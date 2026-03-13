@@ -324,6 +324,14 @@ pub struct LedgerInfo {
     pub extra: Value,
 }
 
+/// amm_info response.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AmmInfoResponse {
+    pub amm: Value,
+    #[serde(flatten)]
+    pub base: BaseResponse,
+}
+
 /// Subscription event types.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -509,6 +517,26 @@ mod tests {
         assert_eq!(resp.ledger.ledger_index.as_deref(), Some("75000000"));
         assert_eq!(resp.base.validated, Some(true));
     }
+
+    #[test]
+    fn deserialize_amm_info_response() {
+        let json = r#"{
+            "amm": {
+                "account": "rAMMAccount1111111111111111111",
+                "trading_fee": 500,
+                "lp_token": {
+                    "value": "1000",
+                    "currency": "03930D02208264E2E40EC1B0C09E4DB96EE197B1",
+                    "issuer": "rAMMAccount1111111111111111111"
+                }
+            },
+            "status": "success"
+        }"#;
+        let resp: AmmInfoResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.amm["account"], "rAMMAccount1111111111111111111");
+        assert_eq!(resp.base.status.as_deref(), Some("success"));
+    }
+
     #[test]
     fn deserialize_subscription_event_ledger() {
         let json = r#"{

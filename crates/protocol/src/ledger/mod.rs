@@ -14,6 +14,7 @@ pub mod check;
 pub mod deposit_preauth;
 pub mod nftoken_page;
 pub mod nftoken_offer;
+pub mod amm;
 pub mod did;
 pub mod oracle;
 
@@ -33,6 +34,7 @@ pub use check::Check;
 pub use deposit_preauth::DepositPreauth;
 pub use nftoken_page::NFTokenPage;
 pub use nftoken_offer::NFTokenOffer;
+pub use amm::Amm;
 pub use did::Did;
 pub use oracle::Oracle;
 
@@ -57,6 +59,7 @@ pub enum LedgerObjectKind {
     DepositPreauth(DepositPreauth),
     NFTokenPage(NFTokenPage),
     NFTokenOffer(NFTokenOffer),
+    AMM(Amm),
     DID(Did),
     Oracle(Oracle),
     #[serde(other, deserialize_with = "deserialize_unknown")]

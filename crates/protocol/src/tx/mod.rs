@@ -30,6 +30,12 @@ pub mod nftoken_create_offer;
 pub mod nftoken_cancel_offer;
 pub mod nftoken_accept_offer;
 pub mod clawback;
+pub mod amm_create;
+pub mod amm_deposit;
+pub mod amm_withdraw;
+pub mod amm_vote;
+pub mod amm_bid;
+pub mod amm_delete;
 pub mod did_set;
 pub mod did_delete;
 pub mod oracle_set;
@@ -41,6 +47,7 @@ pub use signer::{
     verify_signature,
 };
 
+// Re-export all transaction types
 pub use payment::Payment;
 pub use account_set::AccountSet;
 pub use trust_set::TrustSet;
@@ -66,6 +73,12 @@ pub use nftoken_create_offer::NFTokenCreateOffer;
 pub use nftoken_cancel_offer::NFTokenCancelOffer;
 pub use nftoken_accept_offer::NFTokenAcceptOffer;
 pub use clawback::Clawback;
+pub use amm_create::AMMCreate;
+pub use amm_deposit::AMMDeposit;
+pub use amm_withdraw::AMMWithdraw;
+pub use amm_vote::AMMVote;
+pub use amm_bid::AMMBid;
+pub use amm_delete::AMMDelete;
 pub use did_set::DIDSet;
 pub use did_delete::DIDDelete;
 pub use oracle_set::OracleSet;
@@ -102,6 +115,12 @@ pub enum TransactionKind {
     NFTokenCancelOffer(NFTokenCancelOffer),
     NFTokenAcceptOffer(NFTokenAcceptOffer),
     Clawback(Clawback),
+    AMMCreate(AMMCreate),
+    AMMDeposit(AMMDeposit),
+    AMMWithdraw(AMMWithdraw),
+    AMMVote(AMMVote),
+    AMMBid(AMMBid),
+    AMMDelete(AMMDelete),
     DIDSet(DIDSet),
     DIDDelete(DIDDelete),
     OracleSet(OracleSet),

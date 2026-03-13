@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use rxrpl_rpc_api::responses::{
     AccountCurrenciesResponse, AccountInfoResponse, AccountLinesResponse, AccountNftsResponse,
-    AccountObjectsResponse, AccountOffersResponse, BookOffersResponse,
+    AccountObjectsResponse, AccountOffersResponse, AmmInfoResponse, BookOffersResponse,
     FeeResponse, LedgerClosedResponse, LedgerResponse, ServerInfoResponse, SubmitResponse,
     TxResponse,
 };
@@ -275,6 +275,31 @@ impl XrplClient {
         .await
     }
 
+    pub async fn amm_info(&self, amm_account: &str) -> Result<Value, ClientError> {
+        self.request(
+            "amm_info",
+            serde_json::json!({
+                "amm_account": amm_account,
+            }),
+        )
+        .await
+    }
+
+    pub async fn amm_info_by_assets(
+        &self,
+        asset: Value,
+        asset2: Value,
+    ) -> Result<Value, ClientError> {
+        self.request(
+            "amm_info",
+            serde_json::json!({
+                "asset": asset,
+                "asset2": asset2,
+            }),
+        )
+        .await
+    }
+
     pub async fn account_nfts(&self, account: &str) -> Result<Value, ClientError> {
         self.request(
             "account_nfts",
@@ -453,6 +478,34 @@ impl XrplClient {
     pub async fn ledger_closed_typed(&self) -> Result<LedgerClosedResponse, ClientError> {
         self.request_typed("ledger_closed", serde_json::json!({}))
             .await
+    }
+
+    pub async fn amm_info_typed(
+        &self,
+        amm_account: &str,
+    ) -> Result<AmmInfoResponse, ClientError> {
+        self.request_typed(
+            "amm_info",
+            serde_json::json!({
+                "amm_account": amm_account,
+            }),
+        )
+        .await
+    }
+
+    pub async fn amm_info_by_assets_typed(
+        &self,
+        asset: Value,
+        asset2: Value,
+    ) -> Result<AmmInfoResponse, ClientError> {
+        self.request_typed(
+            "amm_info",
+            serde_json::json!({
+                "asset": asset,
+                "asset2": asset2,
+            }),
+        )
+        .await
     }
 
     pub async fn ledger_typed(
