@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/primitives", "crates/crypto", "crates/codec", "crates/protocol", "crates/rpc-api", "crates/rpc-client"]
+members = ["crates/primitives", "crates/crypto", "crates/codec", "crates/protocol", "crates/rpc-api", "crates/rpc-client", "crates/rxrpl"]
 
 [workspace.package]
 version = "0.1.0"
