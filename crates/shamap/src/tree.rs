@@ -129,6 +129,16 @@ impl SHAMap {
         snap
     }
 
+    /// Create a mutable copy of this map.
+    ///
+    /// Even if the source map is immutable, the copy is mutable.
+    /// Used when deriving a new open ledger from a closed parent.
+    pub fn mutable_copy(&self) -> SHAMap {
+        let mut copy = self.clone();
+        copy.state = SHAMapState::Modifying;
+        copy
+    }
+
     // --- Internal helpers (all static to avoid borrow issues) ---
 
     /// Find a leaf by key, descending from the given inner node.
