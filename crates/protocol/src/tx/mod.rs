@@ -40,6 +40,14 @@ pub mod did_set;
 pub mod did_delete;
 pub mod oracle_set;
 pub mod oracle_delete;
+pub mod xchain_create_bridge;
+pub mod xchain_modify_bridge;
+pub mod xchain_create_claim_id;
+pub mod xchain_commit;
+pub mod xchain_claim;
+pub mod xchain_account_create_commit;
+pub mod xchain_add_claim_attestation;
+pub mod xchain_add_account_create_attestation;
 
 pub use common::{CommonFields, Memo, Signer, Transaction};
 pub use signer::{
@@ -83,6 +91,14 @@ pub use did_set::DIDSet;
 pub use did_delete::DIDDelete;
 pub use oracle_set::OracleSet;
 pub use oracle_delete::OracleDelete;
+pub use xchain_create_bridge::XChainCreateBridge;
+pub use xchain_modify_bridge::XChainModifyBridge;
+pub use xchain_create_claim_id::XChainCreateClaimId;
+pub use xchain_commit::XChainCommit;
+pub use xchain_claim::XChainClaim;
+pub use xchain_account_create_commit::XChainAccountCreateCommit;
+pub use xchain_add_claim_attestation::XChainAddClaimAttestation;
+pub use xchain_add_account_create_attestation::XChainAddAccountCreateAttestation;
 
 use serde_json::Value;
 
@@ -125,6 +141,14 @@ pub enum TransactionKind {
     DIDDelete(DIDDelete),
     OracleSet(OracleSet),
     OracleDelete(OracleDelete),
+    XChainCreateBridge(XChainCreateBridge),
+    XChainModifyBridge(XChainModifyBridge),
+    XChainCreateClaimId(XChainCreateClaimId),
+    XChainCommit(XChainCommit),
+    XChainClaim(XChainClaim),
+    XChainAccountCreateCommit(XChainAccountCreateCommit),
+    XChainAddClaimAttestation(XChainAddClaimAttestation),
+    XChainAddAccountCreateAttestation(XChainAddAccountCreateAttestation),
     /// Forward-compatible fallback for unknown transaction types.
     #[serde(other, deserialize_with = "deserialize_unknown")]
     Unknown,

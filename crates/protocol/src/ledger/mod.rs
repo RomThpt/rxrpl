@@ -17,6 +17,9 @@ pub mod nftoken_offer;
 pub mod amm;
 pub mod did;
 pub mod oracle;
+pub mod bridge;
+pub mod xchain_owned_claim_id;
+pub mod xchain_owned_create_account_claim_id;
 
 pub use common::{CommonLedgerFields, LedgerObject};
 pub use account_root::AccountRoot;
@@ -37,6 +40,9 @@ pub use nftoken_offer::NFTokenOffer;
 pub use amm::Amm;
 pub use did::Did;
 pub use oracle::Oracle;
+pub use bridge::Bridge;
+pub use xchain_owned_claim_id::XChainOwnedClaimId;
+pub use xchain_owned_create_account_claim_id::XChainOwnedCreateAccountClaimId;
 
 use serde_json::Value;
 
@@ -62,6 +68,9 @@ pub enum LedgerObjectKind {
     AMM(Amm),
     DID(Did),
     Oracle(Oracle),
+    Bridge(Bridge),
+    XChainOwnedClaimId(XChainOwnedClaimId),
+    XChainOwnedCreateAccountClaimId(XChainOwnedCreateAccountClaimId),
     #[serde(other, deserialize_with = "deserialize_unknown")]
     Unknown,
 }

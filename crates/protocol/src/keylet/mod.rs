@@ -216,6 +216,30 @@ pub fn oracle(id: &AccountId, oracle_document_id: u32) -> Hash256 {
     )
 }
 
+/// Compute the keylet for a bridge.
+pub fn bridge(id: &AccountId, bridge_data: &[u8]) -> Hash256 {
+    index_hash(
+        LedgerNamespace::Bridge,
+        &[id.as_bytes(), bridge_data],
+    )
+}
+
+/// Compute the keylet for a cross-chain claim ID.
+pub fn xchain_claim_id(bridge_data: &[u8], claim_id: u64) -> Hash256 {
+    index_hash(
+        LedgerNamespace::XChainClaimId,
+        &[bridge_data, &claim_id.to_be_bytes()],
+    )
+}
+
+/// Compute the keylet for a cross-chain create account claim ID.
+pub fn xchain_create_account_claim_id(bridge_data: &[u8], seq: u64) -> Hash256 {
+    index_hash(
+        LedgerNamespace::XChainCreateAccountClaimId,
+        &[bridge_data, &seq.to_be_bytes()],
+    )
+}
+
 /// Compute the keylet for a credential.
 pub fn credential(subject: &AccountId, issuer: &AccountId, credential_type: &[u8]) -> Hash256 {
     index_hash(
