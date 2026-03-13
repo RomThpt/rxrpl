@@ -17,6 +17,8 @@ pub mod nftoken_offer;
 pub mod amm;
 pub mod did;
 pub mod oracle;
+pub mod mptoken_issuance;
+pub mod mptoken;
 pub mod credential;
 pub mod bridge;
 pub mod xchain_owned_claim_id;
@@ -41,6 +43,8 @@ pub use nftoken_offer::NFTokenOffer;
 pub use amm::Amm;
 pub use did::Did;
 pub use oracle::Oracle;
+pub use mptoken_issuance::MpTokenIssuance;
+pub use mptoken::MpToken;
 pub use credential::Credential;
 pub use bridge::Bridge;
 pub use xchain_owned_claim_id::XChainOwnedClaimId;
@@ -70,6 +74,8 @@ pub enum LedgerObjectKind {
     AMM(Amm),
     DID(Did),
     Oracle(Oracle),
+    MPTokenIssuance(MpTokenIssuance),
+    MPToken(MpToken),
     Credential(Credential),
     Bridge(Bridge),
     XChainOwnedClaimId(XChainOwnedClaimId),

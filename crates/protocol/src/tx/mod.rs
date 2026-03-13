@@ -40,6 +40,10 @@ pub mod did_set;
 pub mod did_delete;
 pub mod oracle_set;
 pub mod oracle_delete;
+pub mod mptoken_issuance_create;
+pub mod mptoken_issuance_destroy;
+pub mod mptoken_issuance_set;
+pub mod mptoken_authorize;
 pub mod credential_create;
 pub mod credential_accept;
 pub mod credential_delete;
@@ -94,6 +98,10 @@ pub use did_set::DIDSet;
 pub use did_delete::DIDDelete;
 pub use oracle_set::OracleSet;
 pub use oracle_delete::OracleDelete;
+pub use mptoken_issuance_create::MPTokenIssuanceCreate;
+pub use mptoken_issuance_destroy::MPTokenIssuanceDestroy;
+pub use mptoken_issuance_set::MPTokenIssuanceSet;
+pub use mptoken_authorize::MPTokenAuthorize;
 pub use credential_create::CredentialCreate;
 pub use credential_accept::CredentialAccept;
 pub use credential_delete::CredentialDelete;
@@ -147,6 +155,10 @@ pub enum TransactionKind {
     DIDDelete(DIDDelete),
     OracleSet(OracleSet),
     OracleDelete(OracleDelete),
+    MPTokenIssuanceCreate(MPTokenIssuanceCreate),
+    MPTokenIssuanceDestroy(MPTokenIssuanceDestroy),
+    MPTokenIssuanceSet(MPTokenIssuanceSet),
+    MPTokenAuthorize(MPTokenAuthorize),
     CredentialCreate(CredentialCreate),
     CredentialAccept(CredentialAccept),
     CredentialDelete(CredentialDelete),

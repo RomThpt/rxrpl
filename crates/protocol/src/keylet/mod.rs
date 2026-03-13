@@ -240,6 +240,22 @@ pub fn xchain_create_account_claim_id(bridge_data: &[u8], seq: u64) -> Hash256 {
     )
 }
 
+/// Compute the keylet for a multi-purpose token issuance.
+pub fn mptoken_issuance(id: &AccountId, seq: u32) -> Hash256 {
+    index_hash(
+        LedgerNamespace::MPTokenIssuance,
+        &[id.as_bytes(), &seq.to_be_bytes()],
+    )
+}
+
+/// Compute the keylet for a multi-purpose token holding.
+pub fn mptoken(issuance_id: &[u8], holder: &AccountId) -> Hash256 {
+    index_hash(
+        LedgerNamespace::MPToken,
+        &[issuance_id, holder.as_bytes()],
+    )
+}
+
 /// Compute the keylet for a credential.
 pub fn credential(subject: &AccountId, issuer: &AccountId, credential_type: &[u8]) -> Hash256 {
     index_hash(
