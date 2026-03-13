@@ -10,10 +10,12 @@ pub struct XChainOwnedClaimId {
     #[serde(flatten)]
     pub common: CommonLedgerFields,
     pub account: String,
+    #[serde(rename = "XChainBridge")]
     pub xchain_bridge: Value,
     #[serde(rename = "XChainClaimID")]
     pub xchain_claim_id: String,
     pub other_chain_source: String,
+    #[serde(rename = "XChainClaimAttestations")]
     pub xchain_claim_attestations: Vec<Value>,
     pub signature_reward: Value,
     pub owner_node: String,

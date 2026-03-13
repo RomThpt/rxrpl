@@ -10,8 +10,11 @@ pub struct XChainOwnedCreateAccountClaimId {
     #[serde(flatten)]
     pub common: CommonLedgerFields,
     pub account: String,
+    #[serde(rename = "XChainBridge")]
     pub xchain_bridge: Value,
+    #[serde(rename = "XChainAccountCreateCount")]
     pub xchain_account_create_count: String,
+    #[serde(rename = "XChainCreateAccountAttestations")]
     pub xchain_create_account_attestations: Vec<Value>,
     pub owner_node: String,
 }

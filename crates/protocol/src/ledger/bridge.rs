@@ -10,11 +10,14 @@ pub struct Bridge {
     #[serde(flatten)]
     pub common: CommonLedgerFields,
     pub account: String,
+    #[serde(rename = "XChainBridge")]
     pub xchain_bridge: Value,
     pub signature_reward: Value,
     #[serde(rename = "XChainClaimID")]
     pub xchain_claim_id: String,
+    #[serde(rename = "XChainAccountCreateCount")]
     pub xchain_account_create_count: String,
+    #[serde(rename = "XChainAccountClaimCount")]
     pub xchain_account_claim_count: String,
     pub owner_node: String,
     #[serde(skip_serializing_if = "Option::is_none")]
