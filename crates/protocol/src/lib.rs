@@ -4,6 +4,9 @@
 //! signature verification, and a high-level `Wallet` API.
 
 pub mod error;
+pub mod flags;
+pub mod keylet;
+pub mod ledger;
 pub mod tx;
 pub mod types;
 pub mod wallet;
