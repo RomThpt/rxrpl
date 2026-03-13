@@ -1,0 +1,17 @@
+[package]
+name = "rxrpl-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "XRPL protocol types: transactions, ledger entries, flags, keylets, and signing"
+
+[dependencies]
+rxrpl-primitives = { workspace = true }
+rxrpl-crypto = { workspace = true }
+rxrpl-codec = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
