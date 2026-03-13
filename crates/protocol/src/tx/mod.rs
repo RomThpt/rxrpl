@@ -15,6 +15,15 @@ pub mod signer_list_set;
 pub mod account_delete;
 pub mod ticket_create;
 pub mod deposit_preauth;
+pub mod escrow_create;
+pub mod escrow_finish;
+pub mod escrow_cancel;
+pub mod check_create;
+pub mod check_cash;
+pub mod check_cancel;
+pub mod payment_channel_create;
+pub mod payment_channel_fund;
+pub mod payment_channel_claim;
 
 pub use common::{CommonFields, Memo, Signer, Transaction};
 pub use signer::{
@@ -32,6 +41,15 @@ pub use signer_list_set::SignerListSet;
 pub use account_delete::AccountDelete;
 pub use ticket_create::TicketCreate;
 pub use deposit_preauth::DepositPreauth;
+pub use escrow_create::EscrowCreate;
+pub use escrow_finish::EscrowFinish;
+pub use escrow_cancel::EscrowCancel;
+pub use check_create::CheckCreate;
+pub use check_cash::CheckCash;
+pub use check_cancel::CheckCancel;
+pub use payment_channel_create::PaymentChannelCreate;
+pub use payment_channel_fund::PaymentChannelFund;
+pub use payment_channel_claim::PaymentChannelClaim;
 
 use serde_json::Value;
 
@@ -49,6 +67,15 @@ pub enum TransactionKind {
     AccountDelete(AccountDelete),
     TicketCreate(TicketCreate),
     DepositPreauth(DepositPreauth),
+    EscrowCreate(EscrowCreate),
+    EscrowFinish(EscrowFinish),
+    EscrowCancel(EscrowCancel),
+    CheckCreate(CheckCreate),
+    CheckCash(CheckCash),
+    CheckCancel(CheckCancel),
+    PaymentChannelCreate(PaymentChannelCreate),
+    PaymentChannelFund(PaymentChannelFund),
+    PaymentChannelClaim(PaymentChannelClaim),
     /// Forward-compatible fallback for unknown transaction types.
     #[serde(other, deserialize_with = "deserialize_unknown")]
     Unknown,
