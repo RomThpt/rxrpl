@@ -32,6 +32,8 @@ pub mod nftoken_accept_offer;
 pub mod clawback;
 pub mod did_set;
 pub mod did_delete;
+pub mod oracle_set;
+pub mod oracle_delete;
 
 pub use common::{CommonFields, Memo, Signer, Transaction};
 pub use signer::{
@@ -66,6 +68,8 @@ pub use nftoken_accept_offer::NFTokenAcceptOffer;
 pub use clawback::Clawback;
 pub use did_set::DIDSet;
 pub use did_delete::DIDDelete;
+pub use oracle_set::OracleSet;
+pub use oracle_delete::OracleDelete;
 
 use serde_json::Value;
 
@@ -100,6 +104,8 @@ pub enum TransactionKind {
     Clawback(Clawback),
     DIDSet(DIDSet),
     DIDDelete(DIDDelete),
+    OracleSet(OracleSet),
+    OracleDelete(OracleDelete),
     /// Forward-compatible fallback for unknown transaction types.
     #[serde(other, deserialize_with = "deserialize_unknown")]
     Unknown,

@@ -15,6 +15,7 @@ pub mod deposit_preauth;
 pub mod nftoken_page;
 pub mod nftoken_offer;
 pub mod did;
+pub mod oracle;
 
 pub use common::{CommonLedgerFields, LedgerObject};
 pub use account_root::AccountRoot;
@@ -33,6 +34,7 @@ pub use deposit_preauth::DepositPreauth;
 pub use nftoken_page::NFTokenPage;
 pub use nftoken_offer::NFTokenOffer;
 pub use did::Did;
+pub use oracle::Oracle;
 
 use serde_json::Value;
 
@@ -56,6 +58,7 @@ pub enum LedgerObjectKind {
     NFTokenPage(NFTokenPage),
     NFTokenOffer(NFTokenOffer),
     DID(Did),
+    Oracle(Oracle),
     #[serde(other, deserialize_with = "deserialize_unknown")]
     Unknown,
 }
