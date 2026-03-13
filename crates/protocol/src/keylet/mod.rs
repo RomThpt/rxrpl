@@ -243,6 +243,22 @@ pub fn xchain_create_account_claim_id(bridge_data: &[u8], seq: u64) -> Hash256 {
     )
 }
 
+/// Compute the keylet for a permissioned domain.
+pub fn permissioned_domain(owner: &AccountId, seq: u32) -> Hash256 {
+    index_hash(
+        LedgerNamespace::PermissionedDomain,
+        &[owner.as_bytes(), &seq.to_be_bytes()],
+    )
+}
+
+/// Compute the keylet for a delegate entry.
+pub fn delegate(owner: &AccountId, authorized: &AccountId) -> Hash256 {
+    index_hash(
+        LedgerNamespace::Delegate,
+        &[owner.as_bytes(), authorized.as_bytes()],
+    )
+}
+
 /// Compute the keylet for a vault.
 pub fn vault(owner: &AccountId, seq: u32) -> Hash256 {
     index_hash(

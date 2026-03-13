@@ -61,6 +61,13 @@ pub mod xchain_claim;
 pub mod xchain_account_create_commit;
 pub mod xchain_add_claim_attestation;
 pub mod xchain_add_account_create_attestation;
+pub mod permissioned_domain_set;
+pub mod permissioned_domain_delete;
+pub mod delegate_set;
+pub mod amm_clawback;
+pub mod nftoken_modify;
+pub mod batch_submit;
+pub mod ledger_state_fix;
 
 pub use common::{CommonFields, Memo, Signer, Transaction};
 pub use signer::{
@@ -125,6 +132,13 @@ pub use xchain_claim::XChainClaim;
 pub use xchain_account_create_commit::XChainAccountCreateCommit;
 pub use xchain_add_claim_attestation::XChainAddClaimAttestation;
 pub use xchain_add_account_create_attestation::XChainAddAccountCreateAttestation;
+pub use permissioned_domain_set::PermissionedDomainSet;
+pub use permissioned_domain_delete::PermissionedDomainDelete;
+pub use delegate_set::DelegateSet;
+pub use amm_clawback::AMMClawback;
+pub use nftoken_modify::NFTokenModify;
+pub use batch_submit::BatchSubmit;
+pub use ledger_state_fix::LedgerStateFix;
 
 use serde_json::Value;
 
@@ -188,6 +202,13 @@ pub enum TransactionKind {
     XChainAccountCreateCommit(XChainAccountCreateCommit),
     XChainAddClaimAttestation(XChainAddClaimAttestation),
     XChainAddAccountCreateAttestation(XChainAddAccountCreateAttestation),
+    PermissionedDomainSet(PermissionedDomainSet),
+    PermissionedDomainDelete(PermissionedDomainDelete),
+    DelegateSet(DelegateSet),
+    AMMClawback(AMMClawback),
+    NFTokenModify(NFTokenModify),
+    BatchSubmit(BatchSubmit),
+    LedgerStateFix(LedgerStateFix),
     /// Forward-compatible fallback for unknown transaction types.
     #[serde(other, deserialize_with = "deserialize_unknown")]
     Unknown,

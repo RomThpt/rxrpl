@@ -21,6 +21,9 @@ pub mod vault;
 pub mod mptoken_issuance;
 pub mod mptoken;
 pub mod credential;
+pub mod permissioned_domain;
+pub mod delegate;
+pub mod negative_unl;
 pub mod bridge;
 pub mod xchain_owned_claim_id;
 pub mod xchain_owned_create_account_claim_id;
@@ -48,6 +51,9 @@ pub use vault::Vault;
 pub use mptoken_issuance::MpTokenIssuance;
 pub use mptoken::MpToken;
 pub use credential::Credential;
+pub use permissioned_domain::PermissionedDomain;
+pub use delegate::Delegate;
+pub use negative_unl::NegativeUnl;
 pub use bridge::Bridge;
 pub use xchain_owned_claim_id::XChainOwnedClaimId;
 pub use xchain_owned_create_account_claim_id::XChainOwnedCreateAccountClaimId;
@@ -80,6 +86,9 @@ pub enum LedgerObjectKind {
     MPTokenIssuance(MpTokenIssuance),
     MPToken(MpToken),
     Credential(Credential),
+    PermissionedDomain(PermissionedDomain),
+    Delegate(Delegate),
+    NegativeUNL(NegativeUnl),
     Bridge(Bridge),
     XChainOwnedClaimId(XChainOwnedClaimId),
     XChainOwnedCreateAccountClaimId(XChainOwnedCreateAccountClaimId),
