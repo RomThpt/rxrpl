@@ -24,6 +24,11 @@ pub mod check_cancel;
 pub mod payment_channel_create;
 pub mod payment_channel_fund;
 pub mod payment_channel_claim;
+pub mod nftoken_mint;
+pub mod nftoken_burn;
+pub mod nftoken_create_offer;
+pub mod nftoken_cancel_offer;
+pub mod nftoken_accept_offer;
 
 pub use common::{CommonFields, Memo, Signer, Transaction};
 pub use signer::{
@@ -50,6 +55,11 @@ pub use check_cancel::CheckCancel;
 pub use payment_channel_create::PaymentChannelCreate;
 pub use payment_channel_fund::PaymentChannelFund;
 pub use payment_channel_claim::PaymentChannelClaim;
+pub use nftoken_mint::NFTokenMint;
+pub use nftoken_burn::NFTokenBurn;
+pub use nftoken_create_offer::NFTokenCreateOffer;
+pub use nftoken_cancel_offer::NFTokenCancelOffer;
+pub use nftoken_accept_offer::NFTokenAcceptOffer;
 
 use serde_json::Value;
 
@@ -76,6 +86,11 @@ pub enum TransactionKind {
     PaymentChannelCreate(PaymentChannelCreate),
     PaymentChannelFund(PaymentChannelFund),
     PaymentChannelClaim(PaymentChannelClaim),
+    NFTokenMint(NFTokenMint),
+    NFTokenBurn(NFTokenBurn),
+    NFTokenCreateOffer(NFTokenCreateOffer),
+    NFTokenCancelOffer(NFTokenCancelOffer),
+    NFTokenAcceptOffer(NFTokenAcceptOffer),
     /// Forward-compatible fallback for unknown transaction types.
     #[serde(other, deserialize_with = "deserialize_unknown")]
     Unknown,
