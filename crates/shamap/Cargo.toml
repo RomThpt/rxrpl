@@ -1,0 +1,15 @@
+[package]
+name = "rxrpl-shamap"
+description = "XRPL SHAMap merkle tree implementation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rxrpl-primitives = { workspace = true }
+rxrpl-crypto = { workspace = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

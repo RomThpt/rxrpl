@@ -18,6 +18,7 @@ rxrpl-protocol = { path = "crates/protocol" }
 rxrpl-rpc-client = { path = "crates/rpc-client" }
 rxrpl = { path = "crates/rxrpl" }
 rxrpl-amount = { path = "crates/amount" }
+rxrpl-shamap = { path = "crates/shamap" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
