@@ -30,7 +30,7 @@ pub enum LedgerEntryType {
     Oracle = 0x0080,
     MPTokenIssuance = 0x007E,
     MPToken = 0x007F,
-    Credential = 0x0044,        // 'D'
+    Credential = 0x0081,
 }
 
 impl LedgerEntryType {
@@ -61,7 +61,7 @@ impl LedgerEntryType {
             0x0080 => Ok(Self::Oracle),
             0x007E => Ok(Self::MPTokenIssuance),
             0x007F => Ok(Self::MPToken),
-            0x0044 => Ok(Self::Credential),
+            0x0081 => Ok(Self::Credential),
             _ => Err(ProtocolError::UnknownLedgerEntryType(code)),
         }
     }

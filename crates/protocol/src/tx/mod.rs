@@ -40,6 +40,9 @@ pub mod did_set;
 pub mod did_delete;
 pub mod oracle_set;
 pub mod oracle_delete;
+pub mod credential_create;
+pub mod credential_accept;
+pub mod credential_delete;
 pub mod xchain_create_bridge;
 pub mod xchain_modify_bridge;
 pub mod xchain_create_claim_id;
@@ -91,6 +94,9 @@ pub use did_set::DIDSet;
 pub use did_delete::DIDDelete;
 pub use oracle_set::OracleSet;
 pub use oracle_delete::OracleDelete;
+pub use credential_create::CredentialCreate;
+pub use credential_accept::CredentialAccept;
+pub use credential_delete::CredentialDelete;
 pub use xchain_create_bridge::XChainCreateBridge;
 pub use xchain_modify_bridge::XChainModifyBridge;
 pub use xchain_create_claim_id::XChainCreateClaimId;
@@ -141,6 +147,9 @@ pub enum TransactionKind {
     DIDDelete(DIDDelete),
     OracleSet(OracleSet),
     OracleDelete(OracleDelete),
+    CredentialCreate(CredentialCreate),
+    CredentialAccept(CredentialAccept),
+    CredentialDelete(CredentialDelete),
     XChainCreateBridge(XChainCreateBridge),
     XChainModifyBridge(XChainModifyBridge),
     XChainCreateClaimId(XChainCreateClaimId),
