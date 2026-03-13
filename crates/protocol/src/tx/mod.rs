@@ -29,6 +29,7 @@ pub mod nftoken_burn;
 pub mod nftoken_create_offer;
 pub mod nftoken_cancel_offer;
 pub mod nftoken_accept_offer;
+pub mod clawback;
 
 pub use common::{CommonFields, Memo, Signer, Transaction};
 pub use signer::{
@@ -60,6 +61,7 @@ pub use nftoken_burn::NFTokenBurn;
 pub use nftoken_create_offer::NFTokenCreateOffer;
 pub use nftoken_cancel_offer::NFTokenCancelOffer;
 pub use nftoken_accept_offer::NFTokenAcceptOffer;
+pub use clawback::Clawback;
 
 use serde_json::Value;
 
@@ -91,6 +93,7 @@ pub enum TransactionKind {
     NFTokenCreateOffer(NFTokenCreateOffer),
     NFTokenCancelOffer(NFTokenCancelOffer),
     NFTokenAcceptOffer(NFTokenAcceptOffer),
+    Clawback(Clawback),
     /// Forward-compatible fallback for unknown transaction types.
     #[serde(other, deserialize_with = "deserialize_unknown")]
     Unknown,
