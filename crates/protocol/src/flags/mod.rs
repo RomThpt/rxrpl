@@ -9,3 +9,4 @@ pub mod payment;
 pub mod ripple_state;
 pub mod trust_set;
 pub mod mptoken;
+pub mod vault;

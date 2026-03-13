@@ -40,6 +40,12 @@ pub mod did_set;
 pub mod did_delete;
 pub mod oracle_set;
 pub mod oracle_delete;
+pub mod vault_create;
+pub mod vault_set;
+pub mod vault_delete;
+pub mod vault_deposit;
+pub mod vault_withdraw;
+pub mod vault_clawback;
 pub mod mptoken_issuance_create;
 pub mod mptoken_issuance_destroy;
 pub mod mptoken_issuance_set;
@@ -98,6 +104,12 @@ pub use did_set::DIDSet;
 pub use did_delete::DIDDelete;
 pub use oracle_set::OracleSet;
 pub use oracle_delete::OracleDelete;
+pub use vault_create::VaultCreate;
+pub use vault_set::VaultSet;
+pub use vault_delete::VaultDelete;
+pub use vault_deposit::VaultDeposit;
+pub use vault_withdraw::VaultWithdraw;
+pub use vault_clawback::VaultClawback;
 pub use mptoken_issuance_create::MPTokenIssuanceCreate;
 pub use mptoken_issuance_destroy::MPTokenIssuanceDestroy;
 pub use mptoken_issuance_set::MPTokenIssuanceSet;
@@ -155,6 +167,12 @@ pub enum TransactionKind {
     DIDDelete(DIDDelete),
     OracleSet(OracleSet),
     OracleDelete(OracleDelete),
+    VaultCreate(VaultCreate),
+    VaultSet(VaultSet),
+    VaultDelete(VaultDelete),
+    VaultDeposit(VaultDeposit),
+    VaultWithdraw(VaultWithdraw),
+    VaultClawback(VaultClawback),
     MPTokenIssuanceCreate(MPTokenIssuanceCreate),
     MPTokenIssuanceDestroy(MPTokenIssuanceDestroy),
     MPTokenIssuanceSet(MPTokenIssuanceSet),

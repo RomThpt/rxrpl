@@ -17,6 +17,7 @@ pub mod nftoken_offer;
 pub mod amm;
 pub mod did;
 pub mod oracle;
+pub mod vault;
 pub mod mptoken_issuance;
 pub mod mptoken;
 pub mod credential;
@@ -43,6 +44,7 @@ pub use nftoken_offer::NFTokenOffer;
 pub use amm::Amm;
 pub use did::Did;
 pub use oracle::Oracle;
+pub use vault::Vault;
 pub use mptoken_issuance::MpTokenIssuance;
 pub use mptoken::MpToken;
 pub use credential::Credential;
@@ -74,6 +76,7 @@ pub enum LedgerObjectKind {
     AMM(Amm),
     DID(Did),
     Oracle(Oracle),
+    Vault(Vault),
     MPTokenIssuance(MpTokenIssuance),
     MPToken(MpToken),
     Credential(Credential),

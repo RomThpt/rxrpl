@@ -31,6 +31,7 @@ pub enum LedgerEntryType {
     MPTokenIssuance = 0x007E,
     MPToken = 0x007F,
     Credential = 0x0081,
+    Vault = 0x0084,
 }
 
 impl LedgerEntryType {
@@ -62,6 +63,7 @@ impl LedgerEntryType {
             0x007E => Ok(Self::MPTokenIssuance),
             0x007F => Ok(Self::MPToken),
             0x0081 => Ok(Self::Credential),
+            0x0084 => Ok(Self::Vault),
             _ => Err(ProtocolError::UnknownLedgerEntryType(code)),
         }
     }
@@ -94,6 +96,7 @@ impl LedgerEntryType {
             Self::MPTokenIssuance => "MPTokenIssuance",
             Self::MPToken => "MPToken",
             Self::Credential => "Credential",
+            Self::Vault => "Vault",
         }
     }
 
@@ -125,6 +128,7 @@ impl LedgerEntryType {
             "MPTokenIssuance" => Ok(Self::MPTokenIssuance),
             "MPToken" => Ok(Self::MPToken),
             "Credential" => Ok(Self::Credential),
+            "Vault" => Ok(Self::Vault),
             _ => Err(ProtocolError::UnknownLedgerEntryTypeName(name.to_string())),
         }
     }

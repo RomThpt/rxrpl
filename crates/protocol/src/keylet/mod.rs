@@ -27,14 +27,17 @@ pub enum LedgerNamespace {
     NFTokenPage = 0x0050,   // 'P'
     NFTokenOffer = 0x0037,  // '7'
     AMM = 0x0041,           // 'A'
-    Bridge = 0x0069,        // 'i'
+    Bridge = 0x0048,        // 'H'
     XChainClaimId = 0x0051, // 'Q'
     XChainCreateAccountClaimId = 0x004B, // 'K'
     DID = 0x0049,           // 'I'
     Oracle = 0x0052,        // 'R'
-    MPTokenIssuance = 0x007E,
-    MPToken = 0x007F,
+    MPTokenIssuance = 0x007E, // '~'
+    MPToken = 0x0074,       // 't'
     Credential = 0x0044,    // 'D'
+    PermissionedDomain = 0x006D, // 'm'
+    Delegate = 0x0045,      // 'E'
+    Vault = 0x0056,         // 'V'
 }
 
 /// Compute a ledger index by hashing: space_u16_be || data...
@@ -237,6 +240,14 @@ pub fn xchain_create_account_claim_id(bridge_data: &[u8], seq: u64) -> Hash256 {
     index_hash(
         LedgerNamespace::XChainCreateAccountClaimId,
         &[bridge_data, &seq.to_be_bytes()],
+    )
+}
+
+/// Compute the keylet for a vault.
+pub fn vault(owner: &AccountId, seq: u32) -> Hash256 {
+    index_hash(
+        LedgerNamespace::Vault,
+        &[owner.as_bytes(), &seq.to_be_bytes()],
     )
 }
 
