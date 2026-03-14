@@ -13,6 +13,9 @@ pub enum LedgerError {
     #[error("ledger entry not found")]
     NotFound,
 
+    #[error("codec error: {0}")]
+    Codec(String),
+
     #[error("shamap error: {0}")]
     SHAMap(#[from] rxrpl_shamap::SHAMapError),
 }

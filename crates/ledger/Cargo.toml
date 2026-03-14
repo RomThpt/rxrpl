@@ -9,7 +9,10 @@ license.workspace = true
 [dependencies]
 rxrpl-primitives = { workspace = true }
 rxrpl-crypto = { workspace = true }
+rxrpl-codec = { workspace = true }
+rxrpl-protocol = { workspace = true }
 rxrpl-shamap = { workspace = true }
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
