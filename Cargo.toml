@@ -20,6 +20,17 @@ rxrpl = { path = "crates/rxrpl" }
 rxrpl-amount = { path = "crates/amount" }
 rxrpl-shamap = { path = "crates/shamap" }
 rxrpl-ledger = { path = "crates/ledger" }
+rxrpl-storage = { path = "crates/storage" }
+rxrpl-nodestore = { path = "crates/nodestore" }
+rxrpl-amendment = { path = "crates/amendment" }
+rxrpl-tx-engine = { path = "crates/tx-engine" }
+rxrpl-txq = { path = "crates/txq" }
+rxrpl-consensus = { path = "crates/consensus" }
+rxrpl-config = { path = "crates/config" }
+rxrpl-p2p-proto = { path = "crates/p2p-proto" }
+rxrpl-overlay = { path = "crates/overlay" }
+rxrpl-rpc-server = { path = "crates/rpc-server" }
+rxrpl-node = { path = "crates/node" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -49,6 +60,11 @@ tracing-subscriber = "0.3"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+# Storage
+rocksdb = "0.22"
+rusqlite = { version = "0.31", features = ["bundled"] }
+lru = "0.12"
 
 # Misc
 hex = "0.4"

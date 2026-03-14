@@ -1,0 +1,17 @@
+[package]
+name = "rxrpl-p2p-proto"
+description = "XRPL peer protocol protobuf messages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+prost = "0.13"
+bytes.workspace = true
+tokio-util = { version = "0.7", features = ["codec"] }
+thiserror.workspace = true
+
+[build-dependencies]
+prost-build = "0.13"
+protox = "0.7"

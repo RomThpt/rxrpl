@@ -1,0 +1,18 @@
+[package]
+name = "rxrpl-storage"
+description = "Key-value store abstraction with pluggable backends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+rocksdb = ["dep:rocksdb"]
+sqlite = ["dep:rusqlite"]
+
+[dependencies]
+thiserror.workspace = true
+
+rocksdb = { version = "0.22", optional = true }
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }

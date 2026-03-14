@@ -1,0 +1,12 @@
+[package]
+name = "rxrpl-config"
+description = "XRPL node configuration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror.workspace = true
+toml = "0.8"

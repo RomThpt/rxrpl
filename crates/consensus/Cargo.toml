@@ -1,0 +1,13 @@
+[package]
+name = "rxrpl-consensus"
+description = "XRPL Ripple Protocol Consensus Algorithm (RPCA)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rxrpl-primitives = { workspace = true }
+rxrpl-crypto = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true

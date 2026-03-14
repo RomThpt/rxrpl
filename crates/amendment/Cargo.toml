@@ -1,0 +1,13 @@
+[package]
+name = "rxrpl-amendment"
+description = "XRPL amendment feature registry and rules"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rxrpl-primitives = { workspace = true }
+rxrpl-crypto = { workspace = true }
+thiserror.workspace = true
+once_cell.workspace = true

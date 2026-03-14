@@ -1,0 +1,19 @@
+[package]
+name = "rxrpl-tx-engine"
+description = "XRPL transaction execution engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rxrpl-primitives = { workspace = true }
+rxrpl-crypto = { workspace = true }
+rxrpl-codec = { workspace = true }
+rxrpl-protocol = { workspace = true }
+rxrpl-ledger = { workspace = true }
+rxrpl-shamap = { workspace = true }
+rxrpl-amendment = { workspace = true }
+thiserror.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

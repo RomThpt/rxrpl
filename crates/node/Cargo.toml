@@ -1,0 +1,24 @@
+[package]
+name = "rxrpl-node"
+description = "XRPL validator node orchestrator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rxrpl-primitives = { workspace = true }
+rxrpl-config = { workspace = true }
+rxrpl-ledger = { workspace = true }
+rxrpl-tx-engine = { workspace = true }
+rxrpl-txq = { workspace = true }
+rxrpl-consensus = { workspace = true }
+rxrpl-overlay = { workspace = true }
+rxrpl-rpc-server = { workspace = true }
+rxrpl-amendment = { workspace = true }
+rxrpl-storage = { workspace = true }
+rxrpl-nodestore = { workspace = true }
+tokio = { workspace = true }
+tracing.workspace = true
+thiserror.workspace = true
+axum = { version = "0.8", features = ["ws"] }

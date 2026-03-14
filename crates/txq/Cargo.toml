@@ -1,0 +1,17 @@
+[package]
+name = "rxrpl-txq"
+description = "XRPL transaction queue / mempool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rxrpl-primitives = { workspace = true }
+rxrpl-protocol = { workspace = true }
+rxrpl-tx-engine = { workspace = true }
+rxrpl-ledger = { workspace = true }
+rxrpl-amendment = { workspace = true }
+thiserror.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

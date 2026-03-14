@@ -8,6 +8,7 @@ use crate::iterator::{SHAMapIter, SHAMapRefIter};
 use crate::leaf_node::LeafNode;
 use crate::node::{SHAMapNode, SHAMapState};
 use crate::node_id::select_branch;
+use crate::node_store::NodeStore;
 
 /// A SHAMap is a merkle tree (16-way radix trie) keyed by 256-bit hashes.
 ///
@@ -17,11 +18,16 @@ use crate::node_id::select_branch;
 ///
 /// The root is stored as `Arc<SHAMapNode>` so that `snapshot()` is O(1)
 /// and copy-on-write only clones the modified path.
+///
+/// An optional `NodeStore` backend enables persistence. When a store is
+/// attached, `flush()` writes all nodes to the store.
 pub struct SHAMap {
     root: Arc<SHAMapNode>,
     state: SHAMapState,
     /// Factory for creating leaves of the right variant.
     leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+    /// Optional backing store for persistence.
+    store: Option<Arc<dyn NodeStore>>,
 }
 
 impl Clone for SHAMap {
@@ -30,6 +36,7 @@ impl Clone for SHAMap {
             root: Arc::clone(&self.root),
             state: self.state,
             leaf_ctor: self.leaf_ctor,
+            store: self.store.clone(),
         }
     }
 }
@@ -39,6 +46,7 @@ impl std::fmt::Debug for SHAMap {
         f.debug_struct("SHAMap")
             .field("state", &self.state)
             .field("root", &self.root)
+            .field("has_store", &self.store.is_some())
             .finish()
     }
 }
@@ -49,6 +57,19 @@ impl SHAMap {
             root: Arc::new(SHAMapNode::inner(InnerNode::new())),
             state: SHAMapState::Modifying,
             leaf_ctor,
+            store: None,
+        }
+    }
+
+    fn new_with_store(
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+        store: Arc<dyn NodeStore>,
+    ) -> Self {
+        Self {
+            root: Arc::new(SHAMapNode::inner(InnerNode::new())),
+            state: SHAMapState::Modifying,
+            leaf_ctor,
+            store: Some(store),
         }
     }
 
@@ -65,6 +86,31 @@ impl SHAMap {
     /// Create a new empty mutable SHAMap for transactions with metadata.
     pub fn transaction_with_meta() -> Self {
         Self::new_with_ctor(LeafNode::transaction_with_meta)
+    }
+
+    /// Create a new empty mutable SHAMap for account state with a backing store.
+    pub fn account_state_with_store(store: Arc<dyn NodeStore>) -> Self {
+        Self::new_with_store(LeafNode::account_state, store)
+    }
+
+    /// Create a new empty mutable SHAMap for transactions with a backing store.
+    pub fn transaction_with_store(store: Arc<dyn NodeStore>) -> Self {
+        Self::new_with_store(LeafNode::transaction_no_meta, store)
+    }
+
+    /// Create a new empty mutable SHAMap for transactions with metadata and a backing store.
+    pub fn transaction_with_meta_and_store(store: Arc<dyn NodeStore>) -> Self {
+        Self::new_with_store(LeafNode::transaction_with_meta, store)
+    }
+
+    /// Attach a backing store to this map.
+    pub fn set_store(&mut self, store: Arc<dyn NodeStore>) {
+        self.store = Some(store);
+    }
+
+    /// Return a reference to the backing store, if any.
+    pub fn store(&self) -> Option<&Arc<dyn NodeStore>> {
+        self.store.as_ref()
     }
 
     /// Return the root hash of the tree, recomputing dirty nodes.
@@ -153,6 +199,7 @@ impl SHAMap {
             root: Arc::clone(&self.root),
             state: SHAMapState::Immutable,
             leaf_ctor: self.leaf_ctor,
+            store: self.store.clone(),
         }
     }
 
@@ -172,6 +219,59 @@ impl SHAMap {
             root: Arc::clone(&self.root),
             state: SHAMapState::Modifying,
             leaf_ctor: self.leaf_ctor,
+            store: self.store.clone(),
+        }
+    }
+
+    /// Flush all nodes (inner and leaf) to the backing store.
+    ///
+    /// Computes hashes for any dirty nodes, then serializes and stores
+    /// all reachable nodes. Returns the root hash.
+    ///
+    /// No-op if no store is attached; returns the root hash regardless.
+    pub fn flush(&mut self) -> Result<Hash256, SHAMapError> {
+        Self::update_hashes(Arc::make_mut(&mut self.root));
+        let root_hash = self.root.hash();
+
+        if let Some(store) = &self.store {
+            let mut entries = Vec::new();
+            Self::collect_nodes(&self.root, &mut entries);
+            if !entries.is_empty() {
+                let refs: Vec<(&Hash256, &[u8])> =
+                    entries.iter().map(|(h, d)| (h, d.as_slice())).collect();
+                store.store_batch(&refs)?;
+            }
+        }
+
+        Ok(root_hash)
+    }
+
+    /// Collect all node hashes and their serialized data for persistence.
+    fn collect_nodes(node: &Arc<SHAMapNode>, out: &mut Vec<(Hash256, Vec<u8>)>) {
+        match node.as_ref() {
+            SHAMapNode::Inner(inner) => {
+                let hash = inner.hash();
+                if !hash.is_zero() {
+                    // Serialize inner node as: [child_hash_0..child_hash_15]
+                    let mut data = Vec::with_capacity(16 * 32);
+                    for i in 0..16u8 {
+                        data.extend_from_slice(inner.child_hash(i).as_bytes());
+                    }
+                    out.push((hash, data));
+                }
+
+                inner.for_each_branch(|_, child| {
+                    Self::collect_nodes(child, out);
+                });
+            }
+            SHAMapNode::Leaf(leaf) => {
+                let hash = leaf.hash();
+                // Serialize leaf as: [key || data]
+                let mut data = Vec::with_capacity(32 + leaf.data().len());
+                data.extend_from_slice(leaf.key().as_bytes());
+                data.extend_from_slice(leaf.data());
+                out.push((hash, data));
+            }
         }
     }
 
@@ -438,6 +538,7 @@ impl SHAMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node_store::InMemoryNodeStore;
     use std::str::FromStr;
 
     fn make_key(hex: &str) -> Hash256 {
@@ -766,5 +867,72 @@ mod tests {
         }
 
         assert_eq!(map1.root_hash(), map2.root_hash());
+    }
+
+    #[test]
+    fn flush_without_store_returns_hash() {
+        let mut map = SHAMap::account_state();
+        let k = make_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        map.put(k, vec![1, 2, 3]).unwrap();
+
+        let hash = map.flush().unwrap();
+        assert!(!hash.is_zero());
+        assert_eq!(hash, map.root_hash());
+    }
+
+    #[test]
+    fn flush_with_store_persists_nodes() {
+        let store = Arc::new(InMemoryNodeStore::new());
+        let mut map = SHAMap::account_state_with_store(store.clone());
+
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let k2 = make_key("2000000000000000000000000000000000000000000000000000000000000000");
+        map.put(k1, vec![1]).unwrap();
+        map.put(k2, vec![2]).unwrap();
+
+        let root_hash = map.flush().unwrap();
+        assert!(!root_hash.is_zero());
+
+        // Root node should be stored
+        let root_data = store.fetch(&root_hash).unwrap();
+        assert!(root_data.is_some());
+    }
+
+    #[test]
+    fn set_store_after_creation() {
+        let store = Arc::new(InMemoryNodeStore::new());
+        let mut map = SHAMap::account_state();
+
+        let k = make_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        map.put(k, vec![42]).unwrap();
+
+        // Attach store after data is added
+        map.set_store(store.clone());
+        let root_hash = map.flush().unwrap();
+
+        assert!(store.fetch(&root_hash).unwrap().is_some());
+    }
+
+    #[test]
+    fn snapshot_inherits_store() {
+        let store = Arc::new(InMemoryNodeStore::new());
+        let mut map = SHAMap::account_state_with_store(store.clone());
+        let k = make_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        map.put(k, vec![1]).unwrap();
+
+        let snap = map.snapshot();
+        assert!(snap.store().is_some());
+    }
+
+    #[test]
+    fn mutable_copy_inherits_store() {
+        let store = Arc::new(InMemoryNodeStore::new());
+        let mut map = SHAMap::account_state_with_store(store.clone());
+        let k = make_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        map.put(k, vec![1]).unwrap();
+        map.set_immutable();
+
+        let copy = map.mutable_copy();
+        assert!(copy.store().is_some());
     }
 }

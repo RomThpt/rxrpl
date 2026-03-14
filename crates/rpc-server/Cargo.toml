@@ -1,0 +1,21 @@
+[package]
+name = "rxrpl-rpc-server"
+description = "XRPL JSON-RPC and WebSocket server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rxrpl-primitives = { workspace = true }
+rxrpl-rpc-api = { workspace = true }
+rxrpl-ledger = { workspace = true }
+rxrpl-config = { workspace = true }
+serde = { workspace = true }
+serde_json.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+thiserror.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }

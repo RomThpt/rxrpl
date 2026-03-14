@@ -1,0 +1,18 @@
+/// Errors from node operations.
+#[derive(Debug, thiserror::Error)]
+pub enum NodeError {
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    #[error("storage error: {0}")]
+    Storage(#[from] rxrpl_storage::StorageError),
+
+    #[error("server error: {0}")]
+    Server(String),
+
+    #[error("already running")]
+    AlreadyRunning,
+
+    #[error("not running")]
+    NotRunning,
+}

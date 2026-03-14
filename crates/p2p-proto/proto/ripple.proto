@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+package ripple;
+
+// Peer handshake hello message
+message TMHello {
+    uint32 proto_version = 1;
+    uint32 proto_version_min = 2;
+    bytes node_public = 3;
+    bytes node_proof = 4;
+    uint32 network_id = 5;
+    uint32 ledger_seq = 6;
+    bytes ledger_hash = 7;
+    uint64 network_time = 8;
+}
+
+// Ping/pong keepalive
+message TMPing {
+    enum PingType {
+        PT_PING = 0;
+        PT_PONG = 1;
+    }
+    PingType type = 1;
+    uint32 seq = 2;
+    uint64 ping_time = 3;
+    uint64 net_time = 4;
+}
+
+// Request ledger data from a peer
+message TMGetLedger {
+    enum LedgerType {
+        LT_CURRENT = 0;
+        LT_CLOSED = 1;
+        LT_VALIDATED = 2;
+        LT_HASH = 3;
+    }
+    LedgerType ledger_type = 1;
+    bytes ledger_hash = 2;
+    uint32 ledger_seq = 3;
+    repeated bytes node_ids = 4;
+    bool request_cookie = 5;
+    uint64 query_depth = 6;
+}
+
+// Ledger data response
+message TMLedgerData {
+    bytes ledger_hash = 1;
+    uint32 ledger_seq = 2;
+    enum LedgerType {
+        LT_CURRENT = 0;
+        LT_CLOSED = 1;
+        LT_VALIDATED = 2;
+        LT_HASH = 3;
+    }
+    LedgerType ledger_type = 3;
+    repeated TMLedgerNode nodes = 4;
+    uint32 request_cookie = 5;
+
+    message TMLedgerNode {
+        bytes node_id = 1;
+        bytes node_data = 2;
+    }
+}
+
+// Transaction relay
+message TMTransaction {
+    bytes raw_transaction = 1;
+    uint32 status = 2;
+    uint64 receive_timestamp = 3;
+    uint32 deferred = 4;
+}
+
+// Consensus proposal
+message TMProposeSet {
+    uint32 propose_seq = 1;
+    bytes current_tx_hash = 2;
+    bytes node_pub_key = 3;
+    uint32 close_time = 4;
+    bytes signature = 5;
+    bytes previous_ledger = 6;
+    uint32 ledger_seq = 7;
+}
+
+// Ledger validation
+message TMValidation {
+    bytes validation = 1;
+    uint32 ledger_seq = 2;
+}
+
+// Status change notification
+message TMStatusChange {
+    uint32 new_status = 1;
+    uint32 new_event = 2;
+    uint32 ledger_seq = 3;
+    bytes ledger_hash = 4;
+    bytes validated_hash = 5;
+    uint32 validated_seq = 6;
+}
+
+// Get peer list
+message TMGetPeers {}
+
+// Peer list response
+message TMPeers {
+    repeated TMPeer peers = 1;
+
+    message TMPeer {
+        string ip = 1;
+        uint32 port = 2;
+    }
+}
