@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 rxrpl = { workspace = true, features = ["full", "autofill"] }
+rxrpl-node = { workspace = true }
+rxrpl-config = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

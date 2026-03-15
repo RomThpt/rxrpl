@@ -1,3 +1,6 @@
+pub mod account_root_not_deleted;
+pub mod no_negative_balance;
+pub mod valid_ledger_entry_type;
 pub mod xrp_not_created;
 
 use crate::view::sandbox::SandboxChanges;
@@ -39,5 +42,10 @@ pub fn run_invariant_checks(
 
 /// Create the default set of invariant checks.
 pub fn default_invariant_checks() -> Vec<Box<dyn InvariantCheck>> {
-    vec![Box::new(xrp_not_created::XrpNotCreated)]
+    vec![
+        Box::new(xrp_not_created::XrpNotCreated),
+        Box::new(no_negative_balance::NoNegativeBalance),
+        Box::new(account_root_not_deleted::AccountRootNotDeleted),
+        Box::new(valid_ledger_entry_type::ValidLedgerEntryType),
+    ]
 }

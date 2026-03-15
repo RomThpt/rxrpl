@@ -1,0 +1,238 @@
+use std::collections::VecDeque;
+use std::sync::Arc;
+
+use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_config::ServerConfig;
+use rxrpl_ledger::Ledger;
+use rxrpl_protocol::keylet;
+use rxrpl_rpc_server::ServerContext;
+use rxrpl_tx_engine::{FeeSettings, TransactorRegistry, TxEngine};
+use serde_json::{json, Value};
+use tokio::sync::RwLock;
+
+const GENESIS_ADDR: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+
+fn make_engine() -> TxEngine {
+    let mut registry = TransactorRegistry::new();
+    rxrpl_tx_engine::handlers::register_phase_a(&mut registry);
+    TxEngine::new_without_sig_check(registry)
+}
+
+fn genesis_funded_ledger() -> Ledger {
+    let mut genesis = Ledger::genesis();
+
+    let account_id = decode_account_id(GENESIS_ADDR).unwrap();
+    let key = keylet::account(&account_id);
+
+    let account = json!({
+        "LedgerEntryType": "AccountRoot",
+        "Account": GENESIS_ADDR,
+        "Balance": genesis.header.drops.to_string(),
+        "Sequence": 1,
+        "OwnerCount": 0,
+        "Flags": 0,
+    });
+    let data = serde_json::to_vec(&account).unwrap();
+    genesis.put_state(key, data).unwrap();
+    genesis.close(0, 0).unwrap();
+
+    Ledger::new_open(&genesis)
+}
+
+fn test_ctx_with_ledger() -> Arc<ServerContext> {
+    let ledger = genesis_funded_ledger();
+    let engine = make_engine();
+    let fees = FeeSettings::default();
+
+    let mut closed = VecDeque::new();
+    // Add the genesis as a closed ledger
+    let genesis_closed = {
+        let mut g = Ledger::genesis();
+        let account_id = decode_account_id(GENESIS_ADDR).unwrap();
+        let key = keylet::account(&account_id);
+        let account = json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": GENESIS_ADDR,
+            "Balance": g.header.drops.to_string(),
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        let data = serde_json::to_vec(&account).unwrap();
+        g.put_state(key, data).unwrap();
+        g.close(0, 0).unwrap();
+        g
+    };
+    closed.push_back(genesis_closed);
+
+    ServerContext::with_node_state(
+        ServerConfig::default(),
+        Arc::new(RwLock::new(ledger)),
+        Arc::new(RwLock::new(closed)),
+        Arc::new(engine),
+        Arc::new(fees),
+    )
+}
+
+// -- account_info tests --
+
+#[tokio::test]
+async fn account_info_existing_account() {
+    let ctx = test_ctx_with_ledger();
+    let params = json!({ "account": GENESIS_ADDR });
+
+    let result = rxrpl_rpc_server::handlers::account_info(params, &ctx)
+        .await
+        .unwrap();
+
+    assert!(result["account_data"]["Balance"].as_str().is_some());
+    assert_eq!(result["account_data"]["Account"], GENESIS_ADDR);
+    assert_eq!(result["ledger_current_index"], 2);
+}
+
+#[tokio::test]
+async fn account_info_nonexistent_account() {
+    let ctx = test_ctx_with_ledger();
+    let params = json!({ "account": "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe" });
+
+    let result = rxrpl_rpc_server::handlers::account_info(params, &ctx).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn account_info_missing_param() {
+    let ctx = test_ctx_with_ledger();
+    let params = json!({});
+
+    let result = rxrpl_rpc_server::handlers::account_info(params, &ctx).await;
+    assert!(result.is_err());
+}
+
+// -- ledger tests --
+
+#[tokio::test]
+async fn ledger_current() {
+    let ctx = test_ctx_with_ledger();
+    let params = json!({ "ledger_index": "current" });
+
+    let result = rxrpl_rpc_server::handlers::ledger(params, &ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(result["ledger"]["ledger_index"], 2);
+    assert_eq!(result["ledger"]["closed"], false);
+}
+
+#[tokio::test]
+async fn ledger_closed() {
+    let ctx = test_ctx_with_ledger();
+    let params = json!({ "ledger_index": "closed" });
+
+    let result = rxrpl_rpc_server::handlers::ledger(params, &ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(result["ledger"]["ledger_index"], 1);
+    assert_eq!(result["ledger"]["closed"], true);
+}
+
+#[tokio::test]
+async fn ledger_by_index() {
+    let ctx = test_ctx_with_ledger();
+    let params = json!({ "ledger_index": "1" });
+
+    let result = rxrpl_rpc_server::handlers::ledger(params, &ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(result["ledger"]["ledger_index"], 1);
+}
+
+#[tokio::test]
+async fn ledger_not_found() {
+    let ctx = test_ctx_with_ledger();
+    let params = json!({ "ledger_index": "999" });
+
+    let result = rxrpl_rpc_server::handlers::ledger(params, &ctx).await;
+    assert!(result.is_err());
+}
+
+// -- ledger_closed tests --
+
+#[tokio::test]
+async fn ledger_closed_handler() {
+    let ctx = test_ctx_with_ledger();
+    let params = json!({});
+
+    let result = rxrpl_rpc_server::handlers::ledger_closed(params, &ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(result["ledger_index"], 1);
+    assert!(result["ledger_hash"].as_str().is_some());
+}
+
+// -- fee tests --
+
+#[tokio::test]
+async fn fee_handler() {
+    let ctx = test_ctx_with_ledger();
+    let params = json!({});
+
+    let result = rxrpl_rpc_server::handlers::fee(params, &ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(result["drops"]["base_fee"], "10");
+    assert_eq!(result["ledger_current_index"], 2);
+}
+
+// -- server_info tests --
+
+#[tokio::test]
+async fn server_info_with_ledger() {
+    let ctx = test_ctx_with_ledger();
+    let params = json!({});
+
+    let result = rxrpl_rpc_server::handlers::server_info(params, &ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(result["info"]["complete_ledgers"], "1-1");
+    assert_eq!(result["info"]["ledger_current_index"], 2);
+}
+
+// -- ledger_current tests --
+
+#[tokio::test]
+async fn ledger_current_handler() {
+    let ctx = test_ctx_with_ledger();
+    let params = json!({});
+
+    let result = rxrpl_rpc_server::handlers::ledger_current(params, &ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(result["ledger_current_index"], 2);
+}
+
+// -- tx tests --
+
+#[tokio::test]
+async fn tx_not_found() {
+    let ctx = test_ctx_with_ledger();
+    let hash = "0".repeat(64);
+    let params = json!({ "transaction": hash });
+
+    let result = rxrpl_rpc_server::handlers::tx(params, &ctx).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn tx_invalid_hash() {
+    let ctx = test_ctx_with_ledger();
+    let params = json!({ "transaction": "not-a-hash" });
+
+    let result = rxrpl_rpc_server::handlers::tx(params, &ctx).await;
+    assert!(result.is_err());
+}

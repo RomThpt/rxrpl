@@ -15,4 +15,13 @@ pub enum NodeError {
 
     #[error("not running")]
     NotRunning,
+
+    #[error("ledger error: {0}")]
+    Ledger(#[from] rxrpl_ledger::LedgerError),
+
+    #[error("transaction engine error: {0}")]
+    TxEngine(#[from] rxrpl_tx_engine::TxEngineError),
+
+    #[error("ledger not open")]
+    LedgerNotOpen,
 }

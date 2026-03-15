@@ -9,6 +9,8 @@ license.workspace = true
 [dependencies]
 rxrpl-primitives = { workspace = true }
 rxrpl-config = { workspace = true }
+rxrpl-codec = { workspace = true }
+rxrpl-protocol = { workspace = true }
 rxrpl-ledger = { workspace = true }
 rxrpl-tx-engine = { workspace = true }
 rxrpl-txq = { workspace = true }
@@ -21,4 +23,10 @@ rxrpl-nodestore = { workspace = true }
 tokio = { workspace = true }
 tracing.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true
 axum = { version = "0.8", features = ["ws"] }
+
+[dev-dependencies]
+rxrpl-crypto = { workspace = true }
+reqwest = { workspace = true }
+hex.workspace = true

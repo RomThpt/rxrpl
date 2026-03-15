@@ -16,6 +16,9 @@ pub struct Sandbox<'a> {
     inserts: HashMap<Hash256, Vec<u8>>,
     updates: HashMap<Hash256, Vec<u8>>,
     deletes: HashMap<Hash256, Vec<u8>>,
+    /// Pre-mutation values for entries that existed before this sandbox.
+    /// Captured on first update/erase so TxMeta can show previous fields.
+    originals: HashMap<Hash256, Vec<u8>>,
     destroyed_drops: u64,
 }
 
@@ -27,6 +30,7 @@ impl<'a> Sandbox<'a> {
             inserts: HashMap::new(),
             updates: HashMap::new(),
             deletes: HashMap::new(),
+            originals: HashMap::new(),
             destroyed_drops: 0,
         }
     }
@@ -41,12 +45,49 @@ impl<'a> Sandbox<'a> {
         self.destroyed_drops
     }
 
+    /// Merge changes from a child sandbox into this sandbox.
+    ///
+    /// Used after a child sandbox succeeds (tes) to fold its mutations
+    /// back into the parent before committing.
+    pub fn merge_child_changes(&mut self, changes: SandboxChanges) {
+        for (key, data) in changes.inserts {
+            if self.deletes.remove(&key).is_some() {
+                // Re-inserting something deleted in this sandbox -> update
+                self.updates.insert(key, data);
+            } else {
+                self.inserts.insert(key, data);
+            }
+        }
+        for (key, data) in changes.updates {
+            if let Some(entry) = self.inserts.get_mut(&key) {
+                // Updating something inserted in this sandbox
+                *entry = data;
+            } else {
+                self.updates.insert(key, data);
+            }
+        }
+        for (key, data) in changes.deletes {
+            if self.inserts.remove(&key).is_some() {
+                // Deleting something inserted in this sandbox -> no-op
+            } else {
+                self.updates.remove(&key);
+                self.deletes.insert(key, data);
+            }
+        }
+        self.destroyed_drops += changes.destroyed_drops;
+        // Merge originals -- only keep the earliest original per key
+        for (key, data) in changes.originals {
+            self.originals.entry(key).or_insert(data);
+        }
+    }
+
     /// Consume this sandbox and return its changes.
     pub fn into_changes(self) -> SandboxChanges {
         SandboxChanges {
             inserts: self.inserts,
             updates: self.updates,
             deletes: self.deletes,
+            originals: self.originals,
             destroyed_drops: self.destroyed_drops,
         }
     }
@@ -119,6 +160,12 @@ impl ApplyView for Sandbox<'_> {
             // Updating something we inserted in this sandbox
             *entry = data;
         } else {
+            // Capture original value on first modification
+            if !self.originals.contains_key(&key) {
+                if let Some(original) = self.parent.read(&key) {
+                    self.originals.insert(key, original);
+                }
+            }
             self.updates.insert(key, data);
         }
         Ok(())
@@ -131,6 +178,12 @@ impl ApplyView for Sandbox<'_> {
         // If it was inserted in this sandbox, just remove the insert
         if self.inserts.remove(key).is_some() {
             return Ok(());
+        }
+        // Capture original value before deletion
+        if !self.originals.contains_key(key) {
+            if let Some(original) = self.parent.read(key) {
+                self.originals.insert(*key, original);
+            }
         }
         // Get the current data for the delete record
         let data = self.read(key).unwrap_or_default();
@@ -150,6 +203,8 @@ pub struct SandboxChanges {
     pub inserts: HashMap<Hash256, Vec<u8>>,
     pub updates: HashMap<Hash256, Vec<u8>>,
     pub deletes: HashMap<Hash256, Vec<u8>>,
+    /// Pre-mutation values for modified/deleted entries.
+    pub originals: HashMap<Hash256, Vec<u8>>,
     pub destroyed_drops: u64,
 }
 

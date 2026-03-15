@@ -1,6 +1,42 @@
 use rxrpl_protocol::TransactionResult;
 use serde_json::Value;
 
+/// Extract an IOU Amount object from a transaction.
+/// Returns (currency, issuer, value) if the Amount field is an object.
+pub fn get_iou_amount<'a>(tx: &'a Value) -> Option<(&'a str, &'a str, &'a str)> {
+    let amount = tx.get("Amount")?;
+    if !amount.is_object() {
+        return None;
+    }
+    let currency = amount.get("currency")?.as_str()?;
+    let issuer = amount.get("issuer")?.as_str()?;
+    let value = amount.get("value")?.as_str()?;
+    Some((currency, issuer, value))
+}
+
+/// Access an array field from a transaction JSON.
+pub fn get_array_field<'a>(tx: &'a Value, field: &str) -> Option<&'a Vec<Value>> {
+    tx.get(field).and_then(|v| v.as_array())
+}
+
+/// Convert a 3-letter currency code (or 40-char hex) to 20 bytes.
+pub fn currency_to_bytes(currency: &str) -> [u8; 20] {
+    let mut bytes = [0u8; 20];
+    let code = currency.as_bytes();
+    if code.len() == 3 {
+        bytes[12] = code[0];
+        bytes[13] = code[1];
+        bytes[14] = code[2];
+    } else if code.len() == 40 {
+        if let Ok(decoded) = hex::decode(currency) {
+            if decoded.len() == 20 {
+                bytes.copy_from_slice(&decoded);
+            }
+        }
+    }
+    bytes
+}
+
 /// Extract the "Account" field from a transaction JSON.
 pub fn get_account(tx: &Value) -> Result<&str, TransactionResult> {
     tx.get("Account")
@@ -70,4 +106,35 @@ pub fn adjust_owner_count(account_obj: &mut Value, delta: i32) {
     let current = get_owner_count(account_obj) as i32;
     let new_count = (current + delta).max(0) as u32;
     account_obj["OwnerCount"] = Value::from(new_count);
+}
+
+/// Extract a string field from a transaction JSON.
+pub fn get_str_field<'a>(tx: &'a Value, field: &str) -> Option<&'a str> {
+    tx.get(field).and_then(|v| v.as_str())
+}
+
+/// Extract a u32 field from a transaction JSON.
+pub fn get_u32_field(tx: &Value, field: &str) -> Option<u32> {
+    tx.get(field).and_then(|v| v.as_u64()).map(|n| n as u32)
+}
+
+/// Extract a u64 field (stored as string) from a transaction JSON.
+pub fn get_u64_str_field(tx: &Value, field: &str) -> Option<u64> {
+    tx.get(field)
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+}
+
+/// Look up an AccountRoot by address and return the keylet + parsed JSON.
+pub fn read_account_by_address(
+    view: &dyn crate::view::read_view::ReadView,
+    address: &str,
+) -> Result<(rxrpl_primitives::Hash256, Value), TransactionResult> {
+    let account_id = rxrpl_codec::address::classic::decode_account_id(address)
+        .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let key = rxrpl_protocol::keylet::account(&account_id);
+    let bytes = view.read(&key).ok_or(TransactionResult::TerNoAccount)?;
+    let obj: Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    Ok((key, obj))
 }

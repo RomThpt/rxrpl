@@ -17,6 +17,12 @@ pub async fn dispatch(
         "server_info" => handlers::server_info(params, ctx).await,
         "server_state" => handlers::server_state(params, ctx).await,
         "fee" => handlers::fee(params, ctx).await,
+        "account_info" => handlers::account_info(params, ctx).await,
+        "submit" => handlers::submit(params, ctx).await,
+        "ledger" => handlers::ledger(params, ctx).await,
+        "ledger_closed" => handlers::ledger_closed(params, ctx).await,
+        "ledger_current" => handlers::ledger_current(params, ctx).await,
+        "tx" => handlers::tx(params, ctx).await,
         _ => Err(RpcServerError::MethodNotFound(method.to_string())),
     }
 }

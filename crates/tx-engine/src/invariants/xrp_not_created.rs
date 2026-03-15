@@ -37,6 +37,7 @@ mod tests {
             inserts: HashMap::new(),
             updates: HashMap::new(),
             deletes: HashMap::new(),
+            originals: HashMap::new(),
             destroyed_drops: destroyed,
         }
     }

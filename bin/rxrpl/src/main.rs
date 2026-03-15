@@ -158,6 +158,19 @@ enum Commands {
         /// Account address
         account: String,
     },
+
+    /// Run a standalone XRPL node
+    NodeRun {
+        /// Genesis account address
+        #[arg(long, default_value = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")]
+        genesis_account: String,
+        /// Ledger close interval in seconds
+        #[arg(long, default_value = "10")]
+        close_interval: u64,
+        /// RPC server bind address
+        #[arg(long, default_value = "127.0.0.1:5005")]
+        bind: String,
+    },
 }
 
 #[tokio::main]
@@ -288,6 +301,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             return cmd_account_delete(&cli.url, &from, &destination, fee.as_deref()).await;
         }
 
+        Commands::NodeRun {
+            genesis_account,
+            close_interval,
+            bind,
+        } => {
+            return cmd_node_run(&genesis_account, close_interval, &bind).await;
+        }
+
         _ => {}
     }
 
@@ -310,7 +331,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         | Commands::Pay { .. }
         | Commands::TrustSet { .. }
         | Commands::OfferCreate { .. }
-        | Commands::AccountDelete { .. } => unreachable!(),
+        | Commands::AccountDelete { .. }
+        | Commands::NodeRun { .. } => unreachable!(),
     };
 
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -454,5 +476,24 @@ async fn autofill_sign_submit(
 
     let result = client.submit_and_wait(&blob, &hash_hex, 30).await?;
     println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+async fn cmd_node_run(
+    genesis_account: &str,
+    close_interval: u64,
+    bind: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = rxrpl_config::NodeConfig::default();
+    config.server.bind = bind.parse()?;
+
+    let node = rxrpl_node::Node::new_standalone(config, genesis_account)?;
+
+    eprintln!("Starting standalone node...");
+    eprintln!("  Genesis account: {genesis_account}");
+    eprintln!("  RPC server: http://{bind}");
+    eprintln!("  Close interval: {close_interval}s");
+
+    node.run_standalone(close_interval).await?;
     Ok(())
 }
