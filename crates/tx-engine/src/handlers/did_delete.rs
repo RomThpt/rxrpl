@@ -1,0 +1,239 @@
+use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_protocol::{keylet, TransactionResult};
+
+use crate::helpers;
+use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
+
+pub struct DIDDeleteTransactor;
+
+impl Transactor for DIDDeleteTransactor {
+    fn preflight(&self, _ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
+        Ok(())
+    }
+
+    fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
+        let account_str = helpers::get_account(ctx.tx)?;
+        helpers::read_account_by_address(ctx.view, account_str)?;
+
+        let account_id = decode_account_id(account_str)
+            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let did_key = keylet::did(&account_id);
+        if !ctx.view.exists(&did_key) {
+            return Err(TransactionResult::TecNoEntry);
+        }
+
+        Ok(())
+    }
+
+    fn apply(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<TransactionResult, TransactionResult> {
+        let account_str = helpers::get_account(ctx.tx)?;
+        let account_id = decode_account_id(account_str)
+            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+
+        let account_key = keylet::account(&account_id);
+        let account_bytes = ctx
+            .view
+            .read(&account_key)
+            .ok_or(TransactionResult::TerNoAccount)?;
+        let mut account: serde_json::Value =
+            serde_json::from_slice(&account_bytes).map_err(|_| TransactionResult::TefInternal)?;
+
+        helpers::increment_sequence(&mut account);
+
+        let did_key = keylet::did(&account_id);
+        ctx.view
+            .erase(&did_key)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        helpers::adjust_owner_count(&mut account, -1);
+
+        let account_data =
+            serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(account_key, account_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        Ok(TransactionResult::TesSuccess)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fees::FeeSettings;
+    use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext};
+    use crate::view::ledger_view::LedgerView;
+    use crate::view::read_view::ReadView;
+    use crate::view::sandbox::Sandbox;
+    use rxrpl_amendment::Rules;
+    use rxrpl_ledger::Ledger;
+
+    const ALICE: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+
+    fn setup_account_with_did() -> Ledger {
+        let mut ledger = Ledger::genesis();
+        let id = decode_account_id(ALICE).unwrap();
+
+        let account_key = keylet::account(&id);
+        let account = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": ALICE,
+            "Balance": "100000000",
+            "Sequence": 1,
+            "OwnerCount": 1,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(account_key, serde_json::to_vec(&account).unwrap())
+            .unwrap();
+
+        let did_key = keylet::did(&id);
+        let did = serde_json::json!({
+            "LedgerEntryType": "DID",
+            "Account": ALICE,
+            "URI": "https://example.com",
+            "Flags": 0,
+        });
+        ledger
+            .put_state(did_key, serde_json::to_vec(&did).unwrap())
+            .unwrap();
+
+        ledger
+    }
+
+    fn setup_account_without_did() -> Ledger {
+        let mut ledger = Ledger::genesis();
+        let id = decode_account_id(ALICE).unwrap();
+        let key = keylet::account(&id);
+        let account = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": ALICE,
+            "Balance": "100000000",
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&account).unwrap())
+            .unwrap();
+        ledger
+    }
+
+    #[test]
+    fn preflight_always_ok() {
+        let tx = serde_json::json!({
+            "TransactionType": "DIDDelete",
+            "Account": ALICE,
+            "Fee": "12",
+        });
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        assert_eq!(DIDDeleteTransactor.preflight(&ctx), Ok(()));
+    }
+
+    #[test]
+    fn preclaim_no_did_rejects() {
+        let ledger = setup_account_without_did();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let rules = Rules::new();
+
+        let tx = serde_json::json!({
+            "TransactionType": "DIDDelete",
+            "Account": ALICE,
+            "Fee": "12",
+        });
+        let ctx = PreclaimContext { tx: &tx, view: &view, rules: &rules };
+        assert_eq!(
+            DIDDeleteTransactor.preclaim(&ctx),
+            Err(TransactionResult::TecNoEntry)
+        );
+    }
+
+    #[test]
+    fn preclaim_with_did_ok() {
+        let ledger = setup_account_with_did();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let rules = Rules::new();
+
+        let tx = serde_json::json!({
+            "TransactionType": "DIDDelete",
+            "Account": ALICE,
+            "Fee": "12",
+        });
+        let ctx = PreclaimContext { tx: &tx, view: &view, rules: &rules };
+        assert_eq!(DIDDeleteTransactor.preclaim(&ctx), Ok(()));
+    }
+
+    #[test]
+    fn apply_deletes_did() {
+        let ledger = setup_account_with_did();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+
+        let tx = serde_json::json!({
+            "TransactionType": "DIDDelete",
+            "Account": ALICE,
+            "Fee": "12",
+            "Sequence": 1,
+        });
+
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+
+        let result = DIDDeleteTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        let id = decode_account_id(ALICE).unwrap();
+        let did_key = keylet::did(&id);
+        assert!(!sandbox.exists(&did_key));
+
+        let account_key = keylet::account(&id);
+        let account_bytes = sandbox.read(&account_key).unwrap();
+        let account: serde_json::Value = serde_json::from_slice(&account_bytes).unwrap();
+        assert_eq!(account["OwnerCount"].as_u64().unwrap(), 0);
+        assert_eq!(account["Sequence"].as_u64().unwrap(), 2);
+    }
+
+    #[test]
+    fn apply_sequence_increments() {
+        let ledger = setup_account_with_did();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+
+        let tx = serde_json::json!({
+            "TransactionType": "DIDDelete",
+            "Account": ALICE,
+            "Fee": "12",
+            "Sequence": 1,
+        });
+
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+
+        DIDDeleteTransactor.apply(&mut ctx).unwrap();
+
+        let id = decode_account_id(ALICE).unwrap();
+        let account_key = keylet::account(&id);
+        let account_bytes = sandbox.read(&account_key).unwrap();
+        let account: serde_json::Value = serde_json::from_slice(&account_bytes).unwrap();
+        assert_eq!(account["Sequence"].as_u64().unwrap(), 2);
+    }
+}

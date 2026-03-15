@@ -291,6 +291,38 @@ pub fn credential(subject: &AccountId, issuer: &AccountId, credential_type: &[u8
     )
 }
 
+/// Compute the keylet for an AMM.
+///
+/// `asset1_currency`/`asset2_currency` are the 20-byte currency identifiers
+/// (all zeros for XRP). `asset1_issuer`/`asset2_issuer` are the issuer account
+/// IDs (zero account for XRP). Assets are sorted canonically so order does not
+/// matter.
+pub fn amm(
+    asset1_currency: &[u8; 20],
+    asset1_issuer: &AccountId,
+    asset2_currency: &[u8; 20],
+    asset2_issuer: &AccountId,
+) -> Hash256 {
+    let a1 = (asset1_currency.as_slice(), asset1_issuer.as_bytes().as_slice());
+    let a2 = (asset2_currency.as_slice(), asset2_issuer.as_bytes().as_slice());
+    let (low_cur, low_iss, high_cur, high_iss) = if a1 <= a2 {
+        (
+            asset1_currency.as_slice(),
+            asset1_issuer.as_bytes().as_slice(),
+            asset2_currency.as_slice(),
+            asset2_issuer.as_bytes().as_slice(),
+        )
+    } else {
+        (
+            asset2_currency.as_slice(),
+            asset2_issuer.as_bytes().as_slice(),
+            asset1_currency.as_slice(),
+            asset1_issuer.as_bytes().as_slice(),
+        )
+    };
+    index_hash(LedgerNamespace::AMM, &[low_cur, low_iss, high_cur, high_iss])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,5 +420,40 @@ mod tests {
         let id = AccountId::from_str("B5F762798A53D543A014CAF8B297CFF8F2F937E8").unwrap();
         let key = ticket(&id, 10);
         assert!(!key.is_zero());
+    }
+
+    #[test]
+    fn amm_keylet_symmetric() {
+        let cur_xrp = [0u8; 20];
+        let iss_xrp = AccountId::from([0u8; 20]);
+        let mut cur_usd = [0u8; 20];
+        cur_usd[12] = b'U';
+        cur_usd[13] = b'S';
+        cur_usd[14] = b'D';
+        let iss_usd = AccountId::from_str("88A5A57C829F40F25EA83385BBDE6C3D8B4CA082").unwrap();
+
+        let key1 = amm(&cur_xrp, &iss_xrp, &cur_usd, &iss_usd);
+        let key2 = amm(&cur_usd, &iss_usd, &cur_xrp, &iss_xrp);
+        assert_eq!(key1, key2, "AMM keylet should be symmetric");
+        assert!(!key1.is_zero());
+    }
+
+    #[test]
+    fn amm_keylet_different_assets() {
+        let cur_xrp = [0u8; 20];
+        let iss_xrp = AccountId::from([0u8; 20]);
+        let mut cur_usd = [0u8; 20];
+        cur_usd[12] = b'U';
+        cur_usd[13] = b'S';
+        cur_usd[14] = b'D';
+        let mut cur_eur = [0u8; 20];
+        cur_eur[12] = b'E';
+        cur_eur[13] = b'U';
+        cur_eur[14] = b'R';
+        let iss = AccountId::from_str("88A5A57C829F40F25EA83385BBDE6C3D8B4CA082").unwrap();
+
+        let key1 = amm(&cur_xrp, &iss_xrp, &cur_usd, &iss);
+        let key2 = amm(&cur_xrp, &iss_xrp, &cur_eur, &iss);
+        assert_ne!(key1, key2, "different asset pairs should produce different keys");
     }
 }

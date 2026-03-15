@@ -6,11 +6,14 @@
 /// - `TxEngine` for orchestrating the apply pipeline
 /// - `ReadView`/`ApplyView`/`Sandbox` for COW state management
 /// - Invariant checks for post-transaction validation
+pub mod amm_helpers;
+pub mod bridge_helpers;
 pub mod engine;
 pub mod error;
 pub mod fees;
 pub mod handlers;
 pub mod helpers;
+pub mod nftoken;
 pub mod invariants;
 pub mod metadata;
 pub mod registry;
