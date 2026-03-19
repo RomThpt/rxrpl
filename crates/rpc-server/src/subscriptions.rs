@@ -6,6 +6,47 @@ use serde_json::Value;
 use crate::error::RpcServerError;
 use crate::events::ServerEvent;
 
+/// Key identifying an order book by its trading pair.
+#[derive(Clone, Debug)]
+struct OrderBookKey {
+    taker_pays: Value,
+    taker_gets: Value,
+    canonical: String,
+}
+
+impl OrderBookKey {
+    fn new(taker_pays: Value, taker_gets: Value) -> Self {
+        let canonical = format!(
+            "{}|{}",
+            serde_json::to_string(&taker_pays).unwrap_or_default(),
+            serde_json::to_string(&taker_gets).unwrap_or_default(),
+        );
+        Self {
+            taker_pays,
+            taker_gets,
+            canonical,
+        }
+    }
+
+    fn matches_event(&self, event_pays: &Value, event_gets: &Value) -> bool {
+        self.taker_pays == *event_pays && self.taker_gets == *event_gets
+    }
+}
+
+impl PartialEq for OrderBookKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical == other.canonical
+    }
+}
+
+impl Eq for OrderBookKey {}
+
+impl std::hash::Hash for OrderBookKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.canonical.hash(state);
+    }
+}
+
 /// Types of subscription streams.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum StreamType {
@@ -45,6 +86,7 @@ pub struct ConnectionSubscriptions {
     streams: HashSet<StreamType>,
     accounts: HashSet<AccountId>,
     accounts_proposed: HashSet<AccountId>,
+    order_books: HashSet<OrderBookKey>,
 }
 
 impl ConnectionSubscriptions {
@@ -86,6 +128,19 @@ impl ConnectionSubscriptions {
             }
         }
 
+        if let Some(books) = params.get("books").and_then(|v| v.as_array()) {
+            for book in books {
+                let taker_pays = book.get("taker_pays").cloned().unwrap_or(Value::Null);
+                let taker_gets = book.get("taker_gets").cloned().unwrap_or(Value::Null);
+                if taker_pays.is_null() || taker_gets.is_null() {
+                    return Err(RpcServerError::InvalidParams(
+                        "books entry requires taker_pays and taker_gets".into(),
+                    ));
+                }
+                self.order_books.insert(OrderBookKey::new(taker_pays, taker_gets));
+            }
+        }
+
         Ok(serde_json::json!({}))
     }
 
@@ -118,6 +173,14 @@ impl ConnectionSubscriptions {
                         self.accounts_proposed.remove(&id);
                     }
                 }
+            }
+        }
+
+        if let Some(books) = params.get("books").and_then(|v| v.as_array()) {
+            for book in books {
+                let taker_pays = book.get("taker_pays").cloned().unwrap_or(Value::Null);
+                let taker_gets = book.get("taker_gets").cloned().unwrap_or(Value::Null);
+                self.order_books.remove(&OrderBookKey::new(taker_pays, taker_gets));
             }
         }
 
@@ -157,6 +220,14 @@ impl ConnectionSubscriptions {
             }
             ServerEvent::BookChange { .. } => self.streams.contains(&StreamType::BookChanges),
             ServerEvent::PathFindUpdate { .. } => self.streams.contains(&StreamType::PathFind),
+            ServerEvent::OrderBookUpdate {
+                taker_pays,
+                taker_gets,
+                ..
+            } => self
+                .order_books
+                .iter()
+                .any(|key| key.matches_event(taker_pays, taker_gets)),
         }
     }
 }
@@ -247,6 +318,62 @@ mod tests {
             txn_count: 0,
         };
         assert!(!subs.matches(&event));
+    }
+
+    #[test]
+    fn subscribe_order_book_matches_event() {
+        let mut subs = ConnectionSubscriptions::new();
+        let params = serde_json::json!({
+            "books": [{"taker_pays": {"currency": "XRP"}, "taker_gets": {"currency": "USD", "issuer": "rIssuer"}}]
+        });
+        subs.apply_subscribe(&params).unwrap();
+
+        let event = ServerEvent::OrderBookUpdate {
+            taker_pays: serde_json::json!({"currency": "XRP"}),
+            taker_gets: serde_json::json!({"currency": "USD", "issuer": "rIssuer"}),
+            offers: vec![],
+        };
+        assert!(subs.matches(&event));
+    }
+
+    #[test]
+    fn order_book_no_match_different_pair() {
+        let mut subs = ConnectionSubscriptions::new();
+        let params = serde_json::json!({
+            "books": [{"taker_pays": {"currency": "XRP"}, "taker_gets": {"currency": "USD", "issuer": "rIssuer"}}]
+        });
+        subs.apply_subscribe(&params).unwrap();
+
+        let event = ServerEvent::OrderBookUpdate {
+            taker_pays: serde_json::json!({"currency": "XRP"}),
+            taker_gets: serde_json::json!({"currency": "EUR", "issuer": "rOther"}),
+            offers: vec![],
+        };
+        assert!(!subs.matches(&event));
+    }
+
+    #[test]
+    fn unsubscribe_order_book_removes_pair() {
+        let mut subs = ConnectionSubscriptions::new();
+        let book = serde_json::json!({"taker_pays": {"currency": "XRP"}, "taker_gets": {"currency": "USD", "issuer": "rIssuer"}});
+        subs.apply_subscribe(&serde_json::json!({"books": [book.clone()]}))
+            .unwrap();
+        subs.apply_unsubscribe(&serde_json::json!({"books": [book]}))
+            .unwrap();
+
+        let event = ServerEvent::OrderBookUpdate {
+            taker_pays: serde_json::json!({"currency": "XRP"}),
+            taker_gets: serde_json::json!({"currency": "USD", "issuer": "rIssuer"}),
+            offers: vec![],
+        };
+        assert!(!subs.matches(&event));
+    }
+
+    #[test]
+    fn order_book_missing_fields_rejected() {
+        let mut subs = ConnectionSubscriptions::new();
+        let result = subs.apply_subscribe(&serde_json::json!({"books": [{"taker_pays": {"currency": "XRP"}}]}));
+        assert!(result.is_err());
     }
 
     #[test]

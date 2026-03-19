@@ -53,6 +53,11 @@ pub enum ServerEvent {
     PathFindUpdate {
         alternatives: Vec<Value>,
     },
+    OrderBookUpdate {
+        taker_pays: Value,
+        taker_gets: Value,
+        offers: Vec<Value>,
+    },
 }
 
 /// Convert a server event to its JSON representation.
@@ -156,6 +161,16 @@ pub fn event_to_json(event: &ServerEvent) -> Value {
             "type": "path_find",
             "alternatives": alternatives,
         }),
+        ServerEvent::OrderBookUpdate {
+            taker_pays,
+            taker_gets,
+            offers,
+        } => serde_json::json!({
+            "type": "orderBookUpdate",
+            "taker_pays": taker_pays,
+            "taker_gets": taker_gets,
+            "offers": offers,
+        }),
     }
 }
 
@@ -189,6 +204,21 @@ mod tests {
         assert_eq!(json["type"], "transaction");
         assert_eq!(json["validated"], true);
         assert_eq!(json["status"], "closed");
+        assert!(json.get("id").is_none());
+    }
+
+    #[test]
+    fn order_book_update_event_json() {
+        let event = ServerEvent::OrderBookUpdate {
+            taker_pays: serde_json::json!({"currency": "XRP"}),
+            taker_gets: serde_json::json!({"currency": "USD", "issuer": "rIssuer"}),
+            offers: vec![serde_json::json!({"quality": "1.5"})],
+        };
+        let json = event_to_json(&event);
+        assert_eq!(json["type"], "orderBookUpdate");
+        assert_eq!(json["taker_pays"]["currency"], "XRP");
+        assert_eq!(json["taker_gets"]["currency"], "USD");
+        assert_eq!(json["offers"].as_array().unwrap().len(), 1);
         assert!(json.get("id").is_none());
     }
 
