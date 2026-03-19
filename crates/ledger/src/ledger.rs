@@ -79,6 +79,30 @@ impl Ledger {
         }
     }
 
+    /// Reconstruct a closed ledger from catchup data.
+    ///
+    /// The state_map must already be built (e.g., via `SHAMap::from_leaf_nodes`).
+    /// The ledger is created in Closed state with immutable maps.
+    pub fn from_catchup(sequence: u32, hash: Hash256, mut state_map: SHAMap) -> Ledger {
+        let mut header = LedgerHeader::new();
+        header.sequence = sequence;
+        header.hash = hash;
+        header.account_hash = state_map.root_hash();
+        header.drops = INITIAL_XRP_DROPS; // best-effort; real drops unknown from catchup
+
+        state_map.set_immutable();
+        let mut tx_map = SHAMap::transaction_with_meta();
+        tx_map.set_immutable();
+
+        Ledger {
+            header,
+            state_map,
+            tx_map,
+            state: LedgerState::Closed,
+            destroyed_drops: 0,
+        }
+    }
+
     /// Return the current state of this ledger.
     pub fn state(&self) -> LedgerState {
         self.state
@@ -306,5 +330,50 @@ mod tests {
         // Parent data is unchanged
         assert_eq!(genesis.get_state(&key), Some(&[1][..]));
         assert_eq!(child.get_state(&key), Some(&[2][..]));
+    }
+
+    #[test]
+    fn from_catchup_is_closed() {
+        let state = rxrpl_shamap::SHAMap::account_state();
+        let hash = Hash256::new([0xAA; 32]);
+        let ledger = Ledger::from_catchup(42, hash, state);
+        assert!(ledger.is_closed());
+        assert_eq!(ledger.header.sequence, 42);
+        assert_eq!(ledger.header.hash, hash);
+    }
+
+    #[test]
+    fn from_catchup_state_accessible() {
+        let mut state = rxrpl_shamap::SHAMap::account_state();
+        let key = Hash256::new([0xBB; 32]);
+        state.put(key, vec![10, 20]).unwrap();
+
+        let hash = Hash256::new([0xCC; 32]);
+        let ledger = Ledger::from_catchup(5, hash, state);
+        assert_eq!(ledger.get_state(&key), Some(&[10, 20][..]));
+    }
+
+    #[test]
+    fn from_catchup_round_trip() {
+        // Build a normal ledger, close it, extract leaves, reconstruct via catchup
+        let mut original = Ledger::genesis();
+        let key = Hash256::new([0xDD; 32]);
+        original.put_state(key, vec![1, 2, 3]).unwrap();
+        original.close(100, 0).unwrap();
+
+        let mut leaves = Vec::new();
+        original.state_map.for_each(&mut |k, d| {
+            leaves.push((k.as_bytes().to_vec(), d.to_vec()));
+        });
+        let state = rxrpl_shamap::SHAMap::from_leaf_nodes(&leaves).unwrap();
+
+        let reconstructed = Ledger::from_catchup(
+            original.header.sequence,
+            original.header.hash,
+            state,
+        );
+        assert!(reconstructed.is_closed());
+        assert_eq!(reconstructed.get_state(&key), Some(&[1, 2, 3][..]));
+        assert_eq!(reconstructed.header.account_hash, original.header.account_hash);
     }
 }
