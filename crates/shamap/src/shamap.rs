@@ -387,6 +387,27 @@ impl SHAMap {
         });
     }
 
+    /// Reconstruct a SHAMap from downloaded leaf (key, data) pairs.
+    ///
+    /// Creates a mutable account state map and inserts all provided nodes.
+    /// Each key must be exactly 32 bytes.
+    pub fn from_leaf_nodes(nodes: &[(Vec<u8>, Vec<u8>)]) -> Result<SHAMap, SHAMapError> {
+        let mut map = SHAMap::account_state();
+        for (key_bytes, data_bytes) in nodes {
+            if key_bytes.len() != 32 {
+                return Err(SHAMapError::InvalidKeyLength(key_bytes.len()));
+            }
+            let key = Hash256::new(key_bytes.as_slice().try_into().unwrap());
+            map.put(key, data_bytes.clone())?;
+        }
+        Ok(map)
+    }
+
+    /// Verify that the root hash matches an expected value.
+    pub fn verify_root_hash(&mut self, expected: &Hash256) -> bool {
+        self.root_hash() == *expected
+    }
+
     // --- Internal helpers ---
 
     fn check_mutable(&self) -> Result<(), SHAMapError> {
@@ -1128,6 +1149,63 @@ mod tests {
         assert!(!diffs.iter().any(|d| match d {
             DiffEntry::Added { key } | DiffEntry::Removed { key } | DiffEntry::Modified { key } => *key == k3,
         }));
+    }
+
+    #[test]
+    fn from_leaf_nodes_round_trip() {
+        let mut original = SHAMap::account_state();
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let k2 = make_key("2000000000000000000000000000000000000000000000000000000000000000");
+        let k3 = make_key("3000000000000000000000000000000000000000000000000000000000000000");
+        original.put(k1, vec![1, 2]).unwrap();
+        original.put(k2, vec![3, 4]).unwrap();
+        original.put(k3, vec![5, 6]).unwrap();
+        let original_hash = original.root_hash();
+
+        // Serialize leaves
+        let mut leaves = Vec::new();
+        original.for_each(&mut |key, data| {
+            leaves.push((key.as_bytes().to_vec(), data.to_vec()));
+        });
+
+        // Reconstruct
+        let mut reconstructed = SHAMap::from_leaf_nodes(&leaves).unwrap();
+        assert_eq!(reconstructed.root_hash(), original_hash);
+        assert_eq!(reconstructed.get(&k1), Some(&[1, 2][..]));
+        assert_eq!(reconstructed.get(&k2), Some(&[3, 4][..]));
+        assert_eq!(reconstructed.get(&k3), Some(&[5, 6][..]));
+    }
+
+    #[test]
+    fn from_leaf_nodes_invalid_key_length() {
+        let nodes = vec![(vec![1, 2, 3], vec![4, 5, 6])]; // key is 3 bytes, not 32
+        let result = SHAMap::from_leaf_nodes(&nodes);
+        assert!(matches!(result, Err(SHAMapError::InvalidKeyLength(3))));
+    }
+
+    #[test]
+    fn from_leaf_nodes_empty() {
+        let mut map = SHAMap::from_leaf_nodes(&[]).unwrap();
+        assert!(map.is_empty());
+        assert_eq!(map.root_hash(), Hash256::ZERO);
+    }
+
+    #[test]
+    fn verify_root_hash_pass() {
+        let mut map = SHAMap::account_state();
+        let k = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        map.put(k, vec![1]).unwrap();
+        let hash = map.root_hash();
+        assert!(map.verify_root_hash(&hash));
+    }
+
+    #[test]
+    fn verify_root_hash_fail() {
+        let mut map = SHAMap::account_state();
+        let k = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        map.put(k, vec![1]).unwrap();
+        let wrong = make_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert!(!map.verify_root_hash(&wrong));
     }
 
     #[test]

@@ -12,4 +12,7 @@ pub enum SHAMapError {
 
     #[error("invalid node data")]
     InvalidNode,
+
+    #[error("invalid key length: expected 32, got {0}")]
+    InvalidKeyLength(usize),
 }
