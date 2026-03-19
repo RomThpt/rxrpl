@@ -1,0 +1,5 @@
+target/
+.git/
+fuzz/
+*.md
+.github/
