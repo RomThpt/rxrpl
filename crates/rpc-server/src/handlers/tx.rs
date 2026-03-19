@@ -40,5 +40,7 @@ pub async fn tx(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcSer
         }
     }
 
-    Err(RpcServerError::InvalidParams("transaction not found".into()))
+    Err(RpcServerError::InvalidParams(
+        "transaction not found".into(),
+    ))
 }

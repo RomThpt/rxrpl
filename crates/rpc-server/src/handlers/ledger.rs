@@ -43,9 +43,9 @@ pub async fn ledger(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
             Ok(serde_json::json!({ "ledger": ledger_header_json(ledger) }))
         }
         index => {
-            let seq: u32 = index
-                .parse()
-                .map_err(|_| RpcServerError::InvalidParams(format!("invalid ledger_index: {index}")))?;
+            let seq: u32 = index.parse().map_err(|_| {
+                RpcServerError::InvalidParams(format!("invalid ledger_index: {index}"))
+            })?;
 
             // Check current open ledger first
             if let Some(ref l) = ctx.ledger {
@@ -64,9 +64,7 @@ pub async fn ledger(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
             let ledger = closed
                 .iter()
                 .find(|l| l.header.sequence == seq)
-                .ok_or_else(|| {
-                    RpcServerError::InvalidParams(format!("ledger {seq} not found"))
-                })?;
+                .ok_or_else(|| RpcServerError::InvalidParams(format!("ledger {seq} not found")))?;
             Ok(serde_json::json!({ "ledger": ledger_header_json(ledger) }))
         }
     }

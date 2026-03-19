@@ -1,0 +1,16 @@
+[package]
+name = "rxrpl-pathfind"
+description = "XRPL cross-currency payment path finding"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rxrpl-primitives = { workspace = true }
+rxrpl-ledger = { workspace = true }
+rxrpl-protocol = { workspace = true }
+rxrpl-codec = { workspace = true }
+serde_json.workspace = true
+tracing.workspace = true
+hex.workspace = true

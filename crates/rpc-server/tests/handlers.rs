@@ -7,7 +7,7 @@ use rxrpl_ledger::Ledger;
 use rxrpl_protocol::keylet;
 use rxrpl_rpc_server::ServerContext;
 use rxrpl_tx_engine::{FeeSettings, TransactorRegistry, TxEngine};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
 const GENESIS_ADDR: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
@@ -71,6 +71,9 @@ fn test_ctx_with_ledger() -> Arc<ServerContext> {
         Arc::new(RwLock::new(closed)),
         Arc::new(engine),
         Arc::new(fees),
+        None,
+        None,
+        None,
     )
 }
 
@@ -179,9 +182,7 @@ async fn fee_handler() {
     let ctx = test_ctx_with_ledger();
     let params = json!({});
 
-    let result = rxrpl_rpc_server::handlers::fee(params, &ctx)
-        .await
-        .unwrap();
+    let result = rxrpl_rpc_server::handlers::fee(params, &ctx).await.unwrap();
 
     assert_eq!(result["drops"]["base_fee"], "10");
     assert_eq!(result["ledger_current_index"], 2);

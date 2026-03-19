@@ -6,11 +6,7 @@ use crate::context::ServerContext;
 use crate::error::RpcServerError;
 
 pub async fn fee(_params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcServerError> {
-    let base_fee = ctx
-        .fees
-        .as_ref()
-        .map(|f| f.base_fee)
-        .unwrap_or(10);
+    let base_fee = ctx.fees.as_ref().map(|f| f.base_fee).unwrap_or(10);
 
     let ledger_current_index = if let Some(ref ledger) = ctx.ledger {
         let l = ledger.read().await;
