@@ -2,7 +2,7 @@ use rxrpl_primitives::Hash256;
 use rxrpl_shamap::SHAMap;
 
 use crate::error::LedgerError;
-use crate::header::{LedgerHeader, INITIAL_XRP_DROPS};
+use crate::header::{INITIAL_XRP_DROPS, LedgerHeader};
 
 /// The lifecycle state of a ledger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,11 +145,7 @@ impl Ledger {
     }
 
     /// Close this ledger, computing final hashes.
-    pub fn close(
-        &mut self,
-        close_time: u32,
-        close_flags: u8,
-    ) -> Result<(), LedgerError> {
+    pub fn close(&mut self, close_time: u32, close_flags: u8) -> Result<(), LedgerError> {
         if !self.is_open() {
             return Err(LedgerError::AlreadyClosed);
         }

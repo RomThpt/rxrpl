@@ -137,10 +137,7 @@ fn large_scale_insert_and_retrieve() {
         key_bytes[5] = (i.wrapping_mul(0x9E3779B9) >> 16) as u8;
 
         let key = Hash256::new(key_bytes);
-        let data = vec![
-            (i & 0xFF) as u8,
-            ((i >> 8) & 0xFF) as u8,
-        ];
+        let data = vec![(i & 0xFF) as u8, ((i >> 8) & 0xFF) as u8];
         map.put(key, data).unwrap();
         keys.push(key);
     }
@@ -148,10 +145,7 @@ fn large_scale_insert_and_retrieve() {
     // Verify all 1000 entries can be retrieved
     for (i, key) in keys.iter().enumerate() {
         let i = i as u32;
-        let expected = vec![
-            (i & 0xFF) as u8,
-            ((i >> 8) & 0xFF) as u8,
-        ];
+        let expected = vec![(i & 0xFF) as u8, ((i >> 8) & 0xFF) as u8];
         assert_eq!(
             map.get(key),
             Some(expected.as_slice()),
@@ -167,13 +161,14 @@ fn large_scale_insert_and_retrieve() {
     let mut map2 = SHAMap::transaction();
     for (i, key) in keys.iter().enumerate().rev() {
         let i = i as u32;
-        let data = vec![
-            (i & 0xFF) as u8,
-            ((i >> 8) & 0xFF) as u8,
-        ];
+        let data = vec![(i & 0xFF) as u8, ((i >> 8) & 0xFF) as u8];
         map2.put(*key, data).unwrap();
     }
-    assert_eq!(map2.root_hash(), h1, "insertion order should not affect root hash");
+    assert_eq!(
+        map2.root_hash(),
+        h1,
+        "insertion order should not affect root hash"
+    );
 }
 
 #[test]

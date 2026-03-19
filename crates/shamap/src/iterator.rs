@@ -65,9 +65,7 @@ pub struct SHAMapRefIter<'a> {
 
 impl<'a> SHAMapRefIter<'a> {
     pub(crate) fn new(root: &'a SHAMapNode) -> Self {
-        let mut iter = SHAMapRefIter {
-            stack: Vec::new(),
-        };
+        let mut iter = SHAMapRefIter { stack: Vec::new() };
         if let SHAMapNode::Inner(inner) = root {
             iter.stack.push((inner, 0));
         }

@@ -74,9 +74,7 @@ mod tests {
         let h2 = Hash256::new([0x02; 32]);
         let d1 = vec![10];
         let d2 = vec![20];
-        store
-            .store_batch(&[(&h1, &d1), (&h2, &d2)])
-            .unwrap();
+        store.store_batch(&[(&h1, &d1), (&h2, &d2)]).unwrap();
         assert_eq!(store.fetch(&h1).unwrap(), Some(d1));
         assert_eq!(store.fetch(&h2).unwrap(), Some(d2));
     }

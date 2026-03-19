@@ -72,6 +72,16 @@ pub struct PeerConfig {
     /// Fixed peers (always connect to these).
     #[serde(default)]
     pub fixed_peers: Vec<String>,
+    /// Hex seed for deterministic node identity. If None, a random identity is generated.
+    #[serde(default)]
+    pub node_seed: Option<String>,
+    /// Enable TLS for P2P connections (default: true).
+    #[serde(default = "default_tls_enabled")]
+    pub tls_enabled: bool,
+}
+
+fn default_tls_enabled() -> bool {
+    true
 }
 
 fn default_peer_port() -> u16 {
@@ -89,6 +99,8 @@ impl Default for PeerConfig {
             max_peers: default_max_peers(),
             seeds: Vec::new(),
             fixed_peers: Vec::new(),
+            node_seed: None,
+            tls_enabled: true,
         }
     }
 }

@@ -135,6 +135,54 @@ impl SqliteStore {
         Ok(result)
     }
 
+    /// Get transaction hashes for an account with marker-based pagination.
+    ///
+    /// When `marker_ledger_seq` and `marker_tx_index` are provided, results start
+    /// after that position. Returns tx hashes in reverse chronological order.
+    pub fn get_account_transactions_with_marker(
+        &self,
+        account: &[u8],
+        limit: u32,
+        marker_ledger_seq: Option<u32>,
+        marker_tx_index: Option<u32>,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+
+        let (query, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) =
+            if let (Some(m_seq), Some(m_idx)) = (marker_ledger_seq, marker_tx_index) {
+                (
+                    "SELECT tx_hash FROM account_transactions
+                     WHERE account = ?1
+                       AND (ledger_seq < ?2 OR (ledger_seq = ?2 AND tx_index < ?3))
+                     ORDER BY ledger_seq DESC, tx_index DESC
+                     LIMIT ?4",
+                    vec![
+                        Box::new(account.to_vec()),
+                        Box::new(m_seq),
+                        Box::new(m_idx),
+                        Box::new(limit),
+                    ],
+                )
+            } else {
+                (
+                    "SELECT tx_hash FROM account_transactions
+                     WHERE account = ?1
+                     ORDER BY ledger_seq DESC, tx_index DESC
+                     LIMIT ?2",
+                    vec![Box::new(account.to_vec()), Box::new(limit)],
+                )
+            };
+
+        let mut stmt = conn.prepare(query)?;
+        let hashes = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| row.get(0))?
+            .collect::<Result<Vec<Vec<u8>>, _>>()?;
+        Ok(hashes)
+    }
+
     /// Get transaction hashes for an account in reverse chronological order.
     pub fn get_account_transactions(
         &self,

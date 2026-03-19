@@ -417,11 +417,7 @@ impl SHAMap {
         inner
     }
 
-    fn delete_from(
-        node: &mut InnerNode,
-        key: &Hash256,
-        depth: u8,
-    ) -> Result<Vec<u8>, SHAMapError> {
+    fn delete_from(node: &mut InnerNode, key: &Hash256, depth: u8) -> Result<Vec<u8>, SHAMapError> {
         let branch = select_branch(key, depth);
 
         if node.is_empty_branch(branch) {
@@ -617,12 +613,9 @@ mod tests {
     #[test]
     fn multiple_keys() {
         let mut map = SHAMap::account_state();
-        let k1 =
-            make_key("1000000000000000000000000000000000000000000000000000000000000000");
-        let k2 =
-            make_key("2000000000000000000000000000000000000000000000000000000000000000");
-        let k3 =
-            make_key("3000000000000000000000000000000000000000000000000000000000000000");
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let k2 = make_key("2000000000000000000000000000000000000000000000000000000000000000");
+        let k3 = make_key("3000000000000000000000000000000000000000000000000000000000000000");
 
         map.put(k1, vec![1]).unwrap();
         map.put(k2, vec![2]).unwrap();
@@ -636,10 +629,8 @@ mod tests {
     #[test]
     fn keys_sharing_prefix() {
         let mut map = SHAMap::account_state();
-        let k1 =
-            make_key("A100000000000000000000000000000000000000000000000000000000000000");
-        let k2 =
-            make_key("A200000000000000000000000000000000000000000000000000000000000000");
+        let k1 = make_key("A100000000000000000000000000000000000000000000000000000000000000");
+        let k2 = make_key("A200000000000000000000000000000000000000000000000000000000000000");
 
         map.put(k1, vec![1]).unwrap();
         map.put(k2, vec![2]).unwrap();
@@ -651,10 +642,8 @@ mod tests {
     #[test]
     fn keys_sharing_long_prefix() {
         let mut map = SHAMap::account_state();
-        let k1 =
-            make_key("ABCDEF0000000000000000000000000000000000000000000000000000000001");
-        let k2 =
-            make_key("ABCDEF0000000000000000000000000000000000000000000000000000000002");
+        let k1 = make_key("ABCDEF0000000000000000000000000000000000000000000000000000000001");
+        let k2 = make_key("ABCDEF0000000000000000000000000000000000000000000000000000000002");
 
         map.put(k1, vec![1]).unwrap();
         map.put(k2, vec![2]).unwrap();
@@ -666,8 +655,7 @@ mod tests {
     #[test]
     fn root_hash_changes_on_modification() {
         let mut map = SHAMap::account_state();
-        let k1 =
-            make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
 
         let h0 = map.root_hash();
         map.put(k1, vec![1]).unwrap();
@@ -681,10 +669,8 @@ mod tests {
 
     #[test]
     fn root_hash_deterministic() {
-        let k1 =
-            make_key("1000000000000000000000000000000000000000000000000000000000000000");
-        let k2 =
-            make_key("2000000000000000000000000000000000000000000000000000000000000000");
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let k2 = make_key("2000000000000000000000000000000000000000000000000000000000000000");
 
         let mut map1 = SHAMap::account_state();
         map1.put(k1, vec![1]).unwrap();
@@ -700,12 +686,9 @@ mod tests {
     #[test]
     fn for_each_visits_all() {
         let mut map = SHAMap::account_state();
-        let k1 =
-            make_key("1000000000000000000000000000000000000000000000000000000000000000");
-        let k2 =
-            make_key("2000000000000000000000000000000000000000000000000000000000000000");
-        let k3 =
-            make_key("3000000000000000000000000000000000000000000000000000000000000000");
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let k2 = make_key("2000000000000000000000000000000000000000000000000000000000000000");
+        let k3 = make_key("3000000000000000000000000000000000000000000000000000000000000000");
 
         map.put(k1, vec![1]).unwrap();
         map.put(k2, vec![2]).unwrap();
@@ -724,8 +707,7 @@ mod tests {
         let mut map = SHAMap::account_state();
         map.set_immutable();
 
-        let key =
-            make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let key = make_key("1000000000000000000000000000000000000000000000000000000000000000");
         assert_eq!(map.put(key, vec![1]), Err(SHAMapError::Immutable));
         assert_eq!(map.delete(&key), Err(SHAMapError::Immutable));
     }
@@ -733,8 +715,7 @@ mod tests {
     #[test]
     fn snapshot_is_independent() {
         let mut map = SHAMap::account_state();
-        let k1 =
-            make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
         map.put(k1, vec![1]).unwrap();
 
         let snap = map.snapshot();
@@ -750,8 +731,7 @@ mod tests {
     #[test]
     fn update_existing() {
         let mut map = SHAMap::account_state();
-        let key =
-            make_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        let key = make_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
 
         map.put(key, vec![1]).unwrap();
         map.update(key, vec![9, 9, 9]).unwrap();
@@ -761,18 +741,15 @@ mod tests {
     #[test]
     fn update_nonexistent_fails() {
         let mut map = SHAMap::account_state();
-        let key =
-            make_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        let key = make_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         assert_eq!(map.update(key, vec![1]), Err(SHAMapError::NotFound));
     }
 
     #[test]
     fn delete_with_consolidation() {
         let mut map = SHAMap::account_state();
-        let k1 =
-            make_key("A100000000000000000000000000000000000000000000000000000000000000");
-        let k2 =
-            make_key("A200000000000000000000000000000000000000000000000000000000000000");
+        let k1 = make_key("A100000000000000000000000000000000000000000000000000000000000000");
+        let k2 = make_key("A200000000000000000000000000000000000000000000000000000000000000");
 
         map.put(k1, vec![1]).unwrap();
         map.put(k2, vec![2]).unwrap();

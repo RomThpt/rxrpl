@@ -62,10 +62,7 @@ impl TxQueue {
         let account = entry.account.clone();
 
         self.by_fee.insert(std::cmp::Reverse(fee_level), hash);
-        self.by_account
-            .entry(account)
-            .or_default()
-            .push(hash);
+        self.by_account.entry(account).or_default().push(hash);
         self.by_hash.insert(hash, entry);
 
         Ok(())

@@ -53,8 +53,7 @@ impl LedgerFees {
                     .and_then(|s| u64::from_str_radix(s, 16).ok())
                     .unwrap_or(10);
                 let reserve_base = fs.reserve_base.map(u64::from).unwrap_or(10_000_000);
-                let reserve_increment =
-                    fs.reserve_increment.map(u64::from).unwrap_or(2_000_000);
+                let reserve_increment = fs.reserve_increment.map(u64::from).unwrap_or(2_000_000);
 
                 LedgerFees {
                     base_fee,

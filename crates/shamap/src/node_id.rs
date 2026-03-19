@@ -85,30 +85,27 @@ mod tests {
 
     #[test]
     fn select_branch_upper_nibble() {
-        let key = Hash256::from_str(
-            "AB00000000000000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
+        let key =
+            Hash256::from_str("AB00000000000000000000000000000000000000000000000000000000000000")
+                .unwrap();
         assert_eq!(select_branch(&key, 0), 0xA);
         assert_eq!(select_branch(&key, 1), 0xB);
     }
 
     #[test]
     fn select_branch_second_byte() {
-        let key = Hash256::from_str(
-            "00CD000000000000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
+        let key =
+            Hash256::from_str("00CD000000000000000000000000000000000000000000000000000000000000")
+                .unwrap();
         assert_eq!(select_branch(&key, 2), 0xC);
         assert_eq!(select_branch(&key, 3), 0xD);
     }
 
     #[test]
     fn node_id_masking() {
-        let key = Hash256::from_str(
-            "ABCDEF0123456789000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
+        let key =
+            Hash256::from_str("ABCDEF0123456789000000000000000000000000000000000000000000000000")
+                .unwrap();
 
         let n1 = NodeId::new(1, &key);
         assert_eq!(n1.id().as_bytes()[0], 0xA0);
@@ -125,10 +122,9 @@ mod tests {
 
     #[test]
     fn child_advances_depth() {
-        let key = Hash256::from_str(
-            "ABCDEF0123456789000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
+        let key =
+            Hash256::from_str("ABCDEF0123456789000000000000000000000000000000000000000000000000")
+                .unwrap();
         let root = NodeId::ROOT;
         let child = root.child(0xA, &key);
         assert_eq!(child.depth(), 1);
@@ -136,10 +132,9 @@ mod tests {
 
     #[test]
     fn select_branch_all_nibbles() {
-        let key = Hash256::from_str(
-            "0123456789ABCDEF000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
+        let key =
+            Hash256::from_str("0123456789ABCDEF000000000000000000000000000000000000000000000000")
+                .unwrap();
 
         assert_eq!(select_branch(&key, 0), 0x0);
         assert_eq!(select_branch(&key, 1), 0x1);

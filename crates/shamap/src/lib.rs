@@ -19,6 +19,6 @@ pub use item::SHAMapItem;
 pub use iterator::{SHAMapIter, SHAMapRefIter};
 pub use leaf_node::LeafNode;
 pub use node::{NodeType, SHAMapNode, SHAMapState, SHAMapType};
-pub use node_id::{NodeId, select_branch, BRANCH_FACTOR, MAX_DEPTH};
+pub use node_id::{BRANCH_FACTOR, MAX_DEPTH, NodeId, select_branch};
 pub use node_store::{InMemoryNodeStore, NodeStore};
 pub use shamap::SHAMap;

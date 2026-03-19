@@ -153,13 +153,11 @@ impl<D: NodeDatabase> CachedNodeStore<D> {
 /// directly with SHAMap for persistent backing.
 impl<D: NodeDatabase> rxrpl_shamap::NodeStore for CachedNodeStore<D> {
     fn fetch(&self, hash: &Hash256) -> Result<Option<Vec<u8>>, rxrpl_shamap::SHAMapError> {
-        self.fetch(hash).map_err(|_| rxrpl_shamap::SHAMapError::InvalidNode)
+        self.fetch(hash)
+            .map_err(|_| rxrpl_shamap::SHAMapError::InvalidNode)
     }
 
-    fn store_batch(
-        &self,
-        entries: &[(&Hash256, &[u8])],
-    ) -> Result<(), rxrpl_shamap::SHAMapError> {
+    fn store_batch(&self, entries: &[(&Hash256, &[u8])]) -> Result<(), rxrpl_shamap::SHAMapError> {
         let mut batch = NodeBatch::with_capacity(entries.len());
         for (hash, data) in entries {
             batch.add(**hash, data.to_vec());

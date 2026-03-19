@@ -28,10 +28,7 @@ pub fn read_ledger_object(
 ///
 /// Returns `None` if the key is not present. Returns an error if the entry
 /// exists but is not an `AccountRoot`.
-pub fn read_account_root(
-    map: &SHAMap,
-    key: &Hash256,
-) -> Result<Option<AccountRoot>, LedgerError> {
+pub fn read_account_root(map: &SHAMap, key: &Hash256) -> Result<Option<AccountRoot>, LedgerError> {
     let Some(obj) = read_ledger_object(map, key)? else {
         return Ok(None);
     };
@@ -77,10 +74,8 @@ mod tests {
     use std::str::FromStr;
 
     fn test_key() -> Hash256 {
-        Hash256::from_str(
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        )
-        .unwrap()
+        Hash256::from_str("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+            .unwrap()
     }
 
     fn sample_account_root() -> AccountRoot {
