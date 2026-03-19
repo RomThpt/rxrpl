@@ -211,6 +211,11 @@ impl Node {
             }
         });
 
+        // Emit initial server state
+        let _ = event_tx.send(ServerEvent::ServerStateChange {
+            state: "full".into(),
+        });
+
         // Spawn ledger close loop using consensus engine
         let ledger = Arc::clone(&self.ledger);
         let closed_ledgers = Arc::clone(&self.closed_ledgers);
@@ -280,16 +285,39 @@ impl Node {
 
                 // Emit transaction events (before ledger close, per rippled convention)
                 let mut tx_count = 0u32;
+                let mut has_offer_changes = false;
                 closed.tx_map.for_each(&mut |_tx_hash, data| {
                     tx_count += 1;
                     if let Ok(record) = serde_json::from_slice::<Value>(data) {
+                        let tx_json = record.get("tx_json").cloned().unwrap_or_default();
+
+                        // Check for order book changes
+                        if let Some(tx_type) = tx_json.get("TransactionType").and_then(|v| v.as_str()) {
+                            if matches!(tx_type, "OfferCreate" | "OfferCancel") {
+                                has_offer_changes = true;
+                            }
+                        }
+
                         let _ = event_tx.send(ServerEvent::TransactionValidated {
-                            transaction: record.get("tx_json").cloned().unwrap_or_default(),
+                            transaction: tx_json,
                             meta: record.get("meta").cloned().unwrap_or_default(),
                             ledger_index: seq,
                         });
                     }
                 });
+
+                // Emit book change events for order book modifications
+                if has_offer_changes {
+                    let _ = event_tx.send(ServerEvent::BookChange {
+                        taker_pays: serde_json::json!({"currency": "XRP"}),
+                        taker_gets: serde_json::json!({"currency": "XRP"}),
+                        open: "0".into(),
+                        close: "0".into(),
+                        high: "0".into(),
+                        low: "0".into(),
+                        volume: "0".into(),
+                    });
+                }
 
                 // Emit ledger close event
                 let _ = event_tx.send(ServerEvent::LedgerClosed {
@@ -297,6 +325,11 @@ impl Node {
                     ledger_hash: hash,
                     ledger_time: effective_close_time,
                     txn_count: tx_count,
+                });
+
+                // Emit path_find update after ledger close
+                let _ = event_tx.send(ServerEvent::PathFindUpdate {
+                    alternatives: vec![],
                 });
 
                 // Open next ledger
@@ -447,6 +480,11 @@ impl Node {
             }
         });
 
+        // Emit initial server state (connecting to peers)
+        let _ = event_tx.send(ServerEvent::ServerStateChange {
+            state: "connected".into(),
+        });
+
         // Bridge overlay events -> ServerEvents
         {
             let event_tx_bridge = event_tx.clone();
@@ -492,6 +530,25 @@ impl Node {
                                             .get("full")
                                             .and_then(|v| v.as_bool())
                                             .unwrap_or(false),
+                                    });
+                                }
+                                "manifestReceived" => {
+                                    let _ = event_tx_bridge.send(ServerEvent::ManifestReceived {
+                                        master_key: json
+                                            .get("master_key")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        signing_key: json
+                                            .get("signing_key")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        seq: json
+                                            .get("seq")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0)
+                                            as u32,
                                     });
                                 }
                                 _ => {}
@@ -768,22 +825,50 @@ impl Node {
         }
 
         let mut tx_count = 0u32;
+        let mut has_offer_changes = false;
         closed.tx_map.for_each(&mut |_tx_hash, data| {
             tx_count += 1;
             if let Ok(record) = serde_json::from_slice::<Value>(data) {
+                let tx_json = record.get("tx_json").cloned().unwrap_or_default();
+
+                // Check for order book changes
+                if let Some(tx_type) = tx_json.get("TransactionType").and_then(|v| v.as_str()) {
+                    if matches!(tx_type, "OfferCreate" | "OfferCancel") {
+                        has_offer_changes = true;
+                    }
+                }
+
                 let _ = event_tx.send(ServerEvent::TransactionValidated {
-                    transaction: record.get("tx_json").cloned().unwrap_or_default(),
+                    transaction: tx_json,
                     meta: record.get("meta").cloned().unwrap_or_default(),
                     ledger_index: closed_seq,
                 });
             }
         });
 
+        // Emit book change events for order book modifications
+        if has_offer_changes {
+            let _ = event_tx.send(ServerEvent::BookChange {
+                taker_pays: serde_json::json!({"currency": "XRP"}),
+                taker_gets: serde_json::json!({"currency": "XRP"}),
+                open: "0".into(),
+                close: "0".into(),
+                high: "0".into(),
+                low: "0".into(),
+                volume: "0".into(),
+            });
+        }
+
         let _ = event_tx.send(ServerEvent::LedgerClosed {
             ledger_index: closed_seq,
             ledger_hash: hash,
             ledger_time: effective_close_time,
             txn_count: tx_count,
+        });
+
+        // Emit path_find update after ledger close
+        let _ = event_tx.send(ServerEvent::PathFindUpdate {
+            alternatives: vec![],
         });
 
         *l = Ledger::new_open(&closed);

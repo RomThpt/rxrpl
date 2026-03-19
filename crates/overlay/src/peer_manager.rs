@@ -26,6 +26,7 @@ use crate::peer_loop;
 use crate::peer_set::{PeerInfo, PeerSet};
 use crate::proto_convert;
 use crate::relay::RelayFilter;
+use crate::reputation::PeerReputation;
 use crate::tls::{self, PeerStream};
 
 /// Messages forwarded from the overlay to the consensus layer.
@@ -164,6 +165,9 @@ impl PeerManager {
         let mut sync_interval = tokio::time::interval(Duration::from_secs(5));
         sync_interval.tick().await; // skip first immediate tick
 
+        let mut reputation_interval = tokio::time::interval(Duration::from_secs(30));
+        reputation_interval.tick().await; // skip first immediate tick
+
         loop {
             tokio::select! {
                 accept_result = listener.accept() => {
@@ -188,6 +192,10 @@ impl PeerManager {
 
                 _ = sync_interval.tick() => {
                     self.check_sync();
+                }
+
+                _ = reputation_interval.tick() => {
+                    self.check_peer_reputations();
                 }
             }
         }
@@ -368,84 +376,137 @@ impl PeerManager {
     }
 
     fn dispatch_message(&mut self, from: Hash256, msg_type: MessageType, payload: &[u8]) {
+        let peer_info = self.peer_set.get(&from);
+        let payload_len = payload.len() as u64;
+
         match msg_type {
             MessageType::Ping => {
-                if let Ok(ping) = proto_convert::decode_ping(payload) {
-                    if ping.r#type == 0 {
-                        let pong = proto_convert::encode_ping(ping.seq, true);
-                        if let Some(handle) = self.peer_handles.get(&from) {
-                            let _ = handle.tx.try_send(PeerMessage {
-                                msg_type: MessageType::Ping,
-                                payload: pong,
-                            });
+                match proto_convert::decode_ping(payload) {
+                    Ok(ping) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                        }
+                        if ping.r#type == 0 {
+                            let pong = proto_convert::encode_ping(ping.seq, true);
+                            if let Some(handle) = self.peer_handles.get(&from) {
+                                let _ = handle.tx.try_send(PeerMessage {
+                                    msg_type: MessageType::Ping,
+                                    payload: pong,
+                                });
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
                         }
                     }
                 }
             }
             MessageType::Transaction => {
-                if let Ok((tx_hash, tx_data)) = proto_convert::decode_transaction(payload) {
-                    if self.relay_filter.should_relay(&tx_hash) {
-                        let _ = self.consensus_tx.send(ConsensusMessage::Transaction {
-                            hash: tx_hash,
-                            data: tx_data,
-                        });
-                        // Re-broadcast to other peers
-                        for (id, handle) in &self.peer_handles {
-                            if *id != from {
-                                let _ = handle.tx.try_send(PeerMessage {
-                                    msg_type: MessageType::Transaction,
-                                    payload: payload.to_vec(),
-                                });
+                match proto_convert::decode_transaction(payload) {
+                    Ok((tx_hash, tx_data)) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                        }
+                        if self.relay_filter.should_relay(&tx_hash) {
+                            let _ = self.consensus_tx.send(ConsensusMessage::Transaction {
+                                hash: tx_hash,
+                                data: tx_data,
+                            });
+                            // Re-broadcast to other peers
+                            for (id, handle) in &self.peer_handles {
+                                if *id != from {
+                                    let _ = handle.tx.try_send(PeerMessage {
+                                        msg_type: MessageType::Transaction,
+                                        payload: payload.to_vec(),
+                                    });
+                                }
                             }
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
                         }
                     }
                 }
             }
             MessageType::ProposeSet => {
-                if let Ok(proposal) = proto_convert::decode_propose_set(payload) {
-                    let _ = self.consensus_tx.send(ConsensusMessage::Proposal(proposal));
+                match proto_convert::decode_propose_set(payload) {
+                    Ok(proposal) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                        }
+                        let _ = self.consensus_tx.send(ConsensusMessage::Proposal(proposal));
+                    }
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
+                    }
                 }
             }
             MessageType::Validation => {
-                if let Ok(validation) = proto_convert::decode_validation(payload) {
-                    if let Some(ref tx) = self.server_event_tx {
-                        let _ = tx.send(serde_json::json!({
-                            "type": "validationReceived",
-                            "validator": validation.node_id.0.to_string(),
-                            "ledger_hash": validation.ledger_hash.to_string(),
-                            "ledger_seq": validation.ledger_seq,
-                            "full": validation.full,
-                        }));
+                match proto_convert::decode_validation(payload) {
+                    Ok(validation) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                        }
+                        if let Some(ref tx) = self.server_event_tx {
+                            let _ = tx.send(serde_json::json!({
+                                "type": "validationReceived",
+                                "validator": validation.node_id.0.to_string(),
+                                "ledger_hash": validation.ledger_hash.to_string(),
+                                "ledger_seq": validation.ledger_seq,
+                                "full": validation.full,
+                            }));
+                        }
+                        let _ = self
+                            .consensus_tx
+                            .send(ConsensusMessage::Validation(validation));
                     }
-                    let _ = self
-                        .consensus_tx
-                        .send(ConsensusMessage::Validation(validation));
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
+                    }
                 }
             }
             MessageType::StatusChange => {
-                if let Ok((ledger_hash, ledger_seq)) = proto_convert::decode_status_change(payload)
-                {
-                    if let Some(info) = self.peer_set.get(&from) {
-                        info.ledger_seq.store(ledger_seq, Ordering::Relaxed);
-                    }
+                match proto_convert::decode_status_change(payload) {
+                    Ok((ledger_hash, ledger_seq)) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                            info.ledger_seq.store(ledger_seq, Ordering::Relaxed);
+                        }
 
-                    // Trigger sync if peer is ahead
-                    let our_seq = self.ledger_seq.load(Ordering::Relaxed);
-                    if self.ledger_syncer.needs_sync(our_seq, ledger_seq) {
-                        let requests = self.ledger_syncer.request_missing(our_seq, ledger_seq);
-                        for (seq, hash) in requests {
-                            self.send_get_ledger(seq, hash);
+                        // Trigger sync if peer is ahead
+                        let our_seq = self.ledger_seq.load(Ordering::Relaxed);
+                        if self.ledger_syncer.needs_sync(our_seq, ledger_seq) {
+                            let requests = self.ledger_syncer.request_missing(our_seq, ledger_seq);
+                            for (seq, hash) in requests {
+                                self.send_get_ledger(seq, hash);
+                            }
+                        }
+
+                        let _ = self.consensus_tx.send(ConsensusMessage::StatusChange {
+                            from,
+                            ledger_seq,
+                            ledger_hash,
+                        });
+                    }
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
                         }
                     }
-
-                    let _ = self.consensus_tx.send(ConsensusMessage::StatusChange {
-                        from,
-                        ledger_seq,
-                        ledger_hash,
-                    });
                 }
             }
             MessageType::GetPeers => {
+                if let Some(ref info) = peer_info {
+                    info.reputation.record_valid_message(payload_len);
+                }
                 tracing::debug!("GetPeers from {}", from);
                 // Collect connected peer addresses and respond
                 let mut peer_addrs = Vec::new();
@@ -470,50 +531,112 @@ impl PeerManager {
                 }
             }
             MessageType::GetLedger => {
+                if let Some(ref info) = peer_info {
+                    info.reputation.record_valid_message(payload_len);
+                }
                 self.handle_get_ledger(from, payload);
             }
             MessageType::LedgerData => {
-                if let Ok(msg) = proto_convert::decode_ledger_data(payload) {
-                    let hash = Hash256::new(msg.ledger_hash[..32].try_into().unwrap_or([0u8; 32]));
-                    let nodes: Vec<(Vec<u8>, Vec<u8>)> = msg
-                        .nodes
-                        .into_iter()
-                        .map(|n| (n.node_id, n.node_data))
-                        .collect();
+                match proto_convert::decode_ledger_data(payload) {
+                    Ok(msg) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                            // Peer provided requested ledger data -- useful contribution
+                            info.reputation.record_useful_contribution();
+                        }
+                        let hash =
+                            Hash256::new(msg.ledger_hash[..32].try_into().unwrap_or([0u8; 32]));
+                        let nodes: Vec<(Vec<u8>, Vec<u8>)> = msg
+                            .nodes
+                            .into_iter()
+                            .map(|n| (n.node_id, n.node_data))
+                            .collect();
 
-                    // Notify ledger syncer about the response
-                    if let Some(synced) =
-                        self.ledger_syncer
-                            .handle_response(msg.ledger_seq, hash, nodes.clone())
-                    {
-                        tracing::info!(
-                            "synced ledger #{} hash={} ({} nodes)",
-                            synced.seq,
-                            synced.hash,
-                            synced.nodes.len()
-                        );
+                        // Notify ledger syncer about the response
+                        if let Some(synced) =
+                            self.ledger_syncer
+                                .handle_response(msg.ledger_seq, hash, nodes.clone())
+                        {
+                            tracing::info!(
+                                "synced ledger #{} hash={} ({} nodes)",
+                                synced.seq,
+                                synced.hash,
+                                synced.nodes.len()
+                            );
+                        }
+
+                        let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
+                            hash,
+                            seq: msg.ledger_seq,
+                            nodes,
+                        });
                     }
-
-                    let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
-                        hash,
-                        seq: msg.ledger_seq,
-                        nodes,
-                    });
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
+                    }
                 }
             }
             MessageType::Peers => {
-                if let Ok(peers) = proto_convert::decode_peers(payload) {
-                    tracing::debug!("received {} peer addresses from {}", peers.len(), from);
-                    if let Some(ref discovery) = self.discovery {
-                        let disc = Arc::clone(discovery);
-                        let peers = peers.clone();
-                        tokio::spawn(async move {
-                            disc.handle_peers_response(peers).await;
-                        });
+                match proto_convert::decode_peers(payload) {
+                    Ok(peers) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                        }
+                        tracing::debug!(
+                            "received {} peer addresses from {}",
+                            peers.len(),
+                            from
+                        );
+                        if let Some(ref discovery) = self.discovery {
+                            let disc = Arc::clone(discovery);
+                            let peers = peers.clone();
+                            tokio::spawn(async move {
+                                disc.handle_peers_response(peers).await;
+                            });
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
+                    }
+                }
+            }
+            MessageType::Manifest => {
+                match proto_convert::decode_manifest(payload) {
+                    Ok(manifest) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                        }
+                        tracing::debug!(
+                            "manifest from {} master_key={} seq={}",
+                            from,
+                            manifest.master_key,
+                            manifest.seq
+                        );
+                        if let Some(ref tx) = self.server_event_tx {
+                            let _ = tx.send(serde_json::json!({
+                                "type": "manifestReceived",
+                                "master_key": manifest.master_key,
+                                "signing_key": manifest.signing_key,
+                                "seq": manifest.seq,
+                            }));
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
                     }
                 }
             }
             MessageType::Hello => {
+                // Unexpected Hello after handshake is a protocol violation
+                if let Some(ref info) = peer_info {
+                    info.reputation.record_violation();
+                }
                 tracing::debug!("unexpected Hello from {}", from);
             }
         }
@@ -544,6 +667,32 @@ impl PeerManager {
         for seq in timed_out {
             tracing::debug!("ledger sync request for #{} timed out, retrying", seq);
             self.send_get_ledger(seq, None);
+        }
+    }
+
+    /// Disconnect peers whose reputation has dropped below the threshold.
+    fn check_peer_reputations(&mut self) {
+        let bad_peers: Vec<Hash256> = self
+            .peer_set
+            .all_peers()
+            .iter()
+            .filter(|info| info.reputation.should_disconnect())
+            .map(|info| info.node_id)
+            .collect();
+
+        for node_id in bad_peers {
+            tracing::warn!(
+                "disconnecting peer {} due to low reputation score ({})",
+                node_id,
+                self.peer_set
+                    .get(&node_id)
+                    .map(|i| i.reputation.score())
+                    .unwrap_or(0),
+            );
+            if let Some(handle) = self.peer_handles.remove(&node_id) {
+                drop(handle);
+            }
+            self.peer_set.remove(&node_id);
         }
     }
 
@@ -668,6 +817,7 @@ async fn try_connect_outbound(
         address: addr.to_string(),
         inbound: false,
         ledger_seq: AtomicU32::new(0),
+        reputation: PeerReputation::new(),
     });
 
     if !peer_set.add(Arc::clone(&info)) {
@@ -717,6 +867,7 @@ async fn try_accept_inbound(
         address: addr.to_string(),
         inbound: true,
         ledger_seq: AtomicU32::new(0),
+        reputation: PeerReputation::new(),
     });
 
     if !peer_set.add(Arc::clone(&info)) {

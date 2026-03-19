@@ -1,8 +1,8 @@
 use prost::Message;
 use rxrpl_consensus::types::{NodeId, Proposal, Validation};
 use rxrpl_p2p_proto::proto::{
-    TmGetLedger, TmHello, TmLedgerData, TmPing, TmProposeSet, TmStatusChange, TmTransaction,
-    TmValidation, tm_ledger_data::TmLedgerNode,
+    TmGetLedger, TmHello, TmLedgerData, TmManifest, TmPing, TmProposeSet, TmStatusChange,
+    TmTransaction, TmValidation, tm_ledger_data::TmLedgerNode,
 };
 use rxrpl_primitives::Hash256;
 
@@ -276,6 +276,26 @@ pub fn decode_peers(data: &[u8]) -> Result<Vec<(String, u16)>, OverlayError> {
         .into_iter()
         .map(|p| (p.ip, p.port as u16))
         .collect())
+}
+
+// --- Manifest ---
+
+/// Decoded manifest fields.
+pub struct ManifestData {
+    pub master_key: String,
+    pub signing_key: String,
+    pub seq: u32,
+}
+
+pub fn decode_manifest(data: &[u8]) -> Result<ManifestData, OverlayError> {
+    let msg = TmManifest::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode Manifest: {e}")))?;
+
+    Ok(ManifestData {
+        master_key: hex::encode(&msg.master_key),
+        signing_key: hex::encode(&msg.signing_key),
+        seq: msg.seq,
+    })
 }
 
 // --- Helpers ---

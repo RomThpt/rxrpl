@@ -3,6 +3,8 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use rxrpl_primitives::Hash256;
 
+use crate::reputation::PeerReputation;
+
 /// Thread-safe collection of connected peers.
 pub struct PeerSet {
     peers: DashMap<Hash256, Arc<PeerInfo>>,
@@ -20,6 +22,8 @@ pub struct PeerInfo {
     pub inbound: bool,
     /// Last known ledger sequence from this peer.
     pub ledger_seq: std::sync::atomic::AtomicU32,
+    /// Reputation score tracking.
+    pub reputation: PeerReputation,
 }
 
 impl PeerSet {
@@ -62,6 +66,11 @@ impl PeerSet {
     pub fn peer_ids(&self) -> Vec<Hash256> {
         self.peers.iter().map(|r| *r.key()).collect()
     }
+
+    /// Get all peer infos for iteration.
+    pub fn all_peers(&self) -> Vec<Arc<PeerInfo>> {
+        self.peers.iter().map(|r| Arc::clone(r.value())).collect()
+    }
 }
 
 #[cfg(test)]
@@ -74,6 +83,7 @@ mod tests {
             address: format!("127.0.0.1:{}", 51235 + id_byte as u16),
             inbound,
             ledger_seq: std::sync::atomic::AtomicU32::new(0),
+            reputation: PeerReputation::new(),
         })
     }
 

@@ -158,6 +158,7 @@ mod tests {
             address: "127.0.0.1:9999".to_string(),
             inbound: false,
             ledger_seq: std::sync::atomic::AtomicU32::new(0),
+            reputation: crate::reputation::PeerReputation::new(),
         });
         peer_set.add(info);
 

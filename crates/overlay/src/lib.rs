@@ -17,6 +17,7 @@ pub mod peer_manager;
 pub mod peer_set;
 pub mod proto_convert;
 pub mod relay;
+pub mod reputation;
 pub mod tls;
 
 pub use command::OverlayCommand;
@@ -29,3 +30,4 @@ pub use ledger_sync::LedgerSyncer;
 pub use peer_manager::{ConsensusMessage, PeerManager, PeerManagerConfig};
 pub use peer_set::{PeerInfo, PeerSet};
 pub use relay::RelayFilter;
+pub use reputation::PeerReputation;

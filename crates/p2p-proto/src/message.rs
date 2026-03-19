@@ -14,6 +14,7 @@ pub enum MessageType {
     ProposeSet = 33,
     StatusChange = 34,
     Validation = 41,
+    Manifest = 42,
 }
 
 impl MessageType {
@@ -29,6 +30,7 @@ impl MessageType {
             33 => Some(Self::ProposeSet),
             34 => Some(Self::StatusChange),
             41 => Some(Self::Validation),
+            42 => Some(Self::Manifest),
             _ => None,
         }
     }

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// All 67 RPC methods supported by the XRPL.
+/// All 78 RPC methods supported by the XRPL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Method {
@@ -13,11 +13,13 @@ pub enum Method {
     AccountOffers,
     AccountCurrencies,
     AccountNfts,
+    AccountNftsByIssuer,
     GatewayBalances,
     NorippleCheck,
 
     // Ledger methods
     Ledger,
+    LedgerAccept,
     LedgerEntry,
     LedgerData,
     LedgerClosed,
@@ -42,6 +44,7 @@ pub enum Method {
     ServerInfo,
     ServerState,
     ServerDefinitions,
+    ServerSubscribe,
     Fee,
     Feature,
     Manifest,
@@ -51,6 +54,8 @@ pub enum Method {
     // NFT methods
     NftBuyOffers,
     NftSellOffers,
+    NftInfo,
+    NftHistory,
 
     // Subscription methods
     Subscribe,
@@ -70,21 +75,28 @@ pub enum Method {
     Peers,
     Connect,
     LogLevel,
+    Logrotate,
     Validators,
     ConsensusInfo,
     ValidationCreate,
+    ValidationSeed,
+    ValidatorInfo,
     PeerReservationsAdd,
     PeerReservationsDel,
     PeerReservationsList,
     ValidatorListSites,
     FetchInfo,
     Print,
+    CanDelete,
+    Crawl,
+    TxReduceRelay,
 
     // Ledger management
     LedgerHeader,
     LedgerRequest,
     LedgerCleaner,
     LedgerDiff,
+    LedgerRange,
 
     // Misc
     TxHistory,
@@ -107,9 +119,11 @@ impl Method {
             Self::AccountOffers => "account_offers",
             Self::AccountCurrencies => "account_currencies",
             Self::AccountNfts => "account_nfts",
+            Self::AccountNftsByIssuer => "account_nfts_by_issuer",
             Self::GatewayBalances => "gateway_balances",
             Self::NorippleCheck => "noripple_check",
             Self::Ledger => "ledger",
+            Self::LedgerAccept => "ledger_accept",
             Self::LedgerEntry => "ledger_entry",
             Self::LedgerData => "ledger_data",
             Self::LedgerClosed => "ledger_closed",
@@ -128,6 +142,7 @@ impl Method {
             Self::ServerInfo => "server_info",
             Self::ServerState => "server_state",
             Self::ServerDefinitions => "server_definitions",
+            Self::ServerSubscribe => "server_subscribe",
             Self::Fee => "fee",
             Self::Feature => "feature",
             Self::Manifest => "manifest",
@@ -135,6 +150,8 @@ impl Method {
             Self::Random => "random",
             Self::NftBuyOffers => "nft_buy_offers",
             Self::NftSellOffers => "nft_sell_offers",
+            Self::NftInfo => "nft_info",
+            Self::NftHistory => "nft_history",
             Self::Subscribe => "subscribe",
             Self::Unsubscribe => "unsubscribe",
             Self::ChannelAuthorize => "channel_authorize",
@@ -146,19 +163,26 @@ impl Method {
             Self::Peers => "peers",
             Self::Connect => "connect",
             Self::LogLevel => "log_level",
+            Self::Logrotate => "logrotate",
             Self::Validators => "validators",
             Self::ConsensusInfo => "consensus_info",
             Self::ValidationCreate => "validation_create",
+            Self::ValidationSeed => "validation_seed",
+            Self::ValidatorInfo => "validator_info",
             Self::PeerReservationsAdd => "peer_reservations_add",
             Self::PeerReservationsDel => "peer_reservations_del",
             Self::PeerReservationsList => "peer_reservations_list",
             Self::ValidatorListSites => "validator_list_sites",
             Self::FetchInfo => "fetch_info",
             Self::Print => "print",
+            Self::CanDelete => "can_delete",
+            Self::Crawl => "crawl",
+            Self::TxReduceRelay => "tx_reduce_relay",
             Self::LedgerHeader => "ledger_header",
             Self::LedgerRequest => "ledger_request",
             Self::LedgerCleaner => "ledger_cleaner",
             Self::LedgerDiff => "ledger_diff",
+            Self::LedgerRange => "ledger_range",
             Self::TxHistory => "tx_history",
             Self::BookChanges => "book_changes",
             Self::Json => "json",

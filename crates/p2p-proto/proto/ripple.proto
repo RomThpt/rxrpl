@@ -97,6 +97,14 @@ message TMStatusChange {
     uint32 validated_seq = 6;
 }
 
+// Manifest (validator key rotation)
+message TMManifest {
+    bytes master_key = 1;
+    bytes signing_key = 2;
+    uint32 seq = 3;
+    bytes signature = 4;
+}
+
 // Get peer list
 message TMGetPeers {}
 
