@@ -15,6 +15,7 @@ use rxrpl_overlay::{
 };
 use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
+use rxrpl_shamap::SHAMap;
 use rxrpl_rpc_server::{ServerContext, ServerEvent};
 use rxrpl_storage::{SqliteStore, TxStore};
 use rxrpl_tx_engine::{FeeSettings, TransactorRegistry, TxEngine};
@@ -456,6 +457,7 @@ impl Node {
         // 4. Create relay channel (clone cmd_tx BEFORE moving into adapter)
         let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<(Hash256, Vec<u8>)>();
         let cmd_tx_relay = cmd_tx.clone();
+        let cmd_tx_catchup = cmd_tx.clone();
 
         // 5. Create NetworkConsensusAdapter (consumes cmd_tx)
         let adapter = NetworkConsensusAdapter::new(cmd_tx, Arc::clone(&identity));
@@ -796,9 +798,14 @@ impl Node {
                                 });
                                 if peer_seq > our_seq + 1 {
                                     tracing::info!(
-                                        "peer {} ahead by {} ledgers, catchup needed",
+                                        "peer {} ahead by {} ledgers, requesting catchup",
                                         from, peer_seq - our_seq
                                     );
+                                    let next_seq = our_seq + 1;
+                                    let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
+                                        seq: next_seq,
+                                        hash: None,
+                                    });
                                 }
                             }
                             ConsensusMessage::LedgerData { hash, seq, nodes } => {
@@ -806,6 +813,22 @@ impl Node {
                                     "received LedgerData hash={} seq={} nodes={}",
                                     hash, seq, nodes.len()
                                 );
+                                if !nodes.is_empty() {
+                                    match Node::try_reconstruct_ledger(seq, hash, &nodes) {
+                                        Ok(ledger) => {
+                                            let mut history = closed_ledgers.write().await;
+                                            if !history.iter().any(|l| l.header.sequence == seq) {
+                                                let pos = history.partition_point(|l| l.header.sequence < seq);
+                                                history.insert(pos, ledger);
+                                                while history.len() > crate::consensus_adapter::MAX_CLOSED_LEDGERS {
+                                                    history.pop_front();
+                                                }
+                                                tracing::info!("catchup: reconstructed ledger #{} hash={}", seq, hash);
+                                            }
+                                        }
+                                        Err(e) => tracing::warn!("catchup: failed to reconstruct ledger #{}: {}", seq, e),
+                                    }
+                                }
                             }
                         }
                     }
@@ -938,6 +961,17 @@ impl Node {
         while history.len() > crate::consensus_adapter::MAX_CLOSED_LEDGERS {
             history.pop_front();
         }
+    }
+
+    /// Attempt to reconstruct a closed ledger from downloaded leaf nodes.
+    fn try_reconstruct_ledger(
+        seq: u32,
+        expected_hash: Hash256,
+        nodes: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<Ledger, NodeError> {
+        let state_map = SHAMap::from_leaf_nodes(nodes)
+            .map_err(|e| NodeError::Server(format!("shamap reconstruction failed: {e}")))?;
+        Ok(Ledger::from_catchup(seq, expected_hash, state_map))
     }
 
     /// Create a genesis ledger with a single funded account holding all XRP.

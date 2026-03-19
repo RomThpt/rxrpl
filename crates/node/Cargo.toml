@@ -26,6 +26,7 @@ rxrpl-rpc-server = { workspace = true }
 rxrpl-amendment = { workspace = true }
 rxrpl-storage = { workspace = true, features = ["sqlite"] }
 rxrpl-nodestore = { workspace = true }
+rxrpl-shamap = { workspace = true }
 tokio = { workspace = true }
 tracing.workspace = true
 thiserror.workspace = true
