@@ -13,6 +13,8 @@ pub struct ConsensusParams {
     pub max_threshold: u32,
     /// Maximum number of consensus rounds before we agree.
     pub max_consensus_rounds: u32,
+    /// Close time rounding resolution in seconds.
+    pub close_time_resolution: u32,
 }
 
 impl Default for ConsensusParams {
@@ -24,6 +26,7 @@ impl Default for ConsensusParams {
             threshold_increase: 10,
             max_threshold: 80,
             max_consensus_rounds: 10,
+            close_time_resolution: 30,
         }
     }
 }

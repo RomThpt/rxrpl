@@ -20,14 +20,14 @@ pub trait ConsensusAdapter: Send + Sync {
     fn acquire_tx_set(&self, hash: &Hash256) -> Option<TxSet>;
 
     /// Called when the ledger is closed.
-    fn on_close(
-        &self,
-        ledger_hash: &Hash256,
-        ledger_seq: u32,
-        close_time: u32,
-        tx_set: &TxSet,
-    );
+    fn on_close(&self, ledger_hash: &Hash256, ledger_seq: u32, close_time: u32, tx_set: &TxSet);
 
     /// Called when the ledger is accepted (validated).
     fn on_accept(&self, validation: &Validation);
+
+    /// Apply the accepted transaction set to the ledger.
+    ///
+    /// The adapter closes the current ledger with the given close_time and flags,
+    /// opens the next ledger, and returns the resulting ledger hash.
+    fn on_accept_ledger(&self, tx_set: &TxSet, close_time: u32, close_flags: u8) -> Hash256;
 }

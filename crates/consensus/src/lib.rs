@@ -5,12 +5,14 @@
 /// - `ConsensusAdapter`: Pluggable I/O interface
 /// - `ConsensusPhase`: Open/Establish/Accepted phases
 /// - Consensus types: `Proposal`, `Validation`, `TxSet`, `DisputedTx`
+/// - `TrustedValidatorList`: UNL management
 pub mod adapter;
 pub mod engine;
 pub mod error;
 pub mod params;
 pub mod phase;
 pub mod types;
+pub mod unl;
 
 pub use adapter::ConsensusAdapter;
 pub use engine::ConsensusEngine;
@@ -18,3 +20,4 @@ pub use error::ConsensusError;
 pub use params::ConsensusParams;
 pub use phase::ConsensusPhase;
 pub use types::{DisputedTx, NodeId, Proposal, TxSet, Validation};
+pub use unl::TrustedValidatorList;
