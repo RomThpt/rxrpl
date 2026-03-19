@@ -60,6 +60,7 @@ pub enum StreamType {
     Consensus,
     BookChanges,
     PathFind,
+    OrderBook,
 }
 
 impl StreamType {
@@ -75,6 +76,7 @@ impl StreamType {
             "consensus" => Some(Self::Consensus),
             "book_changes" => Some(Self::BookChanges),
             "path_find" => Some(Self::PathFind),
+            "order_book" => Some(Self::OrderBook),
             _ => None,
         }
     }
@@ -224,10 +226,13 @@ impl ConnectionSubscriptions {
                 taker_pays,
                 taker_gets,
                 ..
-            } => self
-                .order_books
-                .iter()
-                .any(|key| key.matches_event(taker_pays, taker_gets)),
+            } => {
+                self.streams.contains(&StreamType::OrderBook)
+                    || self
+                        .order_books
+                        .iter()
+                        .any(|key| key.matches_event(taker_pays, taker_gets))
+            }
         }
     }
 }
@@ -374,6 +379,29 @@ mod tests {
         let mut subs = ConnectionSubscriptions::new();
         let result = subs.apply_subscribe(&serde_json::json!({"books": [{"taker_pays": {"currency": "XRP"}}]}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn subscribe_order_book_stream_matches_all_updates() {
+        let mut subs = ConnectionSubscriptions::new();
+        subs.apply_subscribe(&serde_json::json!({"streams": ["order_book"]}))
+            .unwrap();
+
+        // Should match ANY OrderBookUpdate regardless of pair
+        let event = ServerEvent::OrderBookUpdate {
+            taker_pays: serde_json::json!({"currency": "XRP"}),
+            taker_gets: serde_json::json!({"currency": "EUR", "issuer": "rAny"}),
+            offers: vec![],
+        };
+        assert!(subs.matches(&event));
+
+        // Also a different pair
+        let event2 = ServerEvent::OrderBookUpdate {
+            taker_pays: serde_json::json!({"currency": "BTC", "issuer": "rBTC"}),
+            taker_gets: serde_json::json!({"currency": "USD", "issuer": "rUSD"}),
+            offers: vec![],
+        };
+        assert!(subs.matches(&event2));
     }
 
     #[test]
