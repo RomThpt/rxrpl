@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use rusqlite::Connection;
 
 use crate::error::StorageError;
+use crate::txstore::{TransactionRecord, TxStore};
 
 /// SQLite-backed relational store for transaction history indexing.
 ///
@@ -67,8 +68,10 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Insert a transaction record.
-    pub fn insert_transaction(
+}
+
+impl TxStore for SqliteStore {
+    fn insert_transaction(
         &self,
         tx_hash: &[u8],
         ledger_seq: u32,
@@ -88,8 +91,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Insert an account-transaction mapping.
-    pub fn insert_account_transaction(
+    fn insert_account_transaction(
         &self,
         account: &[u8],
         ledger_seq: u32,
@@ -108,8 +110,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Look up a transaction by hash.
-    pub fn get_transaction(
+    fn get_transaction(
         &self,
         tx_hash: &[u8],
     ) -> Result<Option<TransactionRecord>, StorageError> {
@@ -135,11 +136,7 @@ impl SqliteStore {
         Ok(result)
     }
 
-    /// Get transaction hashes for an account with marker-based pagination.
-    ///
-    /// When `marker_ledger_seq` and `marker_tx_index` are provided, results start
-    /// after that position. Returns tx hashes in reverse chronological order.
-    pub fn get_account_transactions_with_marker(
+    fn get_account_transactions_with_marker(
         &self,
         account: &[u8],
         limit: u32,
@@ -183,8 +180,7 @@ impl SqliteStore {
         Ok(hashes)
     }
 
-    /// Get transaction hashes for an account in reverse chronological order.
-    pub fn get_account_transactions(
+    fn get_account_transactions(
         &self,
         account: &[u8],
         limit: u32,
@@ -204,16 +200,6 @@ impl SqliteStore {
             .collect::<Result<Vec<Vec<u8>>, _>>()?;
         Ok(hashes)
     }
-}
-
-/// A transaction record from the database.
-#[derive(Debug)]
-pub struct TransactionRecord {
-    pub tx_hash: Vec<u8>,
-    pub ledger_seq: u32,
-    pub tx_index: u32,
-    pub tx_blob: Vec<u8>,
-    pub meta_blob: Vec<u8>,
 }
 
 /// Extension trait to convert `rusqlite::Error::QueryReturnedNoRows` to `None`.

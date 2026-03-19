@@ -27,3 +27,10 @@ impl From<rusqlite::Error> for StorageError {
         StorageError::Backend(e.to_string())
     }
 }
+
+#[cfg(feature = "postgres")]
+impl From<sqlx::Error> for StorageError {
+    fn from(e: sqlx::Error) -> Self {
+        StorageError::Backend(e.to_string())
+    }
+}

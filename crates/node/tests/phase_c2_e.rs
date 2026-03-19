@@ -175,7 +175,7 @@ fn tx_indexing_on_ledger_close() {
         let closed = ledger.clone();
 
         // Index transactions
-        Node::index_ledger_transactions(store, &closed);
+        Node::index_ledger_transactions(store.as_ref(), &closed);
 
         // Open next ledger
         *ledger = Ledger::new_open(&closed);

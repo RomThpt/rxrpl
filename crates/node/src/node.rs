@@ -16,7 +16,7 @@ use rxrpl_overlay::{
 use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
 use rxrpl_rpc_server::{ServerContext, ServerEvent};
-use rxrpl_storage::SqliteStore;
+use rxrpl_storage::{SqliteStore, TxStore};
 use rxrpl_tx_engine::{FeeSettings, TransactorRegistry, TxEngine};
 use rxrpl_txq::TxQueue;
 use serde_json::Value;
@@ -60,7 +60,7 @@ pub struct Node {
     tx_queue: Arc<RwLock<TxQueue>>,
     amendment_table: Arc<RwLock<AmendmentTable>>,
     fees: Arc<FeeSettings>,
-    tx_store: Option<Arc<SqliteStore>>,
+    tx_store: Option<Arc<dyn TxStore>>,
     running: bool,
 }
 
@@ -127,7 +127,7 @@ impl Node {
         rxrpl_tx_engine::handlers::register_pseudo(&mut tx_registry);
         let tx_engine = TxEngine::new_without_sig_check(tx_registry);
 
-        let tx_store =
+        let tx_store: Arc<dyn TxStore> =
             Arc::new(SqliteStore::in_memory().map_err(|e| NodeError::Config(e.to_string()))?);
 
         let closed_genesis = Self::genesis_with_funded_account(genesis_address)?;
@@ -279,9 +279,9 @@ impl Node {
                 let seq = l.header.sequence;
                 let closed = l.clone();
 
-                // Index transactions in SQLite
+                // Index transactions
                 if let Some(ref store) = tx_store {
-                    Self::index_ledger_transactions(store, &closed);
+                    Self::index_ledger_transactions(store.as_ref(), &closed);
                 }
 
                 // Emit transaction events (before ledger close, per rippled convention)
@@ -800,7 +800,7 @@ impl Node {
         pending_close_time: u32,
         ledger: &Arc<RwLock<Ledger>>,
         closed_ledgers: &Arc<RwLock<VecDeque<Ledger>>>,
-        tx_store: &Option<Arc<SqliteStore>>,
+        tx_store: &Option<Arc<dyn TxStore>>,
         event_tx: &tokio::sync::broadcast::Sender<ServerEvent>,
         ledger_seq_shared: &Arc<AtomicU32>,
         ledger_hash_shared: &Arc<tokio::sync::RwLock<Hash256>>,
@@ -822,7 +822,7 @@ impl Node {
         let closed = l.clone();
 
         if let Some(store) = tx_store {
-            Node::index_ledger_transactions(store, &closed);
+            Node::index_ledger_transactions(store.as_ref(), &closed);
         }
 
         let mut tx_count = 0u32;
@@ -985,12 +985,12 @@ impl Node {
     }
 
     /// Get a reference to the transaction store.
-    pub fn tx_store(&self) -> Option<&Arc<SqliteStore>> {
+    pub fn tx_store(&self) -> Option<&Arc<dyn TxStore>> {
         self.tx_store.as_ref()
     }
 
-    /// Index all transactions from a closed ledger into the SQLite store.
-    pub fn index_ledger_transactions(store: &SqliteStore, ledger: &Ledger) {
+    /// Index all transactions from a closed ledger into the transaction store.
+    pub fn index_ledger_transactions(store: &dyn TxStore, ledger: &Ledger) {
         let seq = ledger.header.sequence;
         let mut tx_index = 0u32;
 

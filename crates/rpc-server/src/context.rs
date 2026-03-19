@@ -4,7 +4,7 @@ use std::sync::Arc;
 use rxrpl_config::ServerConfig;
 use rxrpl_ledger::Ledger;
 use rxrpl_primitives::Hash256;
-use rxrpl_storage::SqliteStore;
+use rxrpl_storage::TxStore;
 use rxrpl_tx_engine::{FeeSettings, TxEngine};
 use rxrpl_txq::TxQueue;
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -20,7 +20,7 @@ pub struct ServerContext {
     pub closed_ledgers: Option<Arc<RwLock<VecDeque<Ledger>>>>,
     pub tx_engine: Option<Arc<TxEngine>>,
     pub fees: Option<Arc<FeeSettings>>,
-    pub tx_store: Option<Arc<SqliteStore>>,
+    pub tx_store: Option<Arc<dyn TxStore>>,
     pub tx_queue: Option<Arc<RwLock<TxQueue>>>,
     pub relay_tx: Option<mpsc::UnboundedSender<(Hash256, Vec<u8>)>>,
     pub metrics_handle: Option<PrometheusHandle>,
@@ -54,7 +54,7 @@ impl ServerContext {
         closed_ledgers: Arc<RwLock<VecDeque<Ledger>>>,
         tx_engine: Arc<TxEngine>,
         fees: Arc<FeeSettings>,
-        tx_store: Option<Arc<SqliteStore>>,
+        tx_store: Option<Arc<dyn TxStore>>,
         tx_queue: Option<Arc<RwLock<TxQueue>>>,
         relay_tx: Option<mpsc::UnboundedSender<(Hash256, Vec<u8>)>>,
     ) -> Arc<Self> {
@@ -82,7 +82,7 @@ impl ServerContext {
         closed_ledgers: Arc<RwLock<VecDeque<Ledger>>>,
         tx_engine: Arc<TxEngine>,
         fees: Arc<FeeSettings>,
-        tx_store: Option<Arc<SqliteStore>>,
+        tx_store: Option<Arc<dyn TxStore>>,
         tx_queue: Option<Arc<RwLock<TxQueue>>>,
         relay_tx: Option<mpsc::UnboundedSender<(Hash256, Vec<u8>)>>,
         metrics_handle: PrometheusHandle,
