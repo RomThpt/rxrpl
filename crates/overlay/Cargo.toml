@@ -10,11 +10,19 @@ license.workspace = true
 rxrpl-primitives = { workspace = true }
 rxrpl-crypto = { workspace = true }
 rxrpl-p2p-proto = { workspace = true }
+rxrpl-consensus = { workspace = true }
 rxrpl-config = { workspace = true }
+rxrpl-ledger = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["codec"] }
-futures-util.workspace = true
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+futures-util = { workspace = true, features = ["sink"] }
+prost = "0.13"
 tracing.workspace = true
 thiserror.workspace = true
 dashmap = "6"
 lru.workspace = true
+hex.workspace = true
+serde_json = { workspace = true }
