@@ -10,6 +10,17 @@ use crate::node::{SHAMapNode, SHAMapState};
 use crate::node_id::select_branch;
 use crate::node_store::NodeStore;
 
+/// A difference entry between two SHAMaps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiffEntry {
+    /// Key exists in the new map but not the old.
+    Added { key: Hash256 },
+    /// Key exists in the old map but not the new.
+    Removed { key: Hash256 },
+    /// Key exists in both maps but with different data.
+    Modified { key: Hash256 },
+}
+
 /// A SHAMap is a merkle tree (16-way radix trie) keyed by 256-bit hashes.
 ///
 /// It stores key-value pairs and provides deterministic root hashing
@@ -273,6 +284,107 @@ impl SHAMap {
                 out.push((hash, data));
             }
         }
+    }
+
+    /// Find differences between this map and another.
+    ///
+    /// Returns a list of `DiffEntry` describing keys that were added, removed,
+    /// or modified between `self` (the "old" state) and `other` (the "new" state).
+    ///
+    /// Uses Merkle hashes to skip identical subtrees, making this efficient
+    /// for maps that share most of their data (e.g., consecutive ledger states).
+    pub fn find_difference(&self, other: &SHAMap) -> Vec<DiffEntry> {
+        let mut diffs = Vec::new();
+        Self::diff_nodes(&self.root, &other.root, &mut diffs);
+        diffs
+    }
+
+    fn diff_nodes(old: &Arc<SHAMapNode>, new: &Arc<SHAMapNode>, diffs: &mut Vec<DiffEntry>) {
+        // Same hash means identical subtree
+        if old.hash() == new.hash() && !old.hash().is_zero() {
+            return;
+        }
+
+        match (old.as_ref(), new.as_ref()) {
+            (SHAMapNode::Inner(old_inner), SHAMapNode::Inner(new_inner)) => {
+                Self::diff_inner_nodes(old_inner, new_inner, diffs);
+            }
+            (SHAMapNode::Leaf(old_leaf), SHAMapNode::Leaf(new_leaf)) => {
+                if old_leaf.key() == new_leaf.key() {
+                    if old_leaf.data() != new_leaf.data() {
+                        diffs.push(DiffEntry::Modified {
+                            key: *old_leaf.key(),
+                        });
+                    }
+                } else {
+                    diffs.push(DiffEntry::Removed {
+                        key: *old_leaf.key(),
+                    });
+                    diffs.push(DiffEntry::Added {
+                        key: *new_leaf.key(),
+                    });
+                }
+            }
+            (SHAMapNode::Leaf(old_leaf), SHAMapNode::Inner(new_inner)) => {
+                diffs.push(DiffEntry::Removed {
+                    key: *old_leaf.key(),
+                });
+                Self::collect_all_leaves_inner(new_inner, diffs, true);
+            }
+            (SHAMapNode::Inner(old_inner), SHAMapNode::Leaf(new_leaf)) => {
+                Self::collect_all_leaves_inner(old_inner, diffs, false);
+                diffs.push(DiffEntry::Added {
+                    key: *new_leaf.key(),
+                });
+            }
+        }
+    }
+
+    fn diff_inner_nodes(
+        old: &InnerNode,
+        new: &InnerNode,
+        diffs: &mut Vec<DiffEntry>,
+    ) {
+        for branch in 0..16u8 {
+            let old_child = old.child(branch);
+            let new_child = new.child(branch);
+
+            match (old_child, new_child) {
+                (None, None) => {}
+                (Some(old_c), None) => {
+                    Self::collect_all_leaves(old_c, diffs, false);
+                }
+                (None, Some(new_c)) => {
+                    Self::collect_all_leaves(new_c, diffs, true);
+                }
+                (Some(old_c), Some(new_c)) => {
+                    if old_c.hash() != new_c.hash() || old_c.hash().is_zero() {
+                        Self::diff_nodes(old_c, new_c, diffs);
+                    }
+                }
+            }
+        }
+    }
+
+    fn collect_all_leaves(node: &Arc<SHAMapNode>, diffs: &mut Vec<DiffEntry>, added: bool) {
+        match node.as_ref() {
+            SHAMapNode::Leaf(leaf) => {
+                if added {
+                    diffs.push(DiffEntry::Added { key: *leaf.key() });
+                } else {
+                    diffs.push(DiffEntry::Removed { key: *leaf.key() });
+                }
+            }
+            SHAMapNode::Inner(inner) => {
+                Self::collect_all_leaves_inner(inner, diffs, added);
+            }
+        }
+    }
+
+    fn collect_all_leaves_inner(inner: &InnerNode, diffs: &mut Vec<DiffEntry>, added: bool) {
+        inner.for_each_branch(|_, child| {
+            Self::collect_all_leaves(child, diffs, added);
+        });
     }
 
     // --- Internal helpers ---
@@ -899,6 +1011,123 @@ mod tests {
 
         let snap = map.snapshot();
         assert!(snap.store().is_some());
+    }
+
+    #[test]
+    fn diff_identical_maps() {
+        let mut a = SHAMap::account_state();
+        let k = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        a.put(k, vec![1]).unwrap();
+        a.root_hash();
+
+        let b = a.snapshot();
+        let diffs = a.find_difference(&b);
+        assert!(diffs.is_empty());
+    }
+
+    #[test]
+    fn diff_added_key() {
+        let mut a = SHAMap::account_state();
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        a.put(k1, vec![1]).unwrap();
+        a.root_hash();
+
+        let mut b = a.mutable_copy();
+        let k2 = make_key("2000000000000000000000000000000000000000000000000000000000000000");
+        b.put(k2, vec![2]).unwrap();
+        b.root_hash();
+
+        let diffs = a.find_difference(&b);
+        assert!(diffs.contains(&DiffEntry::Added { key: k2 }));
+    }
+
+    #[test]
+    fn diff_removed_key() {
+        let mut a = SHAMap::account_state();
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let k2 = make_key("2000000000000000000000000000000000000000000000000000000000000000");
+        a.put(k1, vec![1]).unwrap();
+        a.put(k2, vec![2]).unwrap();
+        a.root_hash();
+
+        let mut b = a.mutable_copy();
+        b.delete(&k2).unwrap();
+        b.root_hash();
+
+        let diffs = a.find_difference(&b);
+        assert!(diffs.contains(&DiffEntry::Removed { key: k2 }));
+    }
+
+    #[test]
+    fn diff_modified_key() {
+        let mut a = SHAMap::account_state();
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        a.put(k1, vec![1]).unwrap();
+        a.root_hash();
+
+        let mut b = a.mutable_copy();
+        b.put(k1, vec![99]).unwrap();
+        b.root_hash();
+
+        let diffs = a.find_difference(&b);
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs.contains(&DiffEntry::Modified { key: k1 }));
+    }
+
+    #[test]
+    fn diff_empty_to_populated() {
+        let a = SHAMap::account_state();
+        let mut b = SHAMap::account_state();
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let k2 = make_key("2000000000000000000000000000000000000000000000000000000000000000");
+        b.put(k1, vec![1]).unwrap();
+        b.put(k2, vec![2]).unwrap();
+
+        let diffs = a.find_difference(&b);
+        assert_eq!(diffs.len(), 2);
+        assert!(diffs.contains(&DiffEntry::Added { key: k1 }));
+        assert!(diffs.contains(&DiffEntry::Added { key: k2 }));
+    }
+
+    #[test]
+    fn diff_populated_to_empty() {
+        let mut a = SHAMap::account_state();
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        a.put(k1, vec![1]).unwrap();
+
+        let b = SHAMap::account_state();
+        let diffs = a.find_difference(&b);
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs.contains(&DiffEntry::Removed { key: k1 }));
+    }
+
+    #[test]
+    fn diff_complex_changes() {
+        let mut a = SHAMap::account_state();
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let k2 = make_key("2000000000000000000000000000000000000000000000000000000000000000");
+        let k3 = make_key("3000000000000000000000000000000000000000000000000000000000000000");
+        a.put(k1, vec![1]).unwrap();
+        a.put(k2, vec![2]).unwrap();
+        a.put(k3, vec![3]).unwrap();
+        a.root_hash();
+
+        let mut b = a.mutable_copy();
+        b.delete(&k1).unwrap(); // removed
+        b.put(k2, vec![22]).unwrap(); // modified
+        // k3 unchanged
+        let k4 = make_key("4000000000000000000000000000000000000000000000000000000000000000");
+        b.put(k4, vec![4]).unwrap(); // added
+        b.root_hash();
+
+        let diffs = a.find_difference(&b);
+        assert!(diffs.contains(&DiffEntry::Removed { key: k1 }));
+        assert!(diffs.contains(&DiffEntry::Modified { key: k2 }));
+        assert!(diffs.contains(&DiffEntry::Added { key: k4 }));
+        // k3 should NOT appear in diffs
+        assert!(!diffs.iter().any(|d| match d {
+            DiffEntry::Added { key } | DiffEntry::Removed { key } | DiffEntry::Modified { key } => *key == k3,
+        }));
     }
 
     #[test]
