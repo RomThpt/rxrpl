@@ -50,16 +50,11 @@ pub async fn autofill(tx: &mut Value, client: &XrplClient) -> Result<(), Protoco
             .ledger_current()
             .await
             .map_err(|e| ProtocolError::InvalidFieldValue(format!("ledger_current failed: {e}")))?;
-        let current = ledger["ledger_current_index"]
-            .as_u64()
-            .ok_or_else(|| {
-                ProtocolError::MissingField("ledger_current_index from ledger_current".into())
-            })?;
+        let current = ledger["ledger_current_index"].as_u64().ok_or_else(|| {
+            ProtocolError::MissingField("ledger_current_index from ledger_current".into())
+        })?;
         let lls = current as u32 + LEDGER_OFFSET;
-        obj.insert(
-            "LastLedgerSequence".to_string(),
-            Value::Number(lls.into()),
-        );
+        obj.insert("LastLedgerSequence".to_string(), Value::Number(lls.into()));
     }
 
     Ok(())

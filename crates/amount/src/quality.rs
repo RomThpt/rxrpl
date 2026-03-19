@@ -58,10 +58,7 @@ pub fn is_better_quality(a: u64, b: u64) -> bool {
 /// Compute the quality for an offer given taker-pays and taker-gets amounts.
 ///
 /// Quality = taker_pays / taker_gets. Lower is better for the taker.
-pub fn offer_quality(
-    taker_pays: &IOUAmount,
-    taker_gets: &IOUAmount,
-) -> Result<u64, AmountError> {
+pub fn offer_quality(taker_pays: &IOUAmount, taker_gets: &IOUAmount) -> Result<u64, AmountError> {
     get_rate(taker_pays, taker_gets)
 }
 

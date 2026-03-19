@@ -171,6 +171,16 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:5005")]
         bind: String,
     },
+
+    /// Run a networked XRPL node with P2P overlay
+    NetworkRun {
+        /// Path to TOML configuration file
+        #[arg(long)]
+        config: String,
+        /// Ledger close interval in seconds
+        #[arg(long, default_value = "10")]
+        close_interval: u64,
+    },
 }
 
 #[tokio::main]
@@ -235,9 +245,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 cli.url.clone()
             };
 
-            let client = rxrpl::ClientBuilder::new(&ws_url)
-                .build_ws()
-                .await?;
+            let client = rxrpl::ClientBuilder::new(&ws_url).build_ws().await?;
 
             let result = client.subscribe(streams.clone()).await?;
             println!("Subscribed: {}", serde_json::to_string_pretty(&result)?);
@@ -309,6 +317,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             return cmd_node_run(&genesis_account, close_interval, &bind).await;
         }
 
+        Commands::NetworkRun {
+            config,
+            close_interval,
+        } => {
+            return cmd_network_run(&config, close_interval).await;
+        }
+
         _ => {}
     }
 
@@ -332,7 +347,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         | Commands::TrustSet { .. }
         | Commands::OfferCreate { .. }
         | Commands::AccountDelete { .. }
-        | Commands::NodeRun { .. } => unreachable!(),
+        | Commands::NodeRun { .. }
+        | Commands::NetworkRun { .. } => unreachable!(),
     };
 
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -495,5 +511,22 @@ async fn cmd_node_run(
     eprintln!("  Close interval: {close_interval}s");
 
     node.run_standalone(close_interval).await?;
+    Ok(())
+}
+
+async fn cmd_network_run(
+    config_path: &str,
+    close_interval: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let toml_str = std::fs::read_to_string(config_path)?;
+    let config: rxrpl_config::NodeConfig = toml::from_str(&toml_str)?;
+
+    let node = rxrpl_node::Node::new(config)?;
+
+    eprintln!("Starting networked node...");
+    eprintln!("  Config: {config_path}");
+    eprintln!("  Close interval: {close_interval}s");
+
+    node.run_networked(close_interval).await?;
     Ok(())
 }

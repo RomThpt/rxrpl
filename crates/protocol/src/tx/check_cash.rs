@@ -28,7 +28,10 @@ mod tests {
             "Amount": "1000000"
         });
         let tx = CheckCash::from_json(&json).unwrap();
-        assert_eq!(tx.check_id, "838766BA2B995C00744175F69A1B11E32C3DBC40E64801A4056FCBD657F57334");
+        assert_eq!(
+            tx.check_id,
+            "838766BA2B995C00744175F69A1B11E32C3DBC40E64801A4056FCBD657F57334"
+        );
         let rt = tx.to_json().unwrap();
         assert_eq!(rt["TransactionType"], "CheckCash");
     }

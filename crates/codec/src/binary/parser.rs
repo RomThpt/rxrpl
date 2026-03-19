@@ -182,6 +182,8 @@ impl<'a> BinaryParser<'a> {
                 let bytes = self.read_bytes(20)?;
                 Ok(Value::String(decode_currency_code(bytes)))
             }
+            "XChainBridge" => self.parse_object(),
+            "Number" => self.parse_number(),
             other => Err(CodecError::UnsupportedType(format!(
                 "unsupported field type: {other}"
             ))),
@@ -304,6 +306,11 @@ impl<'a> BinaryParser<'a> {
         }
 
         Ok(Value::Array(paths))
+    }
+
+    pub(crate) fn parse_number(&mut self) -> Result<Value, CodecError> {
+        let raw = self.read_u64()?;
+        Ok(Value::String(decode_iou_value(raw)))
     }
 
     fn parse_issue(&mut self) -> Result<Value, CodecError> {

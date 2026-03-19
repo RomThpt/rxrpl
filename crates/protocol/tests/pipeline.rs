@@ -1,11 +1,11 @@
 use rxrpl_codec::address::{decode_seed, encode_classic_address_from_pubkey, encode_seed};
 use rxrpl_crypto::{KeyPair, KeyType, Seed};
+use rxrpl_protocol::Wallet;
 use rxrpl_protocol::tx::common::Transaction;
 use rxrpl_protocol::tx::{
-    combine_multisig, compute_tx_hash, serialize_signed, sign, verify_multisig, verify_signature,
-    Payment,
+    Payment, combine_multisig, compute_tx_hash, serialize_signed, sign, verify_multisig,
+    verify_signature,
 };
-use rxrpl_protocol::Wallet;
 
 /// End-to-end offline pipeline: build -> sign -> serialize -> compute hash.
 #[test]

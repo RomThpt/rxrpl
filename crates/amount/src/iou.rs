@@ -402,21 +402,15 @@ impl IOUAmount {
                 if result.is_zero() {
                     return Ok(IOUAmount::MIN_POSITIVE);
                 }
-                result = IOUAmount::from_parts(
-                    result.mantissa + 1,
-                    result.exponent,
-                    result.negative,
-                )?;
+                result =
+                    IOUAmount::from_parts(result.mantissa + 1, result.exponent, result.negative)?;
             } else if !round_up && negative {
                 // Round away from zero for negative
                 if result.is_zero() {
                     return Ok(IOUAmount::from_raw(MIN_MANTISSA, MIN_EXPONENT, true));
                 }
-                result = IOUAmount::from_parts(
-                    result.mantissa + 1,
-                    result.exponent,
-                    result.negative,
-                )?;
+                result =
+                    IOUAmount::from_parts(result.mantissa + 1, result.exponent, result.negative)?;
             }
         }
 
@@ -551,11 +545,7 @@ impl Ord for IOUAmount {
             self.mantissa.cmp(&other.mantissa)
         };
 
-        if self.negative {
-            mag.reverse()
-        } else {
-            mag
-        }
+        if self.negative { mag.reverse() } else { mag }
     }
 }
 

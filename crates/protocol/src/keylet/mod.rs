@@ -7,37 +7,37 @@ use rxrpl_primitives::{AccountId, Hash256};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum LedgerNamespace {
-    Account = 0x0061,       // 'a'
-    DirNode = 0x0064,       // 'd'
-    GeneratorMap = 0x0067,  // 'g'
-    RippleState = 0x0072,   // 'r'
-    Offer = 0x006F,         // 'o'
-    OwnerDir = 0x004F,      // 'O'
-    BookDir = 0x0042,       // 'B'
-    Skip = 0x0073,          // 's'
-    Amendment = 0x0066,     // 'f'
-    Fee = 0x0065,           // 'e'
-    NegativeUNL = 0x004E,   // 'N'
-    Ticket = 0x0054,        // 'T'
-    SignerList = 0x0053,    // 'S'
-    PayChannel = 0x0078,    // 'x'
-    Check = 0x0043,         // 'C'
-    DepositPreauth = 0x0070, // 'p'
-    Escrow = 0x0075,        // 'u'
-    NFTokenPage = 0x0050,   // 'P'
-    NFTokenOffer = 0x0037,  // '7'
-    AMM = 0x0041,           // 'A'
-    Bridge = 0x0048,        // 'H'
-    XChainClaimId = 0x0051, // 'Q'
+    Account = 0x0061,                    // 'a'
+    DirNode = 0x0064,                    // 'd'
+    GeneratorMap = 0x0067,               // 'g'
+    RippleState = 0x0072,                // 'r'
+    Offer = 0x006F,                      // 'o'
+    OwnerDir = 0x004F,                   // 'O'
+    BookDir = 0x0042,                    // 'B'
+    Skip = 0x0073,                       // 's'
+    Amendment = 0x0066,                  // 'f'
+    Fee = 0x0065,                        // 'e'
+    NegativeUNL = 0x004E,                // 'N'
+    Ticket = 0x0054,                     // 'T'
+    SignerList = 0x0053,                 // 'S'
+    PayChannel = 0x0078,                 // 'x'
+    Check = 0x0043,                      // 'C'
+    DepositPreauth = 0x0070,             // 'p'
+    Escrow = 0x0075,                     // 'u'
+    NFTokenPage = 0x0050,                // 'P'
+    NFTokenOffer = 0x0037,               // '7'
+    AMM = 0x0041,                        // 'A'
+    Bridge = 0x0048,                     // 'H'
+    XChainClaimId = 0x0051,              // 'Q'
     XChainCreateAccountClaimId = 0x004B, // 'K'
-    DID = 0x0049,           // 'I'
-    Oracle = 0x0052,        // 'R'
-    MPTokenIssuance = 0x007E, // '~'
-    MPToken = 0x0074,       // 't'
-    Credential = 0x0044,    // 'D'
-    PermissionedDomain = 0x006D, // 'm'
-    Delegate = 0x0045,      // 'E'
-    Vault = 0x0056,         // 'V'
+    DID = 0x0049,                        // 'I'
+    Oracle = 0x0052,                     // 'R'
+    MPTokenIssuance = 0x007E,            // '~'
+    MPToken = 0x0074,                    // 't'
+    Credential = 0x0044,                 // 'D'
+    PermissionedDomain = 0x006D,         // 'm'
+    Delegate = 0x0045,                   // 'E'
+    Vault = 0x0056,                      // 'V'
 }
 
 /// Compute a ledger index by hashing: space_u16_be || data...
@@ -74,10 +74,7 @@ pub fn trust_line(a: &AccountId, b: &AccountId, currency: &[u8; 20]) -> Hash256 
 
 /// Compute the keylet for an offer.
 pub fn offer(id: &AccountId, seq: u32) -> Hash256 {
-    index_hash(
-        LedgerNamespace::Offer,
-        &[id.as_bytes(), &seq.to_be_bytes()],
-    )
+    index_hash(LedgerNamespace::Offer, &[id.as_bytes(), &seq.to_be_bytes()])
 }
 
 /// Compute the keylet for an account's owner directory.
@@ -165,10 +162,7 @@ pub fn pay_channel(src: &AccountId, dst: &AccountId, seq: u32) -> Hash256 {
 
 /// Compute the keylet for a check.
 pub fn check(id: &AccountId, seq: u32) -> Hash256 {
-    index_hash(
-        LedgerNamespace::Check,
-        &[id.as_bytes(), &seq.to_be_bytes()],
-    )
+    index_hash(LedgerNamespace::Check, &[id.as_bytes(), &seq.to_be_bytes()])
 }
 
 /// Compute the keylet for a deposit preauth entry.
@@ -221,10 +215,7 @@ pub fn oracle(id: &AccountId, oracle_document_id: u32) -> Hash256 {
 
 /// Compute the keylet for a bridge.
 pub fn bridge(id: &AccountId, bridge_data: &[u8]) -> Hash256 {
-    index_hash(
-        LedgerNamespace::Bridge,
-        &[id.as_bytes(), bridge_data],
-    )
+    index_hash(LedgerNamespace::Bridge, &[id.as_bytes(), bridge_data])
 }
 
 /// Compute the keylet for a cross-chain claim ID.
@@ -277,10 +268,7 @@ pub fn mptoken_issuance(id: &AccountId, seq: u32) -> Hash256 {
 
 /// Compute the keylet for a multi-purpose token holding.
 pub fn mptoken(issuance_id: &[u8], holder: &AccountId) -> Hash256 {
-    index_hash(
-        LedgerNamespace::MPToken,
-        &[issuance_id, holder.as_bytes()],
-    )
+    index_hash(LedgerNamespace::MPToken, &[issuance_id, holder.as_bytes()])
 }
 
 /// Compute the keylet for a credential.
@@ -303,8 +291,14 @@ pub fn amm(
     asset2_currency: &[u8; 20],
     asset2_issuer: &AccountId,
 ) -> Hash256 {
-    let a1 = (asset1_currency.as_slice(), asset1_issuer.as_bytes().as_slice());
-    let a2 = (asset2_currency.as_slice(), asset2_issuer.as_bytes().as_slice());
+    let a1 = (
+        asset1_currency.as_slice(),
+        asset1_issuer.as_bytes().as_slice(),
+    );
+    let a2 = (
+        asset2_currency.as_slice(),
+        asset2_issuer.as_bytes().as_slice(),
+    );
     let (low_cur, low_iss, high_cur, high_iss) = if a1 <= a2 {
         (
             asset1_currency.as_slice(),
@@ -320,7 +314,10 @@ pub fn amm(
             asset1_issuer.as_bytes().as_slice(),
         )
     };
-    index_hash(LedgerNamespace::AMM, &[low_cur, low_iss, high_cur, high_iss])
+    index_hash(
+        LedgerNamespace::AMM,
+        &[low_cur, low_iss, high_cur, high_iss],
+    )
 }
 
 #[cfg(test)]
@@ -454,6 +451,9 @@ mod tests {
 
         let key1 = amm(&cur_xrp, &iss_xrp, &cur_usd, &iss);
         let key2 = amm(&cur_xrp, &iss_xrp, &cur_eur, &iss);
-        assert_ne!(key1, key2, "different asset pairs should produce different keys");
+        assert_ne!(
+            key1, key2,
+            "different asset pairs should produce different keys"
+        );
     }
 }

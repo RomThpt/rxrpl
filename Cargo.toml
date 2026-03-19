@@ -29,6 +29,7 @@ rxrpl-consensus = { path = "crates/consensus" }
 rxrpl-config = { path = "crates/config" }
 rxrpl-p2p-proto = { path = "crates/p2p-proto" }
 rxrpl-overlay = { path = "crates/overlay" }
+rxrpl-pathfind = { path = "crates/pathfind" }
 rxrpl-rpc-server = { path = "crates/rpc-server" }
 rxrpl-node = { path = "crates/node" }
 
@@ -47,9 +48,16 @@ bs58 = "0.5"
 
 # Async / Networking
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rcgen = "0.13"
 reqwest = { version = "0.12", features = ["json"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
+
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
 
 # Error handling
 thiserror = "2"

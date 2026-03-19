@@ -113,6 +113,12 @@ impl BinarySerializer {
             "PathSet" => self.serialize_pathset(value)?,
             "Issue" => self.serialize_issue(value)?,
             "Currency" => self.serialize_currency(value)?,
+            "XChainBridge" => {
+                self.serialize_object(value, true)?;
+                let end = field_id::encode_field_id(14, 1);
+                self.write_bytes(&end);
+            }
+            "Number" => self.serialize_number(value)?,
             other => {
                 return Err(CodecError::UnsupportedType(format!(
                     "unsupported field type: {other}"
@@ -436,6 +442,13 @@ impl BinarySerializer {
         Ok(())
     }
 
+    fn serialize_number(&mut self, value: &Value) -> Result<(), CodecError> {
+        let value_str = value
+            .as_str()
+            .ok_or_else(|| CodecError::UnsupportedType("expected string for Number".to_string()))?;
+        self.serialize_iou_value(value_str)
+    }
+
     fn serialize_currency(&mut self, value: &Value) -> Result<(), CodecError> {
         let s = value.as_str().ok_or_else(|| {
             CodecError::UnsupportedType("expected string for Currency".to_string())
@@ -538,5 +551,79 @@ mod tests {
         assert_eq!(bytes.len(), 8);
         // Should have the positive bit set
         assert!(bytes[0] & 0x40 != 0);
+    }
+
+    #[test]
+    fn serialize_number_zero() {
+        let mut s = BinarySerializer::new();
+        s.serialize_number(&Value::String("0".to_string())).unwrap();
+        let bytes = s.into_bytes();
+        assert_eq!(bytes.len(), 8);
+        // Zero IOU encoding
+        assert_eq!(
+            u64::from_be_bytes(bytes.try_into().unwrap()),
+            0x8000_0000_0000_0000
+        );
+    }
+
+    #[test]
+    fn number_roundtrip() {
+        use super::super::parser::BinaryParser;
+
+        for value_str in &["1.5", "0", "-42.7", "1000000", "-0.001"] {
+            let mut s = BinarySerializer::new();
+            s.serialize_number(&Value::String(value_str.to_string()))
+                .unwrap();
+            let bytes = s.into_bytes();
+
+            let mut p = BinaryParser::new(&bytes);
+            let parsed = p.parse_number().unwrap();
+            let parsed_str = parsed.as_str().unwrap();
+
+            // Verify round-trip by comparing numeric values
+            let original: f64 = value_str.parse().unwrap();
+            let roundtripped: f64 = parsed_str.parse().unwrap();
+            assert!(
+                (original - roundtripped).abs() < 1e-10,
+                "Number round-trip failed for {value_str}: got {parsed_str}"
+            );
+        }
+    }
+
+    #[test]
+    fn xchain_bridge_roundtrip() {
+        use super::super::parser::BinaryParser;
+
+        let bridge = serde_json::json!({
+            "LockingChainDoor": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+            "IssuingChainDoor": "r9cZA1mLK5R5Am25ArfXFmqgNwjZgnfk59",
+            "LockingChainIssue": {"currency": "XRP"},
+            "IssuingChainIssue": {"currency": "XRP"}
+        });
+
+        let tx = serde_json::json!({
+            "TransactionType": "XChainCreateBridge",
+            "Account": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+            "XChainBridge": bridge,
+            "SignatureReward": "100",
+            "Fee": "12",
+            "Sequence": 1,
+        });
+
+        let mut s = BinarySerializer::new();
+        s.serialize_object(&tx, false).unwrap();
+        let bytes = s.into_bytes();
+
+        let mut p = BinaryParser::new(&bytes);
+        let parsed = p.parse_object().unwrap();
+
+        assert_eq!(
+            parsed["XChainBridge"]["LockingChainDoor"],
+            tx["XChainBridge"]["LockingChainDoor"]
+        );
+        assert_eq!(
+            parsed["XChainBridge"]["IssuingChainDoor"],
+            tx["XChainBridge"]["IssuingChainDoor"]
+        );
     }
 }

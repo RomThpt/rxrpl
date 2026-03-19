@@ -33,7 +33,10 @@ mod tests {
             "Amount": "1000000"
         });
         let tx = PaymentChannelClaim::from_json(&json).unwrap();
-        assert_eq!(tx.channel, "C1AE6DDDEEC05CF2978C0BAD6FE302948E9533691DC749DCDD3B9E5992CA6198");
+        assert_eq!(
+            tx.channel,
+            "C1AE6DDDEEC05CF2978C0BAD6FE302948E9533691DC749DCDD3B9E5992CA6198"
+        );
         let rt = tx.to_json().unwrap();
         assert_eq!(rt["TransactionType"], "PaymentChannelClaim");
     }

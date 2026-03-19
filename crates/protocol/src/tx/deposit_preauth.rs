@@ -26,7 +26,10 @@ mod tests {
             "Authorize": "rfkE1aSy9G8Upk4JssnwBxhEv5p4mn2KTy"
         });
         let tx = DepositPreauth::from_json(&json).unwrap();
-        assert_eq!(tx.authorize.as_deref(), Some("rfkE1aSy9G8Upk4JssnwBxhEv5p4mn2KTy"));
+        assert_eq!(
+            tx.authorize.as_deref(),
+            Some("rfkE1aSy9G8Upk4JssnwBxhEv5p4mn2KTy")
+        );
         let rt = tx.to_json().unwrap();
         assert_eq!(rt["TransactionType"], "DepositPreauth");
     }

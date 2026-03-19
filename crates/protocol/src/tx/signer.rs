@@ -2,10 +2,10 @@ use serde_json::Value;
 
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_codec::binary;
+use rxrpl_crypto::KeyPair;
 use rxrpl_crypto::hash_prefix::HashPrefix;
 use rxrpl_crypto::key_type::KeyType;
 use rxrpl_crypto::sha512_half::sha512_half;
-use rxrpl_crypto::KeyPair;
 use rxrpl_primitives::Hash256;
 
 use crate::error::ProtocolError;
@@ -81,12 +81,8 @@ pub fn sign_for(
     let signing_bytes = binary::encode_for_multisigning(&json, account_id.as_bytes())?;
 
     let signature = match key_pair.key_type {
-        KeyType::Secp256k1 => {
-            rxrpl_crypto::secp256k1::sign(&signing_bytes, &key_pair.private_key)?
-        }
-        KeyType::Ed25519 => {
-            rxrpl_crypto::ed25519::sign(&signing_bytes, &key_pair.private_key)?
-        }
+        KeyType::Secp256k1 => rxrpl_crypto::secp256k1::sign(&signing_bytes, &key_pair.private_key)?,
+        KeyType::Ed25519 => rxrpl_crypto::ed25519::sign(&signing_bytes, &key_pair.private_key)?,
     };
 
     Ok(Signer {
@@ -101,10 +97,7 @@ pub fn sign_for(
 /// Assemble multiple `Signer` entries into a complete multisig transaction.
 ///
 /// Signers are sorted by account ID bytes as required by the XRPL protocol.
-pub fn combine_multisig(
-    tx_json: &Value,
-    mut signers: Vec<Signer>,
-) -> Result<Value, ProtocolError> {
+pub fn combine_multisig(tx_json: &Value, mut signers: Vec<Signer>) -> Result<Value, ProtocolError> {
     if signers.is_empty() {
         return Err(ProtocolError::InvalidFieldValue(
             "signers list must not be empty".into(),
@@ -127,10 +120,7 @@ pub fn combine_multisig(
         .as_object_mut()
         .ok_or_else(|| ProtocolError::Serialization("expected JSON object".into()))?;
 
-    obj.insert(
-        "SigningPubKey".to_string(),
-        Value::String(String::new()),
-    );
+    obj.insert("SigningPubKey".to_string(), Value::String(String::new()));
     obj.remove("TxnSignature");
 
     let signers_json: Vec<Value> = signers
@@ -207,8 +197,7 @@ pub fn verify_multisig(signed_tx: &Value) -> Result<(), ProtocolError> {
             ProtocolError::InvalidFieldValue("unrecognized public key prefix".into())
         })?;
 
-        let signing_bytes =
-            binary::encode_for_multisigning(&base_tx, account_id.as_bytes())?;
+        let signing_bytes = binary::encode_for_multisigning(&base_tx, account_id.as_bytes())?;
 
         let valid = match key_type {
             KeyType::Ed25519 => {
@@ -290,7 +279,9 @@ pub fn verify_signature(signed_tx: &Value) -> Result<(), ProtocolError> {
     if valid {
         Ok(())
     } else {
-        Err(ProtocolError::Signing("signature verification failed".into()))
+        Err(ProtocolError::Signing(
+            "signature verification failed".into(),
+        ))
     }
 }
 
@@ -422,12 +413,8 @@ mod tests {
         let mut signed = sign(&tx, &kp_a).unwrap();
 
         // Replace SigningPubKey with a different key
-        let kp_b = KeyPair::from_seed(
-            &Seed::from_passphrase("different_key"),
-            KeyType::Ed25519,
-        );
-        signed["SigningPubKey"] =
-            Value::String(hex::encode_upper(kp_b.public_key.as_bytes()));
+        let kp_b = KeyPair::from_seed(&Seed::from_passphrase("different_key"), KeyType::Ed25519);
+        signed["SigningPubKey"] = Value::String(hex::encode_upper(kp_b.public_key.as_bytes()));
 
         assert!(verify_signature(&signed).is_err());
     }

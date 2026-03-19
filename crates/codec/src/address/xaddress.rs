@@ -65,8 +65,8 @@ pub fn decode_x_address(x_address: &str) -> Result<(AccountId, Option<u32>, bool
         }
     };
 
-    let account_id =
-        AccountId::from_slice(&decoded[2..22]).map_err(|e| CodecError::InvalidAddress(e.to_string()))?;
+    let account_id = AccountId::from_slice(&decoded[2..22])
+        .map_err(|e| CodecError::InvalidAddress(e.to_string()))?;
 
     let flag = decoded[22];
     let tag_bytes = &decoded[23..31];
@@ -107,10 +107,8 @@ mod tests {
     use super::*;
 
     fn test_account_id() -> AccountId {
-        AccountId::from_slice(
-            &hex::decode("88a5a57c829f40f25ea83385bbde6c3d8b4ca082").unwrap(),
-        )
-        .unwrap()
+        AccountId::from_slice(&hex::decode("88a5a57c829f40f25ea83385bbde6c3d8b4ca082").unwrap())
+            .unwrap()
     }
 
     #[test]

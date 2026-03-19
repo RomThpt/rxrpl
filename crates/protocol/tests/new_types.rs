@@ -1,5 +1,5 @@
-use rxrpl_protocol::tx::common::Transaction;
 use rxrpl_protocol::ledger::common::LedgerObject;
+use rxrpl_protocol::tx::common::Transaction;
 
 // --- XChain transaction roundtrips ---
 
@@ -263,7 +263,10 @@ fn mptoken_issuance_destroy_roundtrip() {
     let tx = rxrpl_protocol::tx::MPTokenIssuanceDestroy::from_json(&json).unwrap();
     let rt = tx.to_json().unwrap();
     assert_eq!(rt["TransactionType"], "MPTokenIssuanceDestroy");
-    assert_eq!(rt["MPTokenIssuanceID"], "00000001A407AF5856CEF3379FAB85D584A4A42163");
+    assert_eq!(
+        rt["MPTokenIssuanceID"],
+        "00000001A407AF5856CEF3379FAB85D584A4A42163"
+    );
 }
 
 #[test]
@@ -276,7 +279,10 @@ fn mptoken_issuance_set_roundtrip() {
         "Holder": "rGWrZyQqhTp9Xu7G5iFQmGeFSGnR3EUj3M"
     });
     let tx = rxrpl_protocol::tx::MPTokenIssuanceSet::from_json(&json).unwrap();
-    assert_eq!(tx.holder, Some("rGWrZyQqhTp9Xu7G5iFQmGeFSGnR3EUj3M".to_string()));
+    assert_eq!(
+        tx.holder,
+        Some("rGWrZyQqhTp9Xu7G5iFQmGeFSGnR3EUj3M".to_string())
+    );
     let rt = tx.to_json().unwrap();
     assert_eq!(rt["TransactionType"], "MPTokenIssuanceSet");
 }
@@ -361,7 +367,10 @@ fn vault_withdraw_roundtrip() {
         "Destination": "rGWrZyQqhTp9Xu7G5iFQmGeFSGnR3EUj3M"
     });
     let tx = rxrpl_protocol::tx::VaultWithdraw::from_json(&json).unwrap();
-    assert_eq!(tx.destination, Some("rGWrZyQqhTp9Xu7G5iFQmGeFSGnR3EUj3M".to_string()));
+    assert_eq!(
+        tx.destination,
+        Some("rGWrZyQqhTp9Xu7G5iFQmGeFSGnR3EUj3M".to_string())
+    );
     let rt = tx.to_json().unwrap();
     assert_eq!(rt["TransactionType"], "VaultWithdraw");
 }
@@ -422,7 +431,10 @@ fn delegate_set_roundtrip() {
         "Permissions": [{"Permission": {"PermissionValue": "Payment"}}]
     });
     let tx = rxrpl_protocol::tx::DelegateSet::from_json(&json).unwrap();
-    assert_eq!(tx.authorize, Some("rGWrZyQqhTp9Xu7G5iFQmGeFSGnR3EUj3M".to_string()));
+    assert_eq!(
+        tx.authorize,
+        Some("rGWrZyQqhTp9Xu7G5iFQmGeFSGnR3EUj3M".to_string())
+    );
     let rt = tx.to_json().unwrap();
     assert_eq!(rt["TransactionType"], "DelegateSet");
 }
@@ -599,7 +611,10 @@ fn mptoken_ledger_entry_roundtrip() {
     let entry = rxrpl_protocol::ledger::MpToken::from_json(&json).unwrap();
     assert_eq!(entry.mpt_amount, Some("1000".to_string()));
     let rt = entry.to_json().unwrap();
-    assert_eq!(rt["MPTokenIssuanceID"], "00000001A407AF5856CEF3379FAB85D584A4A42163");
+    assert_eq!(
+        rt["MPTokenIssuanceID"],
+        "00000001A407AF5856CEF3379FAB85D584A4A42163"
+    );
 }
 
 #[test]
@@ -679,7 +694,10 @@ fn transaction_kind_xchain_roundtrip() {
         "SignatureReward": "200"
     });
     let kind = rxrpl_protocol::tx::TransactionKind::from_json(&json).unwrap();
-    assert!(matches!(kind, rxrpl_protocol::tx::TransactionKind::XChainCreateBridge(_)));
+    assert!(matches!(
+        kind,
+        rxrpl_protocol::tx::TransactionKind::XChainCreateBridge(_)
+    ));
 }
 
 #[test]
@@ -691,7 +709,10 @@ fn transaction_kind_vault_roundtrip() {
         "Asset": {"currency": "USD", "issuer": "rGWrZyQqhTp9Xu7G5iFQmGeFSGnR3EUj3M"}
     });
     let kind = rxrpl_protocol::tx::TransactionKind::from_json(&json).unwrap();
-    assert!(matches!(kind, rxrpl_protocol::tx::TransactionKind::VaultCreate(_)));
+    assert!(matches!(
+        kind,
+        rxrpl_protocol::tx::TransactionKind::VaultCreate(_)
+    ));
 }
 
 // --- LedgerObjectKind polymorphic roundtrips ---
@@ -714,7 +735,10 @@ fn ledger_object_kind_bridge_roundtrip() {
         "OwnerNode": "0"
     });
     let kind = rxrpl_protocol::ledger::LedgerObjectKind::from_json(&json).unwrap();
-    assert!(matches!(kind, rxrpl_protocol::ledger::LedgerObjectKind::Bridge(_)));
+    assert!(matches!(
+        kind,
+        rxrpl_protocol::ledger::LedgerObjectKind::Bridge(_)
+    ));
 }
 
 #[test]
@@ -730,7 +754,10 @@ fn ledger_object_kind_vault_roundtrip() {
         "ShareMPTID": "00000001A407AF5856CEF3379FAB85D584A4A42163"
     });
     let kind = rxrpl_protocol::ledger::LedgerObjectKind::from_json(&json).unwrap();
-    assert!(matches!(kind, rxrpl_protocol::ledger::LedgerObjectKind::Vault(_)));
+    assert!(matches!(
+        kind,
+        rxrpl_protocol::ledger::LedgerObjectKind::Vault(_)
+    ));
 }
 
 // --- TransactionType enum code roundtrips ---
@@ -741,25 +768,69 @@ fn new_transaction_type_codes_roundtrip() {
 
     let variants = [
         (TransactionType::AMMClawback, 31, "AMMClawback"),
-        (TransactionType::XChainCreateClaimId, 41, "XChainCreateClaimId"),
+        (
+            TransactionType::XChainCreateClaimId,
+            41,
+            "XChainCreateClaimId",
+        ),
         (TransactionType::XChainCommit, 42, "XChainCommit"),
         (TransactionType::XChainClaim, 43, "XChainClaim"),
-        (TransactionType::XChainAccountCreateCommit, 44, "XChainAccountCreateCommit"),
-        (TransactionType::XChainAddClaimAttestation, 45, "XChainAddClaimAttestation"),
-        (TransactionType::XChainAddAccountCreateAttestation, 46, "XChainAddAccountCreateAttestation"),
-        (TransactionType::XChainModifyBridge, 47, "XChainModifyBridge"),
-        (TransactionType::XChainCreateBridge, 48, "XChainCreateBridge"),
+        (
+            TransactionType::XChainAccountCreateCommit,
+            44,
+            "XChainAccountCreateCommit",
+        ),
+        (
+            TransactionType::XChainAddClaimAttestation,
+            45,
+            "XChainAddClaimAttestation",
+        ),
+        (
+            TransactionType::XChainAddAccountCreateAttestation,
+            46,
+            "XChainAddAccountCreateAttestation",
+        ),
+        (
+            TransactionType::XChainModifyBridge,
+            47,
+            "XChainModifyBridge",
+        ),
+        (
+            TransactionType::XChainCreateBridge,
+            48,
+            "XChainCreateBridge",
+        ),
         (TransactionType::LedgerStateFix, 53, "LedgerStateFix"),
-        (TransactionType::MPTokenIssuanceCreate, 54, "MPTokenIssuanceCreate"),
-        (TransactionType::MPTokenIssuanceDestroy, 55, "MPTokenIssuanceDestroy"),
-        (TransactionType::MPTokenIssuanceSet, 56, "MPTokenIssuanceSet"),
+        (
+            TransactionType::MPTokenIssuanceCreate,
+            54,
+            "MPTokenIssuanceCreate",
+        ),
+        (
+            TransactionType::MPTokenIssuanceDestroy,
+            55,
+            "MPTokenIssuanceDestroy",
+        ),
+        (
+            TransactionType::MPTokenIssuanceSet,
+            56,
+            "MPTokenIssuanceSet",
+        ),
         (TransactionType::MPTokenAuthorize, 57, "MPTokenAuthorize"),
         (TransactionType::CredentialCreate, 58, "CredentialCreate"),
         (TransactionType::CredentialAccept, 59, "CredentialAccept"),
         (TransactionType::CredentialDelete, 60, "CredentialDelete"),
         (TransactionType::NFTokenModify, 61, "NFTokenModify"),
-        (TransactionType::PermissionedDomainSet, 62, "PermissionedDomainSet"),
-        (TransactionType::PermissionedDomainDelete, 63, "PermissionedDomainDelete"),
+        (
+            TransactionType::PermissionedDomainSet,
+            62,
+            "PermissionedDomainSet",
+        ),
+        (
+            TransactionType::PermissionedDomainDelete,
+            63,
+            "PermissionedDomainDelete",
+        ),
         (TransactionType::DelegateSet, 64, "DelegateSet"),
         (TransactionType::VaultCreate, 65, "VaultCreate"),
         (TransactionType::VaultSet, 66, "VaultSet"),
@@ -772,8 +843,16 @@ fn new_transaction_type_codes_roundtrip() {
     for (variant, code, name) in variants {
         assert_eq!(variant.code(), code, "code mismatch for {name}");
         assert_eq!(variant.as_str(), name, "name mismatch for code {code}");
-        assert_eq!(TransactionType::from_code(code).unwrap(), variant, "from_code({code}) failed");
-        assert_eq!(TransactionType::from_name(name).unwrap(), variant, "from_name({name}) failed");
+        assert_eq!(
+            TransactionType::from_code(code).unwrap(),
+            variant,
+            "from_code({code}) failed"
+        );
+        assert_eq!(
+            TransactionType::from_name(name).unwrap(),
+            variant,
+            "from_name({name}) failed"
+        );
     }
 }
 
@@ -785,12 +864,24 @@ fn new_ledger_entry_type_codes_roundtrip() {
 
     let variants = [
         (LedgerEntryType::Bridge, 0x0069, "Bridge"),
-        (LedgerEntryType::XChainOwnedClaimId, 0x0071, "XChainOwnedClaimId"),
-        (LedgerEntryType::XChainOwnedCreateAccountClaimId, 0x0074, "XChainOwnedCreateAccountClaimId"),
+        (
+            LedgerEntryType::XChainOwnedClaimId,
+            0x0071,
+            "XChainOwnedClaimId",
+        ),
+        (
+            LedgerEntryType::XChainOwnedCreateAccountClaimId,
+            0x0074,
+            "XChainOwnedCreateAccountClaimId",
+        ),
         (LedgerEntryType::MPTokenIssuance, 0x007E, "MPTokenIssuance"),
         (LedgerEntryType::MPToken, 0x007F, "MPToken"),
         (LedgerEntryType::Credential, 0x0081, "Credential"),
-        (LedgerEntryType::PermissionedDomain, 0x0082, "PermissionedDomain"),
+        (
+            LedgerEntryType::PermissionedDomain,
+            0x0082,
+            "PermissionedDomain",
+        ),
         (LedgerEntryType::Delegate, 0x0083, "Delegate"),
         (LedgerEntryType::Vault, 0x0084, "Vault"),
         (LedgerEntryType::NegativeUNL, 0x004E, "NegativeUNL"),
@@ -798,7 +889,15 @@ fn new_ledger_entry_type_codes_roundtrip() {
     for (variant, code, name) in variants {
         assert_eq!(variant.code(), code, "code mismatch for {name}");
         assert_eq!(variant.as_str(), name, "name mismatch for code {code:#06x}");
-        assert_eq!(LedgerEntryType::from_code(code).unwrap(), variant, "from_code({code:#06x}) failed");
-        assert_eq!(LedgerEntryType::from_name(name).unwrap(), variant, "from_name({name}) failed");
+        assert_eq!(
+            LedgerEntryType::from_code(code).unwrap(),
+            variant,
+            "from_code({code:#06x}) failed"
+        );
+        assert_eq!(
+            LedgerEntryType::from_name(name).unwrap(),
+            variant,
+            "from_name({name}) failed"
+        );
     }
 }
