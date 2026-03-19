@@ -11,6 +11,7 @@ pub mod engine;
 pub mod error;
 pub mod params;
 pub mod phase;
+pub mod simulator;
 pub mod types;
 pub mod unl;
 

@@ -11,3 +11,4 @@ rxrpl-primitives = { workspace = true }
 rxrpl-crypto = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true
+rand = { workspace = true }

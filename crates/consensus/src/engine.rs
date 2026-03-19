@@ -72,6 +72,11 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         }
     }
 
+    /// Get a mutable reference to the adapter (for simulation/testing).
+    pub fn adapter_mut(&mut self) -> &mut A {
+        &mut self.adapter
+    }
+
     /// Get the UNL.
     pub fn unl(&self) -> &TrustedValidatorList {
         &self.unl
