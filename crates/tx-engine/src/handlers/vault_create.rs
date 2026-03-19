@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -46,10 +46,7 @@ impl Transactor for VaultCreateTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -82,8 +79,7 @@ impl Transactor for VaultCreateTransactor {
         }
 
         let vault_key = keylet::vault(&account_id, seq);
-        let vault_data =
-            serde_json::to_vec(&vault).map_err(|_| TransactionResult::TefInternal)?;
+        let vault_data = serde_json::to_vec(&vault).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .insert(vault_key, vault_data)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -92,8 +88,7 @@ impl Transactor for VaultCreateTransactor {
         helpers::increment_sequence(&mut account);
         helpers::adjust_owner_count(&mut account, 1);
 
-        let acct_data =
-            serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
+        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
             .map_err(|_| TransactionResult::TefInternal)?;

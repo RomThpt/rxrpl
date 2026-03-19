@@ -1,6 +1,6 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::keylet;
 use rxrpl_protocol::TransactionResult;
+use rxrpl_protocol::keylet;
 use serde_json::Value;
 
 use crate::helpers;
@@ -37,10 +37,7 @@ impl Transactor for TicketCreateTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemMalformed)?;
@@ -82,8 +79,7 @@ impl Transactor for TicketCreateTransactor {
         acct["Sequence"] = Value::from(new_seq);
         helpers::adjust_owner_count(&mut acct, count as i32);
 
-        let new_bytes =
-            serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
+        let new_bytes = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
         ctx.view
             .update(acct_key, new_bytes)
             .map_err(|_| TransactionResult::TemMalformed)?;

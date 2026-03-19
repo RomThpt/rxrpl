@@ -1,6 +1,6 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::keylet;
 use rxrpl_protocol::TransactionResult;
+use rxrpl_protocol::keylet;
 use serde_json::Value;
 
 use crate::helpers;
@@ -33,19 +33,13 @@ impl Transactor for SetRegularKeyTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemMalformed)?;
         let key = keylet::account(&account_id);
 
-        let bytes = ctx
-            .view
-            .read(&key)
-            .ok_or(TransactionResult::TerNoAccount)?;
+        let bytes = ctx.view.read(&key).ok_or(TransactionResult::TerNoAccount)?;
         let mut obj: Value =
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
 
@@ -57,8 +51,7 @@ impl Transactor for SetRegularKeyTransactor {
 
         helpers::increment_sequence(&mut obj);
 
-        let new_bytes =
-            serde_json::to_vec(&obj).map_err(|_| TransactionResult::TemMalformed)?;
+        let new_bytes = serde_json::to_vec(&obj).map_err(|_| TransactionResult::TemMalformed)?;
         ctx.view
             .update(key, new_bytes)
             .map_err(|_| TransactionResult::TemMalformed)?;

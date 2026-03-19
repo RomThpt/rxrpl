@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::amm_helpers;
 use crate::helpers;
@@ -10,19 +10,22 @@ pub struct AMMDepositTransactor;
 impl Transactor for AMMDepositTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
         let asset = ctx.tx.get("Asset").ok_or(TransactionResult::TemMalformed)?;
-        let asset2 = ctx.tx.get("Asset2").ok_or(TransactionResult::TemMalformed)?;
+        let asset2 = ctx
+            .tx
+            .get("Asset2")
+            .ok_or(TransactionResult::TemMalformed)?;
 
         amm_helpers::validate_asset(asset)?;
         amm_helpers::validate_asset(asset2)?;
 
-        let amount = helpers::get_u64_str_field(ctx.tx, "Amount")
-            .ok_or(TransactionResult::TemBadAmount)?;
+        let amount =
+            helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
         if amount == 0 {
             return Err(TransactionResult::TemBadAmount);
         }
 
-        let amount2 = helpers::get_u64_str_field(ctx.tx, "Amount2")
-            .ok_or(TransactionResult::TemBadAmount)?;
+        let amount2 =
+            helpers::get_u64_str_field(ctx.tx, "Amount2").ok_or(TransactionResult::TemBadAmount)?;
         if amount2 == 0 {
             return Err(TransactionResult::TemBadAmount);
         }
@@ -40,18 +43,15 @@ impl Transactor for AMMDepositTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        let deposit1 = helpers::get_u64_str_field(ctx.tx, "Amount")
-            .ok_or(TransactionResult::TemBadAmount)?;
-        let deposit2 = helpers::get_u64_str_field(ctx.tx, "Amount2")
-            .ok_or(TransactionResult::TemBadAmount)?;
+        let deposit1 =
+            helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
+        let deposit2 =
+            helpers::get_u64_str_field(ctx.tx, "Amount2").ok_or(TransactionResult::TemBadAmount)?;
 
         let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
         let mut amm = amm_helpers::read_amm(ctx.view, &amm_key)?;
@@ -61,7 +61,8 @@ impl Transactor for AMMDepositTransactor {
         let total_lp = amm_helpers::get_pool_field(&amm, "LPTokenBalance");
 
         // Compute new LP tokens
-        let new_lp = amm_helpers::compute_lp_tokens_deposit(pool1, pool2, deposit1, deposit2, total_lp);
+        let new_lp =
+            amm_helpers::compute_lp_tokens_deposit(pool1, pool2, deposit1, deposit2, total_lp);
 
         // Update AMM entry
         amm["PoolBalance1"] = serde_json::Value::String((pool1 + deposit1).to_string());
@@ -87,8 +88,7 @@ impl Transactor for AMMDepositTransactor {
         helpers::set_balance(&mut account, balance.saturating_sub(total_deducted));
         helpers::increment_sequence(&mut account);
 
-        let acct_data =
-            serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
+        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
             .map_err(|_| TransactionResult::TefInternal)?;

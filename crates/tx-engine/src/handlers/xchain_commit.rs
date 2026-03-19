@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::bridge_helpers;
 use crate::helpers;
@@ -21,8 +21,7 @@ impl Transactor for XChainCommitTransactor {
             .ok_or(TransactionResult::TemMalformed)?;
 
         // Amount is required and must be > 0
-        let amount =
-            helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
+        let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
         if amount == 0 {
             return Err(TransactionResult::TemBadAmount);
         }
@@ -51,8 +50,8 @@ impl Transactor for XChainCommitTransactor {
         }
 
         // Bridge must exist
-        let door_id = decode_account_id(locking_door)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let door_id =
+            decode_account_id(locking_door).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let bridge_key = keylet::bridge(&door_id, &bridge_data);
         if !ctx.view.exists(&bridge_key) {
             return Err(TransactionResult::TecNoEntry);
@@ -66,8 +65,7 @@ impl Transactor for XChainCommitTransactor {
         }
 
         // Check sufficient balance
-        let amount =
-            helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
+        let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
         let fee = helpers::get_fee(ctx.tx);
         let balance = helpers::get_balance(&src_account);
         if balance < amount + fee {
@@ -77,15 +75,11 @@ impl Transactor for XChainCommitTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let amount =
-            helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
 
         let bridge = ctx.tx.get("XChainBridge").unwrap().clone();
         let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge)?;
@@ -124,14 +118,11 @@ impl Transactor for XChainCommitTransactor {
         let mut claim_entry: serde_json::Value =
             serde_json::from_slice(&claim_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        claim_entry["CommitAmount"] =
-            serde_json::Value::String(amount.to_string());
-        claim_entry["SendingAccount"] =
-            serde_json::Value::String(account_str.to_string());
+        claim_entry["CommitAmount"] = serde_json::Value::String(amount.to_string());
+        claim_entry["SendingAccount"] = serde_json::Value::String(account_str.to_string());
 
         if let Some(dest) = helpers::get_str_field(ctx.tx, "OtherChainDestination") {
-            claim_entry["OtherChainDestination"] =
-                serde_json::Value::String(dest.to_string());
+            claim_entry["OtherChainDestination"] = serde_json::Value::String(dest.to_string());
         }
 
         let claim_data =
@@ -170,8 +161,11 @@ mod tests {
 
     fn setup_with_bridge_and_claim() -> Ledger {
         let mut ledger = Ledger::genesis();
-        for (addr, balance) in [(DOOR, 100_000_000u64), (USER, 100_000_000), (SENDER, 50_000_000)]
-        {
+        for (addr, balance) in [
+            (DOOR, 100_000_000u64),
+            (USER, 100_000_000),
+            (SENDER, 50_000_000),
+        ] {
             let id = decode_account_id(addr).unwrap();
             let key = keylet::account(&id);
             let account = serde_json::json!({
@@ -188,8 +182,7 @@ mod tests {
         }
 
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data =
-            bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
         let bridge_key = keylet::bridge(&door_id, &bridge_data);
         let bridge_entry = serde_json::json!({
             "LedgerEntryType": "Bridge",
@@ -353,8 +346,7 @@ mod tests {
         assert_eq!(src["Balance"].as_str().unwrap(), "45000000");
 
         // Verify claim ID entry updated with commitment
-        let bridge_data =
-            bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
         let claim_key = keylet::xchain_claim_id(&bridge_data, 1);
         let claim_bytes = sandbox.read(&claim_key).unwrap();
         let claim: serde_json::Value = serde_json::from_slice(&claim_bytes).unwrap();

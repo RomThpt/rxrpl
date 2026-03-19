@@ -134,7 +134,6 @@ pub fn read_account_by_address(
         .map_err(|_| TransactionResult::TemInvalidAccountId)?;
     let key = rxrpl_protocol::keylet::account(&account_id);
     let bytes = view.read(&key).ok_or(TransactionResult::TerNoAccount)?;
-    let obj: Value =
-        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let obj: Value = serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
     Ok((key, obj))
 }

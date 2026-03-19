@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -21,36 +21,39 @@ impl Transactor for CredentialAcceptTransactor {
         let subject_str = helpers::get_account(ctx.tx)?;
         helpers::read_account_by_address(ctx.view, subject_str)?;
 
-        let issuer_str = helpers::get_str_field(ctx.tx, "Issuer")
-            .ok_or(TransactionResult::TemMalformed)?;
+        let issuer_str =
+            helpers::get_str_field(ctx.tx, "Issuer").ok_or(TransactionResult::TemMalformed)?;
         let credential_type = helpers::get_str_field(ctx.tx, "CredentialType")
             .ok_or(TransactionResult::TemMalformed)?;
 
-        let subject_id = decode_account_id(subject_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let issuer_id = decode_account_id(issuer_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let subject_id =
+            decode_account_id(subject_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let issuer_id =
+            decode_account_id(issuer_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let cred_key = keylet::credential(&subject_id, &issuer_id, credential_type.as_bytes());
 
-        let entry_bytes = ctx.view.read(&cred_key)
+        let entry_bytes = ctx
+            .view
+            .read(&cred_key)
             .ok_or(TransactionResult::TecNoEntry)?;
-        let entry: serde_json::Value = serde_json::from_slice(&entry_bytes)
-            .map_err(|_| TransactionResult::TefInternal)?;
+        let entry: serde_json::Value =
+            serde_json::from_slice(&entry_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        if entry.get("Accepted").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if entry
+            .get("Accepted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             return Err(TransactionResult::TecDuplicate);
         }
 
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let subject_str = helpers::get_account(ctx.tx)?;
-        let subject_id = decode_account_id(subject_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let subject_id =
+            decode_account_id(subject_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
         let account_key = keylet::account(&subject_id);
         let account_bytes = ctx
@@ -64,8 +67,8 @@ impl Transactor for CredentialAcceptTransactor {
 
         let issuer_str = helpers::get_str_field(ctx.tx, "Issuer").unwrap();
         let credential_type = helpers::get_str_field(ctx.tx, "CredentialType").unwrap();
-        let issuer_id = decode_account_id(issuer_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let issuer_id =
+            decode_account_id(issuer_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let cred_key = keylet::credential(&subject_id, &issuer_id, credential_type.as_bytes());
 
         let entry_bytes = ctx
@@ -77,8 +80,7 @@ impl Transactor for CredentialAcceptTransactor {
 
         entry["Accepted"] = serde_json::Value::Bool(true);
 
-        let entry_data =
-            serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?;
+        let entry_data = serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(cred_key, entry_data)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -154,7 +156,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             CredentialAcceptTransactor.preflight(&ctx),
             Err(TransactionResult::TemMalformed)
@@ -171,7 +177,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             CredentialAcceptTransactor.preflight(&ctx),
             Err(TransactionResult::TemMalformed)
@@ -206,7 +216,11 @@ mod tests {
             "CredentialType": "KYC",
             "Fee": "12",
         });
-        let ctx = PreclaimContext { tx: &tx, view: &view, rules: &rules };
+        let ctx = PreclaimContext {
+            tx: &tx,
+            view: &view,
+            rules: &rules,
+        };
         assert_eq!(
             CredentialAcceptTransactor.preclaim(&ctx),
             Err(TransactionResult::TecNoEntry)
@@ -227,7 +241,11 @@ mod tests {
             "CredentialType": "KYC",
             "Fee": "12",
         });
-        let ctx = PreclaimContext { tx: &tx, view: &view, rules: &rules };
+        let ctx = PreclaimContext {
+            tx: &tx,
+            view: &view,
+            rules: &rules,
+        };
         assert_eq!(
             CredentialAcceptTransactor.preclaim(&ctx),
             Err(TransactionResult::TecDuplicate)

@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -16,11 +16,11 @@ impl Transactor for EscrowCancelTransactor {
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
         let owner_str =
             helpers::get_str_field(ctx.tx, "Owner").ok_or(TransactionResult::TemMalformed)?;
-        let offer_seq =
-            helpers::get_u32_field(ctx.tx, "OfferSequence").ok_or(TransactionResult::TemMalformed)?;
+        let offer_seq = helpers::get_u32_field(ctx.tx, "OfferSequence")
+            .ok_or(TransactionResult::TemMalformed)?;
 
-        let owner_id = decode_account_id(owner_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let owner_id =
+            decode_account_id(owner_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let escrow_key = keylet::escrow(&owner_id, offer_seq);
 
         let escrow_bytes = ctx
@@ -43,17 +43,14 @@ impl Transactor for EscrowCancelTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let owner_str =
             helpers::get_str_field(ctx.tx, "Owner").ok_or(TransactionResult::TemMalformed)?;
-        let offer_seq =
-            helpers::get_u32_field(ctx.tx, "OfferSequence").ok_or(TransactionResult::TemMalformed)?;
+        let offer_seq = helpers::get_u32_field(ctx.tx, "OfferSequence")
+            .ok_or(TransactionResult::TemMalformed)?;
 
-        let owner_id = decode_account_id(owner_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let owner_id =
+            decode_account_id(owner_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let escrow_key = keylet::escrow(&owner_id, offer_seq);
 
         let escrow_bytes = ctx
@@ -83,8 +80,8 @@ impl Transactor for EscrowCancelTransactor {
 
         // Increment sequence on tx sender
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         if account_id == owner_id {
             helpers::increment_sequence(&mut owner_account);
         }
@@ -102,12 +99,11 @@ impl Transactor for EscrowCancelTransactor {
                 .view
                 .read(&sender_key)
                 .ok_or(TransactionResult::TerNoAccount)?;
-            let mut sender_account: serde_json::Value =
-                serde_json::from_slice(&sender_bytes)
-                    .map_err(|_| TransactionResult::TefInternal)?;
-            helpers::increment_sequence(&mut sender_account);
-            let sender_data = serde_json::to_vec(&sender_account)
+            let mut sender_account: serde_json::Value = serde_json::from_slice(&sender_bytes)
                 .map_err(|_| TransactionResult::TefInternal)?;
+            helpers::increment_sequence(&mut sender_account);
+            let sender_data =
+                serde_json::to_vec(&sender_account).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
                 .update(sender_key, sender_data)
                 .map_err(|_| TransactionResult::TefInternal)?;

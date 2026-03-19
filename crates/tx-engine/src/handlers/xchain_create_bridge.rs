@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::bridge_helpers;
 use crate::helpers;
@@ -15,9 +15,8 @@ impl Transactor for XChainCreateBridgeTransactor {
             .ok_or(TransactionResult::TemXChainBridge)?;
 
         // SignatureReward is required and must be > 0
-        let reward =
-            helpers::get_u64_str_field(ctx.tx, "SignatureReward")
-                .ok_or(TransactionResult::TemMalformed)?;
+        let reward = helpers::get_u64_str_field(ctx.tx, "SignatureReward")
+            .ok_or(TransactionResult::TemMalformed)?;
         if reward == 0 {
             return Err(TransactionResult::TemMalformed);
         }
@@ -50,8 +49,8 @@ impl Transactor for XChainCreateBridgeTransactor {
 
         // Bridge must not already exist
         let bridge_data = bridge_helpers::serialize_bridge_spec(bridge)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let bridge_key = keylet::bridge(&account_id, &bridge_data);
         if ctx.view.exists(&bridge_key) {
             return Err(TransactionResult::TecDuplicate);
@@ -60,13 +59,10 @@ impl Transactor for XChainCreateBridgeTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
         let bridge = ctx.tx.get("XChainBridge").unwrap().clone();
         let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge)?;
@@ -87,12 +83,10 @@ impl Transactor for XChainCreateBridgeTransactor {
         });
 
         if let Some(min_create) = helpers::get_u64_str_field(ctx.tx, "MinAccountCreateAmount") {
-            entry["MinAccountCreateAmount"] =
-                serde_json::Value::String(min_create.to_string());
+            entry["MinAccountCreateAmount"] = serde_json::Value::String(min_create.to_string());
         }
 
-        let entry_data =
-            serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?;
+        let entry_data = serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .insert(bridge_key, entry_data)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -297,8 +291,7 @@ mod tests {
 
         // Verify bridge entry exists
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data =
-            bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
         let bridge_key = keylet::bridge(&door_id, &bridge_data);
         let entry_bytes = sandbox.read(&bridge_key).unwrap();
         let entry: serde_json::Value = serde_json::from_slice(&entry_bytes).unwrap();
@@ -317,8 +310,7 @@ mod tests {
     fn preclaim_duplicate_bridge() {
         let mut ledger = setup_ledger();
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data =
-            bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
         let bridge_key = keylet::bridge(&door_id, &bridge_data);
         let entry = serde_json::json!({
             "LedgerEntryType": "Bridge",

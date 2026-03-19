@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::bridge_helpers;
 use crate::helpers;
@@ -20,8 +20,7 @@ impl Transactor for XChainAccountCreateCommitTransactor {
         helpers::get_destination(ctx.tx)?;
 
         // Amount is required and must be > 0
-        let amount =
-            helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
+        let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
         if amount == 0 {
             return Err(TransactionResult::TemBadAmount);
         }
@@ -45,18 +44,16 @@ impl Transactor for XChainAccountCreateCommitTransactor {
             .get("LockingChainDoor")
             .and_then(|v| v.as_str())
             .ok_or(TransactionResult::TemXChainBridge)?;
-        let door_id = decode_account_id(locking_door)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let door_id =
+            decode_account_id(locking_door).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let bridge_key = keylet::bridge(&door_id, &bridge_data);
         if !ctx.view.exists(&bridge_key) {
             return Err(TransactionResult::TecNoEntry);
         }
 
         // Check sufficient balance for Amount + SignatureReward + Fee
-        let amount =
-            helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
-        let sig_reward =
-            helpers::get_u64_str_field(ctx.tx, "SignatureReward").unwrap_or(0);
+        let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
+        let sig_reward = helpers::get_u64_str_field(ctx.tx, "SignatureReward").unwrap_or(0);
         let fee = helpers::get_fee(ctx.tx);
         let balance = helpers::get_balance(&src_account);
         if balance < amount + sig_reward + fee {
@@ -66,18 +63,13 @@ impl Transactor for XChainAccountCreateCommitTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let destination_str = helpers::get_destination(ctx.tx)?.to_string();
-        let amount =
-            helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
-        let sig_reward =
-            helpers::get_u64_str_field(ctx.tx, "SignatureReward").unwrap_or(0);
+        let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
+        let sig_reward = helpers::get_u64_str_field(ctx.tx, "SignatureReward").unwrap_or(0);
 
         let bridge = ctx.tx.get("XChainBridge").unwrap().clone();
         let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge)?;
@@ -113,8 +105,8 @@ impl Transactor for XChainAccountCreateCommitTransactor {
             .get("LockingChainDoor")
             .and_then(|v| v.as_str())
             .ok_or(TransactionResult::TemXChainBridge)?;
-        let door_id = decode_account_id(locking_door)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let door_id =
+            decode_account_id(locking_door).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let bridge_key = keylet::bridge(&door_id, &bridge_data);
 
         let bridge_bytes = ctx
@@ -129,8 +121,7 @@ impl Transactor for XChainAccountCreateCommitTransactor {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         let new_count = current_count + 1;
-        bridge_entry["XChainAccountCreateCount"] =
-            serde_json::Value::String(new_count.to_string());
+        bridge_entry["XChainAccountCreateCount"] = serde_json::Value::String(new_count.to_string());
 
         let bridge_data_updated =
             serde_json::to_vec(&bridge_entry).map_err(|_| TransactionResult::TefInternal)?;
@@ -139,8 +130,7 @@ impl Transactor for XChainAccountCreateCommitTransactor {
             .map_err(|_| TransactionResult::TefInternal)?;
 
         // Create XChainOwnedCreateAccountClaimID entry
-        let create_key =
-            keylet::xchain_create_account_claim_id(&bridge_data, new_count);
+        let create_key = keylet::xchain_create_account_claim_id(&bridge_data, new_count);
         let create_entry = serde_json::json!({
             "LedgerEntryType": "XChainOwnedCreateAccountClaimID",
             "Account": account_str,
@@ -190,9 +180,11 @@ mod tests {
 
     fn setup_with_bridge() -> Ledger {
         let mut ledger = Ledger::genesis();
-        for (addr, balance) in
-            [(DOOR, 100_000_000u64), (USER, 100_000_000), (SENDER, 50_000_000)]
-        {
+        for (addr, balance) in [
+            (DOOR, 100_000_000u64),
+            (USER, 100_000_000),
+            (SENDER, 50_000_000),
+        ] {
             let id = decode_account_id(addr).unwrap();
             let key = keylet::account(&id);
             let account = serde_json::json!({
@@ -209,8 +201,7 @@ mod tests {
         }
 
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data =
-            bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
         let bridge_key = keylet::bridge(&door_id, &bridge_data);
         let bridge_entry = serde_json::json!({
             "LedgerEntryType": "Bridge",
@@ -339,23 +330,19 @@ mod tests {
 
         // Verify bridge counter incremented
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data =
-            bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
         let bridge_key = keylet::bridge(&door_id, &bridge_data);
         let bridge_bytes = sandbox.read(&bridge_key).unwrap();
-        let bridge_entry: serde_json::Value =
-            serde_json::from_slice(&bridge_bytes).unwrap();
+        let bridge_entry: serde_json::Value = serde_json::from_slice(&bridge_bytes).unwrap();
         assert_eq!(
             bridge_entry["XChainAccountCreateCount"].as_str().unwrap(),
             "1"
         );
 
         // Verify create account claim ID entry exists
-        let create_key =
-            keylet::xchain_create_account_claim_id(&bridge_data, 1);
+        let create_key = keylet::xchain_create_account_claim_id(&bridge_data, 1);
         let create_bytes = sandbox.read(&create_key).unwrap();
-        let create: serde_json::Value =
-            serde_json::from_slice(&create_bytes).unwrap();
+        let create: serde_json::Value = serde_json::from_slice(&create_bytes).unwrap();
         assert_eq!(
             create["LedgerEntryType"].as_str().unwrap(),
             "XChainOwnedCreateAccountClaimID"

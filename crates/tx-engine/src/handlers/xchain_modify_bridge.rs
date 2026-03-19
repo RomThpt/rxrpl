@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::bridge_helpers;
 use crate::helpers;
@@ -18,8 +18,7 @@ impl Transactor for XChainModifyBridgeTransactor {
 
         // At least one of SignatureReward or MinAccountCreateAmount must be present
         let has_reward = helpers::get_u64_str_field(ctx.tx, "SignatureReward").is_some();
-        let has_min_create =
-            helpers::get_u64_str_field(ctx.tx, "MinAccountCreateAmount").is_some();
+        let has_min_create = helpers::get_u64_str_field(ctx.tx, "MinAccountCreateAmount").is_some();
         if !has_reward && !has_min_create {
             return Err(TransactionResult::TemMalformed);
         }
@@ -48,8 +47,8 @@ impl Transactor for XChainModifyBridgeTransactor {
 
         // Bridge must exist
         let bridge_data = bridge_helpers::serialize_bridge_spec(bridge)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let bridge_key = keylet::bridge(&account_id, &bridge_data);
         if !ctx.view.exists(&bridge_key) {
             return Err(TransactionResult::TecNoEntry);
@@ -58,13 +57,10 @@ impl Transactor for XChainModifyBridgeTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
         let bridge = ctx.tx.get("XChainBridge").unwrap();
         let bridge_data = bridge_helpers::serialize_bridge_spec(bridge)?;
@@ -83,12 +79,10 @@ impl Transactor for XChainModifyBridgeTransactor {
             entry["SignatureReward"] = serde_json::Value::String(reward.to_string());
         }
         if let Some(min_create) = helpers::get_u64_str_field(ctx.tx, "MinAccountCreateAmount") {
-            entry["MinAccountCreateAmount"] =
-                serde_json::Value::String(min_create.to_string());
+            entry["MinAccountCreateAmount"] = serde_json::Value::String(min_create.to_string());
         }
 
-        let entry_data =
-            serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?;
+        let entry_data = serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(bridge_key, entry_data)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -155,8 +149,7 @@ mod tests {
         }
 
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data =
-            bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
         let bridge_key = keylet::bridge(&door_id, &bridge_data);
         let entry = serde_json::json!({
             "LedgerEntryType": "Bridge",
@@ -281,8 +274,7 @@ mod tests {
 
         // Verify updated
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data =
-            bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
         let bridge_key = keylet::bridge(&door_id, &bridge_data);
         let entry_bytes = sandbox.read(&bridge_key).unwrap();
         let entry: serde_json::Value = serde_json::from_slice(&entry_bytes).unwrap();
@@ -316,8 +308,7 @@ mod tests {
         assert_eq!(result, TransactionResult::TesSuccess);
 
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data =
-            bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
         let bridge_key = keylet::bridge(&door_id, &bridge_data);
         let entry_bytes = sandbox.read(&bridge_key).unwrap();
         let entry: serde_json::Value = serde_json::from_slice(&entry_bytes).unwrap();

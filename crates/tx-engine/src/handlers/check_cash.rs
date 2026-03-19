@@ -1,6 +1,6 @@
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_primitives::Hash256;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -62,10 +62,7 @@ impl Transactor for CheckCashTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let check_key = parse_check_id(ctx.tx)?;
 
         let check_bytes = ctx
@@ -87,8 +84,8 @@ impl Transactor for CheckCashTransactor {
             }
             amount
         } else {
-            let deliver_min =
-                helpers::get_u64_str_field(ctx.tx, "DeliverMin").ok_or(TransactionResult::TemMalformed)?;
+            let deliver_min = helpers::get_u64_str_field(ctx.tx, "DeliverMin")
+                .ok_or(TransactionResult::TemMalformed)?;
             if deliver_min > send_max {
                 return Err(TransactionResult::TecInsufficientPayment);
             }
@@ -99,8 +96,8 @@ impl Transactor for CheckCashTransactor {
         let check_src_str = check["Account"]
             .as_str()
             .ok_or(TransactionResult::TefInternal)?;
-        let check_src_id = decode_account_id(check_src_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let check_src_id =
+            decode_account_id(check_src_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let check_src_key = keylet::account(&check_src_id);
 
         let check_src_bytes = ctx
@@ -108,8 +105,7 @@ impl Transactor for CheckCashTransactor {
             .read(&check_src_key)
             .ok_or(TransactionResult::TerNoAccount)?;
         let mut check_src_account: serde_json::Value =
-            serde_json::from_slice(&check_src_bytes)
-                .map_err(|_| TransactionResult::TefInternal)?;
+            serde_json::from_slice(&check_src_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
         let src_balance = helpers::get_balance(&check_src_account);
         if src_balance < cash_amount {
@@ -118,16 +114,16 @@ impl Transactor for CheckCashTransactor {
         helpers::set_balance(&mut check_src_account, src_balance - cash_amount);
         helpers::adjust_owner_count(&mut check_src_account, -1);
 
-        let check_src_data = serde_json::to_vec(&check_src_account)
-            .map_err(|_| TransactionResult::TefInternal)?;
+        let check_src_data =
+            serde_json::to_vec(&check_src_account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(check_src_key, check_src_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
         // Credit destination (tx sender)
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let account_key = keylet::account(&account_id);
 
         let account_bytes = ctx
@@ -175,10 +171,7 @@ mod tests {
         let src_id = decode_account_id(src).unwrap();
         let dst_id = decode_account_id(dst).unwrap();
 
-        for (addr, id, balance) in [
-            (src, &src_id, 100_000_000u64),
-            (dst, &dst_id, 50_000_000),
-        ] {
+        for (addr, id, balance) in [(src, &src_id, 100_000_000u64), (dst, &dst_id, 50_000_000)] {
             let key = keylet::account(id);
             let account = serde_json::json!({
                 "LedgerEntryType": "AccountRoot",
@@ -222,7 +215,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             CheckCashTransactor.preflight(&ctx),
             Err(TransactionResult::TemMalformed)

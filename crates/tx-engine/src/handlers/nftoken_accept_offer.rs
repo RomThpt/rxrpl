@@ -1,6 +1,6 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
 use rxrpl_primitives::Hash256;
+use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
 use crate::helpers;
@@ -38,19 +38,17 @@ impl Transactor for NFTokenAcceptOfferTransactor {
 
         // Verify referenced offers exist
         if let Some(sell_id) = helpers::get_str_field(ctx.tx, "NFTokenSellOffer") {
-            let key_bytes =
-                hex::decode(sell_id).map_err(|_| TransactionResult::TemMalformed)?;
-            let key = Hash256::from_slice(&key_bytes)
-                .map_err(|_| TransactionResult::TemMalformed)?;
+            let key_bytes = hex::decode(sell_id).map_err(|_| TransactionResult::TemMalformed)?;
+            let key =
+                Hash256::from_slice(&key_bytes).map_err(|_| TransactionResult::TemMalformed)?;
             if !ctx.view.exists(&key) {
                 return Err(TransactionResult::TecNoEntry);
             }
         }
         if let Some(buy_id) = helpers::get_str_field(ctx.tx, "NFTokenBuyOffer") {
-            let key_bytes =
-                hex::decode(buy_id).map_err(|_| TransactionResult::TemMalformed)?;
-            let key = Hash256::from_slice(&key_bytes)
-                .map_err(|_| TransactionResult::TemMalformed)?;
+            let key_bytes = hex::decode(buy_id).map_err(|_| TransactionResult::TemMalformed)?;
+            let key =
+                Hash256::from_slice(&key_bytes).map_err(|_| TransactionResult::TemMalformed)?;
             if !ctx.view.exists(&key) {
                 return Err(TransactionResult::TecNoEntry);
             }
@@ -59,10 +57,7 @@ impl Transactor for NFTokenAcceptOfferTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -114,14 +109,9 @@ impl NFTokenAcceptOfferTransactor {
         ctx: &mut ApplyContext<'_>,
         offer_hex: &str,
     ) -> Result<(Hash256, Value), TransactionResult> {
-        let key_bytes =
-            hex::decode(offer_hex).map_err(|_| TransactionResult::TemMalformed)?;
-        let key = Hash256::from_slice(&key_bytes)
-            .map_err(|_| TransactionResult::TemMalformed)?;
-        let bytes = ctx
-            .view
-            .read(&key)
-            .ok_or(TransactionResult::TecNoEntry)?;
+        let key_bytes = hex::decode(offer_hex).map_err(|_| TransactionResult::TemMalformed)?;
+        let key = Hash256::from_slice(&key_bytes).map_err(|_| TransactionResult::TemMalformed)?;
+        let bytes = ctx.view.read(&key).ok_or(TransactionResult::TecNoEntry)?;
         let offer: Value =
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
         Ok((key, offer))
@@ -141,8 +131,8 @@ impl NFTokenAcceptOfferTransactor {
         // Remove from seller's page
         let from_page_key = keylet::nftoken_page_min(&from_id);
         if let Some(page_bytes) = ctx.view.read(&from_page_key) {
-            let page: Value = serde_json::from_slice(&page_bytes)
-                .map_err(|_| TransactionResult::TefInternal)?;
+            let page: Value =
+                serde_json::from_slice(&page_bytes).map_err(|_| TransactionResult::TefInternal)?;
             let mut tokens: Vec<Value> = page
                 .get("NFTokens")
                 .and_then(|v| v.as_array())
@@ -176,8 +166,8 @@ impl NFTokenAcceptOfferTransactor {
                     "LedgerEntryType": "NFTokenPage",
                     "NFTokens": tokens,
                 });
-                let data = serde_json::to_vec(&page_obj)
-                    .map_err(|_| TransactionResult::TefInternal)?;
+                let data =
+                    serde_json::to_vec(&page_obj).map_err(|_| TransactionResult::TefInternal)?;
                 ctx.view
                     .update(from_page_key, data)
                     .map_err(|_| TransactionResult::TefInternal)?;
@@ -192,8 +182,8 @@ impl NFTokenAcceptOfferTransactor {
             let mut from_acct: Value = serde_json::from_slice(&from_acct_bytes)
                 .map_err(|_| TransactionResult::TefInternal)?;
             helpers::adjust_owner_count(&mut from_acct, -1);
-            let from_data = serde_json::to_vec(&from_acct)
-                .map_err(|_| TransactionResult::TefInternal)?;
+            let from_data =
+                serde_json::to_vec(&from_acct).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
                 .update(from_acct_key, from_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
@@ -220,8 +210,8 @@ impl NFTokenAcceptOfferTransactor {
                     "LedgerEntryType": "NFTokenPage",
                     "NFTokens": to_tokens,
                 });
-                let to_data = serde_json::to_vec(&to_page_obj)
-                    .map_err(|_| TransactionResult::TefInternal)?;
+                let to_data =
+                    serde_json::to_vec(&to_page_obj).map_err(|_| TransactionResult::TefInternal)?;
 
                 if ctx.view.exists(&to_page_key) {
                     ctx.view
@@ -242,8 +232,8 @@ impl NFTokenAcceptOfferTransactor {
                 let mut to_acct: Value = serde_json::from_slice(&to_acct_bytes)
                     .map_err(|_| TransactionResult::TefInternal)?;
                 helpers::adjust_owner_count(&mut to_acct, 1);
-                let to_acct_data = serde_json::to_vec(&to_acct)
-                    .map_err(|_| TransactionResult::TefInternal)?;
+                let to_acct_data =
+                    serde_json::to_vec(&to_acct).map_err(|_| TransactionResult::TefInternal)?;
                 ctx.view
                     .update(to_acct_key, to_acct_data)
                     .map_err(|_| TransactionResult::TefInternal)?;
@@ -296,8 +286,7 @@ impl NFTokenAcceptOfferTransactor {
 
         let to_balance = helpers::get_balance(&to_acct);
         helpers::set_balance(&mut to_acct, to_balance + amount);
-        let to_data =
-            serde_json::to_vec(&to_acct).map_err(|_| TransactionResult::TefInternal)?;
+        let to_data = serde_json::to_vec(&to_acct).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(to_key, to_data)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -324,8 +313,7 @@ impl NFTokenAcceptOfferTransactor {
         let mut owner_acct: Value =
             serde_json::from_slice(&owner_bytes).map_err(|_| TransactionResult::TefInternal)?;
         helpers::adjust_owner_count(&mut owner_acct, -1);
-        let data =
-            serde_json::to_vec(&owner_acct).map_err(|_| TransactionResult::TefInternal)?;
+        let data = serde_json::to_vec(&owner_acct).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(owner_acct_key, data)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -547,7 +535,10 @@ mod tests {
         let offer_key = keylet::nftoken_offer(&seller_id, 2);
         let offer_id = hex::encode(offer_key.as_bytes()).to_uppercase();
 
-        sandbox2.into_changes().apply_to_ledger(&mut ledger).unwrap();
+        sandbox2
+            .into_changes()
+            .apply_to_ledger(&mut ledger)
+            .unwrap();
 
         (ledger, nftoken_id, offer_id)
     }

@@ -1,6 +1,6 @@
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_primitives::Hash256;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -61,10 +61,7 @@ impl Transactor for PaymentChannelFundTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let channel_key = parse_channel(ctx.tx)?;
         let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
         let account_str = helpers::get_account(ctx.tx)?;
@@ -88,15 +85,14 @@ impl Transactor for PaymentChannelFundTransactor {
             channel["Expiration"] = serde_json::Value::from(expiration);
         }
 
-        let ch_data =
-            serde_json::to_vec(&channel).map_err(|_| TransactionResult::TefInternal)?;
+        let ch_data = serde_json::to_vec(&channel).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(channel_key, ch_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
         // Debit sender
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let account_key = keylet::account(&account_id);
         let account_bytes = ctx
             .view

@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -39,8 +39,8 @@ impl Transactor for DelegateSetTransactor {
 
             let owner_id = decode_account_id(account_str)
                 .map_err(|_| TransactionResult::TemInvalidAccountId)?;
-            let auth_id = decode_account_id(authorize)
-                .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+            let auth_id =
+                decode_account_id(authorize).map_err(|_| TransactionResult::TemInvalidAccountId)?;
             let delegate_key = keylet::delegate(&owner_id, &auth_id);
             if ctx.view.exists(&delegate_key) {
                 return Err(TransactionResult::TecDuplicate);
@@ -61,13 +61,10 @@ impl Transactor for DelegateSetTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
         let account_key = keylet::account(&account_id);
         let account_bytes = ctx
@@ -80,8 +77,8 @@ impl Transactor for DelegateSetTransactor {
         helpers::increment_sequence(&mut account);
 
         if let Some(authorize) = helpers::get_str_field(ctx.tx, "Authorize") {
-            let auth_id = decode_account_id(authorize)
-                .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+            let auth_id =
+                decode_account_id(authorize).map_err(|_| TransactionResult::TemInvalidAccountId)?;
             let delegate_key = keylet::delegate(&account_id, &auth_id);
 
             let entry = serde_json::json!({
@@ -166,7 +163,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             DelegateSetTransactor.preflight(&ctx),
             Err(TransactionResult::TemMalformed)
@@ -183,7 +184,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             DelegateSetTransactor.preflight(&ctx),
             Err(TransactionResult::TemMalformed)
@@ -199,7 +204,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             DelegateSetTransactor.preflight(&ctx),
             Err(TransactionResult::TemMalformed)
@@ -295,7 +304,11 @@ mod tests {
             "Authorize": BOB,
             "Fee": "12",
         });
-        let ctx = PreclaimContext { tx: &tx, view: &view, rules: &rules };
+        let ctx = PreclaimContext {
+            tx: &tx,
+            view: &view,
+            rules: &rules,
+        };
         assert_eq!(
             DelegateSetTransactor.preclaim(&ctx),
             Err(TransactionResult::TecDuplicate)

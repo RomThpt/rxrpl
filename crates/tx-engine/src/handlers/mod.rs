@@ -1,3 +1,4 @@
+pub mod account_delete;
 pub mod account_set;
 pub mod amm_bid;
 pub mod amm_clawback;
@@ -6,6 +7,7 @@ pub mod amm_delete;
 pub mod amm_deposit;
 pub mod amm_vote;
 pub mod amm_withdraw;
+pub mod batch_submit;
 pub mod check_cancel;
 pub mod check_cash;
 pub mod check_create;
@@ -17,6 +19,7 @@ pub mod delegate_set;
 pub mod deposit_preauth;
 pub mod did_delete;
 pub mod did_set;
+pub mod enable_amendment;
 pub mod escrow_cancel;
 pub mod escrow_create;
 pub mod escrow_finish;
@@ -31,6 +34,7 @@ pub mod nftoken_cancel_offer;
 pub mod nftoken_create_offer;
 pub mod nftoken_mint;
 pub mod nftoken_modify;
+pub mod nickname_set;
 pub mod offer_cancel;
 pub mod offer_create;
 pub mod oracle_delete;
@@ -41,10 +45,13 @@ pub mod payment_channel_create;
 pub mod payment_channel_fund;
 pub mod permissioned_domain_delete;
 pub mod permissioned_domain_set;
+pub mod set_fee;
+pub mod set_hook;
 pub mod set_regular_key;
 pub mod signer_list_set;
 pub mod ticket_create;
 pub mod trust_set;
+pub mod unl_modify;
 pub mod vault_clawback;
 pub mod vault_create;
 pub mod vault_delete;
@@ -67,7 +74,10 @@ use crate::registry::TransactorRegistry;
 /// Register all implemented Phase A transaction handlers.
 pub fn register_phase_a(registry: &mut TransactorRegistry) {
     registry.register(TransactionType::Payment, payment::PaymentTransactor);
-    registry.register(TransactionType::AccountSet, account_set::AccountSetTransactor);
+    registry.register(
+        TransactionType::AccountSet,
+        account_set::AccountSetTransactor,
+    );
     registry.register(
         TransactionType::SetRegularKey,
         set_regular_key::SetRegularKeyTransactor,
@@ -89,6 +99,10 @@ pub fn register_phase_a(registry: &mut TransactorRegistry) {
         TransactionType::SignerListSet,
         signer_list_set::SignerListSetTransactor,
     );
+    registry.register(
+        TransactionType::AccountDelete,
+        account_delete::AccountDeleteTransactor,
+    );
 }
 
 /// Register all implemented Phase B transaction handlers.
@@ -109,10 +123,7 @@ pub fn register_phase_b(registry: &mut TransactorRegistry) {
         TransactionType::CheckCreate,
         check_create::CheckCreateTransactor,
     );
-    registry.register(
-        TransactionType::CheckCash,
-        check_cash::CheckCashTransactor,
-    );
+    registry.register(TransactionType::CheckCash, check_cash::CheckCashTransactor);
     registry.register(
         TransactionType::CheckCancel,
         check_cancel::CheckCancelTransactor,
@@ -229,10 +240,7 @@ pub fn register_phase_d1(registry: &mut TransactorRegistry) {
         TransactionType::VaultCreate,
         vault_create::VaultCreateTransactor,
     );
-    registry.register(
-        TransactionType::VaultSet,
-        vault_set::VaultSetTransactor,
-    );
+    registry.register(TransactionType::VaultSet, vault_set::VaultSetTransactor);
     registry.register(
         TransactionType::VaultDelete,
         vault_delete::VaultDeleteTransactor,
@@ -253,10 +261,7 @@ pub fn register_phase_d1(registry: &mut TransactorRegistry) {
 
 /// Register all implemented Phase D2 transaction handlers (AMM).
 pub fn register_phase_d2(registry: &mut TransactorRegistry) {
-    registry.register(
-        TransactionType::AMMCreate,
-        amm_create::AMMCreateTransactor,
-    );
+    registry.register(TransactionType::AMMCreate, amm_create::AMMCreateTransactor);
     registry.register(
         TransactionType::AMMDeposit,
         amm_deposit::AMMDepositTransactor,
@@ -267,10 +272,7 @@ pub fn register_phase_d2(registry: &mut TransactorRegistry) {
     );
     registry.register(TransactionType::AMMVote, amm_vote::AMMVoteTransactor);
     registry.register(TransactionType::AMMBid, amm_bid::AMMBidTransactor);
-    registry.register(
-        TransactionType::AMMDelete,
-        amm_delete::AMMDeleteTransactor,
-    );
+    registry.register(TransactionType::AMMDelete, amm_delete::AMMDeleteTransactor);
     registry.register(
         TransactionType::AMMClawback,
         amm_clawback::AMMClawbackTransactor,
@@ -311,4 +313,37 @@ pub fn register_phase_e(registry: &mut TransactorRegistry) {
         TransactionType::XChainAddAccountCreateAttestation,
         xchain_add_account_create_attestation::XChainAddAccountCreateAttestationTransactor,
     );
+}
+
+/// Register the BatchSubmit handler (atomic batch execution).
+pub fn register_batch(registry: &mut TransactorRegistry) {
+    registry.register(
+        TransactionType::BatchSubmit,
+        batch_submit::BatchSubmitTransactor,
+    );
+}
+
+/// Register stub handlers for unimplemented transaction types.
+///
+/// These return `TemDisabled` at preflight: SetHook (WASM hooks),
+/// NickNameSet (deprecated 2014).
+pub fn register_stubs(registry: &mut TransactorRegistry) {
+    registry.register(TransactionType::SetHook, set_hook::SetHookTransactor);
+    registry.register(
+        TransactionType::NickNameSet,
+        nickname_set::NickNameSetTransactor,
+    );
+}
+
+/// Register pseudo-transaction handlers.
+///
+/// Pseudo-transactions (EnableAmendment, SetFee, UNLModify) are emitted by
+/// consensus and bypass signature verification and fee deduction in the engine.
+pub fn register_pseudo(registry: &mut TransactorRegistry) {
+    registry.register(
+        TransactionType::EnableAmendment,
+        enable_amendment::EnableAmendmentTransactor,
+    );
+    registry.register(TransactionType::SetFee, set_fee::SetFeeTransactor);
+    registry.register(TransactionType::UNLModify, unl_modify::UNLModifyTransactor);
 }

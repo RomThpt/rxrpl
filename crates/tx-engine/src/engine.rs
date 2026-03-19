@@ -1,6 +1,6 @@
 use rxrpl_amendment::Rules;
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult, TransactionType};
+use rxrpl_protocol::{TransactionResult, TransactionType, keylet};
 use serde_json::Value;
 
 use crate::error::TxEngineError;
@@ -52,6 +52,16 @@ impl TxEngine {
         }
     }
 
+    /// Check if a transaction type is a pseudo-transaction.
+    ///
+    /// Pseudo-transactions bypass signature verification and fee deduction.
+    fn is_pseudo_transaction(tx_type: &TransactionType) -> bool {
+        matches!(
+            tx_type,
+            TransactionType::EnableAmendment | TransactionType::SetFee | TransactionType::UNLModify
+        )
+    }
+
     /// Apply a transaction to a ledger.
     ///
     /// Returns the transaction result code.
@@ -76,14 +86,16 @@ impl TxEngine {
             .get(&tx_type)
             .ok_or_else(|| TxEngineError::UnknownTransactionType(tx_type_str.into()))?;
 
+        let is_pseudo = Self::is_pseudo_transaction(&tx_type);
+
         // 2. Preflight (stateless)
         let preflight_ctx = PreflightContext { tx, rules, fees };
         if let Err(result) = transactor.preflight(&preflight_ctx) {
             return Ok(result);
         }
 
-        // 3. Verify signature
-        if !self.skip_signature_verification {
+        // 3. Verify signature (skip for pseudo-transactions)
+        if !is_pseudo && !self.skip_signature_verification {
             if let Err(_e) = rxrpl_protocol::tx::verify_signature(tx) {
                 return Ok(TransactionResult::TefBadSignature);
             }
@@ -104,49 +116,63 @@ impl TxEngine {
         }
 
         // 6. Create sandbox and deduct fee from sender account
+        //    (skip fee deduction for pseudo-transactions)
         let drops_before = ledger.header.drops;
         let view = LedgerView::with_fees(ledger, fees.clone());
         let mut sandbox = Sandbox::new(&view);
 
-        let fee_drops = helpers::get_fee(tx);
-        if fee_drops > 0 {
-            let account_str = helpers::get_account(tx)
-                .map_err(TxEngineError::TransactionFailed)?;
-            let account_id = decode_account_id(account_str)
-                .map_err(|_| TxEngineError::TransactionFailed(TransactionResult::TemInvalidAccountId))?;
-            let account_key = keylet::account(&account_id);
+        if !is_pseudo {
+            let fee_drops = helpers::get_fee(tx);
+            if fee_drops > 0 {
+                let account_str =
+                    helpers::get_account(tx).map_err(TxEngineError::TransactionFailed)?;
+                let account_id = decode_account_id(account_str).map_err(|_| {
+                    TxEngineError::TransactionFailed(TransactionResult::TemInvalidAccountId)
+                })?;
+                let account_key = keylet::account(&account_id);
 
-            let account_bytes = sandbox
-                .read(&account_key)
-                .ok_or(TxEngineError::TransactionFailed(TransactionResult::TerNoAccount))?;
-            let mut account_obj: Value = serde_json::from_slice(&account_bytes)
-                .map_err(|_| TxEngineError::TransactionFailed(TransactionResult::TefInternal))?;
+                let account_bytes =
+                    sandbox
+                        .read(&account_key)
+                        .ok_or(TxEngineError::TransactionFailed(
+                            TransactionResult::TerNoAccount,
+                        ))?;
+                let mut account_obj: Value =
+                    serde_json::from_slice(&account_bytes).map_err(|_| {
+                        TxEngineError::TransactionFailed(TransactionResult::TefInternal)
+                    })?;
 
-            let balance = helpers::get_balance(&account_obj);
-            if balance < fee_drops {
-                return Ok(TransactionResult::TerInsufFee);
+                let balance = helpers::get_balance(&account_obj);
+                if balance < fee_drops {
+                    return Ok(TransactionResult::TerInsufFee);
+                }
+                helpers::set_balance(&mut account_obj, balance - fee_drops);
+
+                let updated = serde_json::to_vec(&account_obj).map_err(|_| {
+                    TxEngineError::TransactionFailed(TransactionResult::TefInternal)
+                })?;
+                sandbox.update(account_key, updated).map_err(|_| {
+                    TxEngineError::TransactionFailed(TransactionResult::TefInternal)
+                })?;
+
+                sandbox.destroy_drops(fee_drops);
             }
-            helpers::set_balance(&mut account_obj, balance - fee_drops);
-
-            let updated = serde_json::to_vec(&account_obj)
-                .map_err(|_| TxEngineError::TransactionFailed(TransactionResult::TefInternal))?;
-            sandbox
-                .update(account_key, updated)
-                .map_err(|_| TxEngineError::TransactionFailed(TransactionResult::TefInternal))?;
-
-            sandbox.destroy_drops(fee_drops);
         }
 
         // 7. Apply in child sandbox
         let mut child = sandbox.child();
-        let mut apply_ctx = ApplyContext {
-            tx,
-            view: &mut child,
-            rules,
-            fees,
-        };
 
-        let handler_result = transactor.apply(&mut apply_ctx);
+        let handler_result = if tx_type == TransactionType::BatchSubmit {
+            self.apply_batch(tx, &mut child, rules, fees)
+        } else {
+            let mut apply_ctx = ApplyContext {
+                tx,
+                view: &mut child,
+                rules,
+                fees,
+            };
+            transactor.apply(&mut apply_ctx)
+        };
         // Consume child to release borrow on sandbox
         let child_changes = child.into_changes();
 
@@ -170,11 +196,13 @@ impl TxEngine {
         let changes = sandbox.into_changes();
         let drops_after = drops_before.saturating_sub(changes.destroyed_drops);
 
+        let tx_for_invariants = if is_pseudo { None } else { Some(tx) };
         if let Err(msg) = invariants::run_invariant_checks(
             &self.invariants,
             &changes,
             drops_before,
             drops_after,
+            tx_for_invariants,
         ) {
             return Err(TxEngineError::InvariantViolated(msg));
         }
@@ -198,12 +226,107 @@ impl TxEngine {
                     "AffectedNodes": meta.affected_nodes.len(),
                 },
             });
-            let tx_data = serde_json::to_vec(&tx_record)
-                .map_err(|e| TxEngineError::Codec(e.to_string()))?;
+            let tx_data =
+                serde_json::to_vec(&tx_record).map_err(|e| TxEngineError::Codec(e.to_string()))?;
             ledger.add_transaction(tx_hash, tx_data)?;
         }
 
         Ok(result)
+    }
+
+    /// Execute inner transactions for a BatchSubmit atomically.
+    ///
+    /// Each inner transaction goes through preflight, preclaim, fee deduction,
+    /// and apply within the same sandbox. If any inner tx fails, the entire
+    /// batch is rolled back.
+    fn apply_batch(
+        &self,
+        batch_tx: &Value,
+        sandbox: &mut crate::view::sandbox::Sandbox<'_>,
+        rules: &Rules,
+        fees: &FeeSettings,
+    ) -> Result<TransactionResult, TransactionResult> {
+        use crate::handlers::batch_submit::extract_inner_txs;
+        use crate::transactor::PreclaimContext;
+
+        let inner_txs = extract_inner_txs(batch_tx)?;
+
+        for inner_tx in inner_txs {
+            let inner_type_str = inner_tx
+                .get("TransactionType")
+                .and_then(|v| v.as_str())
+                .ok_or(TransactionResult::TemMalformed)?;
+
+            let inner_type = TransactionType::from_name(inner_type_str)
+                .map_err(|_| TransactionResult::TemMalformed)?;
+
+            let transactor = self
+                .registry
+                .get(&inner_type)
+                .ok_or(TransactionResult::TemMalformed)?;
+
+            // Preflight
+            let preflight_ctx = crate::transactor::PreflightContext {
+                tx: inner_tx,
+                rules,
+                fees,
+            };
+            transactor.preflight(&preflight_ctx)?;
+
+            // Preclaim against current sandbox state (sees prior inner tx mutations)
+            let preclaim_ctx = PreclaimContext {
+                tx: inner_tx,
+                view: sandbox as &dyn ReadView,
+                rules,
+            };
+            transactor.preclaim(&preclaim_ctx)?;
+
+            // Fee deduction for inner transaction
+            let fee_drops = helpers::get_fee(inner_tx);
+            if fee_drops > 0 {
+                let account_str =
+                    helpers::get_account(inner_tx).map_err(|_| TransactionResult::TemMalformed)?;
+                let account_id = decode_account_id(account_str)
+                    .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+                let account_key = keylet::account(&account_id);
+
+                let account_bytes = sandbox
+                    .read(&account_key)
+                    .ok_or(TransactionResult::TerNoAccount)?;
+                let mut account_obj: Value = serde_json::from_slice(&account_bytes)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+
+                let balance = helpers::get_balance(&account_obj);
+                if balance < fee_drops {
+                    return Err(TransactionResult::TerInsufFee);
+                }
+                helpers::set_balance(&mut account_obj, balance - fee_drops);
+
+                let updated =
+                    serde_json::to_vec(&account_obj).map_err(|_| TransactionResult::TefInternal)?;
+                sandbox
+                    .update(account_key, updated)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+
+                sandbox.destroy_drops(fee_drops);
+            }
+
+            // Apply inner transaction
+            let mut apply_ctx = ApplyContext {
+                tx: inner_tx,
+                view: sandbox,
+                rules,
+                fees,
+            };
+            let inner_result = transactor.apply(&mut apply_ctx)?;
+
+            // Only TesSuccess is acceptable for atomic batch
+            if inner_result != TransactionResult::TesSuccess {
+                return Err(inner_result);
+            }
+        }
+
+        Ok(TransactionResult::TesSuccess)
     }
 }
 
@@ -267,7 +390,10 @@ mod tests {
         }
     }
 
-    fn test_engine_with(tx_type: TransactionType, transactor: impl Transactor + 'static) -> TxEngine {
+    fn test_engine_with(
+        tx_type: TransactionType,
+        transactor: impl Transactor + 'static,
+    ) -> TxEngine {
         let mut registry = TransactorRegistry::new();
         registry.register(tx_type, transactor);
         TxEngine::new_without_sig_check(registry)
@@ -440,7 +566,214 @@ mod tests {
         });
         let signed_tx = rxrpl_protocol::tx::sign(&tx, &kp).unwrap();
 
-        let result = engine.apply(&signed_tx, &mut ledger, &rules, &fees).unwrap();
+        let result = engine
+            .apply(&signed_tx, &mut ledger, &rules, &fees)
+            .unwrap();
         assert_eq!(result, TransactionResult::TesSuccess);
+    }
+
+    // ---- BatchSubmit engine tests ----
+
+    fn batch_engine() -> TxEngine {
+        let mut registry = TransactorRegistry::new();
+        crate::handlers::register_phase_a(&mut registry);
+        crate::handlers::register_batch(&mut registry);
+        TxEngine::new_without_sig_check(registry)
+    }
+
+    fn setup_two_accounts(addr1: &str, bal1: u64, addr2: &str, bal2: u64) -> Ledger {
+        let mut ledger = Ledger::genesis();
+        for (addr, bal) in [(addr1, bal1), (addr2, bal2)] {
+            let id = decode_account_id(addr).unwrap();
+            let key = keylet::account(&id);
+            let account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot",
+                "Account": addr,
+                "Balance": bal.to_string(),
+                "Sequence": 1,
+                "OwnerCount": 0,
+                "Flags": 0,
+            });
+            ledger
+                .put_state(key, serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        ledger
+    }
+
+    const GENESIS: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    const DEST: &str = "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe";
+
+    #[test]
+    fn batch_submit_single_payment() {
+        let engine = batch_engine();
+        let mut ledger = setup_two_accounts(GENESIS, 1_000_000_000, DEST, 10_000_000);
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+
+        let tx = serde_json::json!({
+            "TransactionType": "BatchSubmit",
+            "Account": GENESIS,
+            "Fee": "10",
+            "RawTransactions": [{
+                "RawTransaction": {
+                    "InnerTx": {
+                        "TransactionType": "Payment",
+                        "Account": GENESIS,
+                        "Destination": DEST,
+                        "Amount": "5000000",
+                        "Fee": "12",
+                        "Sequence": 1,
+                    }
+                }
+            }],
+        });
+
+        let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        // Check balances: genesis lost outer fee (10) + inner fee (12) + payment (5M)
+        let gid = decode_account_id(GENESIS).unwrap();
+        let gdata = ledger.get_state(&keylet::account(&gid)).unwrap();
+        let gobj: Value = serde_json::from_slice(gdata).unwrap();
+        let genesis_balance: u64 = gobj["Balance"].as_str().unwrap().parse().unwrap();
+        assert_eq!(genesis_balance, 1_000_000_000 - 10 - 12 - 5_000_000);
+
+        // Dest gained 5M
+        let did = decode_account_id(DEST).unwrap();
+        let ddata = ledger.get_state(&keylet::account(&did)).unwrap();
+        let dobj: Value = serde_json::from_slice(ddata).unwrap();
+        let dest_balance: u64 = dobj["Balance"].as_str().unwrap().parse().unwrap();
+        assert_eq!(dest_balance, 10_000_000 + 5_000_000);
+    }
+
+    #[test]
+    fn batch_submit_multiple_payments() {
+        let engine = batch_engine();
+        let mut ledger = setup_two_accounts(GENESIS, 1_000_000_000, DEST, 10_000_000);
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+
+        let tx = serde_json::json!({
+            "TransactionType": "BatchSubmit",
+            "Account": GENESIS,
+            "Fee": "20",
+            "RawTransactions": [
+                {
+                    "RawTransaction": {
+                        "InnerTx": {
+                            "TransactionType": "Payment",
+                            "Account": GENESIS,
+                            "Destination": DEST,
+                            "Amount": "1000000",
+                            "Fee": "12",
+                            "Sequence": 1,
+                        }
+                    }
+                },
+                {
+                    "RawTransaction": {
+                        "InnerTx": {
+                            "TransactionType": "Payment",
+                            "Account": GENESIS,
+                            "Destination": DEST,
+                            "Amount": "2000000",
+                            "Fee": "12",
+                            "Sequence": 2,
+                        }
+                    }
+                },
+            ],
+        });
+
+        let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        // Genesis: -20 (outer fee) -12 -1M -12 -2M
+        let gid = decode_account_id(GENESIS).unwrap();
+        let gdata = ledger.get_state(&keylet::account(&gid)).unwrap();
+        let gobj: Value = serde_json::from_slice(gdata).unwrap();
+        let genesis_balance: u64 = gobj["Balance"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            genesis_balance,
+            1_000_000_000 - 20 - 12 - 1_000_000 - 12 - 2_000_000
+        );
+
+        // Dest: +1M +2M
+        let did = decode_account_id(DEST).unwrap();
+        let ddata = ledger.get_state(&keylet::account(&did)).unwrap();
+        let dobj: Value = serde_json::from_slice(ddata).unwrap();
+        let dest_balance: u64 = dobj["Balance"].as_str().unwrap().parse().unwrap();
+        assert_eq!(dest_balance, 10_000_000 + 1_000_000 + 2_000_000);
+    }
+
+    #[test]
+    fn batch_submit_inner_failure_rolls_back() {
+        let engine = batch_engine();
+        // Give dest only 1 XRP so it exists but second payment from dest will fail
+        let mut ledger = setup_two_accounts(GENESIS, 1_000_000_000, DEST, 1_000_000);
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+
+        let tx = serde_json::json!({
+            "TransactionType": "BatchSubmit",
+            "Account": GENESIS,
+            "Fee": "20",
+            "RawTransactions": [
+                {
+                    "RawTransaction": {
+                        "InnerTx": {
+                            "TransactionType": "Payment",
+                            "Account": GENESIS,
+                            "Destination": DEST,
+                            "Amount": "5000000",
+                            "Fee": "12",
+                            "Sequence": 1,
+                        }
+                    }
+                },
+                {
+                    "RawTransaction": {
+                        "InnerTx": {
+                            "TransactionType": "Payment",
+                            "Account": DEST,
+                            "Destination": GENESIS,
+                            "Amount": "999999999999",
+                            "Fee": "12",
+                            "Sequence": 1,
+                        }
+                    }
+                },
+            ],
+        });
+
+        let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
+        // Inner tx failure => batch fails, but outer fee is still claimed (tec)
+        assert!(result != TransactionResult::TesSuccess);
+
+        // Genesis balance: only outer fee deducted (child sandbox rolled back)
+        let gid = decode_account_id(GENESIS).unwrap();
+        let gdata = ledger.get_state(&keylet::account(&gid)).unwrap();
+        let gobj: Value = serde_json::from_slice(gdata).unwrap();
+        let genesis_balance: u64 = gobj["Balance"].as_str().unwrap().parse().unwrap();
+        assert_eq!(genesis_balance, 1_000_000_000 - 20);
+    }
+
+    #[test]
+    fn batch_submit_empty_rejected() {
+        let engine = batch_engine();
+        let mut ledger = setup_ledger_with_account(GENESIS, 1_000_000_000);
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+
+        let tx = serde_json::json!({
+            "TransactionType": "BatchSubmit",
+            "Account": GENESIS,
+            "Fee": "10",
+            "RawTransactions": [],
+        });
+
+        let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
+        assert_eq!(result, TransactionResult::TemMalformed);
     }
 }

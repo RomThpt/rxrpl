@@ -1,5 +1,6 @@
 use crate::invariants::InvariantCheck;
 use crate::view::sandbox::SandboxChanges;
+use serde_json::Value;
 
 /// Invariant: XRP cannot be created. The total supply must not increase.
 ///
@@ -17,6 +18,7 @@ impl InvariantCheck for XrpNotCreated {
         _changes: &SandboxChanges,
         drops_before: u64,
         drops_after: u64,
+        _tx: Option<&Value>,
     ) -> Result<(), String> {
         if drops_after > drops_before {
             return Err(format!(
@@ -46,20 +48,20 @@ mod tests {
     fn xrp_supply_unchanged() {
         let check = XrpNotCreated;
         let changes = empty_changes(0);
-        assert!(check.check(&changes, 100, 100).is_ok());
+        assert!(check.check(&changes, 100, 100, None).is_ok());
     }
 
     #[test]
     fn xrp_supply_decreased() {
         let check = XrpNotCreated;
         let changes = empty_changes(10);
-        assert!(check.check(&changes, 100, 90).is_ok());
+        assert!(check.check(&changes, 100, 90, None).is_ok());
     }
 
     #[test]
     fn xrp_supply_increased_fails() {
         let check = XrpNotCreated;
         let changes = empty_changes(0);
-        assert!(check.check(&changes, 100, 110).is_err());
+        assert!(check.check(&changes, 100, 110, None).is_err());
     }
 }

@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -43,13 +43,10 @@ impl Transactor for DIDSetTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
         let account_key = keylet::account(&account_id);
         let account_bytes = ctx
@@ -88,8 +85,7 @@ impl Transactor for DIDSetTransactor {
             entry["Data"] = serde_json::Value::String(data.to_string());
         }
 
-        let entry_data =
-            serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?;
+        let entry_data = serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?;
 
         if is_create {
             ctx.view
@@ -152,7 +148,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             DIDSetTransactor.preflight(&ctx),
             Err(TransactionResult::TemMalformed)
@@ -169,7 +169,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             DIDSetTransactor.preflight(&ctx),
             Err(TransactionResult::TemMalformed)
@@ -186,7 +190,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(DIDSetTransactor.preflight(&ctx), Ok(()));
     }
 

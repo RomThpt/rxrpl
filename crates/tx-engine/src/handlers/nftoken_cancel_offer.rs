@@ -1,6 +1,6 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
 use rxrpl_primitives::Hash256;
+use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
 use crate::helpers;
@@ -34,10 +34,7 @@ impl Transactor for NFTokenCancelOfferTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -57,8 +54,8 @@ impl Transactor for NFTokenCancelOfferTransactor {
                 .view
                 .read(&offer_key)
                 .ok_or(TransactionResult::TecNoEntry)?;
-            let offer: Value = serde_json::from_slice(&offer_bytes)
-                .map_err(|_| TransactionResult::TefInternal)?;
+            let offer: Value =
+                serde_json::from_slice(&offer_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
             // Verify caller is the offer creator
             let owner = offer
@@ -75,18 +72,18 @@ impl Transactor for NFTokenCancelOfferTransactor {
                 .map_err(|_| TransactionResult::TefInternal)?;
 
             // Adjust owner count for the offer creator
-            let owner_id = decode_account_id(owner)
-                .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+            let owner_id =
+                decode_account_id(owner).map_err(|_| TransactionResult::TemInvalidAccountId)?;
             let owner_acct_key = keylet::account(&owner_id);
             let owner_bytes = ctx
                 .view
                 .read(&owner_acct_key)
                 .ok_or(TransactionResult::TerNoAccount)?;
-            let mut owner_acct: Value = serde_json::from_slice(&owner_bytes)
-                .map_err(|_| TransactionResult::TefInternal)?;
+            let mut owner_acct: Value =
+                serde_json::from_slice(&owner_bytes).map_err(|_| TransactionResult::TefInternal)?;
             helpers::adjust_owner_count(&mut owner_acct, -1);
-            let owner_data = serde_json::to_vec(&owner_acct)
-                .map_err(|_| TransactionResult::TefInternal)?;
+            let owner_data =
+                serde_json::to_vec(&owner_acct).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
                 .update(owner_acct_key, owner_data)
                 .map_err(|_| TransactionResult::TefInternal)?;

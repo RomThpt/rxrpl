@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
 use crate::helpers;
@@ -9,8 +9,8 @@ pub struct NFTokenBurnTransactor;
 
 impl Transactor for NFTokenBurnTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
-        let id = helpers::get_str_field(ctx.tx, "NFTokenID")
-            .ok_or(TransactionResult::TemMalformed)?;
+        let id =
+            helpers::get_str_field(ctx.tx, "NFTokenID").ok_or(TransactionResult::TemMalformed)?;
         if id.len() != 64 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(TransactionResult::TemMalformed);
         }
@@ -28,7 +28,10 @@ impl Transactor for NFTokenBurnTransactor {
 
         // Check token exists in owner's page
         let page_key = keylet::nftoken_page_min(&owner_id);
-        let page_bytes = ctx.view.read(&page_key).ok_or(TransactionResult::TecNoEntry)?;
+        let page_bytes = ctx
+            .view
+            .read(&page_key)
+            .ok_or(TransactionResult::TecNoEntry)?;
         let page: Value =
             serde_json::from_slice(&page_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
@@ -51,10 +54,7 @@ impl Transactor for NFTokenBurnTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -146,8 +146,7 @@ impl Transactor for NFTokenBurnTransactor {
             let mut updated: Value = serde_json::from_slice(&updated_bytes)
                 .map_err(|_| TransactionResult::TefInternal)?;
             helpers::increment_sequence(&mut updated);
-            let data =
-                serde_json::to_vec(&updated).map_err(|_| TransactionResult::TefInternal)?;
+            let data = serde_json::to_vec(&updated).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
                 .update(caller_key, data)
                 .map_err(|_| TransactionResult::TefInternal)?;

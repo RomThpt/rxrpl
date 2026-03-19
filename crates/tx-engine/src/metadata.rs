@@ -76,7 +76,11 @@ impl SandboxChanges {
                 change_type: ChangeType::Deleted,
                 key: *key,
                 ledger_entry_type: extract_entry_type(data),
-                previous: self.originals.get(key).cloned().or_else(|| Some(data.clone())),
+                previous: self
+                    .originals
+                    .get(key)
+                    .cloned()
+                    .or_else(|| Some(data.clone())),
                 final_fields: None,
             });
         }

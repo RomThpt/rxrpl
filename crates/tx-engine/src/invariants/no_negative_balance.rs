@@ -1,5 +1,6 @@
 use crate::invariants::InvariantCheck;
 use crate::view::sandbox::SandboxChanges;
+use serde_json::Value;
 
 /// Invariant: no account may have a negative XRP balance.
 ///
@@ -17,6 +18,7 @@ impl InvariantCheck for NoNegativeBalance {
         changes: &SandboxChanges,
         _drops_before: u64,
         _drops_after: u64,
+        _tx: Option<&Value>,
     ) -> Result<(), String> {
         for (key, data) in changes.updates.iter().chain(changes.inserts.iter()) {
             if let Ok(obj) = serde_json::from_slice::<serde_json::Value>(data) {
@@ -67,7 +69,7 @@ mod tests {
         changes
             .updates
             .insert(Hash256::new([0x01; 32]), account_bytes("1000000"));
-        assert!(check.check(&changes, 100, 100).is_ok());
+        assert!(check.check(&changes, 100, 100, None).is_ok());
     }
 
     #[test]
@@ -77,7 +79,7 @@ mod tests {
         changes
             .updates
             .insert(Hash256::new([0x01; 32]), account_bytes("0"));
-        assert!(check.check(&changes, 100, 100).is_ok());
+        assert!(check.check(&changes, 100, 100, None).is_ok());
     }
 
     #[test]
@@ -87,7 +89,7 @@ mod tests {
         changes
             .updates
             .insert(Hash256::new([0x01; 32]), account_bytes("-100"));
-        assert!(check.check(&changes, 100, 100).is_err());
+        assert!(check.check(&changes, 100, 100, None).is_err());
     }
 
     #[test]
@@ -100,6 +102,6 @@ mod tests {
         }))
         .unwrap();
         changes.updates.insert(Hash256::new([0x01; 32]), data);
-        assert!(check.check(&changes, 100, 100).is_ok());
+        assert!(check.check(&changes, 100, 100, None).is_ok());
     }
 }

@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -37,10 +37,7 @@ impl Transactor for CheckCreateTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let destination_str = helpers::get_destination(ctx.tx)?;
 
@@ -84,8 +81,7 @@ impl Transactor for CheckCreateTransactor {
             check["Expiration"] = serde_json::Value::from(expiration);
         }
 
-        let check_data =
-            serde_json::to_vec(&check).map_err(|_| TransactionResult::TefInternal)?;
+        let check_data = serde_json::to_vec(&check).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .insert(check_key, check_data)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -139,7 +135,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             CheckCreateTransactor.preflight(&ctx),
             Err(TransactionResult::TemBadSend)

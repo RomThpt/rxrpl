@@ -1,5 +1,6 @@
 use crate::invariants::InvariantCheck;
 use crate::view::sandbox::SandboxChanges;
+use serde_json::Value;
 
 /// Known ledger entry types in the XRPL protocol.
 const KNOWN_ENTRY_TYPES: &[&str] = &[
@@ -48,6 +49,7 @@ impl InvariantCheck for ValidLedgerEntryType {
         changes: &SandboxChanges,
         _drops_before: u64,
         _drops_after: u64,
+        _tx: Option<&Value>,
     ) -> Result<(), String> {
         for (key, data) in &changes.inserts {
             let obj: serde_json::Value = serde_json::from_slice(data)
@@ -56,9 +58,7 @@ impl InvariantCheck for ValidLedgerEntryType {
             let entry_type = obj
                 .get("LedgerEntryType")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    format!("insert at {key} missing LedgerEntryType field")
-                })?;
+                .ok_or_else(|| format!("insert at {key} missing LedgerEntryType field"))?;
 
             if !KNOWN_ENTRY_TYPES.contains(&entry_type) {
                 return Err(format!(
@@ -95,7 +95,7 @@ mod tests {
         }))
         .unwrap();
         changes.inserts.insert(Hash256::new([0x01; 32]), data);
-        assert!(check.check(&changes, 100, 100).is_ok());
+        assert!(check.check(&changes, 100, 100, None).is_ok());
     }
 
     #[test]
@@ -107,7 +107,7 @@ mod tests {
         }))
         .unwrap();
         changes.inserts.insert(Hash256::new([0x01; 32]), data);
-        assert!(check.check(&changes, 100, 100).is_err());
+        assert!(check.check(&changes, 100, 100, None).is_err());
     }
 
     #[test]
@@ -119,13 +119,13 @@ mod tests {
         }))
         .unwrap();
         changes.inserts.insert(Hash256::new([0x01; 32]), data);
-        assert!(check.check(&changes, 100, 100).is_err());
+        assert!(check.check(&changes, 100, 100, None).is_err());
     }
 
     #[test]
     fn no_inserts_passes() {
         let check = ValidLedgerEntryType;
-        assert!(check.check(&empty_changes(), 100, 100).is_ok());
+        assert!(check.check(&empty_changes(), 100, 100, None).is_ok());
     }
 
     #[test]
@@ -138,6 +138,6 @@ mod tests {
         .unwrap();
         // Only inserts are checked, updates are not
         changes.updates.insert(Hash256::new([0x01; 32]), data);
-        assert!(check.check(&changes, 100, 100).is_ok());
+        assert!(check.check(&changes, 100, 100, None).is_ok());
     }
 }

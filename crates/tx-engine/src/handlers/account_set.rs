@@ -1,6 +1,6 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::keylet;
 use rxrpl_protocol::TransactionResult;
+use rxrpl_protocol::keylet;
 use serde_json::Value;
 
 use crate::helpers;
@@ -99,7 +99,11 @@ impl Transactor for AccountSetTransactor {
         }
 
         // Cannot set NoFreeze if GlobalFreeze is already set
-        let set_flag = ctx.tx.get("SetFlag").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let set_flag = ctx
+            .tx
+            .get("SetFlag")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
         if set_flag == Some(ASF_NO_FREEZE) {
             if let Some(bytes) = ctx.view.read(&key) {
                 if let Ok(obj) = serde_json::from_slice::<Value>(&bytes) {
@@ -112,7 +116,11 @@ impl Transactor for AccountSetTransactor {
         }
 
         // Cannot clear NoFreeze once set
-        let clear_flag = ctx.tx.get("ClearFlag").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let clear_flag = ctx
+            .tx
+            .get("ClearFlag")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
         if clear_flag == Some(ASF_NO_FREEZE) {
             return Err(TransactionResult::TecNoPermission);
         }
@@ -120,33 +128,37 @@ impl Transactor for AccountSetTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemMalformed)?;
         let key = keylet::account(&account_id);
 
-        let bytes = ctx
-            .view
-            .read(&key)
-            .ok_or(TransactionResult::TerNoAccount)?;
+        let bytes = ctx.view.read(&key).ok_or(TransactionResult::TerNoAccount)?;
         let mut obj: Value =
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
 
         let mut flags = obj["Flags"].as_u64().unwrap_or(0) as u32;
 
         // Apply SetFlag
-        if let Some(asf) = ctx.tx.get("SetFlag").and_then(|v| v.as_u64()).map(|v| v as u32) {
+        if let Some(asf) = ctx
+            .tx
+            .get("SetFlag")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+        {
             if let Some(lsf) = asf_to_lsf(asf) {
                 flags |= lsf;
             }
         }
 
         // Apply ClearFlag
-        if let Some(asf) = ctx.tx.get("ClearFlag").and_then(|v| v.as_u64()).map(|v| v as u32) {
+        if let Some(asf) = ctx
+            .tx
+            .get("ClearFlag")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+        {
             if let Some(lsf) = asf_to_lsf(asf) {
                 flags &= !lsf;
             }
@@ -200,14 +212,24 @@ impl Transactor for AccountSetTransactor {
         }
 
         // Apply NFTokenMinter
-        if let Some(asf) = ctx.tx.get("SetFlag").and_then(|v| v.as_u64()).map(|v| v as u32) {
+        if let Some(asf) = ctx
+            .tx
+            .get("SetFlag")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+        {
             if asf == ASF_AUTHORIZED_NFTOKEN_MINTER {
                 if let Some(minter) = ctx.tx.get("NFTokenMinter") {
                     obj["NFTokenMinter"] = minter.clone();
                 }
             }
         }
-        if let Some(asf) = ctx.tx.get("ClearFlag").and_then(|v| v.as_u64()).map(|v| v as u32) {
+        if let Some(asf) = ctx
+            .tx
+            .get("ClearFlag")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+        {
             if asf == ASF_AUTHORIZED_NFTOKEN_MINTER {
                 obj.as_object_mut().unwrap().remove("NFTokenMinter");
             }
@@ -216,8 +238,7 @@ impl Transactor for AccountSetTransactor {
         // Increment sequence
         helpers::increment_sequence(&mut obj);
 
-        let new_bytes =
-            serde_json::to_vec(&obj).map_err(|_| TransactionResult::TemMalformed)?;
+        let new_bytes = serde_json::to_vec(&obj).map_err(|_| TransactionResult::TemMalformed)?;
         ctx.view
             .update(key, new_bytes)
             .map_err(|_| TransactionResult::TemMalformed)?;

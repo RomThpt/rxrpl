@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
 use crate::helpers;
@@ -13,8 +13,8 @@ pub struct NFTokenCreateOfferTransactor;
 impl Transactor for NFTokenCreateOfferTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
         // NFTokenID must be present and valid
-        let id = helpers::get_str_field(ctx.tx, "NFTokenID")
-            .ok_or(TransactionResult::TemMalformed)?;
+        let id =
+            helpers::get_str_field(ctx.tx, "NFTokenID").ok_or(TransactionResult::TemMalformed)?;
         if id.len() != 64 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(TransactionResult::TemMalformed);
         }
@@ -39,10 +39,7 @@ impl Transactor for NFTokenCreateOfferTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -60,8 +57,7 @@ impl Transactor for NFTokenCreateOfferTransactor {
         helpers::increment_sequence(&mut acct);
         helpers::adjust_owner_count(&mut acct, 1);
 
-        let acct_data =
-            serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
+        let acct_data = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -88,8 +84,7 @@ impl Transactor for NFTokenCreateOfferTransactor {
             offer["Expiration"] = Value::from(exp);
         }
 
-        let offer_data =
-            serde_json::to_vec(&offer).map_err(|_| TransactionResult::TefInternal)?;
+        let offer_data = serde_json::to_vec(&offer).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .insert(offer_key, offer_data)
             .map_err(|_| TransactionResult::TefInternal)?;

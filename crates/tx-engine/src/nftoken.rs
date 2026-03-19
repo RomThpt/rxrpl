@@ -22,14 +22,13 @@ pub fn parse_nftoken_id(id: &str) -> Result<(u32, u16, String, u32), Transaction
         return Err(TransactionResult::TemMalformed);
     }
 
-    let flags = u32::from_str_radix(&id[0..8], 16)
-        .map_err(|_| TransactionResult::TemMalformed)?;
-    let transfer_fee = u16::from_str_radix(&id[8..12], 16)
-        .map_err(|_| TransactionResult::TemMalformed)?;
+    let flags = u32::from_str_radix(&id[0..8], 16).map_err(|_| TransactionResult::TemMalformed)?;
+    let transfer_fee =
+        u16::from_str_radix(&id[8..12], 16).map_err(|_| TransactionResult::TemMalformed)?;
     // bytes 12..16 are reserved
     let issuer_hex = id[16..56].to_string();
-    let token_seq = u32::from_str_radix(&id[56..64], 16)
-        .map_err(|_| TransactionResult::TemMalformed)?;
+    let token_seq =
+        u32::from_str_radix(&id[56..64], 16).map_err(|_| TransactionResult::TemMalformed)?;
 
     Ok((flags, transfer_fee, issuer_hex, token_seq))
 }

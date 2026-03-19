@@ -20,7 +20,7 @@ impl Default for FeeSettings {
     fn default() -> Self {
         Self {
             base_fee: 10,
-            reserve_base: 10_000_000, // 10 XRP
+            reserve_base: 10_000_000,     // 10 XRP
             reserve_increment: 2_000_000, // 2 XRP
         }
     }

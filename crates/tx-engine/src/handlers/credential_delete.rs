@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -32,10 +32,10 @@ impl Transactor for CredentialDeleteTransactor {
             return Err(TransactionResult::TecNoPermission);
         }
 
-        let subject_id = decode_account_id(subject_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let issuer_id = decode_account_id(issuer_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let subject_id =
+            decode_account_id(subject_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let issuer_id =
+            decode_account_id(issuer_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let credential_type = helpers::get_str_field(ctx.tx, "CredentialType").unwrap();
         let cred_key = keylet::credential(&subject_id, &issuer_id, credential_type.as_bytes());
 
@@ -46,13 +46,10 @@ impl Transactor for CredentialDeleteTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
         let account_key = keylet::account(&account_id);
         let account_bytes = ctx
@@ -68,10 +65,10 @@ impl Transactor for CredentialDeleteTransactor {
         let issuer_str = helpers::get_str_field(ctx.tx, "Issuer").unwrap();
         let credential_type = helpers::get_str_field(ctx.tx, "CredentialType").unwrap();
 
-        let subject_id = decode_account_id(subject_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let issuer_id = decode_account_id(issuer_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let subject_id =
+            decode_account_id(subject_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let issuer_id =
+            decode_account_id(issuer_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let cred_key = keylet::credential(&subject_id, &issuer_id, credential_type.as_bytes());
 
         ctx.view
@@ -88,15 +85,13 @@ impl Transactor for CredentialDeleteTransactor {
                 .view
                 .read(&issuer_account_key)
                 .ok_or(TransactionResult::TerNoAccount)?;
-            let mut issuer_account: serde_json::Value =
-                serde_json::from_slice(&issuer_bytes)
-                    .map_err(|_| TransactionResult::TefInternal)?;
+            let mut issuer_account: serde_json::Value = serde_json::from_slice(&issuer_bytes)
+                .map_err(|_| TransactionResult::TefInternal)?;
 
             helpers::adjust_owner_count(&mut issuer_account, -1);
 
             let issuer_data =
-                serde_json::to_vec(&issuer_account)
-                    .map_err(|_| TransactionResult::TefInternal)?;
+                serde_json::to_vec(&issuer_account).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
                 .update(issuer_account_key, issuer_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
@@ -129,10 +124,7 @@ mod tests {
 
     fn setup_with_credential() -> Ledger {
         let mut ledger = Ledger::genesis();
-        for (addr, balance, owner_count) in [
-            (ALICE, 100_000_000u64, 1u32),
-            (BOB, 50_000_000, 0),
-        ] {
+        for (addr, balance, owner_count) in [(ALICE, 100_000_000u64, 1u32), (BOB, 50_000_000, 0)] {
             let id = decode_account_id(addr).unwrap();
             let key = keylet::account(&id);
             let account = serde_json::json!({
@@ -176,7 +168,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             CredentialDeleteTransactor.preflight(&ctx),
             Err(TransactionResult::TemMalformed)
@@ -213,7 +209,11 @@ mod tests {
             "CredentialType": "KYC",
             "Fee": "12",
         });
-        let ctx = PreclaimContext { tx: &tx, view: &view, rules: &rules };
+        let ctx = PreclaimContext {
+            tx: &tx,
+            view: &view,
+            rules: &rules,
+        };
         assert_eq!(
             CredentialDeleteTransactor.preclaim(&ctx),
             Err(TransactionResult::TecNoPermission)
@@ -249,7 +249,11 @@ mod tests {
             "CredentialType": "KYC",
             "Fee": "12",
         });
-        let ctx = PreclaimContext { tx: &tx, view: &view, rules: &rules };
+        let ctx = PreclaimContext {
+            tx: &tx,
+            view: &view,
+            rules: &rules,
+        };
         assert_eq!(
             CredentialDeleteTransactor.preclaim(&ctx),
             Err(TransactionResult::TecNoEntry)

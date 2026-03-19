@@ -1,6 +1,6 @@
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_primitives::Hash256;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
 use crate::helpers;
@@ -96,10 +96,7 @@ impl Transactor for MPTokenAuthorizeTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -215,8 +212,8 @@ impl Transactor for MPTokenAuthorizeTransactor {
                 .view
                 .read(&acct_key)
                 .ok_or(TransactionResult::TerNoAccount)?;
-            let mut acct: Value = serde_json::from_slice(&acct_bytes)
-                .map_err(|_| TransactionResult::TefInternal)?;
+            let mut acct: Value =
+                serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
             helpers::increment_sequence(&mut acct);
 

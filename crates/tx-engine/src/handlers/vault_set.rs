@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -16,11 +16,11 @@ impl Transactor for VaultSetTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         helpers::read_account_by_address(ctx.view, account_str)?;
 
-        let vault_seq =
-            helpers::get_u32_field(ctx.tx, "VaultSequence").ok_or(TransactionResult::TemMalformed)?;
+        let vault_seq = helpers::get_u32_field(ctx.tx, "VaultSequence")
+            .ok_or(TransactionResult::TemMalformed)?;
 
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let vault_key = keylet::vault(&account_id, vault_seq);
 
         let vault_bytes = ctx
@@ -41,16 +41,13 @@ impl Transactor for VaultSetTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        let vault_seq =
-            helpers::get_u32_field(ctx.tx, "VaultSequence").ok_or(TransactionResult::TemMalformed)?;
+        let vault_seq = helpers::get_u32_field(ctx.tx, "VaultSequence")
+            .ok_or(TransactionResult::TemMalformed)?;
         let vault_key = keylet::vault(&account_id, vault_seq);
 
         let vault_bytes = ctx
@@ -70,8 +67,7 @@ impl Transactor for VaultSetTransactor {
             vault["Flags"] = serde_json::Value::from(flags);
         }
 
-        let vault_data =
-            serde_json::to_vec(&vault).map_err(|_| TransactionResult::TefInternal)?;
+        let vault_data = serde_json::to_vec(&vault).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(vault_key, vault_data)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -86,8 +82,7 @@ impl Transactor for VaultSetTransactor {
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
         helpers::increment_sequence(&mut account);
 
-        let acct_data =
-            serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
+        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
             .map_err(|_| TransactionResult::TefInternal)?;

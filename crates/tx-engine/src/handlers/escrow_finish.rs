@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -25,16 +25,18 @@ impl Transactor for EscrowFinishTransactor {
     }
 
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
-        let owner_str = helpers::get_str_field(ctx.tx, "Owner")
-            .ok_or(TransactionResult::TemMalformed)?;
+        let owner_str =
+            helpers::get_str_field(ctx.tx, "Owner").ok_or(TransactionResult::TemMalformed)?;
         let offer_seq = helpers::get_u32_field(ctx.tx, "OfferSequence")
             .ok_or(TransactionResult::TemMalformed)?;
 
-        let owner_id = decode_account_id(owner_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let owner_id =
+            decode_account_id(owner_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let escrow_key = keylet::escrow(&owner_id, offer_seq);
 
-        let escrow_bytes = ctx.view.read(&escrow_key)
+        let escrow_bytes = ctx
+            .view
+            .read(&escrow_key)
             .ok_or(TransactionResult::TecNoTarget)?;
         let escrow: serde_json::Value =
             serde_json::from_slice(&escrow_bytes).map_err(|_| TransactionResult::TefInternal)?;
@@ -49,20 +51,19 @@ impl Transactor for EscrowFinishTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
-        let owner_str = helpers::get_str_field(ctx.tx, "Owner")
-            .ok_or(TransactionResult::TemMalformed)?;
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
+        let owner_str =
+            helpers::get_str_field(ctx.tx, "Owner").ok_or(TransactionResult::TemMalformed)?;
         let offer_seq = helpers::get_u32_field(ctx.tx, "OfferSequence")
             .ok_or(TransactionResult::TemMalformed)?;
 
-        let owner_id = decode_account_id(owner_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let owner_id =
+            decode_account_id(owner_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let escrow_key = keylet::escrow(&owner_id, offer_seq);
 
-        let escrow_bytes = ctx.view.read(&escrow_key)
+        let escrow_bytes = ctx
+            .view
+            .read(&escrow_key)
             .ok_or(TransactionResult::TecNoTarget)?;
         let escrow: serde_json::Value =
             serde_json::from_slice(&escrow_bytes).map_err(|_| TransactionResult::TefInternal)?;
@@ -114,7 +115,9 @@ impl Transactor for EscrowFinishTransactor {
 
         // Decrement owner count on source
         let owner_key = keylet::account(&owner_id);
-        let owner_bytes = ctx.view.read(&owner_key)
+        let owner_bytes = ctx
+            .view
+            .read(&owner_key)
             .ok_or(TransactionResult::TerNoAccount)?;
         let mut owner_account: serde_json::Value =
             serde_json::from_slice(&owner_bytes).map_err(|_| TransactionResult::TefInternal)?;
@@ -122,8 +125,8 @@ impl Transactor for EscrowFinishTransactor {
 
         // Increment sequence on the transaction sender (not necessarily the owner)
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         if account_id == owner_id {
             helpers::increment_sequence(&mut owner_account);
         }
@@ -137,14 +140,15 @@ impl Transactor for EscrowFinishTransactor {
         // If sender is different from owner, increment sender's sequence
         if account_id != owner_id {
             let sender_key = keylet::account(&account_id);
-            let sender_bytes = ctx.view.read(&sender_key)
+            let sender_bytes = ctx
+                .view
+                .read(&sender_key)
                 .ok_or(TransactionResult::TerNoAccount)?;
-            let mut sender_account: serde_json::Value =
-                serde_json::from_slice(&sender_bytes)
-                    .map_err(|_| TransactionResult::TefInternal)?;
-            helpers::increment_sequence(&mut sender_account);
-            let sender_data = serde_json::to_vec(&sender_account)
+            let mut sender_account: serde_json::Value = serde_json::from_slice(&sender_bytes)
                 .map_err(|_| TransactionResult::TefInternal)?;
+            helpers::increment_sequence(&mut sender_account);
+            let sender_data =
+                serde_json::to_vec(&sender_account).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
                 .update(sender_key, sender_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
@@ -208,7 +212,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             EscrowFinishTransactor.preflight(&ctx),
             Err(TransactionResult::TemMalformed)

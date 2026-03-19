@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::bridge_helpers;
 use crate::helpers;
@@ -33,10 +33,8 @@ impl Transactor for XChainAddAccountCreateAttestationTransactor {
         // Attestation fields are required
         helpers::get_str_field(ctx.tx, "AttestationSignerAccount")
             .ok_or(TransactionResult::TemMalformed)?;
-        helpers::get_str_field(ctx.tx, "PublicKey")
-            .ok_or(TransactionResult::TemMalformed)?;
-        helpers::get_str_field(ctx.tx, "Signature")
-            .ok_or(TransactionResult::TemMalformed)?;
+        helpers::get_str_field(ctx.tx, "PublicKey").ok_or(TransactionResult::TemMalformed)?;
+        helpers::get_str_field(ctx.tx, "Signature").ok_or(TransactionResult::TemMalformed)?;
         helpers::get_str_field(ctx.tx, "AttestationRewardAccount")
             .ok_or(TransactionResult::TemMalformed)?;
         helpers::get_u32_field(ctx.tx, "WasLockingChainSend")
@@ -57,18 +55,16 @@ impl Transactor for XChainAddAccountCreateAttestationTransactor {
             .get("LockingChainDoor")
             .and_then(|v| v.as_str())
             .ok_or(TransactionResult::TemXChainBridge)?;
-        let door_id = decode_account_id(locking_door)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let door_id =
+            decode_account_id(locking_door).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let bridge_key = keylet::bridge(&door_id, &bridge_data);
         if !ctx.view.exists(&bridge_key) {
             return Err(TransactionResult::TecNoEntry);
         }
 
         // Create account claim ID entry must exist
-        let count =
-            helpers::get_u64_str_field(ctx.tx, "XChainAccountCreateCount").unwrap();
-        let create_key =
-            keylet::xchain_create_account_claim_id(&bridge_data, count);
+        let count = helpers::get_u64_str_field(ctx.tx, "XChainAccountCreateCount").unwrap();
+        let create_key = keylet::xchain_create_account_claim_id(&bridge_data, count);
         if !ctx.view.exists(&create_key) {
             return Err(TransactionResult::TecXChainAccountCreatePastSeq);
         }
@@ -76,18 +72,14 @@ impl Transactor for XChainAddAccountCreateAttestationTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
         let bridge = ctx.tx.get("XChainBridge").unwrap().clone();
         let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge)?;
-        let count =
-            helpers::get_u64_str_field(ctx.tx, "XChainAccountCreateCount").unwrap();
+        let count = helpers::get_u64_str_field(ctx.tx, "XChainAccountCreateCount").unwrap();
 
         let attestation_signer = helpers::get_str_field(ctx.tx, "AttestationSignerAccount")
             .ok_or(TransactionResult::TemMalformed)?
@@ -95,10 +87,8 @@ impl Transactor for XChainAddAccountCreateAttestationTransactor {
         let public_key = helpers::get_str_field(ctx.tx, "PublicKey")
             .ok_or(TransactionResult::TemMalformed)?
             .to_string();
-        let amount =
-            helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
-        let sig_reward =
-            helpers::get_u64_str_field(ctx.tx, "SignatureReward").unwrap_or(0);
+        let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
+        let sig_reward = helpers::get_u64_str_field(ctx.tx, "SignatureReward").unwrap_or(0);
         let reward_account = helpers::get_str_field(ctx.tx, "AttestationRewardAccount")
             .ok_or(TransactionResult::TemMalformed)?
             .to_string();
@@ -106,14 +96,13 @@ impl Transactor for XChainAddAccountCreateAttestationTransactor {
             .ok_or(TransactionResult::TemMalformed)?;
 
         // Add attestation to entry's Attestations array
-        let create_key =
-            keylet::xchain_create_account_claim_id(&bridge_data, count);
+        let create_key = keylet::xchain_create_account_claim_id(&bridge_data, count);
         let create_bytes = ctx
             .view
             .read(&create_key)
             .ok_or(TransactionResult::TecXChainAccountCreatePastSeq)?;
-        let mut create_entry: serde_json::Value = serde_json::from_slice(&create_bytes)
-            .map_err(|_| TransactionResult::TefInternal)?;
+        let mut create_entry: serde_json::Value =
+            serde_json::from_slice(&create_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
         let attestation = serde_json::json!({
             "AttestationSignerAccount": attestation_signer,
@@ -200,8 +189,7 @@ mod tests {
         }
 
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data =
-            bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
         let bridge_key = keylet::bridge(&door_id, &bridge_data);
         let bridge_entry = serde_json::json!({
             "LedgerEntryType": "Bridge",
@@ -217,8 +205,7 @@ mod tests {
             .unwrap();
 
         // Create account claim entry
-        let create_key =
-            keylet::xchain_create_account_claim_id(&bridge_data, 1);
+        let create_key = keylet::xchain_create_account_claim_id(&bridge_data, 1);
         let create_entry = serde_json::json!({
             "LedgerEntryType": "XChainOwnedCreateAccountClaimID",
             "Account": USER,
@@ -364,17 +351,16 @@ mod tests {
         assert_eq!(result, TransactionResult::TesSuccess);
 
         // Verify attestation added
-        let bridge_data =
-            bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
-        let create_key =
-            keylet::xchain_create_account_claim_id(&bridge_data, 1);
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
+        let create_key = keylet::xchain_create_account_claim_id(&bridge_data, 1);
         let create_bytes = sandbox.read(&create_key).unwrap();
-        let create: serde_json::Value =
-            serde_json::from_slice(&create_bytes).unwrap();
+        let create: serde_json::Value = serde_json::from_slice(&create_bytes).unwrap();
         let attestations = create["Attestations"].as_array().unwrap();
         assert_eq!(attestations.len(), 1);
         assert_eq!(
-            attestations[0]["AttestationSignerAccount"].as_str().unwrap(),
+            attestations[0]["AttestationSignerAccount"]
+                .as_str()
+                .unwrap(),
             WITNESS
         );
     }
@@ -423,13 +409,10 @@ mod tests {
             .apply(&mut ctx)
             .unwrap();
 
-        let bridge_data =
-            bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
-        let create_key =
-            keylet::xchain_create_account_claim_id(&bridge_data, 1);
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
+        let create_key = keylet::xchain_create_account_claim_id(&bridge_data, 1);
         let create_bytes = sandbox.read(&create_key).unwrap();
-        let create: serde_json::Value =
-            serde_json::from_slice(&create_bytes).unwrap();
+        let create: serde_json::Value = serde_json::from_slice(&create_bytes).unwrap();
         let attestations = create["Attestations"].as_array().unwrap();
         assert_eq!(attestations.len(), 2);
     }

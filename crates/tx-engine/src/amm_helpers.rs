@@ -1,5 +1,4 @@
 /// AMM helper functions for the constant-product market maker.
-
 use rxrpl_primitives::AccountId;
 use rxrpl_protocol::TransactionResult;
 use serde_json::Value;
@@ -37,12 +36,17 @@ pub fn asset_to_bytes(asset: &Value) -> Result<([u8; 20], [u8; 20]), Transaction
 }
 
 /// Compute the AMM keylet from the Asset and Asset2 fields of a transaction.
-pub fn compute_amm_key(asset1: &Value, asset2: &Value) -> Result<rxrpl_primitives::Hash256, TransactionResult> {
+pub fn compute_amm_key(
+    asset1: &Value,
+    asset2: &Value,
+) -> Result<rxrpl_primitives::Hash256, TransactionResult> {
     let (cur1, iss1) = asset_to_bytes(asset1)?;
     let (cur2, iss2) = asset_to_bytes(asset2)?;
     let iss1_id = AccountId::from(iss1);
     let iss2_id = AccountId::from(iss2);
-    Ok(rxrpl_protocol::keylet::amm(&cur1, &iss1_id, &cur2, &iss2_id))
+    Ok(rxrpl_protocol::keylet::amm(
+        &cur1, &iss1_id, &cur2, &iss2_id,
+    ))
 }
 
 /// Compute the AMM keylet from the Asset and Asset2 fields of a transaction
@@ -244,7 +248,8 @@ mod tests {
     #[test]
     fn amm_key_symmetric() {
         let a1 = serde_json::json!("XRP");
-        let a2 = serde_json::json!({"currency": "USD", "issuer": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"});
+        let a2 =
+            serde_json::json!({"currency": "USD", "issuer": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"});
         let k1 = compute_amm_key(&a1, &a2).unwrap();
         let k2 = compute_amm_key(&a2, &a1).unwrap();
         assert_eq!(k1, k2);

@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -26,8 +26,8 @@ impl Transactor for VaultDepositTransactor {
 
         let vault_owner_str =
             helpers::get_str_field(ctx.tx, "VaultOwner").ok_or(TransactionResult::TemMalformed)?;
-        let vault_seq =
-            helpers::get_u32_field(ctx.tx, "VaultSequence").ok_or(TransactionResult::TemMalformed)?;
+        let vault_seq = helpers::get_u32_field(ctx.tx, "VaultSequence")
+            .ok_or(TransactionResult::TemMalformed)?;
 
         let vault_owner_id = decode_account_id(vault_owner_str)
             .map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -67,10 +67,7 @@ impl Transactor for VaultDepositTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let depositor_str = helpers::get_account(ctx.tx)?;
         let depositor_id =
             decode_account_id(depositor_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -78,8 +75,8 @@ impl Transactor for VaultDepositTransactor {
         let vault_owner_str = helpers::get_str_field(ctx.tx, "VaultOwner")
             .ok_or(TransactionResult::TemMalformed)?
             .to_string();
-        let vault_seq =
-            helpers::get_u32_field(ctx.tx, "VaultSequence").ok_or(TransactionResult::TemMalformed)?;
+        let vault_seq = helpers::get_u32_field(ctx.tx, "VaultSequence")
+            .ok_or(TransactionResult::TemMalformed)?;
         let amount =
             helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
 
@@ -115,13 +112,10 @@ impl Transactor for VaultDepositTransactor {
         };
 
         // Update vault
-        vault["TotalDeposited"] =
-            serde_json::Value::String((total_deposited + amount).to_string());
-        vault["TotalShares"] =
-            serde_json::Value::String((total_shares + shares).to_string());
+        vault["TotalDeposited"] = serde_json::Value::String((total_deposited + amount).to_string());
+        vault["TotalShares"] = serde_json::Value::String((total_shares + shares).to_string());
 
-        let vault_data =
-            serde_json::to_vec(&vault).map_err(|_| TransactionResult::TefInternal)?;
+        let vault_data = serde_json::to_vec(&vault).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(vault_key, vault_data)
             .map_err(|_| TransactionResult::TefInternal)?;

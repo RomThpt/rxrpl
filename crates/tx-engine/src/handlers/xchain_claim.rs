@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::bridge_helpers;
 use crate::helpers;
@@ -24,8 +24,7 @@ impl Transactor for XChainClaimTransactor {
         helpers::get_destination(ctx.tx)?;
 
         // Amount is required and must be > 0
-        let amount =
-            helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
+        let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
         if amount == 0 {
             return Err(TransactionResult::TemBadAmount);
         }
@@ -45,8 +44,8 @@ impl Transactor for XChainClaimTransactor {
             .get("LockingChainDoor")
             .and_then(|v| v.as_str())
             .ok_or(TransactionResult::TemXChainBridge)?;
-        let door_id = decode_account_id(locking_door)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let door_id =
+            decode_account_id(locking_door).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let bridge_key = keylet::bridge(&door_id, &bridge_data);
         if !ctx.view.exists(&bridge_key) {
             return Err(TransactionResult::TecNoEntry);
@@ -64,8 +63,8 @@ impl Transactor for XChainClaimTransactor {
             .view
             .read(&claim_key)
             .ok_or(TransactionResult::TecXChainNoClaimId)?;
-        let claim_entry: serde_json::Value = serde_json::from_slice(&claim_bytes)
-            .map_err(|_| TransactionResult::TefInternal)?;
+        let claim_entry: serde_json::Value =
+            serde_json::from_slice(&claim_bytes).map_err(|_| TransactionResult::TefInternal)?;
         let attestations = claim_entry
             .get("Attestations")
             .and_then(|v| v.as_array())
@@ -78,16 +77,12 @@ impl Transactor for XChainClaimTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let destination_str = helpers::get_destination(ctx.tx)?;
-        let amount =
-            helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
+        let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
 
         let bridge = ctx.tx.get("XChainBridge").unwrap().clone();
         let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge)?;
@@ -99,8 +94,8 @@ impl Transactor for XChainClaimTransactor {
             .view
             .read(&claim_key)
             .ok_or(TransactionResult::TecXChainNoClaimId)?;
-        let claim_entry: serde_json::Value = serde_json::from_slice(&claim_bytes)
-            .map_err(|_| TransactionResult::TefInternal)?;
+        let claim_entry: serde_json::Value =
+            serde_json::from_slice(&claim_bytes).map_err(|_| TransactionResult::TefInternal)?;
         let creator_str = claim_entry["Account"]
             .as_str()
             .ok_or(TransactionResult::TefInternal)?
@@ -132,19 +127,19 @@ impl Transactor for XChainClaimTransactor {
             .map_err(|_| TransactionResult::TefInternal)?;
 
         // Decrement owner count on the original creator
-        let creator_id = decode_account_id(&creator_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let creator_id =
+            decode_account_id(&creator_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let creator_key = keylet::account(&creator_id);
         let creator_bytes = ctx
             .view
             .read(&creator_key)
             .ok_or(TransactionResult::TerNoAccount)?;
-        let mut creator_account: serde_json::Value = serde_json::from_slice(&creator_bytes)
-            .map_err(|_| TransactionResult::TefInternal)?;
+        let mut creator_account: serde_json::Value =
+            serde_json::from_slice(&creator_bytes).map_err(|_| TransactionResult::TefInternal)?;
         helpers::adjust_owner_count(&mut creator_account, -1);
 
-        let creator_data = serde_json::to_vec(&creator_account)
-            .map_err(|_| TransactionResult::TefInternal)?;
+        let creator_data =
+            serde_json::to_vec(&creator_account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(creator_key, creator_data)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -195,8 +190,11 @@ mod tests {
 
     fn setup_with_attested_claim() -> Ledger {
         let mut ledger = Ledger::genesis();
-        for (addr, balance) in [(DOOR, 100_000_000u64), (USER, 100_000_000), (DEST, 50_000_000)]
-        {
+        for (addr, balance) in [
+            (DOOR, 100_000_000u64),
+            (USER, 100_000_000),
+            (DEST, 50_000_000),
+        ] {
             let id = decode_account_id(addr).unwrap();
             let key = keylet::account(&id);
             let account = serde_json::json!({
@@ -213,8 +211,7 @@ mod tests {
         }
 
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data =
-            bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
         let bridge_key = keylet::bridge(&door_id, &bridge_data);
         let bridge_entry = serde_json::json!({
             "LedgerEntryType": "Bridge",
@@ -306,8 +303,7 @@ mod tests {
     fn preclaim_no_quorum() {
         let mut ledger = setup_with_attested_claim();
         // Replace claim with one that has no attestations
-        let bridge_data =
-            bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
         let claim_key = keylet::xchain_claim_id(&bridge_data, 1);
         let claim_entry = serde_json::json!({
             "LedgerEntryType": "XChainOwnedClaimID",
@@ -379,8 +375,7 @@ mod tests {
         assert_eq!(dest["Balance"].as_str().unwrap(), "60000000");
 
         // Verify claim ID entry erased
-        let bridge_data =
-            bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
         let claim_key = keylet::xchain_claim_id(&bridge_data, 1);
         assert!(sandbox.read(&claim_key).is_none());
 
@@ -388,8 +383,7 @@ mod tests {
         let user_id = decode_account_id(USER).unwrap();
         let creator_key = keylet::account(&user_id);
         let creator_bytes = sandbox.read(&creator_key).unwrap();
-        let creator: serde_json::Value =
-            serde_json::from_slice(&creator_bytes).unwrap();
+        let creator: serde_json::Value = serde_json::from_slice(&creator_bytes).unwrap();
         assert_eq!(creator["OwnerCount"].as_u64().unwrap(), 0);
     }
 

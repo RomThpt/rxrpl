@@ -1,6 +1,6 @@
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_primitives::Hash256;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
 use crate::helpers;
@@ -50,9 +50,7 @@ impl Transactor for MPTokenIssuanceDestroyTransactor {
         }
 
         // OutstandingAmount must be "0"
-        let outstanding = issuance["OutstandingAmount"]
-            .as_str()
-            .unwrap_or("0");
+        let outstanding = issuance["OutstandingAmount"].as_str().unwrap_or("0");
         if outstanding != "0" {
             return Err(TransactionResult::TecNoPermission);
         }
@@ -60,10 +58,7 @@ impl Transactor for MPTokenIssuanceDestroyTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -87,8 +82,7 @@ impl Transactor for MPTokenIssuanceDestroyTransactor {
         helpers::increment_sequence(&mut acct);
         helpers::adjust_owner_count(&mut acct, -1);
 
-        let acct_data =
-            serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
+        let acct_data = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
             .map_err(|_| TransactionResult::TefInternal)?;

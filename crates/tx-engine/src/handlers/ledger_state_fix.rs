@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -17,13 +17,10 @@ impl Transactor for LedgerStateFixTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
         let account_key = keylet::account(&account_id);
         let account_bytes = ctx
@@ -85,7 +82,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(LedgerStateFixTransactor.preflight(&ctx), Ok(()));
     }
 
@@ -101,7 +102,11 @@ mod tests {
             "Account": ALICE,
             "Fee": "12",
         });
-        let ctx = PreclaimContext { tx: &tx, view: &view, rules: &rules };
+        let ctx = PreclaimContext {
+            tx: &tx,
+            view: &view,
+            rules: &rules,
+        };
         assert_eq!(
             LedgerStateFixTransactor.preclaim(&ctx),
             Err(TransactionResult::TerNoAccount)
@@ -120,7 +125,11 @@ mod tests {
             "Account": ALICE,
             "Fee": "12",
         });
-        let ctx = PreclaimContext { tx: &tx, view: &view, rules: &rules };
+        let ctx = PreclaimContext {
+            tx: &tx,
+            view: &view,
+            rules: &rules,
+        };
         assert_eq!(LedgerStateFixTransactor.preclaim(&ctx), Ok(()));
     }
 

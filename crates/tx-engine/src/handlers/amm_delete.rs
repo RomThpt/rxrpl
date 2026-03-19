@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::amm_helpers;
 use crate::helpers;
@@ -10,7 +10,10 @@ pub struct AMMDeleteTransactor;
 impl Transactor for AMMDeleteTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
         let asset = ctx.tx.get("Asset").ok_or(TransactionResult::TemMalformed)?;
-        let asset2 = ctx.tx.get("Asset2").ok_or(TransactionResult::TemMalformed)?;
+        let asset2 = ctx
+            .tx
+            .get("Asset2")
+            .ok_or(TransactionResult::TemMalformed)?;
 
         amm_helpers::validate_asset(asset)?;
         amm_helpers::validate_asset(asset2)?;
@@ -35,10 +38,7 @@ impl Transactor for AMMDeleteTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -62,8 +62,7 @@ impl Transactor for AMMDeleteTransactor {
         helpers::adjust_owner_count(&mut account, -1);
         helpers::increment_sequence(&mut account);
 
-        let acct_data =
-            serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
+        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
             .map_err(|_| TransactionResult::TefInternal)?;

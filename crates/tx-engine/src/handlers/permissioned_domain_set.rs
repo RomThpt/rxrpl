@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -25,13 +25,10 @@ impl Transactor for PermissionedDomainSetTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
         let account_key = keylet::account(&account_id);
         let account_bytes = ctx
@@ -61,7 +58,10 @@ impl Transactor for PermissionedDomainSetTransactor {
             (key, true)
         };
 
-        let credentials = ctx.tx.get("AcceptedCredentials").cloned()
+        let credentials = ctx
+            .tx
+            .get("AcceptedCredentials")
+            .cloned()
             .ok_or(TransactionResult::TemMalformed)?;
 
         if is_create {
@@ -149,7 +149,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             PermissionedDomainSetTransactor.preflight(&ctx),
             Err(TransactionResult::TemMalformed)
@@ -166,7 +170,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             PermissionedDomainSetTransactor.preflight(&ctx),
             Err(TransactionResult::TecArrayEmpty)
@@ -186,7 +194,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             PermissionedDomainSetTransactor.preflight(&ctx),
             Err(TransactionResult::TecArrayTooLarge)
@@ -274,7 +286,10 @@ mod tests {
 
         let entry_bytes = sandbox.read(&domain_key).unwrap();
         let entry: serde_json::Value = serde_json::from_slice(&entry_bytes).unwrap();
-        assert_eq!(entry["AcceptedCredentials"][0]["Issuer"].as_str().unwrap(), "new");
+        assert_eq!(
+            entry["AcceptedCredentials"][0]["Issuer"].as_str().unwrap(),
+            "new"
+        );
 
         // Owner count should not increase on update
         let account_key = keylet::account(&id);

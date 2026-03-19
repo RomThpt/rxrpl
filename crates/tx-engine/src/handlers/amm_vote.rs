@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::amm_helpers;
 use crate::helpers;
@@ -13,13 +13,16 @@ pub struct AMMVoteTransactor;
 impl Transactor for AMMVoteTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
         let asset = ctx.tx.get("Asset").ok_or(TransactionResult::TemMalformed)?;
-        let asset2 = ctx.tx.get("Asset2").ok_or(TransactionResult::TemMalformed)?;
+        let asset2 = ctx
+            .tx
+            .get("Asset2")
+            .ok_or(TransactionResult::TemMalformed)?;
 
         amm_helpers::validate_asset(asset)?;
         amm_helpers::validate_asset(asset2)?;
 
-        let trading_fee = helpers::get_u32_field(ctx.tx, "TradingFee")
-            .ok_or(TransactionResult::TemMalformed)?;
+        let trading_fee =
+            helpers::get_u32_field(ctx.tx, "TradingFee").ok_or(TransactionResult::TemMalformed)?;
         if trading_fee > 1000 {
             return Err(TransactionResult::TemBadFee);
         }
@@ -37,16 +40,13 @@ impl Transactor for AMMVoteTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        let new_fee = helpers::get_u32_field(ctx.tx, "TradingFee")
-            .ok_or(TransactionResult::TemMalformed)?;
+        let new_fee =
+            helpers::get_u32_field(ctx.tx, "TradingFee").ok_or(TransactionResult::TemMalformed)?;
 
         let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
         let mut amm = amm_helpers::read_amm(ctx.view, &amm_key)?;
@@ -57,9 +57,7 @@ impl Transactor for AMMVoteTransactor {
             "TradingFee": new_fee,
         });
 
-        let vote_slots = amm
-            .get_mut("VoteSlots")
-            .and_then(|v| v.as_array_mut());
+        let vote_slots = amm.get_mut("VoteSlots").and_then(|v| v.as_array_mut());
 
         match vote_slots {
             Some(slots) => {
@@ -113,8 +111,7 @@ impl Transactor for AMMVoteTransactor {
 
         helpers::increment_sequence(&mut account);
 
-        let acct_data =
-            serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
+        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
             .map_err(|_| TransactionResult::TefInternal)?;

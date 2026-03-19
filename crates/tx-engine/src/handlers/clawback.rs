@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
 use crate::helpers;
@@ -69,7 +69,10 @@ impl Transactor for ClawbackTransactor {
         let currency_bytes = helpers::currency_to_bytes(currency);
 
         let tl_key = keylet::trust_line(&issuer_id, &holder_id, &currency_bytes);
-        let tl_bytes = ctx.view.read(&tl_key).ok_or(TransactionResult::TecNoEntry)?;
+        let tl_bytes = ctx
+            .view
+            .read(&tl_key)
+            .ok_or(TransactionResult::TecNoEntry)?;
         let tl: Value =
             serde_json::from_slice(&tl_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
@@ -95,10 +98,7 @@ impl Transactor for ClawbackTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let issuer_str = helpers::get_account(ctx.tx)?;
         let issuer_id =
             decode_account_id(issuer_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -108,8 +108,8 @@ impl Transactor for ClawbackTransactor {
             .as_str()
             .ok_or(TransactionResult::TemBadIssuer)?
             .to_string();
-        let holder_id = decode_account_id(&holder_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let holder_id =
+            decode_account_id(&holder_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
         let currency = amount["currency"]
             .as_str()
@@ -150,8 +150,7 @@ impl Transactor for ClawbackTransactor {
 
         tl["Balance"]["value"] = Value::String(format!("{new_balance}"));
 
-        let tl_data =
-            serde_json::to_vec(&tl).map_err(|_| TransactionResult::TefInternal)?;
+        let tl_data = serde_json::to_vec(&tl).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(tl_key, tl_data)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -296,11 +295,7 @@ mod tests {
         let tl_bytes = sandbox.read(&tl_key).unwrap();
         let tl: Value = serde_json::from_slice(&tl_bytes).unwrap();
 
-        let balance: f64 = tl["Balance"]["value"]
-            .as_str()
-            .unwrap()
-            .parse()
-            .unwrap();
+        let balance: f64 = tl["Balance"]["value"].as_str().unwrap().parse().unwrap();
 
         let is_issuer_low = issuer_id.as_bytes() < holder_id.as_bytes();
         let holder_balance = if is_issuer_low { balance } else { -balance };
@@ -344,11 +339,7 @@ mod tests {
         let tl_bytes = sandbox.read(&tl_key).unwrap();
         let tl: Value = serde_json::from_slice(&tl_bytes).unwrap();
 
-        let balance: f64 = tl["Balance"]["value"]
-            .as_str()
-            .unwrap()
-            .parse()
-            .unwrap();
+        let balance: f64 = tl["Balance"]["value"].as_str().unwrap().parse().unwrap();
         assert!(balance.abs() < 0.001);
     }
 

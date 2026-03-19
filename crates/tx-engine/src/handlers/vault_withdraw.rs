@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -11,8 +11,8 @@ impl Transactor for VaultWithdrawTransactor {
         helpers::get_u32_field(ctx.tx, "VaultSequence").ok_or(TransactionResult::TemMalformed)?;
         helpers::get_str_field(ctx.tx, "VaultOwner").ok_or(TransactionResult::TemMalformed)?;
 
-        let shares =
-            helpers::get_u64_str_field(ctx.tx, "SharesAmount").ok_or(TransactionResult::TemBadAmount)?;
+        let shares = helpers::get_u64_str_field(ctx.tx, "SharesAmount")
+            .ok_or(TransactionResult::TemBadAmount)?;
         if shares == 0 {
             return Err(TransactionResult::TemBadAmount);
         }
@@ -26,8 +26,8 @@ impl Transactor for VaultWithdrawTransactor {
 
         let vault_owner_str =
             helpers::get_str_field(ctx.tx, "VaultOwner").ok_or(TransactionResult::TemMalformed)?;
-        let vault_seq =
-            helpers::get_u32_field(ctx.tx, "VaultSequence").ok_or(TransactionResult::TemMalformed)?;
+        let vault_seq = helpers::get_u32_field(ctx.tx, "VaultSequence")
+            .ok_or(TransactionResult::TemMalformed)?;
 
         let vault_owner_id = decode_account_id(vault_owner_str)
             .map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -45,8 +45,8 @@ impl Transactor for VaultWithdrawTransactor {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
-        let shares_amount =
-            helpers::get_u64_str_field(ctx.tx, "SharesAmount").ok_or(TransactionResult::TemBadAmount)?;
+        let shares_amount = helpers::get_u64_str_field(ctx.tx, "SharesAmount")
+            .ok_or(TransactionResult::TemBadAmount)?;
 
         if total_shares < shares_amount {
             return Err(TransactionResult::TecUnfunded);
@@ -55,10 +55,7 @@ impl Transactor for VaultWithdrawTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -66,10 +63,10 @@ impl Transactor for VaultWithdrawTransactor {
         let vault_owner_str = helpers::get_str_field(ctx.tx, "VaultOwner")
             .ok_or(TransactionResult::TemMalformed)?
             .to_string();
-        let vault_seq =
-            helpers::get_u32_field(ctx.tx, "VaultSequence").ok_or(TransactionResult::TemMalformed)?;
-        let shares_amount =
-            helpers::get_u64_str_field(ctx.tx, "SharesAmount").ok_or(TransactionResult::TemBadAmount)?;
+        let vault_seq = helpers::get_u32_field(ctx.tx, "VaultSequence")
+            .ok_or(TransactionResult::TemMalformed)?;
+        let shares_amount = helpers::get_u64_str_field(ctx.tx, "SharesAmount")
+            .ok_or(TransactionResult::TemBadAmount)?;
 
         let vault_owner_id = decode_account_id(&vault_owner_str)
             .map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -99,13 +96,11 @@ impl Transactor for VaultWithdrawTransactor {
             / total_shares;
 
         // Update vault
-        vault["TotalDeposited"] =
-            serde_json::Value::String((total_deposited - payout).to_string());
+        vault["TotalDeposited"] = serde_json::Value::String((total_deposited - payout).to_string());
         vault["TotalShares"] =
             serde_json::Value::String((total_shares - shares_amount).to_string());
 
-        let vault_data =
-            serde_json::to_vec(&vault).map_err(|_| TransactionResult::TefInternal)?;
+        let vault_data = serde_json::to_vec(&vault).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(vault_key, vault_data)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -123,8 +118,7 @@ impl Transactor for VaultWithdrawTransactor {
         helpers::set_balance(&mut account, balance + payout);
         helpers::increment_sequence(&mut account);
 
-        let acct_data =
-            serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
+        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
             .map_err(|_| TransactionResult::TefInternal)?;

@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -32,15 +32,17 @@ impl Transactor for OracleSetTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         helpers::read_account_by_address(ctx.view, account_str)?;
 
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let doc_id = helpers::get_u32_field(ctx.tx, "OracleDocumentID").unwrap();
         let oracle_key = keylet::oracle(&account_id, doc_id);
 
         // On update, Provider cannot change
         if ctx.view.exists(&oracle_key) {
             if let Some(new_provider) = helpers::get_str_field(ctx.tx, "Provider") {
-                let entry_bytes = ctx.view.read(&oracle_key)
+                let entry_bytes = ctx
+                    .view
+                    .read(&oracle_key)
                     .ok_or(TransactionResult::TefInternal)?;
                 let entry: serde_json::Value = serde_json::from_slice(&entry_bytes)
                     .map_err(|_| TransactionResult::TefInternal)?;
@@ -60,13 +62,10 @@ impl Transactor for OracleSetTransactor {
         Ok(())
     }
 
-    fn apply(
-        &self,
-        ctx: &mut ApplyContext<'_>,
-    ) -> Result<TransactionResult, TransactionResult> {
+    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
         let account_key = keylet::account(&account_id);
         let account_bytes = ctx
@@ -110,8 +109,7 @@ impl Transactor for OracleSetTransactor {
             entry["PriceDataSeries"] = series.clone();
         }
 
-        let entry_data =
-            serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?;
+        let entry_data = serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?;
 
         if is_create {
             ctx.view
@@ -176,7 +174,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             OracleSetTransactor.preflight(&ctx),
             Err(TransactionResult::TemMalformed)
@@ -195,7 +197,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             OracleSetTransactor.preflight(&ctx),
             Err(TransactionResult::TecArrayEmpty)
@@ -204,9 +210,8 @@ mod tests {
 
     #[test]
     fn preflight_too_many_price_entries() {
-        let series: Vec<serde_json::Value> = (0..11)
-            .map(|i| serde_json::json!({"price": i}))
-            .collect();
+        let series: Vec<serde_json::Value> =
+            (0..11).map(|i| serde_json::json!({"price": i})).collect();
         let tx = serde_json::json!({
             "TransactionType": "OracleSet",
             "Account": ALICE,
@@ -217,7 +222,11 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
-        let ctx = PreflightContext { tx: &tx, rules: &rules, fees: &fees };
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
         assert_eq!(
             OracleSetTransactor.preflight(&ctx),
             Err(TransactionResult::TecArrayTooLarge)
@@ -239,7 +248,11 @@ mod tests {
             "PriceDataSeries": [{"price": 1}],
             "Fee": "12",
         });
-        let ctx = PreclaimContext { tx: &tx, view: &view, rules: &rules };
+        let ctx = PreclaimContext {
+            tx: &tx,
+            view: &view,
+            rules: &rules,
+        };
         assert_eq!(
             OracleSetTransactor.preclaim(&ctx),
             Err(TransactionResult::TemMalformed)
