@@ -2,7 +2,7 @@ use rxrpl_codec::address::classic::{decode_account_id, encode_classic_address_fr
 use rxrpl_crypto::{KeyPair, KeyType, Seed};
 use rxrpl_ledger::Ledger;
 use rxrpl_node::Node;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 use rxrpl_tx_engine::{FeeSettings, TransactorRegistry, TxEngine};
 use serde_json::Value;
 
@@ -28,11 +28,7 @@ fn read_account_balance(ledger: &Ledger, address: &str) -> u64 {
     let key = keylet::account(&account_id);
     let data = ledger.get_state(&key).unwrap();
     let account: Value = serde_json::from_slice(data).unwrap();
-    account["Balance"]
-        .as_str()
-        .unwrap()
-        .parse::<u64>()
-        .unwrap()
+    account["Balance"].as_str().unwrap().parse::<u64>().unwrap()
 }
 
 fn read_owner_count(ledger: &Ledger, address: &str) -> u32 {
@@ -348,7 +344,10 @@ fn payment_channel_create_fund_claim_lifecycle() {
     assert_eq!(result2, TransactionResult::TesSuccess);
 
     let after_fund = read_account_balance(&ledger, &genesis_addr);
-    assert_eq!(after_fund, genesis_balance - 10_000_000 - 12 - 5_000_000 - 12);
+    assert_eq!(
+        after_fund,
+        genesis_balance - 10_000_000 - 12 - 5_000_000 - 12
+    );
 
     // Claim part of channel (dest claims 3M)
     let tx3 = serde_json::json!({

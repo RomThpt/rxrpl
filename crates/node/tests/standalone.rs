@@ -2,8 +2,9 @@ use rxrpl_codec::address::classic::encode_classic_address_from_pubkey;
 use rxrpl_config::NodeConfig;
 use rxrpl_crypto::{KeyPair, KeyType, Seed};
 use rxrpl_node::Node;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 const GENESIS_ADDR: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
 
@@ -241,4 +242,85 @@ async fn standalone_sign_submit_verify() {
         .parse()
         .unwrap();
     assert_eq!(dest_balance, payment_amount);
+}
+
+#[tokio::test]
+async fn standalone_submit_queues_and_close_clears() {
+    let port = available_port();
+    let mut config = NodeConfig::default();
+    config.server.bind = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let node = Node::new_standalone(config, GENESIS_ADDR).unwrap();
+    let tx_queue = Arc::clone(node.tx_queue());
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    // Use a 2-second close interval so we can observe the queue before and after close
+    tokio::spawn(async move {
+        node.run_standalone(2).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Derive destination keypair
+    let dest_seed = Seed::from_passphrase("e2e_dest");
+    let dest_kp = KeyPair::from_seed(&dest_seed, KeyType::Ed25519);
+    let dest_addr = encode_classic_address_from_pubkey(dest_kp.public_key.as_bytes());
+
+    let dummy_seed = Seed::from_passphrase("dummy_signer");
+    let dummy_kp = KeyPair::from_seed(&dummy_seed, KeyType::Ed25519);
+
+    // Submit first Payment
+    let tx1 = json!({
+        "TransactionType": "Payment",
+        "Account": GENESIS_ADDR,
+        "Destination": dest_addr,
+        "Amount": "50000000",
+        "Fee": "12",
+        "Sequence": 1,
+    });
+    let signed1 = rxrpl_protocol::tx::sign(&tx1, &dummy_kp).unwrap();
+    let blob1 = rxrpl_protocol::tx::serialize_signed(&signed1).unwrap();
+
+    let resp = rpc_call(&addr, "submit", json!({ "tx_blob": blob1 })).await;
+    assert_eq!(resp["result"]["engine_result"], "tesSUCCESS");
+
+    // Queue should have 1 transaction
+    {
+        let q = tx_queue.read().await;
+        assert_eq!(q.len(), 1, "expected 1 tx in queue after first submit");
+    }
+
+    // Submit second Payment (sequence 2, different destination to avoid dup)
+    let dest_seed2 = Seed::from_passphrase("e2e_dest2");
+    let dest_kp2 = KeyPair::from_seed(&dest_seed2, KeyType::Ed25519);
+    let dest_addr2 = encode_classic_address_from_pubkey(dest_kp2.public_key.as_bytes());
+
+    let tx2 = json!({
+        "TransactionType": "Payment",
+        "Account": GENESIS_ADDR,
+        "Destination": dest_addr2,
+        "Amount": "30000000",
+        "Fee": "12",
+        "Sequence": 2,
+    });
+    let signed2 = rxrpl_protocol::tx::sign(&tx2, &dummy_kp).unwrap();
+    let blob2 = rxrpl_protocol::tx::serialize_signed(&signed2).unwrap();
+
+    let resp = rpc_call(&addr, "submit", json!({ "tx_blob": blob2 })).await;
+    assert_eq!(resp["result"]["engine_result"], "tesSUCCESS");
+
+    // Queue should have 2 transactions
+    {
+        let q = tx_queue.read().await;
+        assert_eq!(q.len(), 2, "expected 2 txs in queue after second submit");
+    }
+
+    // Wait for the ledger close (2s interval + margin)
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // After close, queue should be empty
+    {
+        let q = tx_queue.read().await;
+        assert_eq!(q.len(), 0, "expected empty queue after ledger close");
+    }
 }

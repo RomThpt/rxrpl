@@ -2,7 +2,7 @@ use rxrpl_codec::address::classic::{decode_account_id, encode_classic_address_fr
 use rxrpl_crypto::{KeyPair, KeyType, Seed};
 use rxrpl_ledger::Ledger;
 use rxrpl_node::Node;
-use rxrpl_protocol::{keylet, TransactionResult};
+use rxrpl_protocol::{TransactionResult, keylet};
 use rxrpl_tx_engine::{FeeSettings, TransactorRegistry, TxEngine};
 use serde_json::Value;
 
@@ -29,11 +29,7 @@ fn read_account_balance(ledger: &Ledger, address: &str) -> u64 {
     let key = keylet::account(&account_id);
     let data = ledger.get_state(&key).unwrap();
     let account: Value = serde_json::from_slice(data).unwrap();
-    account["Balance"]
-        .as_str()
-        .unwrap()
-        .parse::<u64>()
-        .unwrap()
+    account["Balance"].as_str().unwrap().parse::<u64>().unwrap()
 }
 
 fn read_owner_count(ledger: &Ledger, address: &str) -> u32 {
@@ -284,11 +280,7 @@ fn clawback_lifecycle() {
     // 4. Verify balance reduced to 70
     let tl_data = ledger.get_state(&tl_key).unwrap();
     let tl: Value = serde_json::from_slice(tl_data).unwrap();
-    let balance: f64 = tl["Balance"]["value"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let balance: f64 = tl["Balance"]["value"].as_str().unwrap().parse().unwrap();
     let holder_balance = if is_genesis_low { balance } else { -balance };
     assert!((holder_balance - 70.0).abs() < 0.001);
 }
