@@ -196,6 +196,10 @@ impl Node {
         );
         let event_tx = ctx.event_sender().clone();
 
+        // Clone ctx for gRPC before moving into RPC router
+        #[cfg(feature = "grpc")]
+        let grpc_ctx = Arc::clone(&ctx);
+
         let app = rxrpl_rpc_server::build_router(ctx);
         let bind = self.config.server.bind;
 
@@ -211,6 +215,18 @@ impl Node {
                 tracing::error!("RPC server error: {}", e);
             }
         });
+
+        // Spawn gRPC server if enabled
+        #[cfg(feature = "grpc")]
+        {
+            let grpc_port = self.config.server.bind.port() + 1000;
+            let grpc_addr = SocketAddr::new(self.config.server.bind.ip(), grpc_port);
+            tokio::spawn(async move {
+                if let Err(e) = rxrpl_grpc_server::start_grpc_server(grpc_addr, grpc_ctx).await {
+                    tracing::error!("gRPC server error: {}", e);
+                }
+            });
+        }
 
         // Emit initial server state
         let _ = event_tx.send(ServerEvent::ServerStateChange {
@@ -467,6 +483,11 @@ impl Node {
             Some(relay_tx),
         );
         let event_tx = ctx.event_sender().clone();
+
+        // Clone ctx for gRPC before moving into RPC router
+        #[cfg(feature = "grpc")]
+        let grpc_ctx = Arc::clone(&ctx);
+
         let app = rxrpl_rpc_server::build_router(ctx);
         let bind = self.config.server.bind;
 
@@ -480,6 +501,18 @@ impl Node {
                 tracing::error!("RPC server error: {}", e);
             }
         });
+
+        // Spawn gRPC server if enabled
+        #[cfg(feature = "grpc")]
+        {
+            let grpc_port = self.config.server.bind.port() + 1000;
+            let grpc_addr = SocketAddr::new(self.config.server.bind.ip(), grpc_port);
+            tokio::spawn(async move {
+                if let Err(e) = rxrpl_grpc_server::start_grpc_server(grpc_addr, grpc_ctx).await {
+                    tracing::error!("gRPC server error: {}", e);
+                }
+            });
+        }
 
         // Emit initial server state (connecting to peers)
         let _ = event_tx.send(ServerEvent::ServerStateChange {

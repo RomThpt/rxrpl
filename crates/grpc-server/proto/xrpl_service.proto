@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package xrpl;
+
+// Unary RPC service for XRPL node queries.
+service XrplNode {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
+  rpc Fee(FeeRequest) returns (FeeResponse);
+  rpc AccountInfo(AccountInfoRequest) returns (AccountInfoResponse);
+  rpc AccountTx(AccountTxRequest) returns (AccountTxResponse);
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+  rpc Tx(TxRequest) returns (TxResponse);
+  rpc LedgerClosed(LedgerClosedRequest) returns (LedgerClosedResponse);
+}
+
+// Streaming subscription service.
+service XrplSubscription {
+  rpc Subscribe(SubscribeRequest) returns (stream ServerEventMessage);
+}
+
+// -- Ping --
+message PingRequest {}
+message PingResponse {}
+
+// -- ServerInfo --
+message ServerInfoRequest {}
+message ServerInfoResponse {
+  string json_result = 1;
+}
+
+// -- Fee --
+message FeeRequest {}
+message FeeResponse {
+  string json_result = 1;
+}
+
+// -- AccountInfo --
+message AccountInfoRequest {
+  string account = 1;
+}
+message AccountInfoResponse {
+  string json_result = 1;
+}
+
+// -- AccountTx --
+message AccountTxRequest {
+  string account = 1;
+  uint32 limit = 2;
+  string marker = 3;
+}
+message AccountTxResponse {
+  string json_result = 1;
+}
+
+// -- Submit --
+message SubmitRequest {
+  string tx_blob = 1;
+  string tx_json = 2;
+}
+message SubmitResponse {
+  string json_result = 1;
+}
+
+// -- Tx --
+message TxRequest {
+  string transaction = 1;
+}
+message TxResponse {
+  string json_result = 1;
+}
+
+// -- LedgerClosed --
+message LedgerClosedRequest {}
+message LedgerClosedResponse {
+  string json_result = 1;
+}
+
+// -- Subscribe / Streaming --
+message SubscribeRequest {
+  repeated string streams = 1;
+  repeated string accounts = 2;
+  repeated BookEntry books = 3;
+}
+
+message BookEntry {
+  string taker_pays_json = 1;
+  string taker_gets_json = 2;
+}
+
+message ServerEventMessage {
+  string event_type = 1;
+  string json_payload = 2;
+}

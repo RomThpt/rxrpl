@@ -32,6 +32,7 @@ rxrpl-overlay = { path = "crates/overlay" }
 rxrpl-pathfind = { path = "crates/pathfind" }
 rxrpl-rpc-server = { path = "crates/rpc-server" }
 rxrpl-node = { path = "crates/node" }
+rxrpl-grpc-server = { path = "crates/grpc-server" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

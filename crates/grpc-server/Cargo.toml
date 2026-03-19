@@ -1,0 +1,19 @@
+[package]
+name = "rxrpl-grpc-server"
+description = "gRPC API server for XRPL node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rxrpl-rpc-server = { workspace = true }
+tonic = "0.12"
+prost = "0.13"
+tokio = { workspace = true }
+tokio-stream = "0.1"
+serde_json.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+tonic-build = "0.12"
