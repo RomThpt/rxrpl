@@ -1,4 +1,5 @@
 use std::collections::{HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -169,7 +170,7 @@ impl Node {
         self.running = true;
 
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
+            if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
                 tracing::error!("RPC server error: {}", e);
             }
         });
@@ -206,7 +207,7 @@ impl Node {
 
         // Spawn RPC server
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
+            if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
                 tracing::error!("RPC server error: {}", e);
             }
         });
@@ -475,7 +476,7 @@ impl Node {
             .map_err(|e| NodeError::Server(e.to_string()))?;
 
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
+            if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
                 tracing::error!("RPC server error: {}", e);
             }
         });

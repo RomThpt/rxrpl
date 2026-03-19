@@ -1,5 +1,7 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::connect_info::ConnectInfo;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -12,10 +14,14 @@ use tokio::sync::broadcast;
 
 use crate::context::ServerContext;
 use crate::events::event_to_json;
+use crate::role::{ConnectionRole, RequestContext};
 use crate::router::dispatch;
 use crate::subscriptions::ConnectionSubscriptions;
 
 /// Build the axum Router for the RPC server.
+///
+/// Callers must use `into_make_service_with_connect_info::<SocketAddr>()`
+/// when serving so that `ConnectInfo<SocketAddr>` is available.
 pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     Router::new()
         .route("/", post(rpc_handler).get(ws_handler))
@@ -34,13 +40,15 @@ async fn metrics_handler(State(ctx): State<Arc<ServerContext>>) -> impl IntoResp
 /// Handle WebSocket upgrade requests.
 async fn ws_handler(
     State(ctx): State<Arc<ServerContext>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_connection(socket, ctx))
+    let role = ConnectionRole::from_ip(addr.ip(), &ctx.config);
+    ws.on_upgrade(move |socket| handle_ws_connection(socket, ctx, role))
 }
 
 /// Handle a single WebSocket connection.
-async fn handle_ws_connection(socket: WebSocket, ctx: Arc<ServerContext>) {
+async fn handle_ws_connection(socket: WebSocket, ctx: Arc<ServerContext>, role: ConnectionRole) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let mut subscriptions = ConnectionSubscriptions::new();
     let mut event_rx = ctx.event_sender().subscribe();
@@ -80,6 +88,9 @@ async fn handle_ws_connection(socket: WebSocket, ctx: Arc<ServerContext>) {
                     .unwrap_or("")
                     .to_string();
 
+                let api_version = parse_api_version(&body);
+                let req_ctx = RequestContext { role, api_version };
+
                 let response = match method.as_str() {
                     "subscribe" => {
                         match subscriptions.apply_subscribe(&body) {
@@ -96,7 +107,7 @@ async fn handle_ws_connection(socket: WebSocket, ctx: Arc<ServerContext>) {
                     _ => {
                         // Standard RPC dispatch -- params come directly in
                         // the body for WS (no wrapping array like HTTP).
-                        let result = dispatch(&method, body.clone(), &ctx).await;
+                        let result = dispatch(&method, body.clone(), &ctx, &req_ctx).await;
                         ws_response(id, result)
                     }
                 };
@@ -159,6 +170,7 @@ fn ws_response(id: Option<Value>, result: Result<Value, crate::error::RpcServerE
 /// Handle JSON-RPC requests over HTTP.
 async fn rpc_handler(
     State(ctx): State<Arc<ServerContext>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let method = body.get("method").and_then(|v| v.as_str()).unwrap_or("");
@@ -170,7 +182,11 @@ async fn rpc_handler(
         .cloned()
         .unwrap_or(Value::Object(serde_json::Map::new()));
 
-    match dispatch(method, params, &ctx).await {
+    let api_version = parse_api_version(&params);
+    let role = ConnectionRole::from_ip(addr.ip(), &ctx.config);
+    let req_ctx = RequestContext { role, api_version };
+
+    match dispatch(method, params, &ctx, &req_ctx).await {
         Ok(result) => {
             let mut obj = result.as_object().cloned().unwrap_or_default();
             obj.insert("status".into(), Value::String("success".into()));
@@ -186,6 +202,14 @@ async fn rpc_handler(
             });
             (StatusCode::OK, Json(response))
         }
+    }
+}
+
+/// Parse `api_version` from a JSON value, defaulting to V1.
+fn parse_api_version(value: &Value) -> rxrpl_rpc_api::ApiVersion {
+    match value.get("api_version").and_then(|v| v.as_u64()) {
+        Some(2) => rxrpl_rpc_api::ApiVersion::V2,
+        _ => rxrpl_rpc_api::ApiVersion::V1,
     }
 }
 
@@ -209,6 +233,7 @@ mod tests {
             .method("POST")
             .uri("/")
             .header("content-type", "application/json")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
             .body(Body::from(serde_json::to_string(&body).unwrap()))
             .unwrap();
 
@@ -224,6 +249,7 @@ mod tests {
             .method("POST")
             .uri("/")
             .header("content-type", "application/json")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
             .body(Body::from(serde_json::to_string(&body).unwrap()))
             .unwrap();
 

@@ -4,9 +4,14 @@ use serde_json::Value;
 
 use crate::context::ServerContext;
 use crate::error::RpcServerError;
+use crate::role::RequestContext;
 use crate::router::dispatch;
 
-pub async fn json(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcServerError> {
+pub async fn json(
+    params: Value,
+    ctx: &Arc<ServerContext>,
+    req_ctx: &RequestContext,
+) -> Result<Value, RpcServerError> {
     let method = params
         .get("method")
         .and_then(|v| v.as_str())
@@ -19,5 +24,5 @@ pub async fn json(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcS
         .cloned()
         .unwrap_or(Value::Object(serde_json::Map::new()));
 
-    Box::pin(dispatch(method, inner_params, ctx)).await
+    Box::pin(dispatch(method, inner_params, ctx, req_ctx)).await
 }

@@ -6,15 +6,23 @@ use crate::context::ServerContext;
 use crate::error::RpcServerError;
 use crate::handlers;
 use crate::metrics;
+use crate::role::{is_admin_method, RequestContext};
 
 /// Dispatch an RPC method call to the appropriate handler.
 pub async fn dispatch(
     method: &str,
     params: Value,
     ctx: &Arc<ServerContext>,
+    req_ctx: &RequestContext,
 ) -> Result<Value, RpcServerError> {
+    if is_admin_method(method) && !req_ctx.role.is_admin() {
+        return Err(RpcServerError::NoPermission(format!(
+            "you are not authorized to call '{method}'"
+        )));
+    }
+
     let start = std::time::Instant::now();
-    let result = dispatch_inner(method, params, ctx).await;
+    let result = dispatch_inner(method, params, ctx, req_ctx).await;
 
     ::metrics::counter!(metrics::RPC_REQUESTS_TOTAL, "method" => method.to_string()).increment(1);
     ::metrics::histogram!(metrics::RPC_REQUEST_DURATION_SECONDS, "method" => method.to_string())
@@ -27,6 +35,7 @@ async fn dispatch_inner(
     method: &str,
     params: Value,
     ctx: &Arc<ServerContext>,
+    req_ctx: &RequestContext,
 ) -> Result<Value, RpcServerError> {
     match method {
         // Core
@@ -122,13 +131,59 @@ async fn dispatch_inner(
         "tx_reduce_relay" => handlers::tx_reduce_relay(params, ctx).await,
         "server_subscribe" => handlers::server_subscribe(params, ctx).await,
         "path_find" => handlers::path_find(params, ctx).await,
-        "json" => handlers::json(params, ctx).await,
-        "batch" => handlers::batch(params, ctx).await,
+        "json" => handlers::json(params, ctx, req_ctx).await,
+        "batch" => handlers::batch(params, ctx, req_ctx).await,
 
         "subscribe" | "unsubscribe" => Err(RpcServerError::InvalidParams(
             "subscribe/unsubscribe only available over WebSocket".into(),
         )),
 
         _ => Err(RpcServerError::MethodNotFound(method.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::role::ConnectionRole;
+    use rxrpl_config::ServerConfig;
+
+    fn test_ctx() -> Arc<ServerContext> {
+        ServerContext::new(ServerConfig::default())
+    }
+
+    fn admin_req_ctx() -> RequestContext {
+        RequestContext {
+            role: ConnectionRole::Admin,
+            api_version: Default::default(),
+        }
+    }
+
+    fn public_req_ctx() -> RequestContext {
+        RequestContext {
+            role: ConnectionRole::Public,
+            api_version: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn public_cannot_call_admin_method() {
+        let ctx = test_ctx();
+        let result = dispatch("stop", Value::Object(Default::default()), &ctx, &public_req_ctx()).await;
+        assert!(matches!(result, Err(RpcServerError::NoPermission(_))));
+    }
+
+    #[tokio::test]
+    async fn admin_can_call_admin_method() {
+        let ctx = test_ctx();
+        let result = dispatch("stop", Value::Object(Default::default()), &ctx, &admin_req_ctx()).await;
+        assert!(!matches!(result, Err(RpcServerError::NoPermission(_))));
+    }
+
+    #[tokio::test]
+    async fn public_can_call_public_method() {
+        let ctx = test_ctx();
+        let result = dispatch("ping", Value::Object(Default::default()), &ctx, &public_req_ctx()).await;
+        assert!(result.is_ok());
     }
 }

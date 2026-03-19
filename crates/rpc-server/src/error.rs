@@ -12,4 +12,7 @@ pub enum RpcServerError {
 
     #[error("server error: {0}")]
     Server(String),
+
+    #[error("no permission: {0}")]
+    NoPermission(String),
 }

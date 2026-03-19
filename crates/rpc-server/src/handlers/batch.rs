@@ -4,11 +4,16 @@ use serde_json::Value;
 
 use crate::context::ServerContext;
 use crate::error::RpcServerError;
+use crate::role::RequestContext;
 use crate::router::dispatch;
 
 const MAX_BATCH_SIZE: usize = 50;
 
-pub async fn batch(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcServerError> {
+pub async fn batch(
+    params: Value,
+    ctx: &Arc<ServerContext>,
+    req_ctx: &RequestContext,
+) -> Result<Value, RpcServerError> {
     let requests = params
         .get("requests")
         .and_then(|v| v.as_array())
@@ -39,7 +44,7 @@ pub async fn batch(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rpc
             .cloned()
             .unwrap_or(Value::Object(serde_json::Map::new()));
 
-        match Box::pin(dispatch(method, req_params, ctx)).await {
+        match Box::pin(dispatch(method, req_params, ctx, req_ctx)).await {
             Ok(result) => results.push(result),
             Err(e) => results.push(serde_json::json!({
                 "error": e.to_string(),
