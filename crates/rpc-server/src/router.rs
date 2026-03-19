@@ -129,6 +129,8 @@ async fn dispatch_inner(
         "logrotate" => handlers::logrotate(params, ctx).await,
         "crawl" => handlers::crawl(params, ctx).await,
         "tx_reduce_relay" => handlers::tx_reduce_relay(params, ctx).await,
+        "get_counts" => handlers::get_counts(params, ctx).await,
+        "unl_list" => handlers::unl_list(params, ctx).await,
         "server_subscribe" => handlers::server_subscribe(params, ctx).await,
         "path_find" => handlers::path_find(params, ctx).await,
         "json" => handlers::json(params, ctx, req_ctx).await,

@@ -65,6 +65,8 @@ pub fn is_admin_method(method: &str) -> bool {
             | "validators"
             | "validator_list_sites"
             | "ledger_diff"
+            | "get_counts"
+            | "unl_list"
     )
 }
 
