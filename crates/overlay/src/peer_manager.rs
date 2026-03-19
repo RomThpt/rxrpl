@@ -696,17 +696,26 @@ impl PeerManager {
         }
     }
 
-    /// Send a GetLedger request to the first available peer.
+    /// Send a GetLedger request to up to 3 available peers.
     fn send_get_ledger(&self, seq: u32, hash: Option<Hash256>) {
         use rxrpl_p2p_proto::proto::tm_get_ledger::LedgerType;
         let payload =
             proto_convert::encode_get_ledger(LedgerType::LtHash as i32, hash.as_ref(), seq, false);
-        // Send to all peers (they'll respond if they have it)
-        if let Some(handle) = self.peer_handles.values().next() {
+        let mut sent = 0;
+        for handle in self.peer_handles.values() {
+            if sent >= 3 {
+                break;
+            }
             let _ = handle.tx.try_send(PeerMessage {
                 msg_type: MessageType::GetLedger,
-                payload,
+                payload: payload.clone(),
             });
+            sent += 1;
+        }
+        if sent == 0 {
+            tracing::debug!("no peers available for GetLedger seq={}", seq);
+        } else {
+            tracing::debug!("sent GetLedger seq={} to {} peers", seq, sent);
         }
     }
 
@@ -748,12 +757,29 @@ impl PeerManager {
 
         let ledger = match ledger {
             Some(l) => l,
-            None => return,
+            None => {
+                tracing::debug!("GetLedger from {}: ledger not found", from);
+                let empty_response = proto_convert::encode_ledger_data(
+                    &Hash256::ZERO,
+                    req.ledger_seq,
+                    req.ledger_type,
+                    vec![],
+                    0,
+                );
+                if let Some(handle) = self.peer_handles.get(&from) {
+                    let _ = handle.tx.try_send(PeerMessage {
+                        msg_type: MessageType::LedgerData,
+                        payload: empty_response,
+                    });
+                }
+                return;
+            }
         };
 
         // Serialize state nodes (limit to 256KB)
         let mut nodes = Vec::new();
         let mut total_size = 0usize;
+        let mut truncated = false;
         const MAX_RESPONSE_SIZE: usize = 256 * 1024;
 
         ledger.state_map.for_each(&mut |key, data| {
@@ -761,8 +787,17 @@ impl PeerManager {
             if total_size + entry_size <= MAX_RESPONSE_SIZE {
                 nodes.push((key.as_bytes().to_vec(), data.to_vec()));
                 total_size += entry_size;
+            } else {
+                truncated = true;
             }
         });
+
+        if truncated {
+            tracing::warn!(
+                "GetLedger response truncated at 256KB: sent {} state nodes for seq={}",
+                nodes.len(), ledger.header.sequence
+            );
+        }
 
         let response = proto_convert::encode_ledger_data(
             &ledger.header.hash,
