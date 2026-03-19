@@ -12,8 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Amount": "1000000",
     });
 
-    let client = ClientBuilder::new("https://s.altnet.rippletest.net:51234")
-        .build_http()?;
+    let client = ClientBuilder::new("https://s.altnet.rippletest.net:51234").build_http()?;
 
     // Autofill fee, sequence, and last ledger sequence
     rxrpl::protocol::tx::autofill::autofill(&mut tx, &client).await?;

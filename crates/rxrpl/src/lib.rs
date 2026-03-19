@@ -34,7 +34,7 @@
 pub use rxrpl_primitives as primitives;
 
 pub use rxrpl_primitives::{
-    AccountId, Amount, CurrencyCode, Hash256, IssuedAmount, Issue, LedgerIndex, PublicKey,
+    AccountId, Amount, CurrencyCode, Hash256, Issue, IssuedAmount, LedgerIndex, PublicKey,
     Signature, XrpAmount,
 };
 
@@ -66,7 +66,9 @@ pub use rxrpl_protocol::{
 pub use rxrpl_rpc_api as rpc_api;
 
 #[cfg(feature = "rpc")]
-pub use rxrpl_rpc_api::{ApiVersion, JsonRpcRequest, JsonRpcResponse, Method, RpcError, RpcErrorCode};
+pub use rxrpl_rpc_api::{
+    ApiVersion, JsonRpcRequest, JsonRpcResponse, Method, RpcError, RpcErrorCode,
+};
 
 // -- client feature --
 #[cfg(feature = "client")]

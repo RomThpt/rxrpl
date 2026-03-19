@@ -5,7 +5,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
@@ -86,10 +86,7 @@ impl WebSocketTransport {
         let bg_config = config.clone();
 
         let task_handle = tokio::spawn(run_background_task(
-            ws_stream,
-            command_rx,
-            sub_tx,
-            bg_config,
+            ws_stream, command_rx, sub_tx, bg_config,
         ));
 
         Ok(Self {
@@ -137,9 +134,7 @@ impl WebSocketTransport {
     /// Read the next subscription event (backward-compat wrapper).
     pub async fn next_message(&self) -> Result<Value, ClientError> {
         let mut rx = self.subscription_tx.subscribe();
-        rx.recv()
-            .await
-            .map_err(|_| ClientError::SubscriptionClosed)
+        rx.recv().await.map_err(|_| ClientError::SubscriptionClosed)
     }
 
     /// Get an independent subscription event stream.
@@ -202,10 +197,7 @@ async fn run_background_task(
                     config.reconnect_backoff_multiplier,
                 );
                 reconnect_attempts += 1;
-                debug!(
-                    "reconnecting in {:?} (attempt {reconnect_attempts})",
-                    delay
-                );
+                debug!("reconnecting in {:?} (attempt {reconnect_attempts})", delay);
                 tokio::time::sleep(delay).await;
 
                 match connect_async(&config.url).await {
@@ -224,8 +216,7 @@ async fn run_background_task(
         };
 
         let (mut ws_write, mut ws_read) = ws.split();
-        let mut pending: HashMap<u64, oneshot::Sender<Result<Value, ClientError>>> =
-            HashMap::new();
+        let mut pending: HashMap<u64, oneshot::Sender<Result<Value, ClientError>>> = HashMap::new();
         let mut ping_interval = tokio::time::interval(config.ping_interval);
         ping_interval.reset(); // Don't fire immediately
         let mut awaiting_pong = false;

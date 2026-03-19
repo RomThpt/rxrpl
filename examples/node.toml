@@ -1,0 +1,39 @@
+# rxrpl networked node configuration
+
+[server]
+# RPC/WebSocket bind address
+bind = "127.0.0.1:5005"
+# Admin IP addresses (for admin-only RPC methods)
+admin_ips = ["127.0.0.1"]
+
+[peer]
+# P2P listen port
+port = 51235
+# Maximum peer connections
+max_peers = 21
+# Fixed peers (always connect to these)
+fixed_peers = []
+# Node identity seed (32 hex chars). If omitted, a random identity is generated.
+# node_seed = "0123456789abcdef0123456789abcdef"
+# Enable TLS for peer connections
+tls_enabled = true
+
+[database]
+# Data directory
+path = "data"
+# Node store backend: "memory" or "rocksdb"
+backend = "memory"
+
+[validators]
+# Whether this node validates
+enabled = false
+# Trusted validator public keys (hex)
+trusted = []
+
+[network]
+# Network ID (0 = mainnet, 1 = testnet)
+network_id = 1
+
+[genesis]
+# Genesis ledger hash (optional, for network identification)
+# ledger_hash = "..."

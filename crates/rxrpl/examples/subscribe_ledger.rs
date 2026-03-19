@@ -6,9 +6,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_ws()
         .await?;
 
-    let result = client
-        .subscribe(vec!["ledger".to_string()])
-        .await?;
+    let result = client.subscribe(vec!["ledger".to_string()]).await?;
     println!("Subscribed: {}", serde_json::to_string_pretty(&result)?);
 
     if let Some(mut stream) = client.subscription_stream() {

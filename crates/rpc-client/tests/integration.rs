@@ -39,9 +39,7 @@ async fn build_auto_detect_http() {
 #[tokio::test]
 async fn build_auto_detect_ws() {
     // Will fail to connect (no server), but should attempt WS path (not HTTP)
-    let result = ClientBuilder::new("wss://localhost:19999")
-        .build()
-        .await;
+    let result = ClientBuilder::new("wss://localhost:19999").build().await;
     assert!(result.is_err());
     let err = result.err().unwrap();
     // Should be a WebSocket error, not InvalidUrl
@@ -79,5 +77,8 @@ async fn http_fee() {
         .build_http()
         .unwrap();
     let result = client.fee().await.unwrap();
-    assert!(result.get("drops").is_some(), "response missing drops field");
+    assert!(
+        result.get("drops").is_some(),
+        "response missing drops field"
+    );
 }

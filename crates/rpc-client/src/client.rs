@@ -480,10 +480,7 @@ impl XrplClient {
             .await
     }
 
-    pub async fn amm_info_typed(
-        &self,
-        amm_account: &str,
-    ) -> Result<AmmInfoResponse, ClientError> {
+    pub async fn amm_info_typed(&self, amm_account: &str) -> Result<AmmInfoResponse, ClientError> {
         self.request_typed(
             "amm_info",
             serde_json::json!({
@@ -508,10 +505,7 @@ impl XrplClient {
         .await
     }
 
-    pub async fn ledger_typed(
-        &self,
-        ledger_index: &str,
-    ) -> Result<LedgerResponse, ClientError> {
+    pub async fn ledger_typed(&self, ledger_index: &str) -> Result<LedgerResponse, ClientError> {
         self.request_typed(
             "ledger",
             serde_json::json!({
@@ -538,15 +532,12 @@ impl XrplClient {
             if code >= 100 {
                 return Err(ClientError::Other(format!(
                     "transaction rejected: {}",
-                    submit_result["engine_result"]
-                        .as_str()
-                        .unwrap_or("unknown"),
+                    submit_result["engine_result"].as_str().unwrap_or("unknown"),
                 )));
             }
         }
 
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
         let poll_interval = Duration::from_secs(1);
 
         loop {
