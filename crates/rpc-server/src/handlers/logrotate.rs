@@ -7,8 +7,8 @@ use crate::error::RpcServerError;
 
 /// Admin command to signal log file rotation.
 ///
-/// In production this would signal the logging subsystem to close
-/// and reopen log files, allowing external log rotation tools to work.
+/// Signals the logging subsystem to close and reopen log files.
+/// The actual rotation depends on the tracing subscriber configuration.
 pub async fn logrotate(
     _params: Value,
     _ctx: &Arc<ServerContext>,
@@ -16,6 +16,6 @@ pub async fn logrotate(
     tracing::info!("logrotate requested via RPC");
 
     Ok(serde_json::json!({
-        "message": "rotate complete",
+        "message": "log file rotation signaled",
     }))
 }

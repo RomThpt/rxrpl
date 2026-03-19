@@ -59,6 +59,21 @@ pub async fn server_subscribe(
                     Value::Bool(true),
                 );
             }
+            "consensus" => {
+                result.insert("consensus_subscribed".into(), Value::Bool(true));
+            }
+            "peer_status" => {
+                result.insert("peer_status_subscribed".into(), Value::Bool(true));
+            }
+            "manifests" => {
+                result.insert("manifests_subscribed".into(), Value::Bool(true));
+            }
+            "book_changes" => {
+                result.insert("book_changes_subscribed".into(), Value::Bool(true));
+            }
+            "path_find" => {
+                result.insert("path_find_subscribed".into(), Value::Bool(true));
+            }
             _ => {
                 return Err(RpcServerError::InvalidParams(format!(
                     "unknown stream: {stream_name}"
