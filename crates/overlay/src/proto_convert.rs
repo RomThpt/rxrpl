@@ -15,13 +15,13 @@ use crate::identity::NodeIdentity;
 
 pub fn encode_propose_set(proposal: &Proposal) -> Vec<u8> {
     let msg = TmProposeSet {
-        propose_seq: proposal.prop_seq,
-        current_tx_hash: proposal.tx_set_hash.as_bytes().to_vec(),
-        node_pub_key: proposal.node_id.0.as_bytes().to_vec(),
-        close_time: proposal.close_time,
-        signature: proposal.signature.clone().unwrap_or_default(),
-        previous_ledger: proposal.prev_ledger.as_bytes().to_vec(),
-        ledger_seq: proposal.ledger_seq,
+        propose_seq: Some(proposal.prop_seq),
+        current_tx_hash: Some(proposal.tx_set_hash.as_bytes().to_vec()),
+        node_pub_key: Some(proposal.node_id.0.as_bytes().to_vec()),
+        close_time: Some(proposal.close_time),
+        signature: Some(proposal.signature.clone().unwrap_or_default()),
+        previous_ledger: Some(proposal.prev_ledger.as_bytes().to_vec()),
+        ledger_seq: Some(proposal.ledger_seq),
     };
     msg.encode_to_vec()
 }
@@ -30,21 +30,24 @@ pub fn decode_propose_set(data: &[u8]) -> Result<Proposal, OverlayError> {
     let msg = TmProposeSet::decode(data)
         .map_err(|e| OverlayError::Codec(format!("decode ProposeSet: {e}")))?;
 
-    let node_id = NodeId(hash256_from_bytes(&msg.node_pub_key)?);
-    let tx_set_hash = hash256_from_bytes(&msg.current_tx_hash)?;
-    let prev_ledger = hash256_from_bytes(&msg.previous_ledger)?;
+    let node_id = NodeId(hash256_from_bytes(&msg.node_pub_key.unwrap_or_default())?);
+    let tx_set_hash = hash256_from_bytes(&msg.current_tx_hash.unwrap_or_default())?;
+    let prev_ledger = hash256_from_bytes(&msg.previous_ledger.unwrap_or_default())?;
 
     Ok(Proposal {
         node_id,
         tx_set_hash,
-        close_time: msg.close_time,
-        prop_seq: msg.propose_seq,
-        ledger_seq: msg.ledger_seq,
+        close_time: msg.close_time.unwrap_or(0),
+        prop_seq: msg.propose_seq.unwrap_or(0),
+        ledger_seq: msg.ledger_seq.unwrap_or(0),
         prev_ledger,
-        signature: if msg.signature.is_empty() {
-            None
-        } else {
-            Some(msg.signature)
+        signature: {
+            let sig = msg.signature.unwrap_or_default();
+            if sig.is_empty() {
+                None
+            } else {
+                Some(sig)
+            }
         },
     })
 }
@@ -58,8 +61,8 @@ pub fn encode_validation(validation: &Validation) -> Vec<u8> {
         payload.extend_from_slice(sig);
     }
     let msg = TmValidation {
-        validation: payload,
-        ledger_seq: validation.ledger_seq,
+        validation: Some(payload),
+        ledger_seq: Some(validation.ledger_seq),
     };
     msg.encode_to_vec()
 }
@@ -69,7 +72,7 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
         .map_err(|e| OverlayError::Codec(format!("decode Validation: {e}")))?;
 
     // Validation payload: signing_data(45 bytes) + signature(64 bytes)
-    let payload = &msg.validation;
+    let payload = msg.validation.unwrap_or_default();
     if payload.len() < 45 {
         return Err(OverlayError::Codec("validation payload too short".into()));
     }
@@ -106,10 +109,10 @@ pub fn encode_transaction(tx_hash: &Hash256, tx_data: &[u8]) -> Vec<u8> {
     raw.extend_from_slice(tx_data);
 
     let msg = TmTransaction {
-        raw_transaction: raw,
-        status: 0,
-        receive_timestamp: 0,
-        deferred: 0,
+        raw_transaction: Some(raw),
+        status: Some(0),
+        receive_timestamp: Some(0),
+        deferred: Some(0),
     };
     msg.encode_to_vec()
 }
@@ -118,12 +121,13 @@ pub fn decode_transaction(data: &[u8]) -> Result<(Hash256, Vec<u8>), OverlayErro
     let msg = TmTransaction::decode(data)
         .map_err(|e| OverlayError::Codec(format!("decode Transaction: {e}")))?;
 
-    if msg.raw_transaction.len() < 32 {
+    let raw_transaction = msg.raw_transaction.unwrap_or_default();
+    if raw_transaction.len() < 32 {
         return Err(OverlayError::Codec("transaction payload too short".into()));
     }
 
-    let tx_hash = hash256_from_bytes(&msg.raw_transaction[..32])?;
-    let tx_data = msg.raw_transaction[32..].to_vec();
+    let tx_hash = hash256_from_bytes(&raw_transaction[..32])?;
+    let tx_data = raw_transaction[32..].to_vec();
     Ok((tx_hash, tx_data))
 }
 
@@ -131,12 +135,12 @@ pub fn decode_transaction(data: &[u8]) -> Result<(Hash256, Vec<u8>), OverlayErro
 
 pub fn encode_status_change(ledger_hash: &Hash256, ledger_seq: u32) -> Vec<u8> {
     let msg = TmStatusChange {
-        new_status: 0,
-        new_event: 0,
-        ledger_seq,
-        ledger_hash: ledger_hash.as_bytes().to_vec(),
-        validated_hash: Vec::new(),
-        validated_seq: 0,
+        new_status: Some(0),
+        new_event: Some(0),
+        ledger_seq: Some(ledger_seq),
+        ledger_hash: Some(ledger_hash.as_bytes().to_vec()),
+        validated_hash: Some(Vec::new()),
+        validated_seq: Some(0),
     };
     msg.encode_to_vec()
 }
@@ -144,8 +148,8 @@ pub fn encode_status_change(ledger_hash: &Hash256, ledger_seq: u32) -> Vec<u8> {
 pub fn decode_status_change(data: &[u8]) -> Result<(Hash256, u32), OverlayError> {
     let msg = TmStatusChange::decode(data)
         .map_err(|e| OverlayError::Codec(format!("decode StatusChange: {e}")))?;
-    let ledger_hash = hash256_from_bytes(&msg.ledger_hash)?;
-    Ok((ledger_hash, msg.ledger_seq))
+    let ledger_hash = hash256_from_bytes(&msg.ledger_hash.unwrap_or_default())?;
+    Ok((ledger_hash, msg.ledger_seq.unwrap_or(0)))
 }
 
 // --- Hello ---
@@ -189,13 +193,15 @@ pub fn decode_hello(data: &[u8]) -> Result<TmHello, OverlayError> {
 
 pub fn encode_ping(seq: u32, is_pong: bool) -> Vec<u8> {
     let msg = TmPing {
-        r#type: if is_pong { 1 } else { 0 },
-        seq,
-        ping_time: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        net_time: 0,
+        r#type: Some(if is_pong { 1 } else { 0 }),
+        seq: Some(seq),
+        ping_time: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        ),
+        net_time: Some(0),
     };
     msg.encode_to_vec()
 }
@@ -227,12 +233,12 @@ pub fn encode_get_ledger_with_nodes(
     node_ids: Vec<Vec<u8>>,
 ) -> Vec<u8> {
     let msg = TmGetLedger {
-        ledger_type,
-        ledger_hash: hash.map(|h| h.as_bytes().to_vec()).unwrap_or_default(),
-        ledger_seq: seq,
+        ledger_type: Some(ledger_type),
+        ledger_hash: Some(hash.map(|h| h.as_bytes().to_vec()).unwrap_or_default()),
+        ledger_seq: Some(seq),
         node_ids,
-        request_cookie,
-        query_depth: 0,
+        request_cookie: Some(request_cookie),
+        query_depth: Some(0),
     };
     msg.encode_to_vec()
 }
@@ -251,14 +257,17 @@ pub fn encode_ledger_data(
     cookie: u32,
 ) -> Vec<u8> {
     let msg = TmLedgerData {
-        ledger_hash: hash.as_bytes().to_vec(),
-        ledger_seq: seq,
-        ledger_type: ltype,
+        ledger_hash: Some(hash.as_bytes().to_vec()),
+        ledger_seq: Some(seq),
+        ledger_type: Some(ltype),
         nodes: nodes
             .into_iter()
-            .map(|(node_id, node_data)| TmLedgerNode { node_id, node_data })
+            .map(|(node_id, node_data)| TmLedgerNode {
+                node_id: Some(node_id),
+                node_data: Some(node_data),
+            })
             .collect(),
-        request_cookie: cookie,
+        request_cookie: Some(cookie),
     };
     msg.encode_to_vec()
 }
@@ -275,8 +284,8 @@ pub fn encode_peers(peers: Vec<(String, u16)>) -> Vec<u8> {
         peers: peers
             .into_iter()
             .map(|(ip, port)| TmPeer {
-                ip,
-                port: port as u32,
+                ip: Some(ip),
+                port: Some(port as u32),
             })
             .collect(),
     };
@@ -290,7 +299,7 @@ pub fn decode_peers(data: &[u8]) -> Result<Vec<(String, u16)>, OverlayError> {
     Ok(msg
         .peers
         .into_iter()
-        .map(|p| (p.ip, p.port as u16))
+        .map(|p| (p.ip.unwrap_or_default(), p.port.unwrap_or(0) as u16))
         .collect())
 }
 
@@ -337,7 +346,7 @@ pub fn decode_endpoints(data: &[u8]) -> Result<Vec<(String, u32)>, OverlayError>
     Ok(msg
         .endpoints_v2
         .into_iter()
-        .map(|ep| (ep.endpoint, ep.hops))
+        .map(|ep| (ep.endpoint.unwrap_or_default(), ep.hops.unwrap_or(0)))
         .collect())
 }
 
@@ -351,9 +360,9 @@ pub struct HaveSetData {
 pub fn decode_have_set(data: &[u8]) -> Result<HaveSetData, OverlayError> {
     let msg = TmHaveTransactionSet::decode(data)
         .map_err(|e| OverlayError::Codec(format!("decode HaveSet: {e}")))?;
-    let hash = hash256_from_bytes(&msg.hash)?;
+    let hash = hash256_from_bytes(&msg.hash.unwrap_or_default())?;
     Ok(HaveSetData {
-        status: msg.status,
+        status: msg.status.unwrap_or(0),
         hash,
     })
 }
@@ -486,13 +495,13 @@ mod tests {
     fn ping_roundtrip() {
         let encoded = encode_ping(7, false);
         let decoded = decode_ping(&encoded).unwrap();
-        assert_eq!(decoded.seq, 7);
-        assert_eq!(decoded.r#type, 0);
+        assert_eq!(decoded.seq.unwrap_or(0), 7);
+        assert_eq!(decoded.r#type.unwrap_or(0), 0);
 
         let encoded_pong = encode_ping(8, true);
         let decoded_pong = decode_ping(&encoded_pong).unwrap();
-        assert_eq!(decoded_pong.seq, 8);
-        assert_eq!(decoded_pong.r#type, 1);
+        assert_eq!(decoded_pong.seq.unwrap_or(0), 8);
+        assert_eq!(decoded_pong.r#type.unwrap_or(0), 1);
     }
 
     #[test]
@@ -501,10 +510,10 @@ mod tests {
         let encoded = encode_get_ledger(3, Some(&hash), 42, true);
         let decoded = decode_get_ledger(&encoded).unwrap();
 
-        assert_eq!(decoded.ledger_type, 3);
-        assert_eq!(decoded.ledger_seq, 42);
-        assert!(decoded.request_cookie);
-        assert_eq!(decoded.ledger_hash, hash.as_bytes());
+        assert_eq!(decoded.ledger_type.unwrap_or(0), 3);
+        assert_eq!(decoded.ledger_seq.unwrap_or(0), 42);
+        assert!(decoded.request_cookie.unwrap_or(false));
+        assert_eq!(decoded.ledger_hash.unwrap_or_default(), hash.as_bytes());
     }
 
     #[test]
@@ -512,10 +521,10 @@ mod tests {
         let encoded = encode_get_ledger(1, None, 10, false);
         let decoded = decode_get_ledger(&encoded).unwrap();
 
-        assert_eq!(decoded.ledger_type, 1);
-        assert_eq!(decoded.ledger_seq, 10);
-        assert!(!decoded.request_cookie);
-        assert!(decoded.ledger_hash.is_empty());
+        assert_eq!(decoded.ledger_type.unwrap_or(0), 1);
+        assert_eq!(decoded.ledger_seq.unwrap_or(0), 10);
+        assert!(!decoded.request_cookie.unwrap_or(false));
+        assert!(decoded.ledger_hash.as_ref().map_or(true, |v| v.is_empty()));
     }
 
     #[test]
@@ -551,14 +560,14 @@ mod tests {
         let encoded = encode_ledger_data(&hash, 50, 2, nodes.clone(), 99);
         let decoded = decode_ledger_data(&encoded).unwrap();
 
-        assert_eq!(&decoded.ledger_hash[..], hash.as_bytes());
-        assert_eq!(decoded.ledger_seq, 50);
-        assert_eq!(decoded.ledger_type, 2);
-        assert_eq!(decoded.request_cookie, 99);
+        assert_eq!(decoded.ledger_hash.unwrap_or_default(), hash.as_bytes());
+        assert_eq!(decoded.ledger_seq.unwrap_or(0), 50);
+        assert_eq!(decoded.ledger_type.unwrap_or(0), 2);
+        assert_eq!(decoded.request_cookie.unwrap_or(0), 99);
         assert_eq!(decoded.nodes.len(), 2);
-        assert_eq!(decoded.nodes[0].node_id, vec![1, 2, 3]);
-        assert_eq!(decoded.nodes[0].node_data, vec![4, 5, 6]);
-        assert_eq!(decoded.nodes[1].node_id, vec![7, 8]);
-        assert_eq!(decoded.nodes[1].node_data, vec![9, 10, 11, 12]);
+        assert_eq!(decoded.nodes[0].node_id.as_deref().unwrap_or(&[]), &[1, 2, 3]);
+        assert_eq!(decoded.nodes[0].node_data.as_deref().unwrap_or(&[]), &[4, 5, 6]);
+        assert_eq!(decoded.nodes[1].node_id.as_deref().unwrap_or(&[]), &[7, 8]);
+        assert_eq!(decoded.nodes[1].node_data.as_deref().unwrap_or(&[]), &[9, 10, 11, 12]);
     }
 }

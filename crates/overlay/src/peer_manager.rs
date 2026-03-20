@@ -300,12 +300,6 @@ impl PeerManager {
     fn handle_command(&self, cmd: OverlayCommand) {
         match cmd {
             OverlayCommand::Broadcast { msg_type, payload } => {
-                // Skip consensus messages (ProposeSet, Validation) that use
-                // proto2 required fields incompatible with our proto3 encoding.
-                // These should only be sent by validated consensus participants.
-                if matches!(msg_type, MessageType::ProposeSet | MessageType::Validation) {
-                    return;
-                }
                 for handle in self.peer_handles.values() {
                     let _ = handle.tx.try_send(PeerMessage {
                         msg_type,
@@ -411,8 +405,8 @@ impl PeerManager {
                         if let Some(ref info) = peer_info {
                             info.reputation.record_valid_message(payload_len);
                         }
-                        if ping.r#type == 0 {
-                            let pong = proto_convert::encode_ping(ping.seq, true);
+                        if ping.r#type.unwrap_or(0) == 0 {
+                            let pong = proto_convert::encode_ping(ping.seq.unwrap_or(0), true);
                             if let Some(handle) = self.peer_handles.get(&from) {
                                 let _ = handle.tx.try_send(PeerMessage {
                                     msg_type: MessageType::Ping,
@@ -550,28 +544,31 @@ impl PeerManager {
                             // Peer provided requested ledger data -- useful contribution
                             info.reputation.record_useful_contribution();
                         }
+                        let ledger_hash_bytes = msg.ledger_hash.unwrap_or_default();
                         let hash =
-                            Hash256::new(msg.ledger_hash[..32].try_into().unwrap_or([0u8; 32]));
+                            Hash256::new(ledger_hash_bytes[..32].try_into().unwrap_or([0u8; 32]));
                         let nodes: Vec<(Vec<u8>, Vec<u8>)> = msg
                             .nodes
                             .into_iter()
-                            .map(|n| (n.node_id, n.node_data))
+                            .map(|n| (n.node_id.unwrap_or_default(), n.node_data.unwrap_or_default()))
                             .collect();
+
+                        let ledger_seq = msg.ledger_seq.unwrap_or(0);
 
                         // Feed nodes into incremental sync if active.
                         let incremental_complete =
-                            self.ledger_syncer.feed_nodes(msg.ledger_seq, &nodes);
+                            self.ledger_syncer.feed_nodes(ledger_seq, &nodes);
                         if incremental_complete {
                             tracing::info!(
                                 "incremental sync complete for ledger #{} hash={}",
-                                msg.ledger_seq, hash,
+                                ledger_seq, hash,
                             );
                         }
 
                         // Notify ledger syncer about the response (full sync path).
                         if let Some(synced) =
                             self.ledger_syncer
-                                .handle_response(msg.ledger_seq, hash, nodes.clone())
+                                .handle_response(ledger_seq, hash, nodes.clone())
                         {
                             tracing::info!(
                                 "synced ledger #{} hash={} ({} nodes)",
@@ -583,7 +580,7 @@ impl PeerManager {
 
                         let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
                             hash,
-                            seq: msg.ledger_seq,
+                            seq: ledger_seq,
                             nodes,
                         });
                     }
@@ -695,7 +692,9 @@ impl PeerManager {
                         }
                         tracing::debug!(
                             "ValidatorList v{} from {} ({} bytes manifest, {} bytes blob)",
-                            vl.version, from, vl.manifest.len(), vl.blob.len()
+                            vl.version.unwrap_or(0), from,
+                            vl.manifest.as_ref().map(|v| v.len()).unwrap_or(0),
+                            vl.blob.as_ref().map(|v| v.len()).unwrap_or(0)
                         );
                     }
                     Err(_) => {
@@ -713,7 +712,7 @@ impl PeerManager {
                         }
                         tracing::debug!(
                             "ValidatorListCollection v{} from {} ({} blobs)",
-                            vlc.version, from, vlc.blobs.len()
+                            vlc.version.unwrap_or(0), from, vlc.blobs.len()
                         );
                     }
                     Err(_) => {
@@ -807,7 +806,8 @@ impl PeerManager {
     /// sequence, the request includes specific node hashes (delta sync).
     /// Otherwise, falls back to requesting all leaf nodes.
     fn send_get_ledger(&self, seq: u32, hash: Option<Hash256>) {
-        use rxrpl_p2p_proto::proto::tm_get_ledger::LedgerType;
+        // LedgerType enum values: LtCurrent=0, LtClosed=1, LtValidated=2, LtHash=3
+        const LT_HASH: i32 = 3;
 
         // Check if we have missing node hashes from an active incremental sync.
         let node_ids: Vec<Vec<u8>> = self
@@ -819,7 +819,7 @@ impl PeerManager {
 
         let is_delta = !node_ids.is_empty();
         let payload = proto_convert::encode_get_ledger_with_nodes(
-            LedgerType::LtHash as i32,
+            LT_HASH,
             hash.as_ref(),
             seq,
             false,
@@ -866,18 +866,25 @@ impl PeerManager {
             }
         };
 
-        use rxrpl_p2p_proto::proto::tm_get_ledger::LedgerType;
+        // LedgerType enum values: LtCurrent=0, LtClosed=1, LtValidated=2, LtHash=3
+        const LT_CLOSED: i32 = 1;
+        const LT_VALIDATED: i32 = 2;
+        const LT_HASH: i32 = 3;
 
-        let ledger = match req.ledger_type {
-            x if x == LedgerType::LtClosed as i32 || x == LedgerType::LtValidated as i32 => {
+        let req_ledger_type = req.ledger_type.unwrap_or(0);
+        let req_ledger_hash = req.ledger_hash.unwrap_or_default();
+        let req_ledger_seq = req.ledger_seq.unwrap_or(0);
+
+        let ledger = match req_ledger_type {
+            x if x == LT_CLOSED || x == LT_VALIDATED => {
                 provider.latest_closed()
             }
-            x if x == LedgerType::LtHash as i32 => {
-                if req.ledger_hash.len() >= 32 {
-                    let hash = Hash256::new(req.ledger_hash[..32].try_into().unwrap_or([0u8; 32]));
+            x if x == LT_HASH => {
+                if req_ledger_hash.len() >= 32 {
+                    let hash = Hash256::new(req_ledger_hash[..32].try_into().unwrap_or([0u8; 32]));
                     provider.get_by_hash(&hash)
-                } else if req.ledger_seq > 0 {
-                    provider.get_by_seq(req.ledger_seq)
+                } else if req_ledger_seq > 0 {
+                    provider.get_by_seq(req_ledger_seq)
                 } else {
                     None
                 }
@@ -891,8 +898,8 @@ impl PeerManager {
                 tracing::debug!("GetLedger from {}: ledger not found", from);
                 let empty_response = proto_convert::encode_ledger_data(
                     &Hash256::ZERO,
-                    req.ledger_seq,
-                    req.ledger_type,
+                    req_ledger_seq,
+                    req_ledger_type,
                     vec![],
                     0,
                 );
@@ -972,7 +979,7 @@ impl PeerManager {
         let response = proto_convert::encode_ledger_data(
             &ledger.header.hash,
             ledger.header.sequence,
-            req.ledger_type,
+            req_ledger_type,
             nodes,
             0,
         );
