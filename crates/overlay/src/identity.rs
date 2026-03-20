@@ -64,12 +64,12 @@ impl NodeIdentity {
 
     /// Sign a consensus proposal with this node's key.
     pub fn sign_proposal(&self, proposal: &mut rxrpl_consensus::types::Proposal) {
-        proposal.sign(&self.key_pair.private_key);
+        proposal.sign(&self.key_pair.private_key, self.key_pair.key_type);
     }
 
     /// Sign a consensus validation with this node's key.
     pub fn sign_validation(&self, validation: &mut rxrpl_consensus::types::Validation) {
-        validation.sign(&self.key_pair.private_key);
+        validation.sign(&self.key_pair.private_key, self.key_pair.key_type);
     }
 }
 

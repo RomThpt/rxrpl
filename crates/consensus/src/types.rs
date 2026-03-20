@@ -19,6 +19,8 @@ impl NodeId {
 pub struct Proposal {
     /// The proposer's node ID.
     pub node_id: NodeId,
+    /// Raw public key bytes (33 bytes for secp256k1).
+    pub public_key: Vec<u8>,
     /// Proposed transaction set hash.
     pub tx_set_hash: Hash256,
     /// Target close time (ripple epoch seconds).
@@ -53,9 +55,13 @@ pub struct Validation {
 }
 
 impl Proposal {
-    /// Compute the data to be signed: prop_seq(4) || close_time(4) || prev_ledger(32) || tx_set_hash(32).
+    /// Compute the data to be signed (rippled-compatible):
+    /// HashPrefix::proposal(4) || prop_seq(4) || close_time(4) || prev_ledger(32) || tx_set_hash(32).
     pub fn signing_data(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(72);
+        // HashPrefix::proposal = 'P','R','P',0 = 0x50525000
+        const HASH_PREFIX_PROPOSAL: [u8; 4] = [0x50, 0x52, 0x50, 0x00];
+        let mut data = Vec::with_capacity(76);
+        data.extend_from_slice(&HASH_PREFIX_PROPOSAL);
         data.extend_from_slice(&self.prop_seq.to_be_bytes());
         data.extend_from_slice(&self.close_time.to_be_bytes());
         data.extend_from_slice(self.prev_ledger.as_bytes());
@@ -63,11 +69,21 @@ impl Proposal {
         data
     }
 
-    /// Sign this proposal with the given private key (Ed25519).
-    pub fn sign(&mut self, private_key: &[u8]) {
+    /// Sign this proposal with the given private key and key type.
+    pub fn sign(&mut self, private_key: &[u8], key_type: rxrpl_crypto::KeyType) {
         let data = self.signing_data();
-        if let Ok(sig) = rxrpl_crypto::ed25519::sign(&data, private_key) {
-            self.signature = Some(sig.as_bytes().to_vec());
+        let sig = match key_type {
+            rxrpl_crypto::KeyType::Secp256k1 => {
+                rxrpl_crypto::secp256k1::sign(&data, private_key)
+                    .map(|s| s.as_bytes().to_vec())
+            }
+            rxrpl_crypto::KeyType::Ed25519 => {
+                rxrpl_crypto::ed25519::sign(&data, private_key)
+                    .map(|s| s.as_bytes().to_vec())
+            }
+        };
+        if let Ok(sig) = sig {
+            self.signature = Some(sig);
         }
     }
 
@@ -76,7 +92,12 @@ impl Proposal {
         match &self.signature {
             Some(sig) => {
                 let data = self.signing_data();
-                rxrpl_crypto::ed25519::verify(&data, public_key, sig)
+                let is_ed25519 = public_key.first() == Some(&0xED);
+                if is_ed25519 {
+                    rxrpl_crypto::ed25519::verify(&data, public_key, sig)
+                } else {
+                    rxrpl_crypto::secp256k1::verify(&data, public_key, sig)
+                }
             }
             None => false,
         }
@@ -95,11 +116,21 @@ impl Validation {
         data
     }
 
-    /// Sign this validation with the given private key (Ed25519).
-    pub fn sign(&mut self, private_key: &[u8]) {
+    /// Sign this validation with the given private key and key type.
+    pub fn sign(&mut self, private_key: &[u8], key_type: rxrpl_crypto::KeyType) {
         let data = self.signing_data();
-        if let Ok(sig) = rxrpl_crypto::ed25519::sign(&data, private_key) {
-            self.signature = Some(sig.as_bytes().to_vec());
+        let sig = match key_type {
+            rxrpl_crypto::KeyType::Secp256k1 => {
+                rxrpl_crypto::secp256k1::sign(&data, private_key)
+                    .map(|s| s.as_bytes().to_vec())
+            }
+            rxrpl_crypto::KeyType::Ed25519 => {
+                rxrpl_crypto::ed25519::sign(&data, private_key)
+                    .map(|s| s.as_bytes().to_vec())
+            }
+        };
+        if let Ok(sig) = sig {
+            self.signature = Some(sig);
         }
     }
 
@@ -108,7 +139,12 @@ impl Validation {
         match &self.signature {
             Some(sig) => {
                 let data = self.signing_data();
-                rxrpl_crypto::ed25519::verify(&data, public_key, sig)
+                let is_ed25519 = public_key.first() == Some(&0xED);
+                if is_ed25519 {
+                    rxrpl_crypto::ed25519::verify(&data, public_key, sig)
+                } else {
+                    rxrpl_crypto::secp256k1::verify(&data, public_key, sig)
+                }
             }
             None => false,
         }
@@ -245,6 +281,7 @@ mod tests {
 
         let mut proposal = Proposal {
             node_id: NodeId::from_public_key(kp.public_key.as_bytes()),
+            public_key: kp.public_key.as_bytes().to_vec(),
             tx_set_hash: Hash256::new([0x01; 32]),
             close_time: 100,
             prop_seq: 0,
@@ -253,7 +290,7 @@ mod tests {
             signature: None,
         };
 
-        proposal.sign(&kp.private_key);
+        proposal.sign(&kp.private_key, kp.key_type);
         assert!(proposal.signature.is_some());
         assert!(proposal.verify(kp.public_key.as_bytes()));
     }
@@ -265,6 +302,7 @@ mod tests {
 
         let mut proposal = Proposal {
             node_id: NodeId::from_public_key(kp.public_key.as_bytes()),
+            public_key: kp.public_key.as_bytes().to_vec(),
             tx_set_hash: Hash256::new([0x01; 32]),
             close_time: 100,
             prop_seq: 0,
@@ -273,7 +311,7 @@ mod tests {
             signature: None,
         };
 
-        proposal.sign(&kp.private_key);
+        proposal.sign(&kp.private_key, kp.key_type);
         // Tamper
         proposal.close_time = 999;
         assert!(!proposal.verify(kp.public_key.as_bytes()));
@@ -294,7 +332,7 @@ mod tests {
             signature: None,
         };
 
-        validation.sign(&kp.private_key);
+        validation.sign(&kp.private_key, kp.key_type);
         assert!(validation.signature.is_some());
         assert!(validation.verify(kp.public_key.as_bytes()));
     }
@@ -306,6 +344,7 @@ mod tests {
 
         let proposal = Proposal {
             node_id: NodeId::from_public_key(kp.public_key.as_bytes()),
+            public_key: kp.public_key.as_bytes().to_vec(),
             tx_set_hash: Hash256::new([0x01; 32]),
             close_time: 100,
             prop_seq: 0,

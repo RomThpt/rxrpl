@@ -694,7 +694,7 @@ impl Node {
         tokio::spawn(async move {
             let node_id = NodeId(identity.node_id);
             let mut consensus =
-                ConsensusEngine::new_with_unl(adapter, node_id, ConsensusParams::default(), unl);
+                ConsensusEngine::new_with_unl(adapter, node_id, identity.public_key_bytes().to_vec(), ConsensusParams::default(), unl);
 
             let mut close_interval = tokio::time::interval(interval_duration);
             let converge_duration = Duration::from_millis(1250);

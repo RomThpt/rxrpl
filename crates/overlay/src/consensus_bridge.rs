@@ -102,6 +102,7 @@ mod tests {
 
         let proposal = Proposal {
             node_id: NodeId(Hash256::new([0x01; 32])),
+            public_key: vec![0x02; 33],
             tx_set_hash: Hash256::new([0x02; 32]),
             close_time: 100,
             prop_seq: 0,

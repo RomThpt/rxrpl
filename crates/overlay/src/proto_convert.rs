@@ -17,7 +17,7 @@ pub fn encode_propose_set(proposal: &Proposal) -> Vec<u8> {
     let msg = TmProposeSet {
         propose_seq: Some(proposal.prop_seq),
         current_tx_hash: Some(proposal.tx_set_hash.as_bytes().to_vec()),
-        node_pub_key: Some(proposal.node_id.0.as_bytes().to_vec()),
+        node_pub_key: Some(proposal.public_key.clone()),
         close_time: Some(proposal.close_time),
         signature: Some(proposal.signature.clone().unwrap_or_default()),
         previousledger: Some(proposal.prev_ledger.as_bytes().to_vec()),
@@ -31,12 +31,14 @@ pub fn decode_propose_set(data: &[u8]) -> Result<Proposal, OverlayError> {
     let msg = TmProposeSet::decode(data)
         .map_err(|e| OverlayError::Codec(format!("decode ProposeSet: {e}")))?;
 
-    let node_id = NodeId(hash256_from_bytes(&msg.node_pub_key.unwrap_or_default())?);
+    let pubkey_bytes = msg.node_pub_key.unwrap_or_default();
+    let node_id = NodeId(rxrpl_crypto::sha512_half::sha512_half(&[&pubkey_bytes]));
     let tx_set_hash = hash256_from_bytes(&msg.current_tx_hash.unwrap_or_default())?;
     let prev_ledger = hash256_from_bytes(&msg.previousledger.unwrap_or_default())?;
 
     Ok(Proposal {
         node_id,
+        public_key: pubkey_bytes,
         tx_set_hash,
         close_time: msg.close_time.unwrap_or(0),
         prop_seq: msg.propose_seq.unwrap_or(0),
@@ -444,8 +446,11 @@ mod tests {
 
     #[test]
     fn propose_set_roundtrip() {
+        let pubkey = vec![0x02; 33];
+        let node_id = NodeId(rxrpl_crypto::sha512_half::sha512_half(&[&pubkey]));
         let proposal = Proposal {
-            node_id: NodeId(Hash256::new([0x01; 32])),
+            node_id,
+            public_key: pubkey,
             tx_set_hash: Hash256::new([0x02; 32]),
             close_time: 100,
             prop_seq: 1,
@@ -458,6 +463,7 @@ mod tests {
         let decoded = decode_propose_set(&encoded).unwrap();
 
         assert_eq!(decoded.node_id, proposal.node_id);
+        assert_eq!(decoded.public_key, proposal.public_key);
         assert_eq!(decoded.tx_set_hash, proposal.tx_set_hash);
         assert_eq!(decoded.close_time, proposal.close_time);
         assert_eq!(decoded.prop_seq, proposal.prop_seq);
