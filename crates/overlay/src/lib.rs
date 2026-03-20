@@ -21,6 +21,7 @@ pub mod relay;
 pub mod reputation;
 pub mod stobject;
 pub mod tls;
+pub mod validation_aggregator;
 
 pub use command::OverlayCommand;
 pub use consensus_bridge::NetworkConsensusAdapter;

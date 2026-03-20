@@ -703,6 +703,9 @@ impl Node {
             let mut syncing = false;
             let mut max_peer_seq: u32 = 0;
             let mut pending_close_time = 0u32;
+            // Track validations from network peers to determine validated ledgers.
+            // Threshold of 1 for isolated testing; in production use UNL size * 0.8.
+            let mut val_aggregator = rxrpl_overlay::validation_aggregator::ValidationAggregator::new(1);
 
             close_interval.tick().await; // skip first immediate tick
             converge_interval.tick().await;
@@ -787,16 +790,47 @@ impl Node {
                                 consensus.peer_proposal(proposal);
                             }
                             ConsensusMessage::Validation(validation) => {
+                                let val_seq = validation.ledger_seq;
+                                let val_hash = validation.ledger_hash;
                                 tracing::debug!(
                                     "validation from {:?} for ledger #{} hash={}",
-                                    validation.node_id, validation.ledger_seq, validation.ledger_hash
+                                    validation.node_id, val_seq, val_hash
                                 );
                                 let _ = event_tx.send(ServerEvent::ValidationReceived {
                                     validator: validation.node_id.0.to_string(),
-                                    ledger_hash: validation.ledger_hash.to_string(),
-                                    ledger_seq: validation.ledger_seq,
+                                    ledger_hash: val_hash.to_string(),
+                                    ledger_seq: val_seq,
                                     full: validation.full,
                                 });
+
+                                // Aggregate validation and check for quorum
+                                if let Some(validated) = val_aggregator.add_validation(validation) {
+                                    tracing::info!(
+                                        "network validated ledger #{} hash={} ({} validations)",
+                                        validated.seq, validated.hash, validated.validation_count
+                                    );
+                                    let our_seq = ledger_seq_shared.load(Ordering::Relaxed);
+
+                                    // If the network is ahead, enter sync mode
+                                    if validated.seq >= our_seq && !syncing {
+                                        if validated.seq > our_seq {
+                                            tracing::info!(
+                                                "network ahead (validated #{} vs our #{}), syncing to #{}",
+                                                validated.seq, our_seq, validated.seq
+                                            );
+                                            syncing = true;
+                                            // Request the network's validated ledger directly
+                                            // (not our_seq+1 which may not exist on peers)
+                                            let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
+                                                seq: validated.seq,
+                                                hash: Some(validated.hash),
+                                            });
+                                        }
+                                        if validated.seq > max_peer_seq {
+                                            max_peer_seq = validated.seq;
+                                        }
+                                    }
+                                }
                             }
                             ConsensusMessage::Transaction { hash, data } => {
                                 tracing::debug!("received transaction {} from network", hash);
@@ -871,15 +905,15 @@ impl Node {
                                 if peer_seq > our_seq + 1 {
                                     if !syncing {
                                         tracing::info!(
-                                            "peer {} ahead by {} ledgers, entering sync mode",
-                                            from, peer_seq - our_seq
+                                            "peer {} ahead by {} ledgers, entering sync mode (target #{})",
+                                            from, peer_seq - our_seq, peer_seq
                                         );
                                         syncing = true;
                                     }
-                                    let next_seq = our_seq + 1;
+                                    // Request the peer's current ledger directly
                                     let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
-                                        seq: next_seq,
-                                        hash: None,
+                                        seq: peer_seq,
+                                        hash: Some(peer_hash),
                                     });
                                 }
                             }

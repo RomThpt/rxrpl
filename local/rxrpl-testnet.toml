@@ -1,0 +1,16 @@
+[server]
+bind = "127.0.0.1:5059"
+
+[peer]
+port = 51237
+max_peers = 10
+fixed_peers = ["s.altnet.rippletest.net:51235"]
+seeds = []
+tls_enabled = true
+
+[database]
+path = "local/data-testnet"
+backend = "memory"
+
+[network]
+network_id = 1
