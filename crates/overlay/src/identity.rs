@@ -67,9 +67,42 @@ impl NodeIdentity {
         proposal.sign(&self.key_pair.private_key, self.key_pair.key_type);
     }
 
-    /// Sign a consensus validation with this node's key.
+    /// Sign a consensus validation with this node's key (STObject format).
+    ///
+    /// Produces a signature over the STObject signing hash:
+    /// SHA-512-Half(HashPrefix::validation || STObject_without_signature)
     pub fn sign_validation(&self, validation: &mut rxrpl_consensus::types::Validation) {
-        validation.sign(&self.key_pair.private_key, self.key_pair.key_type);
+        use crate::stobject;
+
+        // HashPrefix::validation = 'V','A','L',0 = 0x56414C00
+        const HASH_PREFIX_VALIDATION: [u8; 4] = [0x56, 0x41, 0x4C, 0x00];
+
+        // Build signing data: prefix + STObject fields (without sfSignature)
+        let mut signing_data = Vec::with_capacity(128);
+        signing_data.extend_from_slice(&HASH_PREFIX_VALIDATION);
+
+        // sfFlags (UINT32, field 2)
+        let flags: u32 = if validation.full { 0x80000001 } else { 0x00000000 };
+        stobject::put_uint32(&mut signing_data, 2, flags);
+
+        // sfLedgerSequence (UINT32, field 6)
+        stobject::put_uint32(&mut signing_data, 6, validation.ledger_seq);
+
+        // sfSigningTime (UINT32, field 9)
+        stobject::put_uint32(&mut signing_data, 9, validation.sign_time);
+
+        // sfLedgerHash (UINT256, field 1)
+        stobject::put_hash256(&mut signing_data, 1, validation.ledger_hash.as_bytes());
+
+        // sfSigningPubKey (VL, field 3)
+        stobject::put_vl(&mut signing_data, 3, self.public_key_bytes());
+
+        // Sign: SHA-512-Half(signing_data) then ECDSA
+        let sig = rxrpl_crypto::secp256k1::sign(&signing_data, &self.key_pair.private_key)
+            .map(|s| s.as_bytes().to_vec());
+        if let Ok(sig) = sig {
+            validation.signature = Some(sig);
+        }
     }
 }
 

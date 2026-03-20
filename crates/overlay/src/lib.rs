@@ -19,6 +19,7 @@ pub mod peer_set;
 pub mod proto_convert;
 pub mod relay;
 pub mod reputation;
+pub mod stobject;
 pub mod tls;
 
 pub use command::OverlayCommand;

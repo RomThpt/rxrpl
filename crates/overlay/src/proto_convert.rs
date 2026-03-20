@@ -57,46 +57,130 @@ pub fn decode_propose_set(data: &[u8]) -> Result<Proposal, OverlayError> {
 
 // --- Validation ---
 
-pub fn encode_validation(validation: &Validation) -> Vec<u8> {
-    // Pack validation data: signing_data + signature
-    let mut payload = validation.signing_data();
+/// Encode a validation as a rippled-compatible STObject inside TMValidation.
+///
+/// The STObject contains: sfFlags, sfLedgerHash, sfLedgerSequence,
+/// sfSigningTime, sfSigningPubKey, sfSignature.
+pub fn encode_validation(validation: &Validation, public_key: &[u8]) -> Vec<u8> {
+    use crate::stobject;
+
+    // Build the signing data (without signature) for hashing
+    let mut stobj = Vec::with_capacity(256);
+
+    // sfFlags (UINT32, field 2) -- 0x80000001 = vfFullValidation if full
+    let flags: u32 = if validation.full { 0x80000001 } else { 0x00000000 };
+    stobject::put_uint32(&mut stobj, 2, flags);
+
+    // sfLedgerSequence (UINT32, field 6)
+    stobject::put_uint32(&mut stobj, 6, validation.ledger_seq);
+
+    // sfSigningTime (UINT32, field 9)
+    stobject::put_uint32(&mut stobj, 9, validation.sign_time);
+
+    // sfLedgerHash (UINT256, field 1)
+    stobject::put_hash256(&mut stobj, 1, validation.ledger_hash.as_bytes());
+
+    // sfSigningPubKey (VL, field 3)
+    stobject::put_vl(&mut stobj, 3, public_key);
+
+    // sfSignature (VL, field 6) -- must be last (notSigning field)
     if let Some(ref sig) = validation.signature {
-        payload.extend_from_slice(sig);
+        stobject::put_vl(&mut stobj, 6, sig);
     }
+
     let msg = TmValidation {
-        validation: Some(payload),
+        validation: Some(stobj),
     };
     msg.encode_to_vec()
 }
 
+/// Decode a validation from rippled STObject format.
 pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
     let msg = TmValidation::decode(data)
         .map_err(|e| OverlayError::Codec(format!("decode Validation: {e}")))?;
 
-    // Validation payload: signing_data(45 bytes) + signature(64 bytes)
     let payload = msg.validation.unwrap_or_default();
-    if payload.len() < 45 {
-        return Err(OverlayError::Codec("validation payload too short".into()));
+
+    // Parse STObject fields
+    let mut ledger_hash = Hash256::ZERO;
+    let mut ledger_seq = 0u32;
+    let mut sign_time = 0u32;
+    let mut full = false;
+    let mut signature: Option<Vec<u8>> = None;
+    let mut signing_pub_key: Vec<u8> = Vec::new();
+
+    let mut pos = 0;
+    while pos < payload.len() {
+        let (type_id, field_id, hdr_len) =
+            crate::stobject::decode_field_id(&payload[pos..])
+                .ok_or_else(|| OverlayError::Codec("invalid STObject field header".into()))?;
+        pos += hdr_len;
+
+        match (type_id, field_id) {
+            // UINT32 fields
+            (2, 2) => {
+                // sfFlags
+                if pos + 4 > payload.len() { break; }
+                let v = u32::from_be_bytes(payload[pos..pos + 4].try_into().unwrap());
+                full = (v & 0x80000001) == 0x80000001;
+                pos += 4;
+            }
+            (2, fid) => {
+                // Other UINT32
+                if pos + 4 > payload.len() { break; }
+                let v = u32::from_be_bytes(payload[pos..pos + 4].try_into().unwrap());
+                match fid {
+                    6 => ledger_seq = v,  // sfLedgerSequence
+                    9 => sign_time = v,   // sfSigningTime
+                    _ => {}
+                }
+                pos += 4;
+            }
+            // UINT64 fields
+            (3, _) => {
+                if pos + 8 > payload.len() { break; }
+                pos += 8;
+            }
+            // UINT256 fields
+            (5, fid) => {
+                if pos + 32 > payload.len() { break; }
+                if fid == 1 {
+                    // sfLedgerHash
+                    ledger_hash = hash256_from_bytes(&payload[pos..pos + 32])?;
+                }
+                pos += 32;
+            }
+            // VL fields
+            (7, fid) => {
+                let (vl_len, vl_hdr) =
+                    crate::stobject::decode_vl_length(&payload[pos..])
+                        .ok_or_else(|| OverlayError::Codec("invalid VL length".into()))?;
+                pos += vl_hdr;
+                if pos + vl_len > payload.len() { break; }
+                match fid {
+                    3 => signing_pub_key = payload[pos..pos + vl_len].to_vec(),
+                    6 => signature = Some(payload[pos..pos + vl_len].to_vec()),
+                    _ => {}
+                }
+                pos += vl_len;
+            }
+            // Skip unknown types
+            _ => break,
+        }
     }
 
-    let ledger_hash = hash256_from_bytes(&payload[0..32])?;
-    let ledger_seq = u32::from_be_bytes(payload[32..36].try_into().unwrap());
-    let close_time = u32::from_be_bytes(payload[36..40].try_into().unwrap());
-    let sign_time = u32::from_be_bytes(payload[40..44].try_into().unwrap());
-    let full = payload[44] != 0;
-
-    let signature = if payload.len() > 45 {
-        Some(payload[45..].to_vec())
+    let node_id = if !signing_pub_key.is_empty() {
+        NodeId(rxrpl_crypto::sha512_half::sha512_half(&[&signing_pub_key]))
     } else {
-        None
+        NodeId(Hash256::ZERO)
     };
 
     Ok(Validation {
-        node_id: NodeId(Hash256::ZERO), // caller must set from context
+        node_id,
         ledger_hash,
         ledger_seq,
         full,
-        close_time,
+        close_time: sign_time,
         sign_time,
         signature,
     })
