@@ -67,7 +67,7 @@ pub struct PeerConfig {
     #[serde(default = "default_max_peers")]
     pub max_peers: usize,
     /// Bootstrap peer addresses.
-    #[serde(default)]
+    #[serde(default = "default_seeds")]
     pub seeds: Vec<String>,
     /// Fixed peers (always connect to these).
     #[serde(default)]
@@ -92,12 +92,21 @@ fn default_max_peers() -> usize {
     21
 }
 
+fn default_seeds() -> Vec<String> {
+    vec![
+        "r.ripple.com:51235".into(),
+        "s1.ripple.com:51235".into(),
+        "s2.ripple.com:51235".into(),
+        "s.altnet.rippletest.net:51235".into(),
+    ]
+}
+
 impl Default for PeerConfig {
     fn default() -> Self {
         Self {
             port: default_peer_port(),
             max_peers: default_max_peers(),
-            seeds: Vec::new(),
+            seeds: default_seeds(),
             fixed_peers: Vec::new(),
             node_seed: None,
             tls_enabled: true,

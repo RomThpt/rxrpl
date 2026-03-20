@@ -53,6 +53,7 @@ pub enum ConsensusMessage {
 pub struct PeerManagerConfig {
     pub listen_port: u16,
     pub max_peers: usize,
+    pub seeds: Vec<String>,
     pub fixed_peers: Vec<String>,
     pub network_id: u32,
     pub tls_server: Arc<ServerConfig>,
@@ -66,6 +67,7 @@ pub struct PeerManagerConfig {
 pub struct PeerManager {
     identity: Arc<NodeIdentity>,
     config: PeerManagerConfig,
+    seeds: Vec<String>,
     peer_set: Arc<PeerSet>,
     peer_handles: HashMap<Hash256, PeerHandle>,
     relay_filter: RelayFilter,
@@ -99,8 +101,10 @@ impl PeerManager {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let peer_set = Arc::new(PeerSet::new(config.max_peers));
 
+        let seeds = config.seeds.clone();
         let mgr = Self {
             identity,
+            seeds,
             config,
             peer_set,
             peer_handles: HashMap::new(),
@@ -145,14 +149,29 @@ impl PeerManager {
             self.spawn_fixed_peer_connector(addr.clone());
         }
 
-        // Create and launch peer discovery
-        if self.discovery.is_none() && !self.config.fixed_peers.is_empty() {
-            self.discovery = Some(Arc::new(PeerDiscovery::new(
-                self.config.fixed_peers.clone(),
-                Arc::clone(&self.peer_set),
-                self.cmd_tx_internal.clone(),
-                self.config.max_peers,
-            )));
+        // Create and launch peer discovery using seeds + fixed_peers
+        if self.discovery.is_none() {
+            let mut all_seeds: Vec<String> = Vec::new();
+            // Seeds from config (includes defaults like r.ripple.com)
+            for seed in &self.seeds {
+                if !all_seeds.contains(seed) {
+                    all_seeds.push(seed.clone());
+                }
+            }
+            // Fixed peers also act as seeds
+            for fp in &self.config.fixed_peers {
+                if !all_seeds.contains(fp) {
+                    all_seeds.push(fp.clone());
+                }
+            }
+            if !all_seeds.is_empty() {
+                self.discovery = Some(Arc::new(PeerDiscovery::new(
+                    all_seeds,
+                    Arc::clone(&self.peer_set),
+                    self.cmd_tx_internal.clone(),
+                    self.config.max_peers,
+                )));
+            }
         }
         if let Some(ref discovery) = self.discovery {
             let disc = Arc::clone(discovery);

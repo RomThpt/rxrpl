@@ -491,6 +491,7 @@ impl Node {
         let peer_config = PeerManagerConfig {
             listen_port: self.config.peer.port,
             max_peers: self.config.peer.max_peers,
+            seeds: self.config.peer.seeds.clone(),
             fixed_peers: self.config.peer.fixed_peers.clone(),
             network_id: self.config.network.network_id,
             tls_server,
