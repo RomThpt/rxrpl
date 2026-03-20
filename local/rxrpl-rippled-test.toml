@@ -1,0 +1,16 @@
+[server]
+bind = "127.0.0.1:5058"
+
+[peer]
+port = 51236
+max_peers = 10
+fixed_peers = ["127.0.0.1:51235"]
+seeds = []
+tls_enabled = true
+
+[database]
+path = "local/data"
+backend = "memory"
+
+[network]
+network_id = 21465

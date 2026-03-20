@@ -45,14 +45,13 @@ impl Decoder for PeerCodec {
         src.advance(HEADER_SIZE);
         let payload = src.split_to(length).to_vec();
 
-        let msg_type = MessageType::from_u32(msg_type_raw).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unknown message type: {msg_type_raw}"),
-            )
-        })?;
-
-        Ok(Some(PeerMessage { msg_type, payload }))
+        match MessageType::from_u32(msg_type_raw) {
+            Some(msg_type) => Ok(Some(PeerMessage { msg_type, payload })),
+            None => {
+                // Skip unknown message types for forward compatibility with newer rippled
+                self.decode(src)
+            }
+        }
     }
 }
 

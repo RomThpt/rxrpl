@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use rustls::{ClientConfig, ServerConfig};
+use openssl::ssl::{SslAcceptor, SslConnector};
 use rxrpl_consensus::types::{Proposal, Validation};
 use rxrpl_p2p_proto::MessageType;
 use rxrpl_p2p_proto::codec::{PeerCodec, PeerMessage};
@@ -56,8 +56,8 @@ pub struct PeerManagerConfig {
     pub seeds: Vec<String>,
     pub fixed_peers: Vec<String>,
     pub network_id: u32,
-    pub tls_server: Arc<ServerConfig>,
-    pub tls_client: Arc<ClientConfig>,
+    pub tls_server: Arc<SslAcceptor>,
+    pub tls_client: Arc<SslConnector>,
 }
 
 /// Central P2P network manager.
@@ -276,7 +276,7 @@ impl PeerManager {
         let ledger_hash = Arc::clone(&self.ledger_hash);
         let event_tx = self.event_tx.clone();
         let peer_set = Arc::clone(&self.peer_set);
-        let tls_server = Arc::clone(&self.config.tls_server);
+        let tls_server = self.config.tls_server.clone();
 
         tokio::spawn(async move {
             if let Err(e) = try_accept_inbound(
@@ -468,9 +468,7 @@ impl PeerManager {
             }
             MessageType::Validation => {
                 match proto_convert::decode_validation(payload) {
-                    Ok(mut validation) => {
-                        // Set the sender's node_id from the authenticated peer identity
-                        validation.node_id = rxrpl_consensus::types::NodeId(from);
+                    Ok(validation) => {
                         if let Some(ref info) = peer_info {
                             info.reputation.record_valid_message(payload_len);
                         }
@@ -524,7 +522,7 @@ impl PeerManager {
                     }
                 }
             }
-            MessageType::GetPeers => {
+            MessageType::Cluster => {
                 if let Some(ref info) = peer_info {
                     info.reputation.record_valid_message(payload_len);
                 }
@@ -545,7 +543,7 @@ impl PeerManager {
                     let response = proto_convert::encode_peers(peer_addrs);
                     if let Some(handle) = self.peer_handles.get(&from) {
                         let _ = handle.tx.try_send(PeerMessage {
-                            msg_type: MessageType::Peers,
+                            msg_type: MessageType::Endpoints,
                             payload: response,
                         });
                     }
@@ -609,7 +607,7 @@ impl PeerManager {
                     }
                 }
             }
-            MessageType::Peers => {
+            MessageType::Endpoints => {
                 match proto_convert::decode_peers(payload) {
                     Ok(peers) => {
                         if let Some(ref info) = peer_info {
@@ -635,7 +633,7 @@ impl PeerManager {
                     }
                 }
             }
-            MessageType::Manifest => {
+            MessageType::Manifests => {
                 match proto_convert::decode_manifest(payload) {
                     Ok(manifest) => {
                         if let Some(ref info) = peer_info {
@@ -663,12 +661,12 @@ impl PeerManager {
                     }
                 }
             }
-            MessageType::Hello => {
-                // Unexpected Hello after handshake is a protocol violation
+            _ => {
+                // Unhandled message type -- log and ignore
                 if let Some(ref info) = peer_info {
-                    info.reputation.record_violation();
+                    info.reputation.record_valid_message(payload_len);
                 }
-                tracing::debug!("unexpected Hello from {}", from);
+                tracing::trace!("unhandled message type {:?} from {}", msg_type, from);
             }
         }
     }
@@ -925,7 +923,7 @@ async fn try_connect_outbound(
     ledger_hash: &RwLock<Hash256>,
     event_tx: &mpsc::UnboundedSender<PeerEvent>,
     peer_set: &PeerSet,
-    tls_client: &Arc<ClientConfig>,
+    tls_client: &Arc<SslConnector>,
 ) -> Result<Hash256, OverlayError> {
     let tcp = TcpStream::connect(addr)
         .await
@@ -935,12 +933,11 @@ async fn try_connect_outbound(
         .await
         .map_err(|e| OverlayError::Connection(format!("TLS connect {addr}: {e}")))?;
 
-    let mut framed = Framed::new(stream, PeerCodec);
     let seq = ledger_seq.load(Ordering::Relaxed);
     let hash = *ledger_hash.read().await;
 
-    let peer_node_id =
-        handshake::handshake_outbound(&mut framed, identity, network_id, seq, &hash).await?;
+    let (peer_node_id, framed) =
+        handshake::handshake_outbound_http(stream, identity, network_id, seq, &hash).await?;
 
     if peer_set.get(&peer_node_id).is_some() {
         return Err(OverlayError::Handshake("already connected".into()));
@@ -979,18 +976,17 @@ async fn try_accept_inbound(
     ledger_hash: &RwLock<Hash256>,
     event_tx: &mpsc::UnboundedSender<PeerEvent>,
     peer_set: &PeerSet,
-    tls_server: &Arc<ServerConfig>,
+    tls_server: &Arc<SslAcceptor>,
 ) -> Result<Hash256, OverlayError> {
     let stream = tls::accept_tls(tcp, tls_server)
         .await
         .map_err(|e| OverlayError::Connection(format!("TLS accept {addr}: {e}")))?;
 
-    let mut framed = Framed::new(stream, PeerCodec);
     let seq = ledger_seq.load(Ordering::Relaxed);
     let hash = *ledger_hash.read().await;
 
-    let peer_node_id =
-        handshake::handshake_inbound(&mut framed, identity, network_id, seq, &hash).await?;
+    let (peer_node_id, framed) =
+        handshake::handshake_inbound_http(stream, identity, network_id, seq, &hash).await?;
 
     if peer_set.get(&peer_node_id).is_some() {
         return Err(OverlayError::Handshake("already connected".into()));

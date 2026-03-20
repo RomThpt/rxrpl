@@ -76,7 +76,7 @@ impl PeerDiscovery {
             for peer_id in &peer_ids {
                 let _ = self.cmd_tx.send(OverlayCommand::SendTo {
                     node_id: *peer_id,
-                    msg_type: rxrpl_p2p_proto::MessageType::GetPeers,
+                    msg_type: rxrpl_p2p_proto::MessageType::Cluster,
                     payload: payload.clone(),
                 });
             }

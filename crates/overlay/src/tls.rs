@@ -1,124 +1,161 @@
 use std::sync::Arc;
 
-use rcgen::{CertificateParams, KeyPair as RcgenKeyPair};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-use rustls::{ClientConfig, ServerConfig};
+use openssl::hash::MessageDigest;
+use openssl::pkey::PKey;
+use openssl::rsa::Rsa;
+use openssl::ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode};
+use openssl::x509::X509NameBuilder;
 use tokio::net::TcpStream;
 
+use crate::error::OverlayError;
 use crate::identity::NodeIdentity;
 
-/// A TLS-wrapped TCP stream (either client or server side).
-pub type PeerStream = tokio_rustls::TlsStream<TcpStream>;
+/// A TLS-wrapped TCP stream (openssl).
+pub type PeerStream = tokio_openssl::SslStream<TcpStream>;
 
-/// Generate a self-signed X.509 certificate from the node identity.
+/// Generate a self-signed X.509 certificate.
 pub fn generate_self_signed_cert(
     identity: &NodeIdentity,
-) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
-    let subject = format!(
-        "rxrpl-node-{}",
-        hex::encode(&identity.node_id.as_bytes()[..8])
-    );
-    let mut params = CertificateParams::new(vec![subject]).expect("valid cert params");
-    params.distinguished_name = rcgen::DistinguishedName::new();
+) -> (openssl::x509::X509, PKey<openssl::pkey::Private>) {
+    let rsa = Rsa::generate(2048).expect("RSA keygen");
+    let pkey = PKey::from_rsa(rsa).expect("PKey");
 
-    let key_pair = RcgenKeyPair::generate().expect("keygen");
-    let cert = params.self_signed(&key_pair).expect("self-sign");
+    let mut name = X509NameBuilder::new().expect("name builder");
+    name.append_entry_by_text(
+        "CN",
+        &format!(
+            "rxrpl-node-{}",
+            hex::encode(&identity.node_id.as_bytes()[..8])
+        ),
+    )
+    .expect("CN entry");
+    let name = name.build();
 
-    let cert_der = CertificateDer::from(cert.der().to_vec());
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+    let mut cert = openssl::x509::X509Builder::new().expect("cert builder");
+    cert.set_version(2).expect("version");
+    cert.set_subject_name(&name).expect("subject");
+    cert.set_issuer_name(&name).expect("issuer");
+    cert.set_pubkey(&pkey).expect("pubkey");
 
-    (cert_der, key_der)
+    let not_before = openssl::asn1::Asn1Time::days_from_now(0).expect("not_before");
+    let not_after = openssl::asn1::Asn1Time::days_from_now(365).expect("not_after");
+    cert.set_not_before(&not_before).expect("set not_before");
+    cert.set_not_after(&not_after).expect("set not_after");
+
+    cert.sign(&pkey, MessageDigest::sha256()).expect("sign");
+    (cert.build(), pkey)
 }
 
-/// Build a rustls `ServerConfig` that accepts any client certificate.
+/// Build an SslAcceptor (server side) that accepts any client certificate.
 ///
 /// Peer authentication happens at the overlay handshake layer, not TLS.
-pub fn build_server_config(identity: &NodeIdentity) -> Arc<ServerConfig> {
-    let (cert_der, key_der) = generate_self_signed_cert(identity);
+pub fn build_server_config(identity: &NodeIdentity) -> Arc<SslAcceptor> {
+    let (cert, pkey) = generate_self_signed_cert(identity);
 
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
-        .expect("valid server TLS config");
+    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).expect("acceptor");
+    builder.set_certificate(&cert).expect("set cert");
+    builder.set_private_key(&pkey).expect("set key");
+    builder.check_private_key().expect("check key");
+    builder.set_verify(SslVerifyMode::NONE);
 
-    Arc::new(config)
+    Arc::new(builder.build())
 }
 
-/// Build a rustls `ClientConfig` that accepts any server certificate.
+/// Build an SslConnector (client side) that accepts any server certificate.
 ///
 /// Peer authentication happens at the overlay handshake layer, not TLS.
-pub fn build_client_config() -> Arc<ClientConfig> {
-    let config = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
-        .with_no_client_auth();
-
-    Arc::new(config)
+pub fn build_client_config() -> Arc<SslConnector> {
+    let mut builder = SslConnector::builder(SslMethod::tls()).expect("connector");
+    builder.set_verify(SslVerifyMode::NONE);
+    Arc::new(builder.build())
 }
 
-/// Connect a TLS client stream over the given TCP stream.
+/// Connect a TLS client stream.
 pub async fn connect_tls(
     stream: TcpStream,
-    client_config: &Arc<ClientConfig>,
-) -> Result<PeerStream, std::io::Error> {
-    let connector = tokio_rustls::TlsConnector::from(Arc::clone(client_config));
-    let server_name = ServerName::try_from("rxrpl-peer").expect("valid DNS name");
-    let tls = connector.connect(server_name, stream).await?;
-    Ok(tokio_rustls::TlsStream::Client(tls))
+    client_config: &Arc<SslConnector>,
+) -> Result<PeerStream, OverlayError> {
+    let ssl = client_config
+        .configure()
+        .map_err(|e| OverlayError::Connection(format!("SSL configure: {e}")))?
+        .verify_hostname(false)
+        .into_ssl("rxrpl-peer")
+        .map_err(|e| OverlayError::Connection(format!("SSL create: {e}")))?;
+
+    let mut tls = tokio_openssl::SslStream::new(ssl, stream)
+        .map_err(|e| OverlayError::Connection(format!("SSL stream: {e}")))?;
+
+    std::pin::Pin::new(&mut tls)
+        .connect()
+        .await
+        .map_err(|e| OverlayError::Connection(format!("TLS connect: {e}")))?;
+
+    Ok(tls)
 }
 
-/// Accept a TLS server stream over the given TCP stream.
+/// Accept a TLS server stream.
 pub async fn accept_tls(
     stream: TcpStream,
-    server_config: &Arc<ServerConfig>,
-) -> Result<PeerStream, std::io::Error> {
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(server_config));
-    let tls = acceptor.accept(stream).await?;
-    Ok(tokio_rustls::TlsStream::Server(tls))
+    server_config: &Arc<SslAcceptor>,
+) -> Result<PeerStream, OverlayError> {
+    let ssl = openssl::ssl::Ssl::new(server_config.context())
+        .map_err(|e| OverlayError::Connection(format!("SSL create: {e}")))?;
+
+    let mut tls = tokio_openssl::SslStream::new(ssl, stream)
+        .map_err(|e| OverlayError::Connection(format!("SSL stream: {e}")))?;
+
+    std::pin::Pin::new(&mut tls)
+        .accept()
+        .await
+        .map_err(|e| OverlayError::Connection(format!("TLS accept: {e}")))?;
+
+    Ok(tls)
 }
 
-/// Certificate verifier that accepts any certificate.
+/// Extract the session cookie from a TLS stream for the XRPL peer handshake.
 ///
-/// This is safe because peer identity verification happens in the
-/// overlay handshake protocol (public key + signature proof).
-#[derive(Debug)]
-struct AcceptAnyCert;
+/// Matches rippled's `makeSharedValue()`:
+/// 1. cookie1 = SHA-512(local finished message)
+/// 2. cookie2 = SHA-512(peer finished message)
+/// 3. shared = cookie1 XOR cookie2
+/// 4. cookie = SHA-512-Half(shared)
+pub fn extract_session_cookie(
+    stream: &PeerStream,
+) -> Result<rxrpl_primitives::Hash256, OverlayError> {
+    let ssl = stream.ssl();
 
-impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    let mut local_buf = [0u8; 256];
+    let local_len = ssl.finished(&mut local_buf);
+    if local_len < 12 {
+        return Err(OverlayError::Handshake(
+            "local finished message too short".into(),
+        ));
     }
 
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    let mut peer_buf = [0u8; 256];
+    let peer_len = ssl.peer_finished(&mut peer_buf);
+    if peer_len < 12 {
+        return Err(OverlayError::Handshake(
+            "peer finished message too short".into(),
+        ));
     }
 
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    use sha2::{Digest, Sha512};
+    let cookie1 = Sha512::digest(&local_buf[..local_len]);
+    let cookie2 = Sha512::digest(&peer_buf[..peer_len]);
+
+    let mut shared = [0u8; 64];
+    for i in 0..64 {
+        shared[i] = cookie1[i] ^ cookie2[i];
     }
 
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+    if shared.iter().all(|&b| b == 0) {
+        return Err(OverlayError::Handshake(
+            "identical finished messages".into(),
+        ));
     }
+
+    Ok(rxrpl_crypto::sha512_half::sha512_half(&[&shared]))
 }
 
 #[cfg(test)]
@@ -128,9 +165,9 @@ mod tests {
     #[test]
     fn generate_cert_roundtrip() {
         let identity = NodeIdentity::generate();
-        let (cert, key) = generate_self_signed_cert(&identity);
-        assert!(!cert.is_empty());
-        assert!(!key.secret_der().is_empty());
+        let (cert, pkey) = generate_self_signed_cert(&identity);
+        assert!(!cert.to_der().unwrap().is_empty());
+        assert!(!pkey.private_key_to_der().unwrap().is_empty());
     }
 
     #[test]
