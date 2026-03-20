@@ -552,7 +552,17 @@ impl PeerManager {
                             .map(|n| (n.node_id, n.node_data))
                             .collect();
 
-                        // Notify ledger syncer about the response
+                        // Feed nodes into incremental sync if active.
+                        let incremental_complete =
+                            self.ledger_syncer.feed_nodes(msg.ledger_seq, &nodes);
+                        if incremental_complete {
+                            tracing::info!(
+                                "incremental sync complete for ledger #{} hash={}",
+                                msg.ledger_seq, hash,
+                            );
+                        }
+
+                        // Notify ledger syncer about the response (full sync path).
                         if let Some(synced) =
                             self.ledger_syncer
                                 .handle_response(msg.ledger_seq, hash, nodes.clone())
@@ -696,26 +706,54 @@ impl PeerManager {
         }
     }
 
-    /// Send a GetLedger request to up to 3 available peers.
+    /// Send a GetLedger request to the best 3 peers by reputation score.
+    ///
+    /// Uses weighted peer selection: peers are ranked by reputation score with
+    /// a bonus for peers whose known ledger sequence is at or ahead of the target.
+    ///
+    /// When the ledger syncer has an active incremental sync for the target
+    /// sequence, the request includes specific node hashes (delta sync).
+    /// Otherwise, falls back to requesting all leaf nodes.
     fn send_get_ledger(&self, seq: u32, hash: Option<Hash256>) {
         use rxrpl_p2p_proto::proto::tm_get_ledger::LedgerType;
-        let payload =
-            proto_convert::encode_get_ledger(LedgerType::LtHash as i32, hash.as_ref(), seq, false);
+
+        // Check if we have missing node hashes from an active incremental sync.
+        let node_ids: Vec<Vec<u8>> = self
+            .ledger_syncer
+            .get_missing_node_ids(seq)
+            .into_iter()
+            .map(|h| h.as_bytes().to_vec())
+            .collect();
+
+        let is_delta = !node_ids.is_empty();
+        let payload = proto_convert::encode_get_ledger_with_nodes(
+            LedgerType::LtHash as i32,
+            hash.as_ref(),
+            seq,
+            false,
+            node_ids,
+        );
+
+        let best = self.peer_set.best_peers_for_ledger(seq, 3);
         let mut sent = 0;
-        for handle in self.peer_handles.values() {
-            if sent >= 3 {
-                break;
+        for node_id in &best {
+            if let Some(handle) = self.peer_handles.get(node_id) {
+                let _ = handle.tx.try_send(PeerMessage {
+                    msg_type: MessageType::GetLedger,
+                    payload: payload.clone(),
+                });
+                sent += 1;
             }
-            let _ = handle.tx.try_send(PeerMessage {
-                msg_type: MessageType::GetLedger,
-                payload: payload.clone(),
-            });
-            sent += 1;
         }
         if sent == 0 {
             tracing::debug!("no peers available for GetLedger seq={}", seq);
+        } else if is_delta {
+            tracing::debug!(
+                "sent GetLedger seq={} to {} peers (delta sync, reputation-selected)",
+                seq, sent
+            );
         } else {
-            tracing::debug!("sent GetLedger seq={} to {} peers", seq, sent);
+            tracing::debug!("sent GetLedger seq={} to {} peers (reputation-selected)", seq, sent);
         }
     }
 
@@ -782,21 +820,61 @@ impl PeerManager {
         let mut truncated = false;
         const MAX_RESPONSE_SIZE: usize = 256 * 1024;
 
-        ledger.state_map.for_each(&mut |key, data| {
-            let entry_size = key.as_bytes().len() + data.len();
-            if total_size + entry_size <= MAX_RESPONSE_SIZE {
-                nodes.push((key.as_bytes().to_vec(), data.to_vec()));
-                total_size += entry_size;
-            } else {
-                truncated = true;
-            }
-        });
+        // Parse requested node_ids from the request for delta sync.
+        let request_node_ids: Vec<Hash256> = req
+            .node_ids
+            .iter()
+            .filter_map(|id_bytes| {
+                if id_bytes.len() >= 32 {
+                    let arr: [u8; 32] = id_bytes[..32].try_into().ok()?;
+                    Some(Hash256::new(arr))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-        if truncated {
-            tracing::warn!(
-                "GetLedger response truncated at 256KB: sent {} state nodes for seq={}",
-                nodes.len(), ledger.header.sequence
-            );
+        if !request_node_ids.is_empty() {
+            // Delta sync: serve specific nodes by hash from the backing store.
+            for node_hash in &request_node_ids {
+                if let Some(store) = ledger.state_map.store() {
+                    if let Ok(Some(data)) = store.fetch(node_hash) {
+                        let entry_size = node_hash.as_bytes().len() + data.len();
+                        if total_size + entry_size <= MAX_RESPONSE_SIZE {
+                            nodes.push((node_hash.as_bytes().to_vec(), data));
+                            total_size += entry_size;
+                        } else {
+                            truncated = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if truncated {
+                tracing::warn!(
+                    "GetLedger delta response truncated at 256KB: sent {} of {} requested nodes for seq={}",
+                    nodes.len(), request_node_ids.len(), ledger.header.sequence
+                );
+            }
+        } else {
+            // Full sync fallback: serve all leaf nodes.
+            ledger.state_map.for_each(&mut |key, data| {
+                let entry_size = key.as_bytes().len() + data.len();
+                if total_size + entry_size <= MAX_RESPONSE_SIZE {
+                    nodes.push((key.as_bytes().to_vec(), data.to_vec()));
+                    total_size += entry_size;
+                } else {
+                    truncated = true;
+                }
+            });
+
+            if truncated {
+                tracing::warn!(
+                    "GetLedger response truncated at 256KB: sent {} state nodes for seq={}",
+                    nodes.len(), ledger.header.sequence
+                );
+            }
         }
 
         let response = proto_convert::encode_ledger_data(

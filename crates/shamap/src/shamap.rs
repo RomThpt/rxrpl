@@ -790,6 +790,204 @@ impl SHAMap {
         }
     }
 
+    // --- Delta sync methods ---
+
+    /// Compute hashes of missing nodes needed to complete the tree toward a target root.
+    ///
+    /// Walks the tree comparing known inner node hashes against what is in the
+    /// backing store. A branch is "missing" if `is_branch` is set but the child
+    /// is neither loaded in memory nor fetchable from the store.
+    ///
+    /// If `self` has no root (empty tree), returns the `target_root_hash` itself
+    /// so the caller can request the root node first.
+    ///
+    /// Returns up to `max_count` hashes of missing nodes.
+    pub fn missing_nodes(
+        &self,
+        target_root_hash: Hash256,
+        max_count: usize,
+    ) -> Vec<Hash256> {
+        if max_count == 0 {
+            return Vec::new();
+        }
+
+        // If our tree is empty, we need the target root itself.
+        if self.is_empty() {
+            return vec![target_root_hash];
+        }
+
+        let mut missing = Vec::new();
+        match self.root.as_ref() {
+            SHAMapNode::Inner(inner) => {
+                Self::collect_missing(
+                    inner,
+                    &self.store,
+                    self.leaf_ctor,
+                    max_count,
+                    &mut missing,
+                );
+            }
+            SHAMapNode::Leaf(_) => {
+                // A leaf root means the tree is trivially complete.
+            }
+        }
+        missing
+    }
+
+    /// Recursively collect hashes of nodes that are referenced but not available.
+    fn collect_missing(
+        inner: &InnerNode,
+        store: &Option<Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+        max_count: usize,
+        out: &mut Vec<Hash256>,
+    ) {
+        let mut mask = inner.branch_mask();
+        while mask != 0 && out.len() < max_count {
+            let branch = mask.trailing_zeros() as u8;
+
+            // Try to get the child: first check if loaded, then try store.
+            if inner.child(branch).is_some() {
+                // Already loaded -- recurse if it is an inner node.
+                if let Some(child) = inner.child(branch) {
+                    if let SHAMapNode::Inner(child_inner) = child.as_ref() {
+                        Self::collect_missing(child_inner, store, leaf_ctor, max_count, out);
+                    }
+                }
+            } else {
+                // Not loaded -- check if the store can provide it.
+                let child_hash = inner.child_hash(branch);
+                let available = store
+                    .as_ref()
+                    .and_then(|s| s.fetch(&child_hash).ok())
+                    .flatten()
+                    .is_some();
+                if !available {
+                    out.push(child_hash);
+                } else {
+                    // Available in store but not loaded. Try to deserialize and
+                    // recurse into it if it is an inner node to find deeper gaps.
+                    if let Some(s) = store.as_ref() {
+                        if let Ok(Some(data)) = s.fetch(&child_hash) {
+                            if let Ok(node) =
+                                crate::node_store::deserialize_node(&data, &child_hash, leaf_ctor)
+                            {
+                                if let SHAMapNode::Inner(child_inner) = &node {
+                                    Self::collect_missing(
+                                        child_inner, store, leaf_ctor, max_count, out,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            mask &= mask - 1;
+        }
+    }
+
+    /// Insert a raw node (inner or leaf) fetched from a peer into the backing store.
+    ///
+    /// The node data is stored via `store.store_batch()`. Lazy loading will pick
+    /// it up when the tree is traversed. Returns `Ok(true)` if the node was new
+    /// (not already present), `Ok(false)` if it was already in the store.
+    pub fn add_raw_node(
+        &mut self,
+        hash: Hash256,
+        data: Vec<u8>,
+    ) -> Result<bool, SHAMapError> {
+        let store = self.store.as_ref().ok_or(SHAMapError::MissingStore)?;
+
+        // Check if already present.
+        if let Some(_existing) = store.fetch(&hash)? {
+            return Ok(false);
+        }
+
+        store.store_batch(&[(&hash, &data)])?;
+        Ok(true)
+    }
+
+    /// Check if the tree is complete (all branches can be resolved).
+    ///
+    /// Walks the tree and returns `true` if every branch's child is either
+    /// loaded in memory or fetchable from the backing store. Returns `false`
+    /// if any branch cannot be resolved (missing store or missing node).
+    pub fn is_complete(&self) -> bool {
+        match self.root.as_ref() {
+            SHAMapNode::Inner(inner) => {
+                Self::check_complete(inner, &self.store, self.leaf_ctor)
+            }
+            SHAMapNode::Leaf(_) => true,
+        }
+    }
+
+    /// Recursively check completeness of an inner node.
+    fn check_complete(
+        inner: &InnerNode,
+        store: &Option<Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+    ) -> bool {
+        let mut mask = inner.branch_mask();
+        while mask != 0 {
+            let branch = mask.trailing_zeros() as u8;
+
+            match inner.child_with_store(branch, store.as_ref(), leaf_ctor) {
+                Ok(Some(child)) => {
+                    if let SHAMapNode::Inner(child_inner) = child.as_ref() {
+                        if !Self::check_complete(child_inner, store, leaf_ctor) {
+                            return false;
+                        }
+                    }
+                }
+                _ => return false,
+            }
+
+            mask &= mask - 1;
+        }
+        true
+    }
+
+    /// Create a SHAMap in syncing state from a root hash stored in the backing
+    /// store. Unlike `from_root_hash`, this does not fail if the root is not
+    /// yet in the store -- it creates an empty tree that will be populated
+    /// incrementally via `add_raw_node`.
+    pub fn syncing_with_store(
+        root_hash: Hash256,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+        store: Arc<dyn NodeStore>,
+    ) -> Self {
+        // Try to load the root if already available.
+        let root = store
+            .fetch(&root_hash)
+            .ok()
+            .flatten()
+            .and_then(|bytes| {
+                crate::node_store::deserialize_node(&bytes, &root_hash, leaf_ctor).ok()
+            })
+            .map(|node| Arc::new(node))
+            .unwrap_or_else(|| Arc::new(SHAMapNode::inner(InnerNode::new())));
+
+        Self {
+            root,
+            state: SHAMapState::Syncing,
+            leaf_ctor,
+            store: Some(store),
+        }
+    }
+
+    /// Reload the root node from the store after new nodes have been added.
+    ///
+    /// Used during incremental sync to pick up a newly stored root node.
+    pub fn reload_root(&mut self, root_hash: Hash256) -> Result<(), SHAMapError> {
+        let store = self.store.as_ref().ok_or(SHAMapError::MissingStore)?;
+        if let Some(bytes) = store.fetch(&root_hash)? {
+            let node = crate::node_store::deserialize_node(&bytes, &root_hash, self.leaf_ctor)?;
+            self.root = Arc::new(node);
+        }
+        Ok(())
+    }
+
     /// Recursively update hashes for all dirty nodes.
     fn update_hashes(node: &mut SHAMapNode) {
         if let SHAMapNode::Inner(inner) = node {

@@ -210,11 +210,25 @@ pub fn encode_get_ledger(
     seq: u32,
     request_cookie: bool,
 ) -> Vec<u8> {
+    encode_get_ledger_with_nodes(ledger_type, hash, seq, request_cookie, Vec::new())
+}
+
+/// Encode a GetLedger request with specific node hashes for delta sync.
+///
+/// When `node_ids` is non-empty, the peer should return the raw node data
+/// for each requested hash instead of all leaf nodes.
+pub fn encode_get_ledger_with_nodes(
+    ledger_type: i32,
+    hash: Option<&Hash256>,
+    seq: u32,
+    request_cookie: bool,
+    node_ids: Vec<Vec<u8>>,
+) -> Vec<u8> {
     let msg = TmGetLedger {
         ledger_type,
         ledger_hash: hash.map(|h| h.as_bytes().to_vec()).unwrap_or_default(),
         ledger_seq: seq,
-        node_ids: Vec::new(),
+        node_ids,
         request_cookie,
         query_depth: 0,
     };

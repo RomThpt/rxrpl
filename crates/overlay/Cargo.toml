@@ -13,6 +13,7 @@ rxrpl-p2p-proto = { workspace = true }
 rxrpl-consensus = { workspace = true }
 rxrpl-config = { workspace = true }
 rxrpl-ledger = { workspace = true }
+rxrpl-shamap = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio-rustls = { workspace = true }
