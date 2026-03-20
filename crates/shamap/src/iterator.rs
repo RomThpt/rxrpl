@@ -3,7 +3,9 @@ use std::sync::Arc;
 use rxrpl_primitives::Hash256;
 
 use crate::inner_node::InnerNode;
+use crate::leaf_node::LeafNode;
 use crate::node::SHAMapNode;
+use crate::node_store::NodeStore;
 
 /// Depth-first leaf iterator over a SHAMap.
 ///
@@ -11,12 +13,20 @@ use crate::node::SHAMapNode;
 /// leaves sorted by key since branch selection is based on key nibbles.
 pub struct SHAMapIter {
     stack: Vec<(Arc<SHAMapNode>, u8)>,
+    store: Option<Arc<dyn NodeStore>>,
+    leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
 }
 
 impl SHAMapIter {
-    pub(crate) fn new(root: Arc<SHAMapNode>) -> Self {
+    pub(crate) fn new(
+        root: Arc<SHAMapNode>,
+        store: Option<Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+    ) -> Self {
         SHAMapIter {
             stack: vec![(root, 0)],
+            store,
+            leaf_ctor,
         }
     }
 }
@@ -47,8 +57,12 @@ impl Iterator for SHAMapIter {
 
                     *branch = b + 1;
 
-                    // Clone the Arc before releasing the borrow on self.stack
-                    let child = inner.child(b).cloned();
+                    // Use child_with_store for lazy loading, clone the Arc
+                    let child = inner
+                        .child_with_store(b, self.store.as_ref(), self.leaf_ctor)
+                        .ok()
+                        .flatten()
+                        .cloned();
                     if let Some(child_arc) = child {
                         self.stack.push((child_arc, 0));
                     }
@@ -61,11 +75,21 @@ impl Iterator for SHAMapIter {
 /// Borrowing iterator over a SHAMap, yielding references to leaf key/data.
 pub struct SHAMapRefIter<'a> {
     stack: Vec<(&'a InnerNode, u8)>,
+    store: Option<&'a Arc<dyn NodeStore>>,
+    leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
 }
 
 impl<'a> SHAMapRefIter<'a> {
-    pub(crate) fn new(root: &'a SHAMapNode) -> Self {
-        let mut iter = SHAMapRefIter { stack: Vec::new() };
+    pub(crate) fn new(
+        root: &'a SHAMapNode,
+        store: Option<&'a Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+    ) -> Self {
+        let mut iter = SHAMapRefIter {
+            stack: Vec::new(),
+            store,
+            leaf_ctor,
+        };
         if let SHAMapNode::Inner(inner) = root {
             iter.stack.push((inner, 0));
         }
@@ -92,7 +116,7 @@ impl<'a> Iterator for SHAMapRefIter<'a> {
 
             *branch = b + 1;
 
-            if let Some(child) = inner.child(b) {
+            if let Ok(Some(child)) = inner.child_with_store(b, self.store, self.leaf_ctor) {
                 match child.as_ref() {
                     SHAMapNode::Leaf(leaf) => {
                         return Some((leaf.key(), leaf.data()));

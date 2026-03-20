@@ -1,11 +1,50 @@
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use rxrpl_crypto::hash_prefix::HashPrefix;
 use rxrpl_crypto::sha512_half::sha512_half;
 use rxrpl_primitives::Hash256;
 
+use crate::error::SHAMapError;
+use crate::leaf_node::LeafNode;
 use crate::node::SHAMapNode;
 use crate::node_id::BRANCH_FACTOR;
+use crate::node_store::NodeStore;
+
+/// A child slot that can be either loaded (node in memory) or unloaded (only hash known).
+/// Uses `OnceLock` for thread-safe lazy initialization behind `&self`.
+struct LazyChild {
+    cell: OnceLock<Arc<SHAMapNode>>,
+}
+
+impl Clone for LazyChild {
+    fn clone(&self) -> Self {
+        match self.cell.get() {
+            Some(node) => LazyChild {
+                cell: OnceLock::from(Arc::clone(node)),
+            },
+            None => LazyChild {
+                cell: OnceLock::new(),
+            },
+        }
+    }
+}
+
+impl std::fmt::Debug for LazyChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyChild")
+            .field("cell", &self.cell)
+            .finish()
+    }
+}
+
+impl Default for LazyChild {
+    fn default() -> Self {
+        LazyChild {
+            cell: OnceLock::new(),
+        }
+    }
+}
 
 /// A 16-child branch node with Merkle hashing.
 ///
@@ -14,7 +53,7 @@ use crate::node_id::BRANCH_FACTOR;
 #[derive(Clone, Debug)]
 pub struct InnerNode {
     hashes: [Hash256; BRANCH_FACTOR],
-    children: [Option<Arc<SHAMapNode>>; BRANCH_FACTOR],
+    children: [LazyChild; BRANCH_FACTOR],
     is_branch: u16,
     hash: Hash256,
 }
@@ -73,12 +112,41 @@ impl InnerNode {
         self.is_branch & (1 << branch) == 0
     }
 
-    /// Get a reference to a child node.
+    /// Get a reference to a child node (only if already loaded, no lazy fetch).
     pub fn child(&self, branch: u8) -> Option<&Arc<SHAMapNode>> {
         if self.is_empty_branch(branch) {
             return None;
         }
-        self.children[branch as usize].as_ref()
+        self.children[branch as usize].cell.get()
+    }
+
+    /// Get a reference to a child node, lazily loading from store if needed.
+    pub fn child_with_store(
+        &self,
+        branch: u8,
+        store: Option<&Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+    ) -> Result<Option<&Arc<SHAMapNode>>, SHAMapError> {
+        if self.is_empty_branch(branch) {
+            return Ok(None);
+        }
+        if let Some(node) = self.children[branch as usize].cell.get() {
+            return Ok(Some(node));
+        }
+        let hash = self.hashes[branch as usize];
+        let store = store.ok_or(SHAMapError::MissingStore)?;
+        let bytes = store
+            .fetch(&hash)?
+            .ok_or(SHAMapError::NodeNotFound(hash))?;
+        let node = crate::node_store::deserialize_node(&bytes, &hash, leaf_ctor)?;
+        let _ = self.children[branch as usize].cell.set(Arc::new(node));
+        Ok(self.children[branch as usize].cell.get())
+    }
+
+    /// Get a reference to a child node that is already loaded (no lazy fetch).
+    /// This is an alias for `child()` for clarity.
+    pub fn child_loaded(&self, branch: u8) -> Option<&Arc<SHAMapNode>> {
+        self.child(branch)
     }
 
     /// Get a mutable reference to a child Arc for copy-on-write.
@@ -86,7 +154,7 @@ impl InnerNode {
         if self.is_empty_branch(branch) {
             return None;
         }
-        self.children[branch as usize].as_mut()
+        self.children[branch as usize].cell.get_mut()
     }
 
     pub fn child_hash(&self, branch: u8) -> Hash256 {
@@ -97,7 +165,9 @@ impl InnerNode {
     pub fn set_child(&mut self, branch: u8, node: SHAMapNode) {
         let hash = node.hash();
         self.hashes[branch as usize] = hash;
-        self.children[branch as usize] = Some(Arc::new(node));
+        self.children[branch as usize] = LazyChild {
+            cell: OnceLock::from(Arc::new(node)),
+        };
         self.is_branch |= 1 << branch;
         self.invalidate_hash();
     }
@@ -105,15 +175,28 @@ impl InnerNode {
     /// Set a child from an existing Arc.
     pub fn set_child_arc(&mut self, branch: u8, node: Arc<SHAMapNode>) {
         self.hashes[branch as usize] = node.hash();
-        self.children[branch as usize] = Some(node);
+        self.children[branch as usize] = LazyChild {
+            cell: OnceLock::from(node),
+        };
         self.is_branch |= 1 << branch;
         self.invalidate_hash();
+    }
+
+    /// Set only the child hash (node will be lazily loaded when accessed).
+    pub fn set_child_hash(&mut self, branch: u8, hash: Hash256) {
+        self.hashes[branch as usize] = hash;
+        self.is_branch |= 1 << branch;
+    }
+
+    /// Set the cached hash directly, avoiding recomputation when loading from store.
+    pub fn set_cached_hash(&mut self, hash: Hash256) {
+        self.hash = hash;
     }
 
     /// Remove a child node.
     pub fn remove_child(&mut self, branch: u8) {
         self.hashes[branch as usize] = Hash256::ZERO;
-        self.children[branch as usize] = None;
+        self.children[branch as usize] = LazyChild::default();
         self.is_branch &= !(1 << branch);
         self.invalidate_hash();
     }
@@ -137,6 +220,29 @@ impl InnerNode {
         }
     }
 
+    /// Ensure a child is loaded into memory (for write paths that need take_child).
+    pub fn ensure_loaded(
+        &mut self,
+        branch: u8,
+        store: Option<&Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+    ) -> Result<(), SHAMapError> {
+        if self.is_empty_branch(branch) {
+            return Ok(());
+        }
+        if self.children[branch as usize].cell.get().is_some() {
+            return Ok(());
+        }
+        let hash = self.hashes[branch as usize];
+        let store = store.ok_or(SHAMapError::MissingStore)?;
+        let bytes = store
+            .fetch(&hash)?
+            .ok_or(SHAMapError::NodeNotFound(hash))?;
+        let node = crate::node_store::deserialize_node(&bytes, &hash, leaf_ctor)?;
+        let _ = self.children[branch as usize].cell.set(Arc::new(node));
+        Ok(())
+    }
+
     /// Take a child node out of this inner node (ownership transfer).
     pub fn take_child(&mut self, branch: u8) -> Option<Arc<SHAMapNode>> {
         if self.is_empty_branch(branch) {
@@ -145,7 +251,9 @@ impl InnerNode {
         self.hashes[branch as usize] = Hash256::ZERO;
         self.is_branch &= !(1 << branch);
         self.invalidate_hash();
-        self.children[branch as usize].take()
+        std::mem::take(&mut self.children[branch as usize])
+            .cell
+            .into_inner()
     }
 
     /// Iterate over all occupied branches.
@@ -153,7 +261,7 @@ impl InnerNode {
         let mut mask = self.is_branch;
         while mask != 0 {
             let branch = mask.trailing_zeros() as u8;
-            if let Some(child) = &self.children[branch as usize] {
+            if let Some(child) = self.children[branch as usize].cell.get() {
                 f(branch, child);
             }
             mask &= mask - 1;
@@ -246,5 +354,35 @@ mod tests {
         let h2 = node.hash();
 
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn set_child_hash_marks_branch() {
+        let mut node = InnerNode::new();
+        let hash = Hash256::new([0xAA; 32]);
+        node.set_child_hash(5, hash);
+        assert!(!node.is_empty_branch(5));
+        assert_eq!(node.child_hash(5), hash);
+        // Node is not loaded yet
+        assert!(node.child(5).is_none());
+    }
+
+    #[test]
+    fn set_cached_hash() {
+        let mut node = InnerNode::new();
+        let hash = Hash256::new([0xBB; 32]);
+        node.set_cached_hash(hash);
+        assert_eq!(node.hash(), hash);
+    }
+
+    #[test]
+    fn clone_preserves_loaded_children() {
+        let mut node = InnerNode::new();
+        let leaf = LeafNode::account_state(Hash256::ZERO, vec![1, 2, 3]);
+        node.set_child(5, SHAMapNode::Leaf(leaf));
+
+        let cloned = node.clone();
+        assert!(cloned.child(5).is_some());
+        assert_eq!(cloned.child_hash(5), node.child_hash(5));
     }
 }

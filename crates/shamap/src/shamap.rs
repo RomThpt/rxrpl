@@ -151,14 +151,19 @@ impl SHAMap {
     pub fn insert(&mut self, key: Hash256, data: Vec<u8>) -> Result<(), SHAMapError> {
         self.check_mutable()?;
         let leaf = (self.leaf_ctor)(key, data);
+        let store = self.store.clone();
+        let leaf_ctor = self.leaf_ctor;
         let root = Self::root_inner_mut(&mut self.root);
-        Self::insert_leaf(root, key, leaf, 0)
+        Self::insert_leaf(root, key, leaf, 0, store.as_ref(), leaf_ctor)
     }
 
     /// Get the data for a key.
     pub fn get(&self, key: &Hash256) -> Option<&[u8]> {
         match self.root.as_ref() {
-            SHAMapNode::Inner(inner) => Self::find_leaf(inner, key, 0).map(|l| l.data()),
+            SHAMapNode::Inner(inner) => {
+                Self::find_leaf(inner, key, 0, self.store.as_ref(), self.leaf_ctor)
+                    .map(|l| l.data())
+            }
             SHAMapNode::Leaf(leaf) => {
                 if leaf.key() == key {
                     Some(leaf.data())
@@ -176,29 +181,37 @@ impl SHAMap {
     /// Delete a key. Returns the old data.
     pub fn delete(&mut self, key: &Hash256) -> Result<Vec<u8>, SHAMapError> {
         self.check_mutable()?;
+        let store = self.store.clone();
+        let leaf_ctor = self.leaf_ctor;
         let root = Self::root_inner_mut(&mut self.root);
-        Self::delete_from(root, key, 0)
+        Self::delete_from(root, key, 0, store.as_ref(), leaf_ctor)
     }
 
     /// Update the data for an existing key.
     pub fn update(&mut self, key: Hash256, data: Vec<u8>) -> Result<(), SHAMapError> {
         self.check_mutable()?;
+        let store = self.store.clone();
+        let leaf_ctor = self.leaf_ctor;
         let root = Self::root_inner_mut(&mut self.root);
-        Self::update_in(root, &key, data, 0)
+        Self::update_in(root, &key, data, 0, store.as_ref(), leaf_ctor)
     }
 
     /// Insert or update: if key exists, update; otherwise insert.
     pub fn put(&mut self, key: Hash256, data: Vec<u8>) -> Result<(), SHAMapError> {
         self.check_mutable()?;
         let leaf = (self.leaf_ctor)(key, data);
+        let store = self.store.clone();
+        let leaf_ctor = self.leaf_ctor;
         let root = Self::root_inner_mut(&mut self.root);
-        Self::put_leaf(root, key, leaf, 0)
+        Self::put_leaf(root, key, leaf, 0, store.as_ref(), leaf_ctor)
     }
 
     /// Visit all leaf nodes.
     pub fn for_each(&self, f: &mut impl FnMut(&Hash256, &[u8])) {
         match self.root.as_ref() {
-            SHAMapNode::Inner(inner) => Self::visit(inner, f),
+            SHAMapNode::Inner(inner) => {
+                Self::visit(inner, f, self.store.as_ref(), self.leaf_ctor)
+            }
             SHAMapNode::Leaf(leaf) => f(leaf.key(), leaf.data()),
         }
     }
@@ -216,12 +229,33 @@ impl SHAMap {
 
     /// Return an owning iterator over all leaves (key, data).
     pub fn iter(&self) -> SHAMapIter {
-        SHAMapIter::new(Arc::clone(&self.root))
+        SHAMapIter::new(Arc::clone(&self.root), self.store.clone(), self.leaf_ctor)
     }
 
     /// Return a borrowing iterator over all leaves.
     pub fn iter_ref(&self) -> SHAMapRefIter<'_> {
-        SHAMapRefIter::new(&self.root)
+        SHAMapRefIter::new(&self.root, self.store.as_ref(), self.leaf_ctor)
+    }
+
+    /// Create a SHAMap from a root hash, loading nodes lazily from the store.
+    ///
+    /// Only the root node is fetched immediately. Children are loaded on demand
+    /// when traversed via `get()`, `for_each()`, iterators, etc.
+    pub fn from_root_hash(
+        root_hash: Hash256,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+        store: Arc<dyn NodeStore>,
+    ) -> Result<Self, SHAMapError> {
+        let bytes = store
+            .fetch(&root_hash)?
+            .ok_or(SHAMapError::NodeNotFound(root_hash))?;
+        let root_node = crate::node_store::deserialize_node(&bytes, &root_hash, leaf_ctor)?;
+        Ok(Self {
+            root: Arc::new(root_node),
+            state: SHAMapState::Modifying,
+            leaf_ctor,
+            store: Some(store),
+        })
     }
 
     /// Create a mutable copy (even if the source is immutable).
@@ -234,10 +268,11 @@ impl SHAMap {
         }
     }
 
-    /// Flush all nodes (inner and leaf) to the backing store.
+    /// Flush modified nodes to the backing store (incremental).
     ///
-    /// Computes hashes for any dirty nodes, then serializes and stores
-    /// all reachable nodes. Returns the root hash.
+    /// Only dirty subtrees (nodes that were modified since last flush) are
+    /// serialized and persisted. Unmodified nodes loaded from the store are
+    /// skipped since they are already persisted.
     ///
     /// No-op if no store is attached; returns the root hash regardless.
     pub fn flush(&mut self) -> Result<Hash256, SHAMapError> {
@@ -246,7 +281,7 @@ impl SHAMap {
 
         if let Some(store) = &self.store {
             let mut entries = Vec::new();
-            Self::collect_nodes(&self.root, &mut entries);
+            Self::collect_dirty_nodes(&self.root, &mut entries);
             if !entries.is_empty() {
                 let refs: Vec<(&Hash256, &[u8])> =
                     entries.iter().map(|(h, d)| (h, d.as_slice())).collect();
@@ -257,13 +292,15 @@ impl SHAMap {
         Ok(root_hash)
     }
 
-    /// Collect all node hashes and their serialized data for persistence.
-    fn collect_nodes(node: &Arc<SHAMapNode>, out: &mut Vec<(Hash256, Vec<u8>)>) {
+    /// Collect dirty node hashes and their serialized data for persistence.
+    ///
+    /// A node is considered "dirty" if it was loaded in memory (and potentially
+    /// modified). Unloaded nodes (only hash known) are already in the store.
+    fn collect_dirty_nodes(node: &Arc<SHAMapNode>, out: &mut Vec<(Hash256, Vec<u8>)>) {
         match node.as_ref() {
             SHAMapNode::Inner(inner) => {
                 let hash = inner.hash();
                 if !hash.is_zero() {
-                    // Serialize inner node as: [child_hash_0..child_hash_15]
                     let mut data = Vec::with_capacity(16 * 32);
                     for i in 0..16u8 {
                         data.extend_from_slice(inner.child_hash(i).as_bytes());
@@ -271,13 +308,13 @@ impl SHAMap {
                     out.push((hash, data));
                 }
 
+                // for_each_branch only visits loaded children
                 inner.for_each_branch(|_, child| {
-                    Self::collect_nodes(child, out);
+                    Self::collect_dirty_nodes(child, out);
                 });
             }
             SHAMapNode::Leaf(leaf) => {
                 let hash = leaf.hash();
-                // Serialize leaf as: [key || data]
                 let mut data = Vec::with_capacity(32 + leaf.data().len());
                 data.extend_from_slice(leaf.key().as_bytes());
                 data.extend_from_slice(leaf.data());
@@ -295,11 +332,27 @@ impl SHAMap {
     /// for maps that share most of their data (e.g., consecutive ledger states).
     pub fn find_difference(&self, other: &SHAMap) -> Vec<DiffEntry> {
         let mut diffs = Vec::new();
-        Self::diff_nodes(&self.root, &other.root, &mut diffs);
+        Self::diff_nodes(
+            &self.root,
+            &other.root,
+            &mut diffs,
+            self.store.as_ref(),
+            other.store.as_ref(),
+            self.leaf_ctor,
+            other.leaf_ctor,
+        );
         diffs
     }
 
-    fn diff_nodes(old: &Arc<SHAMapNode>, new: &Arc<SHAMapNode>, diffs: &mut Vec<DiffEntry>) {
+    fn diff_nodes(
+        old: &Arc<SHAMapNode>,
+        new: &Arc<SHAMapNode>,
+        diffs: &mut Vec<DiffEntry>,
+        old_store: Option<&Arc<dyn NodeStore>>,
+        new_store: Option<&Arc<dyn NodeStore>>,
+        old_leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+        new_leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+    ) {
         // Same hash means identical subtree
         if old.hash() == new.hash() && !old.hash().is_zero() {
             return;
@@ -307,7 +360,15 @@ impl SHAMap {
 
         match (old.as_ref(), new.as_ref()) {
             (SHAMapNode::Inner(old_inner), SHAMapNode::Inner(new_inner)) => {
-                Self::diff_inner_nodes(old_inner, new_inner, diffs);
+                Self::diff_inner_nodes(
+                    old_inner,
+                    new_inner,
+                    diffs,
+                    old_store,
+                    new_store,
+                    old_leaf_ctor,
+                    new_leaf_ctor,
+                );
             }
             (SHAMapNode::Leaf(old_leaf), SHAMapNode::Leaf(new_leaf)) => {
                 if old_leaf.key() == new_leaf.key() {
@@ -329,10 +390,10 @@ impl SHAMap {
                 diffs.push(DiffEntry::Removed {
                     key: *old_leaf.key(),
                 });
-                Self::collect_all_leaves_inner(new_inner, diffs, true);
+                Self::collect_all_leaves_inner(new_inner, diffs, true, new_store, new_leaf_ctor);
             }
             (SHAMapNode::Inner(old_inner), SHAMapNode::Leaf(new_leaf)) => {
-                Self::collect_all_leaves_inner(old_inner, diffs, false);
+                Self::collect_all_leaves_inner(old_inner, diffs, false, old_store, old_leaf_ctor);
                 diffs.push(DiffEntry::Added {
                     key: *new_leaf.key(),
                 });
@@ -344,29 +405,53 @@ impl SHAMap {
         old: &InnerNode,
         new: &InnerNode,
         diffs: &mut Vec<DiffEntry>,
+        old_store: Option<&Arc<dyn NodeStore>>,
+        new_store: Option<&Arc<dyn NodeStore>>,
+        old_leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+        new_leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
     ) {
         for branch in 0..16u8 {
-            let old_child = old.child(branch);
-            let new_child = new.child(branch);
+            let old_child = old
+                .child_with_store(branch, old_store, old_leaf_ctor)
+                .ok()
+                .flatten();
+            let new_child = new
+                .child_with_store(branch, new_store, new_leaf_ctor)
+                .ok()
+                .flatten();
 
             match (old_child, new_child) {
                 (None, None) => {}
                 (Some(old_c), None) => {
-                    Self::collect_all_leaves(old_c, diffs, false);
+                    Self::collect_all_leaves(old_c, diffs, false, old_store, old_leaf_ctor);
                 }
                 (None, Some(new_c)) => {
-                    Self::collect_all_leaves(new_c, diffs, true);
+                    Self::collect_all_leaves(new_c, diffs, true, new_store, new_leaf_ctor);
                 }
                 (Some(old_c), Some(new_c)) => {
                     if old_c.hash() != new_c.hash() || old_c.hash().is_zero() {
-                        Self::diff_nodes(old_c, new_c, diffs);
+                        Self::diff_nodes(
+                            old_c,
+                            new_c,
+                            diffs,
+                            old_store,
+                            new_store,
+                            old_leaf_ctor,
+                            new_leaf_ctor,
+                        );
                     }
                 }
             }
         }
     }
 
-    fn collect_all_leaves(node: &Arc<SHAMapNode>, diffs: &mut Vec<DiffEntry>, added: bool) {
+    fn collect_all_leaves(
+        node: &Arc<SHAMapNode>,
+        diffs: &mut Vec<DiffEntry>,
+        added: bool,
+        store: Option<&Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+    ) {
         match node.as_ref() {
             SHAMapNode::Leaf(leaf) => {
                 if added {
@@ -376,15 +461,26 @@ impl SHAMap {
                 }
             }
             SHAMapNode::Inner(inner) => {
-                Self::collect_all_leaves_inner(inner, diffs, added);
+                Self::collect_all_leaves_inner(inner, diffs, added, store, leaf_ctor);
             }
         }
     }
 
-    fn collect_all_leaves_inner(inner: &InnerNode, diffs: &mut Vec<DiffEntry>, added: bool) {
-        inner.for_each_branch(|_, child| {
-            Self::collect_all_leaves(child, diffs, added);
-        });
+    fn collect_all_leaves_inner(
+        inner: &InnerNode,
+        diffs: &mut Vec<DiffEntry>,
+        added: bool,
+        store: Option<&Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+    ) {
+        let mut mask = inner.branch_mask();
+        while mask != 0 {
+            let branch = mask.trailing_zeros() as u8;
+            if let Ok(Some(child)) = inner.child_with_store(branch, store, leaf_ctor) {
+                Self::collect_all_leaves(child, diffs, added, store, leaf_ctor);
+            }
+            mask &= mask - 1;
+        }
     }
 
     /// Reconstruct a SHAMap from downloaded leaf (key, data) pairs.
@@ -425,9 +521,15 @@ impl SHAMap {
         }
     }
 
-    fn find_leaf<'a>(node: &'a InnerNode, key: &Hash256, depth: u8) -> Option<&'a LeafNode> {
+    fn find_leaf<'a>(
+        node: &'a InnerNode,
+        key: &Hash256,
+        depth: u8,
+        store: Option<&Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+    ) -> Option<&'a LeafNode> {
         let branch = select_branch(key, depth);
-        let child = node.child(branch)?;
+        let child = node.child_with_store(branch, store, leaf_ctor).ok()??;
         match child.as_ref() {
             SHAMapNode::Leaf(leaf) => {
                 if leaf.key() == key {
@@ -436,7 +538,7 @@ impl SHAMap {
                     None
                 }
             }
-            SHAMapNode::Inner(inner) => Self::find_leaf(inner, key, depth + 1),
+            SHAMapNode::Inner(inner) => Self::find_leaf(inner, key, depth + 1, store, leaf_ctor),
         }
     }
 
@@ -445,6 +547,8 @@ impl SHAMap {
         key: Hash256,
         leaf: LeafNode,
         depth: u8,
+        store: Option<&Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
     ) -> Result<(), SHAMapError> {
         let branch = select_branch(&key, depth);
 
@@ -453,14 +557,21 @@ impl SHAMap {
             return Ok(());
         }
 
+        node.ensure_loaded(branch, store, leaf_ctor)?;
         match node.take_child(branch) {
             Some(arc) => {
                 // Try to unwrap, otherwise clone
                 match Arc::try_unwrap(arc) {
-                    Ok(owned) => Self::insert_into_existing(node, branch, owned, key, leaf, depth),
+                    Ok(owned) => {
+                        Self::insert_into_existing(
+                            node, branch, owned, key, leaf, depth, store, leaf_ctor,
+                        )
+                    }
                     Err(shared) => {
                         let owned = (*shared).clone();
-                        Self::insert_into_existing(node, branch, owned, key, leaf, depth)
+                        Self::insert_into_existing(
+                            node, branch, owned, key, leaf, depth, store, leaf_ctor,
+                        )
                     }
                 }
             }
@@ -475,6 +586,8 @@ impl SHAMap {
         key: Hash256,
         leaf: LeafNode,
         depth: u8,
+        store: Option<&Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
     ) -> Result<(), SHAMapError> {
         match existing {
             SHAMapNode::Leaf(existing_leaf) => {
@@ -487,7 +600,7 @@ impl SHAMap {
                 Ok(())
             }
             SHAMapNode::Inner(mut inner) => {
-                Self::insert_leaf(&mut inner, key, leaf, depth + 1)?;
+                Self::insert_leaf(&mut inner, key, leaf, depth + 1, store, leaf_ctor)?;
                 node.set_child(branch, SHAMapNode::Inner(inner));
                 Ok(())
             }
@@ -499,6 +612,8 @@ impl SHAMap {
         key: Hash256,
         leaf: LeafNode,
         depth: u8,
+        store: Option<&Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
     ) -> Result<(), SHAMapError> {
         let branch = select_branch(&key, depth);
 
@@ -507,6 +622,7 @@ impl SHAMap {
             return Ok(());
         }
 
+        node.ensure_loaded(branch, store, leaf_ctor)?;
         match node.take_child(branch) {
             Some(arc) => {
                 let owned = match Arc::try_unwrap(arc) {
@@ -524,7 +640,7 @@ impl SHAMap {
                         Ok(())
                     }
                     SHAMapNode::Inner(mut inner) => {
-                        Self::put_leaf(&mut inner, key, leaf, depth + 1)?;
+                        Self::put_leaf(&mut inner, key, leaf, depth + 1, store, leaf_ctor)?;
                         node.set_child(branch, SHAMapNode::Inner(inner));
                         Ok(())
                     }
@@ -550,13 +666,20 @@ impl SHAMap {
         inner
     }
 
-    fn delete_from(node: &mut InnerNode, key: &Hash256, depth: u8) -> Result<Vec<u8>, SHAMapError> {
+    fn delete_from(
+        node: &mut InnerNode,
+        key: &Hash256,
+        depth: u8,
+        store: Option<&Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+    ) -> Result<Vec<u8>, SHAMapError> {
         let branch = select_branch(key, depth);
 
         if node.is_empty_branch(branch) {
             return Err(SHAMapError::NotFound);
         }
 
+        node.ensure_loaded(branch, store, leaf_ctor)?;
         match node.take_child(branch) {
             Some(arc) => {
                 let owned = match Arc::try_unwrap(arc) {
@@ -573,10 +696,13 @@ impl SHAMap {
                         }
                     }
                     SHAMapNode::Inner(mut inner) => {
-                        let data = Self::delete_from(&mut inner, key, depth + 1)?;
+                        let data =
+                            Self::delete_from(&mut inner, key, depth + 1, store, leaf_ctor)?;
                         if inner.branch_count() == 0 {
                             // Empty inner, don't re-insert
                         } else if let Some(single) = inner.single_branch() {
+                            // Need to ensure the single child is loaded before taking
+                            inner.ensure_loaded(single, store, leaf_ctor)?;
                             if let Some(child_arc) = inner.take_child(single) {
                                 let child = match Arc::try_unwrap(child_arc) {
                                     Ok(owned) => owned,
@@ -606,6 +732,8 @@ impl SHAMap {
         key: &Hash256,
         data: Vec<u8>,
         depth: u8,
+        store: Option<&Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
     ) -> Result<(), SHAMapError> {
         let branch = select_branch(key, depth);
 
@@ -613,6 +741,7 @@ impl SHAMap {
             return Err(SHAMapError::NotFound);
         }
 
+        node.ensure_loaded(branch, store, leaf_ctor)?;
         match node.take_child(branch) {
             Some(arc) => {
                 let owned = match Arc::try_unwrap(arc) {
@@ -631,7 +760,8 @@ impl SHAMap {
                         }
                     }
                     SHAMapNode::Inner(mut inner) => {
-                        let result = Self::update_in(&mut inner, key, data, depth + 1);
+                        let result =
+                            Self::update_in(&mut inner, key, data, depth + 1, store, leaf_ctor);
                         node.set_child(branch, SHAMapNode::Inner(inner));
                         result
                     }
@@ -641,11 +771,23 @@ impl SHAMap {
         }
     }
 
-    fn visit(node: &InnerNode, f: &mut impl FnMut(&Hash256, &[u8])) {
-        node.for_each_branch(|_, child| match child.as_ref() {
-            SHAMapNode::Leaf(leaf) => f(leaf.key(), leaf.data()),
-            SHAMapNode::Inner(inner) => Self::visit(inner, f),
-        });
+    fn visit(
+        node: &InnerNode,
+        f: &mut impl FnMut(&Hash256, &[u8]),
+        store: Option<&Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+    ) {
+        let mut mask = node.branch_mask();
+        while mask != 0 {
+            let branch = mask.trailing_zeros() as u8;
+            if let Ok(Some(child)) = node.child_with_store(branch, store, leaf_ctor) {
+                match child.as_ref() {
+                    SHAMapNode::Leaf(leaf) => f(leaf.key(), leaf.data()),
+                    SHAMapNode::Inner(inner) => Self::visit(inner, f, store, leaf_ctor),
+                }
+            }
+            mask &= mask - 1;
+        }
     }
 
     /// Recursively update hashes for all dirty nodes.
@@ -1219,4 +1361,102 @@ mod tests {
         let copy = map.mutable_copy();
         assert!(copy.store().is_some());
     }
+
+    #[test]
+    fn from_root_hash_round_trip() {
+        let store = Arc::new(InMemoryNodeStore::new());
+        let mut map = SHAMap::account_state_with_store(store.clone());
+
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let k2 = make_key("2000000000000000000000000000000000000000000000000000000000000000");
+        let k3 = make_key("3000000000000000000000000000000000000000000000000000000000000000");
+        map.put(k1, vec![1]).unwrap();
+        map.put(k2, vec![2]).unwrap();
+        map.put(k3, vec![3]).unwrap();
+
+        let root_hash = map.flush().unwrap();
+
+        // Reconstruct from root hash
+        let loaded =
+            SHAMap::from_root_hash(root_hash, LeafNode::account_state, store).unwrap();
+        assert_eq!(loaded.get(&k1), Some(&[1][..]));
+        assert_eq!(loaded.get(&k2), Some(&[2][..]));
+        assert_eq!(loaded.get(&k3), Some(&[3][..]));
+    }
+
+    #[test]
+    fn from_root_hash_iterate() {
+        let store = Arc::new(InMemoryNodeStore::new());
+        let mut map = SHAMap::account_state_with_store(store.clone());
+
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let k2 = make_key("2000000000000000000000000000000000000000000000000000000000000000");
+        map.put(k1, vec![10]).unwrap();
+        map.put(k2, vec![20]).unwrap();
+
+        let root_hash = map.flush().unwrap();
+
+        let loaded =
+            SHAMap::from_root_hash(root_hash, LeafNode::account_state, store).unwrap();
+        let items: Vec<_> = loaded.iter().collect();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn from_root_hash_for_each() {
+        let store = Arc::new(InMemoryNodeStore::new());
+        let mut map = SHAMap::account_state_with_store(store.clone());
+
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        map.put(k1, vec![42]).unwrap();
+
+        let root_hash = map.flush().unwrap();
+
+        let loaded =
+            SHAMap::from_root_hash(root_hash, LeafNode::account_state, store).unwrap();
+        let mut visited = Vec::new();
+        loaded.for_each(&mut |key, data| {
+            visited.push((*key, data.to_vec()));
+        });
+        assert_eq!(visited.len(), 1);
+        assert_eq!(visited[0].0, k1);
+        assert_eq!(visited[0].1, vec![42]);
+    }
+
+    #[test]
+    fn incremental_flush() {
+        let store = Arc::new(InMemoryNodeStore::new());
+        let mut map = SHAMap::account_state_with_store(store.clone());
+
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let k2 = make_key("2000000000000000000000000000000000000000000000000000000000000000");
+        map.put(k1, vec![1]).unwrap();
+        map.put(k2, vec![2]).unwrap();
+        let root_hash_1 = map.flush().unwrap();
+
+        // Load from store, modify one leaf
+        let mut loaded =
+            SHAMap::from_root_hash(root_hash_1, LeafNode::account_state, store.clone())
+                .unwrap();
+        loaded.put(k1, vec![99]).unwrap();
+        let root_hash_2 = loaded.flush().unwrap();
+
+        assert_ne!(root_hash_1, root_hash_2);
+
+        // Verify the modified tree
+        let reloaded =
+            SHAMap::from_root_hash(root_hash_2, LeafNode::account_state, store).unwrap();
+        assert_eq!(reloaded.get(&k1), Some(&[99][..]));
+        assert_eq!(reloaded.get(&k2), Some(&[2][..]));
+    }
+
+    #[test]
+    fn from_root_hash_missing_root() {
+        let store = Arc::new(InMemoryNodeStore::new());
+        let missing = make_key("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
+        let result = SHAMap::from_root_hash(missing, LeafNode::account_state, store);
+        assert!(result.is_err());
+    }
+
+    use crate::leaf_node::LeafNode;
 }
