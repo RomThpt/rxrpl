@@ -40,7 +40,11 @@ impl LedgerFees {
             return LedgerFees::default();
         };
 
-        let obj: LedgerObjectKind = match serde_json::from_slice(bytes) {
+        let json_value = match crate::sle_codec::decode_state(bytes) {
+            Ok(v) => v,
+            Err(_) => return LedgerFees::default(),
+        };
+        let obj: LedgerObjectKind = match serde_json::from_value(json_value) {
             Ok(v) => v,
             Err(_) => return LedgerFees::default(),
         };

@@ -65,8 +65,7 @@ pub async fn get_aggregate_price(
             None => continue,
         };
 
-        let oracle_entry: Value = serde_json::from_slice(data)
-            .map_err(|e| RpcServerError::Internal(format!("failed to deserialize oracle: {e}")))?;
+        let oracle_entry: Value = crate::handlers::common::decode_state_value(data)?;
 
         // Search PriceDataSeries for matching asset pair
         if let Some(series) = oracle_entry

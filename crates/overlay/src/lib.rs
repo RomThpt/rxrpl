@@ -8,6 +8,7 @@ pub mod discovery;
 pub mod error;
 pub mod event;
 pub mod handshake;
+pub mod http;
 pub mod identity;
 pub mod ledger_provider;
 pub mod ledger_sync;

@@ -42,8 +42,7 @@ pub async fn vault_info(params: Value, ctx: &Arc<ServerContext>) -> Result<Value
         .get_state(&vault_key)
         .ok_or_else(|| RpcServerError::InvalidParams("vault not found".into()))?;
 
-    let node: Value = serde_json::from_slice(data)
-        .map_err(|e| RpcServerError::Internal(format!("failed to deserialize vault: {e}")))?;
+    let node: Value = crate::handlers::common::decode_state_value(data)?;
 
     Ok(serde_json::json!({
         "vault_id": vault_key.to_string(),

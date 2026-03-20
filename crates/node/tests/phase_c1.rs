@@ -28,7 +28,7 @@ fn read_account_balance(ledger: &Ledger, address: &str) -> u64 {
     let account_id = decode_account_id(address).unwrap();
     let key = keylet::account(&account_id);
     let data = ledger.get_state(&key).unwrap();
-    let account: Value = serde_json::from_slice(data).unwrap();
+    let account: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
     account["Balance"].as_str().unwrap().parse::<u64>().unwrap()
 }
 
@@ -36,7 +36,7 @@ fn read_owner_count(ledger: &Ledger, address: &str) -> u32 {
     let account_id = decode_account_id(address).unwrap();
     let key = keylet::account(&account_id);
     let data = ledger.get_state(&key).unwrap();
-    let account: Value = serde_json::from_slice(data).unwrap();
+    let account: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
     account["OwnerCount"].as_u64().unwrap() as u32
 }
 
@@ -93,7 +93,7 @@ fn nftoken_full_lifecycle() {
     let genesis_id = decode_account_id(&genesis_addr).unwrap();
     let page_key = keylet::nftoken_page_min(&genesis_id);
     let page_data = ledger.get_state(&page_key).unwrap();
-    let page: Value = serde_json::from_slice(page_data).unwrap();
+    let page: Value = rxrpl_ledger::sle_codec::decode_state(page_data).unwrap();
     let nftoken_id = page["NFTokens"][0]["NFTokenID"]
         .as_str()
         .unwrap()
@@ -132,7 +132,7 @@ fn nftoken_full_lifecycle() {
     let dest_id = decode_account_id(&dest_addr).unwrap();
     let dest_page_key = keylet::nftoken_page_min(&dest_id);
     let dest_page_data = ledger.get_state(&dest_page_key).unwrap();
-    let dest_page: Value = serde_json::from_slice(dest_page_data).unwrap();
+    let dest_page: Value = rxrpl_ledger::sle_codec::decode_state(dest_page_data).unwrap();
     let dest_tokens = dest_page["NFTokens"].as_array().unwrap();
     assert_eq!(dest_tokens.len(), 1);
     assert_eq!(dest_tokens[0]["NFTokenID"].as_str().unwrap(), nftoken_id);
@@ -181,7 +181,7 @@ fn nftoken_cancel_offer_lifecycle() {
     let genesis_id = decode_account_id(&genesis_addr).unwrap();
     let page_key = keylet::nftoken_page_min(&genesis_id);
     let page_data = ledger.get_state(&page_key).unwrap();
-    let page: Value = serde_json::from_slice(page_data).unwrap();
+    let page: Value = rxrpl_ledger::sle_codec::decode_state(page_data).unwrap();
     let nftoken_id = page["NFTokens"][0]["NFTokenID"]
         .as_str()
         .unwrap()
@@ -253,14 +253,14 @@ fn clawback_lifecycle() {
 
     // Read existing trust line and set balance
     let tl_data = ledger.get_state(&tl_key).unwrap();
-    let mut tl: Value = serde_json::from_slice(tl_data).unwrap();
+    let mut tl: Value = rxrpl_ledger::sle_codec::decode_state(tl_data).unwrap();
 
     let is_genesis_low = genesis_id.as_bytes() < dest_id.as_bytes();
     let balance_value = if is_genesis_low { "100" } else { "-100" };
     tl["Balance"]["value"] = Value::String(balance_value.to_string());
-    ledger
-        .put_state(tl_key, serde_json::to_vec(&tl).unwrap())
-        .unwrap();
+    let json_bytes = serde_json::to_vec(&tl).unwrap();
+    let binary = rxrpl_ledger::sle_codec::encode_sle(&json_bytes).unwrap();
+    ledger.put_state(tl_key, binary).unwrap();
 
     // 3. Clawback 30 USD
     let clawback_tx = serde_json::json!({
@@ -279,7 +279,7 @@ fn clawback_lifecycle() {
 
     // 4. Verify balance reduced to 70
     let tl_data = ledger.get_state(&tl_key).unwrap();
-    let tl: Value = serde_json::from_slice(tl_data).unwrap();
+    let tl: Value = rxrpl_ledger::sle_codec::decode_state(tl_data).unwrap();
     let balance: f64 = tl["Balance"]["value"].as_str().unwrap().parse().unwrap();
     let holder_balance = if is_genesis_low { balance } else { -balance };
     assert!((holder_balance - 70.0).abs() < 0.001);

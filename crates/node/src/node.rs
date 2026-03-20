@@ -1161,8 +1161,14 @@ impl Node {
             "OwnerCount": 0,
             "Flags": 0,
         });
-        let data = serde_json::to_vec(&account).map_err(|e| NodeError::Config(e.to_string()))?;
+        let json_bytes =
+            serde_json::to_vec(&account).map_err(|e| NodeError::Config(e.to_string()))?;
+        let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes)
+            .map_err(|e| NodeError::Config(format!("failed to encode genesis account: {e}")))?;
         genesis.put_state(key, data)?;
+
+        // Add FeeSettings with default values
+        Self::insert_genesis_fee_settings(&mut genesis)?;
 
         genesis.close(0, 0)?;
         Ok(genesis)
@@ -1186,13 +1192,38 @@ impl Node {
             "OwnerCount": 0,
             "Flags": 0,
         });
-        let data = serde_json::to_vec(&account).map_err(|e| NodeError::Config(e.to_string()))?;
+        let json_bytes =
+            serde_json::to_vec(&account).map_err(|e| NodeError::Config(e.to_string()))?;
+        let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes)
+            .map_err(|e| NodeError::Config(format!("failed to encode genesis account: {e}")))?;
         genesis.put_state(key, data)?;
+
+        // Add FeeSettings with default values
+        Self::insert_genesis_fee_settings(&mut genesis)?;
 
         // Close genesis ledger
         genesis.close(0, 0)?;
 
         Ok(genesis)
+    }
+
+    /// Insert default FeeSettings into the genesis ledger state map.
+    fn insert_genesis_fee_settings(genesis: &mut Ledger) -> Result<(), NodeError> {
+        let fee_settings = serde_json::json!({
+            "LedgerEntryType": "FeeSettings",
+            "BaseFee": "a",
+            "ReferenceFeeUnits": 10,
+            "ReserveBase": 10000000u32,
+            "ReserveIncrement": 2000000u32,
+            "Flags": 0,
+        });
+        let fee_key = keylet::fee_settings();
+        let json_bytes =
+            serde_json::to_vec(&fee_settings).map_err(|e| NodeError::Config(e.to_string()))?;
+        let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes)
+            .map_err(|e| NodeError::Config(format!("failed to encode fee settings: {e}")))?;
+        genesis.put_state(fee_key, data)?;
+        Ok(())
     }
 
     /// Apply a transaction to the current open ledger (standalone mode).
@@ -1345,7 +1376,7 @@ mod tests {
         let account_id = decode_account_id(address).unwrap();
         let key = keylet::account(&account_id);
         let data = genesis.get_state(&key).unwrap();
-        let account: Value = serde_json::from_slice(data).unwrap();
+        let account: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
         assert_eq!(
             account["Balance"].as_str().unwrap(),
             genesis.header.drops.to_string()
@@ -1367,5 +1398,43 @@ mod tests {
         let closed = node.closed_ledgers.blocking_read();
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].header.sequence, 1);
+    }
+
+    #[test]
+    fn genesis_includes_fee_settings() {
+        let address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let genesis = Node::genesis_with_funded_account(address).unwrap();
+
+        let fee_key = keylet::fee_settings();
+        let data = genesis.get_state(&fee_key).expect("FeeSettings missing from genesis");
+        let fee: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
+        assert_eq!(fee["LedgerEntryType"].as_str().unwrap(), "FeeSettings");
+        assert_eq!(fee["ReserveBase"], 10_000_000);
+        assert_eq!(fee["ReserveIncrement"], 2_000_000);
+    }
+
+    #[test]
+    fn genesis_hash_deterministic() {
+        let address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let genesis1 = Node::genesis_with_funded_account(address).unwrap();
+        let genesis2 = Node::genesis_with_funded_account(address).unwrap();
+
+        assert_eq!(genesis1.header.hash, genesis2.header.hash);
+        assert_eq!(genesis1.header.account_hash, genesis2.header.account_hash);
+        assert!(!genesis1.header.hash.is_zero());
+    }
+
+    #[test]
+    fn genesis_binary_encoding_deterministic() {
+        let address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let genesis1 = Node::genesis_with_funded_account(address).unwrap();
+        let genesis2 = Node::genesis_with_funded_account(address).unwrap();
+
+        // Verify the raw binary data for the account root is identical
+        let account_id = decode_account_id(address).unwrap();
+        let key = keylet::account(&account_id);
+        let data1 = genesis1.get_state(&key).unwrap();
+        let data2 = genesis2.get_state(&key).unwrap();
+        assert_eq!(data1, data2, "binary encoding must be deterministic");
     }
 }

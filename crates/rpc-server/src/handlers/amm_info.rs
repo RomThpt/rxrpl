@@ -36,8 +36,7 @@ pub async fn amm_info(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, 
         .get_state(&amm_key)
         .ok_or_else(|| RpcServerError::InvalidParams("AMM not found".into()))?;
 
-    let amm: Value = serde_json::from_slice(data)
-        .map_err(|e| RpcServerError::Internal(format!("failed to deserialize AMM: {e}")))?;
+    let amm: Value = crate::handlers::common::decode_state_value(data)?;
 
     Ok(serde_json::json!({
         "amm": amm,

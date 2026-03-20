@@ -11,6 +11,22 @@ use rxrpl_protocol::keylet;
 use crate::context::ServerContext;
 use crate::error::RpcServerError;
 
+/// Decode raw state bytes (binary or JSON) to a JSON Value.
+///
+/// Handles both XRPL binary format and legacy JSON format.
+pub fn decode_state_value(data: &[u8]) -> Result<Value, RpcServerError> {
+    rxrpl_ledger::sle_codec::decode_state(data)
+        .map_err(|e| RpcServerError::Internal(format!("failed to decode state: {e}")))
+}
+
+/// Read a state entry from the ledger and decode it as JSON.
+pub fn read_state_as_json(ledger: &Ledger, key: &Hash256) -> Result<Option<Value>, RpcServerError> {
+    let Some(data) = ledger.get_state(key) else {
+        return Ok(None);
+    };
+    decode_state_value(data).map(Some)
+}
+
 /// Result type for paginated directory walks.
 pub type WalkResult = Result<(Vec<(Hash256, Value)>, Option<String>), RpcServerError>;
 
@@ -145,9 +161,7 @@ pub fn walk_owner_directory(
         };
 
         let page_json: Value = if let Some(data) = page_data {
-            serde_json::from_slice(data).map_err(|e| {
-                RpcServerError::Internal(format!("failed to deserialize dir page: {e}"))
-            })?
+            decode_state_value(data)?
         } else {
             break;
         };
@@ -174,9 +188,7 @@ pub fn walk_owner_directory(
                 }
 
                 if let Some(entry_data) = ledger.get_state(&idx_hash) {
-                    let entry: Value = serde_json::from_slice(entry_data).map_err(|e| {
-                        RpcServerError::Internal(format!("failed to deserialize entry: {e}"))
-                    })?;
+                    let entry: Value = decode_state_value(entry_data)?;
                     entries.push((idx_hash, entry));
                 }
             }
