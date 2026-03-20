@@ -71,6 +71,55 @@ impl PeerSet {
     pub fn all_peers(&self) -> Vec<Arc<PeerInfo>> {
         self.peers.iter().map(|r| Arc::clone(r.value())).collect()
     }
+
+    /// Select up to `count` peers sorted by reputation score (highest first).
+    /// Only includes peers with non-negative scores.
+    /// Ties are broken by latency ascending (lower latency preferred).
+    pub fn best_peers(&self, count: usize) -> Vec<Hash256> {
+        let mut candidates: Vec<_> = self
+            .peers
+            .iter()
+            .filter(|r| r.value().reputation.score() >= 0)
+            .map(|r| {
+                let info = r.value();
+                let score = info.reputation.score();
+                let latency = info.reputation.avg_latency_ms().unwrap_or(u64::MAX);
+                (info.node_id, score, latency)
+            })
+            .collect();
+
+        // Sort by score descending, then latency ascending for ties
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+        candidates.into_iter().take(count).map(|(id, _, _)| id).collect()
+    }
+
+    /// Select the best peers for ledger data based on score and ledger proximity.
+    /// Prefers peers whose known `ledger_seq >= target_seq` by adding a +200 bonus.
+    /// Only includes peers with non-negative reputation scores.
+    pub fn best_peers_for_ledger(&self, target_seq: u32, count: usize) -> Vec<Hash256> {
+        const LEDGER_AHEAD_BONUS: i32 = 200;
+
+        let mut candidates: Vec<_> = self
+            .peers
+            .iter()
+            .filter(|r| r.value().reputation.score() >= 0)
+            .map(|r| {
+                let info = r.value();
+                let base_score = info.reputation.score();
+                let peer_seq = info.ledger_seq.load(std::sync::atomic::Ordering::Relaxed);
+                let effective_score = if peer_seq >= target_seq {
+                    base_score + LEDGER_AHEAD_BONUS
+                } else {
+                    base_score
+                };
+                let latency = info.reputation.avg_latency_ms().unwrap_or(u64::MAX);
+                (info.node_id, effective_score, latency)
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+        candidates.into_iter().take(count).map(|(id, _, _)| id).collect()
+    }
 }
 
 #[cfg(test)]
@@ -110,5 +159,104 @@ mod tests {
         set.add(make_peer(1, false));
         assert!(set.remove(&id).is_some());
         assert!(set.is_empty());
+    }
+
+    fn make_peer_with_score(id_byte: u8, score_delta: i32) -> Arc<PeerInfo> {
+        let peer = make_peer(id_byte, false);
+        if score_delta > 0 {
+            for _ in 0..score_delta {
+                peer.reputation.record_valid_message(1);
+            }
+        } else if score_delta < 0 {
+            // Each invalid message is -10, so use violations (-50) and invalid (-10)
+            // For simplicity, adjust via valid/invalid to reach approximate score
+            for _ in 0..(-score_delta) {
+                peer.reputation.record_invalid_message(); // -10 each
+            }
+        }
+        peer
+    }
+
+    #[test]
+    fn best_peers_empty() {
+        let set = PeerSet::new(10);
+        assert!(set.best_peers(3).is_empty());
+    }
+
+    #[test]
+    fn best_peers_filters_negative() {
+        let set = PeerSet::new(10);
+        // Peer 1: score 0 (included)
+        set.add(make_peer(1, false));
+        // Peer 2: negative score (excluded) -- 1 invalid message = -10
+        let negative_peer = make_peer(2, false);
+        negative_peer.reputation.record_invalid_message();
+        set.add(negative_peer);
+
+        let best = set.best_peers(10);
+        assert_eq!(best.len(), 1);
+        assert_eq!(best[0], Hash256::new([1; 32]));
+    }
+
+    #[test]
+    fn best_peers_sorted_by_score() {
+        let set = PeerSet::new(10);
+
+        // Peer 1: score +5 (5 valid messages)
+        let p1 = make_peer(1, false);
+        for _ in 0..5 {
+            p1.reputation.record_valid_message(1);
+        }
+        set.add(p1);
+
+        // Peer 2: score +20 (20 valid messages)
+        let p2 = make_peer(2, false);
+        for _ in 0..20 {
+            p2.reputation.record_valid_message(1);
+        }
+        set.add(p2);
+
+        // Peer 3: score +10 (10 valid messages)
+        let p3 = make_peer(3, false);
+        for _ in 0..10 {
+            p3.reputation.record_valid_message(1);
+        }
+        set.add(p3);
+
+        let best = set.best_peers(3);
+        assert_eq!(best.len(), 3);
+        // Highest score first
+        assert_eq!(best[0], Hash256::new([2; 32])); // score 20
+        assert_eq!(best[1], Hash256::new([3; 32])); // score 10
+        assert_eq!(best[2], Hash256::new([1; 32])); // score 5
+    }
+
+    #[test]
+    fn best_peers_for_ledger_prefers_ahead() {
+        let set = PeerSet::new(10);
+
+        // Peer 1: score +10, ledger_seq = 50 (behind target)
+        let p1 = make_peer(1, false);
+        for _ in 0..10 {
+            p1.reputation.record_valid_message(1);
+        }
+        p1.ledger_seq
+            .store(50, std::sync::atomic::Ordering::Relaxed);
+        set.add(p1);
+
+        // Peer 2: score +5, ledger_seq = 100 (at target -- gets +200 bonus)
+        let p2 = make_peer(2, false);
+        for _ in 0..5 {
+            p2.reputation.record_valid_message(1);
+        }
+        p2.ledger_seq
+            .store(100, std::sync::atomic::Ordering::Relaxed);
+        set.add(p2);
+
+        let best = set.best_peers_for_ledger(100, 2);
+        assert_eq!(best.len(), 2);
+        // Peer 2 has effective score 5 + 200 = 205, peer 1 has 10
+        assert_eq!(best[0], Hash256::new([2; 32]));
+        assert_eq!(best[1], Hash256::new([1; 32]));
     }
 }
