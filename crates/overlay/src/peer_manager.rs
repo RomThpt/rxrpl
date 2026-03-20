@@ -550,7 +550,7 @@ impl PeerManager {
                         let nodes: Vec<(Vec<u8>, Vec<u8>)> = msg
                             .nodes
                             .into_iter()
-                            .map(|n| (n.node_id.unwrap_or_default(), n.node_data.unwrap_or_default()))
+                            .map(|n| (n.nodeid.unwrap_or_default(), n.nodedata.unwrap_or_default()))
                             .collect();
 
                         let ledger_seq = msg.ledger_seq.unwrap_or(0);
@@ -822,7 +822,7 @@ impl PeerManager {
             LT_HASH,
             hash.as_ref(),
             seq,
-            false,
+            0,
             node_ids,
         );
 
@@ -871,7 +871,7 @@ impl PeerManager {
         const LT_VALIDATED: i32 = 2;
         const LT_HASH: i32 = 3;
 
-        let req_ledger_type = req.ledger_type.unwrap_or(0);
+        let req_ledger_type = req.itype.unwrap_or(0);
         let req_ledger_hash = req.ledger_hash.unwrap_or_default();
         let req_ledger_seq = req.ledger_seq.unwrap_or(0);
 
