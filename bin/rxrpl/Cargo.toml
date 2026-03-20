@@ -16,7 +16,7 @@ rxrpl-config = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 serde_json = { workspace = true }
 hex = { workspace = true }
 toml = "0.8"

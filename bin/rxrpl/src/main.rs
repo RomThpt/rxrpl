@@ -1,15 +1,27 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 use rxrpl::Wallet;
 use serde_json::Value;
 
 #[derive(Parser)]
-#[command(name = "rxrpl")]
-#[command(about = "XRPL node client")]
-#[command(version)]
+#[command(name = "rxrpl", about = "XRPL node and client toolchain", version)]
 struct Cli {
     /// XRPL node URL
     #[arg(long, default_value = "https://s1.ripple.com:51234")]
     url: String,
+
+    /// Path to configuration file (TOML)
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
+    /// Log level (error, warn, info, debug, trace)
+    #[arg(long, global = true, default_value = "info")]
+    log_level: String,
+
+    /// Data directory override
+    #[arg(long, global = true)]
+    data_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -17,16 +29,46 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    // -- Server Queries --
+
     /// Get server info from an XRPL node
+    #[command(help_heading = "Server")]
     ServerInfo,
 
+    /// Get current fee info
+    #[command(help_heading = "Server")]
+    Fee,
+
+    /// Get the latest validated ledger
+    #[command(help_heading = "Server")]
+    LedgerClosed,
+
+    /// Get a ledger by index
+    #[command(help_heading = "Server")]
+    Ledger {
+        /// Ledger index or shortcut (validated, current, closed)
+        index: String,
+    },
+
+    /// Subscribe to streams (WebSocket only)
+    #[command(help_heading = "Server")]
+    Subscribe {
+        /// Streams to subscribe to (e.g., ledger, transactions)
+        #[arg(value_delimiter = ',')]
+        streams: Vec<String>,
+    },
+
+    // -- Account Queries --
+
     /// Get account info
+    #[command(help_heading = "Account")]
     AccountInfo {
         /// Account address (classic or X-address)
         account: String,
     },
 
     /// Get account transaction history
+    #[command(help_heading = "Account")]
     AccountTx {
         /// Account address
         account: String,
@@ -35,45 +77,55 @@ enum Commands {
         limit: u32,
     },
 
-    /// Submit a signed transaction blob
-    Submit {
-        /// Hex-encoded transaction blob
-        tx_blob: String,
+    /// List NFTs for an account
+    #[command(help_heading = "Account")]
+    AccountNfts {
+        /// Account address
+        account: String,
     },
 
-    /// Look up a transaction by hash
-    Tx {
-        /// Transaction hash
-        hash: String,
-    },
-
-    /// Get current fee info
-    Fee,
-
-    /// Get the latest validated ledger
-    LedgerClosed,
-
-    /// Get a ledger by index
-    Ledger {
-        /// Ledger index or shortcut (validated, current, closed)
-        index: String,
-    },
-
-    /// Subscribe to streams (WebSocket only)
-    Subscribe {
-        /// Streams to subscribe to (e.g., ledger, transactions)
-        #[arg(value_delimiter = ',')]
-        streams: Vec<String>,
-    },
+    // -- Wallet --
 
     /// Generate a new wallet keypair locally
+    #[command(help_heading = "Wallet")]
     WalletPropose {
         /// Key type: ed25519 or secp256k1
         #[arg(long, default_value = "ed25519")]
         key_type: String,
     },
 
+    // -- Transactions --
+
+    /// Submit a signed transaction blob
+    #[command(help_heading = "Transaction")]
+    Submit {
+        /// Hex-encoded transaction blob
+        tx_blob: String,
+    },
+
+    /// Look up a transaction by hash
+    #[command(help_heading = "Transaction")]
+    Tx {
+        /// Transaction hash
+        hash: String,
+    },
+
+    /// Sign a transaction from JSON (inline or @file)
+    #[command(help_heading = "Transaction")]
+    Sign {
+        /// Secret seed (sXXX format)
+        #[arg(long)]
+        seed: String,
+        /// Transaction JSON (inline string or @path/to/file.json)
+        #[arg(long)]
+        tx: String,
+        /// Key type: ed25519 or secp256k1
+        #[arg(long, default_value = "ed25519")]
+        key_type: String,
+    },
+
     /// Send an XRP payment (build, autofill, sign, submit)
+    #[command(help_heading = "Transaction")]
     Pay {
         /// Sender secret seed (sXXX format)
         #[arg(long)]
@@ -92,20 +144,8 @@ enum Commands {
         key_type: String,
     },
 
-    /// Sign a transaction from JSON (inline or @file)
-    Sign {
-        /// Secret seed (sXXX format)
-        #[arg(long)]
-        seed: String,
-        /// Transaction JSON (inline string or @path/to/file.json)
-        #[arg(long)]
-        tx: String,
-        /// Key type: ed25519 or secp256k1
-        #[arg(long, default_value = "ed25519")]
-        key_type: String,
-    },
-
     /// Set a trust line (autofill, sign, submit)
+    #[command(help_heading = "Transaction")]
     TrustSet {
         /// Sender secret seed (sXXX format)
         #[arg(long)]
@@ -125,6 +165,7 @@ enum Commands {
     },
 
     /// Create an offer (autofill, sign, submit)
+    #[command(help_heading = "Transaction")]
     OfferCreate {
         /// Sender secret seed (sXXX format)
         #[arg(long)]
@@ -141,6 +182,7 @@ enum Commands {
     },
 
     /// Delete an account (autofill, sign, submit)
+    #[command(help_heading = "Transaction")]
     AccountDelete {
         /// Sender secret seed (sXXX format)
         #[arg(long)]
@@ -153,13 +195,10 @@ enum Commands {
         fee: Option<String>,
     },
 
-    /// List NFTs for an account
-    AccountNfts {
-        /// Account address
-        account: String,
-    },
+    // -- Node --
 
     /// Run a standalone XRPL node
+    #[command(help_heading = "Node")]
     NodeRun {
         /// Genesis account address
         #[arg(long, default_value = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")]
@@ -173,21 +212,30 @@ enum Commands {
     },
 
     /// Run a networked XRPL node with P2P overlay
+    #[command(help_heading = "Node")]
     NetworkRun {
-        /// Path to TOML configuration file
-        #[arg(long)]
-        config: String,
         /// Ledger close interval in seconds
         #[arg(long, default_value = "10")]
         close_interval: u64,
     },
 }
 
+fn setup_logging(log_level: &str) {
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(log_level));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
+}
+
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
-
     let cli = Cli::parse();
+    setup_logging(&cli.log_level);
 
     if let Err(e) = run(cli).await {
         eprintln!("Error: {e}");
