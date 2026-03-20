@@ -459,7 +459,11 @@ impl Node {
     ///
     /// Starts the RPC server, P2P peer manager, and a consensus loop that
     /// processes both local ledger close ticks and incoming network messages.
-    pub async fn run_networked(&self, close_interval_secs: u64) -> Result<(), NodeError> {
+    pub async fn run_networked(
+        &self,
+        close_interval_secs: u64,
+        sync_rpc_url: Option<&str>,
+    ) -> Result<(), NodeError> {
         // 1. Generate/load node identity
         let identity = if let Some(ref seed_hex) = self.config.peer.node_seed {
             let bytes = hex::decode(seed_hex)
@@ -479,7 +483,26 @@ impl Node {
         tracing::info!("node identity: {}", identity.node_id);
         tracing::info!("node public key: {}", hex::encode(identity.public_key_bytes()));
 
-        // 2. Shared ledger state for P2P
+        // 2. Bootstrap from RPC: fetch latest validated ledger to set our starting point
+        if let Some(rpc_url) = sync_rpc_url {
+            match Self::bootstrap_from_rpc(rpc_url).await {
+                Ok((seq, hash)) => {
+                    let mut l = self.ledger.write().await;
+                    l.header.sequence = seq + 1; // open ledger = validated + 1
+                    l.header.parent_hash = hash;
+                    drop(l);
+                    tracing::info!(
+                        "bootstrapped from RPC: validated ledger #{} hash={}, open ledger #{}",
+                        seq, hash, seq + 1
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("RPC bootstrap failed (starting from genesis): {}", e);
+                }
+            }
+        }
+
+        // Shared ledger state for P2P
         let ledger_seq = Arc::new(AtomicU32::new(self.ledger.read().await.header.sequence));
         let ledger_hash = Arc::new(tokio::sync::RwLock::new(
             self.ledger.read().await.header.parent_hash,
@@ -1387,6 +1410,63 @@ impl Node {
     /// Check if the node is running.
     pub fn is_running(&self) -> bool {
         self.running
+    }
+
+    /// Fetch the latest validated ledger from an RPC endpoint.
+    ///
+    /// Returns (sequence, hash) of the latest validated ledger.
+    async fn bootstrap_from_rpc(
+        rpc_url: &str,
+    ) -> Result<(u32, Hash256), Box<dyn std::error::Error + Send + Sync>> {
+        tracing::info!("bootstrapping from RPC endpoint: {}", rpc_url);
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .danger_accept_invalid_certs(true)
+            .build()?;
+
+        let resp = client
+            .post(rpc_url)
+            .json(&serde_json::json!({
+                "method": "server_info",
+                "params": [{}]
+            }))
+            .send()
+            .await?
+            .json::<serde_json::Value>()
+            .await?;
+
+        let info = resp
+            .get("result")
+            .and_then(|r| r.get("info"))
+            .ok_or("missing result.info in server_info response")?;
+
+        // Try validated_ledger first, fall back to closed_ledger
+        let ledger = info
+            .get("validated_ledger")
+            .or_else(|| info.get("closed_ledger"))
+            .ok_or("no validated_ledger or closed_ledger in server_info")?;
+
+        let seq = ledger
+            .get("seq")
+            .and_then(|v| v.as_u64())
+            .ok_or("missing seq in ledger info")? as u32;
+
+        let hash_str = ledger
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .ok_or("missing hash in ledger info")?;
+
+        let hash_bytes = hex::decode(hash_str)
+            .map_err(|e| format!("invalid ledger hash hex: {e}"))?;
+        if hash_bytes.len() != 32 {
+            return Err(format!("ledger hash must be 32 bytes, got {}", hash_bytes.len()).into());
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&hash_bytes);
+        let hash = Hash256::new(arr);
+
+        Ok((seq, hash))
     }
 }
 
