@@ -9,6 +9,7 @@ license.workspace = true
 [features]
 default = []
 grpc = ["dep:rxrpl-grpc-server"]
+rocksdb = ["rxrpl-nodestore/rocksdb", "rxrpl-storage/rocksdb"]
 
 [dependencies]
 rxrpl-primitives = { workspace = true }

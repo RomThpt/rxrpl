@@ -1,5 +1,7 @@
+use std::sync::Arc;
+
 use rxrpl_primitives::Hash256;
-use rxrpl_shamap::SHAMap;
+use rxrpl_shamap::{NodeStore, SHAMap};
 
 use crate::error::LedgerError;
 use crate::header::{INITIAL_XRP_DROPS, LedgerHeader};
@@ -45,7 +47,10 @@ impl Ledger {
 
         // Mutable copy of parent state, fresh tx map
         let state_map = parent.state_map.mutable_copy();
-        let tx_map = SHAMap::transaction_with_meta();
+        let tx_map = match parent.state_map.store() {
+            Some(store) => SHAMap::transaction_with_meta_and_store(Arc::clone(store)),
+            None => SHAMap::transaction_with_meta(),
+        };
 
         Ledger {
             header,
@@ -79,6 +84,29 @@ impl Ledger {
         }
     }
 
+    /// Create the genesis ledger with a backing store for persistence.
+    pub fn genesis_with_store(store: Arc<dyn NodeStore>) -> Ledger {
+        let mut header = LedgerHeader::new();
+        header.sequence = 1;
+        header.drops = INITIAL_XRP_DROPS;
+        header.parent_hash = Hash256::ZERO;
+        header.parent_close_time = 0;
+        header.close_time = 0;
+        header.close_time_resolution = 30;
+        header.close_flags = 0;
+
+        let state_map = SHAMap::account_state_with_store(store.clone());
+        let tx_map = SHAMap::transaction_with_meta_and_store(store);
+
+        Ledger {
+            header,
+            state_map,
+            tx_map,
+            state: LedgerState::Open,
+            destroyed_drops: 0,
+        }
+    }
+
     /// Reconstruct a closed ledger from catchup data.
     ///
     /// The state_map must already be built (e.g., via `SHAMap::from_leaf_nodes`).
@@ -101,6 +129,38 @@ impl Ledger {
             state: LedgerState::Closed,
             destroyed_drops: 0,
         }
+    }
+
+    /// Reconstruct a closed ledger from catchup data with a backing store.
+    pub fn from_catchup_with_store(
+        sequence: u32,
+        hash: Hash256,
+        mut state_map: SHAMap,
+        store: Arc<dyn NodeStore>,
+    ) -> Ledger {
+        state_map.set_store(store.clone());
+        let mut header = LedgerHeader::new();
+        header.sequence = sequence;
+        header.hash = hash;
+        header.account_hash = state_map.root_hash();
+        header.drops = INITIAL_XRP_DROPS;
+
+        state_map.set_immutable();
+        let mut tx_map = SHAMap::transaction_with_meta_and_store(store);
+        tx_map.set_immutable();
+
+        Ledger {
+            header,
+            state_map,
+            tx_map,
+            state: LedgerState::Closed,
+            destroyed_drops: 0,
+        }
+    }
+
+    /// Return the backing store, if any.
+    pub fn store(&self) -> Option<&Arc<dyn NodeStore>> {
+        self.state_map.store()
     }
 
     /// Return the current state of this ledger.
@@ -194,6 +254,49 @@ impl Ledger {
 
         self.state = LedgerState::Closed;
         Ok(())
+    }
+
+    /// Flush both SHAMaps to the backing store.
+    ///
+    /// Only dirty (modified/loaded) nodes are persisted. No-op if no store.
+    pub fn flush(&mut self) -> Result<(), LedgerError> {
+        self.state_map.flush()?;
+        self.tx_map.flush()?;
+        Ok(())
+    }
+
+    /// Replace SHAMaps with lazy versions that only hold the root hash.
+    ///
+    /// After compacting, child nodes are loaded on demand from the store.
+    /// This drastically reduces memory usage for historical ledgers.
+    /// Must be called after `flush()` to ensure all nodes are persisted.
+    pub fn compact(&mut self) {
+        if let Some(store) = self.state_map.store().cloned() {
+            let hash = self.header.account_hash;
+            if !hash.is_zero() {
+                if let Ok(lazy) = SHAMap::from_root_hash(
+                    hash,
+                    rxrpl_shamap::LeafNode::account_state,
+                    store,
+                ) {
+                    self.state_map = lazy;
+                    self.state_map.set_immutable();
+                }
+            }
+        }
+        if let Some(store) = self.tx_map.store().cloned() {
+            let hash = self.header.tx_hash;
+            if !hash.is_zero() {
+                if let Ok(lazy) = SHAMap::from_root_hash(
+                    hash,
+                    rxrpl_shamap::LeafNode::transaction_with_meta,
+                    store,
+                ) {
+                    self.tx_map = lazy;
+                    self.tx_map.set_immutable();
+                }
+            }
+        }
     }
 
     /// Mark this ledger as validated by consensus.

@@ -15,7 +15,10 @@ use rxrpl_overlay::{
 };
 use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
-use rxrpl_shamap::SHAMap;
+use rxrpl_nodestore::{CachedNodeStore, MemoryNodeDatabase};
+#[cfg(feature = "rocksdb")]
+use rxrpl_nodestore::PersistentNodeDatabase;
+use rxrpl_shamap::{NodeStore, SHAMap};
 use rxrpl_rpc_server::{ServerContext, ServerEvent};
 use rxrpl_storage::{SqliteStore, TxStore};
 use rxrpl_tx_engine::{FeeSettings, TransactorRegistry, TxEngine};
@@ -62,12 +65,42 @@ pub struct Node {
     amendment_table: Arc<RwLock<AmendmentTable>>,
     fees: Arc<FeeSettings>,
     tx_store: Option<Arc<dyn TxStore>>,
+    node_store: Option<Arc<dyn NodeStore>>,
     running: bool,
 }
 
 impl Node {
+    /// Create a node store based on the database configuration.
+    fn create_node_store(config: &NodeConfig) -> Result<Option<Arc<dyn NodeStore>>, NodeError> {
+        match config.database.backend.as_str() {
+            "memory" => {
+                let db = MemoryNodeDatabase::new();
+                let cached = CachedNodeStore::with_defaults(db);
+                Ok(Some(Arc::new(cached)))
+            }
+            #[cfg(feature = "rocksdb")]
+            "rocksdb" => {
+                let db_path = config.database.path.join("nodestore");
+                std::fs::create_dir_all(&db_path).map_err(|e| {
+                    NodeError::Config(format!("failed to create nodestore dir: {e}"))
+                })?;
+                let kv = rxrpl_storage::RocksDbStore::open(&db_path)?;
+                let db = PersistentNodeDatabase::new(kv);
+                let cached = CachedNodeStore::with_defaults(db);
+                Ok(Some(Arc::new(cached)))
+            }
+            "none" => Ok(None),
+            other => Err(NodeError::Config(format!(
+                "unknown database backend: {other}"
+            ))),
+        }
+    }
+
     /// Create a new node from configuration.
     pub fn new(config: NodeConfig) -> Result<Self, NodeError> {
+        // Initialize node store
+        let node_store = Self::create_node_store(&config)?;
+
         // Initialize amendment registry
         let registry = FeatureRegistry::with_known_amendments();
         let amendment_table = AmendmentTable::new(&registry, 14 * 24 * 60 * 4); // ~14 days at 4s/ledger
@@ -88,7 +121,10 @@ impl Node {
         let tx_engine = TxEngine::new_without_sig_check(tx_registry);
 
         // Initialize genesis ledger
-        let ledger = Ledger::genesis();
+        let ledger = match &node_store {
+            Some(store) => Ledger::genesis_with_store(Arc::clone(store)),
+            None => Ledger::genesis(),
+        };
 
         // Initialize transaction queue
         let tx_queue = TxQueue::new(2000);
@@ -102,6 +138,7 @@ impl Node {
             amendment_table: Arc::new(RwLock::new(amendment_table)),
             fees: Arc::new(FeeSettings::default()),
             tx_store: None,
+            node_store,
             running: false,
         })
     }
@@ -111,6 +148,8 @@ impl Node {
     /// Creates genesis ledger, funds the account, closes genesis,
     /// and opens ledger #2 ready for transactions.
     pub fn new_standalone(config: NodeConfig, genesis_address: &str) -> Result<Self, NodeError> {
+        let node_store = Self::create_node_store(&config)?;
+
         let registry = FeatureRegistry::with_known_amendments();
         let amendment_table = AmendmentTable::new(&registry, 14 * 24 * 60 * 4);
 
@@ -131,7 +170,17 @@ impl Node {
         let tx_store: Arc<dyn TxStore> =
             Arc::new(SqliteStore::in_memory().map_err(|e| NodeError::Config(e.to_string()))?);
 
-        let closed_genesis = Self::genesis_with_funded_account(genesis_address)?;
+        let mut closed_genesis =
+            Self::genesis_with_funded_account_and_store(genesis_address, &node_store)?;
+
+        // Flush genesis to store and compact for memory efficiency
+        if node_store.is_some() {
+            if let Err(e) = closed_genesis.flush() {
+                tracing::warn!("failed to flush genesis ledger: {}", e);
+            }
+            closed_genesis.compact();
+        }
+
         let open_ledger = Ledger::new_open(&closed_genesis);
 
         let mut closed_ledgers = VecDeque::new();
@@ -148,6 +197,7 @@ impl Node {
             amendment_table: Arc::new(RwLock::new(amendment_table)),
             fees: Arc::new(FeeSettings::default()),
             tx_store: Some(tx_store),
+            node_store,
             running: false,
         })
     }
@@ -292,6 +342,11 @@ impl Node {
                     continue;
                 }
 
+                // Flush closed ledger to node store
+                if let Err(e) = l.flush() {
+                    tracing::warn!("failed to flush ledger: {}", e);
+                }
+
                 let hash = l.header.hash;
                 let seq = l.header.sequence;
                 let closed = l.clone();
@@ -376,9 +431,11 @@ impl Node {
                     q.remove_expired(new_open_seq);
                 }
 
-                // Store in history
+                // Store in history (compact for memory efficiency)
                 let mut history = closed_ledgers.write().await;
-                history.push_back(closed);
+                let mut compacted = closed;
+                compacted.compact();
+                history.push_back(compacted);
                 while history.len() > crate::consensus_adapter::MAX_CLOSED_LEDGERS {
                     history.pop_front();
                 }
@@ -626,6 +683,7 @@ impl Node {
         let tx_engine = Arc::clone(&self.tx_engine);
         let fees = Arc::clone(&self.fees);
         let tx_queue = Arc::clone(&self.tx_queue);
+        let node_store = self.node_store.clone();
         let tx_store = self.tx_store.as_ref().map(Arc::clone);
         let interval_duration = Duration::from_secs(close_interval_secs);
         let ledger_seq_shared = Arc::clone(&ledger_seq);
@@ -814,7 +872,7 @@ impl Node {
                                     hash, seq, nodes.len()
                                 );
                                 if !nodes.is_empty() {
-                                    match Node::try_reconstruct_ledger(seq, hash, &nodes) {
+                                    match Node::try_reconstruct_ledger(seq, hash, &nodes, &node_store) {
                                         Ok(ledger) => {
                                             let mut history = closed_ledgers.write().await;
                                             if !history.iter().any(|l| l.header.sequence == seq) {
@@ -871,6 +929,11 @@ impl Node {
         if let Err(e) = l.close(effective_close_time, close_flags) {
             tracing::error!("failed to close ledger: {}", e);
             return;
+        }
+
+        // Flush closed ledger to node store
+        if let Err(e) = l.flush() {
+            tracing::warn!("failed to flush ledger: {}", e);
         }
 
         let hash = l.header.hash;
@@ -957,7 +1020,9 @@ impl Node {
         }
 
         let mut history = closed_ledgers.write().await;
-        history.push_back(closed);
+        let mut compacted = closed;
+        compacted.compact();
+        history.push_back(compacted);
         while history.len() > crate::consensus_adapter::MAX_CLOSED_LEDGERS {
             history.pop_front();
         }
@@ -968,10 +1033,55 @@ impl Node {
         seq: u32,
         expected_hash: Hash256,
         nodes: &[(Vec<u8>, Vec<u8>)],
+        node_store: &Option<Arc<dyn NodeStore>>,
     ) -> Result<Ledger, NodeError> {
         let state_map = SHAMap::from_leaf_nodes(nodes)
             .map_err(|e| NodeError::Server(format!("shamap reconstruction failed: {e}")))?;
-        Ok(Ledger::from_catchup(seq, expected_hash, state_map))
+        match node_store {
+            Some(store) => {
+                let mut ledger = Ledger::from_catchup_with_store(
+                    seq,
+                    expected_hash,
+                    state_map,
+                    Arc::clone(store),
+                );
+                if let Err(e) = ledger.flush() {
+                    tracing::warn!("failed to flush catchup ledger #{}: {}", seq, e);
+                }
+                ledger.compact();
+                Ok(ledger)
+            }
+            None => Ok(Ledger::from_catchup(seq, expected_hash, state_map)),
+        }
+    }
+
+    /// Create a genesis ledger with a funded account, optionally backed by a store.
+    fn genesis_with_funded_account_and_store(
+        genesis_address: &str,
+        node_store: &Option<Arc<dyn NodeStore>>,
+    ) -> Result<Ledger, NodeError> {
+        let mut genesis = match node_store {
+            Some(store) => Ledger::genesis_with_store(Arc::clone(store)),
+            None => Ledger::genesis(),
+        };
+
+        let account_id = decode_account_id(genesis_address)
+            .map_err(|e| NodeError::Config(format!("invalid genesis address: {e}")))?;
+        let key = keylet::account(&account_id);
+
+        let account = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": genesis_address,
+            "Balance": genesis.header.drops.to_string(),
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        let data = serde_json::to_vec(&account).map_err(|e| NodeError::Config(e.to_string()))?;
+        genesis.put_state(key, data)?;
+
+        genesis.close(0, 0)?;
+        Ok(genesis)
     }
 
     /// Create a genesis ledger with a single funded account holding all XRP.
@@ -1054,6 +1164,11 @@ impl Node {
     /// Get a reference to the transaction store.
     pub fn tx_store(&self) -> Option<&Arc<dyn TxStore>> {
         self.tx_store.as_ref()
+    }
+
+    /// Get a reference to the node store.
+    pub fn node_store(&self) -> Option<&Arc<dyn NodeStore>> {
+        self.node_store.as_ref()
     }
 
     /// Index all transactions from a closed ledger into the transaction store.

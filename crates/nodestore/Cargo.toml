@@ -12,3 +12,7 @@ rxrpl-shamap = { workspace = true }
 rxrpl-storage = { workspace = true }
 thiserror.workspace = true
 lru.workspace = true
+
+[features]
+default = []
+rocksdb = ["rxrpl-storage/rocksdb"]
