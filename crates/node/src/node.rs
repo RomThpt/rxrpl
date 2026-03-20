@@ -36,17 +36,17 @@ struct ClosedLedgerAccess {
 
 impl LedgerProvider for ClosedLedgerAccess {
     fn get_by_hash(&self, hash: &Hash256) -> Option<Ledger> {
-        let history = self.closed_ledgers.blocking_read();
+        let history = self.closed_ledgers.try_read().ok()?;
         history.iter().find(|l| l.header.hash == *hash).cloned()
     }
 
     fn get_by_seq(&self, seq: u32) -> Option<Ledger> {
-        let history = self.closed_ledgers.blocking_read();
+        let history = self.closed_ledgers.try_read().ok()?;
         history.iter().find(|l| l.header.sequence == seq).cloned()
     }
 
     fn latest_closed(&self) -> Option<Ledger> {
-        let history = self.closed_ledgers.blocking_read();
+        let history = self.closed_ledgers.try_read().ok()?;
         history.back().cloned()
     }
 }
@@ -700,6 +700,8 @@ impl Node {
             let converge_duration = Duration::from_millis(1250);
             let mut converge_interval = tokio::time::interval(converge_duration);
             let mut establishing = false;
+            let mut syncing = false;
+            let mut max_peer_seq: u32 = 0;
             let mut pending_close_time = 0u32;
 
             close_interval.tick().await; // skip first immediate tick
@@ -707,7 +709,7 @@ impl Node {
 
             loop {
                 tokio::select! {
-                    _ = close_interval.tick(), if !establishing => {
+                    _ = close_interval.tick(), if !establishing && !syncing => {
                         let close_time = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -863,11 +865,17 @@ impl Node {
                                     peer_id: from.to_string(),
                                     event: format!("status_change:seq={}", peer_seq),
                                 });
+                                if peer_seq > max_peer_seq {
+                                    max_peer_seq = peer_seq;
+                                }
                                 if peer_seq > our_seq + 1 {
-                                    tracing::info!(
-                                        "peer {} ahead by {} ledgers, requesting catchup",
-                                        from, peer_seq - our_seq
-                                    );
+                                    if !syncing {
+                                        tracing::info!(
+                                            "peer {} ahead by {} ledgers, entering sync mode",
+                                            from, peer_seq - our_seq
+                                        );
+                                        syncing = true;
+                                    }
                                     let next_seq = our_seq + 1;
                                     let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
                                         seq: next_seq,
@@ -882,15 +890,46 @@ impl Node {
                                 );
                                 if !nodes.is_empty() {
                                     match Node::try_reconstruct_ledger(seq, hash, &nodes, &node_store) {
-                                        Ok(ledger) => {
+                                        Ok(reconstructed) => {
                                             let mut history = closed_ledgers.write().await;
                                             if !history.iter().any(|l| l.header.sequence == seq) {
                                                 let pos = history.partition_point(|l| l.header.sequence < seq);
-                                                history.insert(pos, ledger);
+                                                history.insert(pos, reconstructed.clone());
                                                 while history.len() > crate::consensus_adapter::MAX_CLOSED_LEDGERS {
                                                     history.pop_front();
                                                 }
                                                 tracing::info!("catchup: reconstructed ledger #{} hash={}", seq, hash);
+                                            }
+                                            drop(history);
+
+                                            if syncing {
+                                                // Adopt the reconstructed ledger: open ledger becomes N+1
+                                                let new_open = Ledger::new_open(&reconstructed);
+                                                let new_seq = new_open.header.sequence;
+                                                let mut l = ledger.write().await;
+                                                *l = new_open;
+                                                drop(l);
+                                                ledger_seq_shared.store(new_seq, Ordering::Relaxed);
+                                                *ledger_hash_shared.write().await = reconstructed.header.hash;
+                                                tracing::info!(
+                                                    "sync: adopted ledger #{}, open ledger is now #{}",
+                                                    seq, new_seq
+                                                );
+
+                                                if new_seq < max_peer_seq {
+                                                    // Request next ledger in the chain
+                                                    let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
+                                                        seq: new_seq,
+                                                        hash: None,
+                                                    });
+                                                } else {
+                                                    syncing = false;
+                                                    close_interval.reset();
+                                                    tracing::info!(
+                                                        "catchup complete, resuming consensus at ledger #{}",
+                                                        new_seq
+                                                    );
+                                                }
                                             }
                                         }
                                         Err(e) => tracing::warn!("catchup: failed to reconstruct ledger #{}: {}", seq, e),
@@ -1041,6 +1080,16 @@ impl Node {
             let payload = rxrpl_overlay::proto_convert::encode_validation(&validation);
             let _ = cmd_tx.send(OverlayCommand::Broadcast {
                 msg_type: rxrpl_p2p_proto::MessageType::Validation,
+                payload,
+            });
+        }
+
+        // Broadcast StatusChange so peers know our current ledger
+        {
+            let payload =
+                rxrpl_overlay::proto_convert::encode_status_change(&hash, closed_seq);
+            let _ = cmd_tx.send(OverlayCommand::Broadcast {
+                msg_type: rxrpl_p2p_proto::MessageType::StatusChange,
                 payload,
             });
         }

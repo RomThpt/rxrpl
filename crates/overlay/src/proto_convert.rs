@@ -157,7 +157,7 @@ pub fn encode_hello(
     // node_proof = sign(SHA-512-Half(pubkey || "RXRPL-HANDSHAKE"))
     let mut proof_data = Vec::new();
     proof_data.extend_from_slice(identity.public_key_bytes());
-    proof_data.extend_from_slice(b"RXRPL-HANDSHAKE");
+    proof_data.extend_from_slice(b"XRPL-HANDSHAKE");
     let proof_hash = rxrpl_crypto::sha512_half::sha512_half(&[&proof_data]);
     let node_proof = identity.sign(proof_hash.as_bytes());
 
@@ -167,8 +167,8 @@ pub fn encode_hello(
         .as_secs();
 
     let msg = TmHello {
-        proto_version: 1,
-        proto_version_min: 1,
+        proto_version: 2,
+        proto_version_min: 2,
         node_public: identity.public_key_bytes().to_vec(),
         node_proof,
         network_id,

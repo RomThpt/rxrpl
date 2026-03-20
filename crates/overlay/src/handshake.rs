@@ -105,10 +105,19 @@ fn validate_hello(
         )));
     }
 
-    // Verify node_proof: signature of SHA-512-Half(peer_pubkey || "RXRPL-HANDSHAKE")
+    // Check protocol version compatibility
+    const OUR_PROTO_VERSION_MIN: u32 = 2;
+    if hello.proto_version < OUR_PROTO_VERSION_MIN {
+        return Err(OverlayError::Handshake(format!(
+            "peer protocol version {} too old (min {})",
+            hello.proto_version, OUR_PROTO_VERSION_MIN
+        )));
+    }
+
+    // Verify node_proof: signature of SHA-512-Half(peer_pubkey || "XRPL-HANDSHAKE")
     let mut proof_data = Vec::new();
     proof_data.extend_from_slice(&hello.node_public);
-    proof_data.extend_from_slice(b"RXRPL-HANDSHAKE");
+    proof_data.extend_from_slice(b"XRPL-HANDSHAKE");
     let proof_hash = rxrpl_crypto::sha512_half::sha512_half(&[&proof_data]);
 
     if !rxrpl_crypto::ed25519::verify(proof_hash.as_bytes(), &hello.node_public, &hello.node_proof)
