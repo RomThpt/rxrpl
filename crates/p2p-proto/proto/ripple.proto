@@ -14,7 +14,20 @@ message TMHello {
     uint64 network_time = 8;
 }
 
-// Ping/pong keepalive
+// Validator manifest (single)
+message TMManifest {
+    bytes master_key = 1;
+    bytes signing_key = 2;
+    uint32 seq = 3;
+    bytes signature = 4;
+}
+
+// Batch manifests (mtMANIFESTS = 2)
+message TMManifests {
+    repeated bytes list = 1;
+}
+
+// Ping/pong keepalive (mtPING = 3)
 message TMPing {
     enum PingType {
         PT_PING = 0;
@@ -26,7 +39,39 @@ message TMPing {
     uint64 net_time = 4;
 }
 
-// Request ledger data from a peer
+// Cluster node info (mtCLUSTER = 5)
+message TMCluster {
+    repeated TMClusterNode cluster_nodes = 1;
+}
+
+message TMClusterNode {
+    string public_key = 1;
+    uint32 report_time = 2;
+    uint32 node_load = 3;
+    string node_name = 4;
+    string address = 5;
+}
+
+// Peer endpoints (mtENDPOINTS = 15)
+message TMEndpoints {
+    uint32 version = 1;
+
+    message TMEndpointv2 {
+        string endpoint = 1;
+        uint32 hops = 2;
+    }
+    repeated TMEndpointv2 endpoints_v2 = 3;
+}
+
+// Transaction relay (mtTRANSACTION = 30)
+message TMTransaction {
+    bytes raw_transaction = 1;
+    uint32 status = 2;
+    uint64 receive_timestamp = 3;
+    uint32 deferred = 4;
+}
+
+// Request ledger data (mtGET_LEDGER = 31)
 message TMGetLedger {
     enum LedgerType {
         LT_CURRENT = 0;
@@ -42,7 +87,7 @@ message TMGetLedger {
     uint64 query_depth = 6;
 }
 
-// Ledger data response
+// Ledger data response (mtLEDGER_DATA = 32)
 message TMLedgerData {
     bytes ledger_hash = 1;
     uint32 ledger_seq = 2;
@@ -62,15 +107,7 @@ message TMLedgerData {
     }
 }
 
-// Transaction relay
-message TMTransaction {
-    bytes raw_transaction = 1;
-    uint32 status = 2;
-    uint64 receive_timestamp = 3;
-    uint32 deferred = 4;
-}
-
-// Consensus proposal
+// Consensus proposal (mtPROPOSE_LEDGER = 33)
 message TMProposeSet {
     uint32 propose_seq = 1;
     bytes current_tx_hash = 2;
@@ -81,13 +118,7 @@ message TMProposeSet {
     uint32 ledger_seq = 7;
 }
 
-// Ledger validation
-message TMValidation {
-    bytes validation = 1;
-    uint32 ledger_seq = 2;
-}
-
-// Status change notification
+// Status change notification (mtSTATUS_CHANGE = 34)
 message TMStatusChange {
     uint32 new_status = 1;
     uint32 new_event = 2;
@@ -97,18 +128,77 @@ message TMStatusChange {
     uint32 validated_seq = 6;
 }
 
-// Manifest (validator key rotation)
-message TMManifest {
-    bytes master_key = 1;
-    bytes signing_key = 2;
-    uint32 seq = 3;
-    bytes signature = 4;
+// Have transaction set (mtHAVE_SET = 35)
+message TMHaveTransactionSet {
+    uint32 status = 1;
+    bytes hash = 2;
 }
 
-// Get peer list
+// Ledger validation (mtVALIDATION = 41)
+message TMValidation {
+    bytes validation = 1;
+    uint32 ledger_seq = 2;
+}
+
+// Get objects by hash (mtGET_OBJECTS = 42)
+message TMGetObjectByHash {
+    uint32 type = 1;
+    bool query = 2;
+    uint32 seq = 3;
+    bytes ledger_hash = 4;
+    bool fat = 5;
+    repeated TMIndexedObject objects = 6;
+}
+
+message TMIndexedObject {
+    bytes hash = 1;
+    bytes node_id = 2;
+    bytes index = 3;
+    bytes data = 4;
+    uint32 ledger_seq = 5;
+}
+
+// Validator list (mtVALIDATOR_LIST = 54)
+message TMValidatorList {
+    bytes manifest = 1;
+    bytes blob = 2;
+    bytes signature = 3;
+    uint32 version = 4;
+}
+
+// Squelch (mtSQUELCH = 55)
+message TMSquelch {
+    bool squelch = 1;
+    bytes validator_pub_key = 2;
+    uint32 squelch_duration = 3;
+}
+
+// Validator list collection (mtVALIDATOR_LIST_COLLECTION = 56)
+message TMValidatorListCollection {
+    uint32 version = 1;
+    bytes manifest = 2;
+    repeated ValidatorBlobInfo blobs = 3;
+}
+
+message ValidatorBlobInfo {
+    bytes manifest = 1;
+    bytes blob = 2;
+    bytes signature = 3;
+}
+
+// Have transactions (mtHAVE_TRANSACTIONS = 63)
+message TMHaveTransactions {
+    repeated bytes hashes = 1;
+}
+
+// Batch transactions (mtTRANSACTIONS = 64)
+message TMTransactions {
+    repeated TMTransaction transactions = 1;
+}
+
+// Legacy peer list (used by rxrpl internal protocol)
 message TMGetPeers {}
 
-// Peer list response
 message TMPeers {
     repeated TMPeer peers = 1;
 

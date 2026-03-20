@@ -1064,26 +1064,6 @@ impl Node {
         );
         drop(l);
 
-        // Broadcast validation with the real ledger hash
-        {
-            use rxrpl_consensus::types::Validation;
-            let mut validation = Validation {
-                node_id: rxrpl_consensus::types::NodeId(Hash256::new(identity.node_id.0)),
-                ledger_hash: hash,
-                ledger_seq: closed_seq,
-                full: true,
-                close_time: effective_close_time,
-                sign_time: effective_close_time,
-                signature: None,
-            };
-            identity.sign_validation(&mut validation);
-            let payload = rxrpl_overlay::proto_convert::encode_validation(&validation);
-            let _ = cmd_tx.send(OverlayCommand::Broadcast {
-                msg_type: rxrpl_p2p_proto::MessageType::Validation,
-                payload,
-            });
-        }
-
         // Broadcast StatusChange so peers know our current ledger
         {
             let payload =

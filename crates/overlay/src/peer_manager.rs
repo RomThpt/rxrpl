@@ -300,6 +300,12 @@ impl PeerManager {
     fn handle_command(&self, cmd: OverlayCommand) {
         match cmd {
             OverlayCommand::Broadcast { msg_type, payload } => {
+                // Skip consensus messages (ProposeSet, Validation) that use
+                // proto2 required fields incompatible with our proto3 encoding.
+                // These should only be sent by validated consensus participants.
+                if matches!(msg_type, MessageType::ProposeSet | MessageType::Validation) {
+                    return;
+                }
                 for handle in self.peer_handles.values() {
                     let _ = handle.tx.try_send(PeerMessage {
                         msg_type,
@@ -523,31 +529,12 @@ impl PeerManager {
                 }
             }
             MessageType::Cluster => {
+                // Cluster messages are only exchanged between nodes in the same
+                // cluster. Log and ignore for non-cluster peers.
                 if let Some(ref info) = peer_info {
                     info.reputation.record_valid_message(payload_len);
                 }
-                tracing::debug!("GetPeers from {}", from);
-                // Collect connected peer addresses and respond
-                let mut peer_addrs = Vec::new();
-                for (id, handle) in &self.peer_handles {
-                    if *id != from {
-                        // Parse "ip:port" from the peer's address
-                        if let Some((ip, port_str)) = handle.info.address.rsplit_once(':') {
-                            if let Ok(port) = port_str.parse::<u16>() {
-                                peer_addrs.push((ip.to_string(), port));
-                            }
-                        }
-                    }
-                }
-                if !peer_addrs.is_empty() {
-                    let response = proto_convert::encode_peers(peer_addrs);
-                    if let Some(handle) = self.peer_handles.get(&from) {
-                        let _ = handle.tx.try_send(PeerMessage {
-                            msg_type: MessageType::Endpoints,
-                            payload: response,
-                        });
-                    }
-                }
+                tracing::debug!("Cluster message from {}", from);
             }
             MessageType::GetLedger => {
                 if let Some(ref info) = peer_info {
@@ -608,7 +595,21 @@ impl PeerManager {
                 }
             }
             MessageType::Endpoints => {
-                match proto_convert::decode_peers(payload) {
+                // Try rippled TMEndpoints format first, fall back to legacy TMPeers
+                let peers_result = proto_convert::decode_endpoints(payload)
+                    .map(|eps| {
+                        eps.into_iter()
+                            .filter_map(|(endpoint, _hops)| {
+                                // endpoint is "ip:port" string
+                                let (ip, port_str) = endpoint.rsplit_once(':')?;
+                                let port = port_str.parse::<u16>().ok()?;
+                                Some((ip.to_string(), port))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .or_else(|_| proto_convert::decode_peers(payload));
+
+                match peers_result {
                     Ok(peers) => {
                         if let Some(ref info) = peer_info {
                             info.reputation.record_valid_message(payload_len);
@@ -634,23 +635,23 @@ impl PeerManager {
                 }
             }
             MessageType::Manifests => {
-                match proto_convert::decode_manifest(payload) {
-                    Ok(manifest) => {
+                match proto_convert::decode_manifests(payload) {
+                    Ok(manifest_list) => {
                         if let Some(ref info) = peer_info {
                             info.reputation.record_valid_message(payload_len);
                         }
                         tracing::debug!(
-                            "manifest from {} master_key={} seq={}",
-                            from,
-                            manifest.master_key,
-                            manifest.seq
+                            "received {} manifests from {}",
+                            manifest_list.len(),
+                            from
                         );
+                        // Each entry is a raw serialized manifest (rippled binary format).
+                        // For now we store the count; full parsing requires SField codec.
                         if let Some(ref tx) = self.server_event_tx {
                             let _ = tx.send(serde_json::json!({
-                                "type": "manifestReceived",
-                                "master_key": manifest.master_key,
-                                "signing_key": manifest.signing_key,
-                                "seq": manifest.seq,
+                                "type": "manifestsReceived",
+                                "count": manifest_list.len(),
+                                "from": from.to_string(),
                             }));
                         }
                     }
@@ -661,12 +662,84 @@ impl PeerManager {
                     }
                 }
             }
-            _ => {
-                // Unhandled message type -- log and ignore
+            MessageType::HaveSet => {
+                match proto_convert::decode_have_set(payload) {
+                    Ok(have_set) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                        }
+                        tracing::debug!(
+                            "HaveTransactionSet from {} hash={} status={}",
+                            from, have_set.hash, have_set.status
+                        );
+                    }
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
+                    }
+                }
+            }
+            MessageType::GetObjects => {
                 if let Some(ref info) = peer_info {
                     info.reputation.record_valid_message(payload_len);
                 }
-                tracing::trace!("unhandled message type {:?} from {}", msg_type, from);
+                tracing::debug!("GetObjectByHash from {} ({} bytes)", from, payload_len);
+                // TODO: implement object serving
+            }
+            MessageType::ValidatorList => {
+                match proto_convert::decode_validator_list(payload) {
+                    Ok(vl) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                        }
+                        tracing::debug!(
+                            "ValidatorList v{} from {} ({} bytes manifest, {} bytes blob)",
+                            vl.version, from, vl.manifest.len(), vl.blob.len()
+                        );
+                    }
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
+                    }
+                }
+            }
+            MessageType::ValidatorListCollection => {
+                match proto_convert::decode_validator_list_collection(payload) {
+                    Ok(vlc) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                        }
+                        tracing::debug!(
+                            "ValidatorListCollection v{} from {} ({} blobs)",
+                            vlc.version, from, vlc.blobs.len()
+                        );
+                    }
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
+                    }
+                }
+            }
+            MessageType::Squelch => {
+                if let Some(ref info) = peer_info {
+                    info.reputation.record_valid_message(payload_len);
+                }
+                tracing::trace!("Squelch from {}", from);
+            }
+            MessageType::HaveTransactions => {
+                if let Some(ref info) = peer_info {
+                    info.reputation.record_valid_message(payload_len);
+                }
+                tracing::trace!("HaveTransactions from {}", from);
+            }
+            MessageType::Transactions => {
+                if let Some(ref info) = peer_info {
+                    info.reputation.record_valid_message(payload_len);
+                }
+                tracing::trace!("Transactions batch from {}", from);
             }
         }
     }

@@ -50,8 +50,9 @@ impl PeerDiscovery {
 
     /// Run the periodic discovery loop.
     ///
-    /// Periodically sends GetPeers to connected peers and connects to
-    /// newly discovered addresses until max_peers is reached.
+    /// Monitors peer count and re-bootstraps from seeds if all peers
+    /// are lost. Peer discovery with rippled happens passively via
+    /// TMEndpoints messages that rippled sends automatically.
     pub async fn run_loop(&self) {
         let mut interval = tokio::time::interval(self.interval);
         interval.tick().await; // skip first immediate tick
@@ -64,21 +65,8 @@ impl PeerDiscovery {
                 continue;
             }
 
-            // Send GetPeers to all connected peers
-            let peer_ids = self.peer_set.peer_ids();
-            if peer_ids.is_empty() {
-                // Re-bootstrap if we lost all peers
+            if current_count == 0 {
                 self.bootstrap().await;
-                continue;
-            }
-
-            let payload = Vec::new(); // TMGetPeers is an empty message
-            for peer_id in &peer_ids {
-                let _ = self.cmd_tx.send(OverlayCommand::SendTo {
-                    node_id: *peer_id,
-                    msg_type: rxrpl_p2p_proto::MessageType::Cluster,
-                    payload: payload.clone(),
-                });
             }
         }
     }

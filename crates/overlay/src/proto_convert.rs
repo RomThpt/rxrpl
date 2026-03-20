@@ -1,8 +1,10 @@
 use prost::Message;
 use rxrpl_consensus::types::{NodeId, Proposal, Validation};
 use rxrpl_p2p_proto::proto::{
-    TmGetLedger, TmHello, TmLedgerData, TmManifest, TmPing, TmProposeSet, TmStatusChange,
-    TmTransaction, TmValidation, tm_ledger_data::TmLedgerNode,
+    TmEndpoints, TmGetLedger, TmGetObjectByHash, TmHaveTransactionSet, TmHaveTransactions,
+    TmHello, TmLedgerData, TmManifests, TmPing, TmProposeSet, TmSquelch, TmStatusChange,
+    TmTransaction, TmTransactions, TmValidation, TmValidatorList, TmValidatorListCollection,
+    tm_ledger_data::TmLedgerNode,
 };
 use rxrpl_primitives::Hash256;
 
@@ -302,6 +304,8 @@ pub struct ManifestData {
 }
 
 pub fn decode_manifest(data: &[u8]) -> Result<ManifestData, OverlayError> {
+    // Try decoding as single TMManifest first (legacy)
+    use rxrpl_p2p_proto::proto::TmManifest;
     let msg = TmManifest::decode(data)
         .map_err(|e| OverlayError::Codec(format!("decode Manifest: {e}")))?;
 
@@ -310,6 +314,92 @@ pub fn decode_manifest(data: &[u8]) -> Result<ManifestData, OverlayError> {
         signing_key: hex::encode(&msg.signing_key),
         seq: msg.seq,
     })
+}
+
+// --- Manifests (batch, type 2) ---
+
+pub fn decode_manifests(data: &[u8]) -> Result<Vec<Vec<u8>>, OverlayError> {
+    let msg = TmManifests::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode Manifests: {e}")))?;
+    Ok(msg.list)
+}
+
+pub fn encode_manifests(manifests: Vec<Vec<u8>>) -> Vec<u8> {
+    let msg = TmManifests { list: manifests };
+    msg.encode_to_vec()
+}
+
+// --- Endpoints (type 15) ---
+
+pub fn decode_endpoints(data: &[u8]) -> Result<Vec<(String, u32)>, OverlayError> {
+    let msg = TmEndpoints::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode Endpoints: {e}")))?;
+    Ok(msg
+        .endpoints_v2
+        .into_iter()
+        .map(|ep| (ep.endpoint, ep.hops))
+        .collect())
+}
+
+// --- HaveTransactionSet (type 35) ---
+
+pub struct HaveSetData {
+    pub status: u32,
+    pub hash: Hash256,
+}
+
+pub fn decode_have_set(data: &[u8]) -> Result<HaveSetData, OverlayError> {
+    let msg = TmHaveTransactionSet::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode HaveSet: {e}")))?;
+    let hash = hash256_from_bytes(&msg.hash)?;
+    Ok(HaveSetData {
+        status: msg.status,
+        hash,
+    })
+}
+
+// --- GetObjectByHash (type 42) ---
+
+pub fn decode_get_objects(data: &[u8]) -> Result<TmGetObjectByHash, OverlayError> {
+    TmGetObjectByHash::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode GetObjects: {e}")))
+}
+
+// --- Squelch (type 55) ---
+
+pub fn decode_squelch(data: &[u8]) -> Result<TmSquelch, OverlayError> {
+    TmSquelch::decode(data).map_err(|e| OverlayError::Codec(format!("decode Squelch: {e}")))
+}
+
+// --- ValidatorList (type 54) ---
+
+pub fn decode_validator_list(data: &[u8]) -> Result<TmValidatorList, OverlayError> {
+    TmValidatorList::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode ValidatorList: {e}")))
+}
+
+// --- ValidatorListCollection (type 56) ---
+
+pub fn decode_validator_list_collection(
+    data: &[u8],
+) -> Result<TmValidatorListCollection, OverlayError> {
+    TmValidatorListCollection::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode ValidatorListCollection: {e}")))
+}
+
+// --- HaveTransactions (type 63) ---
+
+pub fn decode_have_transactions(data: &[u8]) -> Result<Vec<Vec<u8>>, OverlayError> {
+    let msg = TmHaveTransactions::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode HaveTransactions: {e}")))?;
+    Ok(msg.hashes)
+}
+
+// --- Transactions (batch, type 64) ---
+
+pub fn decode_transactions(data: &[u8]) -> Result<TmTransactions, OverlayError> {
+    TmTransactions::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode Transactions: {e}")))
 }
 
 // --- Helpers ---
