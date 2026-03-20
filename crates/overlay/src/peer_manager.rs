@@ -468,7 +468,9 @@ impl PeerManager {
             }
             MessageType::Validation => {
                 match proto_convert::decode_validation(payload) {
-                    Ok(validation) => {
+                    Ok(mut validation) => {
+                        // Set the sender's node_id from the authenticated peer identity
+                        validation.node_id = rxrpl_consensus::types::NodeId(from);
                         if let Some(ref info) = peer_info {
                             info.reputation.record_valid_message(payload_len);
                         }

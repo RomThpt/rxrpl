@@ -477,11 +477,12 @@ impl Node {
         };
         let identity = Arc::new(identity);
         tracing::info!("node identity: {}", identity.node_id);
+        tracing::info!("node public key: {}", hex::encode(identity.public_key_bytes()));
 
         // 2. Shared ledger state for P2P
-        let ledger_seq = Arc::new(AtomicU32::new(self.ledger.blocking_read().header.sequence));
+        let ledger_seq = Arc::new(AtomicU32::new(self.ledger.read().await.header.sequence));
         let ledger_hash = Arc::new(tokio::sync::RwLock::new(
-            self.ledger.blocking_read().header.parent_hash,
+            self.ledger.read().await.header.parent_hash,
         ));
 
         // 3. Create PeerManager with LedgerProvider + TLS
@@ -745,8 +746,9 @@ impl Node {
                                 &consensus, pending_close_time, &ledger,
                                 &closed_ledgers, &tx_store, &event_tx,
                                 &ledger_seq_shared, &ledger_hash_shared,
-                                &tx_queue,
+                                &tx_queue, &identity, &cmd_tx_catchup,
                             ).await;
+                            close_interval.reset();
                         } else {
                             let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
                                 phase: "establish".into(),
@@ -765,15 +767,21 @@ impl Node {
                                 &consensus, pending_close_time, &ledger,
                                 &closed_ledgers, &tx_store, &event_tx,
                                 &ledger_seq_shared, &ledger_hash_shared,
-                                &tx_queue,
+                                &tx_queue, &identity, &cmd_tx_catchup,
                             ).await;
                             establishing = false;
+                            close_interval.reset();
                         }
                     }
 
                     Some(msg) = consensus_rx.recv() => {
                         match msg {
                             ConsensusMessage::Proposal(proposal) => {
+                                tracing::debug!(
+                                    "proposal from {:?} seq={} tx_set={} close_time={}",
+                                    proposal.node_id, proposal.ledger_seq,
+                                    proposal.tx_set_hash, proposal.close_time
+                                );
                                 consensus.peer_proposal(proposal);
                             }
                             ConsensusMessage::Validation(validation) => {
@@ -920,11 +928,17 @@ impl Node {
         ledger_seq_shared: &Arc<AtomicU32>,
         ledger_hash_shared: &Arc<tokio::sync::RwLock<Hash256>>,
         tx_queue: &Arc<RwLock<TxQueue>>,
+        identity: &Arc<NodeIdentity>,
+        cmd_tx: &tokio::sync::mpsc::UnboundedSender<OverlayCommand>,
     ) {
         let effective_close_time = consensus
             .accepted_close_time()
             .unwrap_or(pending_close_time);
         let close_flags = consensus.accepted_close_flags();
+        tracing::debug!(
+            "closing with effective_close_time={} close_flags={} pending_close_time={}",
+            effective_close_time, close_flags, pending_close_time
+        );
 
         let mut l = ledger.write().await;
         if let Err(e) = l.close(effective_close_time, close_flags) {
@@ -1010,6 +1024,26 @@ impl Node {
             new_open_seq
         );
         drop(l);
+
+        // Broadcast validation with the real ledger hash
+        {
+            use rxrpl_consensus::types::Validation;
+            let mut validation = Validation {
+                node_id: rxrpl_consensus::types::NodeId(Hash256::new(identity.node_id.0)),
+                ledger_hash: hash,
+                ledger_seq: closed_seq,
+                full: true,
+                close_time: effective_close_time,
+                sign_time: effective_close_time,
+                signature: None,
+            };
+            identity.sign_validation(&mut validation);
+            let payload = rxrpl_overlay::proto_convert::encode_validation(&validation);
+            let _ = cmd_tx.send(OverlayCommand::Broadcast {
+                msg_type: rxrpl_p2p_proto::MessageType::Validation,
+                payload,
+            });
+        }
 
         // Cleanup TxQueue: remove confirmed + expired
         {

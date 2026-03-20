@@ -77,11 +77,10 @@ impl ConsensusAdapter for NetworkConsensusAdapter {
         self.broadcast(MessageType::StatusChange, payload);
     }
 
-    fn on_accept(&self, validation: &Validation) {
-        let mut signed = validation.clone();
-        self.identity.sign_validation(&mut signed);
-        let payload = proto_convert::encode_validation(&signed);
-        self.broadcast(MessageType::Validation, payload);
+    fn on_accept(&self, _validation: &Validation) {
+        // Validation is broadcast from close_consensus_round after the real
+        // ledger hash is computed. The hash is not available at this point
+        // because on_accept_ledger returns a sentinel zero.
     }
 
     fn on_accept_ledger(&self, _tx_set: &TxSet, _close_time: u32, _close_flags: u8) -> Hash256 {

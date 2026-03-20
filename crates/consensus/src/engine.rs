@@ -41,6 +41,8 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     accepted_validation: Option<Validation>,
     /// Trusted validator list (UNL). Empty = solo mode.
     unl: TrustedValidatorList,
+    /// Proposals received while not in Establish phase, replayed on close.
+    pending_proposals: Vec<Proposal>,
 }
 
 impl<A: ConsensusAdapter> ConsensusEngine<A> {
@@ -69,6 +71,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             accepted_close_flags: 0,
             accepted_validation: None,
             unl,
+            pending_proposals: Vec::new(),
         }
     }
 
@@ -139,6 +142,8 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.accepted_close_time = None;
         self.accepted_close_flags = 0;
         self.accepted_validation = None;
+        // Note: pending_proposals is NOT cleared here -- they will be
+        // replayed in close_ledger() which follows start_round().
         let _ = ledger_seq;
     }
 
@@ -172,32 +177,51 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.our_position = Some(proposal);
         self.our_set = Some(our_set);
         self.phase = ConsensusPhase::Establish;
+
+        // Replay any proposals buffered while we were in Open phase
+        let pending = std::mem::take(&mut self.pending_proposals);
+        for p in pending {
+            self.peer_proposal(p);
+        }
+
         Ok(())
     }
 
     /// Receive a proposal from a peer.
     pub fn peer_proposal(&mut self, proposal: Proposal) {
         if self.phase != ConsensusPhase::Establish {
+            // Buffer proposals received outside Establish phase
+            self.pending_proposals.push(proposal);
             return;
         }
 
         // UNL filtering: if UNL is non-empty, only accept trusted nodes
         if !self.unl.is_empty() && !self.unl.is_trusted(&proposal.node_id) {
+            tracing::debug!("rejected proposal from untrusted {:?}", proposal.node_id);
             return;
         }
 
         // Reject proposals for a different previous ledger
         if proposal.prev_ledger != self.prev_ledger {
+            tracing::debug!(
+                "rejected proposal: prev_ledger mismatch (ours={}, theirs={})",
+                self.prev_ledger, proposal.prev_ledger
+            );
             return;
         }
 
         // Reject proposals for a different ledger sequence
         if let Some(ref our) = self.our_position {
             if proposal.ledger_seq != our.ledger_seq {
+                tracing::debug!(
+                    "rejected proposal: seq mismatch (ours={}, theirs={})",
+                    our.ledger_seq, proposal.ledger_seq
+                );
                 return;
             }
         }
 
+        tracing::debug!("accepted proposal from {:?} seq={}", proposal.node_id, proposal.ledger_seq);
         let node_id = proposal.node_id;
         self.peer_positions.insert(node_id, proposal);
         self.create_disputes();
