@@ -32,26 +32,21 @@ enum Commands {
     // -- Server Queries --
 
     /// Get server info from an XRPL node
-    #[command(help_heading = "Server")]
     ServerInfo,
 
     /// Get current fee info
-    #[command(help_heading = "Server")]
     Fee,
 
     /// Get the latest validated ledger
-    #[command(help_heading = "Server")]
     LedgerClosed,
 
     /// Get a ledger by index
-    #[command(help_heading = "Server")]
     Ledger {
         /// Ledger index or shortcut (validated, current, closed)
         index: String,
     },
 
     /// Subscribe to streams (WebSocket only)
-    #[command(help_heading = "Server")]
     Subscribe {
         /// Streams to subscribe to (e.g., ledger, transactions)
         #[arg(value_delimiter = ',')]
@@ -61,14 +56,12 @@ enum Commands {
     // -- Account Queries --
 
     /// Get account info
-    #[command(help_heading = "Account")]
     AccountInfo {
         /// Account address (classic or X-address)
         account: String,
     },
 
     /// Get account transaction history
-    #[command(help_heading = "Account")]
     AccountTx {
         /// Account address
         account: String,
@@ -78,7 +71,6 @@ enum Commands {
     },
 
     /// List NFTs for an account
-    #[command(help_heading = "Account")]
     AccountNfts {
         /// Account address
         account: String,
@@ -87,7 +79,6 @@ enum Commands {
     // -- Wallet --
 
     /// Generate a new wallet keypair locally
-    #[command(help_heading = "Wallet")]
     WalletPropose {
         /// Key type: ed25519 or secp256k1
         #[arg(long, default_value = "ed25519")]
@@ -97,21 +88,18 @@ enum Commands {
     // -- Transactions --
 
     /// Submit a signed transaction blob
-    #[command(help_heading = "Transaction")]
     Submit {
         /// Hex-encoded transaction blob
         tx_blob: String,
     },
 
     /// Look up a transaction by hash
-    #[command(help_heading = "Transaction")]
     Tx {
         /// Transaction hash
         hash: String,
     },
 
     /// Sign a transaction from JSON (inline or @file)
-    #[command(help_heading = "Transaction")]
     Sign {
         /// Secret seed (sXXX format)
         #[arg(long)]
@@ -125,7 +113,6 @@ enum Commands {
     },
 
     /// Send an XRP payment (build, autofill, sign, submit)
-    #[command(help_heading = "Transaction")]
     Pay {
         /// Sender secret seed (sXXX format)
         #[arg(long)]
@@ -145,7 +132,6 @@ enum Commands {
     },
 
     /// Set a trust line (autofill, sign, submit)
-    #[command(help_heading = "Transaction")]
     TrustSet {
         /// Sender secret seed (sXXX format)
         #[arg(long)]
@@ -165,7 +151,6 @@ enum Commands {
     },
 
     /// Create an offer (autofill, sign, submit)
-    #[command(help_heading = "Transaction")]
     OfferCreate {
         /// Sender secret seed (sXXX format)
         #[arg(long)]
@@ -182,7 +167,6 @@ enum Commands {
     },
 
     /// Delete an account (autofill, sign, submit)
-    #[command(help_heading = "Transaction")]
     AccountDelete {
         /// Sender secret seed (sXXX format)
         #[arg(long)]
@@ -198,7 +182,6 @@ enum Commands {
     // -- Node --
 
     /// Run a standalone XRPL node
-    #[command(help_heading = "Node")]
     NodeRun {
         /// Genesis account address
         #[arg(long, default_value = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")]
@@ -212,7 +195,6 @@ enum Commands {
     },
 
     /// Run a networked XRPL node with P2P overlay
-    #[command(help_heading = "Node")]
     NetworkRun {
         /// Ledger close interval in seconds
         #[arg(long, default_value = "10")]
@@ -362,14 +344,30 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             close_interval,
             bind,
         } => {
-            return cmd_node_run(&genesis_account, close_interval, &bind).await;
+            let mut config = if let Some(ref config_path) = cli.config {
+                rxrpl_config::load_config(config_path)?
+            } else {
+                rxrpl_config::NodeConfig::default()
+            };
+            config.server.bind = bind.parse()?;
+            if let Some(ref dir) = cli.data_dir {
+                config.database.path = dir.clone();
+            }
+            return cmd_node_run(config, &genesis_account, close_interval).await;
         }
 
         Commands::NetworkRun {
-            config,
             close_interval,
         } => {
-            return cmd_network_run(&config, close_interval).await;
+            let mut config = if let Some(ref config_path) = cli.config {
+                rxrpl_config::load_config(config_path)?
+            } else {
+                rxrpl_config::NodeConfig::default()
+            };
+            if let Some(ref dir) = cli.data_dir {
+                config.database.path = dir.clone();
+            }
+            return cmd_network_run(config, close_interval).await;
         }
 
         _ => {}
@@ -544,13 +542,11 @@ async fn autofill_sign_submit(
 }
 
 async fn cmd_node_run(
+    config: rxrpl_config::NodeConfig,
     genesis_account: &str,
     close_interval: u64,
-    bind: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut config = rxrpl_config::NodeConfig::default();
-    config.server.bind = bind.parse()?;
-
+    let bind = config.server.bind;
     let node = rxrpl_node::Node::new_standalone(config, genesis_account)?;
 
     eprintln!("Starting standalone node...");
@@ -563,16 +559,12 @@ async fn cmd_node_run(
 }
 
 async fn cmd_network_run(
-    config_path: &str,
+    config: rxrpl_config::NodeConfig,
     close_interval: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let toml_str = std::fs::read_to_string(config_path)?;
-    let config: rxrpl_config::NodeConfig = toml::from_str(&toml_str)?;
-
     let node = rxrpl_node::Node::new(config)?;
 
     eprintln!("Starting networked node...");
-    eprintln!("  Config: {config_path}");
     eprintln!("  Close interval: {close_interval}s");
 
     node.run_networked(close_interval).await?;
