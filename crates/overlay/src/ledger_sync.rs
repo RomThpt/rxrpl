@@ -179,16 +179,28 @@ impl LedgerSyncer {
         hash: Hash256,
         store: Arc<dyn NodeStore>,
     ) -> Vec<MissingNode> {
-        // Only sync one ledger at a time. Keep the active sync until it
-        // completes -- subsequent ledgers will be fast delta syncs once the
-        // first full state tree is in the store.
+        // Only sync one ledger at a time. Replace the active sync with
+        // a newer ledger to avoid syncing stale data. The store retains
+        // all previously fetched nodes, so the new sync picks up where
+        // the old one left off.
         if !self.incremental.contains_key(&seq) {
             if let Some(&active_seq) = self.incremental.keys().max() {
-                tracing::debug!(
-                    "skipping sync for #{} (active sync: #{})",
-                    seq, active_seq
+                if seq <= active_seq {
+                    return Vec::new();
+                }
+                // Replace when the active sync is stuck (zero-add rounds).
+                // Don't replace during active progress to avoid thrashing.
+                let zero_rounds = self.incremental.get(&active_seq)
+                    .map(|e| e.zero_rounds)
+                    .unwrap_or(0);
+                if zero_rounds < 3 {
+                    return Vec::new();
+                }
+                tracing::info!(
+                    "replacing stale sync #{} (round {}) with #{}",
+                    active_seq, zero_rounds, seq
                 );
-                return Vec::new();
+                self.incremental.clear();
             }
         }
 
@@ -296,7 +308,7 @@ impl LedgerSyncer {
             }
         } else {
             entry.zero_rounds += 1;
-            if entry.zero_rounds > 10 {
+            if entry.zero_rounds > 20 {
                 tracing::warn!(
                     "incremental sync for ledger #{} stuck ({} consecutive zero-add rounds), removing",
                     seq, entry.zero_rounds

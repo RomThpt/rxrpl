@@ -910,7 +910,7 @@ impl PeerManager {
         let payload = proto_convert::encode_get_ledger_with_nodes(
             LI_AS_NODE,
             Some(&ledger_hash),
-            0,
+            seq,
             0,
             node_ids,
         );
