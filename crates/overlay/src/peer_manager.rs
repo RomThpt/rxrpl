@@ -909,25 +909,22 @@ impl PeerManager {
             node_ids,
         );
 
-        let best = self.peer_set.best_peers_for_ledger(seq, 3);
-        let mut sent = 0;
-        for node_id in &best {
+        // Send to a single peer to avoid duplicate responses.
+        let best = self.peer_set.best_peers_for_ledger(seq, 1);
+        if let Some(node_id) = best.first() {
             if let Some(handle) = self.peer_handles.get(node_id) {
                 if handle.tx.try_send(PeerMessage {
                     msg_type: MessageType::GetLedger,
-                    payload: payload.clone(),
+                    payload,
                 }).is_ok() {
-                    sent += 1;
+                    let min_depth = missing.iter().map(|mn| mn.node_id.depth()).min().unwrap_or(0);
+                    let max_depth = missing.iter().map(|mn| mn.node_id.depth()).max().unwrap_or(0);
+                    tracing::debug!(
+                        "sent GetLedger seq={} delta ({} node_ids, depth={}-{})",
+                        seq, num_ids, min_depth, max_depth
+                    );
                 }
             }
-        }
-        if sent > 0 {
-            let min_depth = missing.iter().map(|mn| mn.node_id.depth()).min().unwrap_or(0);
-            let max_depth = missing.iter().map(|mn| mn.node_id.depth()).max().unwrap_or(0);
-            tracing::debug!(
-                "sent GetLedger seq={} delta ({} node_ids, depth={}-{}) to {} peers",
-                seq, num_ids, min_depth, max_depth, sent
-            );
         }
     }
 
@@ -945,50 +942,31 @@ impl PeerManager {
 
         let cookie = self.next_cookie.fetch_add(1, Ordering::Relaxed);
 
-        // Check if we have missing nodes from an active incremental sync.
-        let missing = self.ledger_syncer.get_missing_node_ids(seq);
-        let node_ids: Vec<Vec<u8>> = missing
-            .iter()
-            .map(|mn| mn.node_id.to_wire_bytes())
-            .collect();
-
-        let is_delta = !node_ids.is_empty();
+        // liBASE requests fetch the ledger header only -- no delta node_ids.
         let payload = proto_convert::encode_get_ledger_with_nodes(
             LI_BASE,
             hash.as_ref(),
             seq,
             cookie,
-            node_ids,
+            Vec::new(),
         );
 
-        let best = self.peer_set.best_peers_for_ledger(seq, 3);
-        let mut sent = 0;
-        tracing::debug!(
-            "GetLedger seq={}: {} candidate peers, {} peer handles",
-            seq, best.len(), self.peer_handles.len()
-        );
-        for node_id in &best {
+        // Send to a single peer.
+        let best = self.peer_set.best_peers_for_ledger(seq, 1);
+        if let Some(node_id) = best.first() {
             if let Some(handle) = self.peer_handles.get(node_id) {
                 match handle.tx.try_send(PeerMessage {
                     msg_type: MessageType::GetLedger,
-                    payload: payload.clone(),
+                    payload,
                 }) {
-                    Ok(_) => sent += 1,
+                    Ok(_) => {
+                        tracing::debug!("sent GetLedger seq={} itype=liBASE", seq);
+                    }
                     Err(e) => tracing::warn!("failed to send GetLedger to {}: {}", node_id, e),
                 }
-            } else {
-                tracing::warn!("peer {} in best_peers but no handle found", node_id);
             }
-        }
-        if sent == 0 {
-            tracing::warn!("no peers available for GetLedger seq={}", seq);
-        } else if is_delta {
-            tracing::info!(
-                "sent GetLedger seq={} itype=liBASE to {} peers (delta sync)",
-                seq, sent
-            );
         } else {
-            tracing::info!("sent GetLedger seq={} itype=liBASE to {} peers", seq, sent);
+            tracing::warn!("no peers available for GetLedger seq={}", seq);
         }
     }
 

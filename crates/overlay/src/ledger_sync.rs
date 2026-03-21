@@ -178,6 +178,19 @@ impl LedgerSyncer {
         hash: Hash256,
         store: Arc<dyn NodeStore>,
     ) -> Vec<MissingNode> {
+        // Only sync one ledger at a time. Keep the active sync until it
+        // completes -- subsequent ledgers will be fast delta syncs once the
+        // first full state tree is in the store.
+        if !self.incremental.contains_key(&seq) {
+            if let Some(&active_seq) = self.incremental.keys().max() {
+                tracing::debug!(
+                    "skipping sync for #{} (active sync: #{})",
+                    seq, active_seq
+                );
+                return Vec::new();
+            }
+        }
+
         let entry = self.incremental.entry(seq).or_insert_with(|| {
             let map = SHAMap::syncing_with_store(hash, LeafNode::account_state, store);
             IncrementalSync {
@@ -237,10 +250,14 @@ impl LedgerSyncer {
                 // Inner node: hash = SHA-512-Half("MIN\0" || raw)
                 let prefix: [u8; 4] = [0x4D, 0x49, 0x4E, 0x00]; // "MIN\0"
                 rxrpl_crypto::sha512_half::sha512_half(&[&prefix, raw])
-            } else {
+            } else if raw.len() >= 32 {
                 // Leaf node: hash = SHA-512-Half("MLN\0" || raw)
+                // Wire format is key(32) || data; hash covers both in that order.
                 let prefix: [u8; 4] = [0x4D, 0x4C, 0x4E, 0x00]; // "MLN\0"
                 rxrpl_crypto::sha512_half::sha512_half(&[&prefix, raw])
+            } else {
+                // Too small, skip.
+                continue;
             };
 
             tracing::debug!(
