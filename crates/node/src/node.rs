@@ -713,6 +713,7 @@ impl Node {
         let interval_duration = Duration::from_secs(close_interval_secs);
         let ledger_seq_shared = Arc::clone(&ledger_seq);
         let ledger_hash_shared = Arc::clone(&ledger_hash);
+        let configured_quorum = self.config.validators.quorum;
 
         tokio::spawn(async move {
             let node_id = NodeId(identity.node_id);
@@ -727,11 +728,19 @@ impl Node {
             let mut max_peer_seq: u32 = 0;
             let mut pending_close_time = 0u32;
             // Track validations from network peers to determine validated ledgers.
-            // Threshold of 1 for isolated testing; in production use UNL size * 0.8.
-            let mut val_aggregator = rxrpl_overlay::validation_aggregator::ValidationAggregator::new(1);
+            // Default quorum of 28 (~80% of typical 35-validator UNL).
+            let initial_quorum = configured_quorum.unwrap_or(28);
+            let mut val_aggregator = rxrpl_overlay::validation_aggregator::ValidationAggregator::new(initial_quorum);
+            tracing::info!("validation quorum initialized to {}", initial_quorum);
+
+            let sync_check_duration = Duration::from_secs(5);
+            let mut sync_check_interval = tokio::time::interval(sync_check_duration);
+            let mut sync_started_at: Option<tokio::time::Instant> = None;
+            let mut last_sync_seq: u32 = 0;
 
             close_interval.tick().await; // skip first immediate tick
             converge_interval.tick().await;
+            sync_check_interval.tick().await;
 
             loop {
                 tokio::select! {
@@ -786,7 +795,7 @@ impl Node {
                         }
                     }
 
-                    _ = converge_interval.tick(), if establishing => {
+                    _ = converge_interval.tick(), if establishing && !syncing => {
                         if consensus.converge() {
                             let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
                                 phase: "accepted".into(),
@@ -842,6 +851,9 @@ impl Node {
                                                 validated.seq, our_seq, validated.seq
                                             );
                                             syncing = true;
+                                            establishing = false;
+                                            sync_started_at = Some(tokio::time::Instant::now());
+                                            last_sync_seq = our_seq;
                                             // Request the network's validated ledger directly
                                             // (not our_seq+1 which may not exist on peers)
                                             let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
@@ -932,6 +944,9 @@ impl Node {
                                             from, peer_seq - our_seq, peer_seq
                                         );
                                         syncing = true;
+                                        establishing = false;
+                                        sync_started_at = Some(tokio::time::Instant::now());
+                                        last_sync_seq = our_seq;
                                     }
                                     // Request the peer's current ledger directly
                                     let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
@@ -973,15 +988,23 @@ impl Node {
                                                     seq, new_seq
                                                 );
 
-                                                if new_seq < max_peer_seq {
+                                                // Use both max_peer_seq and highest validated
+                                                // to determine if sync is complete
+                                                let target = max_peer_seq
+                                                    .max(val_aggregator.highest_validated_seq);
+                                                if new_seq < target {
                                                     // Request next ledger in the chain
                                                     let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
                                                         seq: new_seq,
                                                         hash: None,
                                                     });
+                                                    last_sync_seq = new_seq;
                                                 } else {
                                                     syncing = false;
+                                                    sync_started_at = None;
                                                     close_interval.reset();
+                                                    // Clear expired transactions accumulated during sync
+                                                    tx_queue.write().await.remove_expired(new_seq);
                                                     tracing::info!(
                                                         "catchup complete, resuming consensus at ledger #{}",
                                                         new_seq
@@ -992,6 +1015,39 @@ impl Node {
                                         Err(e) => tracing::warn!("catchup: failed to reconstruct ledger #{}: {}", seq, e),
                                     }
                                 }
+                            }
+                            ConsensusMessage::ValidatorListReceived { validator_count } => {
+                                if configured_quorum.is_none() && validator_count > 0 {
+                                    let new_quorum = (validator_count as f64 * 0.8).ceil() as usize;
+                                    val_aggregator.update_quorum(new_quorum);
+                                    tracing::info!(
+                                        "auto-set validation quorum to {} (from {} validators)",
+                                        new_quorum, validator_count
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    _ = sync_check_interval.tick(), if syncing => {
+                        if let Some(started) = sync_started_at {
+                            let current_seq = ledger_seq_shared.load(Ordering::Relaxed);
+                            let elapsed = started.elapsed();
+                            if elapsed > Duration::from_secs(30) && current_seq <= last_sync_seq {
+                                // No progress in 30s, re-request the target ledger
+                                let target = max_peer_seq
+                                    .max(val_aggregator.highest_validated_seq);
+                                tracing::warn!(
+                                    "sync stalled at #{} for {:.0}s, re-requesting target #{}",
+                                    current_seq, elapsed.as_secs_f64(), target
+                                );
+                                let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
+                                    seq: target,
+                                    hash: None,
+                                });
+                                // Reset the timeout clock
+                                sync_started_at = Some(tokio::time::Instant::now());
+                                last_sync_seq = current_seq;
                             }
                         }
                     }
