@@ -188,14 +188,10 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
 
 // --- Transaction ---
 
-pub fn encode_transaction(tx_hash: &Hash256, tx_data: &[u8]) -> Vec<u8> {
-    // Pack: hash(32) + raw_transaction
-    let mut raw = Vec::with_capacity(32 + tx_data.len());
-    raw.extend_from_slice(tx_hash.as_bytes());
-    raw.extend_from_slice(tx_data);
-
+pub fn encode_transaction(_tx_hash: &Hash256, tx_data: &[u8]) -> Vec<u8> {
+    // rippled-compatible: raw_transaction contains the serialized tx directly.
     let msg = TmTransaction {
-        raw_transaction: Some(raw),
+        raw_transaction: Some(tx_data.to_vec()),
         status: Some(0),
         receive_timestamp: Some(0),
         deferred: Some(false),
@@ -208,13 +204,18 @@ pub fn decode_transaction(data: &[u8]) -> Result<(Hash256, Vec<u8>), OverlayErro
         .map_err(|e| OverlayError::Codec(format!("decode Transaction: {e}")))?;
 
     let raw_transaction = msg.raw_transaction.unwrap_or_default();
-    if raw_transaction.len() < 32 {
-        return Err(OverlayError::Codec("transaction payload too short".into()));
+    if raw_transaction.is_empty() {
+        return Err(OverlayError::Codec("empty transaction payload".into()));
     }
 
-    let tx_hash = hash256_from_bytes(&raw_transaction[..32])?;
-    let tx_data = raw_transaction[32..].to_vec();
-    Ok((tx_hash, tx_data))
+    // rippled sends the serialized transaction directly in raw_transaction.
+    // Compute the hash: SHA-512-Half(HashPrefix::TRANSACTION_ID || raw_tx)
+    let prefix = rxrpl_crypto::hash_prefix::HashPrefix::TRANSACTION_ID.to_bytes();
+    let mut hash_input = prefix.to_vec();
+    hash_input.extend_from_slice(&raw_transaction);
+    let tx_hash = rxrpl_crypto::sha512_half::sha512_half(&[&hash_input]);
+
+    Ok((tx_hash, raw_transaction))
 }
 
 // --- StatusChange ---
@@ -558,13 +559,18 @@ mod tests {
 
     #[test]
     fn transaction_roundtrip() {
-        let hash = Hash256::new([0x05; 32]);
         let data = vec![1, 2, 3, 4, 5];
 
-        let encoded = encode_transaction(&hash, &data);
+        // Compute expected hash: SHA-512-Half(TRANSACTION_ID_PREFIX || data)
+        let prefix = rxrpl_crypto::hash_prefix::HashPrefix::TRANSACTION_ID.to_bytes();
+        let mut hash_input = prefix.to_vec();
+        hash_input.extend_from_slice(&data);
+        let expected_hash = rxrpl_crypto::sha512_half::sha512_half(&[&hash_input]);
+
+        let encoded = encode_transaction(&expected_hash, &data);
         let (dec_hash, dec_data) = decode_transaction(&encoded).unwrap();
 
-        assert_eq!(dec_hash, hash);
+        assert_eq!(dec_hash, expected_hash);
         assert_eq!(dec_data, data);
     }
 
