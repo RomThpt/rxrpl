@@ -1018,7 +1018,7 @@ impl Node {
                             }
                             ConsensusMessage::ValidatorListReceived { validator_count } => {
                                 if configured_quorum.is_none() && validator_count > 0 {
-                                    let new_quorum = (validator_count as f64 * 0.8).ceil() as usize;
+                                    let new_quorum = Node::compute_quorum(validator_count);
                                     val_aggregator.update_quorum(new_quorum);
                                     tracing::info!(
                                         "auto-set validation quorum to {} (from {} validators)",
@@ -1342,6 +1342,14 @@ impl Node {
         Ok(())
     }
 
+    /// Compute the validation quorum from a validator count.
+    ///
+    /// Returns `ceil(count * 0.8)`, clamped to at least 1.
+    /// This matches the XRPL UNL quorum formula.
+    pub fn compute_quorum(validator_count: usize) -> usize {
+        (validator_count as f64 * 0.8).ceil().max(1.0) as usize
+    }
+
     /// Apply a transaction to the current open ledger (standalone mode).
     ///
     /// Returns the transaction result code.
@@ -1595,6 +1603,120 @@ mod tests {
         assert_eq!(genesis1.header.hash, genesis2.header.hash);
         assert_eq!(genesis1.header.account_hash, genesis2.header.account_hash);
         assert!(!genesis1.header.hash.is_zero());
+    }
+
+    #[test]
+    fn compute_quorum_standard_unl() {
+        // 35 validators (typical mainnet UNL) → 28 quorum (80%)
+        assert_eq!(Node::compute_quorum(35), 28);
+    }
+
+    #[test]
+    fn compute_quorum_small_list() {
+        assert_eq!(Node::compute_quorum(10), 8);
+        assert_eq!(Node::compute_quorum(5), 4);
+        assert_eq!(Node::compute_quorum(1), 1);
+    }
+
+    #[test]
+    fn compute_quorum_rounds_up() {
+        // 7 * 0.8 = 5.6 → ceil → 6
+        assert_eq!(Node::compute_quorum(7), 6);
+        // 3 * 0.8 = 2.4 → ceil → 3
+        assert_eq!(Node::compute_quorum(3), 3);
+    }
+
+    #[test]
+    fn compute_quorum_zero_returns_one() {
+        assert_eq!(Node::compute_quorum(0), 1);
+    }
+
+    #[test]
+    fn quorum_auto_set_integration() {
+        // Simulate the full flow: ValidatorListReceived → compute_quorum → update_quorum
+        // This tests the exact code path from the select! handler.
+        use rxrpl_overlay::validation_aggregator::ValidationAggregator;
+        use rxrpl_consensus::types::{NodeId as CNodeId, Validation};
+
+        let configured_quorum: Option<usize> = None; // auto mode
+        let mut val_aggregator = ValidationAggregator::new(1);
+
+        // Simulate receiving a ValidatorList with 35 validators
+        let validator_count = 35usize;
+        if configured_quorum.is_none() && validator_count > 0 {
+            let new_quorum = Node::compute_quorum(validator_count);
+            val_aggregator.update_quorum(new_quorum);
+        }
+
+        // Now quorum should be 28. Sending 27 validations should NOT reach quorum.
+        let hash = Hash256::new([0xAA; 32]);
+        for i in 1..=27u8 {
+            let v = Validation {
+                node_id: CNodeId(Hash256::new([i; 32])),
+                ledger_hash: hash,
+                ledger_seq: 100,
+                full: true,
+                close_time: 100,
+                sign_time: 100,
+                signature: None,
+            };
+            assert!(val_aggregator.add_validation(v).is_none());
+        }
+
+        // 28th validation reaches quorum
+        let v28 = Validation {
+            node_id: CNodeId(Hash256::new([28; 32])),
+            ledger_hash: hash,
+            ledger_seq: 100,
+            full: true,
+            close_time: 100,
+            sign_time: 100,
+            signature: None,
+        };
+        let result = val_aggregator.add_validation(v28);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().validation_count, 28);
+    }
+
+    #[test]
+    fn quorum_not_overridden_when_configured() {
+        // When quorum is explicitly configured, ValidatorListReceived should NOT change it
+        use rxrpl_overlay::validation_aggregator::ValidationAggregator;
+
+        let configured_quorum: Option<usize> = Some(5); // explicit
+        let mut val_aggregator = ValidationAggregator::new(5);
+
+        let validator_count = 35usize;
+        // This guard prevents override — same as in the select! handler
+        if configured_quorum.is_none() && validator_count > 0 {
+            let new_quorum = Node::compute_quorum(validator_count);
+            val_aggregator.update_quorum(new_quorum);
+        }
+
+        // Quorum should still be 5, not 28
+        let hash = Hash256::new([0xBB; 32]);
+        for i in 1..=4u8 {
+            let v = rxrpl_consensus::types::Validation {
+                node_id: rxrpl_consensus::types::NodeId(Hash256::new([i; 32])),
+                ledger_hash: hash,
+                ledger_seq: 200,
+                full: true,
+                close_time: 100,
+                sign_time: 100,
+                signature: None,
+            };
+            assert!(val_aggregator.add_validation(v).is_none());
+        }
+        let v5 = rxrpl_consensus::types::Validation {
+            node_id: rxrpl_consensus::types::NodeId(Hash256::new([5; 32])),
+            ledger_hash: hash,
+            ledger_seq: 200,
+            full: true,
+            close_time: 100,
+            sign_time: 100,
+            signature: None,
+        };
+        assert!(val_aggregator.add_validation(v5).is_some());
     }
 
     #[test]
