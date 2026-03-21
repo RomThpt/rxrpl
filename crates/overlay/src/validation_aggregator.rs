@@ -41,6 +41,11 @@ impl ValidationAggregator {
         }
     }
 
+    /// Update the quorum threshold dynamically (e.g. from validator list).
+    pub fn update_quorum(&mut self, new_quorum: usize) {
+        self.min_validations = new_quorum.max(1);
+    }
+
     /// Add a validation and check if quorum is reached.
     ///
     /// Returns `Some(ValidatedLedger)` if this validation caused the ledger

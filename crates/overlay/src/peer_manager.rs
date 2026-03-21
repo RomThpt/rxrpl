@@ -47,6 +47,9 @@ pub enum ConsensusMessage {
         seq: u32,
         nodes: Vec<(Vec<u8>, Vec<u8>)>,
     },
+    ValidatorListReceived {
+        validator_count: usize,
+    },
 }
 
 /// Configuration for the peer manager.
@@ -696,6 +699,16 @@ impl PeerManager {
                             vl.manifest.as_ref().map(|v| v.len()).unwrap_or(0),
                             vl.blob.as_ref().map(|v| v.len()).unwrap_or(0)
                         );
+                        // Try to extract validator count from blob JSON
+                        if let Some(blob_bytes) = vl.blob.as_ref() {
+                            if let Ok(decoded) = base64_decode_validator_blob(blob_bytes) {
+                                let _ = self.consensus_tx.send(
+                                    ConsensusMessage::ValidatorListReceived {
+                                        validator_count: decoded,
+                                    },
+                                );
+                            }
+                        }
                     }
                     Err(_) => {
                         if let Some(ref info) = peer_info {
@@ -1108,4 +1121,17 @@ fn spawn_peer_loops(
     tokio::spawn(peer_loop::run_peer_write_loop(write, rx));
 
     tx
+}
+
+/// Decode a validator list blob (base64-encoded JSON) and return the validator count.
+///
+/// The blob format is: `{"validators": [{"validation_public_key": "...", "manifest": "..."}, ...], ...}`
+fn base64_decode_validator_blob(blob_bytes: &[u8]) -> Result<usize, ()> {
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(blob_bytes)
+        .map_err(|_| ())?;
+    let json: serde_json::Value = serde_json::from_slice(&decoded).map_err(|_| ())?;
+    let validators = json.get("validators").and_then(|v| v.as_array()).ok_or(())?;
+    Ok(validators.len())
 }
