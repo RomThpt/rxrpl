@@ -64,6 +64,14 @@ impl NodeId {
         self.depth == 0
     }
 
+    /// Serialize to rippled's 33-byte wire format: [32 path bytes | 1 depth byte].
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(33);
+        buf.extend_from_slice(self.id.as_bytes());
+        buf.push(self.depth);
+        buf
+    }
+
     /// Compute the child NodeId for a given branch.
     pub fn child(&self, _branch: u8, key: &Hash256) -> Self {
         debug_assert!(_branch < 16);

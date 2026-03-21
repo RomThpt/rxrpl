@@ -48,12 +48,7 @@ impl Decoder for PeerCodec {
         match MessageType::from_u32(msg_type_raw) {
             Some(msg_type) => Ok(Some(PeerMessage { msg_type, payload })),
             None => {
-                // Log unknown message types -- could be compressed (0x8000 flag)
-                // or newer rippled message types.
-                eprintln!(
-                    "[CODEC] skipping unknown message type {} (0x{:04X}), {} bytes payload",
-                    msg_type_raw, msg_type_raw, payload.len()
-                );
+                // Unknown message type (compressed 0x8000 flag or newer rippled type) -- skip.
                 self.decode(src)
             }
         }

@@ -31,7 +31,7 @@ use crate::tls::{self, PeerStream};
 
 /// TMLedgerInfoType values from rippled.
 const LI_BASE: i32 = 0;
-const LI_TX_NODE: i32 = 1;
+const _LI_TX_NODE: i32 = 1;
 const LI_AS_NODE: i32 = 2;
 
 /// Messages forwarded from the overlay to the consensus layer.
@@ -890,25 +890,15 @@ impl PeerManager {
             None => return,
         };
 
-        let missing_hashes = self.ledger_syncer.get_missing_node_ids(seq);
-        if missing_hashes.is_empty() {
+        let missing = self.ledger_syncer.get_missing_node_ids(seq);
+        if missing.is_empty() {
             return;
         }
 
-        // rippled expects node_ids as SHAMapNodeID (33 bytes = 32-byte path + 1-byte depth).
-        // For the root node: 33 bytes of zeros (path=0, depth=0).
-        // For now, request the root node when the tree is empty.
-        let node_ids: Vec<Vec<u8>> = if missing_hashes.len() == 1 {
-            // Likely requesting the root -- use root SHAMapNodeID.
-            vec![vec![0u8; 33]]
-        } else {
-            // Multiple missing nodes -- use content hashes (32 bytes).
-            // rippled may not handle these correctly, but it's a fallback.
-            missing_hashes
-                .into_iter()
-                .map(|h| h.as_bytes().to_vec())
-                .collect()
-        };
+        let node_ids: Vec<Vec<u8>> = missing
+            .iter()
+            .map(|mn| mn.node_id.to_wire_bytes())
+            .collect();
 
         let num_ids = node_ids.len();
         let payload = proto_convert::encode_get_ledger_with_nodes(
@@ -932,7 +922,12 @@ impl PeerManager {
             }
         }
         if sent > 0 {
-            tracing::debug!("sent GetLedger seq={} delta ({} node_ids) to {} peers", seq, num_ids, sent);
+            let min_depth = missing.iter().map(|mn| mn.node_id.depth()).min().unwrap_or(0);
+            let max_depth = missing.iter().map(|mn| mn.node_id.depth()).max().unwrap_or(0);
+            tracing::debug!(
+                "sent GetLedger seq={} delta ({} node_ids, depth={}-{}) to {} peers",
+                seq, num_ids, min_depth, max_depth, sent
+            );
         }
     }
 
@@ -950,12 +945,11 @@ impl PeerManager {
 
         let cookie = self.next_cookie.fetch_add(1, Ordering::Relaxed);
 
-        // Check if we have missing node hashes from an active incremental sync.
-        let node_ids: Vec<Vec<u8>> = self
-            .ledger_syncer
-            .get_missing_node_ids(seq)
-            .into_iter()
-            .map(|h| h.as_bytes().to_vec())
+        // Check if we have missing nodes from an active incremental sync.
+        let missing = self.ledger_syncer.get_missing_node_ids(seq);
+        let node_ids: Vec<Vec<u8>> = missing
+            .iter()
+            .map(|mn| mn.node_id.to_wire_bytes())
             .collect();
 
         let is_delta = !node_ids.is_empty();

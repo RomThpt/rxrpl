@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rxrpl_primitives::Hash256;
-use rxrpl_shamap::{LeafNode, NodeStore, SHAMap};
+use rxrpl_shamap::{LeafNode, MissingNode, NodeStore, SHAMap};
 
 const MAX_CONCURRENT_REQUESTS: usize = 5;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -177,7 +177,7 @@ impl LedgerSyncer {
         seq: u32,
         hash: Hash256,
         store: Arc<dyn NodeStore>,
-    ) -> Vec<Hash256> {
+    ) -> Vec<MissingNode> {
         let entry = self.incremental.entry(seq).or_insert_with(|| {
             let map = SHAMap::syncing_with_store(hash, LeafNode::account_state, store);
             IncrementalSync {
@@ -260,6 +260,11 @@ impl LedgerSyncer {
             }
         }
 
+        tracing::debug!(
+            "feed_nodes #{}: added {} new nodes out of {} received",
+            seq, added, nodes.len()
+        );
+
         if added > 0 {
             // Reload root from the store in case the root node was among the
             // received nodes.
@@ -318,7 +323,7 @@ impl LedgerSyncer {
     /// Get the missing node hashes for an active incremental sync, if any.
     ///
     /// Called by `send_get_ledger` to populate `node_ids` in the request.
-    pub fn get_missing_node_ids(&self, seq: u32) -> Vec<Hash256> {
+    pub fn get_missing_node_ids(&self, seq: u32) -> Vec<MissingNode> {
         match self.incremental.get(&seq) {
             Some(entry) => entry
                 .map
