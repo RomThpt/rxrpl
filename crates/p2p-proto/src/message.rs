@@ -4,6 +4,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum MessageType {
+    Hello = 1,
     Manifests = 2,
     Ping = 3,
     Cluster = 5,
@@ -26,6 +27,7 @@ pub enum MessageType {
 impl MessageType {
     pub fn from_u32(v: u32) -> Option<Self> {
         match v {
+            1 => Some(Self::Hello),
             2 => Some(Self::Manifests),
             3 => Some(Self::Ping),
             5 => Some(Self::Cluster),

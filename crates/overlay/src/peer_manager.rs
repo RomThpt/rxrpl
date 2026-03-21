@@ -402,6 +402,10 @@ impl PeerManager {
         let payload_len = payload.len() as u64;
 
         match msg_type {
+            MessageType::Hello => {
+                // Hello is already handled during handshake; ignore late arrivals.
+                tracing::debug!("ignoring late Hello from {}", from);
+            }
             MessageType::Ping => {
                 match proto_convert::decode_ping(payload) {
                     Ok(ping) => {
