@@ -27,17 +27,24 @@ pub fn encode_sle(json_bytes: &[u8]) -> Result<Vec<u8>, CodecError> {
 
 /// Decode XRPL binary to JSON bytes.
 ///
-/// Parses `binary_bytes` as XRPL binary, then serializes to JSON bytes.
+/// If data starts with `{` or `[`, it is already JSON. Otherwise parses
+/// as XRPL binary and serializes back to JSON bytes.
 pub fn decode_sle(binary_bytes: &[u8]) -> Result<Vec<u8>, CodecError> {
+    if matches!(binary_bytes.first(), Some(b'{') | Some(b'[')) {
+        return Ok(binary_bytes.to_vec());
+    }
     let value = binary::decode(binary_bytes)?;
     serde_json::to_vec(&value).map_err(CodecError::Json)
 }
 
 /// Decode raw state bytes (binary or JSON) to a JSON [`Value`].
 ///
-/// Tries XRPL binary decode first, falls back to JSON parse.
-/// This supports the migration period where both formats may coexist.
+/// If data starts with `{` or `[`, it is JSON (XRPL binary never starts
+/// with those bytes). Otherwise tries binary decode, falls back to JSON.
 pub fn decode_state(bytes: &[u8]) -> Result<Value, CodecError> {
+    if matches!(bytes.first(), Some(b'{') | Some(b'[')) {
+        return serde_json::from_slice(bytes).map_err(CodecError::Json);
+    }
     match binary::decode(bytes) {
         Ok(value) => Ok(value),
         Err(_) => serde_json::from_slice(bytes).map_err(CodecError::Json),
