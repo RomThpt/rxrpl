@@ -296,7 +296,7 @@ impl LedgerSyncer {
             }
         } else {
             entry.zero_rounds += 1;
-            if entry.zero_rounds > 3 {
+            if entry.zero_rounds > 10 {
                 tracing::warn!(
                     "incremental sync for ledger #{} stuck ({} consecutive zero-add rounds), removing",
                     seq, entry.zero_rounds

@@ -841,9 +841,7 @@ impl SHAMap {
                     &mut missing,
                 );
             }
-            SHAMapNode::Leaf(_) => {
-                // A leaf root means the tree is trivially complete.
-            }
+            SHAMapNode::Leaf(_) => {}
         }
         missing
     }
@@ -876,7 +874,6 @@ impl SHAMap {
 
             // Try to get the child: first check if loaded, then try store.
             if inner.child(branch).is_some() {
-                // Already loaded -- recurse if it is an inner node.
                 if let Some(child) = inner.child(branch) {
                     if let SHAMapNode::Inner(child_inner) = child.as_ref() {
                         Self::collect_missing(
@@ -886,7 +883,6 @@ impl SHAMap {
                     }
                 }
             } else {
-                // Not loaded -- check if the store can provide it.
                 let child_hash = inner.child_hash(branch);
                 let available = store
                     .as_ref()
@@ -899,8 +895,6 @@ impl SHAMap {
                         node_id: child_node_id,
                     });
                 } else {
-                    // Available in store but not loaded. Try to deserialize and
-                    // recurse into it if it is an inner node to find deeper gaps.
                     if let Some(s) = store.as_ref() {
                         if let Ok(Some(data)) = s.fetch(&child_hash) {
                             if let Ok(node) =
