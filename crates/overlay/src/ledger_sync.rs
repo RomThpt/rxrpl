@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,10 @@ pub struct LedgerSyncer {
     timeout: Duration,
     /// Active incremental syncs keyed by ledger sequence.
     incremental: HashMap<u32, IncrementalSync>,
+    /// Mapping of seq -> ledger hash for liAS_NODE follow-up requests.
+    ledger_hashes: HashMap<u32, Hash256>,
+    /// Sequences that have already been synced (to avoid re-processing).
+    synced_seqs: HashSet<u32>,
 }
 
 struct PendingRequest {
@@ -48,6 +52,8 @@ impl LedgerSyncer {
             max_concurrent: MAX_CONCURRENT_REQUESTS,
             timeout: REQUEST_TIMEOUT,
             incremental: HashMap::new(),
+            ledger_hashes: HashMap::new(),
+            synced_seqs: HashSet::new(),
         }
     }
 
@@ -142,10 +148,22 @@ impl LedgerSyncer {
         self.pending.len()
     }
 
+    /// Store the ledger hash for a given sequence (used for liAS_NODE requests).
+    pub fn set_ledger_hash(&mut self, seq: u32, hash: Hash256) {
+        self.ledger_hashes.insert(seq, hash);
+    }
+
+    /// Get the stored ledger hash for a given sequence.
+    pub fn get_ledger_hash(&self, seq: u32) -> Option<Hash256> {
+        self.ledger_hashes.get(&seq).copied()
+    }
+
     /// Clear all pending requests (e.g., on full sync reset).
     pub fn clear(&mut self) {
         self.pending.clear();
         self.incremental.clear();
+        self.ledger_hashes.clear();
+        self.synced_seqs.clear();
     }
 
     // --- Incremental (delta) sync ---
@@ -186,15 +204,17 @@ impl LedgerSyncer {
 
     /// Feed received nodes into an active incremental sync.
     ///
-    /// Returns `true` if the sync is now complete (all nodes resolved).
+    /// Returns `Some(leaf_nodes)` if the sync is now complete (all nodes resolved),
+    /// where `leaf_nodes` are the (key, data) pairs from the completed SHAMap.
+    /// Returns `None` if the sync is still in progress or no sync is active.
     pub fn feed_nodes(
         &mut self,
         seq: u32,
         nodes: &[(Vec<u8>, Vec<u8>)],
-    ) -> bool {
+    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
         let entry = match self.incremental.get_mut(&seq) {
             Some(e) => e,
-            None => return false,
+            None => return None,
         };
 
         let mut added = 0;
@@ -228,10 +248,35 @@ impl LedgerSyncer {
                 seq,
                 entry.rounds
             );
-            self.incremental.remove(&seq);
-            true
+            // Extract leaf nodes before removing the sync entry.
+            let entry = self.incremental.remove(&seq).unwrap();
+            let mut leaves = Vec::new();
+            entry.map.for_each(&mut |key, data| {
+                leaves.push((key.as_bytes().to_vec(), data.to_vec()));
+            });
+            Some(leaves)
         } else {
-            false
+            None
+        }
+    }
+
+    /// Check if an incremental sync is active for the given sequence.
+    pub fn has_incremental_sync(&self, seq: u32) -> bool {
+        self.incremental.contains_key(&seq)
+    }
+
+    /// Check if a sequence has already been fully synced.
+    pub fn is_synced(&self, seq: u32) -> bool {
+        self.synced_seqs.contains(&seq)
+    }
+
+    /// Mark a sequence as synced.
+    pub fn mark_synced(&mut self, seq: u32) {
+        self.synced_seqs.insert(seq);
+        // Cleanup: keep at most 100 entries.
+        if self.synced_seqs.len() > 100 {
+            let min_seq = seq.saturating_sub(50);
+            self.synced_seqs.retain(|&s| s >= min_seq);
         }
     }
 
