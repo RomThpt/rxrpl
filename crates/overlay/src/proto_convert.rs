@@ -326,15 +326,16 @@ pub fn encode_get_ledger_with_nodes(
     request_cookie: u64,
     node_ids: Vec<Vec<u8>>,
 ) -> Vec<u8> {
+    let has_nodes = !node_ids.is_empty();
     let msg = TmGetLedger {
-        itype: Some(ledger_type),
+        itype: ledger_type,
         ltype: None,
-        ledger_hash: Some(hash.map(|h| h.as_bytes().to_vec()).unwrap_or_default()),
-        ledger_seq: Some(seq),
+        ledger_hash: hash.map(|h| h.as_bytes().to_vec()),
+        ledger_seq: if seq > 0 { Some(seq) } else { None },
         node_ids,
-        request_cookie: Some(request_cookie),
+        request_cookie: if request_cookie > 0 { Some(request_cookie) } else { None },
         query_type: None,
-        query_depth: Some(1),
+        query_depth: if has_nodes { Some(1) } else { None },
     };
     msg.encode_to_vec()
 }
@@ -353,9 +354,9 @@ pub fn encode_ledger_data(
     cookie: u64,
 ) -> Vec<u8> {
     let msg = TmLedgerData {
-        ledger_hash: Some(hash.as_bytes().to_vec()),
-        ledger_seq: Some(seq),
-        ledger_info_type: Some(ltype),
+        ledger_hash: hash.as_bytes().to_vec(),
+        ledger_seq: seq,
+        ledger_info_type: ltype,
         nodes: nodes
             .into_iter()
             .map(|(id, data)| TmLedgerNode {
@@ -617,7 +618,7 @@ mod tests {
         let encoded = encode_get_ledger(3, Some(&hash), 42, 1);
         let decoded = decode_get_ledger(&encoded).unwrap();
 
-        assert_eq!(decoded.itype.unwrap_or(0), 3);
+        assert_eq!(decoded.itype, 3);
         assert_eq!(decoded.ledger_seq.unwrap_or(0), 42);
         assert_eq!(decoded.request_cookie.unwrap_or(0), 1);
         assert_eq!(decoded.ledger_hash.unwrap_or_default(), hash.as_bytes());
@@ -628,7 +629,7 @@ mod tests {
         let encoded = encode_get_ledger(1, None, 10, 0);
         let decoded = decode_get_ledger(&encoded).unwrap();
 
-        assert_eq!(decoded.itype.unwrap_or(0), 1);
+        assert_eq!(decoded.itype, 1);
         assert_eq!(decoded.ledger_seq.unwrap_or(0), 10);
         assert_eq!(decoded.request_cookie.unwrap_or(0), 0);
         assert!(decoded.ledger_hash.as_ref().map_or(true, |v| v.is_empty()));
@@ -667,9 +668,9 @@ mod tests {
         let encoded = encode_ledger_data(&hash, 50, 2, nodes.clone(), 99);
         let decoded = decode_ledger_data(&encoded).unwrap();
 
-        assert_eq!(decoded.ledger_hash.unwrap_or_default(), hash.as_bytes());
-        assert_eq!(decoded.ledger_seq.unwrap_or(0), 50);
-        assert_eq!(decoded.ledger_info_type.unwrap_or(0), 2);
+        assert_eq!(decoded.ledger_hash, hash.as_bytes());
+        assert_eq!(decoded.ledger_seq, 50);
+        assert_eq!(decoded.ledger_info_type, 2);
         assert_eq!(decoded.request_cookie.unwrap_or(0), 99);
         assert_eq!(decoded.nodes.len(), 2);
         assert_eq!(decoded.nodes[0].nodeid.as_deref().unwrap_or(&[]), &[1, 2, 3]);

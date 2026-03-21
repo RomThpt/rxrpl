@@ -557,7 +557,7 @@ impl PeerManager {
                             // Peer provided requested ledger data -- useful contribution
                             info.reputation.record_useful_contribution();
                         }
-                        let ledger_hash_bytes = msg.ledger_hash.unwrap_or_default();
+                        let ledger_hash_bytes = msg.ledger_hash;
                         let hash =
                             Hash256::new(ledger_hash_bytes[..32].try_into().unwrap_or([0u8; 32]));
                         let nodes: Vec<(Vec<u8>, Vec<u8>)> = msg
@@ -566,7 +566,7 @@ impl PeerManager {
                             .map(|n| (n.nodeid.unwrap_or_default(), n.nodedata.unwrap_or_default()))
                             .collect();
 
-                        let ledger_seq = msg.ledger_seq.unwrap_or(0);
+                        let ledger_seq = msg.ledger_seq;
 
                         // Feed nodes into incremental sync if active.
                         let incremental_complete =
@@ -602,7 +602,8 @@ impl PeerManager {
                             nodes,
                         });
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        tracing::warn!("failed to decode LedgerData from {}: {}", from, e);
                         if let Some(ref info) = peer_info {
                             info.reputation.record_invalid_message();
                         }
@@ -862,24 +863,32 @@ impl PeerManager {
 
         let best = self.peer_set.best_peers_for_ledger(seq, 3);
         let mut sent = 0;
+        tracing::debug!(
+            "GetLedger seq={}: {} candidate peers, {} peer handles",
+            seq, best.len(), self.peer_handles.len()
+        );
         for node_id in &best {
             if let Some(handle) = self.peer_handles.get(node_id) {
-                let _ = handle.tx.try_send(PeerMessage {
+                match handle.tx.try_send(PeerMessage {
                     msg_type: MessageType::GetLedger,
                     payload: payload.clone(),
-                });
-                sent += 1;
+                }) {
+                    Ok(_) => sent += 1,
+                    Err(e) => tracing::warn!("failed to send GetLedger to {}: {}", node_id, e),
+                }
+            } else {
+                tracing::warn!("peer {} in best_peers but no handle found", node_id);
             }
         }
         if sent == 0 {
-            tracing::debug!("no peers available for GetLedger seq={}", seq);
+            tracing::warn!("no peers available for GetLedger seq={}", seq);
         } else if is_delta {
-            tracing::debug!(
-                "sent GetLedger seq={} to {} peers (delta sync, reputation-selected)",
+            tracing::info!(
+                "sent GetLedger seq={} itype=liBASE to {} peers (delta sync)",
                 seq, sent
             );
         } else {
-            tracing::debug!("sent GetLedger seq={} to {} peers (reputation-selected)", seq, sent);
+            tracing::info!("sent GetLedger seq={} itype=liBASE to {} peers", seq, sent);
         }
     }
 
@@ -905,7 +914,7 @@ impl PeerManager {
         const LT_VALIDATED: i32 = 2;
         const LT_HASH: i32 = 3;
 
-        let req_ledger_type = req.itype.unwrap_or(0);
+        let req_ledger_type = req.itype;
         let req_ledger_hash = req.ledger_hash.unwrap_or_default();
         let req_ledger_seq = req.ledger_seq.unwrap_or(0);
         let req_cookie = req.request_cookie.unwrap_or(0);

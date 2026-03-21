@@ -1,6 +1,6 @@
-// Aligned with rippled's xrpl.proto (proto2 -> proto3 with optional markers)
+// Wire-compatible with rippled's xrpl.proto (proto2).
 // Field numbers MUST match rippled exactly for wire compatibility.
-syntax = "proto3";
+syntax = "proto2";
 
 package ripple;
 
@@ -143,7 +143,7 @@ message TMLedgerNode {
 // Request ledger data (mtGET_LEDGER = 31)
 // Field numbers match rippled exactly
 message TMGetLedger {
-    optional int32 itype = 1;
+    required int32 itype = 1;
     optional int32 ltype = 2;
     optional bytes ledger_hash = 3;
     optional uint32 ledger_seq = 4;
@@ -155,9 +155,9 @@ message TMGetLedger {
 
 // Ledger data response (mtLEDGER_DATA = 32)
 message TMLedgerData {
-    optional bytes ledger_hash = 1;
-    optional uint32 ledger_seq = 2;
-    optional int32 ledger_info_type = 3;
+    required bytes ledger_hash = 1;
+    required uint32 ledger_seq = 2;
+    required int32 ledger_info_type = 3;
     repeated TMLedgerNode nodes = 4;
     optional uint32 request_cookie = 5;
     optional int32 error = 6;
@@ -187,14 +187,14 @@ message TMHaveTransactions {
 
 // Peer handshake hello message (used in rxrpl-to-rxrpl protobuf handshake)
 message TMHello {
-    uint32 proto_version = 1;
-    uint32 proto_version_min = 2;
-    bytes node_public = 3;
-    bytes node_proof = 4;
-    uint32 network_id = 5;
-    uint32 ledger_seq = 6;
-    bytes ledger_hash = 7;
-    uint64 network_time = 8;
+    required uint32 proto_version = 1;
+    required uint32 proto_version_min = 2;
+    required bytes node_public = 3;
+    required bytes node_proof = 4;
+    required uint32 network_id = 5;
+    required uint32 ledger_seq = 6;
+    required bytes ledger_hash = 7;
+    required uint64 network_time = 8;
 }
 
 // Legacy peer list (rxrpl internal)
