@@ -890,26 +890,32 @@ impl PeerManager {
             None => return,
         };
 
-        let node_ids: Vec<Vec<u8>> = self
-            .ledger_syncer
-            .get_missing_node_ids(seq)
-            .into_iter()
-            .map(|h| h.as_bytes().to_vec())
-            .collect();
-
-        if node_ids.is_empty() {
+        let missing_hashes = self.ledger_syncer.get_missing_node_ids(seq);
+        if missing_hashes.is_empty() {
             return;
         }
 
-        // Encode minimal liAS_NODE request matching rippled's format:
-        // itype=liAS_NODE, ledger_hash=ledger hash, node_ids=missing hashes.
-        // No request_cookie, no query_depth, no ledger_seq.
+        // rippled expects node_ids as SHAMapNodeID (33 bytes = 32-byte path + 1-byte depth).
+        // For the root node: 33 bytes of zeros (path=0, depth=0).
+        // For now, request the root node when the tree is empty.
+        let node_ids: Vec<Vec<u8>> = if missing_hashes.len() == 1 {
+            // Likely requesting the root -- use root SHAMapNodeID.
+            vec![vec![0u8; 33]]
+        } else {
+            // Multiple missing nodes -- use content hashes (32 bytes).
+            // rippled may not handle these correctly, but it's a fallback.
+            missing_hashes
+                .into_iter()
+                .map(|h| h.as_bytes().to_vec())
+                .collect()
+        };
+
         let num_ids = node_ids.len();
         let payload = proto_convert::encode_get_ledger_with_nodes(
             LI_AS_NODE,
             Some(&ledger_hash),
-            0, // no seq needed -- rippled uses ledger_hash
-            0, // no cookie
+            0,
+            0,
             node_ids,
         );
 
@@ -926,7 +932,7 @@ impl PeerManager {
             }
         }
         if sent > 0 {
-            tracing::debug!("sent GetLedger seq={} itype=liAS_NODE ({} node_ids) to {} peers", seq, num_ids, sent);
+            tracing::debug!("sent GetLedger seq={} delta ({} node_ids) to {} peers", seq, num_ids, sent);
         }
     }
 

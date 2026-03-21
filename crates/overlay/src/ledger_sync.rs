@@ -218,19 +218,44 @@ impl LedgerSyncer {
         };
 
         let mut added = 0;
-        for (node_id, node_data) in nodes {
-            if node_id.len() >= 32 {
-                let hash_bytes: [u8; 32] = node_id[..32].try_into().unwrap_or([0u8; 32]);
-                let hash = Hash256::new(hash_bytes);
-                match entry.map.add_raw_node(hash, node_data.clone()) {
-                    Ok(true) => added += 1,
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::debug!(
-                            "failed to add raw node {} for ledger #{}: {}",
-                            hash, seq, e
-                        );
-                    }
+        for (_node_id, node_data) in nodes {
+            // rippled sends nodedata as: serialized_node_bytes + depth_byte.
+            // Strip the trailing depth byte to get pure node data.
+            // Then compute the content hash to store it correctly.
+            if node_data.is_empty() {
+                continue;
+            }
+            let raw = if node_data.len() == 513 || (node_data.len() > 32 && node_data.len() % 32 != 0) {
+                // Strip trailing depth byte from rippled's SHAMap wire format.
+                &node_data[..node_data.len() - 1]
+            } else {
+                &node_data[..]
+            };
+
+            // Compute the content hash based on node type.
+            let hash = if raw.len() == 512 {
+                // Inner node: hash = SHA-512-Half("MIN\0" || raw)
+                let prefix: [u8; 4] = [0x4D, 0x49, 0x4E, 0x00]; // "MIN\0"
+                rxrpl_crypto::sha512_half::sha512_half(&[&prefix, raw])
+            } else {
+                // Leaf node: hash = SHA-512-Half("MLN\0" || raw)
+                let prefix: [u8; 4] = [0x4D, 0x4C, 0x4E, 0x00]; // "MLN\0"
+                rxrpl_crypto::sha512_half::sha512_half(&[&prefix, raw])
+            };
+
+            tracing::debug!(
+                "feed_nodes #{}: computed hash={} size={} bytes (stripped from {})",
+                seq, hash, raw.len(), node_data.len()
+            );
+
+            match entry.map.add_raw_node(hash, raw.to_vec()) {
+                Ok(true) => added += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        "feed_nodes #{}: failed to add node {} ({} bytes): {}",
+                        seq, hash, raw.len(), e
+                    );
                 }
             }
         }
@@ -238,7 +263,17 @@ impl LedgerSyncer {
         if added > 0 {
             // Reload root from the store in case the root node was among the
             // received nodes.
-            let _ = entry.map.reload_root(entry.hash);
+            if let Err(e) = entry.map.reload_root(entry.hash) {
+                tracing::warn!(
+                    "feed_nodes #{}: reload_root({}) failed: {}",
+                    seq, entry.hash, e
+                );
+            }
+        }
+
+        // A tree with an empty root is never complete (it needs the root first).
+        if entry.map.is_empty() {
+            return None;
         }
 
         // Check if the tree is now complete.
