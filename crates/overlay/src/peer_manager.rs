@@ -1135,3 +1135,56 @@ fn base64_decode_validator_blob(blob_bytes: &[u8]) -> Result<usize, ()> {
     let validators = json.get("validators").and_then(|v| v.as_array()).ok_or(())?;
     Ok(validators.len())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_validator_blob_extracts_count() {
+        use base64::Engine;
+        let json = serde_json::json!({
+            "sequence": 1,
+            "expiration": 999999999,
+            "validators": [
+                {"validation_public_key": "ED0001", "manifest": "AA=="},
+                {"validation_public_key": "ED0002", "manifest": "BB=="},
+                {"validation_public_key": "ED0003", "manifest": "CC=="},
+            ]
+        });
+        let blob = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&json).unwrap());
+        assert_eq!(base64_decode_validator_blob(blob.as_bytes()), Ok(3));
+    }
+
+    #[test]
+    fn decode_validator_blob_invalid_base64() {
+        assert_eq!(base64_decode_validator_blob(b"!!!invalid!!!"), Err(()));
+    }
+
+    #[test]
+    fn decode_validator_blob_no_validators_key() {
+        use base64::Engine;
+        let json = serde_json::json!({"sequence": 1});
+        let blob = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&json).unwrap());
+        assert_eq!(base64_decode_validator_blob(blob.as_bytes()), Err(()));
+    }
+
+    #[test]
+    fn quorum_auto_compute_from_validator_count() {
+        // Simulate the quorum calculation from node.rs:
+        // new_quorum = ceil(count * 0.8)
+        let count = 35usize;
+        let quorum = (count as f64 * 0.8).ceil() as usize;
+        assert_eq!(quorum, 28);
+
+        let count = 10usize;
+        let quorum = (count as f64 * 0.8).ceil() as usize;
+        assert_eq!(quorum, 8);
+
+        let count = 1usize;
+        let quorum = (count as f64 * 0.8).ceil() as usize;
+        assert_eq!(quorum, 1);
+    }
+}

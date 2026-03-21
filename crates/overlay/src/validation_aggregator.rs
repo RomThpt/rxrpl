@@ -208,6 +208,32 @@ mod tests {
     }
 
     #[test]
+    fn update_quorum_changes_threshold() {
+        let mut agg = ValidationAggregator::new(1);
+        let hash = Hash256::new([0xEE; 32]);
+
+        // With quorum=1, a single validation reaches quorum
+        assert!(agg.add_validation(make_validation(1, 10, hash)).is_some());
+
+        // Raise quorum to 3
+        agg.update_quorum(3);
+
+        // Now need 3 validations for next sequence
+        assert!(agg.add_validation(make_validation(1, 20, hash)).is_none());
+        assert!(agg.add_validation(make_validation(2, 20, hash)).is_none());
+        assert!(agg.add_validation(make_validation(3, 20, hash)).is_some());
+    }
+
+    #[test]
+    fn update_quorum_floor_at_one() {
+        let mut agg = ValidationAggregator::new(5);
+        agg.update_quorum(0); // should clamp to 1
+        let hash = Hash256::new([0xFF; 32]);
+        // Single validation should still reach quorum (floor=1)
+        assert!(agg.add_validation(make_validation(1, 10, hash)).is_some());
+    }
+
+    #[test]
     fn non_full_validation_ignored() {
         let mut agg = ValidationAggregator::new(1);
         let mut val = make_validation(1, 5, Hash256::new([0xDD; 32]));
