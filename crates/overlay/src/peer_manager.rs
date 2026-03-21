@@ -583,7 +583,6 @@ impl PeerManager {
                             .collect();
 
                         let ledger_seq = msg.ledger_seq;
-                        let ledger_seq = msg.ledger_seq;
 
                         // Skip already-synced ledgers.
                         if self.ledger_syncer.is_synced(ledger_seq) {
@@ -611,7 +610,14 @@ impl PeerManager {
                         } else if !nodes.is_empty() {
                             // No active sync: try to parse as liBASE header.
                             let header_data = &nodes[0].1;
-                            if let Some(header) = rxrpl_ledger::LedgerHeader::from_raw_bytes(header_data) {
+                            let latest = self.ledger_syncer.latest_known_seq();
+                            if let Some(header) = rxrpl_ledger::LedgerHeader::from_raw_bytes(header_data)
+                                .filter(|h| {
+                                    latest.map_or(true, |known| {
+                                        (h.sequence as i64 - known as i64).unsigned_abs() <= 1000
+                                    })
+                                })
+                            {
                                 tracing::info!(
                                     "received liBASE header for ledger #{} hash={}",
                                     header.sequence, header.hash

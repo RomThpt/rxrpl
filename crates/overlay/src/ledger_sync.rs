@@ -8,7 +8,7 @@ use rxrpl_shamap::{LeafNode, MissingNode, NodeStore, SHAMap};
 const MAX_CONCURRENT_REQUESTS: usize = 5;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum number of missing node hashes to request in a single delta sync round.
-const MAX_DELTA_NODES_PER_REQUEST: usize = 128;
+const MAX_DELTA_NODES_PER_REQUEST: usize = 256;
 /// Maximum number of sync rounds before giving up on incremental sync.
 const MAX_INCREMENTAL_ROUNDS: u32 = 50;
 
@@ -24,6 +24,7 @@ struct IncrementalSync {
     hash: Hash256,
     map: SHAMap,
     rounds: u32,
+    zero_rounds: u32,
 }
 
 /// Tracks in-flight ledger sync requests and manages retries/timeouts.
@@ -197,6 +198,7 @@ impl LedgerSyncer {
                 hash,
                 map,
                 rounds: 0,
+                zero_rounds: 0,
             }
         });
 
@@ -283,6 +285,7 @@ impl LedgerSyncer {
         );
 
         if added > 0 {
+            entry.zero_rounds = 0;
             // Reload root from the store in case the root node was among the
             // received nodes.
             if let Err(e) = entry.map.reload_root(entry.hash) {
@@ -290,6 +293,16 @@ impl LedgerSyncer {
                     "feed_nodes #{}: reload_root({}) failed: {}",
                     seq, entry.hash, e
                 );
+            }
+        } else {
+            entry.zero_rounds += 1;
+            if entry.zero_rounds > 3 {
+                tracing::warn!(
+                    "incremental sync for ledger #{} stuck ({} consecutive zero-add rounds), removing",
+                    seq, entry.zero_rounds
+                );
+                self.incremental.remove(&seq);
+                return None;
             }
         }
 
@@ -334,6 +347,16 @@ impl LedgerSyncer {
         if self.synced_seqs.len() > 100 {
             let min_seq = seq.saturating_sub(50);
             self.synced_seqs.retain(|&s| s >= min_seq);
+        }
+    }
+
+    pub fn latest_known_seq(&self) -> Option<u32> {
+        let a = self.ledger_hashes.keys().copied().max();
+        let b = self.incremental.keys().copied().max();
+        match (a, b) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
         }
     }
 
