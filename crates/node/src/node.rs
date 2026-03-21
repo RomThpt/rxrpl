@@ -530,6 +530,9 @@ impl Node {
         peer_mgr.set_ledger_provider(Arc::new(ClosedLedgerAccess {
             closed_ledgers: Arc::clone(&self.closed_ledgers),
         }));
+        if let Some(ref store) = self.node_store {
+            peer_mgr.set_node_store(Arc::clone(store));
+        }
 
         // 3b. Create overlay event channel for bridging to RPC events
         let (overlay_event_tx, mut overlay_event_rx) =
@@ -1015,6 +1018,15 @@ impl Node {
                                         Err(e) => tracing::warn!("catchup: failed to reconstruct ledger #{}: {}", seq, e),
                                     }
                                 }
+                            }
+                            ConsensusMessage::LedgerHeader { seq, header } => {
+                                tracing::info!(
+                                    "received parsed header for ledger #{} hash={} account_hash={}",
+                                    seq, header.hash, header.account_hash
+                                );
+                                // The overlay layer handles incremental sync (liAS_NODE
+                                // requests). We just log receipt here; reconstruction
+                                // happens when LedgerData with the full state arrives.
                             }
                             ConsensusMessage::ValidatorListReceived { validator_count } => {
                                 if configured_quorum.is_none() && validator_count > 0 {

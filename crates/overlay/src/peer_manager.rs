@@ -29,6 +29,11 @@ use crate::relay::RelayFilter;
 use crate::reputation::PeerReputation;
 use crate::tls::{self, PeerStream};
 
+/// TMLedgerInfoType values from rippled.
+const LI_BASE: i32 = 0;
+const LI_TX_NODE: i32 = 1;
+const LI_AS_NODE: i32 = 2;
+
 /// Messages forwarded from the overlay to the consensus layer.
 pub enum ConsensusMessage {
     Proposal(Proposal),
@@ -46,6 +51,10 @@ pub enum ConsensusMessage {
         hash: Hash256,
         seq: u32,
         nodes: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    LedgerHeader {
+        seq: u32,
+        header: rxrpl_ledger::LedgerHeader,
     },
     ValidatorListReceived {
         validator_count: usize,
@@ -82,6 +91,7 @@ pub struct PeerManager {
     event_tx: mpsc::UnboundedSender<PeerEvent>,
     consensus_tx: mpsc::UnboundedSender<ConsensusMessage>,
     ledger_provider: Option<Arc<dyn LedgerProvider>>,
+    node_store: Option<Arc<dyn rxrpl_shamap::NodeStore>>,
     ledger_syncer: LedgerSyncer,
     next_cookie: AtomicU64,
     discovery: Option<Arc<PeerDiscovery>>,
@@ -121,6 +131,7 @@ impl PeerManager {
             event_tx,
             consensus_tx,
             ledger_provider: None,
+            node_store: None,
             ledger_syncer: LedgerSyncer::new(),
             next_cookie: AtomicU64::new(1),
             discovery: None,
@@ -133,6 +144,11 @@ impl PeerManager {
     /// Set a ledger provider for serving GetLedger requests.
     pub fn set_ledger_provider(&mut self, provider: Arc<dyn LedgerProvider>) {
         self.ledger_provider = Some(provider);
+    }
+
+    /// Set the backing node store for incremental ledger sync.
+    pub fn set_node_store(&mut self, store: Arc<dyn rxrpl_shamap::NodeStore>) {
+        self.node_store = Some(store);
     }
 
     /// Set the event sender for emitting overlay events as JSON values.
@@ -567,40 +583,102 @@ impl PeerManager {
                             .collect();
 
                         let ledger_seq = msg.ledger_seq;
+                        let info_type = msg.ledger_info_type;
 
-                        // Feed nodes into incremental sync if active.
-                        let incremental_complete =
-                            self.ledger_syncer.feed_nodes(ledger_seq, &nodes);
-                        if incremental_complete {
-                            tracing::info!(
-                                "incremental sync complete for ledger #{} hash={}",
-                                ledger_seq, hash,
-                            );
-                        }
+                        if info_type == LI_BASE && !nodes.is_empty() {
+                            // liBASE response: first node is the serialized header.
+                            let header_data = &nodes[0].1;
+                            if let Some(header) = rxrpl_ledger::LedgerHeader::from_raw_bytes(header_data) {
+                                tracing::info!(
+                                    "received liBASE header for ledger #{} hash={} account_hash={}",
+                                    header.sequence, header.hash, header.account_hash
+                                );
+                                // Start incremental sync for the account state tree.
+                                if let Some(store) = self.get_node_store() {
+                                    let missing = self.ledger_syncer.start_incremental_sync(
+                                        header.sequence,
+                                        header.account_hash,
+                                        store,
+                                    );
+                                    if !missing.is_empty() {
+                                        tracing::info!(
+                                            "incremental sync started for #{}: {} missing nodes",
+                                            header.sequence, missing.len()
+                                        );
+                                        // Send follow-up liAS_NODE request.
+                                        self.send_get_ledger_as_node(header.sequence, header.account_hash);
+                                    }
+                                }
 
-                        // Notify ledger syncer about the response (full sync path).
-                        if let Some(synced) =
-                            self.ledger_syncer
-                                .handle_response(ledger_seq, hash, nodes.clone())
-                        {
-                            tracing::info!(
-                                "synced ledger #{} hash={} ({} nodes)",
-                                synced.seq,
-                                synced.hash,
-                                synced.nodes.len()
-                            );
+                                // Forward the parsed header to the node layer.
+                                let _ = self.consensus_tx.send(ConsensusMessage::LedgerHeader {
+                                    seq: header.sequence,
+                                    header,
+                                });
+                            } else {
+                                tracing::warn!(
+                                    "failed to parse liBASE header ({} bytes) for seq={}",
+                                    header_data.len(), ledger_seq
+                                );
+                            }
+                        } else if info_type == LI_AS_NODE || info_type == LI_TX_NODE {
+                            // Incremental sync node data.
+                            let incremental_complete =
+                                self.ledger_syncer.feed_nodes(ledger_seq, &nodes);
+                            if incremental_complete {
+                                tracing::info!(
+                                    "incremental sync complete for ledger #{} hash={} ({} nodes in batch)",
+                                    ledger_seq, hash, nodes.len()
+                                );
+                            } else {
+                                // Request next batch of missing nodes.
+                                let missing = self.ledger_syncer.get_missing_node_ids(ledger_seq);
+                                if !missing.is_empty() {
+                                    tracing::debug!(
+                                        "incremental sync #{}: {} nodes still missing",
+                                        ledger_seq, missing.len()
+                                    );
+                                    self.send_get_ledger_as_node(ledger_seq, hash);
+                                }
+                            }
+
+                            // Forward to node layer.
+                            let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
+                                hash,
+                                seq: ledger_seq,
+                                nodes,
+                            });
                         } else {
-                            tracing::debug!(
-                                "LedgerData for seq={} not in pending requests (uncorrelated response)",
-                                ledger_seq
-                            );
-                        }
+                            // Fallback: forward all data to node layer for reconstruction.
+                            // Feed nodes into incremental sync if active.
+                            let incremental_complete =
+                                self.ledger_syncer.feed_nodes(ledger_seq, &nodes);
+                            if incremental_complete {
+                                tracing::info!(
+                                    "incremental sync complete for ledger #{} hash={}",
+                                    ledger_seq, hash,
+                                );
+                            }
 
-                        let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
-                            hash,
-                            seq: ledger_seq,
-                            nodes,
-                        });
+                            // Notify ledger syncer about the response (full sync path).
+                            if let Some(synced) =
+                                self.ledger_syncer
+                                    .handle_response(ledger_seq, hash, nodes.clone())
+                            {
+                                tracing::info!(
+                                    "synced ledger #{} hash={} ({} nodes)",
+                                    synced.seq,
+                                    synced.hash,
+                                    synced.nodes.len()
+                                );
+                            }
+
+                            let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
+                                hash,
+                                seq: ledger_seq,
+                                nodes,
+                            });
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("failed to decode LedgerData from {}: {}", from, e);
@@ -826,6 +904,59 @@ impl PeerManager {
         }
     }
 
+    fn get_node_store(&self) -> Option<Arc<dyn rxrpl_shamap::NodeStore>> {
+        if let Some(ref store) = self.node_store {
+            return Some(Arc::clone(store));
+        }
+        // Fallback: try to get store from ledger provider's latest ledger.
+        self.ledger_provider
+            .as_ref()
+            .and_then(|p| p.latest_closed())
+            .and_then(|l| l.store().cloned())
+    }
+
+    /// Send a GetLedger request for account state nodes (liAS_NODE).
+    ///
+    /// Used as follow-up after receiving a liBASE response. Includes
+    /// specific node_ids from the incremental sync's missing list.
+    fn send_get_ledger_as_node(&mut self, seq: u32, state_hash: Hash256) {
+        let node_ids: Vec<Vec<u8>> = self
+            .ledger_syncer
+            .get_missing_node_ids(seq)
+            .into_iter()
+            .map(|h| h.as_bytes().to_vec())
+            .collect();
+
+        if node_ids.is_empty() {
+            return;
+        }
+
+        let cookie = self.next_cookie.fetch_add(1, Ordering::Relaxed);
+        let payload = proto_convert::encode_get_ledger_with_nodes(
+            LI_AS_NODE,
+            Some(&state_hash),
+            seq,
+            cookie,
+            node_ids,
+        );
+
+        let best = self.peer_set.best_peers_for_ledger(seq, 3);
+        let mut sent = 0;
+        for node_id in &best {
+            if let Some(handle) = self.peer_handles.get(node_id) {
+                if handle.tx.try_send(PeerMessage {
+                    msg_type: MessageType::GetLedger,
+                    payload: payload.clone(),
+                }).is_ok() {
+                    sent += 1;
+                }
+            }
+        }
+        if sent > 0 {
+            tracing::debug!("sent GetLedger seq={} itype=liAS_NODE to {} peers", seq, sent);
+        }
+    }
+
     /// Send a GetLedger request to the best 3 peers by reputation score.
     ///
     /// Uses weighted peer selection: peers are ranked by reputation score with
@@ -835,10 +966,6 @@ impl PeerManager {
     /// sequence, the request includes specific node hashes (delta sync).
     /// Otherwise, falls back to requesting all leaf nodes.
     fn send_get_ledger(&mut self, seq: u32, hash: Option<Hash256>) {
-        // TMLedgerInfoType: liBASE=0 (header + root hashes), liTX_NODE=1,
-        // liAS_NODE=2, liTS_CANDIDATE=3 (ephemeral tx set -- NOT what we want)
-        const LI_BASE: i32 = 0;
-
         // Register request in the syncer so responses can be correlated.
         self.ledger_syncer.register_request(seq, hash);
 
