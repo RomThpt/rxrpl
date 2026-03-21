@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -83,6 +83,7 @@ pub struct PeerManager {
     consensus_tx: mpsc::UnboundedSender<ConsensusMessage>,
     ledger_provider: Option<Arc<dyn LedgerProvider>>,
     ledger_syncer: LedgerSyncer,
+    next_cookie: AtomicU64,
     discovery: Option<Arc<PeerDiscovery>>,
     server_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
 }
@@ -121,6 +122,7 @@ impl PeerManager {
             consensus_tx,
             ledger_provider: None,
             ledger_syncer: LedgerSyncer::new(),
+            next_cookie: AtomicU64::new(1),
             discovery: None,
             server_event_tx: None,
         };
@@ -300,7 +302,7 @@ impl PeerManager {
         });
     }
 
-    fn handle_command(&self, cmd: OverlayCommand) {
+    fn handle_command(&mut self, cmd: OverlayCommand) {
         match cmd {
             OverlayCommand::Broadcast { msg_type, payload } => {
                 for handle in self.peer_handles.values() {
@@ -544,6 +546,10 @@ impl PeerManager {
                 self.handle_get_ledger(from, payload);
             }
             MessageType::LedgerData => {
+                tracing::debug!(
+                    "received LedgerData from {}: {} bytes",
+                    from, payload.len()
+                );
                 match proto_convert::decode_ledger_data(payload) {
                     Ok(msg) => {
                         if let Some(ref info) = peer_info {
@@ -582,6 +588,11 @@ impl PeerManager {
                                 synced.seq,
                                 synced.hash,
                                 synced.nodes.len()
+                            );
+                        } else {
+                            tracing::debug!(
+                                "LedgerData for seq={} not in pending requests (uncorrelated response)",
+                                ledger_seq
                             );
                         }
 
@@ -822,9 +833,15 @@ impl PeerManager {
     /// When the ledger syncer has an active incremental sync for the target
     /// sequence, the request includes specific node hashes (delta sync).
     /// Otherwise, falls back to requesting all leaf nodes.
-    fn send_get_ledger(&self, seq: u32, hash: Option<Hash256>) {
-        // LedgerType enum values: LtCurrent=0, LtClosed=1, LtValidated=2, LtHash=3
-        const LT_HASH: i32 = 3;
+    fn send_get_ledger(&mut self, seq: u32, hash: Option<Hash256>) {
+        // TMLedgerInfoType: liBASE=0 (header + root hashes), liTX_NODE=1,
+        // liAS_NODE=2, liTS_CANDIDATE=3 (ephemeral tx set -- NOT what we want)
+        const LI_BASE: i32 = 0;
+
+        // Register request in the syncer so responses can be correlated.
+        self.ledger_syncer.register_request(seq, hash);
+
+        let cookie = self.next_cookie.fetch_add(1, Ordering::Relaxed);
 
         // Check if we have missing node hashes from an active incremental sync.
         let node_ids: Vec<Vec<u8>> = self
@@ -836,10 +853,10 @@ impl PeerManager {
 
         let is_delta = !node_ids.is_empty();
         let payload = proto_convert::encode_get_ledger_with_nodes(
-            LT_HASH,
+            LI_BASE,
             hash.as_ref(),
             seq,
-            0,
+            cookie,
             node_ids,
         );
 
@@ -883,7 +900,7 @@ impl PeerManager {
             }
         };
 
-        // LedgerType enum values: LtCurrent=0, LtClosed=1, LtValidated=2, LtHash=3
+        // TMLedgerInfoType: liBASE=0, liTX_NODE=1, liAS_NODE=2, liTS_CANDIDATE=3
         const LT_CLOSED: i32 = 1;
         const LT_VALIDATED: i32 = 2;
         const LT_HASH: i32 = 3;
@@ -891,6 +908,7 @@ impl PeerManager {
         let req_ledger_type = req.itype.unwrap_or(0);
         let req_ledger_hash = req.ledger_hash.unwrap_or_default();
         let req_ledger_seq = req.ledger_seq.unwrap_or(0);
+        let req_cookie = req.request_cookie.unwrap_or(0);
 
         let ledger = match req_ledger_type {
             x if x == LT_CLOSED || x == LT_VALIDATED => {
@@ -918,7 +936,7 @@ impl PeerManager {
                     req_ledger_seq,
                     req_ledger_type,
                     vec![],
-                    0,
+                    req_cookie,
                 );
                 if let Some(handle) = self.peer_handles.get(&from) {
                     let _ = handle.tx.try_send(PeerMessage {
@@ -998,7 +1016,7 @@ impl PeerManager {
             ledger.header.sequence,
             req_ledger_type,
             nodes,
-            0,
+            req_cookie,
         );
 
         if let Some(handle) = self.peer_handles.get(&from) {

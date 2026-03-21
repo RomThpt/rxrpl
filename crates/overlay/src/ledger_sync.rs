@@ -51,6 +51,23 @@ impl LedgerSyncer {
         }
     }
 
+    /// Register an outgoing ledger request so that responses can be correlated.
+    ///
+    /// Called by `PeerManager::send_get_ledger` to ensure the response handler
+    /// can match incoming `LedgerData` to a pending request.
+    pub fn register_request(&mut self, seq: u32, hash: Option<Hash256>) {
+        if !self.pending.contains_key(&seq) {
+            self.pending.insert(
+                seq,
+                PendingRequest {
+                    hash,
+                    sent_at: Instant::now(),
+                    retries: 0,
+                },
+            );
+        }
+    }
+
     /// Check if we need to sync based on our sequence vs a peer's sequence.
     pub fn needs_sync(&self, our_seq: u32, peer_seq: u32) -> bool {
         peer_seq > our_seq + 1

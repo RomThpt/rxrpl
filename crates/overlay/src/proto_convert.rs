@@ -334,7 +334,7 @@ pub fn encode_get_ledger_with_nodes(
         node_ids,
         request_cookie: Some(request_cookie),
         query_type: None,
-        query_depth: Some(0),
+        query_depth: Some(1),
     };
     msg.encode_to_vec()
 }
@@ -350,7 +350,7 @@ pub fn encode_ledger_data(
     seq: u32,
     ltype: i32,
     nodes: Vec<(Vec<u8>, Vec<u8>)>,
-    cookie: u32,
+    cookie: u64,
 ) -> Vec<u8> {
     let msg = TmLedgerData {
         ledger_hash: Some(hash.as_bytes().to_vec()),
@@ -363,7 +363,7 @@ pub fn encode_ledger_data(
                 nodedata: Some(data),
             })
             .collect(),
-        request_cookie: Some(cookie),
+        request_cookie: Some(cookie as u32),
         error: None,
     };
     msg.encode_to_vec()
