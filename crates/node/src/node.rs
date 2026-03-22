@@ -1559,8 +1559,6 @@ impl Node {
     }
 
     /// Download the full state tree for a ledger via RPC `ledger_data` pagination.
-    ///
-    /// Stores all nodes in the provided NodeStore so the P2P sync can use them.
     async fn download_state_via_rpc(
         rpc_url: &str,
         ledger_hash: &str,
@@ -1574,6 +1572,7 @@ impl Node {
         let mut marker: Option<String> = None;
         let mut total = 0u32;
         let mut page = 0u32;
+        let start = std::time::Instant::now();
 
         loop {
             let mut params = serde_json::json!({
@@ -1599,6 +1598,10 @@ impl Node {
             let result = resp.get("result")
                 .ok_or("missing result in ledger_data response")?;
 
+            if let Some(err) = result.get("error") {
+                return Err(format!("ledger_data error: {}", err).into());
+            }
+
             let state = result.get("state")
                 .and_then(|s| s.as_array())
                 .ok_or("missing state array in ledger_data response")?;
@@ -1609,42 +1612,50 @@ impl Node {
 
             let mut batch: Vec<(Hash256, Vec<u8>)> = Vec::with_capacity(state.len());
             for entry in state {
-                let index = entry.get("index")
-                    .and_then(|v| v.as_str())
-                    .ok_or("missing index")?;
-                let data_hex = entry.get("data")
-                    .and_then(|v| v.as_str())
-                    .ok_or("missing data")?;
+                let index = match entry.get("index").and_then(|v| v.as_str()) {
+                    Some(i) => i,
+                    None => continue,
+                };
+                let data_hex = match entry.get("data").and_then(|v| v.as_str()) {
+                    Some(d) => d,
+                    None => continue,
+                };
 
-                let key_bytes = hex::decode(index)?;
-                let data_bytes = hex::decode(data_hex)?;
+                let key_bytes = match hex::decode(index) {
+                    Ok(b) if b.len() == 32 => b,
+                    _ => continue,
+                };
+                let data_bytes = match hex::decode(data_hex) {
+                    Ok(b) => b,
+                    _ => continue,
+                };
 
-                if key_bytes.len() != 32 {
-                    continue;
-                }
-
-                // Store as key(32) || data for deserialize_node compatibility.
                 let mut raw = Vec::with_capacity(32 + data_bytes.len());
                 raw.extend_from_slice(&key_bytes);
                 raw.extend_from_slice(&data_bytes);
 
-                // Compute content hash: SHA-512-Half("MLN\0" || raw)
                 let prefix: [u8; 4] = [0x4D, 0x4C, 0x4E, 0x00];
                 let hash = rxrpl_crypto::sha512_half::sha512_half(&[&prefix, &raw]);
-
                 batch.push((hash, raw));
             }
 
             let count = batch.len();
-            let refs: Vec<(&Hash256, &[u8])> = batch.iter()
-                .map(|(h, d)| (h, d.as_slice()))
-                .collect();
-            store.store_batch(&refs)?;
+            if count > 0 {
+                let refs: Vec<(&Hash256, &[u8])> = batch.iter()
+                    .map(|(h, d)| (h, d.as_slice()))
+                    .collect();
+                store.store_batch(&refs)?;
+            }
             total += count as u32;
-
             page += 1;
-            if page % 10 == 0 {
-                tracing::info!("RPC state download: {} entries ({} pages)", total, page);
+
+            if page % 50 == 0 {
+                let elapsed = start.elapsed().as_secs();
+                let rate = if elapsed > 0 { total as u64 / elapsed } else { 0 };
+                tracing::info!(
+                    "RPC state download: {} entries ({} pages, {} entries/s)",
+                    total, page, rate
+                );
             }
 
             marker = result.get("marker")
@@ -1656,7 +1667,11 @@ impl Node {
             }
         }
 
-        tracing::info!("RPC state download complete: {} entries in {} pages", total, page);
+        let elapsed = start.elapsed().as_secs();
+        tracing::info!(
+            "RPC state download complete: {} entries in {} pages ({}s)",
+            total, page, elapsed
+        );
         Ok(total)
     }
 }
