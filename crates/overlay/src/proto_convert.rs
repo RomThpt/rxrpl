@@ -335,7 +335,7 @@ pub fn encode_get_ledger_with_nodes(
         node_ids,
         request_cookie: if request_cookie > 0 { Some(request_cookie) } else { None },
         query_type: None,
-        query_depth: if has_nodes { Some(1) } else { None },
+        query_depth: if has_nodes { Some(2) } else { None },
     };
     msg.encode_to_vec()
 }

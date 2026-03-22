@@ -905,31 +905,46 @@ impl PeerManager {
             .collect();
 
         let num_ids = node_ids.len();
-        let payload = proto_convert::encode_get_ledger_with_nodes(
-            LI_AS_NODE,
-            Some(&ledger_hash),
-            seq,
-            0,
-            node_ids,
-        );
+        let min_depth = missing.iter().map(|mn| mn.node_id.depth()).min().unwrap_or(0);
+        let max_depth = missing.iter().map(|mn| mn.node_id.depth()).max().unwrap_or(0);
 
-        // Send to a single peer to avoid duplicate responses.
-        let best = self.peer_set.best_peers_for_ledger(seq, 1);
-        if let Some(node_id) = best.first() {
+        // Split requests across multiple peers so each gets a different subset.
+        let best = self.peer_set.best_peers_for_ledger(seq, 3);
+        let num_peers = best.len();
+        if num_peers == 0 {
+            return;
+        }
+        let chunk_size = (node_ids.len() + num_peers - 1) / num_peers;
+        let mut peers_used = 0;
+        for (i, node_id) in best.iter().enumerate() {
+            let chunk: Vec<Vec<u8>> = node_ids
+                .iter()
+                .skip(i * chunk_size)
+                .take(chunk_size)
+                .cloned()
+                .collect();
+            if chunk.is_empty() {
+                break;
+            }
+            let payload = proto_convert::encode_get_ledger_with_nodes(
+                LI_AS_NODE,
+                Some(&ledger_hash),
+                seq,
+                0,
+                chunk,
+            );
             if let Some(handle) = self.peer_handles.get(node_id) {
-                if handle.tx.try_send(PeerMessage {
+                let _ = handle.tx.try_send(PeerMessage {
                     msg_type: MessageType::GetLedger,
                     payload,
-                }).is_ok() {
-                    let min_depth = missing.iter().map(|mn| mn.node_id.depth()).min().unwrap_or(0);
-                    let max_depth = missing.iter().map(|mn| mn.node_id.depth()).max().unwrap_or(0);
-                    tracing::debug!(
-                        "sent GetLedger seq={} delta ({} node_ids, depth={}-{})",
-                        seq, num_ids, min_depth, max_depth
-                    );
-                }
+                });
+                peers_used += 1;
             }
         }
+        tracing::debug!(
+            "sent GetLedger seq={} delta ({} node_ids across {} peers, depth={}-{})",
+            seq, num_ids, peers_used, min_depth, max_depth
+        );
     }
 
     /// Send a GetLedger request to the best 3 peers by reputation score.
