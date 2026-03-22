@@ -618,10 +618,13 @@ impl PeerManager {
                                     })
                                 })
                             {
-                                tracing::info!(
-                                    "received liBASE header for ledger #{} hash={}",
-                                    header.sequence, header.hash
-                                );
+                                let is_newer = latest.map_or(true, |known| header.sequence > known);
+                                if is_newer {
+                                    tracing::info!(
+                                        "received liBASE header for ledger #{} hash={}",
+                                        header.sequence, header.hash
+                                    );
+                                }
                                 self.ledger_syncer.set_ledger_hash(header.sequence, header.hash);
 
                                 if let Some(store) = self.get_node_store() {
@@ -832,18 +835,13 @@ impl PeerManager {
             .max()
             .unwrap_or(0);
 
-        if self.ledger_syncer.needs_sync(our_seq, max_peer_seq) {
-            let requests = self.ledger_syncer.request_missing(our_seq, max_peer_seq);
-            for (seq, hash) in requests {
-                self.send_get_ledger(seq, hash);
-            }
-        }
-
-        // Check and retry timed-out requests
-        let timed_out = self.ledger_syncer.check_timeouts(std::time::Instant::now());
-        for seq in timed_out {
-            tracing::debug!("ledger sync request for #{} timed out, retrying", seq);
-            self.send_get_ledger(seq, None);
+        // Only request the latest ledger if no sync is active.
+        if self.ledger_syncer.needs_sync(our_seq, max_peer_seq)
+            && !self.ledger_syncer.has_any_incremental_sync()
+            && self.ledger_syncer.pending_count() == 0
+        {
+            // Request only the latest peer ledger, not all intermediary ones.
+            self.send_get_ledger(max_peer_seq, None);
         }
     }
 

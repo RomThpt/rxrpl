@@ -353,6 +353,11 @@ impl LedgerSyncer {
         self.incremental.contains_key(&seq)
     }
 
+    /// Check if any incremental sync is active.
+    pub fn has_any_incremental_sync(&self) -> bool {
+        !self.incremental.is_empty()
+    }
+
     /// Check if a sequence has already been fully synced.
     pub fn is_synced(&self, seq: u32) -> bool {
         self.synced_seqs.contains(&seq)
