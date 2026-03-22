@@ -54,15 +54,25 @@ impl LedgerHeader {
     ///
     /// Total: 118 bytes. The ledger hash is computed from these fields.
     pub fn from_raw_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < RAW_HEADER_SIZE {
+        if data.len() != RAW_HEADER_SIZE {
             return None;
         }
         let mut pos = 0;
 
         let sequence = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?);
         pos += 4;
+
+        if sequence == 0 {
+            return None;
+        }
+
         let drops = u64::from_be_bytes(data[pos..pos + 8].try_into().ok()?);
         pos += 8;
+
+        // Total XRP supply is 100 billion drops max.
+        if drops > 100_000_000_000_000_000 {
+            return None;
+        }
         let parent_hash = Hash256::new(data[pos..pos + 32].try_into().ok()?);
         pos += 32;
         let tx_hash = Hash256::new(data[pos..pos + 32].try_into().ok()?);
@@ -230,7 +240,9 @@ mod tests {
     }
 
     #[test]
-    fn from_raw_bytes_too_short() {
+    fn from_raw_bytes_wrong_size() {
         assert!(LedgerHeader::from_raw_bytes(&[0u8; 100]).is_none());
+        assert!(LedgerHeader::from_raw_bytes(&[0u8; 200]).is_none());
+        assert!(LedgerHeader::from_raw_bytes(&[0u8; 512]).is_none());
     }
 }

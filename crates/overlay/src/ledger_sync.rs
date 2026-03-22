@@ -8,7 +8,7 @@ use rxrpl_shamap::{LeafNode, MissingNode, NodeStore, SHAMap};
 const MAX_CONCURRENT_REQUESTS: usize = 5;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum number of missing node hashes to request in a single delta sync round.
-const MAX_DELTA_NODES_PER_REQUEST: usize = 256;
+const MAX_DELTA_NODES_PER_REQUEST: usize = 512;
 /// Maximum number of sync rounds before giving up on incremental sync.
 const MAX_INCREMENTAL_ROUNDS: u32 = 50;
 
@@ -25,6 +25,7 @@ struct IncrementalSync {
     map: SHAMap,
     rounds: u32,
     zero_rounds: u32,
+    total_added: u32,
 }
 
 /// Tracks in-flight ledger sync requests and manages retries/timeouts.
@@ -193,7 +194,7 @@ impl LedgerSyncer {
                 let zero_rounds = self.incremental.get(&active_seq)
                     .map(|e| e.zero_rounds)
                     .unwrap_or(0);
-                if zero_rounds < 3 {
+                if zero_rounds < 8 {
                     return Vec::new();
                 }
                 tracing::info!(
@@ -211,6 +212,7 @@ impl LedgerSyncer {
                 map,
                 rounds: 0,
                 zero_rounds: 0,
+                total_added: 0,
             }
         });
 
@@ -298,6 +300,10 @@ impl LedgerSyncer {
 
         if added > 0 {
             entry.zero_rounds = 0;
+            entry.total_added += added as u32;
+            if entry.total_added % 5000 < added as u32 {
+                tracing::info!("sync #{}: {} total nodes in store", seq, entry.total_added);
+            }
             // Reload root from the store in case the root node was among the
             // received nodes.
             if let Err(e) = entry.map.reload_root(entry.hash) {
