@@ -107,6 +107,49 @@ impl Ledger {
         }
     }
 
+    /// Create a closed ledger from a fully parsed header.
+    ///
+    /// Used when the ledger header is received via liBASE response.
+    /// The state and tx maps are lazy-loaded from the store using the
+    /// root hashes in the header.
+    pub fn from_header(header: LedgerHeader, store: Arc<dyn NodeStore>) -> Result<Ledger, LedgerError> {
+        let state_map = if !header.account_hash.is_zero() {
+            let mut m = SHAMap::from_root_hash(
+                header.account_hash,
+                rxrpl_shamap::LeafNode::account_state,
+                Arc::clone(&store),
+            ).map_err(|e| LedgerError::SHAMap(e))?;
+            m.set_immutable();
+            m
+        } else {
+            let mut m = SHAMap::account_state_with_store(Arc::clone(&store));
+            m.set_immutable();
+            m
+        };
+
+        let tx_map = if !header.tx_hash.is_zero() {
+            let mut m = SHAMap::from_root_hash(
+                header.tx_hash,
+                rxrpl_shamap::LeafNode::transaction_with_meta,
+                Arc::clone(&store),
+            ).map_err(|e| LedgerError::SHAMap(e))?;
+            m.set_immutable();
+            m
+        } else {
+            let mut m = SHAMap::transaction_with_meta_and_store(store);
+            m.set_immutable();
+            m
+        };
+
+        Ok(Ledger {
+            header,
+            state_map,
+            tx_map,
+            state: LedgerState::Closed,
+            destroyed_drops: 0,
+        })
+    }
+
     /// Reconstruct a closed ledger from catchup data.
     ///
     /// The state_map must already be built (e.g., via `SHAMap::from_leaf_nodes`).

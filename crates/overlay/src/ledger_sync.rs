@@ -1,16 +1,18 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rxrpl_primitives::Hash256;
-use rxrpl_shamap::{LeafNode, NodeStore, SHAMap};
+use rxrpl_shamap::{LeafNode, MissingNode, NodeStore, SHAMap};
 
 const MAX_CONCURRENT_REQUESTS: usize = 5;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum number of missing node hashes to request in a single delta sync round.
-const MAX_DELTA_NODES_PER_REQUEST: usize = 128;
+const MAX_DELTA_NODES_PER_REQUEST: usize = 512;
 /// Maximum number of sync rounds before giving up on incremental sync.
 const MAX_INCREMENTAL_ROUNDS: u32 = 50;
+/// Number of consecutive zero-add rounds before falling back to hash-based fetch.
+const HASH_FALLBACK_THRESHOLD: u32 = 5;
 
 /// Data received from a synced ledger.
 pub struct SyncedLedgerData {
@@ -19,11 +21,26 @@ pub struct SyncedLedgerData {
     pub nodes: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/// Result of feeding nodes into an incremental sync.
+pub enum FeedResult {
+    /// Sync is still in progress; continue with tree-based requests.
+    Continue,
+    /// Sync is complete; contains the extracted leaf nodes.
+    Complete(Vec<(Vec<u8>, Vec<u8>)>),
+    /// Tree-based sync is stuck after repeated zero-add rounds.
+    /// Contains the content hashes of missing nodes for hash-based fallback.
+    FallbackToHashFetch(Vec<Hash256>),
+    /// Sync was removed (gave up or not found).
+    Removed,
+}
+
 /// A ledger being synced incrementally via delta sync.
 struct IncrementalSync {
     hash: Hash256,
     map: SHAMap,
     rounds: u32,
+    zero_rounds: u32,
+    total_added: u32,
 }
 
 /// Tracks in-flight ledger sync requests and manages retries/timeouts.
@@ -33,6 +50,10 @@ pub struct LedgerSyncer {
     timeout: Duration,
     /// Active incremental syncs keyed by ledger sequence.
     incremental: HashMap<u32, IncrementalSync>,
+    /// Mapping of seq -> ledger hash for liAS_NODE follow-up requests.
+    ledger_hashes: HashMap<u32, Hash256>,
+    /// Sequences that have already been synced (to avoid re-processing).
+    synced_seqs: HashSet<u32>,
 }
 
 struct PendingRequest {
@@ -48,6 +69,25 @@ impl LedgerSyncer {
             max_concurrent: MAX_CONCURRENT_REQUESTS,
             timeout: REQUEST_TIMEOUT,
             incremental: HashMap::new(),
+            ledger_hashes: HashMap::new(),
+            synced_seqs: HashSet::new(),
+        }
+    }
+
+    /// Register an outgoing ledger request so that responses can be correlated.
+    ///
+    /// Called by `PeerManager::send_get_ledger` to ensure the response handler
+    /// can match incoming `LedgerData` to a pending request.
+    pub fn register_request(&mut self, seq: u32, hash: Option<Hash256>) {
+        if !self.pending.contains_key(&seq) {
+            self.pending.insert(
+                seq,
+                PendingRequest {
+                    hash,
+                    sent_at: Instant::now(),
+                    retries: 0,
+                },
+            );
         }
     }
 
@@ -125,10 +165,22 @@ impl LedgerSyncer {
         self.pending.len()
     }
 
+    /// Store the ledger hash for a given sequence (used for liAS_NODE requests).
+    pub fn set_ledger_hash(&mut self, seq: u32, hash: Hash256) {
+        self.ledger_hashes.insert(seq, hash);
+    }
+
+    /// Get the stored ledger hash for a given sequence.
+    pub fn get_ledger_hash(&self, seq: u32) -> Option<Hash256> {
+        self.ledger_hashes.get(&seq).copied()
+    }
+
     /// Clear all pending requests (e.g., on full sync reset).
     pub fn clear(&mut self) {
         self.pending.clear();
         self.incremental.clear();
+        self.ledger_hashes.clear();
+        self.synced_seqs.clear();
     }
 
     // --- Incremental (delta) sync ---
@@ -142,13 +194,40 @@ impl LedgerSyncer {
         seq: u32,
         hash: Hash256,
         store: Arc<dyn NodeStore>,
-    ) -> Vec<Hash256> {
+    ) -> Vec<MissingNode> {
+        // Only sync one ledger at a time. Replace the active sync with
+        // a newer ledger to avoid syncing stale data. The store retains
+        // all previously fetched nodes, so the new sync picks up where
+        // the old one left off.
+        if !self.incremental.contains_key(&seq) {
+            if let Some(&active_seq) = self.incremental.keys().max() {
+                if seq <= active_seq {
+                    return Vec::new();
+                }
+                // Replace when the active sync is stuck (zero-add rounds).
+                // Don't replace during active progress to avoid thrashing.
+                let zero_rounds = self.incremental.get(&active_seq)
+                    .map(|e| e.zero_rounds)
+                    .unwrap_or(0);
+                if zero_rounds < 8 {
+                    return Vec::new();
+                }
+                tracing::info!(
+                    "replacing stale sync #{} (round {}) with #{}",
+                    active_seq, zero_rounds, seq
+                );
+                self.incremental.clear();
+            }
+        }
+
         let entry = self.incremental.entry(seq).or_insert_with(|| {
             let map = SHAMap::syncing_with_store(hash, LeafNode::account_state, store);
             IncrementalSync {
                 hash,
                 map,
                 rounds: 0,
+                zero_rounds: 0,
+                total_added: 0,
             }
         });
 
@@ -169,39 +248,120 @@ impl LedgerSyncer {
 
     /// Feed received nodes into an active incremental sync.
     ///
-    /// Returns `true` if the sync is now complete (all nodes resolved).
+    /// Returns a `FeedResult` indicating the sync state:
+    /// - `Complete(leaves)` if the sync finished (all nodes resolved).
+    /// - `FallbackToHashFetch(hashes)` if the tree-based sync is stuck and
+    ///   should be retried via TMGetObjectByHash with content hashes.
+    /// - `Continue` if the sync is still in progress.
+    /// - `Removed` if the sync was abandoned or not found.
     pub fn feed_nodes(
         &mut self,
         seq: u32,
         nodes: &[(Vec<u8>, Vec<u8>)],
-    ) -> bool {
+    ) -> FeedResult {
         let entry = match self.incremental.get_mut(&seq) {
             Some(e) => e,
-            None => return false,
+            None => return FeedResult::Removed,
         };
 
         let mut added = 0;
-        for (node_id, node_data) in nodes {
-            if node_id.len() >= 32 {
-                let hash_bytes: [u8; 32] = node_id[..32].try_into().unwrap_or([0u8; 32]);
-                let hash = Hash256::new(hash_bytes);
-                match entry.map.add_raw_node(hash, node_data.clone()) {
-                    Ok(true) => added += 1,
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::debug!(
-                            "failed to add raw node {} for ledger #{}: {}",
-                            hash, seq, e
-                        );
-                    }
+        for (_node_id, node_data) in nodes {
+            // rippled sends nodedata as: serialized_node_bytes + depth_byte.
+            // Strip the trailing depth byte to get pure node data.
+            // Then compute the content hash to store it correctly.
+            if node_data.is_empty() {
+                continue;
+            }
+            let raw = if node_data.len() == 513 || (node_data.len() > 32 && node_data.len() % 32 != 0) {
+                // Strip trailing depth byte from rippled's SHAMap wire format.
+                &node_data[..node_data.len() - 1]
+            } else {
+                &node_data[..]
+            };
+
+            // Compute the content hash based on node type.
+            let hash = if raw.len() == 512 {
+                // Inner node: hash = SHA-512-Half("MIN\0" || raw)
+                let prefix: [u8; 4] = [0x4D, 0x49, 0x4E, 0x00]; // "MIN\0"
+                rxrpl_crypto::sha512_half::sha512_half(&[&prefix, raw])
+            } else if raw.len() >= 32 {
+                // Leaf node: hash = SHA-512-Half("MLN\0" || raw)
+                // Wire format is key(32) || data; hash covers both in that order.
+                let prefix: [u8; 4] = [0x4D, 0x4C, 0x4E, 0x00]; // "MLN\0"
+                rxrpl_crypto::sha512_half::sha512_half(&[&prefix, raw])
+            } else {
+                // Too small, skip.
+                continue;
+            };
+
+            tracing::debug!(
+                "feed_nodes #{}: computed hash={} size={} bytes (stripped from {})",
+                seq, hash, raw.len(), node_data.len()
+            );
+
+            match entry.map.add_raw_node(hash, raw.to_vec()) {
+                Ok(true) => added += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        "feed_nodes #{}: failed to add node {} ({} bytes): {}",
+                        seq, hash, raw.len(), e
+                    );
                 }
             }
         }
 
+        tracing::debug!(
+            "feed_nodes #{}: added {} new nodes out of {} received",
+            seq, added, nodes.len()
+        );
+
         if added > 0 {
+            entry.zero_rounds = 0;
+            entry.total_added += added as u32;
+            if entry.total_added % 5000 < added as u32 {
+                tracing::info!("sync #{}: {} total nodes in store", seq, entry.total_added);
+            }
             // Reload root from the store in case the root node was among the
             // received nodes.
-            let _ = entry.map.reload_root(entry.hash);
+            if let Err(e) = entry.map.reload_root(entry.hash) {
+                tracing::warn!(
+                    "feed_nodes #{}: reload_root({}) failed: {}",
+                    seq, entry.hash, e
+                );
+            }
+        } else {
+            entry.zero_rounds += 1;
+            if entry.zero_rounds > 20 {
+                tracing::warn!(
+                    "incremental sync for ledger #{} stuck ({} consecutive zero-add rounds), removing",
+                    seq, entry.zero_rounds
+                );
+                self.incremental.remove(&seq);
+                return FeedResult::Removed;
+            }
+
+            // After HASH_FALLBACK_THRESHOLD zero-add rounds, signal a fallback
+            // to TMGetObjectByHash using content hashes instead of SHAMap node IDs.
+            if entry.zero_rounds >= HASH_FALLBACK_THRESHOLD && entry.zero_rounds % HASH_FALLBACK_THRESHOLD == 0 {
+                let missing = entry
+                    .map
+                    .missing_nodes(entry.hash, MAX_DELTA_NODES_PER_REQUEST);
+                if !missing.is_empty() {
+                    let content_hashes: Vec<Hash256> =
+                        missing.iter().map(|mn| mn.hash).collect();
+                    tracing::info!(
+                        "sync #{} stuck for {} zero-add rounds, falling back to hash-based fetch ({} hashes)",
+                        seq, entry.zero_rounds, content_hashes.len()
+                    );
+                    return FeedResult::FallbackToHashFetch(content_hashes);
+                }
+            }
+        }
+
+        // A tree with an empty root is never complete (it needs the root first).
+        if entry.map.is_empty() {
+            return FeedResult::Continue;
         }
 
         // Check if the tree is now complete.
@@ -211,17 +371,57 @@ impl LedgerSyncer {
                 seq,
                 entry.rounds
             );
-            self.incremental.remove(&seq);
-            true
+            // Extract leaf nodes before removing the sync entry.
+            let entry = self.incremental.remove(&seq).unwrap();
+            let mut leaves = Vec::new();
+            entry.map.for_each(&mut |key, data| {
+                leaves.push((key.as_bytes().to_vec(), data.to_vec()));
+            });
+            FeedResult::Complete(leaves)
         } else {
-            false
+            FeedResult::Continue
+        }
+    }
+
+    /// Check if an incremental sync is active for the given sequence.
+    pub fn has_incremental_sync(&self, seq: u32) -> bool {
+        self.incremental.contains_key(&seq)
+    }
+
+    /// Check if any incremental sync is active.
+    pub fn has_any_incremental_sync(&self) -> bool {
+        !self.incremental.is_empty()
+    }
+
+    /// Check if a sequence has already been fully synced.
+    pub fn is_synced(&self, seq: u32) -> bool {
+        self.synced_seqs.contains(&seq)
+    }
+
+    /// Mark a sequence as synced.
+    pub fn mark_synced(&mut self, seq: u32) {
+        self.synced_seqs.insert(seq);
+        // Cleanup: keep at most 100 entries.
+        if self.synced_seqs.len() > 100 {
+            let min_seq = seq.saturating_sub(50);
+            self.synced_seqs.retain(|&s| s >= min_seq);
+        }
+    }
+
+    pub fn latest_known_seq(&self) -> Option<u32> {
+        let a = self.ledger_hashes.keys().copied().max();
+        let b = self.incremental.keys().copied().max();
+        match (a, b) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
         }
     }
 
     /// Get the missing node hashes for an active incremental sync, if any.
     ///
     /// Called by `send_get_ledger` to populate `node_ids` in the request.
-    pub fn get_missing_node_ids(&self, seq: u32) -> Vec<Hash256> {
+    pub fn get_missing_node_ids(&self, seq: u32) -> Vec<MissingNode> {
         match self.incremental.get(&seq) {
             Some(entry) => entry
                 .map

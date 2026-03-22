@@ -1,0 +1,19 @@
+[server]
+bind = "127.0.0.1:5059"
+
+[peer]
+port = 51237
+max_peers = 21
+fixed_peers = [
+    "s1.ripple.com:51235",
+    "s2.ripple.com:51235",
+]
+seeds = []
+tls_enabled = true
+
+[database]
+path = "local/data-mainnet"
+backend = "memory"
+
+[network]
+network_id = 0

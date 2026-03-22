@@ -32,8 +32,7 @@ pub async fn account_info(
         .get_state(&key)
         .ok_or_else(|| RpcServerError::InvalidParams("account not found".into()))?;
 
-    let account_data: Value = serde_json::from_slice(data)
-        .map_err(|e| RpcServerError::Internal(format!("failed to deserialize account: {e}")))?;
+    let account_data: Value = crate::handlers::common::decode_state_value(data)?;
 
     Ok(serde_json::json!({
         "account_data": account_data,

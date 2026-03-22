@@ -60,6 +60,7 @@ fn make_unl(ids: &[u8]) -> TrustedValidatorList {
 fn proposal_for(node_id: NodeId, tx_set_hash: Hash256, prev_ledger: Hash256, seq: u32) -> Proposal {
     Proposal {
         node_id,
+        public_key: vec![0x02; 33],
         tx_set_hash,
         close_time: 100,
         prop_seq: 0,
@@ -78,17 +79,17 @@ fn three_nodes_same_set_converge() {
     // Engine for node 1
     let adapter1 = MockAdapter::with_tx_sets(vec![tx_set.clone()]);
     let mut engine1 =
-        ConsensusEngine::new_with_unl(adapter1, node(1), ConsensusParams::default(), unl.clone());
+        ConsensusEngine::new_with_unl(adapter1, node(1), Vec::new(), ConsensusParams::default(), unl.clone());
 
     // Engine for node 2
     let adapter2 = MockAdapter::with_tx_sets(vec![tx_set.clone()]);
     let mut engine2 =
-        ConsensusEngine::new_with_unl(adapter2, node(2), ConsensusParams::default(), unl.clone());
+        ConsensusEngine::new_with_unl(adapter2, node(2), Vec::new(), ConsensusParams::default(), unl.clone());
 
     // Engine for node 3
     let adapter3 = MockAdapter::with_tx_sets(vec![tx_set.clone()]);
     let mut engine3 =
-        ConsensusEngine::new_with_unl(adapter3, node(3), ConsensusParams::default(), unl.clone());
+        ConsensusEngine::new_with_unl(adapter3, node(3), Vec::new(), ConsensusParams::default(), unl.clone());
 
     let prev = Hash256::ZERO;
     let seq = 1;
@@ -138,7 +139,7 @@ fn two_vs_one_dispute_resolution() {
     // Node 1 has the minority set
     let adapter1 = MockAdapter::with_tx_sets(vec![set_majority.clone(), set_minority.clone()]);
     let mut engine1 =
-        ConsensusEngine::new_with_unl(adapter1, node(1), ConsensusParams::default(), unl.clone());
+        ConsensusEngine::new_with_unl(adapter1, node(1), Vec::new(), ConsensusParams::default(), unl.clone());
 
     let prev = Hash256::ZERO;
     let seq = 1;

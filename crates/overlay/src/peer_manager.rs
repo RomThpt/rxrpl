@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use rustls::{ClientConfig, ServerConfig};
+use openssl::ssl::{SslAcceptor, SslConnector};
 use rxrpl_consensus::types::{Proposal, Validation};
 use rxrpl_p2p_proto::MessageType;
 use rxrpl_p2p_proto::codec::{PeerCodec, PeerMessage};
@@ -29,6 +29,11 @@ use crate::relay::RelayFilter;
 use crate::reputation::PeerReputation;
 use crate::tls::{self, PeerStream};
 
+/// TMLedgerInfoType values from rippled.
+const LI_BASE: i32 = 0;
+const _LI_TX_NODE: i32 = 1;
+const LI_AS_NODE: i32 = 2;
+
 /// Messages forwarded from the overlay to the consensus layer.
 pub enum ConsensusMessage {
     Proposal(Proposal),
@@ -47,6 +52,13 @@ pub enum ConsensusMessage {
         seq: u32,
         nodes: Vec<(Vec<u8>, Vec<u8>)>,
     },
+    LedgerHeader {
+        seq: u32,
+        header: rxrpl_ledger::LedgerHeader,
+    },
+    ValidatorListReceived {
+        validator_count: usize,
+    },
 }
 
 /// Configuration for the peer manager.
@@ -56,8 +68,8 @@ pub struct PeerManagerConfig {
     pub seeds: Vec<String>,
     pub fixed_peers: Vec<String>,
     pub network_id: u32,
-    pub tls_server: Arc<ServerConfig>,
-    pub tls_client: Arc<ClientConfig>,
+    pub tls_server: Arc<SslAcceptor>,
+    pub tls_client: Arc<SslConnector>,
 }
 
 /// Central P2P network manager.
@@ -79,7 +91,9 @@ pub struct PeerManager {
     event_tx: mpsc::UnboundedSender<PeerEvent>,
     consensus_tx: mpsc::UnboundedSender<ConsensusMessage>,
     ledger_provider: Option<Arc<dyn LedgerProvider>>,
+    node_store: Option<Arc<dyn rxrpl_shamap::NodeStore>>,
     ledger_syncer: LedgerSyncer,
+    next_cookie: AtomicU64,
     discovery: Option<Arc<PeerDiscovery>>,
     server_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
 }
@@ -117,7 +131,9 @@ impl PeerManager {
             event_tx,
             consensus_tx,
             ledger_provider: None,
+            node_store: None,
             ledger_syncer: LedgerSyncer::new(),
+            next_cookie: AtomicU64::new(1),
             discovery: None,
             server_event_tx: None,
         };
@@ -128,6 +144,11 @@ impl PeerManager {
     /// Set a ledger provider for serving GetLedger requests.
     pub fn set_ledger_provider(&mut self, provider: Arc<dyn LedgerProvider>) {
         self.ledger_provider = Some(provider);
+    }
+
+    /// Set the backing node store for incremental ledger sync.
+    pub fn set_node_store(&mut self, store: Arc<dyn rxrpl_shamap::NodeStore>) {
+        self.node_store = Some(store);
     }
 
     /// Set the event sender for emitting overlay events as JSON values.
@@ -276,7 +297,7 @@ impl PeerManager {
         let ledger_hash = Arc::clone(&self.ledger_hash);
         let event_tx = self.event_tx.clone();
         let peer_set = Arc::clone(&self.peer_set);
-        let tls_server = Arc::clone(&self.config.tls_server);
+        let tls_server = self.config.tls_server.clone();
 
         tokio::spawn(async move {
             if let Err(e) = try_accept_inbound(
@@ -297,7 +318,7 @@ impl PeerManager {
         });
     }
 
-    fn handle_command(&self, cmd: OverlayCommand) {
+    fn handle_command(&mut self, cmd: OverlayCommand) {
         match cmd {
             OverlayCommand::Broadcast { msg_type, payload } => {
                 for handle in self.peer_handles.values() {
@@ -399,14 +420,18 @@ impl PeerManager {
         let payload_len = payload.len() as u64;
 
         match msg_type {
+            MessageType::Hello => {
+                // Hello is already handled during handshake; ignore late arrivals.
+                tracing::debug!("ignoring late Hello from {}", from);
+            }
             MessageType::Ping => {
                 match proto_convert::decode_ping(payload) {
                     Ok(ping) => {
                         if let Some(ref info) = peer_info {
                             info.reputation.record_valid_message(payload_len);
                         }
-                        if ping.r#type == 0 {
-                            let pong = proto_convert::encode_ping(ping.seq, true);
+                        if ping.r#type.unwrap_or(0) == 0 {
+                            let pong = proto_convert::encode_ping(ping.seq.unwrap_or(0), true);
                             if let Some(handle) = self.peer_handles.get(&from) {
                                 let _ = handle.tx.try_send(PeerMessage {
                                     msg_type: MessageType::Ping,
@@ -522,32 +547,13 @@ impl PeerManager {
                     }
                 }
             }
-            MessageType::GetPeers => {
+            MessageType::Cluster => {
+                // Cluster messages are only exchanged between nodes in the same
+                // cluster. Log and ignore for non-cluster peers.
                 if let Some(ref info) = peer_info {
                     info.reputation.record_valid_message(payload_len);
                 }
-                tracing::debug!("GetPeers from {}", from);
-                // Collect connected peer addresses and respond
-                let mut peer_addrs = Vec::new();
-                for (id, handle) in &self.peer_handles {
-                    if *id != from {
-                        // Parse "ip:port" from the peer's address
-                        if let Some((ip, port_str)) = handle.info.address.rsplit_once(':') {
-                            if let Ok(port) = port_str.parse::<u16>() {
-                                peer_addrs.push((ip.to_string(), port));
-                            }
-                        }
-                    }
-                }
-                if !peer_addrs.is_empty() {
-                    let response = proto_convert::encode_peers(peer_addrs);
-                    if let Some(handle) = self.peer_handles.get(&from) {
-                        let _ = handle.tx.try_send(PeerMessage {
-                            msg_type: MessageType::Peers,
-                            payload: response,
-                        });
-                    }
-                }
+                tracing::debug!("Cluster message from {}", from);
             }
             MessageType::GetLedger => {
                 if let Some(ref info) = peer_info {
@@ -556,6 +562,10 @@ impl PeerManager {
                 self.handle_get_ledger(from, payload);
             }
             MessageType::LedgerData => {
+                tracing::debug!(
+                    "received LedgerData from {}: {} bytes",
+                    from, payload.len()
+                );
                 match proto_convert::decode_ledger_data(payload) {
                     Ok(msg) => {
                         if let Some(ref info) = peer_info {
@@ -563,52 +573,119 @@ impl PeerManager {
                             // Peer provided requested ledger data -- useful contribution
                             info.reputation.record_useful_contribution();
                         }
+                        let ledger_hash_bytes = msg.ledger_hash;
                         let hash =
-                            Hash256::new(msg.ledger_hash[..32].try_into().unwrap_or([0u8; 32]));
+                            Hash256::new(ledger_hash_bytes[..32].try_into().unwrap_or([0u8; 32]));
                         let nodes: Vec<(Vec<u8>, Vec<u8>)> = msg
                             .nodes
                             .into_iter()
-                            .map(|n| (n.node_id, n.node_data))
+                            .map(|n| (n.nodeid.unwrap_or_default(), n.nodedata.unwrap_or_default()))
                             .collect();
 
-                        // Feed nodes into incremental sync if active.
-                        let incremental_complete =
-                            self.ledger_syncer.feed_nodes(msg.ledger_seq, &nodes);
-                        if incremental_complete {
-                            tracing::info!(
-                                "incremental sync complete for ledger #{} hash={}",
-                                msg.ledger_seq, hash,
-                            );
-                        }
+                        let ledger_seq = msg.ledger_seq;
 
-                        // Notify ledger syncer about the response (full sync path).
-                        if let Some(synced) =
-                            self.ledger_syncer
-                                .handle_response(msg.ledger_seq, hash, nodes.clone())
-                        {
-                            tracing::info!(
-                                "synced ledger #{} hash={} ({} nodes)",
-                                synced.seq,
-                                synced.hash,
-                                synced.nodes.len()
-                            );
-                        }
+                        // Skip already-synced ledgers.
+                        if self.ledger_syncer.is_synced(ledger_seq) {
+                            tracing::debug!("ignoring LedgerData for already-synced #{}", ledger_seq);
+                        } else if self.ledger_syncer.has_incremental_sync(ledger_seq) {
+                            // Active incremental sync: feed nodes into SHAMap.
+                            use crate::ledger_sync::FeedResult;
+                            match self.ledger_syncer.feed_nodes(ledger_seq, &nodes) {
+                                FeedResult::Complete(leaves) => {
+                                    tracing::info!(
+                                        "incremental sync complete for ledger #{} ({} leaf nodes)",
+                                        ledger_seq, leaves.len()
+                                    );
+                                    self.ledger_syncer.mark_synced(ledger_seq);
+                                    let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
+                                        hash,
+                                        seq: ledger_seq,
+                                        nodes: leaves,
+                                    });
+                                }
+                                FeedResult::FallbackToHashFetch(content_hashes) => {
+                                    // Tree-based sync stuck; try fetching by content hash.
+                                    self.send_get_objects_by_hash(ledger_seq, &content_hashes);
+                                    // Also keep trying tree-based sync in parallel.
+                                    self.send_get_ledger_as_node(ledger_seq);
+                                }
+                                FeedResult::Continue => {
+                                    // Request next batch of missing nodes.
+                                    self.send_get_ledger_as_node(ledger_seq);
+                                }
+                                FeedResult::Removed => {
+                                    // Sync was abandoned.
+                                }
+                            }
+                        } else if !nodes.is_empty() {
+                            // No active sync: try to parse as liBASE header.
+                            let header_data = &nodes[0].1;
+                            let latest = self.ledger_syncer.latest_known_seq();
+                            if let Some(header) = rxrpl_ledger::LedgerHeader::from_raw_bytes(header_data)
+                                .filter(|h| {
+                                    latest.map_or(true, |known| {
+                                        (h.sequence as i64 - known as i64).unsigned_abs() <= 1000
+                                    })
+                                })
+                            {
+                                let is_newer = latest.map_or(true, |known| header.sequence > known);
+                                if is_newer {
+                                    tracing::info!(
+                                        "received liBASE header for ledger #{} hash={}",
+                                        header.sequence, header.hash
+                                    );
+                                }
+                                self.ledger_syncer.set_ledger_hash(header.sequence, header.hash);
 
-                        let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
-                            hash,
-                            seq: msg.ledger_seq,
-                            nodes,
-                        });
+                                if let Some(store) = self.get_node_store() {
+                                    let missing = self.ledger_syncer.start_incremental_sync(
+                                        header.sequence,
+                                        header.account_hash,
+                                        store,
+                                    );
+                                    if !missing.is_empty() {
+                                        self.send_get_ledger_as_node(header.sequence);
+                                    }
+                                }
+
+                                let _ = self.consensus_tx.send(ConsensusMessage::LedgerHeader {
+                                    seq: header.sequence,
+                                    header,
+                                });
+                            } else {
+                                // Not a header -- forward as raw data.
+                                let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
+                                    hash,
+                                    seq: ledger_seq,
+                                    nodes,
+                                });
+                            }
+                        }
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        tracing::warn!("failed to decode LedgerData from {}: {}", from, e);
                         if let Some(ref info) = peer_info {
                             info.reputation.record_invalid_message();
                         }
                     }
                 }
             }
-            MessageType::Peers => {
-                match proto_convert::decode_peers(payload) {
+            MessageType::Endpoints => {
+                // Try rippled TMEndpoints format first, fall back to legacy TMPeers
+                let peers_result = proto_convert::decode_endpoints(payload)
+                    .map(|eps| {
+                        eps.into_iter()
+                            .filter_map(|(endpoint, _hops)| {
+                                // endpoint is "ip:port" string
+                                let (ip, port_str) = endpoint.rsplit_once(':')?;
+                                let port = port_str.parse::<u16>().ok()?;
+                                Some((ip.to_string(), port))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .or_else(|_| proto_convert::decode_peers(payload));
+
+                match peers_result {
                     Ok(peers) => {
                         if let Some(ref info) = peer_info {
                             info.reputation.record_valid_message(payload_len);
@@ -633,24 +710,24 @@ impl PeerManager {
                     }
                 }
             }
-            MessageType::Manifest => {
-                match proto_convert::decode_manifest(payload) {
-                    Ok(manifest) => {
+            MessageType::Manifests => {
+                match proto_convert::decode_manifests(payload) {
+                    Ok(manifest_list) => {
                         if let Some(ref info) = peer_info {
                             info.reputation.record_valid_message(payload_len);
                         }
                         tracing::debug!(
-                            "manifest from {} master_key={} seq={}",
-                            from,
-                            manifest.master_key,
-                            manifest.seq
+                            "received {} manifests from {}",
+                            manifest_list.len(),
+                            from
                         );
+                        // Each entry is a raw serialized manifest (rippled binary format).
+                        // For now we store the count; full parsing requires SField codec.
                         if let Some(ref tx) = self.server_event_tx {
                             let _ = tx.send(serde_json::json!({
-                                "type": "manifestReceived",
-                                "master_key": manifest.master_key,
-                                "signing_key": manifest.signing_key,
-                                "seq": manifest.seq,
+                                "type": "manifestsReceived",
+                                "count": manifest_list.len(),
+                                "from": from.to_string(),
                             }));
                         }
                     }
@@ -661,12 +738,159 @@ impl PeerManager {
                     }
                 }
             }
-            MessageType::Hello => {
-                // Unexpected Hello after handshake is a protocol violation
-                if let Some(ref info) = peer_info {
-                    info.reputation.record_violation();
+            MessageType::HaveSet => {
+                match proto_convert::decode_have_set(payload) {
+                    Ok(have_set) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                        }
+                        tracing::debug!(
+                            "HaveTransactionSet from {} hash={} status={}",
+                            from, have_set.hash, have_set.status
+                        );
+                    }
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
+                    }
                 }
-                tracing::debug!("unexpected Hello from {}", from);
+            }
+            MessageType::GetObjects => {
+                if let Some(ref info) = peer_info {
+                    info.reputation.record_valid_message(payload_len);
+                }
+                match proto_convert::decode_get_objects(payload) {
+                    Ok(msg) => {
+                        let is_response = !msg.query.unwrap_or(true);
+                        if is_response && !msg.objects.is_empty() {
+                            // This is a response to our TMGetObjectByHash request.
+                            // Extract (hash, data) pairs and feed into incremental sync.
+                            let ledger_seq = msg.seq.unwrap_or(0);
+                            let nodes: Vec<(Vec<u8>, Vec<u8>)> = msg
+                                .objects
+                                .into_iter()
+                                .filter_map(|obj| {
+                                    let hash = obj.hash.unwrap_or_default();
+                                    let data = obj.data.unwrap_or_default();
+                                    if !hash.is_empty() && !data.is_empty() {
+                                        Some((hash, data))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            tracing::info!(
+                                "received GetObjectByHash response from {} ({} objects for #{})",
+                                from, nodes.len(), ledger_seq
+                            );
+                            if self.ledger_syncer.has_incremental_sync(ledger_seq) {
+                                use crate::ledger_sync::FeedResult;
+                                let ledger_hash = self.ledger_syncer.get_ledger_hash(ledger_seq);
+                                let hash = ledger_hash.unwrap_or(Hash256::ZERO);
+                                match self.ledger_syncer.feed_nodes(ledger_seq, &nodes) {
+                                    FeedResult::Complete(leaves) => {
+                                        tracing::info!(
+                                            "incremental sync complete (via hash fallback) for #{} ({} leaves)",
+                                            ledger_seq, leaves.len()
+                                        );
+                                        self.ledger_syncer.mark_synced(ledger_seq);
+                                        let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
+                                            hash,
+                                            seq: ledger_seq,
+                                            nodes: leaves,
+                                        });
+                                    }
+                                    FeedResult::FallbackToHashFetch(content_hashes) => {
+                                        self.send_get_objects_by_hash(ledger_seq, &content_hashes);
+                                    }
+                                    FeedResult::Continue => {
+                                        self.send_get_ledger_as_node(ledger_seq);
+                                    }
+                                    FeedResult::Removed => {}
+                                }
+                            }
+                        } else {
+                            tracing::debug!(
+                                "GetObjectByHash query from {} ({} objects requested)",
+                                from, msg.objects.len()
+                            );
+                            // TODO: serve requested objects from our store
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("bad GetObjectByHash from {}: {}", from, e);
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
+                    }
+                }
+            }
+            MessageType::ValidatorList => {
+                match proto_convert::decode_validator_list(payload) {
+                    Ok(vl) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                        }
+                        tracing::debug!(
+                            "ValidatorList v{} from {} ({} bytes manifest, {} bytes blob)",
+                            vl.version.unwrap_or(0), from,
+                            vl.manifest.as_ref().map(|v| v.len()).unwrap_or(0),
+                            vl.blob.as_ref().map(|v| v.len()).unwrap_or(0)
+                        );
+                        // Try to extract validator count from blob JSON
+                        if let Some(blob_bytes) = vl.blob.as_ref() {
+                            if let Ok(decoded) = base64_decode_validator_blob(blob_bytes) {
+                                let _ = self.consensus_tx.send(
+                                    ConsensusMessage::ValidatorListReceived {
+                                        validator_count: decoded,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
+                    }
+                }
+            }
+            MessageType::ValidatorListCollection => {
+                match proto_convert::decode_validator_list_collection(payload) {
+                    Ok(vlc) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                        }
+                        tracing::debug!(
+                            "ValidatorListCollection v{} from {} ({} blobs)",
+                            vlc.version.unwrap_or(0), from, vlc.blobs.len()
+                        );
+                    }
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
+                    }
+                }
+            }
+            MessageType::Squelch => {
+                if let Some(ref info) = peer_info {
+                    info.reputation.record_valid_message(payload_len);
+                }
+                tracing::trace!("Squelch from {}", from);
+            }
+            MessageType::HaveTransactions => {
+                if let Some(ref info) = peer_info {
+                    info.reputation.record_valid_message(payload_len);
+                }
+                tracing::trace!("HaveTransactions from {}", from);
+            }
+            MessageType::Transactions => {
+                if let Some(ref info) = peer_info {
+                    info.reputation.record_valid_message(payload_len);
+                }
+                tracing::trace!("Transactions batch from {}", from);
             }
         }
     }
@@ -684,18 +908,13 @@ impl PeerManager {
             .max()
             .unwrap_or(0);
 
-        if self.ledger_syncer.needs_sync(our_seq, max_peer_seq) {
-            let requests = self.ledger_syncer.request_missing(our_seq, max_peer_seq);
-            for (seq, hash) in requests {
-                self.send_get_ledger(seq, hash);
-            }
-        }
-
-        // Check and retry timed-out requests
-        let timed_out = self.ledger_syncer.check_timeouts(std::time::Instant::now());
-        for seq in timed_out {
-            tracing::debug!("ledger sync request for #{} timed out, retrying", seq);
-            self.send_get_ledger(seq, None);
+        // Only request the latest ledger if no sync is active.
+        if self.ledger_syncer.needs_sync(our_seq, max_peer_seq)
+            && !self.ledger_syncer.has_any_incremental_sync()
+            && self.ledger_syncer.pending_count() == 0
+        {
+            // Request only the latest peer ledger, not all intermediary ones.
+            self.send_get_ledger(max_peer_seq, None);
         }
     }
 
@@ -725,6 +944,134 @@ impl PeerManager {
         }
     }
 
+    fn get_node_store(&self) -> Option<Arc<dyn rxrpl_shamap::NodeStore>> {
+        if let Some(ref store) = self.node_store {
+            return Some(Arc::clone(store));
+        }
+        // Fallback: try to get store from ledger provider's latest ledger.
+        self.ledger_provider
+            .as_ref()
+            .and_then(|p| p.latest_closed())
+            .and_then(|l| l.store().cloned())
+    }
+
+    /// Send a GetLedger request for account state nodes (liAS_NODE).
+    ///
+    /// Used as follow-up after receiving a liBASE response. Includes
+    /// specific node_ids from the incremental sync's missing list.
+    /// Uses the ledger hash (NOT the state root) as `ledger_hash` so
+    /// rippled can locate the correct ledger.
+    fn send_get_ledger_as_node(&mut self, seq: u32) {
+        let ledger_hash = match self.ledger_syncer.get_ledger_hash(seq) {
+            Some(h) => h,
+            None => return,
+        };
+
+        let missing = self.ledger_syncer.get_missing_node_ids(seq);
+        if missing.is_empty() {
+            return;
+        }
+
+        let node_ids: Vec<Vec<u8>> = missing
+            .iter()
+            .map(|mn| mn.node_id.to_wire_bytes())
+            .collect();
+
+        let num_ids = node_ids.len();
+        let min_depth = missing.iter().map(|mn| mn.node_id.depth()).min().unwrap_or(0);
+        let max_depth = missing.iter().map(|mn| mn.node_id.depth()).max().unwrap_or(0);
+
+        // Split requests across multiple peers so each gets a different subset.
+        let best = self.peer_set.best_peers_for_ledger(seq, 3);
+        let num_peers = best.len();
+        if num_peers == 0 {
+            return;
+        }
+        let chunk_size = (node_ids.len() + num_peers - 1) / num_peers;
+        let mut peers_used = 0;
+        for (i, node_id) in best.iter().enumerate() {
+            let chunk: Vec<Vec<u8>> = node_ids
+                .iter()
+                .skip(i * chunk_size)
+                .take(chunk_size)
+                .cloned()
+                .collect();
+            if chunk.is_empty() {
+                break;
+            }
+            let payload = proto_convert::encode_get_ledger_with_nodes(
+                LI_AS_NODE,
+                Some(&ledger_hash),
+                seq,
+                0,
+                chunk,
+            );
+            if let Some(handle) = self.peer_handles.get(node_id) {
+                let _ = handle.tx.try_send(PeerMessage {
+                    msg_type: MessageType::GetLedger,
+                    payload,
+                });
+                peers_used += 1;
+            }
+        }
+        tracing::debug!(
+            "sent GetLedger seq={} delta ({} node_ids across {} peers, depth={}-{})",
+            seq, num_ids, peers_used, min_depth, max_depth
+        );
+    }
+
+    /// Send TMGetObjectByHash requests to fetch missing nodes by content hash.
+    ///
+    /// This is a fallback used when tree-based incremental sync (GetLedger with
+    /// node_ids) gets stuck after repeated zero-add rounds. Instead of
+    /// requesting nodes by their SHAMapNodeID position, we request them
+    /// directly by their content hash via the GetObjects (type 42) message.
+    fn send_get_objects_by_hash(&self, seq: u32, content_hashes: &[Hash256]) {
+        let ledger_hash = match self.ledger_syncer.get_ledger_hash(seq) {
+            Some(h) => h,
+            None => return,
+        };
+
+        if content_hashes.is_empty() {
+            return;
+        }
+
+        // Split across multiple peers, similar to send_get_ledger_as_node.
+        let best = self.peer_set.best_peers_for_ledger(seq, 3);
+        let num_peers = best.len();
+        if num_peers == 0 {
+            tracing::warn!("no peers available for GetObjectByHash seq={}", seq);
+            return;
+        }
+
+        let chunk_size = (content_hashes.len() + num_peers - 1) / num_peers;
+        let mut peers_used = 0;
+        for (i, node_id) in best.iter().enumerate() {
+            let chunk: &[Hash256] = &content_hashes
+                [i * chunk_size..content_hashes.len().min((i + 1) * chunk_size)];
+            if chunk.is_empty() {
+                break;
+            }
+            let payload = proto_convert::encode_get_objects_by_hash(
+                &ledger_hash,
+                seq,
+                chunk,
+                false,
+            );
+            if let Some(handle) = self.peer_handles.get(node_id) {
+                let _ = handle.tx.try_send(PeerMessage {
+                    msg_type: MessageType::GetObjects,
+                    payload,
+                });
+                peers_used += 1;
+            }
+        }
+        tracing::info!(
+            "sent GetObjectByHash seq={} ({} hashes across {} peers, fallback for stuck sync)",
+            seq, content_hashes.len(), peers_used
+        );
+    }
+
     /// Send a GetLedger request to the best 3 peers by reputation score.
     ///
     /// Uses weighted peer selection: peers are ranked by reputation score with
@@ -733,46 +1080,37 @@ impl PeerManager {
     /// When the ledger syncer has an active incremental sync for the target
     /// sequence, the request includes specific node hashes (delta sync).
     /// Otherwise, falls back to requesting all leaf nodes.
-    fn send_get_ledger(&self, seq: u32, hash: Option<Hash256>) {
-        use rxrpl_p2p_proto::proto::tm_get_ledger::LedgerType;
+    fn send_get_ledger(&mut self, seq: u32, hash: Option<Hash256>) {
+        // Register request in the syncer so responses can be correlated.
+        self.ledger_syncer.register_request(seq, hash);
 
-        // Check if we have missing node hashes from an active incremental sync.
-        let node_ids: Vec<Vec<u8>> = self
-            .ledger_syncer
-            .get_missing_node_ids(seq)
-            .into_iter()
-            .map(|h| h.as_bytes().to_vec())
-            .collect();
+        let cookie = self.next_cookie.fetch_add(1, Ordering::Relaxed);
 
-        let is_delta = !node_ids.is_empty();
+        // liBASE requests fetch the ledger header only -- no delta node_ids.
         let payload = proto_convert::encode_get_ledger_with_nodes(
-            LedgerType::LtHash as i32,
+            LI_BASE,
             hash.as_ref(),
             seq,
-            false,
-            node_ids,
+            cookie,
+            Vec::new(),
         );
 
-        let best = self.peer_set.best_peers_for_ledger(seq, 3);
-        let mut sent = 0;
-        for node_id in &best {
+        // Send to a single peer.
+        let best = self.peer_set.best_peers_for_ledger(seq, 1);
+        if let Some(node_id) = best.first() {
             if let Some(handle) = self.peer_handles.get(node_id) {
-                let _ = handle.tx.try_send(PeerMessage {
+                match handle.tx.try_send(PeerMessage {
                     msg_type: MessageType::GetLedger,
-                    payload: payload.clone(),
-                });
-                sent += 1;
+                    payload,
+                }) {
+                    Ok(_) => {
+                        tracing::debug!("sent GetLedger seq={} itype=liBASE", seq);
+                    }
+                    Err(e) => tracing::warn!("failed to send GetLedger to {}: {}", node_id, e),
+                }
             }
-        }
-        if sent == 0 {
-            tracing::debug!("no peers available for GetLedger seq={}", seq);
-        } else if is_delta {
-            tracing::debug!(
-                "sent GetLedger seq={} to {} peers (delta sync, reputation-selected)",
-                seq, sent
-            );
         } else {
-            tracing::debug!("sent GetLedger seq={} to {} peers (reputation-selected)", seq, sent);
+            tracing::warn!("no peers available for GetLedger seq={}", seq);
         }
     }
 
@@ -793,18 +1131,26 @@ impl PeerManager {
             }
         };
 
-        use rxrpl_p2p_proto::proto::tm_get_ledger::LedgerType;
+        // TMLedgerInfoType: liBASE=0, liTX_NODE=1, liAS_NODE=2, liTS_CANDIDATE=3
+        const LT_CLOSED: i32 = 1;
+        const LT_VALIDATED: i32 = 2;
+        const LT_HASH: i32 = 3;
 
-        let ledger = match req.ledger_type {
-            x if x == LedgerType::LtClosed as i32 || x == LedgerType::LtValidated as i32 => {
+        let req_ledger_type = req.itype;
+        let req_ledger_hash = req.ledger_hash.unwrap_or_default();
+        let req_ledger_seq = req.ledger_seq.unwrap_or(0);
+        let req_cookie = req.request_cookie.unwrap_or(0);
+
+        let ledger = match req_ledger_type {
+            x if x == LT_CLOSED || x == LT_VALIDATED => {
                 provider.latest_closed()
             }
-            x if x == LedgerType::LtHash as i32 => {
-                if req.ledger_hash.len() >= 32 {
-                    let hash = Hash256::new(req.ledger_hash[..32].try_into().unwrap_or([0u8; 32]));
+            x if x == LT_HASH => {
+                if req_ledger_hash.len() >= 32 {
+                    let hash = Hash256::new(req_ledger_hash[..32].try_into().unwrap_or([0u8; 32]));
                     provider.get_by_hash(&hash)
-                } else if req.ledger_seq > 0 {
-                    provider.get_by_seq(req.ledger_seq)
+                } else if req_ledger_seq > 0 {
+                    provider.get_by_seq(req_ledger_seq)
                 } else {
                     None
                 }
@@ -818,10 +1164,10 @@ impl PeerManager {
                 tracing::debug!("GetLedger from {}: ledger not found", from);
                 let empty_response = proto_convert::encode_ledger_data(
                     &Hash256::ZERO,
-                    req.ledger_seq,
-                    req.ledger_type,
+                    req_ledger_seq,
+                    req_ledger_type,
                     vec![],
-                    0,
+                    req_cookie,
                 );
                 if let Some(handle) = self.peer_handles.get(&from) {
                     let _ = handle.tx.try_send(PeerMessage {
@@ -899,9 +1245,9 @@ impl PeerManager {
         let response = proto_convert::encode_ledger_data(
             &ledger.header.hash,
             ledger.header.sequence,
-            req.ledger_type,
+            req_ledger_type,
             nodes,
-            0,
+            req_cookie,
         );
 
         if let Some(handle) = self.peer_handles.get(&from) {
@@ -923,7 +1269,7 @@ async fn try_connect_outbound(
     ledger_hash: &RwLock<Hash256>,
     event_tx: &mpsc::UnboundedSender<PeerEvent>,
     peer_set: &PeerSet,
-    tls_client: &Arc<ClientConfig>,
+    tls_client: &Arc<SslConnector>,
 ) -> Result<Hash256, OverlayError> {
     let tcp = TcpStream::connect(addr)
         .await
@@ -933,12 +1279,11 @@ async fn try_connect_outbound(
         .await
         .map_err(|e| OverlayError::Connection(format!("TLS connect {addr}: {e}")))?;
 
-    let mut framed = Framed::new(stream, PeerCodec);
     let seq = ledger_seq.load(Ordering::Relaxed);
     let hash = *ledger_hash.read().await;
 
-    let peer_node_id =
-        handshake::handshake_outbound(&mut framed, identity, network_id, seq, &hash).await?;
+    let (peer_node_id, framed) =
+        handshake::handshake_outbound_http(stream, identity, network_id, seq, &hash).await?;
 
     if peer_set.get(&peer_node_id).is_some() {
         return Err(OverlayError::Handshake("already connected".into()));
@@ -977,18 +1322,17 @@ async fn try_accept_inbound(
     ledger_hash: &RwLock<Hash256>,
     event_tx: &mpsc::UnboundedSender<PeerEvent>,
     peer_set: &PeerSet,
-    tls_server: &Arc<ServerConfig>,
+    tls_server: &Arc<SslAcceptor>,
 ) -> Result<Hash256, OverlayError> {
     let stream = tls::accept_tls(tcp, tls_server)
         .await
         .map_err(|e| OverlayError::Connection(format!("TLS accept {addr}: {e}")))?;
 
-    let mut framed = Framed::new(stream, PeerCodec);
     let seq = ledger_seq.load(Ordering::Relaxed);
     let hash = *ledger_hash.read().await;
 
-    let peer_node_id =
-        handshake::handshake_inbound(&mut framed, identity, network_id, seq, &hash).await?;
+    let (peer_node_id, framed) =
+        handshake::handshake_inbound_http(stream, identity, network_id, seq, &hash).await?;
 
     if peer_set.get(&peer_node_id).is_some() {
         return Err(OverlayError::Handshake("already connected".into()));
@@ -1030,4 +1374,70 @@ fn spawn_peer_loops(
     tokio::spawn(peer_loop::run_peer_write_loop(write, rx));
 
     tx
+}
+
+/// Decode a validator list blob (base64-encoded JSON) and return the validator count.
+///
+/// The blob format is: `{"validators": [{"validation_public_key": "...", "manifest": "..."}, ...], ...}`
+fn base64_decode_validator_blob(blob_bytes: &[u8]) -> Result<usize, ()> {
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(blob_bytes)
+        .map_err(|_| ())?;
+    let json: serde_json::Value = serde_json::from_slice(&decoded).map_err(|_| ())?;
+    let validators = json.get("validators").and_then(|v| v.as_array()).ok_or(())?;
+    Ok(validators.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_validator_blob_extracts_count() {
+        use base64::Engine;
+        let json = serde_json::json!({
+            "sequence": 1,
+            "expiration": 999999999,
+            "validators": [
+                {"validation_public_key": "ED0001", "manifest": "AA=="},
+                {"validation_public_key": "ED0002", "manifest": "BB=="},
+                {"validation_public_key": "ED0003", "manifest": "CC=="},
+            ]
+        });
+        let blob = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&json).unwrap());
+        assert_eq!(base64_decode_validator_blob(blob.as_bytes()), Ok(3));
+    }
+
+    #[test]
+    fn decode_validator_blob_invalid_base64() {
+        assert_eq!(base64_decode_validator_blob(b"!!!invalid!!!"), Err(()));
+    }
+
+    #[test]
+    fn decode_validator_blob_no_validators_key() {
+        use base64::Engine;
+        let json = serde_json::json!({"sequence": 1});
+        let blob = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&json).unwrap());
+        assert_eq!(base64_decode_validator_blob(blob.as_bytes()), Err(()));
+    }
+
+    #[test]
+    fn quorum_auto_compute_from_validator_count() {
+        // Simulate the quorum calculation from node.rs:
+        // new_quorum = ceil(count * 0.8)
+        let count = 35usize;
+        let quorum = (count as f64 * 0.8).ceil() as usize;
+        assert_eq!(quorum, 28);
+
+        let count = 10usize;
+        let quorum = (count as f64 * 0.8).ceil() as usize;
+        assert_eq!(quorum, 8);
+
+        let count = 1usize;
+        let quorum = (count as f64 * 0.8).ceil() as usize;
+        assert_eq!(quorum, 1);
+    }
 }

@@ -12,10 +12,10 @@ pub struct PeerMessage {
 
 /// Length-delimited codec for peer protocol messages.
 ///
-/// Wire format: `[4-byte type BE][4-byte length BE][payload]`
+/// Wire format (rippled-compatible): `[4-byte length BE][2-byte type BE][payload]`
 pub struct PeerCodec;
 
-const HEADER_SIZE: usize = 8;
+const HEADER_SIZE: usize = 6;
 const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
 impl Decoder for PeerCodec {
@@ -27,8 +27,8 @@ impl Decoder for PeerCodec {
             return Ok(None);
         }
 
-        let msg_type_raw = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);
-        let length = u32::from_be_bytes([src[4], src[5], src[6], src[7]]) as usize;
+        let length = u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
+        let msg_type_raw = u16::from_be_bytes([src[4], src[5]]) as u32;
 
         if length > MAX_PAYLOAD_SIZE {
             return Err(std::io::Error::new(
@@ -45,14 +45,13 @@ impl Decoder for PeerCodec {
         src.advance(HEADER_SIZE);
         let payload = src.split_to(length).to_vec();
 
-        let msg_type = MessageType::from_u32(msg_type_raw).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unknown message type: {msg_type_raw}"),
-            )
-        })?;
-
-        Ok(Some(PeerMessage { msg_type, payload }))
+        match MessageType::from_u32(msg_type_raw) {
+            Some(msg_type) => Ok(Some(PeerMessage { msg_type, payload })),
+            None => {
+                // Unknown message type (compressed 0x8000 flag or newer rippled type) -- skip.
+                self.decode(src)
+            }
+        }
     }
 }
 
@@ -60,8 +59,8 @@ impl Encoder<PeerMessage> for PeerCodec {
     type Error = std::io::Error;
 
     fn encode(&mut self, item: PeerMessage, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        dst.put_u32(item.msg_type as u32);
         dst.put_u32(item.payload.len() as u32);
+        dst.put_u16(item.msg_type as u16);
         dst.extend_from_slice(&item.payload);
         Ok(())
     }
@@ -90,8 +89,8 @@ mod tests {
     #[test]
     fn partial_read() {
         let mut codec = PeerCodec;
-        let mut buf = BytesMut::from(&[0, 0, 0, 3][..]);
-        // Only 4 bytes, need 8 for header
+        let mut buf = BytesMut::from(&[0, 0, 0, 3, 0][..]);
+        // Only 5 bytes, need 6 for header
         assert!(codec.decode(&mut buf).unwrap().is_none());
     }
 }

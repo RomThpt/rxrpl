@@ -236,6 +236,7 @@ impl ConsensusSimulator {
             let engine = ConsensusEngine::new_with_unl(
                 adapter,
                 node_ids[i],
+                Vec::new(),
                 ConsensusParams::default(),
                 unl.clone(),
             );

@@ -196,6 +196,9 @@ enum Commands {
 
     /// Run a networked XRPL node with P2P overlay
     NetworkRun {
+        /// Genesis account address
+        #[arg(long, default_value = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")]
+        genesis_account: String,
         /// Ledger close interval in seconds
         #[arg(long, default_value = "10")]
         close_interval: u64,
@@ -357,6 +360,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::NetworkRun {
+            genesis_account,
             close_interval,
         } => {
             let mut config = if let Some(ref config_path) = cli.config {
@@ -367,7 +371,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(ref dir) = cli.data_dir {
                 config.database.path = dir.clone();
             }
-            return cmd_network_run(config, close_interval).await;
+            return cmd_network_run(config, &genesis_account, close_interval, &cli.url).await;
         }
 
         _ => {}
@@ -560,13 +564,17 @@ async fn cmd_node_run(
 
 async fn cmd_network_run(
     config: rxrpl_config::NodeConfig,
+    genesis_account: &str,
     close_interval: u64,
+    sync_rpc_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let node = rxrpl_node::Node::new(config)?;
+    let node = rxrpl_node::Node::new_standalone(config, genesis_account)?;
 
     eprintln!("Starting networked node...");
+    eprintln!("  Genesis account: {genesis_account}");
     eprintln!("  Close interval: {close_interval}s");
+    eprintln!("  Sync RPC: {sync_rpc_url}");
 
-    node.run_networked(close_interval).await?;
+    node.run_networked(close_interval, Some(sync_rpc_url)).await?;
     Ok(())
 }

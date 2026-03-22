@@ -40,9 +40,7 @@ pub async fn book_offers(params: Value, ctx: &Arc<ServerContext>) -> Result<Valu
             None => break,
         };
 
-        let page_json: Value = serde_json::from_slice(page_data).map_err(|e| {
-            RpcServerError::Internal(format!("failed to deserialize book dir: {e}"))
-        })?;
+        let page_json: Value = crate::handlers::common::decode_state_value(page_data)?;
 
         if let Some(indexes) = page_json.get("Indexes").and_then(|v| v.as_array()) {
             for idx_val in indexes {
@@ -55,9 +53,7 @@ pub async fn book_offers(params: Value, ctx: &Arc<ServerContext>) -> Result<Valu
                     .map_err(|e| RpcServerError::Internal(format!("invalid index: {e}")))?;
 
                 if let Some(entry_data) = ledger.get_state(&idx_hash) {
-                    let entry: Value = serde_json::from_slice(entry_data).map_err(|e| {
-                        RpcServerError::Internal(format!("failed to deserialize offer: {e}"))
-                    })?;
+                    let entry: Value = crate::handlers::common::decode_state_value(entry_data)?;
                     offers.push(entry);
                 }
             }

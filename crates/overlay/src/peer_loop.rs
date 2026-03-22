@@ -20,6 +20,10 @@ pub async fn run_peer_read_loop(
     loop {
         match read.next().await {
             Some(Ok(msg)) => {
+                tracing::debug!(
+                    "peer {} msg {:?} ({} bytes)",
+                    node_id, msg.msg_type, msg.payload.len()
+                );
                 let event = PeerEvent::Message {
                     from: node_id,
                     msg_type: msg.msg_type,
@@ -52,6 +56,7 @@ pub async fn run_peer_write_loop(
     mut rx: mpsc::Receiver<PeerMessage>,
 ) {
     while let Some(msg) = rx.recv().await {
+        tracing::debug!("sending {:?} ({} bytes)", msg.msg_type, msg.payload.len());
         if let Err(e) = write.send(msg).await {
             tracing::debug!("peer write error: {}", e);
             break;

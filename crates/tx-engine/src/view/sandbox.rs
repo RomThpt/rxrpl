@@ -210,15 +210,22 @@ pub struct SandboxChanges {
 
 impl SandboxChanges {
     /// Apply these changes to a ledger.
+    ///
+    /// JSON data from handlers is encoded to XRPL binary before storage
+    /// in the SHAMap, ensuring hash-compatible state with rippled.
     pub fn apply_to_ledger(
         self,
         ledger: &mut rxrpl_ledger::Ledger,
     ) -> Result<(), rxrpl_ledger::LedgerError> {
         for (key, data) in self.inserts {
-            ledger.put_state(key, data)?;
+            let binary = rxrpl_ledger::sle_codec::encode_sle(&data)
+                .map_err(|e| rxrpl_ledger::LedgerError::Codec(e.to_string()))?;
+            ledger.put_state(key, binary)?;
         }
         for (key, data) in self.updates {
-            ledger.put_state(key, data)?;
+            let binary = rxrpl_ledger::sle_codec::encode_sle(&data)
+                .map_err(|e| rxrpl_ledger::LedgerError::Codec(e.to_string()))?;
+            ledger.put_state(key, binary)?;
         }
         for (key, _) in self.deletes {
             ledger.delete_state(&key)?;

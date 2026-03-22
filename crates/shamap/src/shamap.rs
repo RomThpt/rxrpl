@@ -7,8 +7,17 @@ use crate::inner_node::InnerNode;
 use crate::iterator::{SHAMapIter, SHAMapRefIter};
 use crate::leaf_node::LeafNode;
 use crate::node::{SHAMapNode, SHAMapState};
-use crate::node_id::select_branch;
+use crate::node_id::{NodeId, select_branch};
 use crate::node_store::NodeStore;
+
+/// A node missing from the SHAMap during incremental sync.
+#[derive(Clone, Debug)]
+pub struct MissingNode {
+    /// Content hash for store operations.
+    pub hash: Hash256,
+    /// SHAMapNodeID for wire protocol (33 bytes: 32 path + 1 depth).
+    pub node_id: NodeId,
+}
 
 /// A difference entry between two SHAMaps.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -806,14 +815,17 @@ impl SHAMap {
         &self,
         target_root_hash: Hash256,
         max_count: usize,
-    ) -> Vec<Hash256> {
+    ) -> Vec<MissingNode> {
         if max_count == 0 {
             return Vec::new();
         }
 
         // If our tree is empty, we need the target root itself.
         if self.is_empty() {
-            return vec![target_root_hash];
+            return vec![MissingNode {
+                hash: target_root_hash,
+                node_id: NodeId::ROOT,
+            }];
         }
 
         let mut missing = Vec::new();
@@ -824,38 +836,53 @@ impl SHAMap {
                     &self.store,
                     self.leaf_ctor,
                     max_count,
+                    0,
+                    Hash256::ZERO,
                     &mut missing,
                 );
             }
-            SHAMapNode::Leaf(_) => {
-                // A leaf root means the tree is trivially complete.
-            }
+            SHAMapNode::Leaf(_) => {}
         }
         missing
     }
 
-    /// Recursively collect hashes of nodes that are referenced but not available.
+    /// Recursively collect nodes that are referenced but not available,
+    /// tracking the SHAMapNodeID (path + depth) for the wire protocol.
     fn collect_missing(
         inner: &InnerNode,
         store: &Option<Arc<dyn NodeStore>>,
         leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
         max_count: usize,
-        out: &mut Vec<Hash256>,
+        depth: u8,
+        path: Hash256,
+        out: &mut Vec<MissingNode>,
     ) {
         let mut mask = inner.branch_mask();
         while mask != 0 && out.len() < max_count {
             let branch = mask.trailing_zeros() as u8;
 
+            // Build child path: set the nibble at `depth` to `branch`.
+            let mut child_path = *path.as_bytes();
+            let byte_idx = (depth / 2) as usize;
+            if depth & 1 == 0 {
+                child_path[byte_idx] = (child_path[byte_idx] & 0x0F) | (branch << 4);
+            } else {
+                child_path[byte_idx] = (child_path[byte_idx] & 0xF0) | branch;
+            }
+            let child_key = Hash256::new(child_path);
+            let child_node_id = NodeId::new(depth + 1, &child_key);
+
             // Try to get the child: first check if loaded, then try store.
             if inner.child(branch).is_some() {
-                // Already loaded -- recurse if it is an inner node.
                 if let Some(child) = inner.child(branch) {
                     if let SHAMapNode::Inner(child_inner) = child.as_ref() {
-                        Self::collect_missing(child_inner, store, leaf_ctor, max_count, out);
+                        Self::collect_missing(
+                            child_inner, store, leaf_ctor, max_count,
+                            depth + 1, child_key, out,
+                        );
                     }
                 }
             } else {
-                // Not loaded -- check if the store can provide it.
                 let child_hash = inner.child_hash(branch);
                 let available = store
                     .as_ref()
@@ -863,10 +890,11 @@ impl SHAMap {
                     .flatten()
                     .is_some();
                 if !available {
-                    out.push(child_hash);
+                    out.push(MissingNode {
+                        hash: child_hash,
+                        node_id: child_node_id,
+                    });
                 } else {
-                    // Available in store but not loaded. Try to deserialize and
-                    // recurse into it if it is an inner node to find deeper gaps.
                     if let Some(s) = store.as_ref() {
                         if let Ok(Some(data)) = s.fetch(&child_hash) {
                             if let Ok(node) =
@@ -874,7 +902,8 @@ impl SHAMap {
                             {
                                 if let SHAMapNode::Inner(child_inner) = &node {
                                     Self::collect_missing(
-                                        child_inner, store, leaf_ctor, max_count, out,
+                                        child_inner, store, leaf_ctor, max_count,
+                                        depth + 1, child_key, out,
                                     );
                                 }
                             }

@@ -419,7 +419,8 @@ mod tests {
             "OwnerCount": 0,
             "Flags": 0,
         });
-        let data = serde_json::to_vec(&account).unwrap();
+        let json_bytes = serde_json::to_vec(&account).unwrap();
+        let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes).unwrap();
         ledger.put_state(key, data).unwrap();
         ledger
     }
@@ -474,7 +475,7 @@ mod tests {
         let account_id = decode_account_id("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh").unwrap();
         let key = keylet::account(&account_id);
         let data = ledger.get_state(&key).unwrap();
-        let account: Value = serde_json::from_slice(data).unwrap();
+        let account: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
         assert_eq!(account["Balance"].as_str().unwrap(), "999990");
     }
 
@@ -493,7 +494,7 @@ mod tests {
         let account_id = decode_account_id("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh").unwrap();
         let key = keylet::account(&account_id);
         let data = ledger.get_state(&key).unwrap();
-        let account: Value = serde_json::from_slice(data).unwrap();
+        let account: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
         assert_eq!(account["Balance"].as_str().unwrap(), "999990");
     }
 
@@ -594,9 +595,9 @@ mod tests {
                 "OwnerCount": 0,
                 "Flags": 0,
             });
-            ledger
-                .put_state(key, serde_json::to_vec(&account).unwrap())
-                .unwrap();
+            let json_bytes = serde_json::to_vec(&account).unwrap();
+            let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes).unwrap();
+            ledger.put_state(key, data).unwrap();
         }
         ledger
     }
@@ -635,14 +636,14 @@ mod tests {
         // Check balances: genesis lost outer fee (10) + inner fee (12) + payment (5M)
         let gid = decode_account_id(GENESIS).unwrap();
         let gdata = ledger.get_state(&keylet::account(&gid)).unwrap();
-        let gobj: Value = serde_json::from_slice(gdata).unwrap();
+        let gobj: Value = rxrpl_ledger::sle_codec::decode_state(gdata).unwrap();
         let genesis_balance: u64 = gobj["Balance"].as_str().unwrap().parse().unwrap();
         assert_eq!(genesis_balance, 1_000_000_000 - 10 - 12 - 5_000_000);
 
         // Dest gained 5M
         let did = decode_account_id(DEST).unwrap();
         let ddata = ledger.get_state(&keylet::account(&did)).unwrap();
-        let dobj: Value = serde_json::from_slice(ddata).unwrap();
+        let dobj: Value = rxrpl_ledger::sle_codec::decode_state(ddata).unwrap();
         let dest_balance: u64 = dobj["Balance"].as_str().unwrap().parse().unwrap();
         assert_eq!(dest_balance, 10_000_000 + 5_000_000);
     }
@@ -692,7 +693,7 @@ mod tests {
         // Genesis: -20 (outer fee) -12 -1M -12 -2M
         let gid = decode_account_id(GENESIS).unwrap();
         let gdata = ledger.get_state(&keylet::account(&gid)).unwrap();
-        let gobj: Value = serde_json::from_slice(gdata).unwrap();
+        let gobj: Value = rxrpl_ledger::sle_codec::decode_state(gdata).unwrap();
         let genesis_balance: u64 = gobj["Balance"].as_str().unwrap().parse().unwrap();
         assert_eq!(
             genesis_balance,
@@ -702,7 +703,7 @@ mod tests {
         // Dest: +1M +2M
         let did = decode_account_id(DEST).unwrap();
         let ddata = ledger.get_state(&keylet::account(&did)).unwrap();
-        let dobj: Value = serde_json::from_slice(ddata).unwrap();
+        let dobj: Value = rxrpl_ledger::sle_codec::decode_state(ddata).unwrap();
         let dest_balance: u64 = dobj["Balance"].as_str().unwrap().parse().unwrap();
         assert_eq!(dest_balance, 10_000_000 + 1_000_000 + 2_000_000);
     }
@@ -754,7 +755,7 @@ mod tests {
         // Genesis balance: only outer fee deducted (child sandbox rolled back)
         let gid = decode_account_id(GENESIS).unwrap();
         let gdata = ledger.get_state(&keylet::account(&gid)).unwrap();
-        let gobj: Value = serde_json::from_slice(gdata).unwrap();
+        let gobj: Value = rxrpl_ledger::sle_codec::decode_state(gdata).unwrap();
         let genesis_balance: u64 = gobj["Balance"].as_str().unwrap().parse().unwrap();
         assert_eq!(genesis_balance, 1_000_000_000 - 20);
     }

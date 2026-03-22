@@ -26,7 +26,7 @@ fn read_account_balance(ledger: &Ledger, address: &str) -> u64 {
     let account_id = decode_account_id(address).unwrap();
     let key = keylet::account(&account_id);
     let data = ledger.get_state(&key).unwrap();
-    let account: Value = serde_json::from_slice(data).unwrap();
+    let account: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
     account["Balance"].as_str().unwrap().parse::<u64>().unwrap()
 }
 
