@@ -589,23 +589,33 @@ impl PeerManager {
                             tracing::debug!("ignoring LedgerData for already-synced #{}", ledger_seq);
                         } else if self.ledger_syncer.has_incremental_sync(ledger_seq) {
                             // Active incremental sync: feed nodes into SHAMap.
-                            if let Some(leaves) =
-                                self.ledger_syncer.feed_nodes(ledger_seq, &nodes)
-                            {
-                                tracing::info!(
-                                    "incremental sync complete for ledger #{} ({} leaf nodes)",
-                                    ledger_seq, leaves.len()
-                                );
-                                self.ledger_syncer.mark_synced(ledger_seq);
-                                // Forward leaf nodes to node layer for reconstruction.
-                                let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
-                                    hash,
-                                    seq: ledger_seq,
-                                    nodes: leaves,
-                                });
-                            } else {
-                                // Request next batch of missing nodes.
-                                self.send_get_ledger_as_node(ledger_seq);
+                            use crate::ledger_sync::FeedResult;
+                            match self.ledger_syncer.feed_nodes(ledger_seq, &nodes) {
+                                FeedResult::Complete(leaves) => {
+                                    tracing::info!(
+                                        "incremental sync complete for ledger #{} ({} leaf nodes)",
+                                        ledger_seq, leaves.len()
+                                    );
+                                    self.ledger_syncer.mark_synced(ledger_seq);
+                                    let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
+                                        hash,
+                                        seq: ledger_seq,
+                                        nodes: leaves,
+                                    });
+                                }
+                                FeedResult::FallbackToHashFetch(content_hashes) => {
+                                    // Tree-based sync stuck; try fetching by content hash.
+                                    self.send_get_objects_by_hash(ledger_seq, &content_hashes);
+                                    // Also keep trying tree-based sync in parallel.
+                                    self.send_get_ledger_as_node(ledger_seq);
+                                }
+                                FeedResult::Continue => {
+                                    // Request next batch of missing nodes.
+                                    self.send_get_ledger_as_node(ledger_seq);
+                                }
+                                FeedResult::Removed => {
+                                    // Sync was abandoned.
+                                }
                             }
                         } else if !nodes.is_empty() {
                             // No active sync: try to parse as liBASE header.
@@ -750,8 +760,71 @@ impl PeerManager {
                 if let Some(ref info) = peer_info {
                     info.reputation.record_valid_message(payload_len);
                 }
-                tracing::debug!("GetObjectByHash from {} ({} bytes)", from, payload_len);
-                // TODO: implement object serving
+                match proto_convert::decode_get_objects(payload) {
+                    Ok(msg) => {
+                        let is_response = !msg.query.unwrap_or(true);
+                        if is_response && !msg.objects.is_empty() {
+                            // This is a response to our TMGetObjectByHash request.
+                            // Extract (hash, data) pairs and feed into incremental sync.
+                            let ledger_seq = msg.seq.unwrap_or(0);
+                            let nodes: Vec<(Vec<u8>, Vec<u8>)> = msg
+                                .objects
+                                .into_iter()
+                                .filter_map(|obj| {
+                                    let hash = obj.hash.unwrap_or_default();
+                                    let data = obj.data.unwrap_or_default();
+                                    if !hash.is_empty() && !data.is_empty() {
+                                        Some((hash, data))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            tracing::info!(
+                                "received GetObjectByHash response from {} ({} objects for #{})",
+                                from, nodes.len(), ledger_seq
+                            );
+                            if self.ledger_syncer.has_incremental_sync(ledger_seq) {
+                                use crate::ledger_sync::FeedResult;
+                                let ledger_hash = self.ledger_syncer.get_ledger_hash(ledger_seq);
+                                let hash = ledger_hash.unwrap_or(Hash256::ZERO);
+                                match self.ledger_syncer.feed_nodes(ledger_seq, &nodes) {
+                                    FeedResult::Complete(leaves) => {
+                                        tracing::info!(
+                                            "incremental sync complete (via hash fallback) for #{} ({} leaves)",
+                                            ledger_seq, leaves.len()
+                                        );
+                                        self.ledger_syncer.mark_synced(ledger_seq);
+                                        let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
+                                            hash,
+                                            seq: ledger_seq,
+                                            nodes: leaves,
+                                        });
+                                    }
+                                    FeedResult::FallbackToHashFetch(content_hashes) => {
+                                        self.send_get_objects_by_hash(ledger_seq, &content_hashes);
+                                    }
+                                    FeedResult::Continue => {
+                                        self.send_get_ledger_as_node(ledger_seq);
+                                    }
+                                    FeedResult::Removed => {}
+                                }
+                            }
+                        } else {
+                            tracing::debug!(
+                                "GetObjectByHash query from {} ({} objects requested)",
+                                from, msg.objects.len()
+                            );
+                            // TODO: serve requested objects from our store
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("bad GetObjectByHash from {}: {}", from, e);
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
+                    }
+                }
             }
             MessageType::ValidatorList => {
                 match proto_convert::decode_validator_list(payload) {
@@ -944,6 +1017,58 @@ impl PeerManager {
         tracing::debug!(
             "sent GetLedger seq={} delta ({} node_ids across {} peers, depth={}-{})",
             seq, num_ids, peers_used, min_depth, max_depth
+        );
+    }
+
+    /// Send TMGetObjectByHash requests to fetch missing nodes by content hash.
+    ///
+    /// This is a fallback used when tree-based incremental sync (GetLedger with
+    /// node_ids) gets stuck after repeated zero-add rounds. Instead of
+    /// requesting nodes by their SHAMapNodeID position, we request them
+    /// directly by their content hash via the GetObjects (type 42) message.
+    fn send_get_objects_by_hash(&self, seq: u32, content_hashes: &[Hash256]) {
+        let ledger_hash = match self.ledger_syncer.get_ledger_hash(seq) {
+            Some(h) => h,
+            None => return,
+        };
+
+        if content_hashes.is_empty() {
+            return;
+        }
+
+        // Split across multiple peers, similar to send_get_ledger_as_node.
+        let best = self.peer_set.best_peers_for_ledger(seq, 3);
+        let num_peers = best.len();
+        if num_peers == 0 {
+            tracing::warn!("no peers available for GetObjectByHash seq={}", seq);
+            return;
+        }
+
+        let chunk_size = (content_hashes.len() + num_peers - 1) / num_peers;
+        let mut peers_used = 0;
+        for (i, node_id) in best.iter().enumerate() {
+            let chunk: &[Hash256] = &content_hashes
+                [i * chunk_size..content_hashes.len().min((i + 1) * chunk_size)];
+            if chunk.is_empty() {
+                break;
+            }
+            let payload = proto_convert::encode_get_objects_by_hash(
+                &ledger_hash,
+                seq,
+                chunk,
+                false,
+            );
+            if let Some(handle) = self.peer_handles.get(node_id) {
+                let _ = handle.tx.try_send(PeerMessage {
+                    msg_type: MessageType::GetObjects,
+                    payload,
+                });
+                peers_used += 1;
+            }
+        }
+        tracing::info!(
+            "sent GetObjectByHash seq={} ({} hashes across {} peers, fallback for stuck sync)",
+            seq, content_hashes.len(), peers_used
         );
     }
 

@@ -11,12 +11,27 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DELTA_NODES_PER_REQUEST: usize = 512;
 /// Maximum number of sync rounds before giving up on incremental sync.
 const MAX_INCREMENTAL_ROUNDS: u32 = 50;
+/// Number of consecutive zero-add rounds before falling back to hash-based fetch.
+const HASH_FALLBACK_THRESHOLD: u32 = 5;
 
 /// Data received from a synced ledger.
 pub struct SyncedLedgerData {
     pub seq: u32,
     pub hash: Hash256,
     pub nodes: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Result of feeding nodes into an incremental sync.
+pub enum FeedResult {
+    /// Sync is still in progress; continue with tree-based requests.
+    Continue,
+    /// Sync is complete; contains the extracted leaf nodes.
+    Complete(Vec<(Vec<u8>, Vec<u8>)>),
+    /// Tree-based sync is stuck after repeated zero-add rounds.
+    /// Contains the content hashes of missing nodes for hash-based fallback.
+    FallbackToHashFetch(Vec<Hash256>),
+    /// Sync was removed (gave up or not found).
+    Removed,
 }
 
 /// A ledger being synced incrementally via delta sync.
@@ -233,17 +248,20 @@ impl LedgerSyncer {
 
     /// Feed received nodes into an active incremental sync.
     ///
-    /// Returns `Some(leaf_nodes)` if the sync is now complete (all nodes resolved),
-    /// where `leaf_nodes` are the (key, data) pairs from the completed SHAMap.
-    /// Returns `None` if the sync is still in progress or no sync is active.
+    /// Returns a `FeedResult` indicating the sync state:
+    /// - `Complete(leaves)` if the sync finished (all nodes resolved).
+    /// - `FallbackToHashFetch(hashes)` if the tree-based sync is stuck and
+    ///   should be retried via TMGetObjectByHash with content hashes.
+    /// - `Continue` if the sync is still in progress.
+    /// - `Removed` if the sync was abandoned or not found.
     pub fn feed_nodes(
         &mut self,
         seq: u32,
         nodes: &[(Vec<u8>, Vec<u8>)],
-    ) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    ) -> FeedResult {
         let entry = match self.incremental.get_mut(&seq) {
             Some(e) => e,
-            None => return None,
+            None => return FeedResult::Removed,
         };
 
         let mut added = 0;
@@ -320,13 +338,30 @@ impl LedgerSyncer {
                     seq, entry.zero_rounds
                 );
                 self.incremental.remove(&seq);
-                return None;
+                return FeedResult::Removed;
+            }
+
+            // After HASH_FALLBACK_THRESHOLD zero-add rounds, signal a fallback
+            // to TMGetObjectByHash using content hashes instead of SHAMap node IDs.
+            if entry.zero_rounds >= HASH_FALLBACK_THRESHOLD && entry.zero_rounds % HASH_FALLBACK_THRESHOLD == 0 {
+                let missing = entry
+                    .map
+                    .missing_nodes(entry.hash, MAX_DELTA_NODES_PER_REQUEST);
+                if !missing.is_empty() {
+                    let content_hashes: Vec<Hash256> =
+                        missing.iter().map(|mn| mn.hash).collect();
+                    tracing::info!(
+                        "sync #{} stuck for {} zero-add rounds, falling back to hash-based fetch ({} hashes)",
+                        seq, entry.zero_rounds, content_hashes.len()
+                    );
+                    return FeedResult::FallbackToHashFetch(content_hashes);
+                }
             }
         }
 
         // A tree with an empty root is never complete (it needs the root first).
         if entry.map.is_empty() {
-            return None;
+            return FeedResult::Continue;
         }
 
         // Check if the tree is now complete.
@@ -342,9 +377,9 @@ impl LedgerSyncer {
             entry.map.for_each(&mut |key, data| {
                 leaves.push((key.as_bytes().to_vec(), data.to_vec()));
             });
-            Some(leaves)
+            FeedResult::Complete(leaves)
         } else {
-            None
+            FeedResult::Continue
         }
     }
 

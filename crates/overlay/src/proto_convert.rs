@@ -468,6 +468,46 @@ pub fn decode_have_set(data: &[u8]) -> Result<HaveSetData, OverlayError> {
 
 // --- GetObjectByHash (type 42) ---
 
+/// rippled ObjectType enum values for TMGetObjectByHash.type.
+/// otLEDGER_NODE = 3: request SHAMap tree nodes by content hash.
+const OT_LEDGER_NODE: i32 = 3;
+
+/// Encode a TMGetObjectByHash request to fetch SHAMap nodes by content hash.
+///
+/// This is used as a fallback when tree-based incremental sync gets stuck:
+/// instead of requesting nodes by their SHAMapNodeID position in the tree,
+/// we request them directly by their content hash (SHA-512-Half of the
+/// serialized node data).
+pub fn encode_get_objects_by_hash(
+    ledger_hash: &Hash256,
+    ledger_seq: u32,
+    content_hashes: &[Hash256],
+    fat: bool,
+) -> Vec<u8> {
+    use rxrpl_p2p_proto::proto::TmIndexedObject;
+
+    let objects: Vec<TmIndexedObject> = content_hashes
+        .iter()
+        .map(|h| TmIndexedObject {
+            hash: Some(h.as_bytes().to_vec()),
+            node_id: None,
+            index: None,
+            data: None,
+            ledger_seq: Some(ledger_seq),
+        })
+        .collect();
+
+    let msg = TmGetObjectByHash {
+        r#type: Some(OT_LEDGER_NODE),
+        query: Some(true),
+        seq: Some(ledger_seq),
+        ledger_hash: Some(ledger_hash.as_bytes().to_vec()),
+        fat: Some(fat),
+        objects,
+    };
+    msg.encode_to_vec()
+}
+
 pub fn decode_get_objects(data: &[u8]) -> Result<TmGetObjectByHash, OverlayError> {
     TmGetObjectByHash::decode(data)
         .map_err(|e| OverlayError::Codec(format!("decode GetObjects: {e}")))
