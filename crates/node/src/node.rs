@@ -495,6 +495,19 @@ impl Node {
                         "bootstrapped from RPC: validated ledger #{} hash={}, open ledger #{}",
                         seq, hash, seq + 1
                     );
+
+                    // Download the full state tree via RPC to pre-populate the store.
+                    if let Some(ref store) = self.node_store {
+                        let hash_hex = hex::encode(hash.as_bytes());
+                        match Self::download_state_via_rpc(rpc_url, &hash_hex, Arc::clone(store)).await {
+                            Ok(count) => {
+                                tracing::info!("pre-populated store with {} state entries via RPC", count);
+                            }
+                            Err(e) => {
+                                tracing::warn!("RPC state download failed (P2P sync will be used): {}", e);
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("RPC bootstrap failed (starting from genesis): {}", e);
@@ -1543,6 +1556,108 @@ impl Node {
         let hash = Hash256::new(arr);
 
         Ok((seq, hash))
+    }
+
+    /// Download the full state tree for a ledger via RPC `ledger_data` pagination.
+    ///
+    /// Stores all nodes in the provided NodeStore so the P2P sync can use them.
+    async fn download_state_via_rpc(
+        rpc_url: &str,
+        ledger_hash: &str,
+        store: Arc<dyn NodeStore>,
+    ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .danger_accept_invalid_certs(true)
+            .build()?;
+
+        let mut marker: Option<String> = None;
+        let mut total = 0u32;
+        let mut page = 0u32;
+
+        loop {
+            let mut params = serde_json::json!({
+                "ledger_hash": ledger_hash,
+                "binary": true,
+                "limit": 2048
+            });
+            if let Some(ref m) = marker {
+                params["marker"] = serde_json::Value::String(m.clone());
+            }
+
+            let resp = client
+                .post(rpc_url)
+                .json(&serde_json::json!({
+                    "method": "ledger_data",
+                    "params": [params]
+                }))
+                .send()
+                .await?
+                .json::<serde_json::Value>()
+                .await?;
+
+            let result = resp.get("result")
+                .ok_or("missing result in ledger_data response")?;
+
+            let state = result.get("state")
+                .and_then(|s| s.as_array())
+                .ok_or("missing state array in ledger_data response")?;
+
+            if state.is_empty() {
+                break;
+            }
+
+            let mut batch: Vec<(Hash256, Vec<u8>)> = Vec::with_capacity(state.len());
+            for entry in state {
+                let index = entry.get("index")
+                    .and_then(|v| v.as_str())
+                    .ok_or("missing index")?;
+                let data_hex = entry.get("data")
+                    .and_then(|v| v.as_str())
+                    .ok_or("missing data")?;
+
+                let key_bytes = hex::decode(index)?;
+                let data_bytes = hex::decode(data_hex)?;
+
+                if key_bytes.len() != 32 {
+                    continue;
+                }
+
+                // Store as key(32) || data for deserialize_node compatibility.
+                let mut raw = Vec::with_capacity(32 + data_bytes.len());
+                raw.extend_from_slice(&key_bytes);
+                raw.extend_from_slice(&data_bytes);
+
+                // Compute content hash: SHA-512-Half("MLN\0" || raw)
+                let prefix: [u8; 4] = [0x4D, 0x4C, 0x4E, 0x00];
+                let hash = rxrpl_crypto::sha512_half::sha512_half(&[&prefix, &raw]);
+
+                batch.push((hash, raw));
+            }
+
+            let count = batch.len();
+            let refs: Vec<(&Hash256, &[u8])> = batch.iter()
+                .map(|(h, d)| (h, d.as_slice()))
+                .collect();
+            store.store_batch(&refs)?;
+            total += count as u32;
+
+            page += 1;
+            if page % 10 == 0 {
+                tracing::info!("RPC state download: {} entries ({} pages)", total, page);
+            }
+
+            marker = result.get("marker")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            if marker.is_none() {
+                break;
+            }
+        }
+
+        tracing::info!("RPC state download complete: {} entries in {} pages", total, page);
+        Ok(total)
     }
 }
 
