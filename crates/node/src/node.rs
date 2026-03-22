@@ -1565,13 +1565,15 @@ impl Node {
         store: Arc<dyn NodeStore>,
     ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .danger_accept_invalid_certs(true)
             .build()?;
 
         let mut marker: Option<String> = None;
         let mut total = 0u32;
         let mut page = 0u32;
+        let mut retries = 0u32;
         let start = std::time::Instant::now();
 
         loop {
@@ -1584,18 +1586,42 @@ impl Node {
                 params["marker"] = serde_json::Value::String(m.clone());
             }
 
-            let resp = client
+            let resp = match client
                 .post(rpc_url)
                 .json(&serde_json::json!({
                     "method": "ledger_data",
                     "params": [params]
                 }))
                 .send()
-                .await?
-                .json::<serde_json::Value>()
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    retries += 1;
+                    if retries > 5 {
+                        return Err(format!("too many retries: {}", e).into());
+                    }
+                    tracing::warn!("RPC request failed (retry {}): {}", retries, e);
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
 
-            let result = resp.get("result")
+            let body = match resp.json::<serde_json::Value>().await {
+                Ok(v) => v,
+                Err(e) => {
+                    retries += 1;
+                    if retries > 5 {
+                        return Err(format!("too many retries: {}", e).into());
+                    }
+                    tracing::warn!("RPC response decode failed (retry {}): {}", retries, e);
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            retries = 0;
+
+            let result = body.get("result")
                 .ok_or("missing result in ledger_data response")?;
 
             if let Some(err) = result.get("error") {
@@ -1649,7 +1675,7 @@ impl Node {
             total += count as u32;
             page += 1;
 
-            if page % 50 == 0 {
+            if page % 100 == 0 {
                 let elapsed = start.elapsed().as_secs();
                 let rate = if elapsed > 0 { total as u64 / elapsed } else { 0 };
                 tracing::info!(
