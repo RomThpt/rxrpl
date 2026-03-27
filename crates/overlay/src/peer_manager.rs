@@ -23,6 +23,7 @@ use crate::ledger_provider::LedgerProvider;
 use crate::ledger_sync::LedgerSyncer;
 use crate::peer_handle::PeerHandle;
 use crate::peer_loop;
+use crate::peer_score::PeerScore;
 use crate::peer_set::{PeerInfo, PeerSet};
 use crate::proto_convert;
 use crate::relay::RelayFilter;
@@ -235,6 +236,7 @@ impl PeerManager {
                 }
 
                 _ = reputation_interval.tick() => {
+                    self.peer_set.apply_score_decay();
                     self.check_peer_reputations();
                 }
             }
@@ -1295,6 +1297,7 @@ async fn try_connect_outbound(
         inbound: false,
         ledger_seq: AtomicU32::new(0),
         reputation: PeerReputation::new(),
+        scoring: PeerScore::new(),
     });
 
     if !peer_set.add(Arc::clone(&info)) {
@@ -1344,6 +1347,7 @@ async fn try_accept_inbound(
         inbound: true,
         ledger_seq: AtomicU32::new(0),
         reputation: PeerReputation::new(),
+        scoring: PeerScore::new(),
     });
 
     if !peer_set.add(Arc::clone(&info)) {
