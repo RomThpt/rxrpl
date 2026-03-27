@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// All 78 RPC methods supported by the XRPL.
+/// All 90 RPC methods supported by the XRPL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Method {
@@ -16,6 +16,7 @@ pub enum Method {
     AccountNftsByIssuer,
     GatewayBalances,
     NorippleCheck,
+    OwnerInfo,
 
     // Ledger methods
     Ledger,
@@ -31,6 +32,7 @@ pub enum Method {
     SubmitMultisigned,
     Sign,
     SignFor,
+    SignAndSubmit,
     TransactionEntry,
     Simulate,
 
@@ -47,7 +49,9 @@ pub enum Method {
     ServerSubscribe,
     Fee,
     Feature,
+    Health,
     Manifest,
+    Metrics,
     Ping,
     Random,
 
@@ -56,6 +60,7 @@ pub enum Method {
     NftSellOffers,
     NftInfo,
     NftHistory,
+    NftOffer,
 
     // Subscription methods
     Subscribe,
@@ -67,6 +72,7 @@ pub enum Method {
 
     // Utility methods
     WalletPropose,
+    WalletSeed,
     DepositAuthorized,
     GetAggregatePrice,
 
@@ -89,7 +95,15 @@ pub enum Method {
     Print,
     CanDelete,
     Crawl,
+    CrawlShards,
     TxReduceRelay,
+    Blacklist,
+    Internal,
+
+    // Shard management
+    DownloadShard,
+    NodeToShard,
+    ShardInfo,
 
     // Ledger management
     LedgerHeader,
@@ -122,6 +136,7 @@ impl Method {
             Self::AccountNftsByIssuer => "account_nfts_by_issuer",
             Self::GatewayBalances => "gateway_balances",
             Self::NorippleCheck => "noripple_check",
+            Self::OwnerInfo => "owner_info",
             Self::Ledger => "ledger",
             Self::LedgerAccept => "ledger_accept",
             Self::LedgerEntry => "ledger_entry",
@@ -133,6 +148,7 @@ impl Method {
             Self::SubmitMultisigned => "submit_multisigned",
             Self::Sign => "sign",
             Self::SignFor => "sign_for",
+            Self::SignAndSubmit => "sign_and_submit",
             Self::TransactionEntry => "transaction_entry",
             Self::Simulate => "simulate",
             Self::BookOffers => "book_offers",
@@ -145,18 +161,22 @@ impl Method {
             Self::ServerSubscribe => "server_subscribe",
             Self::Fee => "fee",
             Self::Feature => "feature",
+            Self::Health => "health",
             Self::Manifest => "manifest",
+            Self::Metrics => "metrics",
             Self::Ping => "ping",
             Self::Random => "random",
             Self::NftBuyOffers => "nft_buy_offers",
             Self::NftSellOffers => "nft_sell_offers",
             Self::NftInfo => "nft_info",
             Self::NftHistory => "nft_history",
+            Self::NftOffer => "nft_offer",
             Self::Subscribe => "subscribe",
             Self::Unsubscribe => "unsubscribe",
             Self::ChannelAuthorize => "channel_authorize",
             Self::ChannelVerify => "channel_verify",
             Self::WalletPropose => "wallet_propose",
+            Self::WalletSeed => "wallet_seed",
             Self::DepositAuthorized => "deposit_authorized",
             Self::GetAggregatePrice => "get_aggregate_price",
             Self::Stop => "stop",
@@ -177,7 +197,13 @@ impl Method {
             Self::Print => "print",
             Self::CanDelete => "can_delete",
             Self::Crawl => "crawl",
+            Self::CrawlShards => "crawl_shards",
             Self::TxReduceRelay => "tx_reduce_relay",
+            Self::Blacklist => "blacklist",
+            Self::Internal => "internal",
+            Self::DownloadShard => "download_shard",
+            Self::NodeToShard => "node_to_shard",
+            Self::ShardInfo => "shard_info",
             Self::LedgerHeader => "ledger_header",
             Self::LedgerRequest => "ledger_request",
             Self::LedgerCleaner => "ledger_cleaner",

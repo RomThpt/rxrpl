@@ -51,6 +51,7 @@ pub fn is_admin_method(method: &str) -> bool {
             | "validation_seed"
             | "validator_info"
             | "crawl"
+            | "crawl_shards"
             | "tx_reduce_relay"
             | "ledger_accept"
             | "ledger_cleaner"
@@ -67,6 +68,13 @@ pub fn is_admin_method(method: &str) -> bool {
             | "ledger_diff"
             | "get_counts"
             | "unl_list"
+            | "download_shard"
+            | "node_to_shard"
+            | "shard_info"
+            | "wallet_seed"
+            | "internal"
+            | "blacklist"
+            | "metrics"
     )
 }
 
