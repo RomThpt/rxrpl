@@ -1,36 +1,108 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rxrpl::Wallet;
 use serde_json::Value;
 
+/// Log verbosity levels.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl std::fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            LogLevel::Trace => "trace",
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+        };
+        f.write_str(s)
+    }
+}
+
 #[derive(Parser)]
-#[command(name = "rxrpl", about = "XRPL node and client toolchain", version)]
+#[command(
+    name = "rxrpl",
+    about = "XRPL node and client toolchain",
+    version,
+    long_about = "rxrpl -- a Rust implementation of the XRP Ledger protocol.\n\n\
+        Run a standalone or networked XRPL node, query ledger data,\n\
+        manage wallets, and submit transactions from the command line."
+)]
 struct Cli {
-    /// XRPL node URL
+    /// XRPL node URL for client commands
     #[arg(long, default_value = "https://s1.ripple.com:51234")]
     url: String,
 
     /// Path to configuration file (TOML)
-    #[arg(long, global = true)]
+    #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 
-    /// Log level (error, warn, info, debug, trace)
-    #[arg(long, global = true, default_value = "info")]
-    log_level: String,
+    /// Log level
+    #[arg(short, long, global = true, default_value = "info", value_enum)]
+    log_level: LogLevel,
 
     /// Data directory override
-    #[arg(long, global = true)]
+    #[arg(short = 'D', long, global = true)]
     data_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
 }
 
+/// Node run modes.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RunMode {
+    /// Standalone single-node mode (no P2P)
+    Standalone,
+    /// Networked mode with P2P overlay
+    Network,
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    // -- Server Queries --
+    /// Run an XRPL node (standalone or networked)
+    Run {
+        /// Node run mode
+        #[arg(short, long, default_value = "standalone", value_enum)]
+        mode: RunMode,
 
+        /// Genesis account address
+        #[arg(long, default_value = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")]
+        genesis_account: String,
+
+        /// Ledger close interval in seconds
+        #[arg(long, default_value = "10")]
+        close_interval: u64,
+
+        /// RPC server bind address (standalone mode)
+        #[arg(long, default_value = "127.0.0.1:5005")]
+        bind: String,
+
+        /// RPC URL of a trusted node to sync from (network mode)
+        #[arg(long)]
+        sync_rpc: Option<String>,
+
+        /// Shorthand for --mode standalone
+        #[arg(long, conflicts_with = "network")]
+        standalone: bool,
+
+        /// Shorthand for --mode network
+        #[arg(long, conflicts_with = "standalone")]
+        network: bool,
+    },
+
+    /// Print version information and exit
+    Version,
+
+    // -- Server Queries --
     /// Get server info from an XRPL node
     ServerInfo,
 
@@ -54,7 +126,6 @@ enum Commands {
     },
 
     // -- Account Queries --
-
     /// Get account info
     AccountInfo {
         /// Account address (classic or X-address)
@@ -77,7 +148,6 @@ enum Commands {
     },
 
     // -- Wallet --
-
     /// Generate a new wallet keypair locally
     WalletPropose {
         /// Key type: ed25519 or secp256k1
@@ -86,7 +156,6 @@ enum Commands {
     },
 
     // -- Transactions --
-
     /// Submit a signed transaction blob
     Submit {
         /// Hex-encoded transaction blob
@@ -178,38 +247,13 @@ enum Commands {
         #[arg(long)]
         fee: Option<String>,
     },
-
-    // -- Node --
-
-    /// Run a standalone XRPL node
-    NodeRun {
-        /// Genesis account address
-        #[arg(long, default_value = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")]
-        genesis_account: String,
-        /// Ledger close interval in seconds
-        #[arg(long, default_value = "10")]
-        close_interval: u64,
-        /// RPC server bind address
-        #[arg(long, default_value = "127.0.0.1:5005")]
-        bind: String,
-    },
-
-    /// Run a networked XRPL node with P2P overlay
-    NetworkRun {
-        /// Genesis account address
-        #[arg(long, default_value = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")]
-        genesis_account: String,
-        /// Ledger close interval in seconds
-        #[arg(long, default_value = "10")]
-        close_interval: u64,
-    },
 }
 
-fn setup_logging(log_level: &str) {
+fn setup_logging(level: LogLevel) {
     use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(log_level));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level.to_string()));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -220,7 +264,7 @@ fn setup_logging(log_level: &str) {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    setup_logging(&cli.log_level);
+    setup_logging(cli.log_level);
 
     if let Err(e) = run(cli).await {
         eprintln!("Error: {e}");
@@ -252,8 +296,62 @@ fn parse_amount(s: &str) -> Result<Value, Box<dyn std::error::Error>> {
     }
 }
 
+/// Resolve the effective run mode from the `--mode`, `--standalone`, and `--network` flags.
+fn resolve_run_mode(mode: RunMode, standalone: bool, network: bool) -> RunMode {
+    if standalone {
+        RunMode::Standalone
+    } else if network {
+        RunMode::Network
+    } else {
+        mode
+    }
+}
+
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
+        Commands::Version => {
+            println!(
+                "{} {}",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(());
+        }
+
+        Commands::Run {
+            mode,
+            genesis_account,
+            close_interval,
+            bind,
+            sync_rpc,
+            standalone,
+            network,
+        } => {
+            let effective_mode = resolve_run_mode(mode, standalone, network);
+
+            let mut config = if let Some(ref config_path) = cli.config {
+                rxrpl_config::load_config(config_path)?
+            } else {
+                rxrpl_config::NodeConfig::default()
+            };
+
+            if let Some(ref dir) = cli.data_dir {
+                config.database.path = dir.clone();
+            }
+
+            match effective_mode {
+                RunMode::Standalone => {
+                    config.server.bind = bind.parse()?;
+                    return cmd_node_run(config, &genesis_account, close_interval).await;
+                }
+                RunMode::Network => {
+                    let rpc_url = sync_rpc.as_deref().unwrap_or(&cli.url);
+                    return cmd_network_run(config, &genesis_account, close_interval, rpc_url)
+                        .await;
+                }
+            }
+        }
+
         Commands::WalletPropose { key_type } => {
             let kt = parse_key_type(&key_type)?;
             let wallet = Wallet::generate(kt);
@@ -342,38 +440,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             return cmd_account_delete(&cli.url, &from, &destination, fee.as_deref()).await;
         }
 
-        Commands::NodeRun {
-            genesis_account,
-            close_interval,
-            bind,
-        } => {
-            let mut config = if let Some(ref config_path) = cli.config {
-                rxrpl_config::load_config(config_path)?
-            } else {
-                rxrpl_config::NodeConfig::default()
-            };
-            config.server.bind = bind.parse()?;
-            if let Some(ref dir) = cli.data_dir {
-                config.database.path = dir.clone();
-            }
-            return cmd_node_run(config, &genesis_account, close_interval).await;
-        }
-
-        Commands::NetworkRun {
-            genesis_account,
-            close_interval,
-        } => {
-            let mut config = if let Some(ref config_path) = cli.config {
-                rxrpl_config::load_config(config_path)?
-            } else {
-                rxrpl_config::NodeConfig::default()
-            };
-            if let Some(ref dir) = cli.data_dir {
-                config.database.path = dir.clone();
-            }
-            return cmd_network_run(config, &genesis_account, close_interval, &cli.url).await;
-        }
-
         _ => {}
     }
 
@@ -390,15 +456,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::LedgerClosed => client.ledger_closed().await?,
         Commands::Ledger { index } => client.ledger(&index).await?,
         Commands::AccountNfts { account } => client.account_nfts(&account).await?,
-        Commands::WalletPropose { .. }
+        Commands::Version
+        | Commands::Run { .. }
+        | Commands::WalletPropose { .. }
         | Commands::Subscribe { .. }
         | Commands::Sign { .. }
         | Commands::Pay { .. }
         | Commands::TrustSet { .. }
         | Commands::OfferCreate { .. }
-        | Commands::AccountDelete { .. }
-        | Commands::NodeRun { .. }
-        | Commands::NetworkRun { .. } => unreachable!(),
+        | Commands::AccountDelete { .. } => unreachable!(),
     };
 
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -575,6 +641,7 @@ async fn cmd_network_run(
     eprintln!("  Close interval: {close_interval}s");
     eprintln!("  Sync RPC: {sync_rpc_url}");
 
-    node.run_networked(close_interval, Some(sync_rpc_url)).await?;
+    node.run_networked(close_interval, Some(sync_rpc_url))
+        .await?;
     Ok(())
 }
