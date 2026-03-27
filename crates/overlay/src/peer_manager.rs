@@ -655,12 +655,11 @@ impl PeerManager {
                                     header,
                                 });
                             } else {
-                                // Not a header -- forward as raw data.
-                                let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
-                                    hash,
-                                    seq: ledger_seq,
-                                    nodes,
-                                });
+                                // Not a header -- raw node data, not useful for reconstruction.
+                                tracing::debug!(
+                                    "ignoring non-header LedgerData for #{} ({} nodes)",
+                                    ledger_seq, nodes.len()
+                                );
                             }
                         }
                     }

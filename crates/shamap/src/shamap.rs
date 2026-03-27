@@ -500,7 +500,7 @@ impl SHAMap {
         let mut map = SHAMap::account_state();
         for (key_bytes, data_bytes) in nodes {
             if key_bytes.len() != 32 {
-                return Err(SHAMapError::InvalidKeyLength(key_bytes.len()));
+                continue; // Skip entries with invalid key length.
             }
             let key = Hash256::new(key_bytes.as_slice().try_into().unwrap());
             map.put(key, data_bytes.clone())?;
@@ -1546,10 +1546,10 @@ mod tests {
     }
 
     #[test]
-    fn from_leaf_nodes_invalid_key_length() {
+    fn from_leaf_nodes_invalid_key_length_skipped() {
         let nodes = vec![(vec![1, 2, 3], vec![4, 5, 6])]; // key is 3 bytes, not 32
-        let result = SHAMap::from_leaf_nodes(&nodes);
-        assert!(matches!(result, Err(SHAMapError::InvalidKeyLength(3))));
+        let mut result = SHAMap::from_leaf_nodes(&nodes).unwrap();
+        assert!(result.is_empty()); // Invalid entries are skipped.
     }
 
     #[test]
