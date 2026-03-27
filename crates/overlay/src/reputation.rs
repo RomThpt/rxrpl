@@ -97,6 +97,12 @@ impl PeerReputation {
         self.adjust_score(VIOLATION_PENALTY);
     }
 
+    /// Apply a penalty (positive value subtracts from score).
+    /// Used by the decay system to gradually reduce scores over time.
+    pub fn apply_penalty(&self, amount: i32) {
+        self.adjust_score(-amount);
+    }
+
     /// Get the current reputation score.
     pub fn score(&self) -> i32 {
         self.score.load(Ordering::Relaxed)

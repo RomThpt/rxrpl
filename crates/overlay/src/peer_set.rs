@@ -3,6 +3,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use rxrpl_primitives::Hash256;
 
+use crate::peer_score::PeerScore;
 use crate::reputation::PeerReputation;
 
 /// Thread-safe collection of connected peers.
@@ -24,6 +25,8 @@ pub struct PeerInfo {
     pub ledger_seq: std::sync::atomic::AtomicU32,
     /// Reputation score tracking.
     pub reputation: PeerReputation,
+    /// Scoring metrics for peer selection.
+    pub scoring: PeerScore,
 }
 
 impl PeerSet {
@@ -93,6 +96,38 @@ impl PeerSet {
         candidates.into_iter().take(count).map(|(id, _, _)| id).collect()
     }
 
+    /// Select up to `count` peers sorted by normalized score (0-100, highest first).
+    /// Uses the multi-metric scoring algorithm that considers latency, uptime,
+    /// message validity, response rate, and base reputation.
+    /// Only includes peers with non-negative reputation scores.
+    pub fn select_by_normalized_score(&self, count: usize) -> Vec<Hash256> {
+        let mut candidates: Vec<_> = self
+            .peers
+            .iter()
+            .filter(|r| r.value().reputation.score() >= 0)
+            .map(|r| {
+                let info = r.value();
+                let norm_score = info.scoring.normalized_score(&info.reputation);
+                (info.node_id, norm_score)
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates
+            .into_iter()
+            .take(count)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Apply temporal decay to all peer scores.
+    pub fn apply_score_decay(&self) {
+        for entry in self.peers.iter() {
+            let info = entry.value();
+            info.scoring.apply_decay(&info.reputation);
+        }
+    }
+
     /// Select the best peers for ledger data based on score and ledger proximity.
     /// Prefers peers whose known `ledger_seq >= target_seq` by adding a +200 bonus.
     /// Only includes peers with non-negative reputation scores.
@@ -133,6 +168,7 @@ mod tests {
             inbound,
             ledger_seq: std::sync::atomic::AtomicU32::new(0),
             reputation: PeerReputation::new(),
+            scoring: PeerScore::new(),
         })
     }
 
