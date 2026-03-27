@@ -1,119 +1,210 @@
-syntax = "proto3";
+// Wire-compatible with rippled's xrpl.proto (proto2).
+// Field numbers MUST match rippled exactly for wire compatibility.
+syntax = "proto2";
 
 package ripple;
 
-// Peer handshake hello message
-message TMHello {
-    uint32 proto_version = 1;
-    uint32 proto_version_min = 2;
-    bytes node_public = 3;
-    bytes node_proof = 4;
-    uint32 network_id = 5;
-    uint32 ledger_seq = 6;
-    bytes ledger_hash = 7;
-    uint64 network_time = 8;
-}
-
-// Ping/pong keepalive
-message TMPing {
-    enum PingType {
-        PT_PING = 0;
-        PT_PONG = 1;
-    }
-    PingType type = 1;
-    uint32 seq = 2;
-    uint64 ping_time = 3;
-    uint64 net_time = 4;
-}
-
-// Request ledger data from a peer
-message TMGetLedger {
-    enum LedgerType {
-        LT_CURRENT = 0;
-        LT_CLOSED = 1;
-        LT_VALIDATED = 2;
-        LT_HASH = 3;
-    }
-    LedgerType ledger_type = 1;
-    bytes ledger_hash = 2;
-    uint32 ledger_seq = 3;
-    repeated bytes node_ids = 4;
-    bool request_cookie = 5;
-    uint64 query_depth = 6;
-}
-
-// Ledger data response
-message TMLedgerData {
-    bytes ledger_hash = 1;
-    uint32 ledger_seq = 2;
-    enum LedgerType {
-        LT_CURRENT = 0;
-        LT_CLOSED = 1;
-        LT_VALIDATED = 2;
-        LT_HASH = 3;
-    }
-    LedgerType ledger_type = 3;
-    repeated TMLedgerNode nodes = 4;
-    uint32 request_cookie = 5;
-
-    message TMLedgerNode {
-        bytes node_id = 1;
-        bytes node_data = 2;
-    }
-}
-
-// Transaction relay
-message TMTransaction {
-    bytes raw_transaction = 1;
-    uint32 status = 2;
-    uint64 receive_timestamp = 3;
-    uint32 deferred = 4;
-}
-
-// Consensus proposal
-message TMProposeSet {
-    uint32 propose_seq = 1;
-    bytes current_tx_hash = 2;
-    bytes node_pub_key = 3;
-    uint32 close_time = 4;
-    bytes signature = 5;
-    bytes previous_ledger = 6;
-    uint32 ledger_seq = 7;
-}
-
-// Ledger validation
-message TMValidation {
-    bytes validation = 1;
-    uint32 ledger_seq = 2;
-}
-
-// Status change notification
-message TMStatusChange {
-    uint32 new_status = 1;
-    uint32 new_event = 2;
-    uint32 ledger_seq = 3;
-    bytes ledger_hash = 4;
-    bytes validated_hash = 5;
-    uint32 validated_seq = 6;
-}
-
-// Manifest (validator key rotation)
+// Validator manifest -- contains a serialized Manifest stobject
 message TMManifest {
-    bytes master_key = 1;
-    bytes signing_key = 2;
-    uint32 seq = 3;
-    bytes signature = 4;
+    optional bytes stobject = 1;
 }
 
-// Get peer list
+// Batch manifests (mtMANIFESTS = 2)
+message TMManifests {
+    repeated TMManifest list = 1;
+}
+
+// Cluster node info
+message TMClusterNode {
+    optional string public_key = 1;
+    optional uint32 report_time = 2;
+    optional uint32 node_load = 3;
+    optional string node_name = 4;
+    optional string address = 5;
+}
+
+// Cluster status (mtCLUSTER = 5)
+message TMCluster {
+    repeated TMClusterNode cluster_nodes = 1;
+}
+
+// Transaction relay (mtTRANSACTION = 30)
+message TMTransaction {
+    optional bytes raw_transaction = 1;
+    optional int32 status = 2;
+    optional uint64 receive_timestamp = 3;
+    optional bool deferred = 4;
+}
+
+// Batch transactions (mtTRANSACTIONS = 64)
+message TMTransactions {
+    repeated TMTransaction transactions = 1;
+}
+
+// Status change notification (mtSTATUS_CHANGE = 34)
+message TMStatusChange {
+    optional int32 new_status = 1;
+    optional int32 new_event = 2;
+    optional uint32 ledger_seq = 3;
+    optional bytes ledger_hash = 4;
+    optional bytes ledger_hash_previous = 5;
+    optional uint64 network_time = 6;
+    optional uint32 first_seq = 7;
+    optional uint32 last_seq = 8;
+}
+
+// Consensus proposal (mtPROPOSE_LEDGER = 33)
+message TMProposeSet {
+    optional uint32 propose_seq = 1;
+    optional bytes current_tx_hash = 2;
+    optional bytes node_pub_key = 3;
+    optional uint32 close_time = 4;
+    optional bytes signature = 5;
+    optional bytes previousledger = 6;
+    // field 7 = checkedSignature (deprecated, skip)
+    // fields 8-9 unused
+    repeated bytes added_transactions = 10;
+    repeated bytes removed_transactions = 11;
+    // field 12 = hops (deprecated, skip)
+}
+
+// Have transaction set (mtHAVE_SET = 35)
+message TMHaveTransactionSet {
+    optional int32 status = 1;
+    optional bytes hash = 2;
+}
+
+// Validator list (mtVALIDATOR_LIST = 54)
+message TMValidatorList {
+    optional bytes manifest = 1;
+    optional bytes blob = 2;
+    optional bytes signature = 3;
+    optional uint32 version = 4;
+}
+
+// Validator list v2 blob info
+message ValidatorBlobInfo {
+    optional bytes manifest = 1;
+    optional bytes blob = 2;
+    optional bytes signature = 3;
+}
+
+// Validator list collection (mtVALIDATOR_LIST_COLLECTION = 56)
+message TMValidatorListCollection {
+    optional uint32 version = 1;
+    optional bytes manifest = 2;
+    repeated ValidatorBlobInfo blobs = 3;
+}
+
+// Validation (mtVALIDATION = 41)
+message TMValidation {
+    optional bytes validation = 1;
+    // field 2 = checkedSignature (deprecated bool, skip)
+    // field 3 = hops (deprecated uint32, skip)
+}
+
+// Peer endpoints (mtENDPOINTS = 15)
+message TMEndpoints {
+    optional uint32 version = 1;
+    // field 2 reserved (was old TMEndpoint)
+
+    message TMEndpointv2 {
+        optional string endpoint = 1;
+        optional uint32 hops = 2;
+    }
+    repeated TMEndpointv2 endpoints_v2 = 3;
+}
+
+// Indexed object for GetObjectByHash
+message TMIndexedObject {
+    optional bytes hash = 1;
+    optional bytes node_id = 2;
+    optional bytes index = 3;
+    optional bytes data = 4;
+    optional uint32 ledger_seq = 5;
+}
+
+// Get objects by hash (mtGET_OBJECTS = 42)
+message TMGetObjectByHash {
+    optional int32 type = 1;
+    optional bool query = 2;
+    optional uint32 seq = 3;
+    optional bytes ledger_hash = 4;
+    optional bool fat = 5;
+    repeated TMIndexedObject objects = 6;
+}
+
+// Ledger node (used in TMLedgerData)
+message TMLedgerNode {
+    optional bytes nodedata = 1;
+    optional bytes nodeid = 2;
+}
+
+// Request ledger data (mtGET_LEDGER = 31)
+// Field numbers match rippled exactly
+message TMGetLedger {
+    required int32 itype = 1;
+    optional int32 ltype = 2;
+    optional bytes ledger_hash = 3;
+    optional uint32 ledger_seq = 4;
+    repeated bytes node_ids = 5;
+    optional uint64 request_cookie = 6;
+    optional int32 query_type = 7;
+    optional uint32 query_depth = 8;
+}
+
+// Ledger data response (mtLEDGER_DATA = 32)
+message TMLedgerData {
+    required bytes ledger_hash = 1;
+    required uint32 ledger_seq = 2;
+    required int32 ledger_info_type = 3;
+    repeated TMLedgerNode nodes = 4;
+    optional uint32 request_cookie = 5;
+    optional int32 error = 6;
+}
+
+// Ping/pong keepalive (mtPING = 3)
+message TMPing {
+    optional int32 type = 1;
+    optional uint32 seq = 2;
+    optional uint64 ping_time = 3;
+    optional uint64 net_time = 4;
+}
+
+// Squelch (mtSQUELCH = 55)
+message TMSquelch {
+    optional bool squelch = 1;
+    optional bytes validator_pub_key = 2;
+    optional uint32 squelch_duration = 3;
+}
+
+// Have transactions (mtHAVE_TRANSACTIONS = 63)
+message TMHaveTransactions {
+    repeated bytes hashes = 1;
+}
+
+// --- Messages used only internally by rxrpl (not sent to rippled) ---
+
+// Peer handshake hello message (used in rxrpl-to-rxrpl protobuf handshake)
+message TMHello {
+    required uint32 proto_version = 1;
+    required uint32 proto_version_min = 2;
+    required bytes node_public = 3;
+    required bytes node_proof = 4;
+    required uint32 network_id = 5;
+    required uint32 ledger_seq = 6;
+    required bytes ledger_hash = 7;
+    required uint64 network_time = 8;
+}
+
+// Legacy peer list (rxrpl internal)
 message TMGetPeers {}
 
-// Peer list response
 message TMPeers {
     repeated TMPeer peers = 1;
 
     message TMPeer {
-        string ip = 1;
-        uint32 port = 2;
+        optional string ip = 1;
+        optional uint32 port = 2;
     }
 }

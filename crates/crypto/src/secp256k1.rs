@@ -82,6 +82,34 @@ pub fn derive_keypair(seed: &Seed, validator: bool) -> (PublicKey, Vec<u8>) {
     (pub_key, priv_bytes)
 }
 
+/// Sign a pre-hashed 32-byte digest directly with a secp256k1 private key.
+///
+/// Unlike `sign()`, this does NOT hash the input -- it signs the digest as-is.
+/// Used for protocols that provide the digest directly (e.g., rippled session cookies).
+/// Returns a DER-encoded signature.
+pub fn sign_digest(digest: &[u8; 32], private_key: &[u8]) -> Result<Signature, crate::CryptoError> {
+    let key_bytes = if private_key.len() == 33 && private_key[0] == 0x00 {
+        &private_key[1..]
+    } else if private_key.len() == 32 {
+        private_key
+    } else {
+        return Err(crate::CryptoError::InvalidPrivateKey);
+    };
+
+    let signing_key =
+        SigningKey::from_slice(key_bytes).map_err(|_| crate::CryptoError::InvalidPrivateKey)?;
+
+    let (sig, _) = signing_key
+        .sign_prehash_recoverable(digest)
+        .map_err(|_| crate::CryptoError::SigningFailed)?;
+
+    let normalized = sig.normalize_s().unwrap_or(sig);
+    let (r_bytes, s_bytes) = normalized.split_bytes();
+
+    let der_sig = der::encode_der_signature(&r_bytes, &s_bytes);
+    Ok(Signature::new(der_sig))
+}
+
 /// Sign a message (raw bytes) with a secp256k1 private key.
 ///
 /// The message is first hashed with SHA-512/2, then signed with ECDSA.
@@ -136,6 +164,32 @@ pub fn verify(message: &[u8], public_key: &[u8], signature: &[u8]) -> bool {
 
     let hash = sha512_half_single(message);
     verifying_key.verify_prehash(hash.as_bytes(), &sig).is_ok()
+}
+
+/// Verify a DER-encoded secp256k1 signature against a pre-hashed 32-byte digest.
+///
+/// Unlike `verify()`, this does NOT hash the input.
+pub fn verify_digest(digest: &[u8; 32], public_key: &[u8], signature: &[u8]) -> bool {
+    let Ok(verifying_key) = VerifyingKey::from_sec1_bytes(public_key) else {
+        return false;
+    };
+
+    let Ok((r_bytes, s_bytes)) = der::decode_der_signature(signature) else {
+        return false;
+    };
+
+    let mut r_padded = [0u8; 32];
+    let mut s_padded = [0u8; 32];
+    let r_start = 32usize.saturating_sub(r_bytes.len());
+    let s_start = 32usize.saturating_sub(s_bytes.len());
+    r_padded[r_start..].copy_from_slice(&r_bytes);
+    s_padded[s_start..].copy_from_slice(&s_bytes);
+
+    let Ok(sig) = k256::ecdsa::Signature::from_scalars(r_padded, s_padded) else {
+        return false;
+    };
+
+    verifying_key.verify_prehash(digest, &sig).is_ok()
 }
 
 #[cfg(test)]

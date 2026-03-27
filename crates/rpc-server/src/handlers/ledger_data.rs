@@ -56,7 +56,7 @@ pub async fn ledger_data(params: Value, ctx: &Arc<ServerContext>) -> Result<Valu
                 "data": hex::encode(data),
             }));
         } else {
-            let node: Value = serde_json::from_slice(data).unwrap_or(Value::Null);
+            let node: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap_or(Value::Null);
             state.push(serde_json::json!({
                 "index": key.to_string(),
                 "data": node,

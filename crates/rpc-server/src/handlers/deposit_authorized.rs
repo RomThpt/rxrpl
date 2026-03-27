@@ -38,8 +38,7 @@ pub async fn deposit_authorized(
         .get_state(&dest_key)
         .ok_or_else(|| RpcServerError::InvalidParams("destination account not found".into()))?;
 
-    let dest_account: Value = serde_json::from_slice(dest_data)
-        .map_err(|e| RpcServerError::Internal(format!("failed to deserialize account: {e}")))?;
+    let dest_account: Value = crate::handlers::common::decode_state_value(dest_data)?;
 
     let flags = dest_account
         .get("Flags")

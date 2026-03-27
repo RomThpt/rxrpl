@@ -6,6 +6,7 @@ pub mod error;
 pub mod fees;
 pub mod header;
 pub mod ledger;
+pub mod sle_codec;
 pub mod state_table;
 
 pub use error::LedgerError;

@@ -8,6 +8,7 @@ pub mod discovery;
 pub mod error;
 pub mod event;
 pub mod handshake;
+pub mod http;
 pub mod identity;
 pub mod ledger_provider;
 pub mod ledger_sync;
@@ -18,7 +19,9 @@ pub mod peer_set;
 pub mod proto_convert;
 pub mod relay;
 pub mod reputation;
+pub mod stobject;
 pub mod tls;
+pub mod validation_aggregator;
 
 pub use command::OverlayCommand;
 pub use consensus_bridge::NetworkConsensusAdapter;

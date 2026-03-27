@@ -33,6 +33,8 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     prev_ledger: Hash256,
     /// Our node ID.
     node_id: NodeId,
+    /// Our raw public key bytes.
+    public_key: Vec<u8>,
     /// Accepted close time after negotiation.
     accepted_close_time: Option<u32>,
     /// Close flags (1 = peers disagree on close time).
@@ -41,16 +43,19 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     accepted_validation: Option<Validation>,
     /// Trusted validator list (UNL). Empty = solo mode.
     unl: TrustedValidatorList,
+    /// Proposals received while not in Establish phase, replayed on close.
+    pending_proposals: Vec<Proposal>,
 }
 
 impl<A: ConsensusAdapter> ConsensusEngine<A> {
     pub fn new(adapter: A, node_id: NodeId, params: ConsensusParams) -> Self {
-        Self::new_with_unl(adapter, node_id, params, TrustedValidatorList::empty())
+        Self::new_with_unl(adapter, node_id, Vec::new(), params, TrustedValidatorList::empty())
     }
 
     pub fn new_with_unl(
         adapter: A,
         node_id: NodeId,
+        public_key: Vec<u8>,
         params: ConsensusParams,
         unl: TrustedValidatorList,
     ) -> Self {
@@ -65,10 +70,12 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             round: 0,
             prev_ledger: Hash256::ZERO,
             node_id,
+            public_key,
             accepted_close_time: None,
             accepted_close_flags: 0,
             accepted_validation: None,
             unl,
+            pending_proposals: Vec::new(),
         }
     }
 
@@ -139,6 +146,8 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.accepted_close_time = None;
         self.accepted_close_flags = 0;
         self.accepted_validation = None;
+        // Note: pending_proposals is NOT cleared here -- they will be
+        // replayed in close_ledger() which follows start_round().
         let _ = ledger_seq;
     }
 
@@ -160,6 +169,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
 
         let proposal = Proposal {
             node_id: self.node_id,
+            public_key: self.public_key.clone(),
             tx_set_hash: our_set.hash,
             close_time,
             prop_seq: 0,
@@ -172,32 +182,51 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.our_position = Some(proposal);
         self.our_set = Some(our_set);
         self.phase = ConsensusPhase::Establish;
+
+        // Replay any proposals buffered while we were in Open phase
+        let pending = std::mem::take(&mut self.pending_proposals);
+        for p in pending {
+            self.peer_proposal(p);
+        }
+
         Ok(())
     }
 
     /// Receive a proposal from a peer.
     pub fn peer_proposal(&mut self, proposal: Proposal) {
         if self.phase != ConsensusPhase::Establish {
+            // Buffer proposals received outside Establish phase
+            self.pending_proposals.push(proposal);
             return;
         }
 
         // UNL filtering: if UNL is non-empty, only accept trusted nodes
         if !self.unl.is_empty() && !self.unl.is_trusted(&proposal.node_id) {
+            tracing::debug!("rejected proposal from untrusted {:?}", proposal.node_id);
             return;
         }
 
         // Reject proposals for a different previous ledger
         if proposal.prev_ledger != self.prev_ledger {
+            tracing::debug!(
+                "rejected proposal: prev_ledger mismatch (ours={}, theirs={})",
+                self.prev_ledger, proposal.prev_ledger
+            );
             return;
         }
 
         // Reject proposals for a different ledger sequence
         if let Some(ref our) = self.our_position {
             if proposal.ledger_seq != our.ledger_seq {
+                tracing::debug!(
+                    "rejected proposal: seq mismatch (ours={}, theirs={})",
+                    our.ledger_seq, proposal.ledger_seq
+                );
                 return;
             }
         }
 
+        tracing::debug!("accepted proposal from {:?} seq={}", proposal.node_id, proposal.ledger_seq);
         let node_id = proposal.node_id;
         self.peer_positions.insert(node_id, proposal);
         self.create_disputes();
@@ -591,6 +620,7 @@ mod tests {
         // B and C propose set with only tx1
         engine.peer_proposal(Proposal {
             node_id: node_b,
+            public_key: vec![0x02; 33],
             tx_set_hash: set_bc.hash,
             close_time: 100,
             prop_seq: 0,
@@ -600,6 +630,7 @@ mod tests {
         });
         engine.peer_proposal(Proposal {
             node_id: node_c,
+            public_key: vec![0x02; 33],
             tx_set_hash: set_bc.hash,
             close_time: 100,
             prop_seq: 0,
@@ -638,6 +669,7 @@ mod tests {
 
         engine.peer_proposal(Proposal {
             node_id: node_b,
+            public_key: vec![0x02; 33],
             tx_set_hash: set_b.hash,
             close_time: 100,
             prop_seq: 0,
@@ -647,6 +679,7 @@ mod tests {
         });
         engine.peer_proposal(Proposal {
             node_id: node_c,
+            public_key: vec![0x02; 33],
             tx_set_hash: set_b.hash,
             close_time: 100,
             prop_seq: 0,
@@ -675,6 +708,7 @@ mod tests {
 
         engine.peer_proposal(Proposal {
             node_id: node_b,
+            public_key: vec![0x02; 33],
             tx_set_hash: set.hash,
             close_time: 100,
             prop_seq: 0,
@@ -703,6 +737,7 @@ mod tests {
 
         engine.peer_proposal(Proposal {
             node_id: node_b,
+            public_key: vec![0x02; 33],
             tx_set_hash: Hash256::new([0xFF; 32]), // unknown
             close_time: 100,
             prop_seq: 0,
@@ -730,6 +765,7 @@ mod tests {
 
         engine.peer_proposal(Proposal {
             node_id: node_b,
+            public_key: vec![0x02; 33],
             tx_set_hash: set.hash,
             close_time: 200,
             prop_seq: 0,
@@ -739,6 +775,7 @@ mod tests {
         });
         engine.peer_proposal(Proposal {
             node_id: node_c,
+            public_key: vec![0x02; 33],
             tx_set_hash: set.hash,
             close_time: 150,
             prop_seq: 0,
@@ -774,6 +811,7 @@ mod tests {
         // Peer proposes time far away (spread > 30s resolution)
         engine.peer_proposal(Proposal {
             node_id: node_b,
+            public_key: vec![0x02; 33],
             tx_set_hash: set.hash,
             close_time: 200,
             prop_seq: 0,
@@ -845,6 +883,7 @@ mod tests {
     ) -> Proposal {
         Proposal {
             node_id,
+            public_key: vec![0x02; 33],
             tx_set_hash,
             close_time: 100,
             prop_seq: 0,
@@ -859,7 +898,7 @@ mod tests {
         let unl = make_unl(&[1, 2, 3]);
         let adapter = SimpleAdapter;
         let mut engine =
-            ConsensusEngine::new_with_unl(adapter, node(1), ConsensusParams::default(), unl);
+            ConsensusEngine::new_with_unl(adapter, node(1), Vec::new(), ConsensusParams::default(), unl);
         engine.start_round(Hash256::ZERO, 1);
 
         let set = TxSet::new(vec![]);
@@ -875,7 +914,7 @@ mod tests {
         let unl = make_unl(&[1, 2, 3]);
         let adapter = SimpleAdapter;
         let mut engine =
-            ConsensusEngine::new_with_unl(adapter, node(1), ConsensusParams::default(), unl);
+            ConsensusEngine::new_with_unl(adapter, node(1), Vec::new(), ConsensusParams::default(), unl);
         engine.start_round(Hash256::ZERO, 1);
 
         let set = TxSet::new(vec![]);
@@ -891,7 +930,7 @@ mod tests {
         let unl = make_unl(&[1, 2]);
         let adapter = SimpleAdapter;
         let mut engine =
-            ConsensusEngine::new_with_unl(adapter, node(1), ConsensusParams::default(), unl);
+            ConsensusEngine::new_with_unl(adapter, node(1), Vec::new(), ConsensusParams::default(), unl);
         engine.start_round(Hash256::ZERO, 1);
 
         let set = TxSet::new(vec![]);
@@ -909,7 +948,7 @@ mod tests {
         let unl = make_unl(&[1, 2, 3, 4, 5]);
         let adapter = SimpleAdapter;
         let mut engine =
-            ConsensusEngine::new_with_unl(adapter, node(1), ConsensusParams::default(), unl);
+            ConsensusEngine::new_with_unl(adapter, node(1), Vec::new(), ConsensusParams::default(), unl);
         engine.start_round(Hash256::ZERO, 1);
 
         let set = TxSet::new(vec![]);
@@ -929,7 +968,7 @@ mod tests {
         let unl = make_unl(&[1, 2, 3, 4, 5]);
         let adapter = SimpleAdapter;
         let mut engine =
-            ConsensusEngine::new_with_unl(adapter, node(1), ConsensusParams::default(), unl);
+            ConsensusEngine::new_with_unl(adapter, node(1), Vec::new(), ConsensusParams::default(), unl);
         engine.start_round(Hash256::ZERO, 1);
 
         let set = TxSet::new(vec![]);

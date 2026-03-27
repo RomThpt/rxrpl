@@ -29,9 +29,7 @@ pub async fn account_nfts(
 
     let mut current_key = page_key;
     while let Some(data) = ledger.get_state(&current_key) {
-        let page: Value = serde_json::from_slice(data).map_err(|e| {
-            RpcServerError::Internal(format!("failed to deserialize nft page: {e}"))
-        })?;
+        let page: Value = crate::handlers::common::decode_state_value(data)?;
 
         if let Some(tokens) = page.get("NFTokens").and_then(|v| v.as_array()) {
             for token in tokens {

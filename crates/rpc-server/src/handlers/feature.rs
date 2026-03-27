@@ -21,8 +21,7 @@ pub async fn feature(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, R
         }
     };
 
-    let amendments: Value = serde_json::from_slice(data)
-        .map_err(|e| RpcServerError::Internal(format!("failed to deserialize amendments: {e}")))?;
+    let amendments: Value = crate::handlers::common::decode_state_value(data)?;
 
     let mut features = serde_json::Map::new();
 

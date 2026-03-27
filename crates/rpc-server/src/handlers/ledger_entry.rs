@@ -23,8 +23,7 @@ pub async fn ledger_entry(
         .get_state(&index)
         .ok_or_else(|| RpcServerError::InvalidParams("entry not found".into()))?;
 
-    let node: Value = serde_json::from_slice(data)
-        .map_err(|e| RpcServerError::Internal(format!("failed to deserialize entry: {e}")))?;
+    let node: Value = crate::handlers::common::decode_state_value(data)?;
 
     Ok(serde_json::json!({
         "index": index.to_string(),

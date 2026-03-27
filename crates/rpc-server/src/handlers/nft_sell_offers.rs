@@ -44,9 +44,7 @@ pub async fn nft_sell_offers(
     let mut offers = Vec::new();
 
     if let Some(data) = ledger.get_state(&dir_key) {
-        let dir: Value = serde_json::from_slice(data).map_err(|e| {
-            RpcServerError::Internal(format!("failed to deserialize nft sell dir: {e}"))
-        })?;
+        let dir: Value = crate::handlers::common::decode_state_value(data)?;
 
         if let Some(indexes) = dir.get("Indexes").and_then(|v| v.as_array()) {
             for idx_val in indexes {
@@ -59,9 +57,7 @@ pub async fn nft_sell_offers(
                     .map_err(|e| RpcServerError::Internal(format!("invalid index: {e}")))?;
 
                 if let Some(entry_data) = ledger.get_state(&idx_hash) {
-                    let entry: Value = serde_json::from_slice(entry_data).map_err(|e| {
-                        RpcServerError::Internal(format!("failed to deserialize nft offer: {e}"))
-                    })?;
+                    let entry: Value = crate::handlers::common::decode_state_value(entry_data)?;
                     offers.push(entry);
                 }
             }

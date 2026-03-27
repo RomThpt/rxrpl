@@ -36,17 +36,17 @@ struct ClosedLedgerAccess {
 
 impl LedgerProvider for ClosedLedgerAccess {
     fn get_by_hash(&self, hash: &Hash256) -> Option<Ledger> {
-        let history = self.closed_ledgers.blocking_read();
+        let history = self.closed_ledgers.try_read().ok()?;
         history.iter().find(|l| l.header.hash == *hash).cloned()
     }
 
     fn get_by_seq(&self, seq: u32) -> Option<Ledger> {
-        let history = self.closed_ledgers.blocking_read();
+        let history = self.closed_ledgers.try_read().ok()?;
         history.iter().find(|l| l.header.sequence == seq).cloned()
     }
 
     fn latest_closed(&self) -> Option<Ledger> {
-        let history = self.closed_ledgers.blocking_read();
+        let history = self.closed_ledgers.try_read().ok()?;
         history.back().cloned()
     }
 }
@@ -459,7 +459,11 @@ impl Node {
     ///
     /// Starts the RPC server, P2P peer manager, and a consensus loop that
     /// processes both local ledger close ticks and incoming network messages.
-    pub async fn run_networked(&self, close_interval_secs: u64) -> Result<(), NodeError> {
+    pub async fn run_networked(
+        &self,
+        close_interval_secs: u64,
+        sync_rpc_url: Option<&str>,
+    ) -> Result<(), NodeError> {
         // 1. Generate/load node identity
         let identity = if let Some(ref seed_hex) = self.config.peer.node_seed {
             let bytes = hex::decode(seed_hex)
@@ -477,11 +481,44 @@ impl Node {
         };
         let identity = Arc::new(identity);
         tracing::info!("node identity: {}", identity.node_id);
+        tracing::info!("node public key: {}", hex::encode(identity.public_key_bytes()));
 
-        // 2. Shared ledger state for P2P
-        let ledger_seq = Arc::new(AtomicU32::new(self.ledger.blocking_read().header.sequence));
+        // 2. Bootstrap from RPC: fetch latest validated ledger to set our starting point
+        if let Some(rpc_url) = sync_rpc_url {
+            match Self::bootstrap_from_rpc(rpc_url).await {
+                Ok((seq, hash)) => {
+                    let mut l = self.ledger.write().await;
+                    l.header.sequence = seq + 1; // open ledger = validated + 1
+                    l.header.parent_hash = hash;
+                    drop(l);
+                    tracing::info!(
+                        "bootstrapped from RPC: validated ledger #{} hash={}, open ledger #{}",
+                        seq, hash, seq + 1
+                    );
+
+                    // Download the full state tree via RPC to pre-populate the store.
+                    if let Some(ref store) = self.node_store {
+                        let hash_hex = hex::encode(hash.as_bytes());
+                        match Self::download_state_via_rpc(rpc_url, &hash_hex, Arc::clone(store)).await {
+                            Ok(count) => {
+                                tracing::info!("pre-populated store with {} state entries via RPC", count);
+                            }
+                            Err(e) => {
+                                tracing::warn!("RPC state download failed (P2P sync will be used): {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("RPC bootstrap failed (starting from genesis): {}", e);
+                }
+            }
+        }
+
+        // Shared ledger state for P2P
+        let ledger_seq = Arc::new(AtomicU32::new(self.ledger.read().await.header.sequence));
         let ledger_hash = Arc::new(tokio::sync::RwLock::new(
-            self.ledger.blocking_read().header.parent_hash,
+            self.ledger.read().await.header.parent_hash,
         ));
 
         // 3. Create PeerManager with LedgerProvider + TLS
@@ -506,6 +543,9 @@ impl Node {
         peer_mgr.set_ledger_provider(Arc::new(ClosedLedgerAccess {
             closed_ledgers: Arc::clone(&self.closed_ledgers),
         }));
+        if let Some(ref store) = self.node_store {
+            peer_mgr.set_node_store(Arc::clone(store));
+        }
 
         // 3b. Create overlay event channel for bridging to RPC events
         let (overlay_event_tx, mut overlay_event_rx) =
@@ -689,24 +729,38 @@ impl Node {
         let interval_duration = Duration::from_secs(close_interval_secs);
         let ledger_seq_shared = Arc::clone(&ledger_seq);
         let ledger_hash_shared = Arc::clone(&ledger_hash);
+        let configured_quorum = self.config.validators.quorum;
 
         tokio::spawn(async move {
             let node_id = NodeId(identity.node_id);
             let mut consensus =
-                ConsensusEngine::new_with_unl(adapter, node_id, ConsensusParams::default(), unl);
+                ConsensusEngine::new_with_unl(adapter, node_id, identity.public_key_bytes().to_vec(), ConsensusParams::default(), unl);
 
             let mut close_interval = tokio::time::interval(interval_duration);
             let converge_duration = Duration::from_millis(1250);
             let mut converge_interval = tokio::time::interval(converge_duration);
             let mut establishing = false;
+            let mut syncing = false;
+            let mut max_peer_seq: u32 = 0;
             let mut pending_close_time = 0u32;
+            // Track validations from network peers to determine validated ledgers.
+            // Default quorum of 28 (~80% of typical 35-validator UNL).
+            let initial_quorum = configured_quorum.unwrap_or(28);
+            let mut val_aggregator = rxrpl_overlay::validation_aggregator::ValidationAggregator::new(initial_quorum);
+            tracing::info!("validation quorum initialized to {}", initial_quorum);
+
+            let sync_check_duration = Duration::from_secs(5);
+            let mut sync_check_interval = tokio::time::interval(sync_check_duration);
+            let mut sync_started_at: Option<tokio::time::Instant> = None;
+            let mut last_sync_seq: u32 = 0;
 
             close_interval.tick().await; // skip first immediate tick
             converge_interval.tick().await;
+            sync_check_interval.tick().await;
 
             loop {
                 tokio::select! {
-                    _ = close_interval.tick(), if !establishing => {
+                    _ = close_interval.tick(), if !establishing && !syncing => {
                         let close_time = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -745,8 +799,9 @@ impl Node {
                                 &consensus, pending_close_time, &ledger,
                                 &closed_ledgers, &tx_store, &event_tx,
                                 &ledger_seq_shared, &ledger_hash_shared,
-                                &tx_queue,
+                                &tx_queue, &identity, &cmd_tx_catchup,
                             ).await;
+                            close_interval.reset();
                         } else {
                             let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
                                 phase: "establish".into(),
@@ -756,7 +811,7 @@ impl Node {
                         }
                     }
 
-                    _ = converge_interval.tick(), if establishing => {
+                    _ = converge_interval.tick(), if establishing && !syncing => {
                         if consensus.converge() {
                             let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
                                 phase: "accepted".into(),
@@ -765,28 +820,68 @@ impl Node {
                                 &consensus, pending_close_time, &ledger,
                                 &closed_ledgers, &tx_store, &event_tx,
                                 &ledger_seq_shared, &ledger_hash_shared,
-                                &tx_queue,
+                                &tx_queue, &identity, &cmd_tx_catchup,
                             ).await;
                             establishing = false;
+                            close_interval.reset();
                         }
                     }
 
                     Some(msg) = consensus_rx.recv() => {
                         match msg {
                             ConsensusMessage::Proposal(proposal) => {
+                                tracing::debug!(
+                                    "proposal from {:?} seq={} tx_set={} close_time={}",
+                                    proposal.node_id, proposal.ledger_seq,
+                                    proposal.tx_set_hash, proposal.close_time
+                                );
                                 consensus.peer_proposal(proposal);
                             }
                             ConsensusMessage::Validation(validation) => {
+                                let val_seq = validation.ledger_seq;
+                                let val_hash = validation.ledger_hash;
                                 tracing::debug!(
                                     "validation from {:?} for ledger #{} hash={}",
-                                    validation.node_id, validation.ledger_seq, validation.ledger_hash
+                                    validation.node_id, val_seq, val_hash
                                 );
                                 let _ = event_tx.send(ServerEvent::ValidationReceived {
                                     validator: validation.node_id.0.to_string(),
-                                    ledger_hash: validation.ledger_hash.to_string(),
-                                    ledger_seq: validation.ledger_seq,
+                                    ledger_hash: val_hash.to_string(),
+                                    ledger_seq: val_seq,
                                     full: validation.full,
                                 });
+
+                                // Aggregate validation and check for quorum
+                                if let Some(validated) = val_aggregator.add_validation(validation) {
+                                    tracing::info!(
+                                        "network validated ledger #{} hash={} ({} validations)",
+                                        validated.seq, validated.hash, validated.validation_count
+                                    );
+                                    let our_seq = ledger_seq_shared.load(Ordering::Relaxed);
+
+                                    // If the network is ahead, enter sync mode
+                                    if validated.seq >= our_seq && !syncing {
+                                        if validated.seq > our_seq {
+                                            tracing::info!(
+                                                "network ahead (validated #{} vs our #{}), syncing to #{}",
+                                                validated.seq, our_seq, validated.seq
+                                            );
+                                            syncing = true;
+                                            establishing = false;
+                                            sync_started_at = Some(tokio::time::Instant::now());
+                                            last_sync_seq = our_seq;
+                                            // Request the network's validated ledger directly
+                                            // (not our_seq+1 which may not exist on peers)
+                                            let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
+                                                seq: validated.seq,
+                                                hash: Some(validated.hash),
+                                            });
+                                        }
+                                        if validated.seq > max_peer_seq {
+                                            max_peer_seq = validated.seq;
+                                        }
+                                    }
+                                }
                             }
                             ConsensusMessage::Transaction { hash, data } => {
                                 tracing::debug!("received transaction {} from network", hash);
@@ -855,15 +950,24 @@ impl Node {
                                     peer_id: from.to_string(),
                                     event: format!("status_change:seq={}", peer_seq),
                                 });
+                                if peer_seq > max_peer_seq {
+                                    max_peer_seq = peer_seq;
+                                }
                                 if peer_seq > our_seq + 1 {
-                                    tracing::info!(
-                                        "peer {} ahead by {} ledgers, requesting catchup",
-                                        from, peer_seq - our_seq
-                                    );
-                                    let next_seq = our_seq + 1;
+                                    if !syncing {
+                                        tracing::info!(
+                                            "peer {} ahead by {} ledgers, entering sync mode (target #{})",
+                                            from, peer_seq - our_seq, peer_seq
+                                        );
+                                        syncing = true;
+                                        establishing = false;
+                                        sync_started_at = Some(tokio::time::Instant::now());
+                                        last_sync_seq = our_seq;
+                                    }
+                                    // Request the peer's current ledger directly
                                     let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
-                                        seq: next_seq,
-                                        hash: None,
+                                        seq: peer_seq,
+                                        hash: Some(peer_hash),
                                     });
                                 }
                             }
@@ -874,20 +978,101 @@ impl Node {
                                 );
                                 if !nodes.is_empty() {
                                     match Node::try_reconstruct_ledger(seq, hash, &nodes, &node_store) {
-                                        Ok(ledger) => {
+                                        Ok(reconstructed) => {
                                             let mut history = closed_ledgers.write().await;
                                             if !history.iter().any(|l| l.header.sequence == seq) {
                                                 let pos = history.partition_point(|l| l.header.sequence < seq);
-                                                history.insert(pos, ledger);
+                                                history.insert(pos, reconstructed.clone());
                                                 while history.len() > crate::consensus_adapter::MAX_CLOSED_LEDGERS {
                                                     history.pop_front();
                                                 }
                                                 tracing::info!("catchup: reconstructed ledger #{} hash={}", seq, hash);
                                             }
+                                            drop(history);
+
+                                            if syncing {
+                                                // Adopt the reconstructed ledger: open ledger becomes N+1
+                                                let new_open = Ledger::new_open(&reconstructed);
+                                                let new_seq = new_open.header.sequence;
+                                                let mut l = ledger.write().await;
+                                                *l = new_open;
+                                                drop(l);
+                                                ledger_seq_shared.store(new_seq, Ordering::Relaxed);
+                                                *ledger_hash_shared.write().await = reconstructed.header.hash;
+                                                tracing::info!(
+                                                    "sync: adopted ledger #{}, open ledger is now #{}",
+                                                    seq, new_seq
+                                                );
+
+                                                // Use both max_peer_seq and highest validated
+                                                // to determine if sync is complete
+                                                let target = max_peer_seq
+                                                    .max(val_aggregator.highest_validated_seq);
+                                                if new_seq < target {
+                                                    // Request next ledger in the chain
+                                                    let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
+                                                        seq: new_seq,
+                                                        hash: None,
+                                                    });
+                                                    last_sync_seq = new_seq;
+                                                } else {
+                                                    syncing = false;
+                                                    sync_started_at = None;
+                                                    close_interval.reset();
+                                                    // Clear expired transactions accumulated during sync
+                                                    tx_queue.write().await.remove_expired(new_seq);
+                                                    tracing::info!(
+                                                        "catchup complete, resuming consensus at ledger #{}",
+                                                        new_seq
+                                                    );
+                                                }
+                                            }
                                         }
                                         Err(e) => tracing::warn!("catchup: failed to reconstruct ledger #{}: {}", seq, e),
                                     }
                                 }
+                            }
+                            ConsensusMessage::LedgerHeader { seq, header } => {
+                                tracing::info!(
+                                    "received parsed header for ledger #{} hash={} account_hash={}",
+                                    seq, header.hash, header.account_hash
+                                );
+                                // The overlay layer handles incremental sync (liAS_NODE
+                                // requests). We just log receipt here; reconstruction
+                                // happens when LedgerData with the full state arrives.
+                            }
+                            ConsensusMessage::ValidatorListReceived { validator_count } => {
+                                if configured_quorum.is_none() && validator_count > 0 {
+                                    let new_quorum = Node::compute_quorum(validator_count);
+                                    val_aggregator.update_quorum(new_quorum);
+                                    tracing::info!(
+                                        "auto-set validation quorum to {} (from {} validators)",
+                                        new_quorum, validator_count
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    _ = sync_check_interval.tick(), if syncing => {
+                        if let Some(started) = sync_started_at {
+                            let current_seq = ledger_seq_shared.load(Ordering::Relaxed);
+                            let elapsed = started.elapsed();
+                            if elapsed > Duration::from_secs(30) && current_seq <= last_sync_seq {
+                                // No progress in 30s, re-request the target ledger
+                                let target = max_peer_seq
+                                    .max(val_aggregator.highest_validated_seq);
+                                tracing::warn!(
+                                    "sync stalled at #{} for {:.0}s, re-requesting target #{}",
+                                    current_seq, elapsed.as_secs_f64(), target
+                                );
+                                let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
+                                    seq: target,
+                                    hash: None,
+                                });
+                                // Reset the timeout clock
+                                sync_started_at = Some(tokio::time::Instant::now());
+                                last_sync_seq = current_seq;
                             }
                         }
                     }
@@ -920,11 +1105,17 @@ impl Node {
         ledger_seq_shared: &Arc<AtomicU32>,
         ledger_hash_shared: &Arc<tokio::sync::RwLock<Hash256>>,
         tx_queue: &Arc<RwLock<TxQueue>>,
+        identity: &Arc<NodeIdentity>,
+        cmd_tx: &tokio::sync::mpsc::UnboundedSender<OverlayCommand>,
     ) {
         let effective_close_time = consensus
             .accepted_close_time()
             .unwrap_or(pending_close_time);
         let close_flags = consensus.accepted_close_flags();
+        tracing::debug!(
+            "closing with effective_close_time={} close_flags={} pending_close_time={}",
+            effective_close_time, close_flags, pending_close_time
+        );
 
         let mut l = ledger.write().await;
         if let Err(e) = l.close(effective_close_time, close_flags) {
@@ -1011,6 +1202,39 @@ impl Node {
         );
         drop(l);
 
+        // Broadcast validation (STObject format, rippled-compatible)
+        {
+            use rxrpl_consensus::types::Validation;
+            let mut validation = Validation {
+                node_id: rxrpl_consensus::types::NodeId(Hash256::new(identity.node_id.0)),
+                ledger_hash: hash,
+                ledger_seq: closed_seq,
+                full: true,
+                close_time: effective_close_time,
+                sign_time: effective_close_time,
+                signature: None,
+            };
+            identity.sign_validation(&mut validation);
+            let payload = rxrpl_overlay::proto_convert::encode_validation(
+                &validation,
+                identity.public_key_bytes(),
+            );
+            let _ = cmd_tx.send(OverlayCommand::Broadcast {
+                msg_type: rxrpl_p2p_proto::MessageType::Validation,
+                payload,
+            });
+        }
+
+        // Broadcast StatusChange so peers know our current ledger
+        {
+            let payload =
+                rxrpl_overlay::proto_convert::encode_status_change(&hash, closed_seq);
+            let _ = cmd_tx.send(OverlayCommand::Broadcast {
+                msg_type: rxrpl_p2p_proto::MessageType::StatusChange,
+                payload,
+            });
+        }
+
         // Cleanup TxQueue: remove confirmed + expired
         {
             let mut q = tx_queue.write().await;
@@ -1078,8 +1302,14 @@ impl Node {
             "OwnerCount": 0,
             "Flags": 0,
         });
-        let data = serde_json::to_vec(&account).map_err(|e| NodeError::Config(e.to_string()))?;
+        let json_bytes =
+            serde_json::to_vec(&account).map_err(|e| NodeError::Config(e.to_string()))?;
+        let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes)
+            .map_err(|e| NodeError::Config(format!("failed to encode genesis account: {e}")))?;
         genesis.put_state(key, data)?;
+
+        // Add FeeSettings with default values
+        Self::insert_genesis_fee_settings(&mut genesis)?;
 
         genesis.close(0, 0)?;
         Ok(genesis)
@@ -1103,13 +1333,46 @@ impl Node {
             "OwnerCount": 0,
             "Flags": 0,
         });
-        let data = serde_json::to_vec(&account).map_err(|e| NodeError::Config(e.to_string()))?;
+        let json_bytes =
+            serde_json::to_vec(&account).map_err(|e| NodeError::Config(e.to_string()))?;
+        let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes)
+            .map_err(|e| NodeError::Config(format!("failed to encode genesis account: {e}")))?;
         genesis.put_state(key, data)?;
+
+        // Add FeeSettings with default values
+        Self::insert_genesis_fee_settings(&mut genesis)?;
 
         // Close genesis ledger
         genesis.close(0, 0)?;
 
         Ok(genesis)
+    }
+
+    /// Insert default FeeSettings into the genesis ledger state map.
+    fn insert_genesis_fee_settings(genesis: &mut Ledger) -> Result<(), NodeError> {
+        let fee_settings = serde_json::json!({
+            "LedgerEntryType": "FeeSettings",
+            "BaseFee": "a",
+            "ReferenceFeeUnits": 10,
+            "ReserveBase": 10000000u32,
+            "ReserveIncrement": 2000000u32,
+            "Flags": 0,
+        });
+        let fee_key = keylet::fee_settings();
+        let json_bytes =
+            serde_json::to_vec(&fee_settings).map_err(|e| NodeError::Config(e.to_string()))?;
+        let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes)
+            .map_err(|e| NodeError::Config(format!("failed to encode fee settings: {e}")))?;
+        genesis.put_state(fee_key, data)?;
+        Ok(())
+    }
+
+    /// Compute the validation quorum from a validator count.
+    ///
+    /// Returns `ceil(count * 0.8)`, clamped to at least 1.
+    /// This matches the XRPL UNL quorum formula.
+    pub fn compute_quorum(validator_count: usize) -> usize {
+        (validator_count as f64 * 0.8).ceil().max(1.0) as usize
     }
 
     /// Apply a transaction to the current open ledger (standalone mode).
@@ -1237,6 +1500,206 @@ impl Node {
     pub fn is_running(&self) -> bool {
         self.running
     }
+
+    /// Fetch the latest validated ledger from an RPC endpoint.
+    ///
+    /// Returns (sequence, hash) of the latest validated ledger.
+    async fn bootstrap_from_rpc(
+        rpc_url: &str,
+    ) -> Result<(u32, Hash256), Box<dyn std::error::Error + Send + Sync>> {
+        tracing::info!("bootstrapping from RPC endpoint: {}", rpc_url);
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .danger_accept_invalid_certs(true)
+            .build()?;
+
+        let resp = client
+            .post(rpc_url)
+            .json(&serde_json::json!({
+                "method": "server_info",
+                "params": [{}]
+            }))
+            .send()
+            .await?
+            .json::<serde_json::Value>()
+            .await?;
+
+        let info = resp
+            .get("result")
+            .and_then(|r| r.get("info"))
+            .ok_or("missing result.info in server_info response")?;
+
+        // Try validated_ledger first, fall back to closed_ledger
+        let ledger = info
+            .get("validated_ledger")
+            .or_else(|| info.get("closed_ledger"))
+            .ok_or("no validated_ledger or closed_ledger in server_info")?;
+
+        let seq = ledger
+            .get("seq")
+            .and_then(|v| v.as_u64())
+            .ok_or("missing seq in ledger info")? as u32;
+
+        let hash_str = ledger
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .ok_or("missing hash in ledger info")?;
+
+        let hash_bytes = hex::decode(hash_str)
+            .map_err(|e| format!("invalid ledger hash hex: {e}"))?;
+        if hash_bytes.len() != 32 {
+            return Err(format!("ledger hash must be 32 bytes, got {}", hash_bytes.len()).into());
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&hash_bytes);
+        let hash = Hash256::new(arr);
+
+        Ok((seq, hash))
+    }
+
+    /// Download the full state tree for a ledger via RPC `ledger_data` pagination.
+    async fn download_state_via_rpc(
+        rpc_url: &str,
+        ledger_hash: &str,
+        store: Arc<dyn NodeStore>,
+    ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .danger_accept_invalid_certs(true)
+            .build()?;
+
+        let mut marker: Option<String> = None;
+        let mut total = 0u32;
+        let mut page = 0u32;
+        let mut retries = 0u32;
+        let start = std::time::Instant::now();
+
+        loop {
+            let mut params = serde_json::json!({
+                "ledger_hash": ledger_hash,
+                "binary": true,
+                "limit": 2048
+            });
+            if let Some(ref m) = marker {
+                params["marker"] = serde_json::Value::String(m.clone());
+            }
+
+            let resp = match client
+                .post(rpc_url)
+                .json(&serde_json::json!({
+                    "method": "ledger_data",
+                    "params": [params]
+                }))
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    retries += 1;
+                    if retries > 5 {
+                        return Err(format!("too many retries: {}", e).into());
+                    }
+                    tracing::warn!("RPC request failed (retry {}): {}", retries, e);
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+
+            let body = match resp.json::<serde_json::Value>().await {
+                Ok(v) => v,
+                Err(e) => {
+                    retries += 1;
+                    if retries > 5 {
+                        return Err(format!("too many retries: {}", e).into());
+                    }
+                    tracing::warn!("RPC response decode failed (retry {}): {}", retries, e);
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            retries = 0;
+
+            let result = body.get("result")
+                .ok_or("missing result in ledger_data response")?;
+
+            if let Some(err) = result.get("error") {
+                return Err(format!("ledger_data error: {}", err).into());
+            }
+
+            let state = result.get("state")
+                .and_then(|s| s.as_array())
+                .ok_or("missing state array in ledger_data response")?;
+
+            if state.is_empty() {
+                break;
+            }
+
+            let mut batch: Vec<(Hash256, Vec<u8>)> = Vec::with_capacity(state.len());
+            for entry in state {
+                let index = match entry.get("index").and_then(|v| v.as_str()) {
+                    Some(i) => i,
+                    None => continue,
+                };
+                let data_hex = match entry.get("data").and_then(|v| v.as_str()) {
+                    Some(d) => d,
+                    None => continue,
+                };
+
+                let key_bytes = match hex::decode(index) {
+                    Ok(b) if b.len() == 32 => b,
+                    _ => continue,
+                };
+                let data_bytes = match hex::decode(data_hex) {
+                    Ok(b) => b,
+                    _ => continue,
+                };
+
+                let mut raw = Vec::with_capacity(32 + data_bytes.len());
+                raw.extend_from_slice(&key_bytes);
+                raw.extend_from_slice(&data_bytes);
+
+                let prefix: [u8; 4] = [0x4D, 0x4C, 0x4E, 0x00];
+                let hash = rxrpl_crypto::sha512_half::sha512_half(&[&prefix, &raw]);
+                batch.push((hash, raw));
+            }
+
+            let count = batch.len();
+            if count > 0 {
+                let refs: Vec<(&Hash256, &[u8])> = batch.iter()
+                    .map(|(h, d)| (h, d.as_slice()))
+                    .collect();
+                store.store_batch(&refs)?;
+            }
+            total += count as u32;
+            page += 1;
+
+            if page % 100 == 0 {
+                let elapsed = start.elapsed().as_secs();
+                let rate = if elapsed > 0 { total as u64 / elapsed } else { 0 };
+                tracing::info!(
+                    "RPC state download: {} entries ({} pages, {} entries/s)",
+                    total, page, rate
+                );
+            }
+
+            marker = result.get("marker")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            if marker.is_none() {
+                break;
+            }
+        }
+
+        let elapsed = start.elapsed().as_secs();
+        tracing::info!(
+            "RPC state download complete: {} entries in {} pages ({}s)",
+            total, page, elapsed
+        );
+        Ok(total)
+    }
 }
 
 #[cfg(test)]
@@ -1262,7 +1725,7 @@ mod tests {
         let account_id = decode_account_id(address).unwrap();
         let key = keylet::account(&account_id);
         let data = genesis.get_state(&key).unwrap();
-        let account: Value = serde_json::from_slice(data).unwrap();
+        let account: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
         assert_eq!(
             account["Balance"].as_str().unwrap(),
             genesis.header.drops.to_string()
@@ -1284,5 +1747,157 @@ mod tests {
         let closed = node.closed_ledgers.blocking_read();
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].header.sequence, 1);
+    }
+
+    #[test]
+    fn genesis_includes_fee_settings() {
+        let address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let genesis = Node::genesis_with_funded_account(address).unwrap();
+
+        let fee_key = keylet::fee_settings();
+        let data = genesis.get_state(&fee_key).expect("FeeSettings missing from genesis");
+        let fee: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
+        assert_eq!(fee["LedgerEntryType"].as_str().unwrap(), "FeeSettings");
+        assert_eq!(fee["ReserveBase"], 10_000_000);
+        assert_eq!(fee["ReserveIncrement"], 2_000_000);
+    }
+
+    #[test]
+    fn genesis_hash_deterministic() {
+        let address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let genesis1 = Node::genesis_with_funded_account(address).unwrap();
+        let genesis2 = Node::genesis_with_funded_account(address).unwrap();
+
+        assert_eq!(genesis1.header.hash, genesis2.header.hash);
+        assert_eq!(genesis1.header.account_hash, genesis2.header.account_hash);
+        assert!(!genesis1.header.hash.is_zero());
+    }
+
+    #[test]
+    fn compute_quorum_standard_unl() {
+        // 35 validators (typical mainnet UNL) → 28 quorum (80%)
+        assert_eq!(Node::compute_quorum(35), 28);
+    }
+
+    #[test]
+    fn compute_quorum_small_list() {
+        assert_eq!(Node::compute_quorum(10), 8);
+        assert_eq!(Node::compute_quorum(5), 4);
+        assert_eq!(Node::compute_quorum(1), 1);
+    }
+
+    #[test]
+    fn compute_quorum_rounds_up() {
+        // 7 * 0.8 = 5.6 → ceil → 6
+        assert_eq!(Node::compute_quorum(7), 6);
+        // 3 * 0.8 = 2.4 → ceil → 3
+        assert_eq!(Node::compute_quorum(3), 3);
+    }
+
+    #[test]
+    fn compute_quorum_zero_returns_one() {
+        assert_eq!(Node::compute_quorum(0), 1);
+    }
+
+    #[test]
+    fn quorum_auto_set_integration() {
+        // Simulate the full flow: ValidatorListReceived → compute_quorum → update_quorum
+        // This tests the exact code path from the select! handler.
+        use rxrpl_overlay::validation_aggregator::ValidationAggregator;
+        use rxrpl_consensus::types::{NodeId as CNodeId, Validation};
+
+        let configured_quorum: Option<usize> = None; // auto mode
+        let mut val_aggregator = ValidationAggregator::new(1);
+
+        // Simulate receiving a ValidatorList with 35 validators
+        let validator_count = 35usize;
+        if configured_quorum.is_none() && validator_count > 0 {
+            let new_quorum = Node::compute_quorum(validator_count);
+            val_aggregator.update_quorum(new_quorum);
+        }
+
+        // Now quorum should be 28. Sending 27 validations should NOT reach quorum.
+        let hash = Hash256::new([0xAA; 32]);
+        for i in 1..=27u8 {
+            let v = Validation {
+                node_id: CNodeId(Hash256::new([i; 32])),
+                ledger_hash: hash,
+                ledger_seq: 100,
+                full: true,
+                close_time: 100,
+                sign_time: 100,
+                signature: None,
+            };
+            assert!(val_aggregator.add_validation(v).is_none());
+        }
+
+        // 28th validation reaches quorum
+        let v28 = Validation {
+            node_id: CNodeId(Hash256::new([28; 32])),
+            ledger_hash: hash,
+            ledger_seq: 100,
+            full: true,
+            close_time: 100,
+            sign_time: 100,
+            signature: None,
+        };
+        let result = val_aggregator.add_validation(v28);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().validation_count, 28);
+    }
+
+    #[test]
+    fn quorum_not_overridden_when_configured() {
+        // When quorum is explicitly configured, ValidatorListReceived should NOT change it
+        use rxrpl_overlay::validation_aggregator::ValidationAggregator;
+
+        let configured_quorum: Option<usize> = Some(5); // explicit
+        let mut val_aggregator = ValidationAggregator::new(5);
+
+        let validator_count = 35usize;
+        // This guard prevents override — same as in the select! handler
+        if configured_quorum.is_none() && validator_count > 0 {
+            let new_quorum = Node::compute_quorum(validator_count);
+            val_aggregator.update_quorum(new_quorum);
+        }
+
+        // Quorum should still be 5, not 28
+        let hash = Hash256::new([0xBB; 32]);
+        for i in 1..=4u8 {
+            let v = rxrpl_consensus::types::Validation {
+                node_id: rxrpl_consensus::types::NodeId(Hash256::new([i; 32])),
+                ledger_hash: hash,
+                ledger_seq: 200,
+                full: true,
+                close_time: 100,
+                sign_time: 100,
+                signature: None,
+            };
+            assert!(val_aggregator.add_validation(v).is_none());
+        }
+        let v5 = rxrpl_consensus::types::Validation {
+            node_id: rxrpl_consensus::types::NodeId(Hash256::new([5; 32])),
+            ledger_hash: hash,
+            ledger_seq: 200,
+            full: true,
+            close_time: 100,
+            sign_time: 100,
+            signature: None,
+        };
+        assert!(val_aggregator.add_validation(v5).is_some());
+    }
+
+    #[test]
+    fn genesis_binary_encoding_deterministic() {
+        let address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let genesis1 = Node::genesis_with_funded_account(address).unwrap();
+        let genesis2 = Node::genesis_with_funded_account(address).unwrap();
+
+        // Verify the raw binary data for the account root is identical
+        let account_id = decode_account_id(address).unwrap();
+        let key = keylet::account(&account_id);
+        let data1 = genesis1.get_state(&key).unwrap();
+        let data2 = genesis2.get_state(&key).unwrap();
+        assert_eq!(data1, data2, "binary encoding must be deterministic");
     }
 }

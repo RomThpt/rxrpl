@@ -28,7 +28,7 @@ fn read_owner_count(ledger: &Ledger, address: &str) -> u32 {
     let account_id = decode_account_id(address).unwrap();
     let key = keylet::account(&account_id);
     let data = ledger.get_state(&key).unwrap();
-    let account: Value = serde_json::from_slice(data).unwrap();
+    let account: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
     account["OwnerCount"].as_u64().unwrap() as u32
 }
 
@@ -64,7 +64,7 @@ fn did_set_creates_entry() {
     let account_id = decode_account_id(&genesis_addr).unwrap();
     let did_key = keylet::did(&account_id);
     let data = ledger.get_state(&did_key).unwrap();
-    let did: Value = serde_json::from_slice(data).unwrap();
+    let did: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
     assert_eq!(did["LedgerEntryType"].as_str().unwrap(), "DID");
 
     assert_eq!(read_owner_count(&ledger, &genesis_addr), 1);
@@ -104,7 +104,7 @@ fn oracle_set_creates_entry() {
     let account_id = decode_account_id(&genesis_addr).unwrap();
     let oracle_key = keylet::oracle(&account_id, 1);
     let data = ledger.get_state(&oracle_key).unwrap();
-    let oracle: Value = serde_json::from_slice(data).unwrap();
+    let oracle: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
     assert_eq!(oracle["LedgerEntryType"].as_str().unwrap(), "Oracle");
 
     assert_eq!(read_owner_count(&ledger, &genesis_addr), 1);
@@ -133,7 +133,7 @@ fn mptoken_issuance_create_succeeds() {
     let account_id = decode_account_id(&genesis_addr).unwrap();
     let issuance_key = keylet::mptoken_issuance(&account_id, 1);
     let data = ledger.get_state(&issuance_key).unwrap();
-    let issuance: Value = serde_json::from_slice(data).unwrap();
+    let issuance: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
     assert_eq!(
         issuance["LedgerEntryType"].as_str().unwrap(),
         "MPTokenIssuance"

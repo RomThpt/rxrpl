@@ -1,8 +1,10 @@
 use prost::Message;
 use rxrpl_consensus::types::{NodeId, Proposal, Validation};
 use rxrpl_p2p_proto::proto::{
-    TmGetLedger, TmHello, TmLedgerData, TmManifest, TmPing, TmProposeSet, TmStatusChange,
-    TmTransaction, TmValidation, tm_ledger_data::TmLedgerNode,
+    TmEndpoints, TmGetLedger, TmGetObjectByHash, TmHaveTransactionSet, TmHaveTransactions,
+    TmHello, TmLedgerData, TmLedgerNode, TmManifest, TmManifests, TmPing, TmProposeSet,
+    TmSquelch, TmStatusChange, TmTransaction, TmTransactions, TmValidation, TmValidatorList,
+    TmValidatorListCollection,
 };
 use rxrpl_primitives::Hash256;
 
@@ -13,13 +15,14 @@ use crate::identity::NodeIdentity;
 
 pub fn encode_propose_set(proposal: &Proposal) -> Vec<u8> {
     let msg = TmProposeSet {
-        propose_seq: proposal.prop_seq,
-        current_tx_hash: proposal.tx_set_hash.as_bytes().to_vec(),
-        node_pub_key: proposal.node_id.0.as_bytes().to_vec(),
-        close_time: proposal.close_time,
-        signature: proposal.signature.clone().unwrap_or_default(),
-        previous_ledger: proposal.prev_ledger.as_bytes().to_vec(),
-        ledger_seq: proposal.ledger_seq,
+        propose_seq: Some(proposal.prop_seq),
+        current_tx_hash: Some(proposal.tx_set_hash.as_bytes().to_vec()),
+        node_pub_key: Some(proposal.public_key.clone()),
+        close_time: Some(proposal.close_time),
+        signature: Some(proposal.signature.clone().unwrap_or_default()),
+        previousledger: Some(proposal.prev_ledger.as_bytes().to_vec()),
+        added_transactions: Vec::new(),
+        removed_transactions: Vec::new(),
     };
     msg.encode_to_vec()
 }
@@ -28,68 +31,156 @@ pub fn decode_propose_set(data: &[u8]) -> Result<Proposal, OverlayError> {
     let msg = TmProposeSet::decode(data)
         .map_err(|e| OverlayError::Codec(format!("decode ProposeSet: {e}")))?;
 
-    let node_id = NodeId(hash256_from_bytes(&msg.node_pub_key)?);
-    let tx_set_hash = hash256_from_bytes(&msg.current_tx_hash)?;
-    let prev_ledger = hash256_from_bytes(&msg.previous_ledger)?;
+    let pubkey_bytes = msg.node_pub_key.unwrap_or_default();
+    let node_id = NodeId(rxrpl_crypto::sha512_half::sha512_half(&[&pubkey_bytes]));
+    let tx_set_hash = hash256_from_bytes(&msg.current_tx_hash.unwrap_or_default())?;
+    let prev_ledger = hash256_from_bytes(&msg.previousledger.unwrap_or_default())?;
 
     Ok(Proposal {
         node_id,
+        public_key: pubkey_bytes,
         tx_set_hash,
-        close_time: msg.close_time,
-        prop_seq: msg.propose_seq,
-        ledger_seq: msg.ledger_seq,
+        close_time: msg.close_time.unwrap_or(0),
+        prop_seq: msg.propose_seq.unwrap_or(0),
+        ledger_seq: 0,
         prev_ledger,
-        signature: if msg.signature.is_empty() {
-            None
-        } else {
-            Some(msg.signature)
+        signature: {
+            let sig = msg.signature.unwrap_or_default();
+            if sig.is_empty() {
+                None
+            } else {
+                Some(sig)
+            }
         },
     })
 }
 
 // --- Validation ---
 
-pub fn encode_validation(validation: &Validation) -> Vec<u8> {
-    // Pack validation data: signing_data + signature
-    let mut payload = validation.signing_data();
+/// Encode a validation as a rippled-compatible STObject inside TMValidation.
+///
+/// The STObject contains: sfFlags, sfLedgerHash, sfLedgerSequence,
+/// sfSigningTime, sfSigningPubKey, sfSignature.
+pub fn encode_validation(validation: &Validation, public_key: &[u8]) -> Vec<u8> {
+    use crate::stobject;
+
+    // Build the signing data (without signature) for hashing
+    let mut stobj = Vec::with_capacity(256);
+
+    // sfFlags (UINT32, field 2) -- 0x80000001 = vfFullValidation if full
+    let flags: u32 = if validation.full { 0x80000001 } else { 0x00000000 };
+    stobject::put_uint32(&mut stobj, 2, flags);
+
+    // sfLedgerSequence (UINT32, field 6)
+    stobject::put_uint32(&mut stobj, 6, validation.ledger_seq);
+
+    // sfSigningTime (UINT32, field 9)
+    stobject::put_uint32(&mut stobj, 9, validation.sign_time);
+
+    // sfLedgerHash (UINT256, field 1)
+    stobject::put_hash256(&mut stobj, 1, validation.ledger_hash.as_bytes());
+
+    // sfSigningPubKey (VL, field 3)
+    stobject::put_vl(&mut stobj, 3, public_key);
+
+    // sfSignature (VL, field 6) -- must be last (notSigning field)
     if let Some(ref sig) = validation.signature {
-        payload.extend_from_slice(sig);
+        stobject::put_vl(&mut stobj, 6, sig);
     }
+
     let msg = TmValidation {
-        validation: payload,
-        ledger_seq: validation.ledger_seq,
+        validation: Some(stobj),
     };
     msg.encode_to_vec()
 }
 
+/// Decode a validation from rippled STObject format.
 pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
     let msg = TmValidation::decode(data)
         .map_err(|e| OverlayError::Codec(format!("decode Validation: {e}")))?;
 
-    // Validation payload: signing_data(45 bytes) + signature(64 bytes)
-    let payload = &msg.validation;
-    if payload.len() < 45 {
-        return Err(OverlayError::Codec("validation payload too short".into()));
+    let payload = msg.validation.unwrap_or_default();
+
+    // Parse STObject fields
+    let mut ledger_hash = Hash256::ZERO;
+    let mut ledger_seq = 0u32;
+    let mut sign_time = 0u32;
+    let mut full = false;
+    let mut signature: Option<Vec<u8>> = None;
+    let mut signing_pub_key: Vec<u8> = Vec::new();
+
+    let mut pos = 0;
+    while pos < payload.len() {
+        let (type_id, field_id, hdr_len) =
+            crate::stobject::decode_field_id(&payload[pos..])
+                .ok_or_else(|| OverlayError::Codec("invalid STObject field header".into()))?;
+        pos += hdr_len;
+
+        match (type_id, field_id) {
+            // UINT32 fields
+            (2, 2) => {
+                // sfFlags
+                if pos + 4 > payload.len() { break; }
+                let v = u32::from_be_bytes(payload[pos..pos + 4].try_into().unwrap());
+                full = (v & 0x80000001) == 0x80000001;
+                pos += 4;
+            }
+            (2, fid) => {
+                // Other UINT32
+                if pos + 4 > payload.len() { break; }
+                let v = u32::from_be_bytes(payload[pos..pos + 4].try_into().unwrap());
+                match fid {
+                    6 => ledger_seq = v,  // sfLedgerSequence
+                    9 => sign_time = v,   // sfSigningTime
+                    _ => {}
+                }
+                pos += 4;
+            }
+            // UINT64 fields
+            (3, _) => {
+                if pos + 8 > payload.len() { break; }
+                pos += 8;
+            }
+            // UINT256 fields
+            (5, fid) => {
+                if pos + 32 > payload.len() { break; }
+                if fid == 1 {
+                    // sfLedgerHash
+                    ledger_hash = hash256_from_bytes(&payload[pos..pos + 32])?;
+                }
+                pos += 32;
+            }
+            // VL fields
+            (7, fid) => {
+                let (vl_len, vl_hdr) =
+                    crate::stobject::decode_vl_length(&payload[pos..])
+                        .ok_or_else(|| OverlayError::Codec("invalid VL length".into()))?;
+                pos += vl_hdr;
+                if pos + vl_len > payload.len() { break; }
+                match fid {
+                    3 => signing_pub_key = payload[pos..pos + vl_len].to_vec(),
+                    6 => signature = Some(payload[pos..pos + vl_len].to_vec()),
+                    _ => {}
+                }
+                pos += vl_len;
+            }
+            // Skip unknown types
+            _ => break,
+        }
     }
 
-    let ledger_hash = hash256_from_bytes(&payload[0..32])?;
-    let ledger_seq = u32::from_be_bytes(payload[32..36].try_into().unwrap());
-    let close_time = u32::from_be_bytes(payload[36..40].try_into().unwrap());
-    let sign_time = u32::from_be_bytes(payload[40..44].try_into().unwrap());
-    let full = payload[44] != 0;
-
-    let signature = if payload.len() > 45 {
-        Some(payload[45..].to_vec())
+    let node_id = if !signing_pub_key.is_empty() {
+        NodeId(rxrpl_crypto::sha512_half::sha512_half(&[&signing_pub_key]))
     } else {
-        None
+        NodeId(Hash256::ZERO)
     };
 
     Ok(Validation {
-        node_id: NodeId(Hash256::ZERO), // caller must set from context
+        node_id,
         ledger_hash,
         ledger_seq,
         full,
-        close_time,
+        close_time: sign_time,
         sign_time,
         signature,
     })
@@ -97,17 +188,13 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
 
 // --- Transaction ---
 
-pub fn encode_transaction(tx_hash: &Hash256, tx_data: &[u8]) -> Vec<u8> {
-    // Pack: hash(32) + raw_transaction
-    let mut raw = Vec::with_capacity(32 + tx_data.len());
-    raw.extend_from_slice(tx_hash.as_bytes());
-    raw.extend_from_slice(tx_data);
-
+pub fn encode_transaction(_tx_hash: &Hash256, tx_data: &[u8]) -> Vec<u8> {
+    // rippled-compatible: raw_transaction contains the serialized tx directly.
     let msg = TmTransaction {
-        raw_transaction: raw,
-        status: 0,
-        receive_timestamp: 0,
-        deferred: 0,
+        raw_transaction: Some(tx_data.to_vec()),
+        status: Some(0),
+        receive_timestamp: Some(0),
+        deferred: Some(false),
     };
     msg.encode_to_vec()
 }
@@ -116,25 +203,38 @@ pub fn decode_transaction(data: &[u8]) -> Result<(Hash256, Vec<u8>), OverlayErro
     let msg = TmTransaction::decode(data)
         .map_err(|e| OverlayError::Codec(format!("decode Transaction: {e}")))?;
 
-    if msg.raw_transaction.len() < 32 {
-        return Err(OverlayError::Codec("transaction payload too short".into()));
+    let raw_transaction = msg.raw_transaction.unwrap_or_default();
+    if raw_transaction.is_empty() {
+        return Err(OverlayError::Codec("empty transaction payload".into()));
     }
 
-    let tx_hash = hash256_from_bytes(&msg.raw_transaction[..32])?;
-    let tx_data = msg.raw_transaction[32..].to_vec();
-    Ok((tx_hash, tx_data))
+    // rippled sends the serialized transaction directly in raw_transaction.
+    // Compute the hash: SHA-512-Half(HashPrefix::TRANSACTION_ID || raw_tx)
+    let prefix = rxrpl_crypto::hash_prefix::HashPrefix::TRANSACTION_ID.to_bytes();
+    let mut hash_input = prefix.to_vec();
+    hash_input.extend_from_slice(&raw_transaction);
+    let tx_hash = rxrpl_crypto::sha512_half::sha512_half(&[&hash_input]);
+
+    Ok((tx_hash, raw_transaction))
 }
 
 // --- StatusChange ---
 
 pub fn encode_status_change(ledger_hash: &Hash256, ledger_seq: u32) -> Vec<u8> {
     let msg = TmStatusChange {
-        new_status: 0,
-        new_event: 0,
-        ledger_seq,
-        ledger_hash: ledger_hash.as_bytes().to_vec(),
-        validated_hash: Vec::new(),
-        validated_seq: 0,
+        new_status: Some(0),
+        new_event: Some(0),
+        ledger_seq: Some(ledger_seq),
+        ledger_hash: Some(ledger_hash.as_bytes().to_vec()),
+        ledger_hash_previous: None,
+        network_time: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        ),
+        first_seq: None,
+        last_seq: None,
     };
     msg.encode_to_vec()
 }
@@ -142,8 +242,8 @@ pub fn encode_status_change(ledger_hash: &Hash256, ledger_seq: u32) -> Vec<u8> {
 pub fn decode_status_change(data: &[u8]) -> Result<(Hash256, u32), OverlayError> {
     let msg = TmStatusChange::decode(data)
         .map_err(|e| OverlayError::Codec(format!("decode StatusChange: {e}")))?;
-    let ledger_hash = hash256_from_bytes(&msg.ledger_hash)?;
-    Ok((ledger_hash, msg.ledger_seq))
+    let ledger_hash = hash256_from_bytes(&msg.ledger_hash.unwrap_or_default())?;
+    Ok((ledger_hash, msg.ledger_seq.unwrap_or(0)))
 }
 
 // --- Hello ---
@@ -157,7 +257,7 @@ pub fn encode_hello(
     // node_proof = sign(SHA-512-Half(pubkey || "RXRPL-HANDSHAKE"))
     let mut proof_data = Vec::new();
     proof_data.extend_from_slice(identity.public_key_bytes());
-    proof_data.extend_from_slice(b"RXRPL-HANDSHAKE");
+    proof_data.extend_from_slice(b"XRPL-HANDSHAKE");
     let proof_hash = rxrpl_crypto::sha512_half::sha512_half(&[&proof_data]);
     let node_proof = identity.sign(proof_hash.as_bytes());
 
@@ -167,8 +267,8 @@ pub fn encode_hello(
         .as_secs();
 
     let msg = TmHello {
-        proto_version: 1,
-        proto_version_min: 1,
+        proto_version: 2,
+        proto_version_min: 2,
         node_public: identity.public_key_bytes().to_vec(),
         node_proof,
         network_id,
@@ -187,13 +287,15 @@ pub fn decode_hello(data: &[u8]) -> Result<TmHello, OverlayError> {
 
 pub fn encode_ping(seq: u32, is_pong: bool) -> Vec<u8> {
     let msg = TmPing {
-        r#type: if is_pong { 1 } else { 0 },
-        seq,
-        ping_time: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        net_time: 0,
+        r#type: Some(if is_pong { 1 } else { 0 }),
+        seq: Some(seq),
+        ping_time: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        ),
+        net_time: Some(0),
     };
     msg.encode_to_vec()
 }
@@ -208,7 +310,7 @@ pub fn encode_get_ledger(
     ledger_type: i32,
     hash: Option<&Hash256>,
     seq: u32,
-    request_cookie: bool,
+    request_cookie: u64,
 ) -> Vec<u8> {
     encode_get_ledger_with_nodes(ledger_type, hash, seq, request_cookie, Vec::new())
 }
@@ -221,16 +323,19 @@ pub fn encode_get_ledger_with_nodes(
     ledger_type: i32,
     hash: Option<&Hash256>,
     seq: u32,
-    request_cookie: bool,
+    request_cookie: u64,
     node_ids: Vec<Vec<u8>>,
 ) -> Vec<u8> {
+    let has_nodes = !node_ids.is_empty();
     let msg = TmGetLedger {
-        ledger_type,
-        ledger_hash: hash.map(|h| h.as_bytes().to_vec()).unwrap_or_default(),
-        ledger_seq: seq,
+        itype: ledger_type,
+        ltype: None,
+        ledger_hash: hash.map(|h| h.as_bytes().to_vec()),
+        ledger_seq: if seq > 0 { Some(seq) } else { None },
         node_ids,
-        request_cookie,
-        query_depth: 0,
+        request_cookie: if request_cookie > 0 { Some(request_cookie) } else { None },
+        query_type: None,
+        query_depth: if has_nodes { Some(2) } else { None },
     };
     msg.encode_to_vec()
 }
@@ -246,17 +351,21 @@ pub fn encode_ledger_data(
     seq: u32,
     ltype: i32,
     nodes: Vec<(Vec<u8>, Vec<u8>)>,
-    cookie: u32,
+    cookie: u64,
 ) -> Vec<u8> {
     let msg = TmLedgerData {
         ledger_hash: hash.as_bytes().to_vec(),
         ledger_seq: seq,
-        ledger_type: ltype,
+        ledger_info_type: ltype,
         nodes: nodes
             .into_iter()
-            .map(|(node_id, node_data)| TmLedgerNode { node_id, node_data })
+            .map(|(id, data)| TmLedgerNode {
+                nodeid: Some(id),
+                nodedata: Some(data),
+            })
             .collect(),
-        request_cookie: cookie,
+        request_cookie: Some(cookie as u32),
+        error: None,
     };
     msg.encode_to_vec()
 }
@@ -273,8 +382,8 @@ pub fn encode_peers(peers: Vec<(String, u16)>) -> Vec<u8> {
         peers: peers
             .into_iter()
             .map(|(ip, port)| TmPeer {
-                ip,
-                port: port as u32,
+                ip: Some(ip),
+                port: Some(port as u32),
             })
             .collect(),
     };
@@ -288,17 +397,15 @@ pub fn decode_peers(data: &[u8]) -> Result<Vec<(String, u16)>, OverlayError> {
     Ok(msg
         .peers
         .into_iter()
-        .map(|p| (p.ip, p.port as u16))
+        .map(|p| (p.ip.unwrap_or_default(), p.port.unwrap_or(0) as u16))
         .collect())
 }
 
 // --- Manifest ---
 
-/// Decoded manifest fields.
+/// Decoded manifest fields -- raw stobject bytes from TMManifest.
 pub struct ManifestData {
-    pub master_key: String,
-    pub signing_key: String,
-    pub seq: u32,
+    pub raw: Vec<u8>,
 }
 
 pub fn decode_manifest(data: &[u8]) -> Result<ManifestData, OverlayError> {
@@ -306,10 +413,141 @@ pub fn decode_manifest(data: &[u8]) -> Result<ManifestData, OverlayError> {
         .map_err(|e| OverlayError::Codec(format!("decode Manifest: {e}")))?;
 
     Ok(ManifestData {
-        master_key: hex::encode(&msg.master_key),
-        signing_key: hex::encode(&msg.signing_key),
-        seq: msg.seq,
+        raw: msg.stobject.unwrap_or_default(),
     })
+}
+
+// --- Manifests (batch, type 2) ---
+
+pub fn decode_manifests(data: &[u8]) -> Result<Vec<TmManifest>, OverlayError> {
+    let msg = TmManifests::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode Manifests: {e}")))?;
+    Ok(msg.list)
+}
+
+pub fn encode_manifests(manifests: Vec<Vec<u8>>) -> Vec<u8> {
+    let msg = TmManifests {
+        list: manifests
+            .into_iter()
+            .map(|raw| TmManifest {
+                stobject: Some(raw),
+            })
+            .collect(),
+    };
+    msg.encode_to_vec()
+}
+
+// --- Endpoints (type 15) ---
+
+pub fn decode_endpoints(data: &[u8]) -> Result<Vec<(String, u32)>, OverlayError> {
+    let msg = TmEndpoints::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode Endpoints: {e}")))?;
+    Ok(msg
+        .endpoints_v2
+        .into_iter()
+        .map(|ep| (ep.endpoint.unwrap_or_default(), ep.hops.unwrap_or(0)))
+        .collect())
+}
+
+// --- HaveTransactionSet (type 35) ---
+
+pub struct HaveSetData {
+    pub status: u32,
+    pub hash: Hash256,
+}
+
+pub fn decode_have_set(data: &[u8]) -> Result<HaveSetData, OverlayError> {
+    let msg = TmHaveTransactionSet::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode HaveSet: {e}")))?;
+    let hash = hash256_from_bytes(&msg.hash.unwrap_or_default())?;
+    Ok(HaveSetData {
+        status: msg.status.unwrap_or(0) as u32,
+        hash,
+    })
+}
+
+// --- GetObjectByHash (type 42) ---
+
+/// rippled ObjectType enum values for TMGetObjectByHash.type.
+/// otLEDGER_NODE = 3: request SHAMap tree nodes by content hash.
+const OT_LEDGER_NODE: i32 = 3;
+
+/// Encode a TMGetObjectByHash request to fetch SHAMap nodes by content hash.
+///
+/// This is used as a fallback when tree-based incremental sync gets stuck:
+/// instead of requesting nodes by their SHAMapNodeID position in the tree,
+/// we request them directly by their content hash (SHA-512-Half of the
+/// serialized node data).
+pub fn encode_get_objects_by_hash(
+    ledger_hash: &Hash256,
+    ledger_seq: u32,
+    content_hashes: &[Hash256],
+    fat: bool,
+) -> Vec<u8> {
+    use rxrpl_p2p_proto::proto::TmIndexedObject;
+
+    let objects: Vec<TmIndexedObject> = content_hashes
+        .iter()
+        .map(|h| TmIndexedObject {
+            hash: Some(h.as_bytes().to_vec()),
+            node_id: None,
+            index: None,
+            data: None,
+            ledger_seq: Some(ledger_seq),
+        })
+        .collect();
+
+    let msg = TmGetObjectByHash {
+        r#type: Some(OT_LEDGER_NODE),
+        query: Some(true),
+        seq: Some(ledger_seq),
+        ledger_hash: Some(ledger_hash.as_bytes().to_vec()),
+        fat: Some(fat),
+        objects,
+    };
+    msg.encode_to_vec()
+}
+
+pub fn decode_get_objects(data: &[u8]) -> Result<TmGetObjectByHash, OverlayError> {
+    TmGetObjectByHash::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode GetObjects: {e}")))
+}
+
+// --- Squelch (type 55) ---
+
+pub fn decode_squelch(data: &[u8]) -> Result<TmSquelch, OverlayError> {
+    TmSquelch::decode(data).map_err(|e| OverlayError::Codec(format!("decode Squelch: {e}")))
+}
+
+// --- ValidatorList (type 54) ---
+
+pub fn decode_validator_list(data: &[u8]) -> Result<TmValidatorList, OverlayError> {
+    TmValidatorList::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode ValidatorList: {e}")))
+}
+
+// --- ValidatorListCollection (type 56) ---
+
+pub fn decode_validator_list_collection(
+    data: &[u8],
+) -> Result<TmValidatorListCollection, OverlayError> {
+    TmValidatorListCollection::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode ValidatorListCollection: {e}")))
+}
+
+// --- HaveTransactions (type 63) ---
+
+pub fn decode_have_transactions(data: &[u8]) -> Result<Vec<Vec<u8>>, OverlayError> {
+    let msg = TmHaveTransactions::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode HaveTransactions: {e}")))?;
+    Ok(msg.hashes)
+}
+
+// --- Transactions (batch, type 64) ---
+
+pub fn decode_transactions(data: &[u8]) -> Result<TmTransactions, OverlayError> {
+    TmTransactions::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode Transactions: {e}")))
 }
 
 // --- Helpers ---
@@ -334,8 +572,11 @@ mod tests {
 
     #[test]
     fn propose_set_roundtrip() {
+        let pubkey = vec![0x02; 33];
+        let node_id = NodeId(rxrpl_crypto::sha512_half::sha512_half(&[&pubkey]));
         let proposal = Proposal {
-            node_id: NodeId(Hash256::new([0x01; 32])),
+            node_id,
+            public_key: pubkey,
             tx_set_hash: Hash256::new([0x02; 32]),
             close_time: 100,
             prop_seq: 1,
@@ -348,23 +589,29 @@ mod tests {
         let decoded = decode_propose_set(&encoded).unwrap();
 
         assert_eq!(decoded.node_id, proposal.node_id);
+        assert_eq!(decoded.public_key, proposal.public_key);
         assert_eq!(decoded.tx_set_hash, proposal.tx_set_hash);
         assert_eq!(decoded.close_time, proposal.close_time);
         assert_eq!(decoded.prop_seq, proposal.prop_seq);
-        assert_eq!(decoded.ledger_seq, proposal.ledger_seq);
+        assert_eq!(decoded.ledger_seq, 0); // ledger_seq removed from proto
         assert_eq!(decoded.prev_ledger, proposal.prev_ledger);
         assert_eq!(decoded.signature, proposal.signature);
     }
 
     #[test]
     fn transaction_roundtrip() {
-        let hash = Hash256::new([0x05; 32]);
         let data = vec![1, 2, 3, 4, 5];
 
-        let encoded = encode_transaction(&hash, &data);
+        // Compute expected hash: SHA-512-Half(TRANSACTION_ID_PREFIX || data)
+        let prefix = rxrpl_crypto::hash_prefix::HashPrefix::TRANSACTION_ID.to_bytes();
+        let mut hash_input = prefix.to_vec();
+        hash_input.extend_from_slice(&data);
+        let expected_hash = rxrpl_crypto::sha512_half::sha512_half(&[&hash_input]);
+
+        let encoded = encode_transaction(&expected_hash, &data);
         let (dec_hash, dec_data) = decode_transaction(&encoded).unwrap();
 
-        assert_eq!(dec_hash, hash);
+        assert_eq!(dec_hash, expected_hash);
         assert_eq!(dec_data, data);
     }
 
@@ -396,36 +643,36 @@ mod tests {
     fn ping_roundtrip() {
         let encoded = encode_ping(7, false);
         let decoded = decode_ping(&encoded).unwrap();
-        assert_eq!(decoded.seq, 7);
-        assert_eq!(decoded.r#type, 0);
+        assert_eq!(decoded.seq.unwrap_or(0), 7);
+        assert_eq!(decoded.r#type.unwrap_or(0), 0);
 
         let encoded_pong = encode_ping(8, true);
         let decoded_pong = decode_ping(&encoded_pong).unwrap();
-        assert_eq!(decoded_pong.seq, 8);
-        assert_eq!(decoded_pong.r#type, 1);
+        assert_eq!(decoded_pong.seq.unwrap_or(0), 8);
+        assert_eq!(decoded_pong.r#type.unwrap_or(0), 1);
     }
 
     #[test]
     fn get_ledger_roundtrip() {
         let hash = Hash256::new([0x0C; 32]);
-        let encoded = encode_get_ledger(3, Some(&hash), 42, true);
+        let encoded = encode_get_ledger(3, Some(&hash), 42, 1);
         let decoded = decode_get_ledger(&encoded).unwrap();
 
-        assert_eq!(decoded.ledger_type, 3);
-        assert_eq!(decoded.ledger_seq, 42);
-        assert!(decoded.request_cookie);
-        assert_eq!(decoded.ledger_hash, hash.as_bytes());
+        assert_eq!(decoded.itype, 3);
+        assert_eq!(decoded.ledger_seq.unwrap_or(0), 42);
+        assert_eq!(decoded.request_cookie.unwrap_or(0), 1);
+        assert_eq!(decoded.ledger_hash.unwrap_or_default(), hash.as_bytes());
     }
 
     #[test]
     fn get_ledger_no_hash_roundtrip() {
-        let encoded = encode_get_ledger(1, None, 10, false);
+        let encoded = encode_get_ledger(1, None, 10, 0);
         let decoded = decode_get_ledger(&encoded).unwrap();
 
-        assert_eq!(decoded.ledger_type, 1);
-        assert_eq!(decoded.ledger_seq, 10);
-        assert!(!decoded.request_cookie);
-        assert!(decoded.ledger_hash.is_empty());
+        assert_eq!(decoded.itype, 1);
+        assert_eq!(decoded.ledger_seq.unwrap_or(0), 10);
+        assert_eq!(decoded.request_cookie.unwrap_or(0), 0);
+        assert!(decoded.ledger_hash.as_ref().map_or(true, |v| v.is_empty()));
     }
 
     #[test]
@@ -461,14 +708,14 @@ mod tests {
         let encoded = encode_ledger_data(&hash, 50, 2, nodes.clone(), 99);
         let decoded = decode_ledger_data(&encoded).unwrap();
 
-        assert_eq!(&decoded.ledger_hash[..], hash.as_bytes());
+        assert_eq!(decoded.ledger_hash, hash.as_bytes());
         assert_eq!(decoded.ledger_seq, 50);
-        assert_eq!(decoded.ledger_type, 2);
-        assert_eq!(decoded.request_cookie, 99);
+        assert_eq!(decoded.ledger_info_type, 2);
+        assert_eq!(decoded.request_cookie.unwrap_or(0), 99);
         assert_eq!(decoded.nodes.len(), 2);
-        assert_eq!(decoded.nodes[0].node_id, vec![1, 2, 3]);
-        assert_eq!(decoded.nodes[0].node_data, vec![4, 5, 6]);
-        assert_eq!(decoded.nodes[1].node_id, vec![7, 8]);
-        assert_eq!(decoded.nodes[1].node_data, vec![9, 10, 11, 12]);
+        assert_eq!(decoded.nodes[0].nodeid.as_deref().unwrap_or(&[]), &[1, 2, 3]);
+        assert_eq!(decoded.nodes[0].nodedata.as_deref().unwrap_or(&[]), &[4, 5, 6]);
+        assert_eq!(decoded.nodes[1].nodeid.as_deref().unwrap_or(&[]), &[7, 8]);
+        assert_eq!(decoded.nodes[1].nodedata.as_deref().unwrap_or(&[]), &[9, 10, 11, 12]);
     }
 }

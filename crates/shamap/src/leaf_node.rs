@@ -16,9 +16,9 @@ pub struct LeafData {
 /// A leaf node in the SHAMap.
 ///
 /// Three variants with different hash prefixes:
-/// - AccountState: SHA-512/2(LEAF_NODE || data || key)
+/// - AccountState: SHA-512/2(LEAF_NODE || key || data)
 /// - TransactionNoMeta: SHA-512/2(TRANSACTION_ID || data)
-/// - TransactionWithMeta: SHA-512/2(TX_NODE || data || key)
+/// - TransactionWithMeta: SHA-512/2(TX_NODE || key || data)
 #[derive(Clone, Debug)]
 pub enum LeafNode {
     AccountState(LeafData),
@@ -105,7 +105,7 @@ impl LeafNode {
 
     fn hash_account_state(item: &SHAMapItem) -> Hash256 {
         let prefix = HashPrefix::LEAF_NODE.to_bytes();
-        sha512_half(&[&prefix, item.data(), item.key().as_bytes()])
+        sha512_half(&[&prefix, item.key().as_bytes(), item.data()])
     }
 
     fn hash_tx_no_meta(item: &SHAMapItem) -> Hash256 {
@@ -115,7 +115,7 @@ impl LeafNode {
 
     fn hash_tx_with_meta(item: &SHAMapItem) -> Hash256 {
         let prefix = HashPrefix::TX_NODE.to_bytes();
-        sha512_half(&[&prefix, item.data(), item.key().as_bytes()])
+        sha512_half(&[&prefix, item.key().as_bytes(), item.data()])
     }
 }
 

@@ -48,8 +48,7 @@ pub async fn noripple_check(
     let mut transactions: Vec<Value> = Vec::new();
 
     if let Some(data) = ledger.get_state(&account_key) {
-        let account_root: Value = serde_json::from_slice(data)
-            .map_err(|e| RpcServerError::Internal(format!("failed to deserialize account: {e}")))?;
+        let account_root: Value = crate::handlers::common::decode_state_value(data)?;
 
         let flags = account_root
             .get("Flags")

@@ -25,7 +25,11 @@ impl<'a> LedgerView<'a> {
 
 impl ReadView for LedgerView<'_> {
     fn read(&self, key: &Hash256) -> Option<Vec<u8>> {
-        self.ledger.get_state(key).map(|d| d.to_vec())
+        let raw = self.ledger.get_state(key)?;
+        match rxrpl_ledger::sle_codec::decode_sle(raw) {
+            Ok(json_bytes) => Some(json_bytes),
+            Err(_) => Some(raw.to_vec()),
+        }
     }
 
     fn exists(&self, key: &Hash256) -> bool {

@@ -157,6 +157,9 @@ pub struct ValidatorConfig {
     /// Validator list public keys.
     #[serde(default)]
     pub validator_list_keys: Vec<String>,
+    /// Validation quorum override. None = auto-compute from validator list size.
+    #[serde(default)]
+    pub quorum: Option<usize>,
 }
 
 impl Default for ValidatorConfig {
@@ -166,6 +169,7 @@ impl Default for ValidatorConfig {
             trusted: Vec::new(),
             validator_list_sites: Vec::new(),
             validator_list_keys: Vec::new(),
+            quorum: None,
         }
     }
 }
