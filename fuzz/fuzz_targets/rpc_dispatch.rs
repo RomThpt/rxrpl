@@ -20,8 +20,12 @@ fuzz_target!(|data: &[u8]| {
                 .unwrap();
             let ctx =
                 rxrpl_rpc_server::ServerContext::new(rxrpl_config::ServerConfig::default());
+            let req_ctx = rxrpl_rpc_server::role::RequestContext {
+                role: rxrpl_rpc_server::role::ConnectionRole::Public,
+                api_version: rxrpl_rpc_api::ApiVersion::default(),
+            };
             rt.block_on(async {
-                let _ = rxrpl_rpc_server::router::dispatch(method, params, &ctx).await;
+                let _ = rxrpl_rpc_server::router::dispatch(method, params, &ctx, &req_ctx).await;
             });
         }
     }
