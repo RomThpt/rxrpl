@@ -9,6 +9,21 @@ use crate::phase::ConsensusPhase;
 use crate::types::{DisputedTx, NodeId, Proposal, TxSet, Validation};
 use crate::unl::TrustedValidatorList;
 
+/// Threshold percentage of trusted validators referencing a different
+/// `prev_ledger` before we consider switching chains.
+const WRONG_PREV_LEDGER_THRESHOLD: u32 = 60;
+
+/// Result of checking whether trusted peers disagree on prev_ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WrongPrevLedgerDetected {
+    /// The prev_ledger hash that the supermajority of trusted peers reference.
+    pub preferred_ledger: Hash256,
+    /// How many trusted peers reference that ledger.
+    pub peer_count: usize,
+    /// Total trusted peers that sent proposals (with any prev_ledger).
+    pub total_trusted: usize,
+}
+
 /// The RPCA (Ripple Protocol Consensus Algorithm) engine.
 ///
 /// Implements the consensus state machine:
@@ -45,6 +60,10 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     unl: TrustedValidatorList,
     /// Proposals received while not in Establish phase, replayed on close.
     pending_proposals: Vec<Proposal>,
+    /// Tracks proposals from trusted peers that reference a different
+    /// `prev_ledger` than ours. Keyed by (node_id -> their prev_ledger).
+    /// Used to detect when we are on the wrong chain.
+    wrong_prev_ledger_votes: HashMap<NodeId, Hash256>,
 }
 
 impl<A: ConsensusAdapter> ConsensusEngine<A> {
@@ -76,6 +95,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             accepted_validation: None,
             unl,
             pending_proposals: Vec::new(),
+            wrong_prev_ledger_votes: HashMap::new(),
         }
     }
 
@@ -129,6 +149,66 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.node_id
     }
 
+    /// Check whether a supermajority of trusted validators reference a
+    /// different `prev_ledger` than ours.
+    ///
+    /// Returns `Some(WrongPrevLedgerDetected)` when more than 60% of the
+    /// trusted peers that sent proposals disagree with our `prev_ledger`.
+    /// The caller should abort the current round and switch to the
+    /// preferred ledger.
+    ///
+    /// In solo mode (empty UNL) this always returns `None`.
+    pub fn check_wrong_prev_ledger(&self) -> Option<WrongPrevLedgerDetected> {
+        if self.unl.is_empty() {
+            return None;
+        }
+
+        if self.wrong_prev_ledger_votes.is_empty() {
+            return None;
+        }
+
+        // Count only trusted peers among those who sent mismatched proposals.
+        let mut ledger_counts: HashMap<Hash256, usize> = HashMap::new();
+        for (node_id, their_prev) in &self.wrong_prev_ledger_votes {
+            if self.unl.is_trusted(node_id) {
+                *ledger_counts.entry(*their_prev).or_default() += 1;
+            }
+        }
+
+        if ledger_counts.is_empty() {
+            return None;
+        }
+
+        // Find the most popular alternative prev_ledger.
+        let (preferred, &count) = ledger_counts
+            .iter()
+            .max_by_key(|&(_, &c)| c)
+            .unwrap();
+
+        // Total trusted proposals = those agreeing with us + those disagreeing.
+        let agreeing_trusted = self
+            .peer_positions
+            .values()
+            .filter(|p| self.unl.is_trusted(&p.node_id))
+            .count();
+        let total_trusted = agreeing_trusted + ledger_counts.values().sum::<usize>();
+
+        if total_trusted == 0 {
+            return None;
+        }
+
+        let pct = (count as u32 * 100) / total_trusted as u32;
+        if pct >= WRONG_PREV_LEDGER_THRESHOLD {
+            Some(WrongPrevLedgerDetected {
+                preferred_ledger: *preferred,
+                peer_count: count,
+                total_trusted,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Get the disputes map.
     pub fn disputes(&self) -> &HashMap<Hash256, DisputedTx> {
         &self.disputes
@@ -146,6 +226,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.accepted_close_time = None;
         self.accepted_close_flags = 0;
         self.accepted_validation = None;
+        self.wrong_prev_ledger_votes.clear();
         // Note: pending_proposals is NOT cleared here -- they will be
         // replayed in close_ledger() which follows start_round().
         let _ = ledger_seq;
@@ -206,12 +287,16 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             return;
         }
 
-        // Reject proposals for a different previous ledger
+        // Track proposals referencing a different previous ledger.
+        // These are rejected from normal consensus but counted toward
+        // wrong-prev-ledger detection so we can switch chains if needed.
         if proposal.prev_ledger != self.prev_ledger {
             tracing::debug!(
-                "rejected proposal: prev_ledger mismatch (ours={}, theirs={})",
+                "rejected proposal: prev_ledger mismatch (ours={}, theirs={}), tracking for recovery",
                 self.prev_ledger, proposal.prev_ledger
             );
+            self.wrong_prev_ledger_votes
+                .insert(proposal.node_id, proposal.prev_ledger);
             return;
         }
 
@@ -996,5 +1081,180 @@ mod tests {
 
         assert!(engine.converge());
         assert_eq!(engine.phase(), ConsensusPhase::Accepted);
+    }
+
+    // --- Wrong prev_ledger recovery tests ---
+
+    #[test]
+    fn wrong_prev_ledger_not_detected_in_solo_mode() {
+        // Solo mode (empty UNL) should never trigger wrong prev_ledger.
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new(adapter, node(1), ConsensusParams::default());
+        engine.start_round(Hash256::ZERO, 1);
+
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
+
+        let bad_prev = Hash256::new([0xFF; 32]);
+        engine.peer_proposal(proposal_for(node(2), set.hash, bad_prev, 1));
+
+        assert_eq!(engine.check_wrong_prev_ledger(), None);
+    }
+
+    #[test]
+    fn wrong_prev_ledger_detected_with_supermajority() {
+        // 5-node UNL. 4 peers send proposals with a different prev_ledger.
+        // 4/4 trusted disagree = 100% > 60% threshold.
+        let unl = make_unl(&[1, 2, 3, 4, 5]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+        );
+        let our_prev = Hash256::ZERO;
+        engine.start_round(our_prev, 1);
+
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
+
+        let peer_prev = Hash256::new([0xBB; 32]);
+        engine.peer_proposal(proposal_for(node(2), set.hash, peer_prev, 1));
+        engine.peer_proposal(proposal_for(node(3), set.hash, peer_prev, 1));
+        engine.peer_proposal(proposal_for(node(4), set.hash, peer_prev, 1));
+        engine.peer_proposal(proposal_for(node(5), set.hash, peer_prev, 1));
+
+        let result = engine.check_wrong_prev_ledger();
+        assert!(result.is_some());
+        let detected = result.unwrap();
+        assert_eq!(detected.preferred_ledger, peer_prev);
+        assert_eq!(detected.peer_count, 4);
+        assert_eq!(detected.total_trusted, 4); // 0 agreeing + 4 disagreeing
+    }
+
+    #[test]
+    fn wrong_prev_ledger_not_detected_below_threshold() {
+        // 5-node UNL. 1 peer disagrees out of 4 who sent proposals.
+        // 1/4 = 25% < 60%, should NOT trigger.
+        let unl = make_unl(&[1, 2, 3, 4, 5]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
+
+        let peer_prev = Hash256::new([0xBB; 32]);
+        // 1 peer disagrees
+        engine.peer_proposal(proposal_for(node(2), set.hash, peer_prev, 1));
+        // 3 peers agree
+        engine.peer_proposal(proposal_for(node(3), set.hash, Hash256::ZERO, 1));
+        engine.peer_proposal(proposal_for(node(4), set.hash, Hash256::ZERO, 1));
+        engine.peer_proposal(proposal_for(node(5), set.hash, Hash256::ZERO, 1));
+
+        assert_eq!(engine.check_wrong_prev_ledger(), None);
+    }
+
+    #[test]
+    fn wrong_prev_ledger_at_exact_threshold() {
+        // 5-node UNL. 3 peers disagree, 2 agree.
+        // 3/5 = 60% >= 60%, should trigger.
+        let unl = make_unl(&[1, 2, 3, 4, 5]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
+
+        let peer_prev = Hash256::new([0xBB; 32]);
+        // 3 peers disagree
+        engine.peer_proposal(proposal_for(node(2), set.hash, peer_prev, 1));
+        engine.peer_proposal(proposal_for(node(3), set.hash, peer_prev, 1));
+        engine.peer_proposal(proposal_for(node(4), set.hash, peer_prev, 1));
+        // 2 peers agree
+        engine.peer_proposal(proposal_for(node(5), set.hash, Hash256::ZERO, 1));
+
+        // total_trusted = 1 agreeing + 3 disagreeing = 4 (node(5) is agreeing, nodes 2,3,4 disagree)
+        // pct = 3/4 = 75% >= 60%
+        let result = engine.check_wrong_prev_ledger();
+        assert!(result.is_some());
+        let detected = result.unwrap();
+        assert_eq!(detected.preferred_ledger, peer_prev);
+        assert_eq!(detected.peer_count, 3);
+    }
+
+    #[test]
+    fn wrong_prev_ledger_untrusted_not_counted() {
+        // 3-node UNL (1,2,3). Untrusted nodes (50,51) disagree.
+        // Only trusted count, so 0 trusted disagree -> no detection.
+        let unl = make_unl(&[1, 2, 3]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
+
+        let peer_prev = Hash256::new([0xBB; 32]);
+        // Untrusted nodes disagree
+        engine.peer_proposal(proposal_for(node(50), set.hash, peer_prev, 1));
+        engine.peer_proposal(proposal_for(node(51), set.hash, peer_prev, 1));
+
+        assert_eq!(engine.check_wrong_prev_ledger(), None);
+    }
+
+    #[test]
+    fn wrong_prev_ledger_cleared_on_new_round() {
+        // After start_round, wrong_prev_ledger tracking resets.
+        let unl = make_unl(&[1, 2, 3]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
+
+        let peer_prev = Hash256::new([0xBB; 32]);
+        engine.peer_proposal(proposal_for(node(2), set.hash, peer_prev, 1));
+        engine.peer_proposal(proposal_for(node(3), set.hash, peer_prev, 1));
+
+        // Should detect (2/2 = 100%)
+        assert!(engine.check_wrong_prev_ledger().is_some());
+
+        // Start new round, tracking should be cleared.
+        engine.start_round(peer_prev, 2);
+        assert_eq!(engine.check_wrong_prev_ledger(), None);
+    }
+
+    #[test]
+    fn wrong_prev_ledger_picks_most_popular() {
+        // 5-node UNL. 2 peers reference ledger A, 2 reference ledger B.
+        // Each is 2/4 = 50% < 60%, so no detection.
+        let unl = make_unl(&[1, 2, 3, 4, 5]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
+
+        let prev_a = Hash256::new([0xAA; 32]);
+        let prev_b = Hash256::new([0xBB; 32]);
+        engine.peer_proposal(proposal_for(node(2), set.hash, prev_a, 1));
+        engine.peer_proposal(proposal_for(node(3), set.hash, prev_a, 1));
+        engine.peer_proposal(proposal_for(node(4), set.hash, prev_b, 1));
+        engine.peer_proposal(proposal_for(node(5), set.hash, prev_b, 1));
+
+        // 2/4 = 50% < 60% -> no detection
+        assert_eq!(engine.check_wrong_prev_ledger(), None);
     }
 }

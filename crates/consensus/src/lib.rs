@@ -17,7 +17,7 @@ pub mod types;
 pub mod unl;
 
 pub use adapter::ConsensusAdapter;
-pub use engine::ConsensusEngine;
+pub use engine::{ConsensusEngine, WrongPrevLedgerDetected};
 pub use error::ConsensusError;
 pub use params::ConsensusParams;
 pub use phase::ConsensusPhase;
