@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use rxrpl_amendment::Rules;
 use rxrpl_protocol::tx::compute_tx_hash;
-use rxrpl_txq::{FeeLevel, QueueEntry};
+use rxrpl_txq::{FeeLevel, FeeMetrics, QueueEntry};
 
 use crate::context::ServerContext;
 use crate::error::RpcServerError;
@@ -36,6 +36,49 @@ pub async fn submit(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
         .as_ref()
         .ok_or_else(|| RpcServerError::Internal("no fee settings available".into()))?;
 
+    // --- Fee escalation gate ---
+    // Compute the minimum fee required given current queue utilization.
+    let fee_drops = tx_json
+        .get("Fee")
+        .and_then(|f| f.as_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    if let Some(ref tq) = ctx.tx_queue {
+        let q = tq.read().await;
+        let metrics = FeeMetrics::from_queue(q.len(), q.max_size());
+        let required = metrics.escalated_fee_drops(fees.base_fee);
+
+        if fee_drops < required {
+            return Ok(serde_json::json!({
+                "engine_result": "telInsufFeeP",
+                "engine_result_code": -394,
+                "engine_result_message": format!(
+                    "Fee of {} drops is not enough. The current open ledger fee is {} drops.",
+                    fee_drops, required
+                ),
+                "tx_json": tx_json,
+            }));
+        }
+
+        // Per-account queue depth check
+        let account = tx_json
+            .get("Account")
+            .and_then(|a| a.as_str())
+            .unwrap_or("");
+        if q.account_txs(account).len() >= rxrpl_txq::MAX_ACCOUNT_QUEUE_DEPTH {
+            return Ok(serde_json::json!({
+                "engine_result": "telCantQueue",
+                "engine_result_code": -396,
+                "engine_result_message": format!(
+                    "Per-account queue limit ({}) reached for {}.",
+                    rxrpl_txq::MAX_ACCOUNT_QUEUE_DEPTH, account
+                ),
+                "tx_json": tx_json,
+            }));
+        }
+    }
+
     let mut ledger = ledger.write().await;
     let rules = Rules::new();
 
@@ -65,11 +108,6 @@ pub async fn submit(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
                 .get("Sequence")
                 .and_then(|s| s.as_u64())
                 .unwrap_or(0) as u32;
-            let fee_drops = tx_json
-                .get("Fee")
-                .and_then(|f| f.as_str())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
             let last_ledger_sequence = tx_json
                 .get("LastLedgerSequence")
                 .and_then(|v| v.as_u64())

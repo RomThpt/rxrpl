@@ -292,6 +292,8 @@ impl Node {
         let closed_ledgers = Arc::clone(&self.closed_ledgers);
         let tx_store = self.tx_store.as_ref().map(Arc::clone);
         let tx_queue = Arc::clone(&self.tx_queue);
+        let tx_engine_close = Arc::clone(&self.tx_engine);
+        let fees_close = Arc::clone(&self.fees);
         let event_tx = event_tx.clone();
         let interval_duration = Duration::from_secs(close_interval_secs);
 
@@ -425,13 +427,35 @@ impl Node {
                 );
                 drop(l);
 
-                // Cleanup TxQueue: remove confirmed + expired
+                // Cleanup TxQueue: remove confirmed + expired, then retry remaining
                 {
                     let mut q = tx_queue.write().await;
                     closed.tx_map.for_each(&mut |tx_hash, _| {
                         q.remove(tx_hash);
                     });
                     q.remove_expired(new_open_seq);
+
+                    // Drain remaining entries for retry against the fresh open ledger
+                    let pending = q.drain_for_retry();
+                    drop(q);
+
+                    let rules = Rules::new();
+                    let mut requeue = Vec::new();
+                    let mut l = ledger.write().await;
+                    for entry in pending {
+                        match tx_engine_close.apply(&entry.tx, &mut l, &rules, &fees_close) {
+                            Ok(result) if result.is_success() => {
+                                requeue.push(entry);
+                            }
+                            _ => {}
+                        }
+                    }
+                    drop(l);
+
+                    let mut q = tx_queue.write().await;
+                    for entry in requeue {
+                        let _ = q.submit(entry);
+                    }
                 }
 
                 // Store in history (compact for memory efficiency)
@@ -813,6 +837,7 @@ impl Node {
                                             &closed_ledgers, &tx_store, &event_tx,
                                             &ledger_seq_shared, &ledger_hash_shared,
                                             &tx_queue, &identity, &cmd_tx_catchup,
+                                            &tx_engine, &fees,
                                         ).await;
                                         // Start new open phase
                                         timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
@@ -833,6 +858,7 @@ impl Node {
                                             &closed_ledgers, &tx_store, &event_tx,
                                             &ledger_seq_shared, &ledger_hash_shared,
                                             &tx_queue, &identity, &cmd_tx_catchup,
+                                            &tx_engine, &fees,
                                         ).await;
                                         // Start new open phase
                                         timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
@@ -854,6 +880,7 @@ impl Node {
                                         &closed_ledgers, &tx_store, &event_tx,
                                         &ledger_seq_shared, &ledger_hash_shared,
                                         &tx_queue, &identity, &cmd_tx_catchup,
+                                        &tx_engine, &fees,
                                     ).await;
                                     timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
                                 }
@@ -1150,6 +1177,8 @@ impl Node {
         tx_queue: &Arc<RwLock<TxQueue>>,
         identity: &Arc<NodeIdentity>,
         cmd_tx: &tokio::sync::mpsc::UnboundedSender<OverlayCommand>,
+        tx_engine: &Arc<TxEngine>,
+        fees: &Arc<FeeSettings>,
     ) {
         let effective_close_time = consensus
             .accepted_close_time()
@@ -1279,13 +1308,34 @@ impl Node {
             });
         }
 
-        // Cleanup TxQueue: remove confirmed + expired
+        // Cleanup TxQueue: remove confirmed + expired, then retry remaining
         {
             let mut q = tx_queue.write().await;
             closed.tx_map.for_each(&mut |tx_hash, _| {
                 q.remove(tx_hash);
             });
             q.remove_expired(new_open_seq);
+
+            let pending = q.drain_for_retry();
+            drop(q);
+
+            let rules = Rules::new();
+            let mut requeue = Vec::new();
+            let mut l = ledger.write().await;
+            for entry in pending {
+                match tx_engine.apply(&entry.tx, &mut l, &rules, fees) {
+                    Ok(result) if result.is_success() => {
+                        requeue.push(entry);
+                    }
+                    _ => {}
+                }
+            }
+            drop(l);
+
+            let mut q = tx_queue.write().await;
+            for entry in requeue {
+                let _ = q.submit(entry);
+            }
         }
 
         let mut history = closed_ledgers.write().await;

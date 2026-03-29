@@ -4,6 +4,9 @@ pub enum TxqError {
     #[error("queue full")]
     QueueFull,
 
+    #[error("per-account queue limit reached")]
+    AccountQueueFull,
+
     #[error("fee too low: need at least {0} drops")]
     FeeTooLow(u64),
 

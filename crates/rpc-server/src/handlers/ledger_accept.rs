@@ -2,12 +2,18 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use rxrpl_amendment::Rules;
 use rxrpl_ledger::Ledger;
+use rxrpl_txq::{FeeLevel, QueueEntry};
 
 use crate::context::ServerContext;
 use crate::error::RpcServerError;
 
 /// Close the current ledger in standalone mode and open a new one.
+///
+/// After closing, queued transactions are re-applied against the fresh open
+/// ledger in fee-priority order (highest fee first). Transactions that still
+/// succeed are re-queued; the rest are silently dropped.
 pub async fn ledger_accept(
     _params: Value,
     ctx: &Arc<ServerContext>,
@@ -65,8 +71,55 @@ pub async fn ledger_accept(
 
     // Replace the open ledger
     *ledger = new_open;
+    let new_seq = ledger.header.sequence;
+
+    // --- Queue retry: re-apply queued txs against the new open ledger ---
+    if let (Some(tq), Some(engine), Some(fees)) =
+        (&ctx.tx_queue, &ctx.tx_engine, &ctx.fees)
+    {
+        let pending = {
+            let mut q = tq.write().await;
+            // First remove confirmed txs (already in closed ledger's tx_map)
+            // and expired entries, then drain the rest for retry.
+            q.remove_expired(new_seq);
+            q.drain_for_retry()
+        };
+
+        let rules = Rules::new();
+        let mut requeue = Vec::new();
+
+        for entry in pending {
+            match engine.apply(&entry.tx, &mut ledger, &rules, fees) {
+                Ok(result) if result.is_success() => {
+                    let fee_drops = entry
+                        .tx
+                        .get("Fee")
+                        .and_then(|f| f.as_str())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    requeue.push(QueueEntry {
+                        hash: entry.hash,
+                        tx: entry.tx,
+                        fee_level: FeeLevel::new(fee_drops, fees.base_fee),
+                        account: entry.account,
+                        sequence: entry.sequence,
+                        last_ledger_sequence: entry.last_ledger_sequence,
+                    });
+                }
+                _ => {
+                    // Transaction no longer valid -- drop it silently.
+                }
+            }
+        }
+
+        // Re-insert surviving entries.
+        let mut q = tq.write().await;
+        for entry in requeue {
+            let _ = q.submit(entry);
+        }
+    }
 
     Ok(serde_json::json!({
-        "ledger_current_index": ledger.header.sequence,
+        "ledger_current_index": new_seq,
     }))
 }

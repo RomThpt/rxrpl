@@ -9,5 +9,5 @@ pub mod fee;
 pub mod queue;
 
 pub use error::TxqError;
-pub use fee::{FeeLevel, FeeMetrics};
+pub use fee::{FeeLevel, FeeMetrics, BASE_FEE_LEVEL, MAX_ACCOUNT_QUEUE_DEPTH};
 pub use queue::{QueueEntry, TxQueue};

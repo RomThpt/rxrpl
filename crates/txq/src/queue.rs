@@ -4,7 +4,7 @@ use rxrpl_primitives::Hash256;
 use serde_json::Value;
 
 use crate::error::TxqError;
-use crate::fee::FeeLevel;
+use crate::fee::{FeeLevel, MAX_ACCOUNT_QUEUE_DEPTH};
 
 /// A queued transaction entry.
 #[derive(Clone, Debug)]
@@ -48,13 +48,31 @@ impl TxQueue {
         }
     }
 
+    /// Maximum queue capacity.
+    pub fn max_size(&self) -> usize {
+        self.max_size
+    }
+
     /// Add a transaction to the queue.
+    ///
+    /// Enforces the global queue size limit and a per-account depth limit
+    /// of `MAX_ACCOUNT_QUEUE_DEPTH` (10, matching rippled).
     pub fn submit(&mut self, entry: QueueEntry) -> Result<(), TxqError> {
         if self.by_hash.contains_key(&entry.hash) {
             return Err(TxqError::Duplicate);
         }
         if self.by_hash.len() >= self.max_size {
             return Err(TxqError::QueueFull);
+        }
+
+        // Per-account depth limit
+        let account_depth = self
+            .by_account
+            .get(&entry.account)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        if account_depth >= MAX_ACCOUNT_QUEUE_DEPTH {
+            return Err(TxqError::AccountQueueFull);
         }
 
         let hash = entry.hash;
@@ -119,6 +137,25 @@ impl TxQueue {
             .get(account)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Drain all queued entries in fee-priority order for retry after ledger close.
+    ///
+    /// Returns a `Vec<QueueEntry>` sorted highest-fee-first so the caller can
+    /// re-apply them against the new open ledger.
+    pub fn drain_for_retry(&mut self) -> Vec<QueueEntry> {
+        let mut entries: Vec<QueueEntry> = Vec::with_capacity(self.by_hash.len());
+        // Iterate fee-descending (BTreeMap key is Reverse<FeeLevel>)
+        for (_, hash) in self.by_fee.iter() {
+            if let Some(entry) = self.by_hash.get(hash) {
+                entries.push(entry.clone());
+            }
+        }
+        // Clear all internal structures
+        self.by_fee.clear();
+        self.by_hash.clear();
+        self.by_account.clear();
+        entries
     }
 }
 
@@ -198,5 +235,45 @@ mod tests {
         assert_eq!(q.account_txs("alice").len(), 2);
         assert_eq!(q.account_txs("bob").len(), 1);
         assert_eq!(q.account_txs("charlie").len(), 0);
+    }
+
+    #[test]
+    fn account_queue_limit() {
+        use crate::fee::MAX_ACCOUNT_QUEUE_DEPTH;
+        let mut q = TxQueue::new(100);
+        for i in 0..MAX_ACCOUNT_QUEUE_DEPTH {
+            q.submit(make_entry(i as u8, 10 + i as u64, "alice"))
+                .unwrap();
+        }
+        // The next one from the same account must fail.
+        let result = q.submit(make_entry(0xFF, 10, "alice"));
+        assert!(matches!(result, Err(TxqError::AccountQueueFull)));
+
+        // A different account should still work.
+        q.submit(make_entry(0xFE, 10, "bob")).unwrap();
+    }
+
+    #[test]
+    fn max_size_getter() {
+        let q = TxQueue::new(42);
+        assert_eq!(q.max_size(), 42);
+    }
+
+    #[test]
+    fn drain_for_retry_returns_fee_ordered() {
+        let mut q = TxQueue::new(10);
+        q.submit(make_entry(0x01, 10, "alice")).unwrap();
+        q.submit(make_entry(0x02, 30, "bob")).unwrap();
+        q.submit(make_entry(0x03, 20, "charlie")).unwrap();
+
+        let entries = q.drain_for_retry();
+        assert_eq!(entries.len(), 3);
+        // Highest fee first
+        assert_eq!(entries[0].hash, Hash256::new([0x02; 32]));
+        assert_eq!(entries[1].hash, Hash256::new([0x03; 32]));
+        assert_eq!(entries[2].hash, Hash256::new([0x01; 32]));
+
+        // Queue must be empty afterwards
+        assert!(q.is_empty());
     }
 }
