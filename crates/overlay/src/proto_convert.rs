@@ -563,6 +563,15 @@ pub fn decode_squelch(data: &[u8]) -> Result<TmSquelch, OverlayError> {
     TmSquelch::decode(data).map_err(|e| OverlayError::Codec(format!("decode Squelch: {e}")))
 }
 
+pub fn encode_squelch(validator_pub_key: &[u8], squelch: bool, duration_secs: u32) -> Vec<u8> {
+    let msg = TmSquelch {
+        squelch: Some(squelch),
+        validator_pub_key: Some(validator_pub_key.to_vec()),
+        squelch_duration: Some(duration_secs),
+    };
+    msg.encode_to_vec()
+}
+
 // --- ValidatorList (type 54) ---
 
 pub fn decode_validator_list(data: &[u8]) -> Result<TmValidatorList, OverlayError> {
