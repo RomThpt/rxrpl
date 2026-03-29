@@ -89,6 +89,7 @@ impl BinarySerializer {
             "UInt8" => self.serialize_uint8(value)?,
             "UInt16" => self.serialize_uint16(value, def)?,
             "UInt32" => self.serialize_uint32(value)?,
+            "Int32" => self.serialize_int32(value)?,
             "UInt64" => self.serialize_uint64(value)?,
             "Hash128" => self.serialize_hash(value, 16)?,
             "Hash160" => self.serialize_hash(value, 20)?,
@@ -164,6 +165,14 @@ impl BinarySerializer {
             .as_u64()
             .ok_or_else(|| CodecError::UnsupportedType("expected u32 integer".to_string()))?;
         self.write_u32(v as u32);
+        Ok(())
+    }
+
+    fn serialize_int32(&mut self, value: &Value) -> Result<(), CodecError> {
+        let v = value
+            .as_i64()
+            .ok_or_else(|| CodecError::UnsupportedType("expected i32 integer".to_string()))?;
+        self.write_u32(v as i32 as u32);
         Ok(())
     }
 

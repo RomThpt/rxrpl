@@ -101,6 +101,7 @@ impl<'a> BinaryParser<'a> {
             1 => { self.read_bytes(2)?; }    // UInt16
             2 => { self.read_bytes(4)?; }    // UInt32
             3 => { self.read_bytes(8)?; }    // UInt64
+            10 => { self.read_bytes(4)?; }   // Int32
             4 => { self.read_bytes(16)?; }   // Hash128
             5 | 29 => { self.read_bytes(32)?; } // Hash256, UInt256
             6 => {                            // Amount
@@ -203,6 +204,11 @@ impl<'a> BinaryParser<'a> {
             "UInt32" => {
                 let v = self.read_u32()?;
                 Ok(Value::Number(v.into()))
+            }
+            "Int32" => {
+                let v = self.read_u32()?;
+                let signed = v as i32;
+                Ok(Value::Number(signed.into()))
             }
             "UInt64" => {
                 let v = self.read_u64()?;

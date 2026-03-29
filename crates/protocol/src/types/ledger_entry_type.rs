@@ -34,6 +34,10 @@ pub enum LedgerEntryType {
     PermissionedDomain = 0x0082,
     Delegate = 0x0083,
     Vault = 0x0084,
+    HookDefinition = 0x0085,
+    HookState = 0x0086,
+    LoanBroker = 0x0088, // 136
+    Loan = 0x0089,       // 137
 }
 
 impl LedgerEntryType {
@@ -68,6 +72,10 @@ impl LedgerEntryType {
             0x0082 => Ok(Self::PermissionedDomain),
             0x0083 => Ok(Self::Delegate),
             0x0084 => Ok(Self::Vault),
+            0x0085 => Ok(Self::HookDefinition),
+            0x0086 => Ok(Self::HookState),
+            0x0088 => Ok(Self::LoanBroker),
+            0x0089 => Ok(Self::Loan),
             _ => Err(ProtocolError::UnknownLedgerEntryType(code)),
         }
     }
@@ -103,6 +111,10 @@ impl LedgerEntryType {
             Self::PermissionedDomain => "PermissionedDomain",
             Self::Delegate => "Delegate",
             Self::Vault => "Vault",
+            Self::HookDefinition => "HookDefinition",
+            Self::HookState => "HookState",
+            Self::LoanBroker => "LoanBroker",
+            Self::Loan => "Loan",
         }
     }
 
@@ -137,6 +149,10 @@ impl LedgerEntryType {
             "PermissionedDomain" => Ok(Self::PermissionedDomain),
             "Delegate" => Ok(Self::Delegate),
             "Vault" => Ok(Self::Vault),
+            "HookDefinition" => Ok(Self::HookDefinition),
+            "HookState" => Ok(Self::HookState),
+            "LoanBroker" => Ok(Self::LoanBroker),
+            "Loan" => Ok(Self::Loan),
             _ => Err(ProtocolError::UnknownLedgerEntryTypeName(name.to_string())),
         }
     }
