@@ -10,9 +10,11 @@ pub mod feature;
 pub mod registry;
 pub mod rules;
 pub mod table;
+pub mod voting;
 
 pub use error::AmendmentError;
 pub use feature::{Feature, feature_id};
 pub use registry::FeatureRegistry;
 pub use rules::Rules;
 pub use table::AmendmentTable;
+pub use voting::{AmendmentAction, is_flag_ledger};

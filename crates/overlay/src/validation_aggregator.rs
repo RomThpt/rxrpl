@@ -140,6 +140,7 @@ mod tests {
             close_time: 100,
             sign_time: 100,
             signature: None,
+            amendments: vec![],
         }
     }
 

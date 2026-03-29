@@ -292,6 +292,7 @@ impl Node {
         let closed_ledgers = Arc::clone(&self.closed_ledgers);
         let tx_store = self.tx_store.as_ref().map(Arc::clone);
         let tx_queue = Arc::clone(&self.tx_queue);
+        let amendment_table = Arc::clone(&self.amendment_table);
         let tx_engine_close = Arc::clone(&self.tx_engine);
         let fees_close = Arc::clone(&self.fees);
         let event_tx = event_tx.clone();
@@ -342,6 +343,26 @@ impl Node {
                 let close_flags = consensus.accepted_close_flags();
 
                 let mut l = ledger.write().await;
+
+                // Apply amendment voting on flag ledgers (before close
+                // computes final hashes). In standalone mode there are no
+                // peer validations, so we only use our own votes.
+                {
+                    let mut at = amendment_table.write().await;
+                    let own_votes = at.get_votes();
+                    // Standalone: 1 trusted validator (ourselves)
+                    let _rules = Node::apply_amendment_voting(
+                        &mut l,
+                        &tx_engine_close,
+                        &mut at,
+                        &fees_close,
+                        1,
+                        &[own_votes],
+                        effective_close_time,
+                        ledger_seq,
+                    );
+                }
+
                 if let Err(e) = l.close(effective_close_time, close_flags) {
                     tracing::error!("failed to close ledger: {}", e);
                     continue;
@@ -755,6 +776,7 @@ impl Node {
         let tx_engine = Arc::clone(&self.tx_engine);
         let fees = Arc::clone(&self.fees);
         let tx_queue = Arc::clone(&self.tx_queue);
+        let amendment_table = Arc::clone(&self.amendment_table);
         let node_store = self.node_store.clone();
         let tx_store = self.tx_store.as_ref().map(Arc::clone);
         let ledger_seq_shared = Arc::clone(&ledger_seq);
@@ -776,6 +798,11 @@ impl Node {
             let initial_quorum = configured_quorum.unwrap_or(28);
             let mut val_aggregator = rxrpl_overlay::validation_aggregator::ValidationAggregator::new(initial_quorum);
             tracing::info!("validation quorum initialized to {}", initial_quorum);
+
+            // Collect amendment votes from received validations for the current round.
+            // Reset after each ledger close.
+            let mut amendment_votes: Vec<Vec<Hash256>> = Vec::new();
+            let mut trusted_validator_count: usize = 0;
 
             let sync_check_duration = Duration::from_secs(5);
             let mut sync_check_interval = tokio::time::interval(sync_check_duration);
@@ -837,8 +864,11 @@ impl Node {
                                             &closed_ledgers, &tx_store, &event_tx,
                                             &ledger_seq_shared, &ledger_hash_shared,
                                             &tx_queue, &identity, &cmd_tx_catchup,
-                                            &tx_engine, &fees,
+                                            &amendment_table, &tx_engine, &fees,
+                                            &amendment_votes, trusted_validator_count,
                                         ).await;
+                                        amendment_votes.clear();
+                                        trusted_validator_count = 0;
                                         // Start new open phase
                                         timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
                                     } else {
@@ -858,8 +888,11 @@ impl Node {
                                             &closed_ledgers, &tx_store, &event_tx,
                                             &ledger_seq_shared, &ledger_hash_shared,
                                             &tx_queue, &identity, &cmd_tx_catchup,
-                                            &tx_engine, &fees,
+                                            &amendment_table, &tx_engine, &fees,
+                                            &amendment_votes, trusted_validator_count,
                                         ).await;
+                                        amendment_votes.clear();
+                                        trusted_validator_count = 0;
                                         // Start new open phase
                                         timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
                                     }
@@ -880,8 +913,11 @@ impl Node {
                                         &closed_ledgers, &tx_store, &event_tx,
                                         &ledger_seq_shared, &ledger_hash_shared,
                                         &tx_queue, &identity, &cmd_tx_catchup,
-                                        &tx_engine, &fees,
+                                        &amendment_table, &tx_engine, &fees,
+                                        &amendment_votes, trusted_validator_count,
                                     ).await;
+                                    amendment_votes.clear();
+                                    trusted_validator_count = 0;
                                     timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
                                 }
                             }
@@ -911,6 +947,14 @@ impl Node {
                                     ledger_seq: val_seq,
                                     full: validation.full,
                                 });
+
+                                // Collect amendment votes from this validator
+                                if validation.full && !validation.amendments.is_empty() {
+                                    amendment_votes.push(validation.amendments.clone());
+                                }
+                                trusted_validator_count = trusted_validator_count.max(
+                                    amendment_votes.len(),
+                                );
 
                                 // Aggregate validation and check for quorum
                                 if let Some(validated) = val_aggregator.add_validation(validation) {
@@ -1177,8 +1221,11 @@ impl Node {
         tx_queue: &Arc<RwLock<TxQueue>>,
         identity: &Arc<NodeIdentity>,
         cmd_tx: &tokio::sync::mpsc::UnboundedSender<OverlayCommand>,
+        amendment_table: &Arc<RwLock<AmendmentTable>>,
         tx_engine: &Arc<TxEngine>,
         fees: &Arc<FeeSettings>,
+        validator_amendment_votes: &[Vec<Hash256>],
+        trusted_validator_count: usize,
     ) {
         let effective_close_time = consensus
             .accepted_close_time()
@@ -1190,6 +1237,24 @@ impl Node {
         );
 
         let mut l = ledger.write().await;
+
+        // Apply amendment voting on flag ledgers (before close computes
+        // final hashes). Votes are collected from received validations.
+        {
+            let ledger_seq = l.header.sequence;
+            let mut at = amendment_table.write().await;
+            let _rules = Node::apply_amendment_voting(
+                &mut l,
+                tx_engine,
+                &mut at,
+                fees,
+                trusted_validator_count,
+                validator_amendment_votes,
+                effective_close_time,
+                ledger_seq,
+            );
+        }
+
         if let Err(e) = l.close(effective_close_time, close_flags) {
             tracing::error!("failed to close ledger: {}", e);
             return;
@@ -1277,6 +1342,8 @@ impl Node {
         // Broadcast validation (STObject format, rippled-compatible)
         {
             use rxrpl_consensus::types::Validation;
+            // Include our amendment votes in the validation message
+            let our_amendment_votes = amendment_table.read().await.get_votes();
             let mut validation = Validation {
                 node_id: rxrpl_consensus::types::NodeId(Hash256::new(identity.node_id.0)),
                 public_key: identity.public_key_bytes().to_vec(),
@@ -1286,6 +1353,7 @@ impl Node {
                 close_time: effective_close_time,
                 sign_time: effective_close_time,
                 signature: None,
+                amendments: our_amendment_votes,
             };
             identity.sign_validation(&mut validation);
             let payload = rxrpl_overlay::proto_convert::encode_validation(
@@ -1484,6 +1552,97 @@ impl Node {
         let rules = Rules::new();
         let result = tx_engine.apply(tx, ledger, &rules, fees)?;
         Ok(result)
+    }
+
+    /// Apply amendment voting pseudo-transactions on a flag ledger.
+    ///
+    /// On flag ledgers (sequence % 256 == 0), this tallies amendment votes from
+    /// received validations, determines which amendments gained/lost majority or
+    /// should activate, generates EnableAmendment pseudo-txs, and applies them
+    /// to the open ledger. After activation, the amendment table and Rules are
+    /// updated so subsequent transactions see the new amendment state.
+    ///
+    /// Returns the updated Rules snapshot.
+    pub fn apply_amendment_voting(
+        ledger: &mut Ledger,
+        tx_engine: &TxEngine,
+        amendment_table: &mut AmendmentTable,
+        fees: &FeeSettings,
+        trusted_count: usize,
+        validator_votes: &[Vec<Hash256>],
+        close_time: u32,
+        ledger_seq: u32,
+    ) -> Rules {
+        if !rxrpl_amendment::is_flag_ledger(ledger_seq) {
+            return amendment_table.build_rules();
+        }
+
+        let vote_counts = rxrpl_amendment::voting::count_votes(validator_votes);
+        let actions = rxrpl_amendment::voting::tally_votes(
+            amendment_table,
+            trusted_count,
+            &vote_counts,
+            close_time,
+            ledger_seq,
+        );
+
+        let rules = amendment_table.build_rules();
+
+        if actions.is_empty() {
+            tracing::debug!(
+                "flag ledger #{}: no amendment voting changes",
+                ledger_seq
+            );
+            return rules;
+        }
+
+        for action in &actions {
+            let tx = rxrpl_amendment::voting::make_enable_amendment_tx(action);
+            match tx_engine.apply(&tx, ledger, &rules, fees) {
+                Ok(result) => {
+                    if result.is_success() {
+                        match action {
+                            rxrpl_amendment::AmendmentAction::GotMajority {
+                                amendment_id,
+                                ..
+                            } => {
+                                tracing::info!(
+                                    "amendment {} gained majority",
+                                    hex::encode(amendment_id.as_bytes())
+                                );
+                            }
+                            rxrpl_amendment::AmendmentAction::LostMajority {
+                                amendment_id,
+                            } => {
+                                tracing::info!(
+                                    "amendment {} lost majority",
+                                    hex::encode(amendment_id.as_bytes())
+                                );
+                            }
+                            rxrpl_amendment::AmendmentAction::Activate {
+                                amendment_id,
+                            } => {
+                                tracing::info!(
+                                    "amendment {} activated",
+                                    hex::encode(amendment_id.as_bytes())
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            "amendment pseudo-tx failed: {}",
+                            result
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("failed to apply amendment pseudo-tx: {}", e);
+                }
+            }
+        }
+
+        // Return updated rules after any activations
+        amendment_table.build_rules()
     }
 
     /// Close the current ledger and return a new open ledger derived from it.
@@ -1922,6 +2081,7 @@ mod tests {
                 close_time: 100,
                 sign_time: 100,
                 signature: None,
+                amendments: vec![],
             };
             assert!(val_aggregator.add_validation(v).is_none());
         }
@@ -1936,6 +2096,7 @@ mod tests {
             close_time: 100,
             sign_time: 100,
             signature: None,
+            amendments: vec![],
         };
         let result = val_aggregator.add_validation(v28);
         assert!(result.is_some());
@@ -1969,6 +2130,7 @@ mod tests {
                 close_time: 100,
                 sign_time: 100,
                 signature: None,
+                amendments: vec![],
             };
             assert!(val_aggregator.add_validation(v).is_none());
         }
@@ -1981,6 +2143,7 @@ mod tests {
             close_time: 100,
             sign_time: 100,
             signature: None,
+            amendments: vec![],
         };
         assert!(val_aggregator.add_validation(v5).is_some());
     }

@@ -184,6 +184,7 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
         close_time: sign_time,
         sign_time,
         signature,
+        amendments: vec![],
     })
 }
 

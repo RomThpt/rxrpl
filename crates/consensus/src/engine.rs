@@ -465,6 +465,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             close_time,
             sign_time: close_time,
             signature: None,
+            amendments: vec![],
         };
 
         self.adapter.on_accept(&validation);

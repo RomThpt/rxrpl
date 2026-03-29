@@ -11,3 +11,5 @@ rxrpl-primitives = { workspace = true }
 rxrpl-crypto = { workspace = true }
 thiserror.workspace = true
 once_cell.workspace = true
+hex.workspace = true
+serde_json.workspace = true

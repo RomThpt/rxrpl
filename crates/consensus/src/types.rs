@@ -54,6 +54,11 @@ pub struct Validation {
     pub sign_time: u32,
     /// Optional cryptographic signature.
     pub signature: Option<Vec<u8>>,
+    /// Amendment IDs this validator votes to enable.
+    ///
+    /// Carried in the validation message so that amendment voting
+    /// can be tallied across the trusted validator set.
+    pub amendments: Vec<Hash256>,
 }
 
 impl Proposal {
@@ -333,6 +338,7 @@ mod tests {
             close_time: 100,
             sign_time: 101,
             signature: None,
+            amendments: vec![],
         };
 
         validation.sign(&kp.private_key, kp.key_type);

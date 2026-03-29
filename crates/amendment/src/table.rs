@@ -75,6 +75,11 @@ impl AmendmentTable {
         }
     }
 
+    /// Check if an amendment currently has majority.
+    pub fn has_majority(&self, id: &Hash256) -> bool {
+        self.state.get(id).is_some_and(|s| s.majority_since.is_some())
+    }
+
     /// Record that an amendment has gained majority at a given ledger sequence.
     pub fn set_majority(&mut self, id: &Hash256, ledger_seq: u32) {
         if let Some(state) = self.state.get_mut(id) {
