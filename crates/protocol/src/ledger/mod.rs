@@ -11,6 +11,8 @@ pub mod did;
 pub mod directory_node;
 pub mod escrow;
 pub mod fee_settings;
+pub mod hook;
+pub mod hook_state;
 pub mod ledger_hashes;
 pub mod mptoken;
 pub mod mptoken_issuance;
@@ -41,6 +43,8 @@ pub use did::Did;
 pub use directory_node::DirectoryNode;
 pub use escrow::Escrow;
 pub use fee_settings::FeeSettings;
+pub use hook::HookDefinition;
+pub use hook_state::HookState;
 pub use ledger_hashes::LedgerHashes;
 pub use mptoken::MpToken;
 pub use mptoken_issuance::MpTokenIssuance;
@@ -92,6 +96,8 @@ pub enum LedgerObjectKind {
     Bridge(Bridge),
     XChainOwnedClaimId(XChainOwnedClaimId),
     XChainOwnedCreateAccountClaimId(XChainOwnedCreateAccountClaimId),
+    HookDefinition(HookDefinition),
+    HookState(HookState),
     #[serde(other, deserialize_with = "deserialize_unknown")]
     Unknown,
 }

@@ -323,12 +323,15 @@ pub fn register_batch(registry: &mut TransactorRegistry) {
     );
 }
 
+/// Register the SetHook handler (WASM hooks).
+pub fn register_hooks(registry: &mut TransactorRegistry) {
+    registry.register(TransactionType::SetHook, set_hook::SetHookTransactor);
+}
+
 /// Register stub handlers for unimplemented transaction types.
 ///
-/// These return `TemDisabled` at preflight: SetHook (WASM hooks),
-/// NickNameSet (deprecated 2014).
+/// These return `TemDisabled` at preflight: NickNameSet (deprecated 2014).
 pub fn register_stubs(registry: &mut TransactorRegistry) {
-    registry.register(TransactionType::SetHook, set_hook::SetHookTransactor);
     registry.register(
         TransactionType::NickNameSet,
         nickname_set::NickNameSetTransactor,

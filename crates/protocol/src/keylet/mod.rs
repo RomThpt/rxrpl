@@ -38,6 +38,8 @@ pub enum LedgerNamespace {
     PermissionedDomain = 0x006D,         // 'm'
     Delegate = 0x0045,                   // 'E'
     Vault = 0x0056,                      // 'V'
+    HookDefinition = 0x0068,             // 'h' (hook definition)
+    HookState = 0x0076,                  // 'v' (hook state)
 }
 
 /// Compute a ledger index by hashing: space_u16_be || data...
@@ -269,6 +271,21 @@ pub fn mptoken_issuance(id: &AccountId, seq: u32) -> Hash256 {
 /// Compute the keylet for a multi-purpose token holding.
 pub fn mptoken(issuance_id: &[u8], holder: &AccountId) -> Hash256 {
     index_hash(LedgerNamespace::MPToken, &[issuance_id, holder.as_bytes()])
+}
+
+/// Compute the keylet for a hook definition on an account.
+pub fn hook_definition(owner: &AccountId) -> Hash256 {
+    index_hash(LedgerNamespace::HookDefinition, &[owner.as_bytes()])
+}
+
+/// Compute the keylet for a hook state entry.
+///
+/// `namespace` is the 32-byte hook namespace, `key` is the state key.
+pub fn hook_state(owner: &AccountId, namespace: &[u8; 32], key: &[u8; 32]) -> Hash256 {
+    index_hash(
+        LedgerNamespace::HookState,
+        &[owner.as_bytes(), namespace.as_slice(), key.as_slice()],
+    )
 }
 
 /// Compute the keylet for a credential.

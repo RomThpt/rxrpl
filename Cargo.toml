@@ -33,6 +33,7 @@ rxrpl-pathfind = { path = "crates/pathfind" }
 rxrpl-rpc-server = { path = "crates/rpc-server" }
 rxrpl-node = { path = "crates/node" }
 rxrpl-grpc-server = { path = "crates/grpc-server" }
+rxrpl-hooks = { path = "crates/hooks" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -76,6 +77,10 @@ clap = { version = "4", features = ["derive"] }
 rocksdb = "0.22"
 rusqlite = { version = "0.31", features = ["bundled"] }
 lru = "0.12"
+
+# WASM
+wasmi = "0.40"
+wat = "1"
 
 # Misc
 hex = "0.4"

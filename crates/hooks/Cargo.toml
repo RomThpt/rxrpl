@@ -1,0 +1,16 @@
+[package]
+name = "rxrpl-hooks"
+description = "XRPL WASM hooks runtime: validation, execution engine, and host functions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rxrpl-primitives = { workspace = true }
+wasmi = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+wat = { workspace = true }

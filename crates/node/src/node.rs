@@ -61,7 +61,7 @@ impl LedgerProvider for ClosedLedgerAccess {
 /// mempool, consensus, overlay, and RPC server.
 #[allow(dead_code)]
 pub struct Node {
-    config: NodeConfig,
+    pub(crate) config: NodeConfig,
     ledger: Arc<RwLock<Ledger>>,
     closed_ledgers: Arc<RwLock<VecDeque<Ledger>>>,
     tx_engine: Arc<TxEngine>,
@@ -121,6 +121,7 @@ impl Node {
         rxrpl_tx_engine::handlers::register_phase_d2(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_phase_e(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_batch(&mut tx_registry);
+        rxrpl_tx_engine::handlers::register_hooks(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_stubs(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_pseudo(&mut tx_registry);
         let tx_engine = TxEngine::new_without_sig_check(tx_registry);
@@ -174,6 +175,7 @@ impl Node {
         rxrpl_tx_engine::handlers::register_phase_d2(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_phase_e(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_batch(&mut tx_registry);
+        rxrpl_tx_engine::handlers::register_hooks(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_stubs(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_pseudo(&mut tx_registry);
         let tx_engine = TxEngine::new_without_sig_check(tx_registry);
