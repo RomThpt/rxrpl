@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use rxrpl_primitives::Hash256;
 
 use crate::adapter::ConsensusAdapter;
+use crate::close_resolution::AdaptiveCloseTime;
 use crate::error::ConsensusError;
+use crate::negative_unl::{NegativeUnlChange, NegativeUnlTracker};
 use crate::params::ConsensusParams;
 use crate::phase::ConsensusPhase;
 use crate::types::{DisputedTx, NodeId, Proposal, TxSet, Validation};
@@ -58,12 +60,16 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     accepted_validation: Option<Validation>,
     /// Trusted validator list (UNL). Empty = solo mode.
     unl: TrustedValidatorList,
+    /// Negative UNL tracker for automatic demotion/re-enable.
+    negative_unl_tracker: NegativeUnlTracker,
     /// Proposals received while not in Establish phase, replayed on close.
     pending_proposals: Vec<Proposal>,
     /// Tracks proposals from trusted peers that reference a different
     /// `prev_ledger` than ours. Keyed by (node_id -> their prev_ledger).
     /// Used to detect when we are on the wrong chain.
     wrong_prev_ledger_votes: HashMap<NodeId, Hash256>,
+    /// Adaptive close-time resolution tracker.
+    adaptive_close_time: AdaptiveCloseTime,
 }
 
 impl<A: ConsensusAdapter> ConsensusEngine<A> {
@@ -78,6 +84,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         params: ConsensusParams,
         unl: TrustedValidatorList,
     ) -> Self {
+        let adaptive_close_time = AdaptiveCloseTime::new(params.close_time_resolution);
         Self {
             adapter,
             params,
@@ -94,8 +101,10 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             accepted_close_flags: 0,
             accepted_validation: None,
             unl,
+            negative_unl_tracker: NegativeUnlTracker::new(),
             pending_proposals: Vec::new(),
             wrong_prev_ledger_votes: HashMap::new(),
+            adaptive_close_time,
         }
     }
 
@@ -107,6 +116,65 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
     /// Get the UNL.
     pub fn unl(&self) -> &TrustedValidatorList {
         &self.unl
+    }
+
+    /// Get a mutable reference to the UNL.
+    pub fn unl_mut(&mut self) -> &mut TrustedValidatorList {
+        &mut self.unl
+    }
+
+    /// Get the negative UNL tracker.
+    pub fn negative_unl_tracker(&self) -> &NegativeUnlTracker {
+        &self.negative_unl_tracker
+    }
+
+    /// Get a mutable reference to the negative UNL tracker.
+    pub fn negative_unl_tracker_mut(&mut self) -> &mut NegativeUnlTracker {
+        &mut self.negative_unl_tracker
+    }
+
+    /// Record a validation from a trusted validator for the current ledger.
+    /// Should be called when a validation message is received.
+    pub fn record_validation(&mut self, node_id: NodeId) {
+        self.negative_unl_tracker.record_validation(node_id);
+    }
+
+    /// Notify the tracker that a ledger has closed.
+    /// Should be called once per ledger close.
+    pub fn on_ledger_close_for_tracker(&mut self) {
+        self.negative_unl_tracker.on_ledger_close();
+    }
+
+    /// Evaluate the negative UNL at a flag ledger boundary.
+    ///
+    /// Returns a list of UNLModify changes (disable/re-enable) that should
+    /// be emitted as pseudo-transactions. Also synchronizes the local UNL's
+    /// negative set to match the tracker's disabled set.
+    pub fn evaluate_negative_unl(&mut self, ledger_seq: u32) -> Vec<NegativeUnlChange> {
+        if !NegativeUnlTracker::is_flag_ledger(ledger_seq) {
+            return Vec::new();
+        }
+
+        let trusted = self.unl.trusted_set().clone();
+        let changes = self.negative_unl_tracker.evaluate(&trusted, ledger_seq);
+
+        // Synchronize the UNL's negative set with the tracker's disabled set.
+        // Add any newly disabled validators.
+        for n in self.negative_unl_tracker.disabled_set() {
+            if !self.unl.is_in_negative_unl(n) {
+                self.unl.add_to_negative_unl(*n);
+            }
+        }
+        // Remove any re-enabled validators.
+        let current_nunl: Vec<NodeId> =
+            self.unl.negative_unl_set().iter().copied().collect();
+        for n in current_nunl {
+            if !self.negative_unl_tracker.disabled_set().contains(&n) {
+                self.unl.remove_from_negative_unl(&n);
+            }
+        }
+
+        changes
     }
 
     /// Get the current consensus phase.
@@ -137,6 +205,16 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
     /// Get the accepted validation.
     pub fn accepted_validation(&self) -> Option<&Validation> {
         self.accepted_validation.as_ref()
+    }
+
+    /// Get the adaptive close-time resolution tracker.
+    pub fn adaptive_close_time(&self) -> &AdaptiveCloseTime {
+        &self.adaptive_close_time
+    }
+
+    /// Get the current close-time resolution (adaptive).
+    pub fn close_time_resolution(&self) -> u32 {
+        self.adaptive_close_time.resolution()
     }
 
     /// Get the current previous ledger hash.
@@ -392,7 +470,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         times.sort();
 
         let median = times[times.len() / 2];
-        round_close_time(median, self.params.close_time_resolution)
+        round_close_time(median, self.adaptive_close_time.resolution())
     }
 
     /// Run one round of convergence.
@@ -507,6 +585,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.accepted_close_time = Some(close_time);
 
         // Check if peers disagree on close time
+        let current_resolution = self.adaptive_close_time.resolution();
         if !self.peer_positions.is_empty() {
             let our_time = self
                 .our_position
@@ -519,9 +598,15 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             }
             let min = *times.iter().min().unwrap();
             let max = *times.iter().max().unwrap();
-            if max - min > self.params.close_time_resolution {
+            if max - min > current_resolution {
                 self.accepted_close_flags = 1;
+                self.adaptive_close_time.on_disagreement();
+            } else {
+                self.adaptive_close_time.on_agreement();
             }
+        } else {
+            // Solo mode: always counts as agreement
+            self.adaptive_close_time.on_agreement();
         }
 
         // Ask adapter to apply the tx set and get ledger hash
@@ -1256,5 +1341,168 @@ mod tests {
 
         // 2/4 = 50% < 60% -> no detection
         assert_eq!(engine.check_wrong_prev_ledger(), None);
+    }
+
+    // --- Adaptive close-time resolution tests ---
+
+    #[test]
+    fn adaptive_resolution_starts_at_params_value() {
+        let engine = test_engine();
+        assert_eq!(engine.close_time_resolution(), 30);
+    }
+
+    #[test]
+    fn solo_rounds_count_as_agreement() {
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new(adapter, node(1), ConsensusParams::default());
+
+        // Run 5 solo rounds (each counts as agreement)
+        for seq in 1..=5 {
+            engine.start_round(Hash256::ZERO, seq);
+            let set = TxSet::new(vec![]);
+            engine.close_ledger(set, 100, seq).unwrap();
+            engine.converge();
+        }
+
+        // After 5 agreements, resolution should halve: 30 -> 15
+        assert_eq!(engine.close_time_resolution(), 15);
+    }
+
+    #[test]
+    fn close_time_agreement_tightens_resolution() {
+        let adapter = SimpleAdapter;
+        let node_a = node(0xA0);
+        let node_b = node(0xB0);
+        let mut engine = ConsensusEngine::new(adapter, node_a, ConsensusParams::default());
+
+        // Run 5 rounds where all peers agree on close time (within resolution)
+        for seq in 1..=5u32 {
+            engine.start_round(Hash256::ZERO, seq);
+            let set = TxSet::new(vec![]);
+            engine.close_ledger(set.clone(), 100, seq).unwrap();
+
+            // Peer proposes same close time
+            engine.peer_proposal(Proposal {
+                node_id: node_b,
+                public_key: vec![0x02; 33],
+                tx_set_hash: set.hash,
+                close_time: 100,
+                prop_seq: 0,
+                ledger_seq: seq,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            });
+
+            engine.converge();
+        }
+
+        // 5 agreements -> resolution halved from 30 to 15
+        assert_eq!(engine.close_time_resolution(), 15);
+    }
+
+    #[test]
+    fn close_time_disagreement_loosens_resolution() {
+        let adapter = SimpleAdapter;
+        let node_a = node(0xA0);
+        let node_b = node(0xB0);
+        let mut engine = ConsensusEngine::new(adapter, node_a, ConsensusParams::default());
+
+        // First: tighten by running 5 agreeing rounds
+        for seq in 1..=5u32 {
+            engine.start_round(Hash256::ZERO, seq);
+            let set = TxSet::new(vec![]);
+            engine.close_ledger(set.clone(), 100, seq).unwrap();
+            engine.peer_proposal(Proposal {
+                node_id: node_b,
+                public_key: vec![0x02; 33],
+                tx_set_hash: set.hash,
+                close_time: 100,
+                prop_seq: 0,
+                ledger_seq: seq,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            });
+            engine.converge();
+        }
+        assert_eq!(engine.close_time_resolution(), 15);
+
+        // Now: disagreement (spread > 15)
+        engine.start_round(Hash256::ZERO, 6);
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 6).unwrap();
+        engine.peer_proposal(Proposal {
+            node_id: node_b,
+            public_key: vec![0x02; 33],
+            tx_set_hash: set.hash,
+            close_time: 200, // spread of 100 > 15
+            prop_seq: 0,
+            ledger_seq: 6,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        });
+        engine.converge();
+
+        // Resolution doubled from 15 to 30
+        assert_eq!(engine.close_time_resolution(), 30);
+    }
+
+    #[test]
+    fn adaptive_resolution_used_for_rounding() {
+        let adapter = SimpleAdapter;
+        let node_a = node(0xA0);
+        let node_b = node(0xB0);
+
+        // Use custom params with resolution 10 for easier testing
+        let params = ConsensusParams {
+            close_time_resolution: 10,
+            ..ConsensusParams::default()
+        };
+        let mut engine = ConsensusEngine::new(adapter, node_a, params);
+
+        // Run 5 solo rounds to halve resolution: 10 -> 5
+        for seq in 1..=5 {
+            engine.start_round(Hash256::ZERO, seq);
+            let set = TxSet::new(vec![]);
+            engine.close_ledger(set, 100, seq).unwrap();
+            engine.converge();
+        }
+        assert_eq!(engine.close_time_resolution(), 5);
+
+        // Now verify that close time rounding uses the new resolution
+        engine.start_round(Hash256::ZERO, 6);
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 97, 6).unwrap();
+        engine.peer_proposal(Proposal {
+            node_id: node_b,
+            public_key: vec![0x02; 33],
+            tx_set_hash: set.hash,
+            close_time: 103,
+            prop_seq: 0,
+            ledger_seq: 6,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        });
+        engine.converge();
+
+        // Median of [97, 103] = 103 (index 1 of 2)
+        // Rounded to resolution 5: (103 + 2) / 5 * 5 = 105
+        assert_eq!(engine.accepted_close_time(), Some(105));
+    }
+
+    #[test]
+    fn adaptive_resolution_getter_reflects_state() {
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new(adapter, node(1), ConsensusParams::default());
+
+        assert_eq!(engine.adaptive_close_time().resolution(), 30);
+        assert_eq!(engine.adaptive_close_time().consecutive_agreements(), 0);
+
+        // One solo round
+        engine.start_round(Hash256::ZERO, 1);
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set, 100, 1).unwrap();
+        engine.converge();
+
+        assert_eq!(engine.adaptive_close_time().consecutive_agreements(), 1);
     }
 }

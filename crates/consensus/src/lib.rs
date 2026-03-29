@@ -7,8 +7,10 @@
 /// - Consensus types: `Proposal`, `Validation`, `TxSet`, `DisputedTx`
 /// - `TrustedValidatorList`: UNL management
 pub mod adapter;
+pub mod close_resolution;
 pub mod engine;
 pub mod error;
+pub mod negative_unl;
 pub mod params;
 pub mod phase;
 pub mod simulator;
@@ -17,8 +19,10 @@ pub mod types;
 pub mod unl;
 
 pub use adapter::ConsensusAdapter;
+pub use close_resolution::AdaptiveCloseTime;
 pub use engine::{ConsensusEngine, WrongPrevLedgerDetected};
 pub use error::ConsensusError;
+pub use negative_unl::{NegativeUnlChange, NegativeUnlTracker, FLAG_LEDGER_INTERVAL};
 pub use params::ConsensusParams;
 pub use phase::ConsensusPhase;
 pub use timer::{ConsensusTimer, TimerAction};
