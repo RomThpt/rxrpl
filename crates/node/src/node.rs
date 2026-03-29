@@ -852,6 +852,9 @@ impl Node {
             let mut last_prev_ledger_switch: Option<tokio::time::Instant> = None;
             const PREV_LEDGER_SWITCH_COOLDOWN: Duration = Duration::from_secs(10);
 
+            // Track consensus stalls for escalating recovery.
+            let mut stall_metrics = rxrpl_consensus::StallMetrics::new();
+
             let sync_check_duration = Duration::from_secs(5);
             let mut sync_check_interval = tokio::time::interval(sync_check_duration);
             let mut sync_started_at: Option<tokio::time::Instant> = None;
@@ -916,6 +919,7 @@ impl Node {
                                             &amendment_votes, trusted_validator_count,
                                             &pruner, &node_store,
                                         ).await;
+                                        stall_metrics.reset_consecutive();
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
                                         // Start new open phase
@@ -941,6 +945,7 @@ impl Node {
                                             &amendment_votes, trusted_validator_count,
                                             &pruner, &node_store,
                                         ).await;
+                                        stall_metrics.reset_consecutive();
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
                                         // Start new open phase
@@ -948,28 +953,48 @@ impl Node {
                                     }
                                 }
                                 TimerAction::StallAbort => {
+                                    let prev_hash = {
+                                        let l = ledger.read().await;
+                                        l.header.parent_hash
+                                    };
+                                    let action = stall_metrics.record_stall(&prev_hash);
                                     tracing::warn!(
-                                        "consensus stalled in {:?} phase, aborting round",
-                                        consensus.phase()
+                                        phase = ?consensus.phase(),
+                                        total_stalls = stall_metrics.total_stalls(),
+                                        consecutive = stall_metrics.consecutive_stalls(),
+                                        action = ?action,
+                                        "consensus stalled, taking recovery action"
                                     );
-                                    // Force-accept by exhausting convergence rounds
-                                    while !consensus.converge() {}
-                                    timer.on_phase_change(consensus.phase());
-                                    let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
-                                        phase: "accepted".into(),
-                                    });
-                                    Self::close_consensus_round(
-                                        &consensus, pending_close_time, &ledger,
-                                        &closed_ledgers, &tx_store, &event_tx,
-                                        &ledger_seq_shared, &ledger_hash_shared,
-                                        &tx_queue, &identity, &cmd_tx_catchup,
-                                        &amendment_table, &tx_engine, &fees,
-                                        &amendment_votes, trusted_validator_count,
-                                        &pruner, &node_store,
-                                    ).await;
-                                    amendment_votes.clear();
-                                    trusted_validator_count = 0;
-                                    timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
+
+                                    match action {
+                                        rxrpl_consensus::StallAction::Retry => {
+                                            // Abandon round, re-open same ledger
+                                            let l = ledger.read().await;
+                                            consensus.start_round(
+                                                l.header.parent_hash,
+                                                l.header.sequence,
+                                            );
+                                            timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
+                                            amendment_votes.clear();
+                                            trusted_validator_count = 0;
+                                        }
+                                        rxrpl_consensus::StallAction::Resync => {
+                                            // Escalate: request latest ledger from peers
+                                            tracing::warn!(
+                                                "3+ consecutive stalls, requesting resync from peers"
+                                            );
+                                            syncing = true;
+                                            timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
+                                            let _ = cmd_tx_catchup.send(
+                                                rxrpl_overlay::OverlayCommand::RequestLedger {
+                                                    hash: Some(Hash256::ZERO),
+                                                    seq: 0,
+                                                },
+                                            );
+                                            amendment_votes.clear();
+                                            trusted_validator_count = 0;
+                                        }
+                                    }
                                 }
                             }
                         }
