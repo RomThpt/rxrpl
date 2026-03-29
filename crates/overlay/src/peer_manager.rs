@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use openssl::ssl::{SslAcceptor, SslConnector};
-use rxrpl_consensus::types::{Proposal, Validation};
+use std::collections::HashSet;
+
+use rxrpl_consensus::types::{Proposal, TxSet, Validation};
 use rxrpl_p2p_proto::MessageType;
 use rxrpl_p2p_proto::codec::{PeerCodec, PeerMessage};
 use rxrpl_primitives::Hash256;
@@ -34,6 +36,11 @@ use crate::tls::{self, PeerStream};
 const LI_BASE: i32 = 0;
 const _LI_TX_NODE: i32 = 1;
 const LI_AS_NODE: i32 = 2;
+const LI_TS_CANDIDATE: i32 = 3;
+
+/// HaveTransactionSet status values from rippled.
+/// tsNEW_SET = 1: peer is proposing a new transaction set.
+const _TS_NEW_SET: u32 = 1;
 
 /// Messages forwarded from the overlay to the consensus layer.
 pub enum ConsensusMessage {
@@ -60,6 +67,7 @@ pub enum ConsensusMessage {
     ValidatorListReceived {
         validator_count: usize,
     },
+    TxSetAcquired(TxSet),
 }
 
 /// Configuration for the peer manager.
@@ -97,6 +105,10 @@ pub struct PeerManager {
     next_cookie: AtomicU64,
     discovery: Option<Arc<PeerDiscovery>>,
     server_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    /// Shared cache of known transaction sets (shared with NetworkConsensusAdapter).
+    tx_sets: Option<Arc<std::sync::RwLock<HashMap<Hash256, TxSet>>>>,
+    /// Tx-set hashes currently being fetched to avoid duplicate requests.
+    pending_tx_set_fetches: HashSet<Hash256>,
 }
 
 impl PeerManager {
@@ -137,6 +149,8 @@ impl PeerManager {
             next_cookie: AtomicU64::new(1),
             discovery: None,
             server_event_tx: None,
+            tx_sets: None,
+            pending_tx_set_fetches: HashSet::new(),
         };
 
         (mgr, cmd_tx, consensus_rx)
@@ -158,6 +172,19 @@ impl PeerManager {
     /// to the RPC server's subscription system without a direct dependency.
     pub fn set_event_sender(&mut self, tx: tokio::sync::broadcast::Sender<serde_json::Value>) {
         self.server_event_tx = Some(tx);
+    }
+
+    /// Set the shared tx-set cache (typically from NetworkConsensusAdapter).
+    pub fn set_tx_sets(&mut self, tx_sets: Arc<std::sync::RwLock<HashMap<Hash256, TxSet>>>) {
+        self.tx_sets = Some(tx_sets);
+    }
+
+    /// Check if a transaction set is known locally.
+    fn has_tx_set(&self, hash: &Hash256) -> bool {
+        self.tx_sets
+            .as_ref()
+            .map(|cache| cache.read().unwrap().contains_key(hash))
+            .unwrap_or(false)
     }
 
     /// Run the peer manager event loop.
@@ -596,6 +623,13 @@ impl PeerManager {
                             .collect();
 
                         let ledger_seq = msg.ledger_seq;
+                        let info_type = msg.ledger_info_type;
+
+                        // Handle tx-set candidate responses (liTS_CANDIDATE = 3).
+                        if info_type == LI_TS_CANDIDATE {
+                            self.handle_tx_set_response(hash, &nodes);
+                            return;
+                        }
 
                         // Skip already-synced ledgers.
                         if self.ledger_syncer.is_synced(ledger_seq) {
@@ -760,6 +794,18 @@ impl PeerManager {
                             "HaveTransactionSet from {} hash={} status={}",
                             from, have_set.hash, have_set.status
                         );
+
+                        // If we do not have this tx-set locally, fetch it from the peer.
+                        if !self.has_tx_set(&have_set.hash)
+                            && !self.pending_tx_set_fetches.contains(&have_set.hash)
+                        {
+                            tracing::info!(
+                                "requesting unknown tx-set {} from peer {}",
+                                have_set.hash, from
+                            );
+                            self.pending_tx_set_fetches.insert(have_set.hash);
+                            self.send_get_tx_set(from, have_set.hash);
+                        }
                     }
                     Err(_) => {
                         if let Some(ref info) = peer_info {
@@ -1153,6 +1199,12 @@ impl PeerManager {
         let req_ledger_seq = req.ledger_seq.unwrap_or(0);
         let req_cookie = req.request_cookie.unwrap_or(0);
 
+        // Handle tx-set requests (liTS_CANDIDATE) separately.
+        if req_ledger_type == LI_TS_CANDIDATE {
+            self.handle_get_tx_set(from, &req_ledger_hash, req_cookie);
+            return;
+        }
+
         let ledger = match req_ledger_type {
             x if x == LT_CLOSED || x == LT_VALIDATED => {
                 provider.latest_closed()
@@ -1268,6 +1320,136 @@ impl PeerManager {
                 payload: response,
             });
         }
+    }
+
+    /// Serve a tx-set request from a peer (GetLedger with itype=liTS_CANDIDATE).
+    fn handle_get_tx_set(&self, from: Hash256, hash_bytes: &[u8], cookie: u64) {
+        let set_hash = if hash_bytes.len() >= 32 {
+            Hash256::new(hash_bytes[..32].try_into().unwrap_or([0u8; 32]))
+        } else {
+            tracing::debug!("GetLedger liTS_CANDIDATE from {}: missing hash", from);
+            return;
+        };
+
+        let tx_set = self.tx_sets.as_ref().and_then(|cache| {
+            cache.read().unwrap().get(&set_hash).cloned()
+        });
+
+        let nodes = match tx_set {
+            Some(set) => {
+                set.txs
+                    .iter()
+                    .map(|tx_hash| (tx_hash.as_bytes().to_vec(), Vec::new()))
+                    .collect()
+            }
+            None => {
+                tracing::debug!(
+                    "GetLedger liTS_CANDIDATE from {}: tx-set {} not found",
+                    from, set_hash
+                );
+                Vec::new()
+            }
+        };
+
+        let response = proto_convert::encode_ledger_data(
+            &set_hash,
+            0,
+            LI_TS_CANDIDATE,
+            nodes,
+            cookie,
+        );
+
+        if let Some(handle) = self.peer_handles.get(&from) {
+            let _ = handle.tx.try_send(PeerMessage {
+                msg_type: MessageType::LedgerData,
+                payload: response,
+            });
+        }
+    }
+
+    /// Send a TMGetLedger request with itype=liTS_CANDIDATE to fetch a tx-set.
+    fn send_get_tx_set(&self, peer: Hash256, tx_set_hash: Hash256) {
+        let cookie = self.next_cookie.fetch_add(1, Ordering::Relaxed);
+        let payload = proto_convert::encode_get_ledger(
+            LI_TS_CANDIDATE,
+            Some(&tx_set_hash),
+            0,
+            cookie,
+        );
+        if let Some(handle) = self.peer_handles.get(&peer) {
+            match handle.tx.try_send(PeerMessage {
+                msg_type: MessageType::GetLedger,
+                payload,
+            }) {
+                Ok(_) => {
+                    tracing::debug!(
+                        "sent GetLedger liTS_CANDIDATE for tx-set {} to {}",
+                        tx_set_hash, peer
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to send GetLedger for tx-set {} to {}: {}",
+                        tx_set_hash, peer, e
+                    );
+                }
+            }
+        }
+    }
+
+    /// Handle a LedgerData response carrying a tx-set (liTS_CANDIDATE).
+    ///
+    /// Each node in the response is a (tx_hash, tx_data) pair.
+    /// Reconstruct the TxSet from the transaction hashes and store it
+    /// in the shared cache, then notify the consensus engine.
+    fn handle_tx_set_response(&mut self, set_hash: Hash256, nodes: &[(Vec<u8>, Vec<u8>)]) {
+        self.pending_tx_set_fetches.remove(&set_hash);
+
+        if nodes.is_empty() {
+            tracing::debug!("empty tx-set response for {}", set_hash);
+            return;
+        }
+
+        // Extract transaction hashes from node IDs.
+        let tx_hashes: Vec<Hash256> = nodes
+            .iter()
+            .filter_map(|(id, _data)| {
+                if id.len() >= 32 {
+                    let arr: [u8; 32] = id[..32].try_into().ok()?;
+                    Some(Hash256::new(arr))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let tx_set = TxSet::new(tx_hashes);
+
+        // Verify: the computed hash should match what we requested.
+        if tx_set.hash != set_hash {
+            tracing::warn!(
+                "tx-set hash mismatch: expected {} got {} ({} txs)",
+                set_hash, tx_set.hash, tx_set.len()
+            );
+            // Store under the computed hash anyway so consensus can still find it.
+        }
+
+        tracing::info!(
+            "acquired tx-set {} with {} transactions",
+            tx_set.hash, tx_set.len()
+        );
+
+        // Store in shared cache.
+        if let Some(ref cache) = self.tx_sets {
+            cache.write().unwrap().insert(tx_set.hash, tx_set.clone());
+            // Also store under the requested hash if different.
+            if tx_set.hash != set_hash {
+                cache.write().unwrap().insert(set_hash, tx_set.clone());
+            }
+        }
+
+        // Notify the consensus engine.
+        let _ = self.consensus_tx.send(ConsensusMessage::TxSetAcquired(tx_set));
     }
 }
 

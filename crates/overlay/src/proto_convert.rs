@@ -467,6 +467,14 @@ pub fn decode_have_set(data: &[u8]) -> Result<HaveSetData, OverlayError> {
     })
 }
 
+pub fn encode_have_set(hash: &Hash256, status: u32) -> Vec<u8> {
+    let msg = TmHaveTransactionSet {
+        status: Some(status as i32),
+        hash: Some(hash.as_bytes().to_vec()),
+    };
+    msg.encode_to_vec()
+}
+
 // --- GetObjectByHash (type 42) ---
 
 /// rippled ObjectType enum values for TMGetObjectByHash.type.
@@ -718,5 +726,25 @@ mod tests {
         assert_eq!(decoded.nodes[0].nodedata.as_deref().unwrap_or(&[]), &[4, 5, 6]);
         assert_eq!(decoded.nodes[1].nodeid.as_deref().unwrap_or(&[]), &[7, 8]);
         assert_eq!(decoded.nodes[1].nodedata.as_deref().unwrap_or(&[]), &[9, 10, 11, 12]);
+    }
+
+    #[test]
+    fn have_set_roundtrip() {
+        let hash = Hash256::new([0x0E; 32]);
+        let encoded = encode_have_set(&hash, 1);
+        let decoded = decode_have_set(&encoded).unwrap();
+
+        assert_eq!(decoded.hash, hash);
+        assert_eq!(decoded.status, 1);
+    }
+
+    #[test]
+    fn have_set_zero_status() {
+        let hash = Hash256::new([0xFF; 32]);
+        let encoded = encode_have_set(&hash, 0);
+        let decoded = decode_have_set(&encoded).unwrap();
+
+        assert_eq!(decoded.hash, hash);
+        assert_eq!(decoded.status, 0);
     }
 }

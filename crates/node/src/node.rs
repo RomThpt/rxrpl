@@ -563,6 +563,10 @@ impl Node {
         // 5. Create NetworkConsensusAdapter (consumes cmd_tx)
         let adapter = NetworkConsensusAdapter::new(cmd_tx, Arc::clone(&identity));
 
+        // 5b. Share the adapter's tx-set cache with the peer manager so it can
+        // check for locally known sets and store newly acquired ones.
+        peer_mgr.set_tx_sets(Arc::clone(adapter.tx_sets()));
+
         // 6. Spawn relay bridge: RPC submit -> P2P broadcast
         tokio::spawn(async move {
             while let Some((tx_hash, tx_bytes)) = relay_rx.recv().await {
@@ -1070,6 +1074,15 @@ impl Node {
                                 // The overlay layer handles incremental sync (liAS_NODE
                                 // requests). We just log receipt here; reconstruction
                                 // happens when LedgerData with the full state arrives.
+                            }
+                            ConsensusMessage::TxSetAcquired(tx_set) => {
+                                tracing::info!(
+                                    "acquired tx-set {} ({} txs) from network",
+                                    tx_set.hash, tx_set.len()
+                                );
+                                // The tx-set is already stored in the shared cache by the
+                                // overlay layer. The consensus engine will find it on its
+                                // next acquire_tx_set call during dispute resolution.
                             }
                             ConsensusMessage::ValidatorListReceived { validator_count } => {
                                 if configured_quorum.is_none() && validator_count > 0 {

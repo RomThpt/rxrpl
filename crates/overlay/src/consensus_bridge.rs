@@ -54,6 +54,13 @@ impl ConsensusAdapter for NetworkConsensusAdapter {
 
     fn share_position(&self, proposal: &Proposal) {
         self.propose(proposal);
+
+        // Broadcast HaveTransactionSet so peers know we have this tx-set.
+        let have_set_payload = proto_convert::encode_have_set(
+            &proposal.tx_set_hash,
+            1, // tsNEW_SET
+        );
+        self.broadcast(MessageType::HaveSet, have_set_payload);
     }
 
     fn share_tx(&self, tx_hash: &Hash256, tx_data: &[u8]) {
@@ -140,5 +147,67 @@ mod tests {
         // Now cached
         let acquired = adapter.acquire_tx_set(&hash).unwrap();
         assert_eq!(acquired.hash, hash);
+    }
+
+    #[test]
+    fn share_position_broadcasts_have_set() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let identity = Arc::new(NodeIdentity::generate());
+        let adapter = NetworkConsensusAdapter::new(cmd_tx, identity);
+
+        let proposal = Proposal {
+            node_id: NodeId(Hash256::new([0x01; 32])),
+            public_key: vec![0x02; 33],
+            tx_set_hash: Hash256::new([0x02; 32]),
+            close_time: 100,
+            prop_seq: 1,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+
+        adapter.share_position(&proposal);
+
+        // First message: ProposeSet broadcast
+        let cmd1 = cmd_rx.try_recv().unwrap();
+        match cmd1 {
+            OverlayCommand::Broadcast { msg_type, .. } => {
+                assert_eq!(msg_type, MessageType::ProposeSet);
+            }
+            _ => panic!("expected ProposeSet Broadcast"),
+        }
+
+        // Second message: HaveSet broadcast
+        let cmd2 = cmd_rx.try_recv().unwrap();
+        match cmd2 {
+            OverlayCommand::Broadcast { msg_type, payload } => {
+                assert_eq!(msg_type, MessageType::HaveSet);
+                // Verify the payload decodes correctly
+                let have_set = proto_convert::decode_have_set(&payload).unwrap();
+                assert_eq!(have_set.hash, proposal.tx_set_hash);
+                assert_eq!(have_set.status, 1); // tsNEW_SET
+            }
+            _ => panic!("expected HaveSet Broadcast"),
+        }
+    }
+
+    #[test]
+    fn tx_sets_shared_ref() {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let identity = Arc::new(NodeIdentity::generate());
+        let adapter = NetworkConsensusAdapter::new(cmd_tx, identity);
+
+        // Get a clone of the shared cache
+        let cache = Arc::clone(adapter.tx_sets());
+
+        // Insert directly into the shared cache (simulates overlay layer inserting)
+        let tx_set = TxSet::new(vec![Hash256::new([0x05; 32])]);
+        let hash = tx_set.hash;
+        cache.write().unwrap().insert(hash, tx_set.clone());
+
+        // Adapter should see the set via acquire_tx_set
+        let acquired = adapter.acquire_tx_set(&hash).unwrap();
+        assert_eq!(acquired.hash, hash);
+        assert_eq!(acquired.len(), 1);
     }
 }
