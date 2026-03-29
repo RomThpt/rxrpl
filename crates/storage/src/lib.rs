@@ -8,6 +8,7 @@
 pub mod batch;
 pub mod error;
 pub mod kvstore;
+pub mod ledgerstore;
 pub mod memory;
 pub mod txstore;
 
@@ -23,6 +24,7 @@ pub mod postgres;
 pub use batch::{BatchEntry, WriteBatch};
 pub use error::StorageError;
 pub use kvstore::KvStore;
+pub use ledgerstore::{InMemoryLedgerStore, LedgerHeaderRecord, LedgerStore, LedgerTxRecord};
 pub use memory::MemoryStore;
 pub use txstore::{TransactionRecord, TxStore};
 

@@ -97,6 +97,10 @@ enum Commands {
         /// Shorthand for --mode network
         #[arg(long, conflicts_with = "standalone")]
         network: bool,
+
+        /// Run in reporting mode (read-only, no consensus)
+        #[arg(long, conflicts_with_all = ["standalone", "network"])]
+        reporting: bool,
     },
 
     /// Print version information and exit
@@ -326,9 +330,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             sync_rpc,
             standalone,
             network,
+            reporting,
         } => {
-            let effective_mode = resolve_run_mode(mode, standalone, network);
-
             let mut config = if let Some(ref config_path) = cli.config {
                 rxrpl_config::load_config(config_path)?
             } else {
@@ -338,6 +341,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(ref dir) = cli.data_dir {
                 config.database.path = dir.clone();
             }
+
+            if reporting {
+                config.reporting.enabled = true;
+                config.server.bind = bind.parse()?;
+                return cmd_reporting_run(config).await;
+            }
+
+            let effective_mode = resolve_run_mode(mode, standalone, network);
 
             match effective_mode {
                 RunMode::Standalone => {
@@ -643,5 +654,23 @@ async fn cmd_network_run(
 
     node.run_networked(close_interval, Some(sync_rpc_url))
         .await?;
+    Ok(())
+}
+
+async fn cmd_reporting_run(
+    config: rxrpl_config::NodeConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bind = config.server.bind;
+    let etl_source = config.reporting.etl_source.clone();
+    let forward_url = config.reporting.forward_url.clone();
+
+    let node = rxrpl_node::Node::new(config)?;
+
+    eprintln!("Starting reporting-mode node...");
+    eprintln!("  RPC server: http://{bind}");
+    eprintln!("  ETL source: {etl_source}");
+    eprintln!("  Forward URL: {forward_url}");
+
+    node.run_reporting().await?;
     Ok(())
 }
