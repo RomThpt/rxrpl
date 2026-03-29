@@ -1,3 +1,4 @@
+use rxrpl_amount::IOUAmount;
 use rxrpl_ledger::Ledger;
 use rxrpl_primitives::AccountId;
 
@@ -63,7 +64,17 @@ impl PathRequest {
                 continue;
             }
 
-            let mut ranks = compute_path_ranks(&paths);
+            let requested = parse_destination_amount(&self.destination_amount);
+            let mut ranks = compute_path_ranks(
+                &paths,
+                ledger,
+                &mut line_cache,
+                src_issue,
+                &dst_issue,
+                &self.source,
+                &self.destination,
+                &requested,
+            );
             let best = get_best_paths(&paths, &mut ranks, MAX_ALTERNATIVES);
 
             if !best.is_empty() {
@@ -81,6 +92,44 @@ impl PathRequest {
 
         alternatives
     }
+}
+
+/// Parse a JSON destination amount into an IOUAmount for simulation.
+fn parse_destination_amount(amount: &serde_json::Value) -> IOUAmount {
+    if let Some(drops_str) = amount.as_str() {
+        if let Ok(drops) = drops_str.parse::<i64>() {
+            if drops != 0 {
+                return IOUAmount::new(drops, 0).unwrap_or(IOUAmount::ZERO);
+            }
+        }
+        return IOUAmount::ZERO;
+    }
+
+    let value_str = amount
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0");
+
+    let value: f64 = value_str.parse().unwrap_or(0.0);
+    if value == 0.0 || !value.is_finite() {
+        return IOUAmount::ZERO;
+    }
+
+    let negative = value < 0.0;
+    let abs_val = value.abs();
+    let mut exponent = 0i32;
+    let mut mantissa = abs_val;
+
+    while mantissa < 1e15 && exponent > -96 {
+        mantissa *= 10.0;
+        exponent -= 1;
+    }
+    while mantissa >= 1e16 && exponent < 80 {
+        mantissa /= 10.0;
+        exponent += 1;
+    }
+
+    IOUAmount::from_parts(mantissa as u64, exponent, negative).unwrap_or(IOUAmount::ZERO)
 }
 
 /// Parse a JSON amount value into an Issue.
