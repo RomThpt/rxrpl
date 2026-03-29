@@ -13,7 +13,9 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::context::ServerContext;
-use crate::events::event_to_json;
+use crate::error::RpcServerError;
+use crate::events::{ServerEvent, event_to_json};
+use crate::handlers::{build_path_find_response, parse_path_find_params, run_path_find};
 use crate::role::{ConnectionRole, RequestContext};
 use crate::router::dispatch;
 use crate::subscriptions::ConnectionSubscriptions;
@@ -104,6 +106,14 @@ async fn handle_ws_connection(socket: WebSocket, ctx: Arc<ServerContext>, role: 
                             Err(e) => ws_response(id, Err(e)),
                         }
                     }
+                    "path_find" => {
+                        let result = handle_ws_path_find(
+                            &body,
+                            &mut subscriptions,
+                            &ctx,
+                        ).await;
+                        ws_response(id, result)
+                    }
                     _ => {
                         // Standard RPC dispatch -- params come directly in
                         // the body for WS (no wrapping array like HTTP).
@@ -120,10 +130,22 @@ async fn handle_ws_connection(socket: WebSocket, ctx: Arc<ServerContext>, role: 
             event = event_rx.recv() => {
                 match event {
                     Ok(ev) => {
+                        // Standard subscription-based event dispatch.
                         if subscriptions.matches(&ev) {
                             let json = event_to_json(&ev);
                             if ws_tx.send(Message::Text(json.to_string().into())).await.is_err() {
                                 break;
+                            }
+                        }
+
+                        // Re-run active path_find subscription on new validated ledger.
+                        if let ServerEvent::LedgerClosed { .. } = &ev {
+                            if subscriptions.path_find_subscription().is_some() {
+                                if let Some(update) = rerun_path_find(&mut subscriptions, &ctx).await {
+                                    if ws_tx.send(Message::Text(update.to_string().into())).await.is_err() {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -135,6 +157,98 @@ async fn handle_ws_connection(socket: WebSocket, ctx: Arc<ServerContext>, role: 
             }
         }
     }
+}
+
+/// Handle `path_find` subcommands over WebSocket with per-connection state.
+async fn handle_ws_path_find(
+    params: &Value,
+    subscriptions: &mut ConnectionSubscriptions,
+    ctx: &Arc<ServerContext>,
+) -> Result<Value, RpcServerError> {
+    let subcommand = params
+        .get("subcommand")
+        .and_then(|v| v.as_str())
+        .unwrap_or("create");
+
+    match subcommand {
+        "create" => {
+            // Close any existing subscription first (rippled behavior).
+            subscriptions.close_path_find();
+
+            let sub = parse_path_find_params(params)?;
+
+            // Run initial pathfinding against the current ledger.
+            let ledger_ref = crate::handlers::common::resolve_ledger(params, ctx).await?;
+            let (alts_json, serialized) = run_path_find(&sub, &ledger_ref);
+            let response = build_path_find_response(&sub, &alts_json);
+
+            // Store subscription with initial result for dedup.
+            let mut sub = sub;
+            sub.last_result = Some(serialized);
+            subscriptions.create_path_find(sub)?;
+
+            Ok(response)
+        }
+        "close" => {
+            let was_active = subscriptions.close_path_find();
+            if was_active {
+                Ok(serde_json::json!({ "closed": true }))
+            } else {
+                Ok(serde_json::json!({ "closed": false, "status": "no path_find in progress" }))
+            }
+        }
+        "status" => {
+            if let Some(sub) = subscriptions.path_find_subscription() {
+                // Re-run pathfinding to get current best paths.
+                let ledger_ref = crate::handlers::common::resolve_ledger(params, ctx).await?;
+                let (alts_json, _) = run_path_find(sub, &ledger_ref);
+                Ok(build_path_find_response(sub, &alts_json))
+            } else {
+                Ok(serde_json::json!({ "status": "no path_find in progress" }))
+            }
+        }
+        _ => Err(RpcServerError::InvalidParams(format!(
+            "unknown subcommand: {subcommand}"
+        ))),
+    }
+}
+
+/// Re-run pathfinding for the active subscription on a new validated ledger.
+///
+/// Returns `Some(json)` if the result changed and an update should be sent,
+/// or `None` if the result is unchanged (suppressed duplicate).
+async fn rerun_path_find(
+    subscriptions: &mut ConnectionSubscriptions,
+    ctx: &Arc<ServerContext>,
+) -> Option<Value> {
+    // Get the current validated ledger.
+    let closed = ctx.closed_ledgers.as_ref()?;
+    let closed_guard = closed.read().await;
+    let ledger = closed_guard.back()?;
+
+    let sub = subscriptions.path_find_subscription()?;
+    let (alts_json, serialized) = run_path_find(sub, ledger);
+
+    // Compare with last result to suppress duplicates.
+    if sub.last_result.as_deref() == Some(&serialized) {
+        return None;
+    }
+
+    let update = serde_json::json!({
+        "type": "path_find",
+        "source_account": sub.source_account_str,
+        "destination_account": sub.destination_account_str,
+        "destination_amount": sub.destination_amount,
+        "full_reply": true,
+        "alternatives": alts_json,
+    });
+
+    // Update stored result for future dedup.
+    if let Some(sub_mut) = subscriptions.path_find_subscription_mut() {
+        sub_mut.last_result = Some(serialized);
+    }
+
+    Some(update)
 }
 
 /// Format a WebSocket RPC response with optional id.

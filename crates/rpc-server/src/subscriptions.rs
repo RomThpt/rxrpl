@@ -6,6 +6,25 @@ use serde_json::Value;
 use crate::error::RpcServerError;
 use crate::events::ServerEvent;
 
+/// Parameters for a persistent path_find subscription.
+///
+/// rippled allows at most one active path_find per WebSocket connection.
+/// On each new validated ledger the pathfinding algorithm is re-run and,
+/// if the result differs from the previous one, an update is pushed.
+#[derive(Clone, Debug)]
+pub struct PathFindSubscription {
+    pub source: AccountId,
+    pub destination: AccountId,
+    pub destination_amount: Value,
+    pub source_currencies: Option<Vec<rxrpl_pathfind::Issue>>,
+    /// Serialized JSON of the last alternatives sent to the client.
+    /// Used to suppress duplicate updates.
+    pub last_result: Option<String>,
+    /// Original string representations for response fields.
+    pub source_account_str: String,
+    pub destination_account_str: String,
+}
+
 /// Key identifying an order book by its trading pair.
 #[derive(Clone, Debug)]
 struct OrderBookKey {
@@ -89,6 +108,8 @@ pub struct ConnectionSubscriptions {
     accounts: HashSet<AccountId>,
     accounts_proposed: HashSet<AccountId>,
     order_books: HashSet<OrderBookKey>,
+    /// At most one active path_find subscription per connection (matching rippled).
+    path_find: Option<PathFindSubscription>,
 }
 
 impl ConnectionSubscriptions {
@@ -187,6 +208,37 @@ impl ConnectionSubscriptions {
         }
 
         Ok(serde_json::json!({}))
+    }
+
+    /// Register a persistent path_find subscription.
+    ///
+    /// Returns an error if a subscription is already active (rippled limit: 1).
+    pub fn create_path_find(
+        &mut self,
+        sub: PathFindSubscription,
+    ) -> Result<(), RpcServerError> {
+        if self.path_find.is_some() {
+            return Err(RpcServerError::InvalidParams(
+                "only one path_find subscription allowed per connection".into(),
+            ));
+        }
+        self.path_find = Some(sub);
+        Ok(())
+    }
+
+    /// Remove the active path_find subscription.
+    pub fn close_path_find(&mut self) -> bool {
+        self.path_find.take().is_some()
+    }
+
+    /// Return a reference to the active path_find subscription, if any.
+    pub fn path_find_subscription(&self) -> Option<&PathFindSubscription> {
+        self.path_find.as_ref()
+    }
+
+    /// Return a mutable reference to the active path_find subscription.
+    pub fn path_find_subscription_mut(&mut self) -> Option<&mut PathFindSubscription> {
+        self.path_find.as_mut()
     }
 
     /// Check if this connection is interested in the given event.
@@ -424,5 +476,74 @@ mod tests {
             ledger_index: 1,
         };
         assert!(!subs.matches(&validated));
+    }
+
+    fn make_test_path_find_sub() -> PathFindSubscription {
+        PathFindSubscription {
+            source: AccountId([1u8; 20]),
+            destination: AccountId([2u8; 20]),
+            destination_amount: serde_json::json!("1000000"),
+            source_currencies: None,
+            last_result: None,
+            source_account_str: "rSource".into(),
+            destination_account_str: "rDest".into(),
+        }
+    }
+
+    #[test]
+    fn create_path_find_subscription() {
+        let mut subs = ConnectionSubscriptions::new();
+        assert!(subs.path_find_subscription().is_none());
+
+        subs.create_path_find(make_test_path_find_sub()).unwrap();
+        assert!(subs.path_find_subscription().is_some());
+    }
+
+    #[test]
+    fn only_one_path_find_allowed() {
+        let mut subs = ConnectionSubscriptions::new();
+        subs.create_path_find(make_test_path_find_sub()).unwrap();
+
+        let result = subs.create_path_find(make_test_path_find_sub());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn close_path_find_subscription() {
+        let mut subs = ConnectionSubscriptions::new();
+        subs.create_path_find(make_test_path_find_sub()).unwrap();
+
+        assert!(subs.close_path_find());
+        assert!(subs.path_find_subscription().is_none());
+    }
+
+    #[test]
+    fn close_path_find_when_none_active() {
+        let mut subs = ConnectionSubscriptions::new();
+        assert!(!subs.close_path_find());
+    }
+
+    #[test]
+    fn path_find_subscription_mutable_access() {
+        let mut subs = ConnectionSubscriptions::new();
+        subs.create_path_find(make_test_path_find_sub()).unwrap();
+
+        let sub = subs.path_find_subscription_mut().unwrap();
+        sub.last_result = Some("test".into());
+
+        assert_eq!(
+            subs.path_find_subscription().unwrap().last_result.as_deref(),
+            Some("test")
+        );
+    }
+
+    #[test]
+    fn create_after_close_succeeds() {
+        let mut subs = ConnectionSubscriptions::new();
+        subs.create_path_find(make_test_path_find_sub()).unwrap();
+        subs.close_path_find();
+        // Should be able to create a new one after closing
+        subs.create_path_find(make_test_path_find_sub()).unwrap();
+        assert!(subs.path_find_subscription().is_some());
     }
 }
