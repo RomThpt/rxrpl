@@ -23,6 +23,7 @@ use crate::handshake;
 use crate::identity::NodeIdentity;
 use crate::ledger_provider::LedgerProvider;
 use crate::ledger_sync::LedgerSyncer;
+use crate::manifest::{self, ManifestStore};
 use crate::peer_handle::PeerHandle;
 use crate::peer_loop;
 use crate::peer_score::PeerScore;
@@ -30,6 +31,7 @@ use crate::peer_set::{PeerInfo, PeerSet};
 use crate::proto_convert;
 use crate::relay::RelayFilter;
 use crate::reputation::PeerReputation;
+use crate::validator_list::{self, ValidatorListTracker};
 use crate::tls::{self, PeerStream};
 
 /// TMLedgerInfoType values from rippled.
@@ -66,6 +68,18 @@ pub enum ConsensusMessage {
     },
     ValidatorListReceived {
         validator_count: usize,
+    },
+    /// A verified validator list with parsed master keys.
+    ValidatorListVerified {
+        validators: Vec<rxrpl_primitives::PublicKey>,
+        sequence: u64,
+    },
+    /// A manifest was applied, containing ephemeral key mapping.
+    ManifestApplied {
+        master_key: rxrpl_primitives::PublicKey,
+        ephemeral_key: Option<rxrpl_primitives::PublicKey>,
+        old_ephemeral_key: Option<rxrpl_primitives::PublicKey>,
+        revoked: bool,
     },
     TxSetAcquired(TxSet),
 }
@@ -109,6 +123,8 @@ pub struct PeerManager {
     tx_sets: Option<Arc<std::sync::RwLock<HashMap<Hash256, TxSet>>>>,
     /// Tx-set hashes currently being fetched to avoid duplicate requests.
     pending_tx_set_fetches: HashSet<Hash256>,
+    manifest_store: ManifestStore,
+    vl_tracker: ValidatorListTracker,
 }
 
 impl PeerManager {
@@ -151,6 +167,8 @@ impl PeerManager {
             server_event_tx: None,
             tx_sets: None,
             pending_tx_set_fetches: HashSet::new(),
+            manifest_store: ManifestStore::new(),
+            vl_tracker: ValidatorListTracker::new(),
         };
 
         (mgr, cmd_tx, consensus_rx)
@@ -767,12 +785,56 @@ impl PeerManager {
                             manifest_list.len(),
                             from
                         );
-                        // Each entry is a raw serialized manifest (rippled binary format).
-                        // For now we store the count; full parsing requires SField codec.
+
+                        // Parse, verify, and apply each manifest
+                        let raw_bytes: Vec<Vec<u8>> = manifest_list
+                            .into_iter()
+                            .filter_map(|m| m.stobject)
+                            .collect();
+                        let mut applied = 0;
+                        for raw in &raw_bytes {
+                            match manifest::parse_and_verify(raw) {
+                                Ok(m) => {
+                                    let master_key = m.master_public_key.clone();
+                                    let eph_key = m.ephemeral_public_key.clone();
+                                    let revoked = m.is_revoked();
+
+                                    // Get old ephemeral before applying
+                                    let old_eph = self
+                                        .manifest_store
+                                        .current_ephemeral_key(&master_key)
+                                        .cloned();
+
+                                    if self.manifest_store.apply(m) {
+                                        applied += 1;
+                                        let _ = self.consensus_tx.send(
+                                            ConsensusMessage::ManifestApplied {
+                                                master_key,
+                                                ephemeral_key: eph_key,
+                                                old_ephemeral_key: old_eph,
+                                                revoked,
+                                            },
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!("manifest verify failed: {}", e);
+                                }
+                            }
+                        }
+
+                        tracing::debug!(
+                            "applied {}/{} manifests from {}",
+                            applied,
+                            raw_bytes.len(),
+                            from
+                        );
+
                         if let Some(ref tx) = self.server_event_tx {
                             let _ = tx.send(serde_json::json!({
                                 "type": "manifestsReceived",
-                                "count": manifest_list.len(),
+                                "count": raw_bytes.len(),
+                                "applied": applied,
                                 "from": from.to_string(),
                             }));
                         }
@@ -892,14 +954,106 @@ impl PeerManager {
                             vl.manifest.as_ref().map(|v| v.len()).unwrap_or(0),
                             vl.blob.as_ref().map(|v| v.len()).unwrap_or(0)
                         );
-                        // Try to extract validator count from blob JSON
-                        if let Some(blob_bytes) = vl.blob.as_ref() {
-                            if let Ok(decoded) = base64_decode_validator_blob(blob_bytes) {
-                                let _ = self.consensus_tx.send(
-                                    ConsensusMessage::ValidatorListReceived {
-                                        validator_count: decoded,
-                                    },
-                                );
+
+                        // Attempt full signature verification
+                        let manifest_bytes = vl.manifest.as_ref().map(|v| v.as_slice());
+                        let blob_bytes = vl.blob.as_ref().map(|v| v.as_slice());
+                        let sig_bytes = vl.signature.as_ref().map(|v| v.as_slice());
+
+                        if let (Some(manifest_b), Some(blob_b), Some(sig_b)) =
+                            (manifest_bytes, blob_bytes, sig_bytes)
+                        {
+                            match validator_list::verify_and_parse(
+                                manifest_b,
+                                blob_b,
+                                sig_b,
+                                &mut self.manifest_store,
+                            ) {
+                                Ok(vl_data) => {
+                                    let count = vl_data.validators.len();
+                                    let seq = vl_data.sequence;
+
+                                    // Track sequence to reject stale lists
+                                    if self.vl_tracker.record_sequence(
+                                        &vl_data.publisher_master_key,
+                                        seq,
+                                    ) {
+                                        tracing::info!(
+                                            "verified validator list seq={} with {} validators from {}",
+                                            seq, count, from
+                                        );
+
+                                        // Process individual validator manifests
+                                        for raw_manifest in &vl_data.validator_manifests {
+                                            if let Ok(m) = manifest::parse_and_verify(raw_manifest) {
+                                                let master_key = m.master_public_key.clone();
+                                                let eph_key = m.ephemeral_public_key.clone();
+                                                let revoked = m.is_revoked();
+                                                let old_eph = self
+                                                    .manifest_store
+                                                    .current_ephemeral_key(&master_key)
+                                                    .cloned();
+                                                if self.manifest_store.apply(m) {
+                                                    let _ = self.consensus_tx.send(
+                                                        ConsensusMessage::ManifestApplied {
+                                                            master_key,
+                                                            ephemeral_key: eph_key,
+                                                            old_ephemeral_key: old_eph,
+                                                            revoked,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        }
+
+                                        // Send verified list to consensus
+                                        let _ = self.consensus_tx.send(
+                                            ConsensusMessage::ValidatorListVerified {
+                                                validators: vl_data.validators,
+                                                sequence: seq,
+                                            },
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            "stale validator list seq={} from {}",
+                                            seq, from
+                                        );
+                                    }
+
+                                    // Also send the count for backward compatibility
+                                    let _ = self.consensus_tx.send(
+                                        ConsensusMessage::ValidatorListReceived {
+                                            validator_count: count,
+                                        },
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        "validator list verification failed from {}: {}",
+                                        from, e
+                                    );
+                                    // Fall back to unverified count extraction
+                                    if let Some(blob_b) = vl.blob.as_ref() {
+                                        if let Ok(count) = base64_decode_validator_blob(blob_b) {
+                                            let _ = self.consensus_tx.send(
+                                                ConsensusMessage::ValidatorListReceived {
+                                                    validator_count: count,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // Missing fields, fall back to unverified extraction
+                            if let Some(blob_bytes) = vl.blob.as_ref() {
+                                if let Ok(decoded) = base64_decode_validator_blob(blob_bytes) {
+                                    let _ = self.consensus_tx.send(
+                                        ConsensusMessage::ValidatorListReceived {
+                                            validator_count: decoded,
+                                        },
+                                    );
+                                }
                             }
                         }
                     }

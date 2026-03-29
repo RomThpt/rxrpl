@@ -1,4 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+use rxrpl_primitives::PublicKey;
 
 use crate::types::NodeId;
 
@@ -6,12 +8,22 @@ use crate::types::NodeId;
 ///
 /// Determines which validators count toward consensus quorum.
 /// An empty UNL means solo mode (all proposals accepted).
+///
+/// Also tracks the ephemeral -> master key mapping so that
+/// validations signed by ephemeral keys can be attributed
+/// to the correct trusted validator.
 #[derive(Clone, Debug, Default)]
 pub struct TrustedValidatorList {
-    /// Validators we trust.
+    /// Validators we trust (by NodeId derived from master key).
     trusted: HashSet<NodeId>,
     /// Validators temporarily removed from quorum (e.g., unreliable).
     negative_unl: HashSet<NodeId>,
+    /// Ephemeral NodeId -> master NodeId mapping.
+    /// Populated from verified manifests so that validations signed
+    /// by an ephemeral key can be resolved to a trusted master key.
+    ephemeral_to_master: HashMap<NodeId, NodeId>,
+    /// Master public key bytes (hex) -> NodeId, for reverse lookups.
+    master_keys: HashMap<String, NodeId>,
 }
 
 impl TrustedValidatorList {
@@ -20,6 +32,8 @@ impl TrustedValidatorList {
         Self {
             trusted,
             negative_unl: HashSet::new(),
+            ephemeral_to_master: HashMap::new(),
+            master_keys: HashMap::new(),
         }
     }
 
@@ -29,8 +43,18 @@ impl TrustedValidatorList {
     }
 
     /// Check if a node is trusted (and not in the negative UNL).
+    ///
+    /// Accepts both master NodeIds and ephemeral NodeIds (resolved
+    /// through the manifest mapping).
     pub fn is_trusted(&self, node_id: &NodeId) -> bool {
-        self.trusted.contains(node_id) && !self.negative_unl.contains(node_id)
+        let resolved = self.resolve_to_master(node_id);
+        self.trusted.contains(resolved) && !self.negative_unl.contains(resolved)
+    }
+
+    /// Resolve an ephemeral NodeId to its master NodeId.
+    /// Returns the input unchanged if no mapping exists.
+    pub fn resolve_to_master<'a>(&'a self, node_id: &'a NodeId) -> &'a NodeId {
+        self.ephemeral_to_master.get(node_id).unwrap_or(node_id)
     }
 
     /// Check if the UNL is empty (solo mode).
@@ -63,6 +87,60 @@ impl TrustedValidatorList {
             return 0;
         }
         (size * 80).div_ceil(100)
+    }
+
+    /// Replace the trusted set with validators from a verified validator list.
+    ///
+    /// Each public key is hashed to produce a NodeId.
+    pub fn update_from_validator_keys(&mut self, master_keys: &[PublicKey]) {
+        self.trusted.clear();
+        self.master_keys.clear();
+        for pk in master_keys {
+            let node_id = NodeId::from_public_key(pk.as_bytes());
+            self.trusted.insert(node_id);
+            self.master_keys
+                .insert(hex::encode(pk.as_bytes()), node_id);
+        }
+    }
+
+    /// Register an ephemeral key mapping from a verified manifest.
+    ///
+    /// If `old_ephemeral` is provided, its mapping is removed first.
+    pub fn register_ephemeral_key(
+        &mut self,
+        master_pk: &PublicKey,
+        ephemeral_pk: &PublicKey,
+        old_ephemeral: Option<&PublicKey>,
+    ) {
+        let master_id = NodeId::from_public_key(master_pk.as_bytes());
+        let eph_id = NodeId::from_public_key(ephemeral_pk.as_bytes());
+
+        // Remove old mapping
+        if let Some(old) = old_ephemeral {
+            let old_id = NodeId::from_public_key(old.as_bytes());
+            self.ephemeral_to_master.remove(&old_id);
+        }
+
+        self.ephemeral_to_master.insert(eph_id, master_id);
+    }
+
+    /// Remove an ephemeral key mapping (e.g., on revocation).
+    pub fn remove_ephemeral_key(&mut self, ephemeral_pk: &PublicKey) {
+        let eph_id = NodeId::from_public_key(ephemeral_pk.as_bytes());
+        self.ephemeral_to_master.remove(&eph_id);
+    }
+
+    /// Remove a master key from the trusted set (e.g., on revocation).
+    pub fn revoke_master_key(&mut self, master_pk: &PublicKey) {
+        let node_id = NodeId::from_public_key(master_pk.as_bytes());
+        self.trusted.remove(&node_id);
+        let hex_key = hex::encode(master_pk.as_bytes());
+        self.master_keys.remove(&hex_key);
+    }
+
+    /// Get a reference to the trusted set.
+    pub fn trusted_set(&self) -> &HashSet<NodeId> {
+        &self.trusted
     }
 }
 
@@ -131,5 +209,109 @@ mod tests {
         }
         let unl = TrustedValidatorList::new(trusted);
         assert_eq!(unl.quorum_threshold(), 3);
+    }
+
+    #[test]
+    fn update_from_validator_keys() {
+        let mut unl = TrustedValidatorList::empty();
+        assert!(unl.is_empty());
+
+        let kp1 = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("val1"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let kp2 = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("val2"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+
+        unl.update_from_validator_keys(&[kp1.public_key.clone(), kp2.public_key.clone()]);
+        assert_eq!(unl.effective_size(), 2);
+
+        let id1 = NodeId::from_public_key(kp1.public_key.as_bytes());
+        assert!(unl.is_trusted(&id1));
+    }
+
+    #[test]
+    fn ephemeral_key_resolution() {
+        let mut unl = TrustedValidatorList::empty();
+
+        let master_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("master_eph_test"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let eph_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("ephemeral_eph_test"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+
+        // Add master to trusted
+        unl.update_from_validator_keys(&[master_kp.public_key.clone()]);
+
+        // Register ephemeral mapping
+        unl.register_ephemeral_key(&master_kp.public_key, &eph_kp.public_key, None);
+
+        // Ephemeral ID should resolve to trusted
+        let eph_id = NodeId::from_public_key(eph_kp.public_key.as_bytes());
+        assert!(unl.is_trusted(&eph_id));
+
+        // Resolve explicitly
+        let master_id = NodeId::from_public_key(master_kp.public_key.as_bytes());
+        assert_eq!(unl.resolve_to_master(&eph_id), &master_id);
+    }
+
+    #[test]
+    fn revoke_master_key() {
+        let mut unl = TrustedValidatorList::empty();
+
+        let kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("revoke_test"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+
+        unl.update_from_validator_keys(&[kp.public_key.clone()]);
+        let id = NodeId::from_public_key(kp.public_key.as_bytes());
+        assert!(unl.is_trusted(&id));
+
+        unl.revoke_master_key(&kp.public_key);
+        assert!(!unl.is_trusted(&id));
+    }
+
+    #[test]
+    fn ephemeral_key_rotation() {
+        let mut unl = TrustedValidatorList::empty();
+
+        let master_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("master_rot"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let eph1 = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("eph_rot_1"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let eph2 = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("eph_rot_2"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+
+        unl.update_from_validator_keys(&[master_kp.public_key.clone()]);
+
+        // Register first ephemeral
+        unl.register_ephemeral_key(&master_kp.public_key, &eph1.public_key, None);
+        let eph1_id = NodeId::from_public_key(eph1.public_key.as_bytes());
+        assert!(unl.is_trusted(&eph1_id));
+
+        // Rotate to second ephemeral
+        unl.register_ephemeral_key(
+            &master_kp.public_key,
+            &eph2.public_key,
+            Some(&eph1.public_key),
+        );
+
+        // Old ephemeral no longer resolves
+        assert!(!unl.is_trusted(&eph1_id));
+        // New ephemeral resolves
+        let eph2_id = NodeId::from_public_key(eph2.public_key.as_bytes());
+        assert!(unl.is_trusted(&eph2_id));
     }
 }

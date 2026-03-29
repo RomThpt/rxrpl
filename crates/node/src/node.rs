@@ -1165,6 +1165,30 @@ impl Node {
                                     );
                                 }
                             }
+                            ConsensusMessage::ValidatorListVerified { validators, sequence } => {
+                                tracing::info!(
+                                    "verified validator list seq={} with {} validators",
+                                    sequence, validators.len()
+                                );
+                            }
+                            ConsensusMessage::ManifestApplied {
+                                master_key,
+                                ephemeral_key,
+                                old_ephemeral_key: _,
+                                revoked,
+                            } => {
+                                if revoked {
+                                    tracing::info!(
+                                        "validator {} master key revoked",
+                                        master_key
+                                    );
+                                } else if let Some(ref eph) = ephemeral_key {
+                                    tracing::debug!(
+                                        "manifest applied: master={} ephemeral={}",
+                                        master_key, eph
+                                    );
+                                }
+                            }
                         }
                     }
 

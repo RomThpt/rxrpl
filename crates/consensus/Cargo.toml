@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 rxrpl-primitives = { workspace = true }
 rxrpl-crypto = { workspace = true }
+hex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 rand = { workspace = true }

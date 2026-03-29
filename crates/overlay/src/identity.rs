@@ -224,6 +224,7 @@ mod tests {
             close_time: 1000,
             sign_time: 1000,
             signature: None,
+            amendments: vec![],
         };
 
         // Unsigned validation should fail verification
@@ -250,6 +251,7 @@ mod tests {
             close_time: 1000,
             sign_time: 1000,
             signature: None,
+            amendments: vec![],
         };
 
         id.sign_validation(&mut validation);
@@ -276,6 +278,7 @@ mod tests {
             close_time: 1000,
             sign_time: 1000,
             signature: None,
+            amendments: vec![],
         };
 
         id1.sign_validation(&mut validation);
@@ -301,6 +304,7 @@ mod tests {
             close_time: 1000,
             sign_time: 1000,
             signature: None,
+            amendments: vec![],
         };
 
         assert!(!verify_validation_signature(&validation));
@@ -321,6 +325,7 @@ mod tests {
             close_time: 1000,
             sign_time: 1000,
             signature: None,
+            amendments: vec![],
         };
 
         id.sign_validation(&mut validation);
