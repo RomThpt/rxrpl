@@ -28,6 +28,17 @@ pub async fn dispatch(
     ::metrics::histogram!(metrics::RPC_REQUEST_DURATION_SECONDS, "method" => method.to_string())
         .record(start.elapsed().as_secs_f64());
 
+    if let Err(ref e) = result {
+        let error_type = match e {
+            RpcServerError::MethodNotFound(_) => "method_not_found",
+            RpcServerError::InvalidParams(_) => "invalid_params",
+            RpcServerError::Internal(_) => "internal",
+            RpcServerError::Server(_) => "server",
+            RpcServerError::NoPermission(_) => "no_permission",
+        };
+        metrics::record_rpc_error(method, error_type);
+    }
+
     result
 }
 

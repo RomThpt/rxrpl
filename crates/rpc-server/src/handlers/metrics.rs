@@ -11,6 +11,14 @@ use crate::error::RpcServerError;
 /// `format` parameter is `"prometheus"` (default), returns the raw
 /// Prometheus text exposition format. When `"json"`, returns a
 /// JSON summary of key metrics.
+///
+/// Supported categories in JSON mode:
+/// - ledger: sequence, closed count
+/// - txq: queue size
+/// - peer_reservations: count
+///
+/// For full subsystem metrics (consensus, P2P, SHAMap, nodestore)
+/// use `"format": "prometheus"` or the `/metrics` HTTP endpoint.
 pub async fn metrics(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcServerError> {
     let format = params
         .get("format")
