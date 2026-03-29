@@ -518,6 +518,40 @@ pub fn encode_get_objects_by_hash(
     msg.encode_to_vec()
 }
 
+/// Encode a TMGetObjectByHash response containing found objects.
+///
+/// This builds a response message (query=false) with the requested objects
+/// populated with their data from the local node store.
+pub fn encode_get_objects_response(
+    object_type: i32,
+    ledger_seq: u32,
+    ledger_hash: Option<&Hash256>,
+    objects: Vec<(Hash256, Vec<u8>)>,
+) -> Vec<u8> {
+    use rxrpl_p2p_proto::proto::TmIndexedObject;
+
+    let indexed: Vec<TmIndexedObject> = objects
+        .into_iter()
+        .map(|(hash, data)| TmIndexedObject {
+            hash: Some(hash.as_bytes().to_vec()),
+            node_id: None,
+            index: None,
+            data: Some(data),
+            ledger_seq: Some(ledger_seq),
+        })
+        .collect();
+
+    let msg = TmGetObjectByHash {
+        r#type: Some(object_type),
+        query: Some(false),
+        seq: Some(ledger_seq),
+        ledger_hash: ledger_hash.map(|h| h.as_bytes().to_vec()),
+        fat: Some(false),
+        objects: indexed,
+    };
+    msg.encode_to_vec()
+}
+
 pub fn decode_get_objects(data: &[u8]) -> Result<TmGetObjectByHash, OverlayError> {
     TmGetObjectByHash::decode(data)
         .map_err(|e| OverlayError::Codec(format!("decode GetObjects: {e}")))
@@ -747,5 +781,83 @@ mod tests {
 
         assert_eq!(decoded.hash, hash);
         assert_eq!(decoded.status, 0);
+    }
+
+    #[test]
+    fn get_objects_response_roundtrip() {
+        let ledger_hash = Hash256::new([0xAB; 32]);
+        let h1 = Hash256::new([0x01; 32]);
+        let h2 = Hash256::new([0x02; 32]);
+        let d1 = vec![10, 20, 30];
+        let d2 = vec![40, 50];
+
+        let encoded = encode_get_objects_response(
+            OT_LEDGER_NODE,
+            100,
+            Some(&ledger_hash),
+            vec![(h1, d1.clone()), (h2, d2.clone())],
+        );
+        let decoded = decode_get_objects(&encoded).unwrap();
+
+        assert_eq!(decoded.query, Some(false));
+        assert_eq!(decoded.r#type, Some(OT_LEDGER_NODE));
+        assert_eq!(decoded.seq, Some(100));
+        assert_eq!(
+            decoded.ledger_hash.as_deref().unwrap_or(&[]),
+            ledger_hash.as_bytes()
+        );
+        assert_eq!(decoded.objects.len(), 2);
+        assert_eq!(
+            decoded.objects[0].hash.as_deref().unwrap_or(&[]),
+            h1.as_bytes()
+        );
+        assert_eq!(
+            decoded.objects[0].data.as_deref().unwrap_or(&[]),
+            &d1[..]
+        );
+        assert_eq!(
+            decoded.objects[1].hash.as_deref().unwrap_or(&[]),
+            h2.as_bytes()
+        );
+        assert_eq!(
+            decoded.objects[1].data.as_deref().unwrap_or(&[]),
+            &d2[..]
+        );
+    }
+
+    #[test]
+    fn get_objects_response_empty() {
+        let encoded = encode_get_objects_response(OT_LEDGER_NODE, 50, None, vec![]);
+        let decoded = decode_get_objects(&encoded).unwrap();
+
+        assert_eq!(decoded.query, Some(false));
+        assert_eq!(decoded.seq, Some(50));
+        assert!(decoded.objects.is_empty());
+    }
+
+    #[test]
+    fn get_objects_request_response_interop() {
+        // Encode a request
+        let ledger_hash = Hash256::new([0xCC; 32]);
+        let hashes = vec![Hash256::new([0x11; 32]), Hash256::new([0x22; 32])];
+        let request = encode_get_objects_by_hash(&ledger_hash, 42, &hashes, false);
+        let decoded_req = decode_get_objects(&request).unwrap();
+
+        assert_eq!(decoded_req.query, Some(true));
+        assert_eq!(decoded_req.seq, Some(42));
+        assert_eq!(decoded_req.objects.len(), 2);
+
+        // Encode a response with found data
+        let response = encode_get_objects_response(
+            decoded_req.r#type.unwrap_or(0),
+            decoded_req.seq.unwrap_or(0),
+            Some(&ledger_hash),
+            vec![(Hash256::new([0x11; 32]), vec![1, 2, 3])],
+        );
+        let decoded_resp = decode_get_objects(&response).unwrap();
+
+        assert_eq!(decoded_resp.query, Some(false));
+        assert_eq!(decoded_resp.objects.len(), 1);
+        assert!(decoded_resp.objects[0].data.is_some());
     }
 }

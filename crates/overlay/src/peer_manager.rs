@@ -869,11 +869,7 @@ impl PeerManager {
                                 }
                             }
                         } else {
-                            tracing::debug!(
-                                "GetObjectByHash query from {} ({} objects requested)",
-                                from, msg.objects.len()
-                            );
-                            // TODO: serve requested objects from our store
+                            self.handle_get_objects_query(from, msg);
                         }
                     }
                     Err(e) => {
@@ -1076,6 +1072,111 @@ impl PeerManager {
             "sent GetLedger seq={} delta ({} node_ids across {} peers, depth={}-{})",
             seq, num_ids, peers_used, min_depth, max_depth
         );
+    }
+
+    /// Handle a TMGetObjectByHash query from a peer.
+    ///
+    /// Looks up each requested hash in the local node store and sends back a
+    /// response containing the found objects. Caps the number of objects per
+    /// response to avoid excessive bandwidth usage (matching rippled's limit
+    /// of 16384 objects per response and 256 KB total payload size).
+    fn handle_get_objects_query(
+        &self,
+        from: Hash256,
+        msg: rxrpl_p2p_proto::proto::TmGetObjectByHash,
+    ) {
+        /// Maximum number of objects to serve in a single response.
+        const MAX_OBJECTS: usize = 16_384;
+        /// Maximum total payload size for response objects (256 KB).
+        const MAX_RESPONSE_SIZE: usize = 256 * 1024;
+
+        let requested = msg.objects.len();
+        tracing::debug!(
+            "GetObjectByHash query from {} ({} objects requested)",
+            from, requested
+        );
+
+        let store = match &self.node_store {
+            Some(s) => s,
+            None => {
+                tracing::debug!(
+                    "GetObjectByHash from {} but no node store configured",
+                    from
+                );
+                return;
+            }
+        };
+
+        let object_type = msg.r#type.unwrap_or(0);
+        let ledger_seq = msg.seq.unwrap_or(0);
+        let ledger_hash_bytes = msg.ledger_hash.as_deref().unwrap_or(&[]);
+        let ledger_hash = if ledger_hash_bytes.len() >= 32 {
+            let arr: [u8; 32] = ledger_hash_bytes[..32].try_into().unwrap_or([0u8; 32]);
+            Some(Hash256::new(arr))
+        } else {
+            None
+        };
+
+        let limit = requested.min(MAX_OBJECTS);
+        let mut found = Vec::new();
+        let mut total_size = 0usize;
+
+        for obj in msg.objects.iter().take(limit) {
+            let hash_bytes = match &obj.hash {
+                Some(h) if h.len() >= 32 => h,
+                _ => continue,
+            };
+            let arr: [u8; 32] = match hash_bytes[..32].try_into() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let hash = Hash256::new(arr);
+
+            match store.fetch(&hash) {
+                Ok(Some(data)) => {
+                    let entry_size = 32 + data.len();
+                    if total_size + entry_size > MAX_RESPONSE_SIZE {
+                        break;
+                    }
+                    found.push((hash, data));
+                    total_size += entry_size;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::trace!(
+                        "GetObjectByHash: store fetch error for {}: {}",
+                        hash, e
+                    );
+                }
+            }
+        }
+
+        if found.is_empty() {
+            tracing::debug!(
+                "GetObjectByHash from {}: none of {} requested objects found",
+                from, requested
+            );
+            return;
+        }
+
+        let response = proto_convert::encode_get_objects_response(
+            object_type,
+            ledger_seq,
+            ledger_hash.as_ref(),
+            found.clone(),
+        );
+
+        tracing::debug!(
+            "GetObjectByHash response to {}: {} of {} objects ({} bytes)",
+            from, found.len(), requested, response.len()
+        );
+
+        if let Some(handle) = self.peer_handles.get(&from) {
+            let _ = handle.tx.try_send(PeerMessage {
+                msg_type: MessageType::GetObjects,
+                payload: response,
+            });
+        }
     }
 
     /// Send TMGetObjectByHash requests to fetch missing nodes by content hash.
