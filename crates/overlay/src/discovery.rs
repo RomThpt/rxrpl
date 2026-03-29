@@ -148,6 +148,7 @@ mod tests {
             ledger_seq: std::sync::atomic::AtomicU32::new(0),
             reputation: crate::reputation::PeerReputation::new(),
             scoring: crate::peer_score::PeerScore::new(),
+            rate_limiter: crate::rate_limiter::PeerRateLimiter::default(),
         });
         peer_set.add(info);
 

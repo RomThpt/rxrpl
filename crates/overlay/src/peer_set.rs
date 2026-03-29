@@ -4,6 +4,7 @@ use dashmap::DashMap;
 use rxrpl_primitives::Hash256;
 
 use crate::peer_score::PeerScore;
+use crate::rate_limiter::PeerRateLimiter;
 use crate::reputation::PeerReputation;
 
 /// Thread-safe collection of connected peers.
@@ -27,6 +28,8 @@ pub struct PeerInfo {
     pub reputation: PeerReputation,
     /// Scoring metrics for peer selection.
     pub scoring: PeerScore,
+    /// Per-peer message rate limiter.
+    pub rate_limiter: PeerRateLimiter,
 }
 
 impl PeerSet {
@@ -169,6 +172,7 @@ mod tests {
             ledger_seq: std::sync::atomic::AtomicU32::new(0),
             reputation: PeerReputation::new(),
             scoring: PeerScore::new(),
+            rate_limiter: PeerRateLimiter::default(),
         })
     }
 

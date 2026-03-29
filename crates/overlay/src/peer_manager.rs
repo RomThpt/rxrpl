@@ -12,7 +12,7 @@ use rxrpl_p2p_proto::MessageType;
 use rxrpl_p2p_proto::codec::{PeerCodec, PeerMessage};
 use rxrpl_primitives::Hash256;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Notify, RwLock, mpsc};
 use tokio_util::codec::Framed;
 
 use crate::cluster::ClusterManager;
@@ -32,6 +32,8 @@ use crate::peer_set::{PeerInfo, PeerSet};
 use crate::proto_convert;
 use crate::relay::RelayFilter;
 use crate::reputation::PeerReputation;
+use crate::squelch::SquelchManager;
+use crate::tx_batch_relay::TxBatchRelay;
 use crate::validator_list::{self, ValidatorListTracker};
 use crate::tls::{self, PeerStream};
 
@@ -135,6 +137,16 @@ pub struct PeerManager {
     manifest_store: ManifestStore,
     vl_tracker: ValidatorListTracker,
     cluster_manager: ClusterManager,
+    squelch_manager: SquelchManager,
+    tx_batch_relay: TxBatchRelay,
+    /// Notifiers for fixed peer reconnection, keyed by address.
+    /// When a fixed peer disconnects, its notifier is triggered so
+    /// the reconnection task wakes up immediately instead of polling.
+    fixed_peer_notifiers: HashMap<String, Arc<Notify>>,
+    /// Maps node_id -> fixed peer address for connected fixed peers.
+    fixed_peer_node_ids: HashMap<Hash256, String>,
+    /// Signalled on shutdown to cancel pending reconnection tasks.
+    shutdown_notify: Arc<Notify>,
 }
 
 impl PeerManager {
@@ -185,6 +197,11 @@ impl PeerManager {
             manifest_store: ManifestStore::new(),
             vl_tracker: ValidatorListTracker::new(),
             cluster_manager,
+            squelch_manager: SquelchManager::new(),
+            tx_batch_relay: TxBatchRelay::new(),
+            fixed_peer_notifiers: HashMap::new(),
+            fixed_peer_node_ids: HashMap::new(),
+            shutdown_notify: Arc::new(Notify::new()),
         };
 
         (mgr, cmd_tx, consensus_rx)
@@ -228,8 +245,9 @@ impl PeerManager {
         tracing::info!("P2P listening on {}", bind_addr);
 
         // Spawn fixed peer connectors with retry
-        for addr in &self.config.fixed_peers {
-            self.spawn_fixed_peer_connector(addr.clone());
+        let fixed_peers = self.config.fixed_peers.clone();
+        for addr in fixed_peers {
+            self.spawn_fixed_peer_connector(addr);
         }
 
         // Create and launch peer discovery using seeds + fixed_peers
@@ -279,6 +297,9 @@ impl PeerManager {
             tokio::time::interval(Duration::from_secs(cluster_interval_secs));
         cluster_interval.tick().await; // skip first immediate tick
 
+        let mut batch_relay_interval = tokio::time::interval(Duration::from_millis(250));
+        batch_relay_interval.tick().await; // skip first immediate tick
+
         loop {
             tokio::select! {
                 accept_result = listener.accept() => {
@@ -308,6 +329,7 @@ impl PeerManager {
                 _ = reputation_interval.tick() => {
                     self.peer_set.apply_score_decay();
                     self.check_peer_reputations();
+                    self.squelch_manager.expire_stale_entries();
                 }
 
                 _ = cluster_interval.tick() => {
@@ -319,11 +341,15 @@ impl PeerManager {
                         }
                     }
                 }
+
+                _ = batch_relay_interval.tick() => {
+                    self.flush_batch_relay();
+                }
             }
         }
     }
 
-    fn spawn_fixed_peer_connector(&self, addr: String) {
+    fn spawn_fixed_peer_connector(&mut self, addr: String) {
         let identity = Arc::clone(&self.identity);
         let network_id = self.config.network_id;
         let ledger_seq = Arc::clone(&self.ledger_seq);
@@ -331,10 +357,14 @@ impl PeerManager {
         let event_tx = self.event_tx.clone();
         let peer_set = Arc::clone(&self.peer_set);
         let tls_client = Arc::clone(&self.config.tls_client);
+        let disconnect_notify = Arc::new(Notify::new());
+        let shutdown_notify = Arc::clone(&self.shutdown_notify);
+
+        self.fixed_peer_notifiers
+            .insert(addr.clone(), Arc::clone(&disconnect_notify));
 
         tokio::spawn(async move {
-            let mut backoff = Duration::from_secs(1);
-            let max_backoff = Duration::from_secs(30);
+            let mut backoff = ReconnectBackoff::new();
 
             loop {
                 match try_connect_outbound(
@@ -351,14 +381,21 @@ impl PeerManager {
                 {
                     Ok(node_id) => {
                         tracing::info!("connected to fixed peer {} ({})", addr, node_id);
-                        backoff = Duration::from_secs(1);
-                        // Wait for disconnect before retrying.
-                        // The peer_loop will send Disconnected, and we reconnect on next iteration.
-                        loop {
-                            // Check periodically if we're still connected
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            if peer_set.get(&node_id).is_none() {
-                                break;
+                        backoff.reset();
+                        // Wait for disconnect notification or shutdown.
+                        tokio::select! {
+                            _ = disconnect_notify.notified() => {
+                                tracing::info!(
+                                    "fixed peer {} ({}) disconnected, scheduling reconnect",
+                                    addr, node_id,
+                                );
+                            }
+                            _ = shutdown_notify.notified() => {
+                                tracing::info!(
+                                    "shutting down fixed peer connector for {}",
+                                    addr,
+                                );
+                                return;
                             }
                         }
                     }
@@ -366,8 +403,22 @@ impl PeerManager {
                         tracing::warn!("failed to connect to {}: {}", addr, e);
                     }
                 }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(max_backoff);
+
+                let delay = backoff.next_delay();
+                tracing::debug!(
+                    "reconnecting to fixed peer {} in {:?} (attempt {})",
+                    addr, delay, backoff.attempt(),
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = shutdown_notify.notified() => {
+                        tracing::info!(
+                            "shutting down fixed peer connector for {}",
+                            addr,
+                        );
+                        return;
+                    }
+                }
             }
         });
     }
@@ -466,6 +517,11 @@ impl PeerManager {
                         "event": "connected",
                     }));
                 }
+                // Track fixed peer node_id -> address mapping for disconnect notification.
+                if self.fixed_peer_notifiers.contains_key(&info.address) {
+                    self.fixed_peer_node_ids
+                        .insert(node_id, info.address.clone());
+                }
                 self.peer_handles.insert(
                     node_id,
                     PeerHandle {
@@ -493,6 +549,13 @@ impl PeerManager {
                 }
                 self.peer_handles.remove(&node_id);
                 self.peer_set.remove(&node_id);
+                self.squelch_manager.remove_peer(&node_id);
+                // Notify the fixed peer reconnector if this was a fixed peer.
+                if let Some(addr) = self.fixed_peer_node_ids.remove(&node_id) {
+                    if let Some(notifier) = self.fixed_peer_notifiers.get(&addr) {
+                        notifier.notify_one();
+                    }
+                }
             }
         }
     }
@@ -500,6 +563,36 @@ impl PeerManager {
     fn dispatch_message(&mut self, from: Hash256, msg_type: MessageType, payload: &[u8]) {
         let peer_info = self.peer_set.get(&from);
         let payload_len = payload.len() as u64;
+
+        // Apply per-peer rate limiting before processing.
+        if let Some(ref info) = peer_info {
+            let result = info.rate_limiter.check(msg_type);
+            match result {
+                crate::rate_limiter::RateLimitResult::Allowed => {}
+                crate::rate_limiter::RateLimitResult::Dropped => {
+                    tracing::warn!(
+                        "rate-limited {:?} from peer {} (consecutive drops: {})",
+                        msg_type, from, info.rate_limiter.consecutive_drops()
+                    );
+                    info.reputation
+                        .apply_penalty(-crate::rate_limiter::PeerRateLimiter::penalty());
+                    return;
+                }
+                crate::rate_limiter::RateLimitResult::Disconnect => {
+                    tracing::warn!(
+                        "disconnecting peer {} due to sustained rate-limit abuse",
+                        from
+                    );
+                    info.reputation.record_violation();
+                }
+            }
+            if result == crate::rate_limiter::RateLimitResult::Disconnect {
+                drop(peer_info);
+                self.peer_handles.remove(&from);
+                self.peer_set.remove(&from);
+                return;
+            }
+        }
 
         match msg_type {
             MessageType::Hello => {
@@ -535,6 +628,9 @@ impl PeerManager {
                         if let Some(ref info) = peer_info {
                             info.reputation.record_valid_message(payload_len);
                         }
+                        // Register in batch relay so it can be served via
+                        // TMHaveTransactions/TMTransactions protocol.
+                        self.tx_batch_relay.add_known_tx(tx_hash, tx_data.clone());
                         if self.relay_filter.should_relay(&tx_hash) {
                             let _ = self.consensus_tx.send(ConsensusMessage::Transaction {
                                 hash: tx_hash,
@@ -589,6 +685,16 @@ impl PeerManager {
                             if let Some(ref info) = peer_info {
                                 info.reputation.record_valid_message(payload_len);
                             }
+
+                            // Track which peer is relaying this validator's messages
+                            // and send squelch to redundant sources.
+                            if let Some(action) = self.squelch_manager.record_validation_source(
+                                from,
+                                &validation.public_key,
+                            ) {
+                                self.send_squelch_to_peers(&action);
+                            }
+
                             if let Some(ref tx) = self.server_event_tx {
                                 let _ = tx.send(serde_json::json!({
                                     "type": "validationReceived",
@@ -598,6 +704,22 @@ impl PeerManager {
                                     "full": validation.full,
                                 }));
                             }
+
+                            // Relay validation to peers, respecting inbound squelch.
+                            for (id, handle) in &self.peer_handles {
+                                if *id != from
+                                    && !self.squelch_manager.is_relay_squelched(
+                                        id,
+                                        &validation.public_key,
+                                    )
+                                {
+                                    let _ = handle.tx.try_send(PeerMessage {
+                                        msg_type: MessageType::Validation,
+                                        payload: payload.to_vec(),
+                                    });
+                                }
+                            }
+
                             let _ = self
                                 .consensus_tx
                                 .send(ConsensusMessage::Validation(validation));
@@ -1148,27 +1270,182 @@ impl PeerManager {
                 }
             }
             MessageType::Squelch => {
-                if let Some(ref info) = peer_info {
-                    info.reputation.record_valid_message(payload_len);
+                match proto_convert::decode_squelch(payload) {
+                    Ok(msg) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                        }
+                        let squelch_flag = msg.squelch.unwrap_or(true);
+                        let validator_key = msg.validator_pub_key.unwrap_or_default();
+                        let duration = msg.squelch_duration.unwrap_or(300);
+                        if !validator_key.is_empty() {
+                            self.squelch_manager.handle_inbound_squelch(
+                                from,
+                                &validator_key,
+                                squelch_flag,
+                                duration,
+                            );
+                        }
+                        tracing::debug!(
+                            "Squelch from {}: squelch={}, duration={}s",
+                            from, squelch_flag, duration,
+                        );
+                    }
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
+                    }
                 }
-                tracing::trace!("Squelch from {}", from);
             }
             MessageType::HaveTransactions => {
-                if let Some(ref info) = peer_info {
-                    info.reputation.record_valid_message(payload_len);
+                match proto_convert::decode_have_transactions(payload) {
+                    Ok(hash_list) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                        }
+                        tracing::debug!(
+                            "HaveTransactions from {} with {} hashes",
+                            from,
+                            hash_list.len(),
+                        );
+
+                        // Separate hashes into those we can serve and those we need.
+                        let mut can_serve: Vec<(Hash256, Vec<u8>)> = Vec::new();
+                        let mut need_hashes: Vec<Vec<u8>> = Vec::new();
+
+                        for raw_hash in &hash_list {
+                            if raw_hash.len() != 32 {
+                                continue;
+                            }
+                            let arr: [u8; 32] = match raw_hash[..32].try_into() {
+                                Ok(a) => a,
+                                Err(_) => continue,
+                            };
+                            let hash = Hash256::new(arr);
+
+                            if let Some(data) = self.tx_batch_relay.get_tx_data(&hash) {
+                                // We have this tx: the peer is requesting it from us.
+                                can_serve.push((hash, data));
+                            } else {
+                                // We don't have it: collect for requesting.
+                                need_hashes.push(raw_hash.clone());
+                            }
+                        }
+
+                        // Respond with TMTransactions for hashes we can serve.
+                        if !can_serve.is_empty() {
+                            let response_payload =
+                                crate::tx_batch_relay::encode_transactions_batch(&can_serve);
+                            if let Some(handle) = self.peer_handles.get(&from) {
+                                let _ = handle.tx.try_send(PeerMessage {
+                                    msg_type: MessageType::Transactions,
+                                    payload: response_payload,
+                                });
+                            }
+                        }
+
+                        // Request the ones we are missing.
+                        let missing =
+                            self.tx_batch_relay.process_have_transactions(&need_hashes);
+                        if !missing.is_empty() {
+                            let request_payload =
+                                crate::tx_batch_relay::encode_have_transactions(&missing);
+                            if let Some(handle) = self.peer_handles.get(&from) {
+                                let _ = handle.tx.try_send(PeerMessage {
+                                    msg_type: MessageType::HaveTransactions,
+                                    payload: request_payload,
+                                });
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
+                    }
                 }
-                tracing::trace!("HaveTransactions from {}", from);
             }
             MessageType::Transactions => {
-                if let Some(ref info) = peer_info {
-                    info.reputation.record_valid_message(payload_len);
+                match proto_convert::decode_transactions(payload) {
+                    Ok(batch) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                        }
+                        let new_txs =
+                            self.tx_batch_relay.process_transactions_batch(&batch.transactions);
+                        tracing::debug!(
+                            "Transactions batch from {} with {} txs ({} new)",
+                            from,
+                            batch.transactions.len(),
+                            new_txs.len(),
+                        );
+                        // Forward each new transaction to the consensus layer
+                        for (tx_hash, tx_data) in &new_txs {
+                            if self.relay_filter.should_relay(tx_hash) {
+                                let _ =
+                                    self.consensus_tx.send(ConsensusMessage::Transaction {
+                                        hash: *tx_hash,
+                                        data: tx_data.clone(),
+                                    });
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
+                    }
                 }
-                tracing::trace!("Transactions batch from {}", from);
             }
         }
     }
 
     /// Check for ledger gaps and request missing ledgers from peers.
+    /// Flush accumulated transaction hashes as a TMHaveTransactions broadcast.
+    ///
+    /// Called periodically (every 250ms) to batch-announce new transactions
+    /// to all connected peers instead of relaying each one individually.
+    fn flush_batch_relay(&mut self) {
+        let batch = self.tx_batch_relay.drain_outbound_queue();
+        if batch.is_empty() {
+            return;
+        }
+
+        let payload = crate::tx_batch_relay::encode_have_transactions(&batch);
+        tracing::debug!("broadcasting HaveTransactions with {} hashes", batch.len());
+
+        for handle in self.peer_handles.values() {
+            let _ = handle.tx.try_send(PeerMessage {
+                msg_type: MessageType::HaveTransactions,
+                payload: payload.clone(),
+            });
+        }
+    }
+
+    /// Send squelch messages to the specified peers for a given validator.
+    fn send_squelch_to_peers(&self, action: &crate::squelch::SquelchAction) {
+        let payload = proto_convert::encode_squelch(
+            &action.validator_key,
+            true,
+            action.duration_secs,
+        );
+        for peer_id in &action.squelch_peers {
+            if let Some(handle) = self.peer_handles.get(peer_id) {
+                let _ = handle.tx.try_send(PeerMessage {
+                    msg_type: MessageType::Squelch,
+                    payload: payload.clone(),
+                });
+                tracing::debug!(
+                    "sent squelch to {} for validator {} ({}s)",
+                    peer_id,
+                    hex::encode(&action.validator_key),
+                    action.duration_secs,
+                );
+            }
+        }
+    }
+
     fn check_sync(&mut self) {
         let our_seq = self.ledger_seq.load(Ordering::Relaxed);
 
@@ -1883,6 +2160,7 @@ async fn try_connect_outbound(
         ledger_seq: AtomicU32::new(0),
         reputation: PeerReputation::new(),
         scoring: PeerScore::new(),
+        rate_limiter: crate::rate_limiter::PeerRateLimiter::default(),
     });
 
     if !peer_set.add(Arc::clone(&info)) {
@@ -1933,6 +2211,7 @@ async fn try_accept_inbound(
         ledger_seq: AtomicU32::new(0),
         reputation: PeerReputation::new(),
         scoring: PeerScore::new(),
+        rate_limiter: crate::rate_limiter::PeerRateLimiter::default(),
     });
 
     if !peer_set.add(Arc::clone(&info)) {
@@ -1976,6 +2255,46 @@ fn base64_decode_validator_blob(blob_bytes: &[u8]) -> Result<usize, ()> {
     let json: serde_json::Value = serde_json::from_slice(&decoded).map_err(|_| ())?;
     let validators = json.get("validators").and_then(|v| v.as_array()).ok_or(())?;
     Ok(validators.len())
+}
+
+/// Exponential backoff state for fixed peer reconnection.
+///
+/// Starts at 1 second and doubles on each failed attempt, capping at 30 seconds.
+/// Resets to 1 second after a successful connection.
+struct ReconnectBackoff {
+    current: Duration,
+    attempts: u32,
+}
+
+const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+impl ReconnectBackoff {
+    fn new() -> Self {
+        Self {
+            current: BACKOFF_INITIAL,
+            attempts: 0,
+        }
+    }
+
+    /// Return the next delay and advance the backoff state.
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.current;
+        self.attempts += 1;
+        self.current = (self.current * 2).min(BACKOFF_MAX);
+        delay
+    }
+
+    /// Reset backoff after a successful connection.
+    fn reset(&mut self) {
+        self.current = BACKOFF_INITIAL;
+        self.attempts = 0;
+    }
+
+    /// Number of reconnection attempts since last reset.
+    fn attempt(&self) -> u32 {
+        self.attempts
+    }
 }
 
 #[cfg(test)]
@@ -2028,5 +2347,49 @@ mod tests {
         let count = 1usize;
         let quorum = (count as f64 * 0.8).ceil() as usize;
         assert_eq!(quorum, 1);
+    }
+
+    #[test]
+    fn backoff_exponential_increase() {
+        let mut b = ReconnectBackoff::new();
+        assert_eq!(b.next_delay(), Duration::from_secs(1));
+        assert_eq!(b.next_delay(), Duration::from_secs(2));
+        assert_eq!(b.next_delay(), Duration::from_secs(4));
+        assert_eq!(b.next_delay(), Duration::from_secs(8));
+        assert_eq!(b.next_delay(), Duration::from_secs(16));
+    }
+
+    #[test]
+    fn backoff_caps_at_max() {
+        let mut b = ReconnectBackoff::new();
+        // 1, 2, 4, 8, 16, 30, 30, ...
+        for _ in 0..5 {
+            b.next_delay();
+        }
+        assert_eq!(b.next_delay(), Duration::from_secs(30));
+        assert_eq!(b.next_delay(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn backoff_reset_restores_initial() {
+        let mut b = ReconnectBackoff::new();
+        b.next_delay();
+        b.next_delay();
+        b.next_delay();
+        assert_eq!(b.attempt(), 3);
+
+        b.reset();
+        assert_eq!(b.attempt(), 0);
+        assert_eq!(b.next_delay(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn backoff_attempt_counter() {
+        let mut b = ReconnectBackoff::new();
+        assert_eq!(b.attempt(), 0);
+        b.next_delay();
+        assert_eq!(b.attempt(), 1);
+        b.next_delay();
+        assert_eq!(b.attempt(), 2);
     }
 }
