@@ -12,6 +12,7 @@ pub mod error;
 pub mod params;
 pub mod phase;
 pub mod simulator;
+pub mod timer;
 pub mod types;
 pub mod unl;
 
@@ -20,5 +21,6 @@ pub use engine::ConsensusEngine;
 pub use error::ConsensusError;
 pub use params::ConsensusParams;
 pub use phase::ConsensusPhase;
+pub use timer::{ConsensusTimer, TimerAction};
 pub use types::{DisputedTx, NodeId, Proposal, TxSet, Validation};
 pub use unl::TrustedValidatorList;

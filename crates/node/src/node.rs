@@ -7,7 +7,10 @@ use std::time::Duration;
 use rxrpl_amendment::{AmendmentTable, FeatureRegistry, Rules};
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_config::NodeConfig;
-use rxrpl_consensus::{ConsensusEngine, ConsensusParams, NodeId, TrustedValidatorList, TxSet};
+use rxrpl_consensus::{
+    ConsensusEngine, ConsensusParams, ConsensusTimer, NodeId, TimerAction, TrustedValidatorList,
+    TxSet,
+};
 use rxrpl_ledger::Ledger;
 use rxrpl_overlay::{
     ConsensusMessage, LedgerProvider, NetworkConsensusAdapter, NodeIdentity, OverlayCommand,
@@ -726,20 +729,17 @@ impl Node {
         let tx_queue = Arc::clone(&self.tx_queue);
         let node_store = self.node_store.clone();
         let tx_store = self.tx_store.as_ref().map(Arc::clone);
-        let interval_duration = Duration::from_secs(close_interval_secs);
         let ledger_seq_shared = Arc::clone(&ledger_seq);
         let ledger_hash_shared = Arc::clone(&ledger_hash);
         let configured_quorum = self.config.validators.quorum;
 
         tokio::spawn(async move {
             let node_id = NodeId(identity.node_id);
+            let consensus_params = ConsensusParams::default();
+            let mut timer = ConsensusTimer::new(&consensus_params);
             let mut consensus =
-                ConsensusEngine::new_with_unl(adapter, node_id, identity.public_key_bytes().to_vec(), ConsensusParams::default(), unl);
+                ConsensusEngine::new_with_unl(adapter, node_id, identity.public_key_bytes().to_vec(), consensus_params, unl);
 
-            let mut close_interval = tokio::time::interval(interval_duration);
-            let converge_duration = Duration::from_millis(1250);
-            let mut converge_interval = tokio::time::interval(converge_duration);
-            let mut establishing = false;
             let mut syncing = false;
             let mut max_peer_seq: u32 = 0;
             let mut pending_close_time = 0u32;
@@ -754,76 +754,106 @@ impl Node {
             let mut sync_started_at: Option<tokio::time::Instant> = None;
             let mut last_sync_seq: u32 = 0;
 
-            close_interval.tick().await; // skip first immediate tick
-            converge_interval.tick().await;
             sync_check_interval.tick().await;
+
+            // Consensus timer tick interval: poll frequently so the timer
+            // can drive phase transitions precisely.
+            let tick_duration = Duration::from_millis(100);
+            let mut tick_interval = tokio::time::interval(tick_duration);
+            tick_interval.tick().await; // skip first immediate tick
 
             loop {
                 tokio::select! {
-                    _ = close_interval.tick(), if !establishing && !syncing => {
-                        let close_time = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs() as u32;
+                    _ = tick_interval.tick(), if !syncing => {
+                        if let Some(action) = timer.tick() {
+                            match action {
+                                TimerAction::CloseLedger => {
+                                    let close_time = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs() as u32;
 
-                        let l = ledger.read().await;
-                        let prev_hash = l.header.parent_hash;
-                        let seq = l.header.sequence;
+                                    let l = ledger.read().await;
+                                    let prev_hash = l.header.parent_hash;
+                                    let seq = l.header.sequence;
 
-                        let mut tx_hashes = Vec::new();
-                        l.tx_map.for_each(&mut |tx_hash, _data| {
-                            tx_hashes.push(*tx_hash);
-                        });
-                        drop(l);
+                                    let mut tx_hashes = Vec::new();
+                                    l.tx_map.for_each(&mut |tx_hash, _data| {
+                                        tx_hashes.push(*tx_hash);
+                                    });
+                                    drop(l);
 
-                        let tx_set = TxSet::new(tx_hashes);
+                                    let tx_set = TxSet::new(tx_hashes);
 
-                        consensus.start_round(prev_hash, seq);
-                        if let Err(e) = consensus.close_ledger(tx_set, close_time, seq) {
-                            tracing::error!("consensus close_ledger failed: {}", e);
-                            continue;
-                        }
+                                    consensus.start_round(prev_hash, seq);
+                                    if let Err(e) = consensus.close_ledger(tx_set, close_time, seq) {
+                                        tracing::error!("consensus close_ledger failed: {}", e);
+                                        continue;
+                                    }
 
-                        pending_close_time = close_time;
+                                    pending_close_time = close_time;
+                                    timer.on_phase_change(consensus.phase());
 
-                        let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
-                            phase: "open".into(),
-                        });
+                                    let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
+                                        phase: "open".into(),
+                                    });
 
-                        // Try immediate convergence (solo mode or instant agreement)
-                        if consensus.converge() {
-                            let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
-                                phase: "accepted".into(),
-                            });
-                            Self::close_consensus_round(
-                                &consensus, pending_close_time, &ledger,
-                                &closed_ledgers, &tx_store, &event_tx,
-                                &ledger_seq_shared, &ledger_hash_shared,
-                                &tx_queue, &identity, &cmd_tx_catchup,
-                            ).await;
-                            close_interval.reset();
-                        } else {
-                            let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
-                                phase: "establish".into(),
-                            });
-                            establishing = true;
-                            converge_interval.reset();
-                        }
-                    }
-
-                    _ = converge_interval.tick(), if establishing && !syncing => {
-                        if consensus.converge() {
-                            let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
-                                phase: "accepted".into(),
-                            });
-                            Self::close_consensus_round(
-                                &consensus, pending_close_time, &ledger,
-                                &closed_ledgers, &tx_store, &event_tx,
-                                &ledger_seq_shared, &ledger_hash_shared,
-                                &tx_queue, &identity, &cmd_tx_catchup,
-                            ).await;
-                            establishing = false;
-                            close_interval.reset();
+                                    // Try immediate convergence (solo mode or instant agreement)
+                                    if consensus.converge() {
+                                        timer.on_phase_change(consensus.phase());
+                                        let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
+                                            phase: "accepted".into(),
+                                        });
+                                        Self::close_consensus_round(
+                                            &consensus, pending_close_time, &ledger,
+                                            &closed_ledgers, &tx_store, &event_tx,
+                                            &ledger_seq_shared, &ledger_hash_shared,
+                                            &tx_queue, &identity, &cmd_tx_catchup,
+                                        ).await;
+                                        // Start new open phase
+                                        timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
+                                    } else {
+                                        let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
+                                            phase: "establish".into(),
+                                        });
+                                    }
+                                }
+                                TimerAction::Converge => {
+                                    if consensus.converge() {
+                                        timer.on_phase_change(consensus.phase());
+                                        let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
+                                            phase: "accepted".into(),
+                                        });
+                                        Self::close_consensus_round(
+                                            &consensus, pending_close_time, &ledger,
+                                            &closed_ledgers, &tx_store, &event_tx,
+                                            &ledger_seq_shared, &ledger_hash_shared,
+                                            &tx_queue, &identity, &cmd_tx_catchup,
+                                        ).await;
+                                        // Start new open phase
+                                        timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
+                                    }
+                                }
+                                TimerAction::StallAbort => {
+                                    tracing::warn!(
+                                        "consensus stalled in {:?} phase, aborting round",
+                                        consensus.phase()
+                                    );
+                                    // Force-accept by exhausting convergence rounds
+                                    while !consensus.converge() {}
+                                    timer.on_phase_change(consensus.phase());
+                                    let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
+                                        phase: "accepted".into(),
+                                    });
+                                    Self::close_consensus_round(
+                                        &consensus, pending_close_time, &ledger,
+                                        &closed_ledgers, &tx_store, &event_tx,
+                                        &ledger_seq_shared, &ledger_hash_shared,
+                                        &tx_queue, &identity, &cmd_tx_catchup,
+                                    ).await;
+                                    timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
+                                }
+                            }
                         }
                     }
 
@@ -867,7 +897,7 @@ impl Node {
                                                 validated.seq, our_seq, validated.seq
                                             );
                                             syncing = true;
-                                            establishing = false;
+                                            timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
                                             sync_started_at = Some(tokio::time::Instant::now());
                                             last_sync_seq = our_seq;
                                             // Request the network's validated ledger directly
@@ -960,7 +990,7 @@ impl Node {
                                             from, peer_seq - our_seq, peer_seq
                                         );
                                         syncing = true;
-                                        establishing = false;
+                                        timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
                                         sync_started_at = Some(tokio::time::Instant::now());
                                         last_sync_seq = our_seq;
                                     }
@@ -1018,7 +1048,7 @@ impl Node {
                                                 } else {
                                                     syncing = false;
                                                     sync_started_at = None;
-                                                    close_interval.reset();
+                                                    timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
                                                     // Clear expired transactions accumulated during sync
                                                     tx_queue.write().await.remove_expired(new_seq);
                                                     tracing::info!(
