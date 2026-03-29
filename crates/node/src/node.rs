@@ -581,6 +581,10 @@ impl Node {
             network_id: self.config.network.network_id,
             tls_server,
             tls_client,
+            cluster_enabled: self.config.cluster.enabled,
+            cluster_node_name: self.config.cluster.node_name.clone().unwrap_or_default(),
+            cluster_members: self.config.cluster.members.clone(),
+            cluster_broadcast_interval_secs: self.config.cluster.broadcast_interval_secs,
         };
         let (mut peer_mgr, cmd_tx, mut consensus_rx) = PeerManager::new(
             Arc::clone(&identity),
@@ -804,6 +808,11 @@ impl Node {
             let mut amendment_votes: Vec<Vec<Hash256>> = Vec::new();
             let mut trusted_validator_count: usize = 0;
 
+            // Cooldown for wrong-prev-ledger recovery to prevent flip-flopping.
+            // At most one switch per 10 seconds.
+            let mut last_prev_ledger_switch: Option<tokio::time::Instant> = None;
+            const PREV_LEDGER_SWITCH_COOLDOWN: Duration = Duration::from_secs(10);
+
             let sync_check_duration = Duration::from_secs(5);
             let mut sync_check_interval = tokio::time::interval(sync_check_duration);
             let mut sync_started_at: Option<tokio::time::Instant> = None;
@@ -933,6 +942,45 @@ impl Node {
                                     proposal.tx_set_hash, proposal.close_time
                                 );
                                 consensus.peer_proposal(proposal);
+
+                                // Check if a supermajority of trusted peers
+                                // reference a different prev_ledger than ours.
+                                let cooldown_ok = last_prev_ledger_switch
+                                    .map(|t| t.elapsed() >= PREV_LEDGER_SWITCH_COOLDOWN)
+                                    .unwrap_or(true);
+                                if cooldown_ok {
+                                    if let Some(detected) = consensus.check_wrong_prev_ledger() {
+                                        tracing::warn!(
+                                            "wrong prev_ledger detected: {}/{} trusted peers reference {}, \
+                                             ours is {}. Triggering recovery.",
+                                            detected.peer_count,
+                                            detected.total_trusted,
+                                            detected.preferred_ledger,
+                                            consensus.prev_ledger()
+                                        );
+                                        last_prev_ledger_switch = Some(tokio::time::Instant::now());
+
+                                        // Abort current consensus round and enter sync mode
+                                        // to fetch the correct ledger from peers.
+                                        syncing = true;
+                                        timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
+                                        sync_started_at = Some(tokio::time::Instant::now());
+                                        last_sync_seq = ledger_seq_shared.load(Ordering::Relaxed);
+
+                                        // Request the preferred ledger from peers.
+                                        let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
+                                            seq: 0, // unknown seq, rely on hash
+                                            hash: Some(detected.preferred_ledger),
+                                        });
+
+                                        // Reset consensus state so we don't keep processing
+                                        // the stale round. The next round will start after
+                                        // we sync the correct ledger.
+                                        consensus.start_round(detected.preferred_ledger, 0);
+                                        amendment_votes.clear();
+                                        trusted_validator_count = 0;
+                                    }
+                                }
                             }
                             ConsensusMessage::Validation(validation) => {
                                 let val_seq = validation.ledger_seq;

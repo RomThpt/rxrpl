@@ -25,6 +25,10 @@ fn make_peer_config(
         network_id: 99999,
         tls_server: tls::build_server_config(identity),
         tls_client: tls::build_client_config(),
+        cluster_enabled: false,
+        cluster_node_name: String::new(),
+        cluster_members: Vec::new(),
+        cluster_broadcast_interval_secs: 5,
     }
 }
 

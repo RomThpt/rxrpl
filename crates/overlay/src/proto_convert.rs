@@ -1,10 +1,10 @@
 use prost::Message;
 use rxrpl_consensus::types::{NodeId, Proposal, Validation};
 use rxrpl_p2p_proto::proto::{
-    TmEndpoints, TmGetLedger, TmGetObjectByHash, TmHaveTransactionSet, TmHaveTransactions,
-    TmHello, TmLedgerData, TmLedgerNode, TmManifest, TmManifests, TmPing, TmProposeSet,
-    TmSquelch, TmStatusChange, TmTransaction, TmTransactions, TmValidation, TmValidatorList,
-    TmValidatorListCollection,
+    TmCluster, TmClusterNode, TmEndpoints, TmGetLedger, TmGetObjectByHash,
+    TmHaveTransactionSet, TmHaveTransactions, TmHello, TmLedgerData, TmLedgerNode, TmManifest,
+    TmManifests, TmPing, TmProposeSet, TmSquelch, TmStatusChange, TmTransaction, TmTransactions,
+    TmValidation, TmValidatorList, TmValidatorListCollection,
 };
 use rxrpl_primitives::Hash256;
 
@@ -594,6 +594,49 @@ pub fn decode_transactions(data: &[u8]) -> Result<TmTransactions, OverlayError> 
         .map_err(|e| OverlayError::Codec(format!("decode Transactions: {e}")))
 }
 
+// --- Cluster (type 5) ---
+
+/// Decoded cluster node entry.
+pub struct ClusterNodeData {
+    pub public_key: String,
+    pub report_time: u32,
+    pub node_load: u32,
+    pub node_name: String,
+    pub address: String,
+}
+
+pub fn encode_cluster(nodes: &[ClusterNodeData]) -> Vec<u8> {
+    let msg = TmCluster {
+        cluster_nodes: nodes
+            .iter()
+            .map(|n| TmClusterNode {
+                public_key: Some(n.public_key.clone()),
+                report_time: Some(n.report_time),
+                node_load: Some(n.node_load),
+                node_name: Some(n.node_name.clone()),
+                address: Some(n.address.clone()),
+            })
+            .collect(),
+    };
+    msg.encode_to_vec()
+}
+
+pub fn decode_cluster(data: &[u8]) -> Result<Vec<ClusterNodeData>, OverlayError> {
+    let msg = TmCluster::decode(data)
+        .map_err(|e| OverlayError::Codec(format!("decode Cluster: {e}")))?;
+    Ok(msg
+        .cluster_nodes
+        .into_iter()
+        .map(|n| ClusterNodeData {
+            public_key: n.public_key.unwrap_or_default(),
+            report_time: n.report_time.unwrap_or(0),
+            node_load: n.node_load.unwrap_or(0),
+            node_name: n.node_name.unwrap_or_default(),
+            address: n.address.unwrap_or_default(),
+        })
+        .collect())
+}
+
 // --- Helpers ---
 
 fn hash256_from_bytes(bytes: &[u8]) -> Result<Hash256, OverlayError> {
@@ -859,5 +902,44 @@ mod tests {
         assert_eq!(decoded_resp.query, Some(false));
         assert_eq!(decoded_resp.objects.len(), 1);
         assert!(decoded_resp.objects[0].data.is_some());
+    }
+
+    #[test]
+    fn cluster_roundtrip() {
+        let nodes = vec![
+            ClusterNodeData {
+                public_key: "pubkey_abc".to_string(),
+                report_time: 12345,
+                node_load: 256,
+                node_name: "node-alpha".to_string(),
+                address: "10.0.0.1:51235".to_string(),
+            },
+            ClusterNodeData {
+                public_key: "pubkey_def".to_string(),
+                report_time: 12346,
+                node_load: 512,
+                node_name: "node-beta".to_string(),
+                address: "10.0.0.2:51235".to_string(),
+            },
+        ];
+
+        let encoded = encode_cluster(&nodes);
+        let decoded = decode_cluster(&encoded).unwrap();
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].public_key, "pubkey_abc");
+        assert_eq!(decoded[0].report_time, 12345);
+        assert_eq!(decoded[0].node_load, 256);
+        assert_eq!(decoded[0].node_name, "node-alpha");
+        assert_eq!(decoded[0].address, "10.0.0.1:51235");
+        assert_eq!(decoded[1].public_key, "pubkey_def");
+        assert_eq!(decoded[1].node_load, 512);
+    }
+
+    #[test]
+    fn cluster_empty_roundtrip() {
+        let encoded = encode_cluster(&[]);
+        let decoded = decode_cluster(&encoded).unwrap();
+        assert!(decoded.is_empty());
     }
 }

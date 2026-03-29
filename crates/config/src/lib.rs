@@ -9,6 +9,6 @@ pub mod types;
 pub use error::ConfigError;
 pub use loader::load_config;
 pub use types::{
-    DatabaseConfig, GenesisConfig, NetworkConfig, NodeConfig, PeerConfig, ServerConfig,
-    ValidatorConfig,
+    ClusterConfig, DatabaseConfig, GenesisConfig, NetworkConfig, NodeConfig, PeerConfig,
+    ServerConfig, ValidatorConfig,
 };

@@ -18,6 +18,8 @@ pub struct NodeConfig {
     pub network: NetworkConfig,
     #[serde(default)]
     pub genesis: GenesisConfig,
+    #[serde(default)]
+    pub cluster: ClusterConfig,
 }
 
 impl Default for NodeConfig {
@@ -29,6 +31,7 @@ impl Default for NodeConfig {
             validators: ValidatorConfig::default(),
             network: NetworkConfig::default(),
             genesis: GenesisConfig::default(),
+            cluster: ClusterConfig::default(),
         }
     }
 }
@@ -185,6 +188,41 @@ pub struct NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self { network_id: 0 }
+    }
+}
+
+/// Cluster configuration.
+///
+/// Defines a set of trusted cluster peer nodes that share load-balancing
+/// and fee information through TMCluster messages.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ClusterConfig {
+    /// Whether cluster mode is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Human-readable name for this cluster node.
+    #[serde(default)]
+    pub node_name: Option<String>,
+    /// Public keys of trusted cluster members (hex-encoded).
+    #[serde(default)]
+    pub members: Vec<String>,
+    /// Interval in seconds between cluster status broadcasts.
+    #[serde(default = "default_cluster_broadcast_interval")]
+    pub broadcast_interval_secs: u64,
+}
+
+fn default_cluster_broadcast_interval() -> u64 {
+    5
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_name: None,
+            members: Vec::new(),
+            broadcast_interval_secs: default_cluster_broadcast_interval(),
+        }
     }
 }
 

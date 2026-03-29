@@ -2,6 +2,7 @@
 ///
 /// Provides peer management, handshake protocol, message relay,
 /// and ledger synchronization.
+pub mod cluster;
 pub mod command;
 pub mod consensus_bridge;
 pub mod discovery;
@@ -26,6 +27,7 @@ pub mod tls;
 pub mod validation_aggregator;
 pub mod validator_list;
 
+pub use cluster::ClusterManager;
 pub use command::OverlayCommand;
 pub use consensus_bridge::NetworkConsensusAdapter;
 pub use discovery::PeerDiscovery;

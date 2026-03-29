@@ -15,6 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::codec::Framed;
 
+use crate::cluster::ClusterManager;
 use crate::command::OverlayCommand;
 use crate::discovery::PeerDiscovery;
 use crate::error::OverlayError;
@@ -93,6 +94,14 @@ pub struct PeerManagerConfig {
     pub network_id: u32,
     pub tls_server: Arc<SslAcceptor>,
     pub tls_client: Arc<SslConnector>,
+    /// Cluster mode configuration.
+    pub cluster_enabled: bool,
+    /// Human-readable node name for cluster broadcasts.
+    pub cluster_node_name: String,
+    /// Public keys of trusted cluster member nodes.
+    pub cluster_members: Vec<String>,
+    /// Interval between cluster status broadcasts (seconds).
+    pub cluster_broadcast_interval_secs: u64,
 }
 
 /// Central P2P network manager.
@@ -125,6 +134,7 @@ pub struct PeerManager {
     pending_tx_set_fetches: HashSet<Hash256>,
     manifest_store: ManifestStore,
     vl_tracker: ValidatorListTracker,
+    cluster_manager: ClusterManager,
 }
 
 impl PeerManager {
@@ -145,6 +155,11 @@ impl PeerManager {
         let peer_set = Arc::new(PeerSet::new(config.max_peers));
 
         let seeds = config.seeds.clone();
+        let cluster_manager = ClusterManager::new(
+            config.cluster_enabled,
+            config.cluster_node_name.clone(),
+            config.cluster_members.clone(),
+        );
         let mgr = Self {
             identity,
             seeds,
@@ -169,6 +184,7 @@ impl PeerManager {
             pending_tx_set_fetches: HashSet::new(),
             manifest_store: ManifestStore::new(),
             vl_tracker: ValidatorListTracker::new(),
+            cluster_manager,
         };
 
         (mgr, cmd_tx, consensus_rx)
@@ -254,6 +270,15 @@ impl PeerManager {
         let mut reputation_interval = tokio::time::interval(Duration::from_secs(30));
         reputation_interval.tick().await; // skip first immediate tick
 
+        let cluster_interval_secs = if self.cluster_manager.is_enabled() {
+            self.config.cluster_broadcast_interval_secs.max(1)
+        } else {
+            3600 // effectively disabled
+        };
+        let mut cluster_interval =
+            tokio::time::interval(Duration::from_secs(cluster_interval_secs));
+        cluster_interval.tick().await; // skip first immediate tick
+
         loop {
             tokio::select! {
                 accept_result = listener.accept() => {
@@ -283,6 +308,16 @@ impl PeerManager {
                 _ = reputation_interval.tick() => {
                     self.peer_set.apply_score_decay();
                     self.check_peer_reputations();
+                }
+
+                _ = cluster_interval.tick() => {
+                    if self.cluster_manager.is_enabled() {
+                        self.broadcast_cluster_status();
+                        let pruned = self.cluster_manager.prune_stale();
+                        if pruned > 0 {
+                            tracing::info!("pruned {} stale cluster nodes", pruned);
+                        }
+                    }
                 }
             }
         }
@@ -606,12 +641,42 @@ impl PeerManager {
                 }
             }
             MessageType::Cluster => {
-                // Cluster messages are only exchanged between nodes in the same
-                // cluster. Log and ignore for non-cluster peers.
-                if let Some(ref info) = peer_info {
-                    info.reputation.record_valid_message(payload_len);
+                if !self.cluster_manager.is_enabled() {
+                    tracing::debug!("ignoring Cluster message (cluster mode disabled)");
+                    return;
                 }
-                tracing::debug!("Cluster message from {}", from);
+                match proto_convert::decode_cluster(payload) {
+                    Ok(nodes) => {
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_valid_message(payload_len);
+                        }
+                        let mut accepted = 0;
+                        for node_data in &nodes {
+                            if self.cluster_manager.update_node(
+                                &node_data.public_key,
+                                node_data.node_load,
+                                &node_data.node_name,
+                                &node_data.address,
+                                node_data.report_time,
+                            ) {
+                                accepted += 1;
+                            }
+                        }
+                        tracing::debug!(
+                            "Cluster message from {}: {}/{} nodes accepted",
+                            from, accepted, nodes.len()
+                        );
+                        if let Some(avg_fee) = self.cluster_manager.average_load_fee() {
+                            tracing::trace!("cluster average load fee: {}", avg_fee);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to decode Cluster from {}: {}", from, e);
+                        if let Some(ref info) = peer_info {
+                            info.reputation.record_invalid_message();
+                        }
+                    }
+                }
             }
             MessageType::GetLedger => {
                 if let Some(ref info) = peer_info {
@@ -1150,6 +1215,79 @@ impl PeerManager {
             }
             self.peer_set.remove(&node_id);
         }
+    }
+
+    /// Broadcast our cluster status to all connected peers.
+    ///
+    /// Sends a TMCluster message containing our own node info (public key,
+    /// load fee, name) plus the latest known state of all active cluster
+    /// members. This allows cluster nodes to propagate a full view.
+    fn broadcast_cluster_status(&self) {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+
+        let our_pub_key = hex::encode(self.identity.public_key_bytes());
+        let our_node = proto_convert::ClusterNodeData {
+            public_key: our_pub_key,
+            report_time: now_secs,
+            node_load: 256, // base load fee (256 = reference fee)
+            node_name: self.cluster_manager.node_name().to_string(),
+            address: format!("0.0.0.0:{}", self.config.listen_port),
+        };
+
+        let mut nodes = vec![our_node];
+
+        // Include known active cluster peer state.
+        for cn in self.cluster_manager.active_nodes() {
+            nodes.push(proto_convert::ClusterNodeData {
+                public_key: cn.public_key.clone(),
+                report_time: cn.report_time,
+                node_load: cn.load_fee,
+                node_name: cn.name.clone(),
+                address: cn.address.clone(),
+            });
+        }
+
+        let payload = proto_convert::encode_cluster(&nodes);
+        let mut sent = 0;
+        for handle in self.peer_handles.values() {
+            let _ = handle.tx.try_send(PeerMessage {
+                msg_type: MessageType::Cluster,
+                payload: payload.clone(),
+            });
+            sent += 1;
+        }
+        tracing::debug!(
+            "broadcast cluster status ({} nodes) to {} peers",
+            nodes.len(),
+            sent
+        );
+    }
+
+    /// Check whether a peer is a trusted cluster member.
+    ///
+    /// Cluster members receive priority for transaction relay and their
+    /// fee recommendations are trusted.
+    pub fn is_cluster_peer(&self, node_id: &Hash256) -> bool {
+        if !self.cluster_manager.is_enabled() {
+            return false;
+        }
+        if self.peer_set.get(node_id).is_some() {
+            // Match the peer's node ID (SHA-512-Half of public key) against
+            // the cluster member list. In production the peer's raw public key
+            // would be checked during handshake.
+            let node_pub_hex = hex::encode(node_id.as_bytes());
+            self.cluster_manager.is_member(&node_pub_hex)
+        } else {
+            false
+        }
+    }
+
+    /// Return a snapshot of the current cluster state for RPC queries.
+    pub fn cluster_info(&self) -> Vec<crate::cluster::ClusterNodeInfo> {
+        self.cluster_manager.cluster_info()
     }
 
     fn get_node_store(&self) -> Option<Arc<dyn rxrpl_shamap::NodeStore>> {
