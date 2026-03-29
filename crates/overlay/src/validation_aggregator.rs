@@ -133,6 +133,7 @@ mod tests {
     fn make_validation(node_byte: u8, seq: u32, hash: Hash256) -> Validation {
         Validation {
             node_id: NodeId(Hash256::new([node_byte; 32])),
+            public_key: Vec::new(),
             ledger_hash: hash,
             ledger_seq: seq,
             full: true,

@@ -40,6 +40,8 @@ pub struct Proposal {
 pub struct Validation {
     /// The validator's node ID.
     pub node_id: NodeId,
+    /// Raw public key bytes (33 bytes for secp256k1, 33 bytes for ed25519).
+    pub public_key: Vec<u8>,
     /// Hash of the validated ledger.
     pub ledger_hash: Hash256,
     /// Sequence of the validated ledger.
@@ -324,6 +326,7 @@ mod tests {
 
         let mut validation = Validation {
             node_id: NodeId::from_public_key(kp.public_key.as_bytes()),
+            public_key: kp.public_key.as_bytes().to_vec(),
             ledger_hash: Hash256::new([0xAA; 32]),
             ledger_seq: 5,
             full: true,

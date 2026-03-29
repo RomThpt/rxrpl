@@ -496,21 +496,32 @@ impl PeerManager {
             MessageType::Validation => {
                 match proto_convert::decode_validation(payload) {
                     Ok(validation) => {
-                        if let Some(ref info) = peer_info {
-                            info.reputation.record_valid_message(payload_len);
+                        // Reject validations with missing or invalid signatures
+                        if !crate::identity::verify_validation_signature(&validation) {
+                            tracing::warn!(
+                                "rejecting validation with invalid signature for ledger #{}",
+                                validation.ledger_seq,
+                            );
+                            if let Some(ref info) = peer_info {
+                                info.reputation.record_invalid_message();
+                            }
+                        } else {
+                            if let Some(ref info) = peer_info {
+                                info.reputation.record_valid_message(payload_len);
+                            }
+                            if let Some(ref tx) = self.server_event_tx {
+                                let _ = tx.send(serde_json::json!({
+                                    "type": "validationReceived",
+                                    "validator": validation.node_id.0.to_string(),
+                                    "ledger_hash": validation.ledger_hash.to_string(),
+                                    "ledger_seq": validation.ledger_seq,
+                                    "full": validation.full,
+                                }));
+                            }
+                            let _ = self
+                                .consensus_tx
+                                .send(ConsensusMessage::Validation(validation));
                         }
-                        if let Some(ref tx) = self.server_event_tx {
-                            let _ = tx.send(serde_json::json!({
-                                "type": "validationReceived",
-                                "validator": validation.node_id.0.to_string(),
-                                "ledger_hash": validation.ledger_hash.to_string(),
-                                "ledger_seq": validation.ledger_seq,
-                                "full": validation.full,
-                            }));
-                        }
-                        let _ = self
-                            .consensus_tx
-                            .send(ConsensusMessage::Validation(validation));
                     }
                     Err(_) => {
                         if let Some(ref info) = peer_info {

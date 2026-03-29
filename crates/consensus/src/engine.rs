@@ -458,6 +458,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         // Create validation
         let validation = Validation {
             node_id: self.node_id,
+            public_key: self.public_key.clone(),
             ledger_hash,
             ledger_seq,
             full: true,

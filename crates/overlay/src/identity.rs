@@ -104,6 +104,66 @@ impl NodeIdentity {
             validation.signature = Some(sig);
         }
     }
+
+    /// Get the private key bytes (for signing operations).
+    pub fn private_key(&self) -> &[u8] {
+        &self.key_pair.private_key
+    }
+}
+
+/// Verify a validation's STObject signature against the embedded public key.
+///
+/// Reconstructs the same signing data that `NodeIdentity::sign_validation` produces:
+/// SHA-512-Half(HashPrefix::validation || STObject fields without sfSignature)
+/// then verifies the signature with the validation's public key.
+///
+/// Returns `false` if the signature is missing, the public key is empty,
+/// or the signature does not match.
+pub fn verify_validation_signature(validation: &rxrpl_consensus::types::Validation) -> bool {
+    use crate::stobject;
+
+    let sig = match &validation.signature {
+        Some(s) => s,
+        None => return false,
+    };
+
+    if validation.public_key.is_empty() {
+        return false;
+    }
+
+    // HashPrefix::validation = 'V','A','L',0 = 0x56414C00
+    const HASH_PREFIX_VALIDATION: [u8; 4] = [0x56, 0x41, 0x4C, 0x00];
+
+    // Build signing data: prefix + STObject fields (without sfSignature)
+    // Must match the exact field order used by sign_validation.
+    let mut signing_data = Vec::with_capacity(128);
+    signing_data.extend_from_slice(&HASH_PREFIX_VALIDATION);
+
+    // sfFlags (UINT32, field 2)
+    let flags: u32 = if validation.full { 0x80000001 } else { 0x00000000 };
+    stobject::put_uint32(&mut signing_data, 2, flags);
+
+    // sfLedgerSequence (UINT32, field 6)
+    stobject::put_uint32(&mut signing_data, 6, validation.ledger_seq);
+
+    // sfSigningTime (UINT32, field 9)
+    stobject::put_uint32(&mut signing_data, 9, validation.sign_time);
+
+    // sfLedgerHash (UINT256, field 1)
+    stobject::put_hash256(&mut signing_data, 1, validation.ledger_hash.as_bytes());
+
+    // sfSigningPubKey (VL, field 3)
+    stobject::put_vl(&mut signing_data, 3, &validation.public_key);
+
+    // Verify: the signature was produced by signing signing_data with secp256k1
+    // (sign_validation always uses secp256k1 regardless of key type prefix,
+    // because NodeIdentity is always secp256k1 for rippled compatibility).
+    let is_ed25519 = validation.public_key.first() == Some(&0xED);
+    if is_ed25519 {
+        rxrpl_crypto::ed25519::verify(&signing_data, &validation.public_key, sig)
+    } else {
+        rxrpl_crypto::secp256k1::verify(&signing_data, &validation.public_key, sig)
+    }
 }
 
 impl std::fmt::Debug for NodeIdentity {
@@ -147,5 +207,125 @@ mod tests {
             id.public_key_bytes(),
             &sig
         ));
+    }
+
+    #[test]
+    fn validation_sign_verify_roundtrip() {
+        use rxrpl_consensus::types::{NodeId, Validation};
+        use rxrpl_primitives::Hash256;
+
+        let id = NodeIdentity::generate();
+        let mut validation = Validation {
+            node_id: NodeId(id.node_id),
+            public_key: id.public_key_bytes().to_vec(),
+            ledger_hash: Hash256::new([0xCC; 32]),
+            ledger_seq: 42,
+            full: true,
+            close_time: 1000,
+            sign_time: 1000,
+            signature: None,
+        };
+
+        // Unsigned validation should fail verification
+        assert!(!verify_validation_signature(&validation));
+
+        // Sign and verify
+        id.sign_validation(&mut validation);
+        assert!(validation.signature.is_some());
+        assert!(verify_validation_signature(&validation));
+    }
+
+    #[test]
+    fn validation_tampered_fails_verify() {
+        use rxrpl_consensus::types::{NodeId, Validation};
+        use rxrpl_primitives::Hash256;
+
+        let id = NodeIdentity::generate();
+        let mut validation = Validation {
+            node_id: NodeId(id.node_id),
+            public_key: id.public_key_bytes().to_vec(),
+            ledger_hash: Hash256::new([0xCC; 32]),
+            ledger_seq: 42,
+            full: true,
+            close_time: 1000,
+            sign_time: 1000,
+            signature: None,
+        };
+
+        id.sign_validation(&mut validation);
+
+        // Tamper with ledger hash
+        validation.ledger_hash = Hash256::new([0xDD; 32]);
+        assert!(!verify_validation_signature(&validation));
+    }
+
+    #[test]
+    fn validation_wrong_key_fails_verify() {
+        use rxrpl_consensus::types::{NodeId, Validation};
+        use rxrpl_primitives::Hash256;
+
+        let id1 = NodeIdentity::generate();
+        let id2 = NodeIdentity::generate();
+
+        let mut validation = Validation {
+            node_id: NodeId(id1.node_id),
+            public_key: id1.public_key_bytes().to_vec(),
+            ledger_hash: Hash256::new([0xCC; 32]),
+            ledger_seq: 42,
+            full: true,
+            close_time: 1000,
+            sign_time: 1000,
+            signature: None,
+        };
+
+        id1.sign_validation(&mut validation);
+        assert!(verify_validation_signature(&validation));
+
+        // Replace public key with a different node's key -- should fail
+        validation.public_key = id2.public_key_bytes().to_vec();
+        assert!(!verify_validation_signature(&validation));
+    }
+
+    #[test]
+    fn validation_missing_signature_fails_verify() {
+        use rxrpl_consensus::types::{NodeId, Validation};
+        use rxrpl_primitives::Hash256;
+
+        let id = NodeIdentity::generate();
+        let validation = Validation {
+            node_id: NodeId(id.node_id),
+            public_key: id.public_key_bytes().to_vec(),
+            ledger_hash: Hash256::new([0xCC; 32]),
+            ledger_seq: 42,
+            full: true,
+            close_time: 1000,
+            sign_time: 1000,
+            signature: None,
+        };
+
+        assert!(!verify_validation_signature(&validation));
+    }
+
+    #[test]
+    fn validation_empty_pubkey_fails_verify() {
+        use rxrpl_consensus::types::{NodeId, Validation};
+        use rxrpl_primitives::Hash256;
+
+        let id = NodeIdentity::generate();
+        let mut validation = Validation {
+            node_id: NodeId(id.node_id),
+            public_key: id.public_key_bytes().to_vec(),
+            ledger_hash: Hash256::new([0xCC; 32]),
+            ledger_seq: 42,
+            full: true,
+            close_time: 1000,
+            sign_time: 1000,
+            signature: None,
+        };
+
+        id.sign_validation(&mut validation);
+        // Clear public key
+        validation.public_key = Vec::new();
+        assert!(!verify_validation_signature(&validation));
     }
 }

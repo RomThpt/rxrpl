@@ -189,6 +189,7 @@ fn stobject_validation_roundtrip() {
     let id = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("val-test"));
     let mut validation = Validation {
         node_id: NodeId(id.node_id),
+        public_key: id.public_key_bytes().to_vec(),
         ledger_hash: Hash256::new([0xCC; 32]),
         ledger_seq: 42,
         full: true,

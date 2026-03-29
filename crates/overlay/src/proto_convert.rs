@@ -177,6 +177,7 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
 
     Ok(Validation {
         node_id,
+        public_key: signing_pub_key,
         ledger_hash,
         ledger_seq,
         full,

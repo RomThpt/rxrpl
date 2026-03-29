@@ -1207,6 +1207,7 @@ impl Node {
             use rxrpl_consensus::types::Validation;
             let mut validation = Validation {
                 node_id: rxrpl_consensus::types::NodeId(Hash256::new(identity.node_id.0)),
+                public_key: identity.public_key_bytes().to_vec(),
                 ledger_hash: hash,
                 ledger_seq: closed_seq,
                 full: true,
@@ -1821,6 +1822,7 @@ mod tests {
         for i in 1..=27u8 {
             let v = Validation {
                 node_id: CNodeId(Hash256::new([i; 32])),
+                public_key: Vec::new(),
                 ledger_hash: hash,
                 ledger_seq: 100,
                 full: true,
@@ -1834,6 +1836,7 @@ mod tests {
         // 28th validation reaches quorum
         let v28 = Validation {
             node_id: CNodeId(Hash256::new([28; 32])),
+            public_key: Vec::new(),
             ledger_hash: hash,
             ledger_seq: 100,
             full: true,
@@ -1866,6 +1869,7 @@ mod tests {
         for i in 1..=4u8 {
             let v = rxrpl_consensus::types::Validation {
                 node_id: rxrpl_consensus::types::NodeId(Hash256::new([i; 32])),
+                public_key: Vec::new(),
                 ledger_hash: hash,
                 ledger_seq: 200,
                 full: true,
@@ -1877,6 +1881,7 @@ mod tests {
         }
         let v5 = rxrpl_consensus::types::Validation {
             node_id: rxrpl_consensus::types::NodeId(Hash256::new([5; 32])),
+            public_key: Vec::new(),
             ledger_hash: hash,
             ledger_seq: 200,
             full: true,
