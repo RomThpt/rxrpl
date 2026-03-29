@@ -10,15 +10,22 @@ use crate::error::RpcServerError;
 /// Matches rippled's `crawl_shards` RPC, which returns information
 /// about which shards a server stores. Used by network crawlers to
 /// map shard distribution across the network.
-///
-/// This implementation returns empty shard info since the shard store
-/// subsystem is not yet implemented.
 pub async fn crawl_shards(
     _params: Value,
-    _ctx: &Arc<ServerContext>,
+    ctx: &Arc<ServerContext>,
 ) -> Result<Value, RpcServerError> {
+    let Some(ref manager_lock) = ctx.shard_manager else {
+        return Ok(serde_json::json!({
+            "complete_shards": "none",
+            "peers": [],
+        }));
+    };
+
+    let manager = manager_lock.read().await;
+    let complete = manager.complete_shards_string();
+
     Ok(serde_json::json!({
-        "complete_shards": "none",
+        "complete_shards": complete,
         "peers": [],
     }))
 }

@@ -9,9 +9,14 @@ pub mod batch;
 pub mod cache;
 pub mod database;
 pub mod error;
+pub mod shard;
 
 pub use backend::{MemoryNodeDatabase, PersistentNodeDatabase};
 pub use batch::NodeBatch;
 pub use cache::{CacheConfig, CachedNodeStore};
 pub use database::NodeDatabase;
 pub use error::NodeStoreError;
+pub use shard::{
+    ShardInfo, ShardManager, ShardState, ShardStore, shard_index_for, shard_range,
+    LEDGERS_PER_SHARD,
+};

@@ -19,6 +19,7 @@ rxrpl-storage = { workspace = true, features = ["sqlite"] }
 rxrpl-txq = { workspace = true }
 rxrpl-crypto = { workspace = true }
 rxrpl-pathfind = { workspace = true }
+rxrpl-nodestore = { workspace = true }
 rand = "0.8"
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }

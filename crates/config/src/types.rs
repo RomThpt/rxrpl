@@ -20,6 +20,8 @@ pub struct NodeConfig {
     pub genesis: GenesisConfig,
     #[serde(default)]
     pub cluster: ClusterConfig,
+    #[serde(default)]
+    pub reporting: ReportingConfig,
 }
 
 impl Default for NodeConfig {
@@ -32,6 +34,43 @@ impl Default for NodeConfig {
             network: NetworkConfig::default(),
             genesis: GenesisConfig::default(),
             cluster: ClusterConfig::default(),
+            reporting: ReportingConfig::default(),
+        }
+    }
+}
+
+/// Reporting mode configuration.
+///
+/// When enabled, the node operates as a read-only reporting server that
+/// receives validated ledgers from an upstream ETL source and serves
+/// historical data via RPC. No consensus or P2P participation.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ReportingConfig {
+    /// Whether reporting mode is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// WebSocket URL of the upstream ETL source (e.g., a validating node).
+    #[serde(default = "default_etl_source")]
+    pub etl_source: String,
+    /// URL to forward write requests (submit, etc.) to.
+    #[serde(default = "default_forward_url")]
+    pub forward_url: String,
+}
+
+fn default_etl_source() -> String {
+    "ws://127.0.0.1:6006".into()
+}
+
+fn default_forward_url() -> String {
+    "http://127.0.0.1:5005".into()
+}
+
+impl Default for ReportingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            etl_source: default_etl_source(),
+            forward_url: default_forward_url(),
         }
     }
 }
@@ -134,6 +173,41 @@ pub struct DatabaseConfig {
     /// when triggered via the `can_delete` RPC command. Default: false.
     #[serde(default)]
     pub advisory_delete: bool,
+    /// Shard store configuration for ledger history sharding.
+    #[serde(default)]
+    pub shard: ShardConfig,
+}
+
+/// Shard store configuration.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ShardConfig {
+    /// Whether the shard store is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory path for shard data.
+    #[serde(default = "default_shard_path")]
+    pub path: String,
+    /// Maximum number of shards to store locally.
+    #[serde(default = "default_max_shards")]
+    pub max_shards: u32,
+}
+
+fn default_shard_path() -> String {
+    "data/shards".into()
+}
+
+fn default_max_shards() -> u32 {
+    10
+}
+
+impl Default for ShardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: default_shard_path(),
+            max_shards: default_max_shards(),
+        }
+    }
 }
 
 fn default_data_dir() -> PathBuf {
@@ -155,6 +229,7 @@ impl Default for DatabaseConfig {
             backend: default_backend(),
             online_delete: default_online_delete(),
             advisory_delete: false,
+            shard: ShardConfig::default(),
         }
     }
 }

@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicU32;
 
 use rxrpl_config::ServerConfig;
 use rxrpl_ledger::Ledger;
+use rxrpl_nodestore::ShardManager;
 use rxrpl_primitives::Hash256;
 use rxrpl_storage::TxStore;
 use rxrpl_tx_engine::{FeeSettings, TxEngine};
@@ -53,6 +54,11 @@ pub struct ServerContext {
     pub metrics_handle: Option<PrometheusHandle>,
     pub peer_reservations: Arc<RwLock<HashSet<String>>>,
     pub pruner_state: Option<Arc<PrunerState>>,
+    pub shard_manager: Option<Arc<RwLock<ShardManager>>>,
+    /// Whether the node is running in reporting mode (read-only, no consensus).
+    pub reporting_mode: bool,
+    /// URL to forward write requests to when in reporting mode.
+    pub forward_url: Option<String>,
     event_tx: broadcast::Sender<ServerEvent>,
 }
 
@@ -71,6 +77,9 @@ impl ServerContext {
             metrics_handle: None,
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
             pruner_state: None,
+            shard_manager: None,
+            reporting_mode: false,
+            forward_url: None,
             event_tx,
         })
     }
@@ -100,6 +109,9 @@ impl ServerContext {
             metrics_handle: None,
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
             pruner_state: None,
+            shard_manager: None,
+            reporting_mode: false,
+            forward_url: None,
             event_tx,
         })
     }
@@ -130,6 +142,9 @@ impl ServerContext {
             metrics_handle: Some(metrics_handle),
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
             pruner_state: None,
+            shard_manager: None,
+            reporting_mode: false,
+            forward_url: None,
             event_tx,
         })
     }
@@ -160,6 +175,34 @@ impl ServerContext {
             metrics_handle: None,
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
             pruner_state: Some(pruner_state),
+            shard_manager: None,
+            reporting_mode: false,
+            forward_url: None,
+            event_tx,
+        })
+    }
+
+    /// Create a context for reporting mode (read-only, no consensus).
+    pub fn for_reporting(
+        config: ServerConfig,
+        forward_url: String,
+    ) -> Arc<Self> {
+        let (event_tx, _) = broadcast::channel(1024);
+        Arc::new(Self {
+            config,
+            ledger: None,
+            closed_ledgers: None,
+            tx_engine: None,
+            fees: None,
+            tx_store: None,
+            tx_queue: None,
+            relay_tx: None,
+            metrics_handle: None,
+            peer_reservations: Arc::new(RwLock::new(HashSet::new())),
+            pruner_state: None,
+            shard_manager: None,
+            reporting_mode: true,
+            forward_url: Some(forward_url),
             event_tx,
         })
     }
