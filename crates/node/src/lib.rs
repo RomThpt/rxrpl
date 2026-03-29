@@ -5,6 +5,7 @@
 pub mod consensus_adapter;
 pub mod error;
 pub mod node;
+pub mod pruner;
 
 pub use error::NodeError;
 pub use node::Node;

@@ -126,6 +126,14 @@ pub struct DatabaseConfig {
     /// Node store backend ("rocksdb" or "memory").
     #[serde(default = "default_backend")]
     pub backend: String,
+    /// Number of most-recent ledgers to retain. Older ledger data is pruned.
+    /// Set to 0 to keep all history (no pruning). Default: 2000.
+    #[serde(default = "default_online_delete")]
+    pub online_delete: u32,
+    /// When true, automatic pruning is disabled and deletion only happens
+    /// when triggered via the `can_delete` RPC command. Default: false.
+    #[serde(default)]
+    pub advisory_delete: bool,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -136,11 +144,17 @@ fn default_backend() -> String {
     "memory".into()
 }
 
+fn default_online_delete() -> u32 {
+    2000
+}
+
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             path: default_data_dir(),
             backend: default_backend(),
+            online_delete: default_online_delete(),
+            advisory_delete: false,
         }
     }
 }

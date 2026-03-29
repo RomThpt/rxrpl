@@ -15,7 +15,7 @@ pub mod router;
 pub mod server;
 pub mod subscriptions;
 
-pub use context::ServerContext;
+pub use context::{PrunerState, ServerContext};
 pub use error::RpcServerError;
 pub use events::ServerEvent;
 pub use server::build_router;

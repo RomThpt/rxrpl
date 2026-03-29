@@ -1,5 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
 use rxrpl_config::ServerConfig;
 use rxrpl_ledger::Ledger;
@@ -13,6 +14,32 @@ use metrics_exporter_prometheus::PrometheusHandle;
 
 use crate::events::ServerEvent;
 
+/// Shared pruner state accessible from RPC handlers.
+///
+/// Wraps atomic counters so the pruner can be queried and controlled
+/// from `can_delete` and `ledger_cleaner` without holding a lock.
+pub struct PrunerState {
+    /// Earliest ledger still available after pruning.
+    pub earliest_seq: AtomicU32,
+    /// Advisory delete cursor (max sequence eligible for deletion).
+    pub can_delete_seq: AtomicU32,
+    /// Whether advisory delete mode is active.
+    pub advisory_delete: bool,
+    /// Retention window size.
+    pub retention_window: u32,
+}
+
+impl PrunerState {
+    pub fn new(retention_window: u32, advisory_delete: bool) -> Self {
+        Self {
+            earliest_seq: AtomicU32::new(0),
+            can_delete_seq: AtomicU32::new(if advisory_delete { 0 } else { u32::MAX }),
+            advisory_delete,
+            retention_window,
+        }
+    }
+}
+
 /// Shared state for all RPC handlers.
 pub struct ServerContext {
     pub config: ServerConfig,
@@ -25,6 +52,7 @@ pub struct ServerContext {
     pub relay_tx: Option<mpsc::UnboundedSender<(Hash256, Vec<u8>)>>,
     pub metrics_handle: Option<PrometheusHandle>,
     pub peer_reservations: Arc<RwLock<HashSet<String>>>,
+    pub pruner_state: Option<Arc<PrunerState>>,
     event_tx: broadcast::Sender<ServerEvent>,
 }
 
@@ -42,6 +70,7 @@ impl ServerContext {
             relay_tx: None,
             metrics_handle: None,
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
+            pruner_state: None,
             event_tx,
         })
     }
@@ -70,6 +99,7 @@ impl ServerContext {
             relay_tx,
             metrics_handle: None,
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
+            pruner_state: None,
             event_tx,
         })
     }
@@ -99,6 +129,37 @@ impl ServerContext {
             relay_tx,
             metrics_handle: Some(metrics_handle),
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
+            pruner_state: None,
+            event_tx,
+        })
+    }
+
+    /// Create a context with full node state and pruner state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_node_state_and_pruner(
+        config: ServerConfig,
+        ledger: Arc<RwLock<Ledger>>,
+        closed_ledgers: Arc<RwLock<VecDeque<Ledger>>>,
+        tx_engine: Arc<TxEngine>,
+        fees: Arc<FeeSettings>,
+        tx_store: Option<Arc<dyn TxStore>>,
+        tx_queue: Option<Arc<RwLock<TxQueue>>>,
+        relay_tx: Option<mpsc::UnboundedSender<(Hash256, Vec<u8>)>>,
+        pruner_state: Arc<PrunerState>,
+    ) -> Arc<Self> {
+        let (event_tx, _) = broadcast::channel(1024);
+        Arc::new(Self {
+            config,
+            ledger: Some(ledger),
+            closed_ledgers: Some(closed_ledgers),
+            tx_engine: Some(tx_engine),
+            fees: Some(fees),
+            tx_store,
+            tx_queue,
+            relay_tx,
+            metrics_handle: None,
+            peer_reservations: Arc::new(RwLock::new(HashSet::new())),
+            pruner_state: Some(pruner_state),
             event_tx,
         })
     }

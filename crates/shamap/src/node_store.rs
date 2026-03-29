@@ -48,6 +48,12 @@ pub fn deserialize_node(
 pub trait NodeStore: Send + Sync {
     fn fetch(&self, hash: &Hash256) -> Result<Option<Vec<u8>>, SHAMapError>;
     fn store_batch(&self, entries: &[(&Hash256, &[u8])]) -> Result<(), SHAMapError>;
+
+    /// Delete a batch of nodes by hash. Used by ledger history pruning.
+    /// The default implementation is a no-op for backward compatibility.
+    fn delete_batch(&self, _hashes: &[Hash256]) -> Result<(), SHAMapError> {
+        Ok(())
+    }
 }
 
 /// In-memory node store backed by a HashMap.
@@ -79,6 +85,14 @@ impl NodeStore for InMemoryNodeStore {
         let mut data = self.data.write().map_err(|_| SHAMapError::InvalidNode)?;
         for (hash, bytes) in entries {
             data.insert(**hash, bytes.to_vec());
+        }
+        Ok(())
+    }
+
+    fn delete_batch(&self, hashes: &[Hash256]) -> Result<(), SHAMapError> {
+        let mut data = self.data.write().map_err(|_| SHAMapError::InvalidNode)?;
+        for hash in hashes {
+            data.remove(hash);
         }
         Ok(())
     }

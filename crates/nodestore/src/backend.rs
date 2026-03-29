@@ -54,6 +54,17 @@ impl NodeDatabase for MemoryNodeDatabase {
             .map_err(|e| NodeStoreError::Encoding(e.to_string()))?;
         Ok(data.contains_key(hash))
     }
+
+    fn delete_batch(&self, hashes: &[Hash256]) -> Result<(), NodeStoreError> {
+        let mut data = self
+            .data
+            .write()
+            .map_err(|e| NodeStoreError::Encoding(e.to_string()))?;
+        for hash in hashes {
+            data.remove(hash);
+        }
+        Ok(())
+    }
 }
 
 /// Persistent node database backed by a `KvStore`.
@@ -85,6 +96,15 @@ impl<S: KvStore> NodeDatabase for PersistentNodeDatabase<S> {
 
     fn exists(&self, hash: &Hash256) -> Result<bool, NodeStoreError> {
         Ok(self.store.exists(hash.as_bytes())?)
+    }
+
+    fn delete_batch(&self, hashes: &[Hash256]) -> Result<(), NodeStoreError> {
+        let mut wb = rxrpl_storage::WriteBatch::with_capacity(hashes.len());
+        for hash in hashes {
+            wb.delete(hash.as_bytes().to_vec());
+        }
+        self.store.write_batch(&wb)?;
+        Ok(())
     }
 }
 

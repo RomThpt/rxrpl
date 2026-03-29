@@ -799,6 +799,52 @@ impl SHAMap {
         }
     }
 
+    // --- Pruning helpers ---
+
+    /// Collect hashes of all nodes (inner + leaf) reachable from this tree.
+    ///
+    /// Walks the tree through the backing store, loading nodes lazily.
+    /// Returns the set of every `Hash256` that forms part of this map.
+    /// Used by ledger pruning to determine which nodes are still referenced.
+    pub fn collect_all_node_hashes(&self) -> Vec<Hash256> {
+        let mut hashes = Vec::new();
+        Self::walk_node_hashes(&self.root, &self.store, self.leaf_ctor, &mut hashes);
+        hashes
+    }
+
+    fn walk_node_hashes(
+        node: &Arc<SHAMapNode>,
+        store: &Option<Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+        out: &mut Vec<Hash256>,
+    ) {
+        match node.as_ref() {
+            SHAMapNode::Inner(inner) => {
+                let hash = inner.hash();
+                if !hash.is_zero() {
+                    out.push(hash);
+                }
+                let mut mask = inner.branch_mask();
+                while mask != 0 {
+                    let branch = mask.trailing_zeros() as u8;
+                    if let Ok(Some(child)) = inner.child_with_store(branch, store.as_ref(), leaf_ctor) {
+                        Self::walk_node_hashes(child, store, leaf_ctor, out);
+                    } else {
+                        // Unresolvable branch: record the hash if known
+                        let ch = inner.child_hash(branch);
+                        if !ch.is_zero() {
+                            out.push(ch);
+                        }
+                    }
+                    mask &= mask - 1;
+                }
+            }
+            SHAMapNode::Leaf(leaf) => {
+                out.push(leaf.hash());
+            }
+        }
+    }
+
     // --- Delta sync methods ---
 
     /// Compute hashes of missing nodes needed to complete the tree toward a target root.

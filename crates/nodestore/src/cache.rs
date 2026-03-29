@@ -125,6 +125,27 @@ impl<D: NodeDatabase> CachedNodeStore<D> {
         }
     }
 
+    /// Delete a batch of nodes, evicting them from caches.
+    pub fn delete(&self, hashes: &[Hash256]) -> Result<(), NodeStoreError> {
+        self.db.delete_batch(hashes)?;
+
+        let mut pos = self
+            .positive
+            .lock()
+            .map_err(|e| NodeStoreError::Encoding(e.to_string()))?;
+        let mut neg = self
+            .negative
+            .lock()
+            .map_err(|e| NodeStoreError::Encoding(e.to_string()))?;
+
+        for hash in hashes {
+            pos.pop(hash);
+            neg.put(*hash, ());
+        }
+
+        Ok(())
+    }
+
     /// Check existence using caches.
     pub fn exists(&self, hash: &Hash256) -> Result<bool, NodeStoreError> {
         {
@@ -163,6 +184,11 @@ impl<D: NodeDatabase> rxrpl_shamap::NodeStore for CachedNodeStore<D> {
             batch.add(**hash, data.to_vec());
         }
         self.store(&batch)
+            .map_err(|_| rxrpl_shamap::SHAMapError::InvalidNode)
+    }
+
+    fn delete_batch(&self, hashes: &[Hash256]) -> Result<(), rxrpl_shamap::SHAMapError> {
+        self.delete(hashes)
             .map_err(|_| rxrpl_shamap::SHAMapError::InvalidNode)
     }
 }

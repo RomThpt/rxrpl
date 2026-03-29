@@ -18,4 +18,7 @@ pub trait NodeDatabase: Send + Sync + 'static {
     fn exists(&self, hash: &Hash256) -> Result<bool, NodeStoreError> {
         Ok(self.fetch_node(hash)?.is_some())
     }
+
+    /// Delete a batch of nodes by hash. Used by ledger history pruning.
+    fn delete_batch(&self, hashes: &[Hash256]) -> Result<(), NodeStoreError>;
 }

@@ -31,6 +31,7 @@ use tokio::sync::RwLock;
 
 use crate::consensus_adapter::NodeConsensusAdapter;
 use crate::error::NodeError;
+use crate::pruner::LedgerPruner;
 
 /// LedgerProvider implementation backed by the node's closed ledger history.
 struct ClosedLedgerAccess {
@@ -69,6 +70,7 @@ pub struct Node {
     fees: Arc<FeeSettings>,
     tx_store: Option<Arc<dyn TxStore>>,
     node_store: Option<Arc<dyn NodeStore>>,
+    pruner: Arc<LedgerPruner>,
     running: bool,
 }
 
@@ -132,6 +134,11 @@ impl Node {
         // Initialize transaction queue
         let tx_queue = TxQueue::new(2000);
 
+        let pruner = Arc::new(LedgerPruner::new(
+            config.database.online_delete,
+            config.database.advisory_delete,
+        ));
+
         Ok(Self {
             config,
             ledger: Arc::new(RwLock::new(ledger)),
@@ -142,6 +149,7 @@ impl Node {
             fees: Arc::new(FeeSettings::default()),
             tx_store: None,
             node_store,
+            pruner,
             running: false,
         })
     }
@@ -191,6 +199,11 @@ impl Node {
 
         let tx_queue = TxQueue::new(2000);
 
+        let pruner = Arc::new(LedgerPruner::new(
+            config.database.online_delete,
+            config.database.advisory_delete,
+        ));
+
         Ok(Self {
             config,
             ledger: Arc::new(RwLock::new(open_ledger)),
@@ -201,6 +214,7 @@ impl Node {
             fees: Arc::new(FeeSettings::default()),
             tx_store: Some(tx_store),
             node_store,
+            pruner,
             running: false,
         })
     }
@@ -238,7 +252,7 @@ impl Node {
     /// Starts the RPC server and a ledger close loop that closes the
     /// ledger every `close_interval_secs` seconds. Blocks until ctrl+c.
     pub async fn run_standalone(&self, close_interval_secs: u64) -> Result<(), NodeError> {
-        let ctx = ServerContext::with_node_state(
+        let ctx = ServerContext::with_node_state_and_pruner(
             self.config.server.clone(),
             Arc::clone(&self.ledger),
             Arc::clone(&self.closed_ledgers),
@@ -247,6 +261,7 @@ impl Node {
             self.tx_store.as_ref().map(Arc::clone),
             Some(Arc::clone(&self.tx_queue)),
             None, // no relay in standalone mode
+            self.pruner.shared_state(),
         );
         let event_tx = ctx.event_sender().clone();
 
@@ -297,6 +312,8 @@ impl Node {
         let fees_close = Arc::clone(&self.fees);
         let event_tx = event_tx.clone();
         let interval_duration = Duration::from_secs(close_interval_secs);
+        let pruner = Arc::clone(&self.pruner);
+        let node_store_prune = self.node_store.clone();
 
         tokio::spawn(async move {
             let adapter = NodeConsensusAdapter::new();
@@ -487,6 +504,26 @@ impl Node {
                 while history.len() > crate::consensus_adapter::MAX_CLOSED_LEDGERS {
                     history.pop_front();
                 }
+
+                // Ledger history pruning
+                if pruner.should_prune(seq) {
+                    if let Some(ref store) = node_store_prune {
+                        let retention = pruner.shared_state().retention_window;
+                        let cutoff_seq = seq.saturating_sub(retention);
+
+                        // Collect old ledgers eligible for pruning
+                        let old: Vec<_> = history.iter()
+                            .filter(|l| l.header.sequence <= cutoff_seq)
+                            .cloned()
+                            .collect();
+
+                        // The retained ledger is the first one after the cutoff
+                        let retained = history.iter()
+                            .find(|l| l.header.sequence > cutoff_seq);
+
+                        let _deleted = pruner.prune(seq, &old, retained, store);
+                    }
+                }
             }
         });
 
@@ -628,7 +665,7 @@ impl Node {
         });
 
         // 7. Start RPC server
-        let ctx = ServerContext::with_node_state(
+        let ctx = ServerContext::with_node_state_and_pruner(
             self.config.server.clone(),
             Arc::clone(&self.ledger),
             Arc::clone(&self.closed_ledgers),
@@ -637,6 +674,7 @@ impl Node {
             self.tx_store.as_ref().map(Arc::clone),
             Some(Arc::clone(&self.tx_queue)),
             Some(relay_tx),
+            self.pruner.shared_state(),
         );
         let event_tx = ctx.event_sender().clone();
 
@@ -783,6 +821,7 @@ impl Node {
         let amendment_table = Arc::clone(&self.amendment_table);
         let node_store = self.node_store.clone();
         let tx_store = self.tx_store.as_ref().map(Arc::clone);
+        let pruner = Arc::clone(&self.pruner);
         let ledger_seq_shared = Arc::clone(&ledger_seq);
         let ledger_hash_shared = Arc::clone(&ledger_hash);
         let configured_quorum = self.config.validators.quorum;
@@ -875,6 +914,7 @@ impl Node {
                                             &tx_queue, &identity, &cmd_tx_catchup,
                                             &amendment_table, &tx_engine, &fees,
                                             &amendment_votes, trusted_validator_count,
+                                            &pruner, &node_store,
                                         ).await;
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
@@ -899,6 +939,7 @@ impl Node {
                                             &tx_queue, &identity, &cmd_tx_catchup,
                                             &amendment_table, &tx_engine, &fees,
                                             &amendment_votes, trusted_validator_count,
+                                            &pruner, &node_store,
                                         ).await;
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
@@ -924,6 +965,7 @@ impl Node {
                                         &tx_queue, &identity, &cmd_tx_catchup,
                                         &amendment_table, &tx_engine, &fees,
                                         &amendment_votes, trusted_validator_count,
+                                        &pruner, &node_store,
                                     ).await;
                                     amendment_votes.clear();
                                     trusted_validator_count = 0;
@@ -1298,6 +1340,8 @@ impl Node {
         fees: &Arc<FeeSettings>,
         validator_amendment_votes: &[Vec<Hash256>],
         trusted_validator_count: usize,
+        pruner: &Arc<LedgerPruner>,
+        node_store: &Option<Arc<dyn NodeStore>>,
     ) {
         let effective_close_time = consensus
             .accepted_close_time()
@@ -1484,6 +1528,24 @@ impl Node {
         history.push_back(compacted);
         while history.len() > crate::consensus_adapter::MAX_CLOSED_LEDGERS {
             history.pop_front();
+        }
+
+        // Ledger history pruning
+        if pruner.should_prune(closed_seq) {
+            if let Some(store) = node_store {
+                let retention = pruner.shared_state().retention_window;
+                let cutoff_seq = closed_seq.saturating_sub(retention);
+
+                let old: Vec<_> = history.iter()
+                    .filter(|l| l.header.sequence <= cutoff_seq)
+                    .cloned()
+                    .collect();
+
+                let retained = history.iter()
+                    .find(|l| l.header.sequence > cutoff_seq);
+
+                let _deleted = pruner.prune(closed_seq, &old, retained, store);
+            }
         }
     }
 
