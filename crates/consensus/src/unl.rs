@@ -142,6 +142,16 @@ impl TrustedValidatorList {
     pub fn trusted_set(&self) -> &HashSet<NodeId> {
         &self.trusted
     }
+
+    /// Get a reference to the negative UNL set.
+    pub fn negative_unl_set(&self) -> &HashSet<NodeId> {
+        &self.negative_unl
+    }
+
+    /// Check if a node is in the negative UNL.
+    pub fn is_in_negative_unl(&self, node_id: &NodeId) -> bool {
+        self.negative_unl.contains(node_id)
+    }
 }
 
 #[cfg(test)]
