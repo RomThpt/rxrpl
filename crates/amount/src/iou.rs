@@ -184,6 +184,15 @@ impl IOUAmount {
             e2 -= 1;
         }
 
+        // Check that the combined exponent won't overflow i32 before normalization.
+        // e1 + e2 + 14 must be representable; if it's wildly out of range,
+        // normalization cannot bring it back within [MIN_EXPONENT, MAX_EXPONENT].
+        let result_exponent = (e1 as i64) + (e2 as i64) + 14;
+        if result_exponent > MAX_EXPONENT as i64 + 16 {
+            // Even after normalizing a large mantissa down, the exponent would exceed MAX_EXPONENT
+            return Err(AmountError::Overflow);
+        }
+
         // 128-bit intermediate: (m1 * m2) / 10^14 + 7
         let product = (m1 as u128) * (m2 as u128);
         let result = product / (TEN_TO_14 as u128) + 7;
@@ -193,7 +202,7 @@ impl IOUAmount {
         }
 
         let result_negative = a.negative != b.negative;
-        let result_exponent = e1 + e2 + 14;
+        let result_exponent = result_exponent as i32;
 
         IOUAmount::from_parts(result as u64, result_exponent, result_negative)
     }
@@ -426,7 +435,10 @@ impl IOUAmount {
             return Ok(*a);
         }
 
-        // Align exponents - bring the smaller-exponent value up
+        // Align exponents by dividing the smaller-exponent mantissa up.
+        // NOTE: When exponents differ wildly, the smaller value's mantissa may
+        // be divided down to 0, effectively dropping it. This matches rippled
+        // behavior -- the precision loss is inherent to the fixed-mantissa format.
         let (mut m1, mut e1, n1) = (a.mantissa as i128, a.exponent, a.negative);
         let (mut m2, mut e2, n2) = (b.mantissa as i128, b.exponent, b.negative);
 
@@ -811,5 +823,196 @@ mod tests {
         let z1 = IOUAmount::ZERO;
         let z2 = IOUAmount::new(0, 0).unwrap();
         assert_eq!(z1, z2);
+    }
+
+    // --- Edge case tests ---
+
+    #[test]
+    fn add_wildly_different_exponents() {
+        // When exponents differ greatly, the tiny value is lost during alignment.
+        // This matches rippled behavior: precision loss is inherent to the format.
+        let big = IOUAmount::from_parts(1_000_000_000_000_000, 80, false).unwrap();
+        let tiny = IOUAmount::from_parts(1_000_000_000_000_000, -96, false).unwrap();
+        let result = IOUAmount::add(&big, &tiny).unwrap();
+        assert_eq!(result, big);
+    }
+
+    #[test]
+    fn sub_equal_values_clears_negative() {
+        let a = IOUAmount::from_parts(5_000_000_000_000_000, 10, false).unwrap();
+        let result = IOUAmount::sub(&a, &a).unwrap();
+        assert!(result.is_zero());
+        assert!(!result.is_negative());
+    }
+
+    #[test]
+    fn sub_negative_result() {
+        let a = IOUAmount::from_parts(1_000_000_000_000_000, 0, false).unwrap();
+        let b = IOUAmount::from_parts(2_000_000_000_000_000, 0, false).unwrap();
+        let result = IOUAmount::sub(&a, &b).unwrap();
+        assert!(result.is_negative());
+    }
+
+    #[test]
+    fn multiply_near_max_exponent() {
+        // Product: mantissa = (10^15 * 10^15)/10^14 + 7 = 10^16 + 7
+        // After normalization: mantissa/10 -> ~10^15, exp = 33+33+14+1 = 81 > MAX(80) -> Overflow
+        // Use smaller exponents so result fits: 32+33+14 = 79
+        let a = IOUAmount::from_parts(1_000_000_000_000_000, 32, false).unwrap();
+        let b = IOUAmount::from_parts(1_000_000_000_000_000, 33, false).unwrap();
+        let result = IOUAmount::multiply(&a, &b);
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        // Mantissa normalizes: (10^16+7)/10 = 10^15, exp = 79+1 = 80
+        assert_eq!(val.exponent(), 80);
+    }
+
+    #[test]
+    fn multiply_overflow_exponent() {
+        let a = IOUAmount::from_parts(1_000_000_000_000_000, 50, false).unwrap();
+        let b = IOUAmount::from_parts(1_000_000_000_000_000, 50, false).unwrap();
+        // exp would be 50 + 50 + 14 = 114, well beyond MAX_EXPONENT
+        let result = IOUAmount::multiply(&a, &b);
+        assert!(matches!(result, Err(AmountError::Overflow)));
+    }
+
+    #[test]
+    fn divide_very_small_by_very_large() {
+        let small = IOUAmount::from_parts(1_000_000_000_000_000, -96, false).unwrap();
+        let large = IOUAmount::from_parts(9_999_999_999_999_999, 80, false).unwrap();
+        let result = IOUAmount::divide(&small, &large);
+        // The result exponent would be -96 - 80 - 17 = -193, which underflows to zero
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_zero());
+    }
+
+    #[test]
+    fn mul_round_preserves_direction() {
+        let a = IOUAmount::from_parts(3_333_333_333_333_333, 0, false).unwrap();
+        let b = IOUAmount::from_parts(3_000_000_000_000_000, 0, false).unwrap();
+        let up = IOUAmount::mul_round(&a, &b, true).unwrap();
+        let down = IOUAmount::mul_round(&a, &b, false).unwrap();
+        assert!(up >= down);
+    }
+
+    #[test]
+    fn mul_round_canonicalize_does_not_undo_rounding() {
+        // Verify that canonicalize_round and subsequent normalize do not
+        // undo the rounding bias. The round-up result must always be >= round-down.
+        let a = IOUAmount::from_parts(9_999_999_999_999_999, 0, false).unwrap();
+        let b = IOUAmount::from_parts(9_999_999_999_999_999, 0, false).unwrap();
+        let up = IOUAmount::mul_round(&a, &b, true).unwrap();
+        let down = IOUAmount::mul_round(&a, &b, false).unwrap();
+        assert!(up >= down);
+
+        // Also test with values that produce remainder in division
+        let c = IOUAmount::from_parts(1_000_000_000_000_001, 0, false).unwrap();
+        let d = IOUAmount::from_parts(3_000_000_000_000_000, 0, false).unwrap();
+        let up2 = IOUAmount::mul_round(&c, &d, true).unwrap();
+        let down2 = IOUAmount::mul_round(&c, &d, false).unwrap();
+        assert!(up2 >= down2);
+    }
+
+    #[test]
+    fn div_round_canonicalize_does_not_undo_rounding() {
+        let a = IOUAmount::from_parts(1_000_000_000_000_000, 0, false).unwrap();
+        let b = IOUAmount::from_parts(3_000_000_000_000_000, 0, false).unwrap();
+        let up = IOUAmount::div_round(&a, &b, true).unwrap();
+        let down = IOUAmount::div_round(&a, &b, false).unwrap();
+        assert!(up >= down);
+    }
+
+    #[test]
+    fn mul_ratio_small_numerator() {
+        let a = IOUAmount::from_parts(1_000_000_000_000_000, 0, false).unwrap();
+        let result = a.mul_ratio(1, 3, false).unwrap();
+        assert!(!result.is_zero());
+    }
+
+    #[test]
+    fn mul_ratio_division_by_zero_returns_error() {
+        let a = IOUAmount::from_parts(1_000_000_000_000_000, 0, false).unwrap();
+        assert!(matches!(
+            a.mul_ratio(1, 0, false),
+            Err(AmountError::DivisionByZero)
+        ));
+    }
+
+    #[test]
+    fn negative_times_negative_is_positive() {
+        let a = IOUAmount::from_parts(2_000_000_000_000_000, 0, true).unwrap();
+        let b = IOUAmount::from_parts(3_000_000_000_000_000, 0, true).unwrap();
+        let result = IOUAmount::multiply(&a, &b).unwrap();
+        assert!(!result.is_negative());
+    }
+
+    #[test]
+    fn add_zero_with_positive() {
+        let zero = IOUAmount::ZERO;
+        let pos = IOUAmount::from_parts(1_000_000_000_000_000, 0, false).unwrap();
+        let result = IOUAmount::add(&zero, &pos).unwrap();
+        assert_eq!(result, pos);
+    }
+
+    #[test]
+    fn add_positive_with_zero() {
+        let pos = IOUAmount::from_parts(1_000_000_000_000_000, 0, false).unwrap();
+        let zero = IOUAmount::ZERO;
+        let result = IOUAmount::add(&pos, &zero).unwrap();
+        assert_eq!(result, pos);
+    }
+
+    #[test]
+    fn ordering_negative_vs_positive() {
+        let neg = IOUAmount::from_parts(5_000_000_000_000_000, 10, true).unwrap();
+        let pos = IOUAmount::from_parts(1_000_000_000_000_000, 0, false).unwrap();
+        assert!(neg < pos);
+    }
+
+    #[test]
+    fn ordering_same_mantissa_different_exponent() {
+        let a = IOUAmount::from_parts(1_000_000_000_000_000, 5, false).unwrap();
+        let b = IOUAmount::from_parts(1_000_000_000_000_000, 10, false).unwrap();
+        assert!(a < b);
+    }
+
+    #[test]
+    fn multiply_positive_by_negative() {
+        let pos = IOUAmount::from_parts(2_000_000_000_000_000, 0, false).unwrap();
+        let neg = IOUAmount::from_parts(3_000_000_000_000_000, 0, true).unwrap();
+        let result = IOUAmount::multiply(&pos, &neg).unwrap();
+        assert!(result.is_negative());
+    }
+
+    #[test]
+    fn divide_negative_by_negative() {
+        let a = IOUAmount::from_parts(6_000_000_000_000_000, 0, true).unwrap();
+        let b = IOUAmount::from_parts(2_000_000_000_000_000, 0, true).unwrap();
+        let result = IOUAmount::divide(&a, &b).unwrap();
+        assert!(!result.is_negative());
+    }
+
+    #[test]
+    fn sub_from_zero() {
+        let zero = IOUAmount::ZERO;
+        let pos = IOUAmount::from_parts(1_000_000_000_000_000, 0, false).unwrap();
+        let result = IOUAmount::sub(&zero, &pos).unwrap();
+        assert!(result.is_negative());
+    }
+
+    #[test]
+    fn mul_round_zero_inputs_round_up() {
+        // When both inputs are zero and round_up is true with positive signs,
+        // should return MIN_POSITIVE
+        let result = IOUAmount::mul_round(&IOUAmount::ZERO, &IOUAmount::ZERO, true).unwrap();
+        assert_eq!(result, IOUAmount::MIN_POSITIVE);
+    }
+
+    #[test]
+    fn abs_of_negative() {
+        let neg = IOUAmount::from_parts(5_000_000_000_000_000, 0, true).unwrap();
+        let pos = neg.abs();
+        assert!(!pos.is_negative());
+        assert_eq!(pos.mantissa(), 5_000_000_000_000_000);
     }
 }

@@ -132,4 +132,65 @@ mod tests {
         assert_eq!(packed_exp, 85);
         assert_eq!(packed_mantissa, MIN_MANTISSA);
     }
+
+    // --- Edge case tests ---
+
+    #[test]
+    fn rate_very_small_values() {
+        // Very small rate: tiny_in / large_out -> underflows to zero rate
+        let tiny = IOUAmount::from_parts(MIN_MANTISSA, -96, false).unwrap();
+        let large = IOUAmount::from_parts(MIN_MANTISSA, 10, false).unwrap();
+        let rate = get_rate(&tiny, &large).unwrap();
+        // exp = -96 - 10 - 17 = -123, which underflows past MIN_EXPONENT to zero
+        assert_eq!(rate, 0);
+    }
+
+    #[test]
+    fn rate_small_but_representable() {
+        // A small but representable rate
+        let small = IOUAmount::from_parts(MIN_MANTISSA, -50, false).unwrap();
+        let large = IOUAmount::from_parts(MIN_MANTISSA, 0, false).unwrap();
+        let rate = get_rate(&small, &large).unwrap();
+        assert_ne!(rate, 0);
+        let decoded = from_rate(rate).unwrap();
+        assert!(!decoded.is_zero());
+    }
+
+    #[test]
+    fn rate_very_large_values() {
+        // Very large rate: large_in / tiny_out
+        let large = IOUAmount::from_parts(MIN_MANTISSA, 10, false).unwrap();
+        let tiny = IOUAmount::from_parts(MIN_MANTISSA, -10, false).unwrap();
+        let rate = get_rate(&large, &tiny).unwrap();
+        assert_ne!(rate, 0);
+        let decoded = from_rate(rate).unwrap();
+        assert!(!decoded.is_zero());
+    }
+
+    #[test]
+    fn rate_equal_amounts() {
+        // Rate of equal amounts should be 1.0
+        let a = IOUAmount::from_parts(5_000_000_000_000_000, 5, false).unwrap();
+        let rate = get_rate(&a, &a).unwrap();
+        let decoded = from_rate(rate).unwrap();
+        assert_eq!(decoded.mantissa(), MIN_MANTISSA);
+        assert_eq!(decoded.exponent(), -15);
+    }
+
+    #[test]
+    fn better_quality_zero_handling() {
+        // Zero quality is never better than anything
+        assert!(!is_better_quality(0, 0));
+        assert!(!is_better_quality(0, 100));
+        assert!(is_better_quality(100, 0));
+    }
+
+    #[test]
+    fn offer_quality_delegates_to_get_rate() {
+        let a = IOUAmount::new(3_000_000_000_000_000, -15).unwrap();
+        let b = IOUAmount::new(1_000_000_000_000_000, -15).unwrap();
+        let q = offer_quality(&a, &b).unwrap();
+        let r = get_rate(&a, &b).unwrap();
+        assert_eq!(q, r);
+    }
 }

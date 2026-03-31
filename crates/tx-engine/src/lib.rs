@@ -13,6 +13,7 @@ pub mod error;
 pub mod fees;
 pub mod handlers;
 pub mod helpers;
+pub mod hooks;
 pub mod invariants;
 pub mod metadata;
 pub mod nftoken;

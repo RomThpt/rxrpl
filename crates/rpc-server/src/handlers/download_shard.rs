@@ -5,10 +5,12 @@ use serde_json::Value;
 use crate::context::ServerContext;
 use crate::error::RpcServerError;
 
-/// Admin command to initiate downloading a shard from a URL.
+/// Admin command to initiate downloading a shard from the P2P network.
 ///
-/// Matches rippled's `download_shard` RPC. Marks the requested shards as
-/// `Downloading` in the shard manager.
+/// Matches rippled's `download_shard` RPC. Validates the request, marks the
+/// requested shards as `Downloading` in the shard manager, and returns an
+/// acknowledgment. The actual download is driven by the overlay's ShardSyncer
+/// which periodically checks for shards in the `Downloading` state.
 pub async fn download_shard(
     params: Value,
     ctx: &Arc<ServerContext>,
@@ -24,15 +26,13 @@ pub async fn download_shard(
         ));
     }
 
-    // Validate each shard entry has required fields
+    // Validate each shard entry has required fields.
     let mut indices = Vec::new();
     for shard in shards {
         let index = shard.get("index").and_then(|v| v.as_u64()).ok_or_else(|| {
             RpcServerError::InvalidParams("each shard must have a numeric 'index'".into())
         })? as u32;
-        shard.get("url").and_then(|v| v.as_str()).ok_or_else(|| {
-            RpcServerError::InvalidParams("each shard must have a 'url' string".into())
-        })?;
+        // URL is optional for P2P downloads but still accepted for API compatibility.
         indices.push(index);
     }
 
@@ -45,13 +45,22 @@ pub async fn download_shard(
     };
 
     let mut manager = manager_lock.write().await;
-    for index in &indices {
-        manager.mark_downloading(*index);
+    let mut already_complete = Vec::new();
+    let mut queued = Vec::new();
+
+    for &index in &indices {
+        if manager.is_complete(index) {
+            already_complete.push(index);
+        } else {
+            manager.mark_downloading(index);
+            queued.push(index);
+        }
     }
 
     Ok(serde_json::json!({
         "message": "downloading shards",
         "status": "acknowledged",
-        "shard_indices": indices,
+        "shard_indices": queued,
+        "already_complete": already_complete,
     }))
 }

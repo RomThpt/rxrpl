@@ -37,5 +37,7 @@ axum = { version = "0.8", features = ["ws"] }
 metrics = { workspace = true }
 rxrpl-grpc-server = { workspace = true, optional = true }
 reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 
 [dev-dependencies]

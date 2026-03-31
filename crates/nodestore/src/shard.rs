@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use rxrpl_primitives::Hash256;
+use rxrpl_storage::KvStore;
 
 /// Number of ledgers contained in a single shard.
 pub const LEDGERS_PER_SHARD: u32 = 16384;
@@ -92,6 +93,141 @@ impl Default for ShardStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Persistent shard data store backed by a `KvStore`.
+///
+/// Key format:
+///   - `shard:{index}:{seq}` -> raw ledger data bytes
+///   - `shard_meta:{index}` -> `ShardInfo` serialized as JSON
+pub struct PersistentShardStore<S: KvStore> {
+    store: S,
+}
+
+impl<S: KvStore> PersistentShardStore<S> {
+    pub fn new(store: S) -> Self {
+        Self { store }
+    }
+
+    fn data_key(shard_index: u32, seq: u32) -> Vec<u8> {
+        format!("shard:{shard_index}:{seq}").into_bytes()
+    }
+
+    fn meta_key(shard_index: u32) -> Vec<u8> {
+        format!("shard_meta:{shard_index}").into_bytes()
+    }
+
+    /// Insert ledger data for a specific shard and sequence.
+    pub fn put(&self, shard_index: u32, seq: u32, data: Vec<u8>) -> Result<(), String> {
+        self.store
+            .put(&Self::data_key(shard_index, seq), &data)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Retrieve ledger data for a specific shard and sequence.
+    pub fn get(&self, shard_index: u32, seq: u32) -> Result<Option<Vec<u8>>, String> {
+        self.store
+            .get(&Self::data_key(shard_index, seq))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Check if a specific ledger entry exists.
+    pub fn exists(&self, shard_index: u32, seq: u32) -> Result<bool, String> {
+        self.store
+            .exists(&Self::data_key(shard_index, seq))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Store shard metadata as JSON.
+    pub fn put_meta(&self, info: &ShardInfo) -> Result<(), String> {
+        let state_str = match &info.state {
+            ShardState::Complete => "complete".to_string(),
+            ShardState::Incomplete { stored_count } => format!("incomplete:{stored_count}"),
+            ShardState::Downloading => "downloading".to_string(),
+        };
+        let hash_str = info
+            .last_hash
+            .map(|h| h.to_string())
+            .unwrap_or_default();
+        let meta = format!(
+            "{}:{}:{}:{}:{}",
+            info.index, state_str, info.first_seq, info.last_seq, hash_str
+        );
+        self.store
+            .put(&Self::meta_key(info.index), meta.as_bytes())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Retrieve shard metadata.
+    pub fn get_meta(&self, shard_index: u32) -> Result<Option<ShardInfo>, String> {
+        match self.store.get(&Self::meta_key(shard_index)) {
+            Ok(Some(bytes)) => {
+                let s = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+                parse_shard_meta(&s).map(Some)
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+/// Parse the serialized metadata string back into a `ShardInfo`.
+fn parse_shard_meta(s: &str) -> Result<ShardInfo, String> {
+    let parts: Vec<&str> = s.splitn(5, ':').collect();
+    if parts.len() < 4 {
+        return Err("invalid shard meta format".into());
+    }
+
+    let index: u32 = parts[0].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+
+    let state = if parts[1] == "complete" {
+        ShardState::Complete
+    } else if parts[1] == "downloading" {
+        ShardState::Downloading
+    } else if let Some(count_str) = parts[1].strip_prefix("incomplete:") {
+        let stored_count: u32 = count_str.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+        ShardState::Incomplete { stored_count }
+    } else {
+        // Handle the case where the state field itself contains a colon
+        // and the count is in the next part
+        if parts[1] == "incomplete" && parts.len() >= 5 {
+            let stored_count: u32 = parts[2].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+            // Re-parse with adjusted positions
+            let first_seq: u32 = parts[3].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+            let rest = if parts.len() > 4 { parts[4] } else { "" };
+            let rest_parts: Vec<&str> = rest.splitn(2, ':').collect();
+            let last_seq: u32 = rest_parts[0].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+            let last_hash = if rest_parts.len() > 1 && !rest_parts[1].is_empty() {
+                rest_parts[1].parse::<Hash256>().ok()
+            } else {
+                None
+            };
+            return Ok(ShardInfo {
+                index,
+                state: ShardState::Incomplete { stored_count },
+                first_seq,
+                last_seq,
+                last_hash,
+            });
+        }
+        return Err(format!("unknown shard state: {}", parts[1]));
+    };
+
+    let first_seq: u32 = parts[2].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+    let last_seq: u32 = parts[3].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+    let last_hash = if parts.len() > 4 && !parts[4].is_empty() {
+        parts[4].parse::<Hash256>().ok()
+    } else {
+        None
+    };
+
+    Ok(ShardInfo {
+        index,
+        state,
+        first_seq,
+        last_seq,
+        last_hash,
+    })
 }
 
 /// Manages shard metadata and coordinates imports.
@@ -187,6 +323,45 @@ impl ShardManager {
         self.shards
             .get(&index)
             .map(|s| s.state == ShardState::Complete)
+            .unwrap_or(false)
+    }
+
+    /// Return indices of all complete shards.
+    pub fn complete_shard_indices(&self) -> Vec<u32> {
+        let mut indices: Vec<u32> = self
+            .shards
+            .values()
+            .filter(|s| s.state == ShardState::Complete)
+            .map(|s| s.index)
+            .collect();
+        indices.sort();
+        indices
+    }
+
+    /// Return `(index, stored_count)` pairs for all incomplete shards.
+    pub fn incomplete_shard_info(&self) -> Vec<(u32, u32)> {
+        let mut result: Vec<(u32, u32)> = self
+            .shards
+            .values()
+            .filter_map(|s| match s.state {
+                ShardState::Incomplete { stored_count } => Some((s.index, stored_count)),
+                _ => None,
+            })
+            .collect();
+        result.sort_by_key(|(idx, _)| *idx);
+        result
+    }
+
+    /// Retrieve raw ledger data from the store.
+    pub fn get_ledger_data(&self, shard_index: u32, seq: u32) -> Option<&[u8]> {
+        self.store.get(shard_index, seq)
+    }
+
+    /// Check whether a shard is currently being downloaded.
+    pub fn is_downloading(&self, index: u32) -> bool {
+        self.shards
+            .get(&index)
+            .map(|s| s.state == ShardState::Downloading)
             .unwrap_or(false)
     }
 }

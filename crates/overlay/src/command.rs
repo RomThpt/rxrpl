@@ -18,4 +18,6 @@ pub enum OverlayCommand {
     ConnectTo { addr: String },
     /// Request a specific ledger from peers.
     RequestLedger { seq: u32, hash: Option<Hash256> },
+    /// Request download of a specific shard index from peers.
+    RequestShard { shard_index: u32 },
 }

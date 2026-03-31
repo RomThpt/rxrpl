@@ -89,6 +89,9 @@ async fn dispatch_inner(
         "sign_for" => handlers::sign_for(params, ctx).await,
         "simulate" => handlers::simulate(params, ctx).await,
 
+        // Queue
+        "queue_info" => handlers::queue_info(params, ctx).await,
+
         // Trading & NFT
         "book_offers" => handlers::book_offers(params, ctx).await,
         "book_changes" => handlers::book_changes(params, ctx).await,

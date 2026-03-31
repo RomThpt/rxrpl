@@ -10,6 +10,12 @@ pub enum TxqError {
     #[error("fee too low: need at least {0} drops")]
     FeeTooLow(u64),
 
+    #[error("fee too low for replacement: new tx must pay a higher fee")]
+    FeeTooLowForReplacement,
+
+    #[error("sequence gap: transaction sequence too far ahead")]
+    SequenceGap,
+
     #[error("duplicate transaction")]
     Duplicate,
 

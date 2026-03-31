@@ -6,7 +6,7 @@ use rxrpl_config::ServerConfig;
 use rxrpl_ledger::Ledger;
 use rxrpl_nodestore::ShardManager;
 use rxrpl_primitives::Hash256;
-use rxrpl_storage::TxStore;
+use rxrpl_storage::{LedgerStore, TxStore};
 use rxrpl_tx_engine::{FeeSettings, TxEngine};
 use rxrpl_txq::TxQueue;
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -55,6 +55,8 @@ pub struct ServerContext {
     pub peer_reservations: Arc<RwLock<HashSet<String>>>,
     pub pruner_state: Option<Arc<PrunerState>>,
     pub shard_manager: Option<Arc<RwLock<ShardManager>>>,
+    /// Ledger store for reporting mode (historical ledger and tx data).
+    pub ledger_store: Option<Arc<dyn LedgerStore>>,
     /// Whether the node is running in reporting mode (read-only, no consensus).
     pub reporting_mode: bool,
     /// URL to forward write requests to when in reporting mode.
@@ -78,6 +80,7 @@ impl ServerContext {
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
             pruner_state: None,
             shard_manager: None,
+            ledger_store: None,
             reporting_mode: false,
             forward_url: None,
             event_tx,
@@ -110,6 +113,7 @@ impl ServerContext {
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
             pruner_state: None,
             shard_manager: None,
+            ledger_store: None,
             reporting_mode: false,
             forward_url: None,
             event_tx,
@@ -143,6 +147,7 @@ impl ServerContext {
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
             pruner_state: None,
             shard_manager: None,
+            ledger_store: None,
             reporting_mode: false,
             forward_url: None,
             event_tx,
@@ -176,6 +181,7 @@ impl ServerContext {
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
             pruner_state: Some(pruner_state),
             shard_manager: None,
+            ledger_store: None,
             reporting_mode: false,
             forward_url: None,
             event_tx,
@@ -186,6 +192,7 @@ impl ServerContext {
     pub fn for_reporting(
         config: ServerConfig,
         forward_url: String,
+        ledger_store: Arc<dyn LedgerStore>,
     ) -> Arc<Self> {
         let (event_tx, _) = broadcast::channel(1024);
         Arc::new(Self {
@@ -201,6 +208,7 @@ impl ServerContext {
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
             pruner_state: None,
             shard_manager: None,
+            ledger_store: Some(ledger_store),
             reporting_mode: true,
             forward_url: Some(forward_url),
             event_tx,

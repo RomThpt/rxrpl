@@ -10,6 +10,35 @@ use crate::context::ServerContext;
 use crate::error::RpcServerError;
 
 pub async fn submit(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcServerError> {
+    // In reporting mode, forward submit requests to the upstream node
+    if ctx.reporting_mode {
+        let forward_url = ctx
+            .forward_url
+            .as_ref()
+            .ok_or_else(|| RpcServerError::Internal("no forward URL configured".into()))?;
+
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({
+            "method": "submit",
+            "params": [params]
+        });
+
+        let response = client
+            .post(forward_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| RpcServerError::Internal(format!("forward request failed: {e}")))?;
+
+        let result: Value = response
+            .json()
+            .await
+            .map_err(|e| RpcServerError::Internal(format!("failed to parse forward response: {e}")))?;
+
+        // The upstream response wraps the result under "result"
+        return Ok(result.get("result").cloned().unwrap_or(result));
+    }
+
     let tx_blob = params
         .get("tx_blob")
         .and_then(|v| v.as_str())
@@ -122,6 +151,7 @@ pub async fn submit(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
                     account,
                     sequence,
                     last_ledger_sequence,
+                    preflight_passed: true,
                 };
                 let _ = tx_queue.write().await.submit(entry);
             }

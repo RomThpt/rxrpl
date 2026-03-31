@@ -22,6 +22,43 @@ pub async fn ledger(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
         .and_then(|v| v.as_str())
         .unwrap_or("current");
 
+    // In reporting mode, query the ledger store for historical headers
+    if ctx.reporting_mode {
+        if let Some(ref store) = ctx.ledger_store {
+            let seq = match ledger_index {
+                "current" | "closed" | "validated" => {
+                    store
+                        .latest_sequence()
+                        .map_err(|e| RpcServerError::Internal(format!("storage error: {e}")))?
+                        .ok_or_else(|| {
+                            RpcServerError::Internal("no ledger data available yet".into())
+                        })?
+                }
+                index => index.parse::<u32>().map_err(|_| {
+                    RpcServerError::InvalidParams(format!("invalid ledger_index: {index}"))
+                })?,
+            };
+
+            let record = store
+                .get_ledger_header(seq)
+                .map_err(|e| RpcServerError::Internal(format!("storage error: {e}")))?
+                .ok_or_else(|| {
+                    RpcServerError::InvalidParams(format!("ledger {seq} not found"))
+                })?;
+
+            return Ok(serde_json::json!({
+                "ledger": {
+                    "ledger_index": record.sequence,
+                    "ledger_hash": hex::encode(&record.hash),
+                    "closed": true,
+                }
+            }));
+        }
+        return Err(RpcServerError::Internal(
+            "reporting mode has no ledger store".into(),
+        ));
+    }
+
     match ledger_index {
         "current" => {
             let ledger = ctx

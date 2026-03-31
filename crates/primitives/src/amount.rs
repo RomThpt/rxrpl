@@ -275,4 +275,56 @@ mod tests {
         let amount = XrpAmount::from_xrp(1).unwrap();
         assert_eq!(amount.drops(), 1_000_000);
     }
+
+    // --- Edge case tests ---
+
+    #[test]
+    fn xrp_negative_add() {
+        let a = XrpAmount::from_drops(100).unwrap();
+        let b = XrpAmount::from_drops(-50).unwrap();
+        let result = a.checked_add(b).unwrap();
+        assert_eq!(result.drops(), 50);
+    }
+
+    #[test]
+    fn xrp_max_supply_overflow() {
+        let max = XrpAmount::from_drops(MAX_XRP_DROPS).unwrap();
+        let one = XrpAmount::from_drops(1).unwrap();
+        assert!(max.checked_add(one).is_none());
+    }
+
+    #[test]
+    fn xrp_underflow() {
+        let a = XrpAmount::from_drops(-MAX_XRP_DROPS).unwrap();
+        let b = XrpAmount::from_drops(-1).unwrap();
+        assert!(a.checked_add(b).is_none());
+    }
+
+    #[test]
+    fn xrp_sub_overflow() {
+        let a = XrpAmount::from_drops(-MAX_XRP_DROPS).unwrap();
+        let b = XrpAmount::from_drops(1).unwrap();
+        assert!(a.checked_sub(b).is_none());
+    }
+
+    #[test]
+    fn xrp_zero_operations() {
+        let zero = XrpAmount::ZERO;
+        let a = XrpAmount::from_drops(100).unwrap();
+        assert_eq!(zero.checked_add(a).unwrap().drops(), 100);
+        assert_eq!(a.checked_sub(a).unwrap().drops(), 0);
+    }
+
+    #[test]
+    fn xrp_from_xrp_overflow() {
+        // i64::MAX / 1_000_000 will overflow when multiplied back
+        assert!(XrpAmount::from_xrp(i64::MAX).is_err());
+    }
+
+    #[test]
+    fn xrp_negative_from_drops() {
+        let neg = XrpAmount::from_drops(-1_000_000).unwrap();
+        assert!(neg.is_negative());
+        assert_eq!(neg.drops(), -1_000_000);
+    }
 }

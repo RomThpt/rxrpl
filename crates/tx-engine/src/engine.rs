@@ -180,6 +180,21 @@ impl TxEngine {
             Ok(result) => {
                 // tes: merge child mutations into parent
                 sandbox.merge_child_changes(child_changes);
+
+                // Execute hooks on the destination account (if any)
+                if result == TransactionResult::TesSuccess {
+                    let tx_hash = rxrpl_protocol::tx::compute_tx_hash(tx)
+                        .unwrap_or_default();
+                    if let Some(hook_result) =
+                        crate::hooks::execute_hooks_for_tx(tx, &tx_hash, &sandbox)
+                    {
+                        if hook_result.rollback {
+                            // A hook called rollback -- revert the transaction
+                            return Ok(TransactionResult::TecHookRejected);
+                        }
+                    }
+                }
+
                 (result, true)
             }
             Err(result) if result.is_claimed() => {

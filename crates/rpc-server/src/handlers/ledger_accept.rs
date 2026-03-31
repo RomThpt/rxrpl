@@ -12,8 +12,9 @@ use crate::error::RpcServerError;
 /// Close the current ledger in standalone mode and open a new one.
 ///
 /// After closing, queued transactions are re-applied against the fresh open
-/// ledger in fee-priority order (highest fee first). Transactions that still
-/// succeed are re-queued; the rest are silently dropped.
+/// ledger in sequence order within each account, with accounts processed in
+/// fee-priority order (highest fee first). Transactions that still succeed are
+/// re-queued; the rest are silently dropped.
 pub async fn ledger_accept(
     _params: Value,
     ctx: &Arc<ServerContext>,
@@ -82,38 +83,51 @@ pub async fn ledger_accept(
             // First remove confirmed txs (already in closed ledger's tx_map)
             // and expired entries, then drain the rest for retry.
             q.remove_expired(new_seq);
-            q.drain_for_retry()
+            q.drain_for_retry_ordered()
         };
 
         let rules = Rules::new();
         let mut requeue = Vec::new();
+        let mut applied_count: u64 = 0;
+        let mut dropped_count: u64 = 0;
 
-        for entry in pending {
-            match engine.apply(&entry.tx, &mut ledger, &rules, fees) {
-                Ok(result) if result.is_success() => {
-                    let fee_drops = entry
-                        .tx
-                        .get("Fee")
-                        .and_then(|f| f.as_str())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    requeue.push(QueueEntry {
-                        hash: entry.hash,
-                        tx: entry.tx,
-                        fee_level: FeeLevel::new(fee_drops, fees.base_fee),
-                        account: entry.account,
-                        sequence: entry.sequence,
-                        last_ledger_sequence: entry.last_ledger_sequence,
-                    });
-                }
-                _ => {
-                    // Transaction no longer valid -- drop it silently.
+        for (_account, entries) in pending {
+            for entry in entries {
+                match engine.apply(&entry.tx, &mut ledger, &rules, fees) {
+                    Ok(result) if result.is_success() => {
+                        let fee_drops = entry
+                            .tx
+                            .get("Fee")
+                            .and_then(|f| f.as_str())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        requeue.push(QueueEntry {
+                            hash: entry.hash,
+                            tx: entry.tx,
+                            fee_level: FeeLevel::new(fee_drops, fees.base_fee),
+                            account: entry.account,
+                            sequence: entry.sequence,
+                            last_ledger_sequence: entry.last_ledger_sequence,
+                            preflight_passed: entry.preflight_passed,
+                        });
+                        applied_count += 1;
+                    }
+                    _ => {
+                        // Transaction no longer valid -- drop it silently.
+                        dropped_count += 1;
+                    }
                 }
             }
         }
 
-        // Re-insert surviving entries.
+        // Re-insert surviving entries and update metrics.
         let mut q = tq.write().await;
+        for _ in 0..applied_count {
+            q.record_applied();
+        }
+        for _ in 0..dropped_count {
+            q.record_drop();
+        }
         for entry in requeue {
             let _ = q.submit(entry);
         }

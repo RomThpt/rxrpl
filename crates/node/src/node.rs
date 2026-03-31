@@ -1151,6 +1151,7 @@ impl Node {
                                                 account,
                                                 sequence,
                                                 last_ledger_sequence,
+                                                preflight_passed: true,
                                             };
                                             let _ = tx_queue.write().await.submit(entry);
                                         }

@@ -15,6 +15,37 @@ pub async fn account_tx(params: Value, ctx: &Arc<ServerContext>) -> Result<Value
         .unwrap_or(200)
         .min(400) as u32;
 
+    // In reporting mode, use the ledger store for account tx history
+    if ctx.reporting_mode {
+        if let Some(ref ledger_store) = ctx.ledger_store {
+            let records = ledger_store
+                .get_account_txs(account_id.as_bytes(), limit)
+                .map_err(|e| RpcServerError::Internal(format!("storage error: {e}")))?;
+
+            let mut transactions = Vec::new();
+            for record in &records {
+                let tx_json: Value =
+                    serde_json::from_slice(&record.tx_blob).unwrap_or(Value::Null);
+                let meta: Value =
+                    serde_json::from_slice(&record.meta_blob).unwrap_or(Value::Null);
+                transactions.push(serde_json::json!({
+                    "tx": tx_json,
+                    "meta": meta,
+                    "validated": true,
+                }));
+            }
+
+            let account_str = params["account"].as_str().unwrap_or_default();
+            return Ok(serde_json::json!({
+                "account": account_str,
+                "transactions": transactions,
+            }));
+        }
+        return Err(RpcServerError::Internal(
+            "reporting mode has no ledger store".into(),
+        ));
+    }
+
     let store = ctx
         .tx_store
         .as_ref()

@@ -7,5 +7,6 @@ pub mod proto {
 
 pub mod codec;
 pub mod message;
+pub mod shard_msg;
 
 pub use message::MessageType;

@@ -22,6 +22,10 @@ pub enum MessageType {
     ValidatorListCollection = 56,
     HaveTransactions = 63,
     Transactions = 64,
+    GetShards = 70,
+    Shards = 71,
+    GetShardData = 72,
+    ShardData = 73,
 }
 
 impl MessageType {
@@ -45,6 +49,10 @@ impl MessageType {
             56 => Some(Self::ValidatorListCollection),
             63 => Some(Self::HaveTransactions),
             64 => Some(Self::Transactions),
+            70 => Some(Self::GetShards),
+            71 => Some(Self::Shards),
+            72 => Some(Self::GetShardData),
+            73 => Some(Self::ShardData),
             _ => None,
         }
     }
