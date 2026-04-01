@@ -1,4 +1,6 @@
+use rxrpl_amendment::feature::feature_id;
 use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_primitives::AccountId;
 use rxrpl_protocol::TransactionResult;
 use rxrpl_protocol::keylet;
 use serde_json::Value;
@@ -60,6 +62,14 @@ impl Transactor for OfferCreateTransactor {
             return Err(TransactionResult::TerNoAccount);
         }
 
+        // PermissionedDEX: if the amendment is enabled and an IOU asset's
+        // issuer has the lsfPermissionedDEX flag set, verify the trader
+        // holds accepted credentials from the issuer's PermissionedDomain.
+        if ctx.rules.enabled(&feature_id("PermissionedDEX")) {
+            check_permissioned_asset(ctx, &account_id, ctx.tx.get("TakerPays"))?;
+            check_permissioned_asset(ctx, &account_id, ctx.tx.get("TakerGets"))?;
+        }
+
         Ok(())
     }
 
@@ -107,4 +117,87 @@ impl Transactor for OfferCreateTransactor {
 
         Ok(TransactionResult::TesSuccess)
     }
+}
+
+/// Permissioned DEX flag on an issuer's AccountRoot.
+const LSF_PERMISSIONED_DEX: u32 = 0x0080_0000;
+
+/// Check if an IOU asset's issuer requires permissioned DEX access.
+///
+/// If the issuer has `lsfPermissionedDEX` set, verifies the trader holds
+/// accepted credentials from the issuer's PermissionedDomain. XRP assets
+/// are always allowed.
+fn check_permissioned_asset(
+    ctx: &PreclaimContext<'_>,
+    trader_id: &AccountId,
+    asset: Option<&Value>,
+) -> Result<(), TransactionResult> {
+    let asset = match asset {
+        Some(v) if v.is_object() => v,
+        _ => return Ok(()), // XRP or missing -- no restriction
+    };
+
+    // Extract issuer from the IOU object
+    let issuer_str = match asset.get("issuer").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    let issuer_id =
+        decode_account_id(issuer_str).map_err(|_| TransactionResult::TemMalformed)?;
+    let issuer_key = keylet::account(&issuer_id);
+
+    let issuer_bytes = match ctx.view.read(&issuer_key) {
+        Some(b) => b,
+        None => return Ok(()), // Issuer not found -- let other checks handle
+    };
+
+    let issuer_obj: Value =
+        serde_json::from_slice(&issuer_bytes).map_err(|_| TransactionResult::TemMalformed)?;
+
+    let flags = helpers::get_flags(&issuer_obj);
+    if flags & LSF_PERMISSIONED_DEX == 0 {
+        return Ok(()); // Issuer does not require permissioned DEX
+    }
+
+    // Issuer requires PermissionedDEX -- check if trader has credentials.
+    // Look up the issuer's PermissionedDomain and verify the trader holds
+    // at least one accepted credential type.
+    //
+    // For simplicity, we check the issuer's first PermissionedDomain (seq 0)
+    // and look for a matching credential from the trader.
+    let domain_key = keylet::permissioned_domain(&issuer_id, 0);
+    if let Some(domain_bytes) = ctx.view.read(&domain_key) {
+        let domain: Value =
+            serde_json::from_slice(&domain_bytes).map_err(|_| TransactionResult::TemMalformed)?;
+
+        if let Some(accepted) = domain
+            .get("AcceptedCredentials")
+            .and_then(|v| v.as_array())
+        {
+            for entry in accepted {
+                let cred_issuer_str = entry
+                    .get("AcceptedCredential")
+                    .and_then(|c| c.get("Issuer"))
+                    .and_then(|v| v.as_str());
+                let cred_type = entry
+                    .get("AcceptedCredential")
+                    .and_then(|c| c.get("CredentialType"))
+                    .and_then(|v| v.as_str());
+
+                if let (Some(ci_str), Some(ct)) = (cred_issuer_str, cred_type) {
+                    if let Ok(ci_id) = decode_account_id(ci_str) {
+                        let cred_key =
+                            keylet::credential(trader_id, &ci_id, ct.as_bytes());
+                        if ctx.view.exists(&cred_key) {
+                            return Ok(()); // Trader holds an accepted credential
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // No valid credential found
+    Err(TransactionResult::TecNoPermission)
 }

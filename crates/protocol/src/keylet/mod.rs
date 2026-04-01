@@ -40,6 +40,8 @@ pub enum LedgerNamespace {
     Vault = 0x0056,                      // 'V'
     HookDefinition = 0x0068,             // 'h' (hook definition)
     HookState = 0x0076,                  // 'v' (hook state)
+    LoanBroker = 0x006C,                  // 'l' (loan broker)
+    Loan = 0x004C,                        // 'L' (loan)
 }
 
 /// Compute a ledger index by hashing: space_u16_be || data...
@@ -286,6 +288,16 @@ pub fn hook_state(owner: &AccountId, namespace: &[u8; 32], key: &[u8; 32]) -> Ha
         LedgerNamespace::HookState,
         &[owner.as_bytes(), namespace.as_slice(), key.as_slice()],
     )
+}
+
+/// Compute the keylet for a loan broker.
+pub fn loan_broker(account: &[u8], sequence: u32) -> Hash256 {
+    index_hash(LedgerNamespace::LoanBroker, &[account, &sequence.to_be_bytes()])
+}
+
+/// Compute the keylet for a loan.
+pub fn loan(broker_id: &[u8], loan_sequence: u32) -> Hash256 {
+    index_hash(LedgerNamespace::Loan, &[broker_id, &loan_sequence.to_be_bytes()])
 }
 
 /// Compute the keylet for a credential.
