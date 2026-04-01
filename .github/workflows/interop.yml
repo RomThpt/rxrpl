@@ -1,0 +1,61 @@
+name: Interop Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      rippled_image:
+        description: 'rippled Docker image'
+        default: 'rippleci/rippled:2.3.0'
+        type: string
+      suite:
+        description: 'Test suite (all, propagation, consensus, sync)'
+        default: 'all'
+        type: string
+  schedule:
+    # Run weekly on Sunday at 02:00 UTC
+    - cron: '0 2 * * 0'
+
+env:
+  RIPPLED_IMAGE: ${{ inputs.rippled_image || 'rippleci/rippled:2.3.0' }}
+
+jobs:
+  interop:
+    name: Mixed Network (${{ inputs.suite || 'all' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate network configs
+        run: python3 interop/scripts/generate_configs.py
+
+      - name: Build rxrpl Docker image
+        run: docker build -t rxrpl:interop -f Dockerfile .
+
+      - name: Start mixed network
+        working-directory: interop
+        run: docker compose up -d --build
+
+      - name: Wait for network startup
+        run: sleep 30
+
+      - name: Run interop tests
+        working-directory: interop
+        run: |
+          docker compose run --rm test-runner \
+            python -m pytest tests/ -v --tb=short \
+            ${{ inputs.suite && inputs.suite != 'all' && format('-k {0}', inputs.suite) || '' }}
+
+      - name: Collect logs on failure
+        if: failure()
+        working-directory: interop
+        run: |
+          for svc in rippled-0 rippled-1 rippled-2 rxrpl-0 rxrpl-1; do
+            echo "=== $svc ==="
+            docker compose logs --tail=50 "$svc" || true
+          done
+
+      - name: Teardown
+        if: always()
+        working-directory: interop
+        run: docker compose down -v --remove-orphans
