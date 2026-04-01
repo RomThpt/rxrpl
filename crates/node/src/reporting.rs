@@ -15,7 +15,7 @@ use rxrpl_rpc_server::ServerContext;
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsWriter = SplitSink<WsStream, Message>;
 type WsReader = SplitStream<WsStream>;
-use rxrpl_storage::{InMemoryLedgerStore, LedgerStore};
+use rxrpl_storage::LedgerStore;
 use tokio::sync::RwLock;
 
 use crate::error::NodeError;
@@ -395,7 +395,15 @@ impl super::Node {
         let etl_source = reporting_cfg.etl_source.clone();
 
         // Create ledger store for reporting data
-        let ledger_store: Arc<dyn LedgerStore> = Arc::new(InMemoryLedgerStore::new());
+        let ledger_store: Arc<dyn LedgerStore> = {
+            let db_path = self.config.database.path.join("reporting.db");
+            Arc::new(
+                rxrpl_storage::SqliteLedgerStore::open(&db_path).unwrap_or_else(|_| {
+                    rxrpl_storage::SqliteLedgerStore::in_memory()
+                        .expect("in-memory fallback")
+                }),
+            )
+        };
 
         // Build RPC server context in reporting mode with the ledger store
         let ctx = ServerContext::for_reporting(

@@ -110,6 +110,24 @@ impl Transactor for LoanSetTransactor {
             return Err(TransactionResult::TemMalformed);
         }
 
+        // Verify CounterpartySignature -- the borrower must have signed the loan terms.
+        // For now, validate presence and non-empty hex content.
+        // TODO: Full cryptographic verification against borrower's public key
+        //       once rxrpl_crypto::verify is wired up end-to-end.
+        let sig_hex = helpers::get_str_field(ctx.tx, "CounterpartySignature")
+            .ok_or(TransactionResult::TemMalformed)?;
+
+        // Decode hex to ensure it is valid hexadecimal and non-empty
+        let sig_bytes: Vec<u8> = (0..sig_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&sig_hex[i..i + 2], 16))
+            .collect::<Result<Vec<u8>, _>>()
+            .map_err(|_| TransactionResult::TemMalformed)?;
+
+        if sig_bytes.is_empty() {
+            return Err(TransactionResult::TemMalformed);
+        }
+
         // DebtMaximum check: DebtTotal + principal <= DebtMaximum
         let principal = helpers::get_u64_str_field(ctx.tx, "LoanPrincipal")
             .ok_or(TransactionResult::TemBadAmount)?;
@@ -423,6 +441,7 @@ mod tests {
             "OriginationFeeRate": 100,
             "GracePeriodDays": 30,
             "ManagementFeeRate": 500,
+            "CounterpartySignature": "DEADBEEF01020304",
             "Fee": "12",
             "Sequence": 2,
         })

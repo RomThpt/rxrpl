@@ -80,6 +80,46 @@ pub fn execute_hooks_for_tx(
             otxn_amount,
         );
 
+        // Read HookOn from hook entry
+        if let Some(hook_on_val) = hook_entry.get("HookOn").and_then(|v| v.as_str()) {
+            if let Ok(bytes) = hex::decode(hook_on_val) {
+                if bytes.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    ctx.hook_on = Some(arr);
+                }
+            }
+        }
+
+        // Read HookGrants from hook entry
+        if let Some(grants_arr) = hook_entry.get("HookGrants").and_then(|v| v.as_array()) {
+            for grant in grants_arr {
+                let g = grant.get("HookGrant").unwrap_or(grant);
+                let authorize = g
+                    .get("Authorize")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| decode_account_id(s).ok().map(|a| a.0));
+                let hook_hash = g
+                    .get("HookHash")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| {
+                        hex::decode(s).ok().and_then(|b| {
+                            if b.len() == 32 {
+                                let mut a = [0u8; 32];
+                                a.copy_from_slice(&b);
+                                Some(a)
+                            } else {
+                                None
+                            }
+                        })
+                    });
+                ctx.grants.push(rxrpl_hooks::HookGrant {
+                    authorize,
+                    hook_hash,
+                });
+            }
+        }
+
         // Populate otxn_fields from the transaction JSON
         populate_otxn_fields(&mut ctx, tx);
 

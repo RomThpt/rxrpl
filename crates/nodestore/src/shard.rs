@@ -330,6 +330,26 @@ impl ShardManager {
 
         info.state = state;
         info.last_hash = Some(hash);
+
+        let is_complete = info.state == ShardState::Complete;
+        // Release the mutable borrow on `self.shards` before calling verify_shard
+        let _ = info;
+
+        // Verify shard integrity on completion
+        if is_complete {
+            match self.verify_shard(index) {
+                Ok(true) => { /* chain verified */ }
+                Ok(false) => {
+                    // Chain broken -- revert to incomplete
+                    if let Some(shard_info) = self.shards.get_mut(&index) {
+                        shard_info.state = ShardState::Incomplete {
+                            stored_count: self.store.count_for_shard(index),
+                        };
+                    }
+                }
+                Err(_) => { /* verification error -- leave as complete, log would go here */ }
+            }
+        }
     }
 
     /// Mark a shard as downloading.
@@ -649,8 +669,9 @@ mod tests {
             manager.import_ledger(*seq, *hash, data.clone());
         }
 
-        assert!(manager.is_complete(TEST_SHARD_INDEX));
-        assert_eq!(manager.verify_shard(TEST_SHARD_INDEX).unwrap(), false);
+        // Verification now runs automatically on completion inside import_ledger,
+        // so a broken chain is reverted to Incomplete.
+        assert!(!manager.is_complete(TEST_SHARD_INDEX));
     }
 
     #[test]
