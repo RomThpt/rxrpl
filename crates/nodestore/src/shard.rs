@@ -5,9 +5,36 @@
 //! downloaded, and queried independently.
 
 use std::collections::HashMap;
+use std::fmt;
 
+use rxrpl_ledger::header::LedgerHeader;
 use rxrpl_primitives::Hash256;
 use rxrpl_storage::KvStore;
+
+/// Errors that can occur during shard verification.
+#[derive(Debug)]
+pub enum ShardVerifyError {
+    /// The shard is not yet complete.
+    NotComplete(u32),
+    /// Missing ledger data for the given sequence in the given shard.
+    MissingData(u32, u32),
+    /// Failed to parse ledger header at the given sequence.
+    ParseError(u32),
+}
+
+impl fmt::Display for ShardVerifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotComplete(idx) => write!(f, "shard {idx} is not complete"),
+            Self::MissingData(seq, idx) => {
+                write!(f, "missing ledger data for seq {seq} in shard {idx}")
+            }
+            Self::ParseError(seq) => write!(f, "failed to parse ledger header at seq {seq}"),
+        }
+    }
+}
+
+impl std::error::Error for ShardVerifyError {}
 
 /// Number of ledgers contained in a single shard.
 pub const LEDGERS_PER_SHARD: u32 = 16384;
@@ -357,6 +384,45 @@ impl ShardManager {
         self.store.get(shard_index, seq)
     }
 
+    /// Verify the hash chain continuity of a complete shard.
+    ///
+    /// For each consecutive pair of ledgers `(seq, seq+1)` in the shard,
+    /// verifies that `header[seq+1].parent_hash == header[seq].hash`.
+    ///
+    /// Returns `Ok(true)` if the chain is valid, `Ok(false)` if broken.
+    pub fn verify_shard(&self, index: u32) -> Result<bool, ShardVerifyError> {
+        if !self.is_complete(index) {
+            return Err(ShardVerifyError::NotComplete(index));
+        }
+
+        let (first_seq, last_seq) = shard_range(index);
+
+        // Parse first header
+        let first_data = self
+            .store
+            .get(index, first_seq)
+            .ok_or(ShardVerifyError::MissingData(first_seq, index))?;
+        let mut prev_header =
+            LedgerHeader::from_raw_bytes(first_data).ok_or(ShardVerifyError::ParseError(first_seq))?;
+
+        // Walk the chain
+        for seq in (first_seq + 1)..=last_seq {
+            let data = self
+                .store
+                .get(index, seq)
+                .ok_or(ShardVerifyError::MissingData(seq, index))?;
+            let header =
+                LedgerHeader::from_raw_bytes(data).ok_or(ShardVerifyError::ParseError(seq))?;
+
+            if header.parent_hash != prev_header.hash {
+                return Ok(false);
+            }
+            prev_header = header;
+        }
+
+        Ok(true)
+    }
+
     /// Check whether a shard is currently being downloaded.
     pub fn is_downloading(&self, index: u32) -> bool {
         self.shards
@@ -375,6 +441,46 @@ impl Default for ShardManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rxrpl_ledger::header::{RAW_HEADER_SIZE, INITIAL_XRP_DROPS};
+
+    /// Serialize a LedgerHeader into the raw binary format (118 bytes).
+    fn header_to_raw(h: &LedgerHeader) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(RAW_HEADER_SIZE);
+        buf.extend_from_slice(&h.sequence.to_be_bytes());
+        buf.extend_from_slice(&h.drops.to_be_bytes());
+        buf.extend_from_slice(h.parent_hash.as_bytes());
+        buf.extend_from_slice(h.tx_hash.as_bytes());
+        buf.extend_from_slice(h.account_hash.as_bytes());
+        buf.extend_from_slice(&h.parent_close_time.to_be_bytes());
+        buf.extend_from_slice(&h.close_time.to_be_bytes());
+        buf.push(h.close_time_resolution);
+        buf.push(h.close_flags);
+        buf
+    }
+
+    /// Build a chain of `count` linked ledger headers starting at `first_seq`.
+    /// Returns Vec of (sequence, hash, raw_bytes).
+    fn build_header_chain(first_seq: u32, count: u32) -> Vec<(u32, Hash256, Vec<u8>)> {
+        let mut chain = Vec::with_capacity(count as usize);
+        let mut parent_hash = Hash256::ZERO;
+
+        for i in 0..count {
+            let mut h = LedgerHeader::new();
+            h.sequence = first_seq + i;
+            h.drops = INITIAL_XRP_DROPS;
+            h.parent_hash = parent_hash;
+            h.close_time = 1000 + i;
+            h.parent_close_time = if i == 0 { 0 } else { 999 + i };
+            h.close_time_resolution = 30;
+            h.hash = h.compute_hash();
+
+            let raw = header_to_raw(&h);
+            parent_hash = h.hash;
+            chain.push((h.sequence, h.hash, raw));
+        }
+
+        chain
+    }
 
     #[test]
     fn test_shard_index_for() {
@@ -475,5 +581,97 @@ mod tests {
         assert_eq!(store.get(0, 5), Some(&[1u8, 2, 3][..]));
         assert_eq!(store.get(0, 6), None);
         assert_eq!(store.get(1, 5), None);
+    }
+
+    /// Use a small shard size for verification tests to keep them fast.
+    /// We test with a "mini shard" by filling exactly LEDGERS_PER_SHARD entries.
+    /// Since that's 16384 entries, we test verify_shard logic with a smaller
+    /// manual approach instead.
+
+    #[test]
+    fn test_verify_shard_incomplete() {
+        let mut manager = ShardManager::new();
+        manager.import_ledger(0, Hash256::ZERO, vec![0u8; 32]);
+        // Shard 0 is incomplete
+        assert!(matches!(
+            manager.verify_shard(0),
+            Err(ShardVerifyError::NotComplete(0))
+        ));
+    }
+
+    #[test]
+    fn test_verify_shard_nonexistent() {
+        let manager = ShardManager::new();
+        // Shard 99 doesn't exist, so is_complete returns false
+        assert!(matches!(
+            manager.verify_shard(99),
+            Err(ShardVerifyError::NotComplete(99))
+        ));
+    }
+
+    // Use shard 1 (seq LEDGERS_PER_SHARD..2*LEDGERS_PER_SHARD) for verification
+    // tests because LedgerHeader::from_raw_bytes rejects sequence 0.
+    const TEST_SHARD_INDEX: u32 = 1;
+    const TEST_FIRST_SEQ: u32 = LEDGERS_PER_SHARD;
+
+    #[test]
+    fn test_verify_shard_valid_chain() {
+        let mut manager = ShardManager::new();
+        let chain = build_header_chain(TEST_FIRST_SEQ, LEDGERS_PER_SHARD);
+
+        for (seq, hash, data) in &chain {
+            manager.import_ledger(*seq, *hash, data.clone());
+        }
+
+        assert!(manager.is_complete(TEST_SHARD_INDEX));
+        assert_eq!(manager.verify_shard(TEST_SHARD_INDEX).unwrap(), true);
+    }
+
+    #[test]
+    fn test_verify_shard_broken_chain() {
+        let mut manager = ShardManager::new();
+        let mut chain = build_header_chain(TEST_FIRST_SEQ, LEDGERS_PER_SHARD);
+
+        // Corrupt the parent_hash of the 10th entry
+        let corrupt_idx = 10usize;
+        let corrupt_seq = TEST_FIRST_SEQ + corrupt_idx as u32;
+        let mut bad_header = LedgerHeader::new();
+        bad_header.sequence = corrupt_seq;
+        bad_header.drops = INITIAL_XRP_DROPS;
+        bad_header.parent_hash = Hash256::new([0xFF; 32]); // wrong parent
+        bad_header.close_time = 1000 + corrupt_idx as u32;
+        bad_header.parent_close_time = 999 + corrupt_idx as u32;
+        bad_header.close_time_resolution = 30;
+        bad_header.hash = bad_header.compute_hash();
+        chain[corrupt_idx] = (corrupt_seq, bad_header.hash, header_to_raw(&bad_header));
+
+        for (seq, hash, data) in &chain {
+            manager.import_ledger(*seq, *hash, data.clone());
+        }
+
+        assert!(manager.is_complete(TEST_SHARD_INDEX));
+        assert_eq!(manager.verify_shard(TEST_SHARD_INDEX).unwrap(), false);
+    }
+
+    #[test]
+    fn test_verify_shard_parse_error() {
+        let mut manager = ShardManager::new();
+        let chain = build_header_chain(TEST_FIRST_SEQ, LEDGERS_PER_SHARD);
+        let garbage_seq = TEST_FIRST_SEQ + 5;
+
+        for (seq, hash, data) in &chain {
+            if *seq == garbage_seq {
+                // Store garbage data that can't be parsed
+                manager.import_ledger(*seq, *hash, vec![0xDE; 50]);
+            } else {
+                manager.import_ledger(*seq, *hash, data.clone());
+            }
+        }
+
+        assert!(manager.is_complete(TEST_SHARD_INDEX));
+        assert!(matches!(
+            manager.verify_shard(TEST_SHARD_INDEX),
+            Err(ShardVerifyError::ParseError(seq)) if seq == garbage_seq
+        ));
     }
 }
