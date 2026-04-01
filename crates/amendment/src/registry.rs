@@ -186,6 +186,8 @@ const SUPPORTED_AMENDMENTS: &[(&str, bool)] = &[
     ("fixMPTDeliveredAmount", true),
     ("fixPriceOracleOrder", true),
     ("fixTokenEscrowV1", true),
+    ("LendingProtocol", false),
+    ("PermissionedDEX", false),
 ];
 
 #[cfg(test)]

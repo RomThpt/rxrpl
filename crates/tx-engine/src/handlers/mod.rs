@@ -24,6 +24,15 @@ pub mod escrow_cancel;
 pub mod escrow_create;
 pub mod escrow_finish;
 pub mod ledger_state_fix;
+pub mod loan_broker_cover_clawback;
+pub mod loan_broker_cover_deposit;
+pub mod loan_broker_cover_withdraw;
+pub mod loan_broker_delete;
+pub mod loan_broker_set;
+pub mod loan_delete;
+pub mod loan_manage;
+pub mod loan_pay;
+pub mod loan_set;
 pub mod mptoken_authorize;
 pub mod mptoken_issuance_create;
 pub mod mptoken_issuance_destroy;
@@ -312,6 +321,40 @@ pub fn register_phase_e(registry: &mut TransactorRegistry) {
     registry.register(
         TransactionType::XChainAddAccountCreateAttestation,
         xchain_add_account_create_attestation::XChainAddAccountCreateAttestationTransactor,
+    );
+}
+
+/// Register all implemented Phase F transaction handlers (Lending Protocol).
+pub fn register_phase_f(registry: &mut TransactorRegistry) {
+    registry.register(
+        TransactionType::LoanBrokerSet,
+        loan_broker_set::LoanBrokerSetTransactor,
+    );
+    registry.register(
+        TransactionType::LoanBrokerDelete,
+        loan_broker_delete::LoanBrokerDeleteTransactor,
+    );
+    registry.register(
+        TransactionType::LoanBrokerCoverDeposit,
+        loan_broker_cover_deposit::LoanBrokerCoverDepositTransactor,
+    );
+    registry.register(
+        TransactionType::LoanBrokerCoverWithdraw,
+        loan_broker_cover_withdraw::LoanBrokerCoverWithdrawTransactor,
+    );
+    registry.register(
+        TransactionType::LoanBrokerCoverClawback,
+        loan_broker_cover_clawback::LoanBrokerCoverClawbackTransactor,
+    );
+    registry.register(TransactionType::LoanSet, loan_set::LoanSetTransactor);
+    registry.register(TransactionType::LoanPay, loan_pay::LoanPayTransactor);
+    registry.register(
+        TransactionType::LoanManage,
+        loan_manage::LoanManageTransactor,
+    );
+    registry.register(
+        TransactionType::LoanDelete,
+        loan_delete::LoanDeleteTransactor,
     );
 }
 

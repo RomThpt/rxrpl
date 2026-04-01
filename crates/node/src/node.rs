@@ -120,6 +120,7 @@ impl Node {
         rxrpl_tx_engine::handlers::register_phase_d1(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_phase_d2(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_phase_e(&mut tx_registry);
+        rxrpl_tx_engine::handlers::register_phase_f(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_batch(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_hooks(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_stubs(&mut tx_registry);
@@ -174,6 +175,7 @@ impl Node {
         rxrpl_tx_engine::handlers::register_phase_d1(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_phase_d2(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_phase_e(&mut tx_registry);
+        rxrpl_tx_engine::handlers::register_phase_f(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_batch(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_hooks(&mut tx_registry);
         rxrpl_tx_engine::handlers::register_stubs(&mut tx_registry);
