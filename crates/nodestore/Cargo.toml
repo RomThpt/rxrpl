@@ -10,6 +10,7 @@ license.workspace = true
 rxrpl-primitives = { workspace = true }
 rxrpl-shamap = { workspace = true }
 rxrpl-storage = { workspace = true }
+rxrpl-ledger = { workspace = true }
 thiserror.workspace = true
 lru.workspace = true
 
