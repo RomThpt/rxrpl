@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use rxrpl_primitives::Hash256;
 
+use crate::grants::HookGrant;
+
 /// Maximum gas units a hook may consume per execution.
 pub const DEFAULT_GAS_LIMIT: u64 = 1_000_000;
 
@@ -42,6 +44,11 @@ pub struct HookContext {
     pub slot_data: Vec<Option<Vec<u8>>>,
     /// Transactions emitted by this hook execution.
     pub emitted_txns: Vec<Vec<u8>>,
+    /// HookOn bitmask: controls which transaction types trigger this hook.
+    /// `None` means fire for all transaction types.
+    pub hook_on: Option<[u8; 32]>,
+    /// Grants controlling foreign state access permissions.
+    pub grants: Vec<HookGrant>,
 }
 
 impl HookContext {
@@ -59,6 +66,8 @@ impl HookContext {
             otxn_fields: HashMap::new(),
             slot_data: vec![None; MAX_SLOTS],
             emitted_txns: Vec::new(),
+            hook_on: None,
+            grants: Vec::new(),
         }
     }
 
@@ -76,6 +85,8 @@ impl HookContext {
             otxn_fields: HashMap::new(),
             slot_data: vec![None; MAX_SLOTS],
             emitted_txns: Vec::new(),
+            hook_on: None,
+            grants: Vec::new(),
         }
     }
 
@@ -100,6 +111,8 @@ impl HookContext {
             otxn_fields: HashMap::new(),
             slot_data: vec![None; MAX_SLOTS],
             emitted_txns: Vec::new(),
+            hook_on: None,
+            grants: Vec::new(),
         }
     }
 

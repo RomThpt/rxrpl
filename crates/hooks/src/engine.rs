@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use wasmi::{Engine, Module, Store};
 
 use crate::context::HookContext;
+use crate::hook_on;
 use crate::host::register_host_functions;
 use crate::validation::{self, ValidationError};
 
@@ -61,6 +62,13 @@ impl HookExecutionEngine {
         wasm: &[u8],
         context: HookContext,
     ) -> Result<HookResult, EngineError> {
+        // Check HookOn filter before executing
+        if let Some(ref hook_on_mask) = context.hook_on {
+            if !hook_on::should_hook_fire(hook_on_mask, context.otxn_type) {
+                return Ok(HookResult::Accept(0));
+            }
+        }
+
         // Validate first
         validation::validate_wasm(wasm)?;
 

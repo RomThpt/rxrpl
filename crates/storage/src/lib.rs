@@ -18,6 +18,9 @@ pub mod rocksdb;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+#[cfg(feature = "sqlite")]
+pub mod sqlite_ledger;
+
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
@@ -33,6 +36,9 @@ pub use rocksdb::RocksDbStore;
 
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStore;
+
+#[cfg(feature = "sqlite")]
+pub use sqlite_ledger::SqliteLedgerStore;
 
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresStore;
