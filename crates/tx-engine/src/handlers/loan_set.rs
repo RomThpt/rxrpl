@@ -6,6 +6,17 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transac
 
 pub struct LoanSetTransactor;
 
+/// Decode a hex string into bytes.
+fn decode_hex(hex: &str) -> Result<Vec<u8>, TransactionResult> {
+    if hex.len() % 2 != 0 {
+        return Err(TransactionResult::TemMalformed);
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| TransactionResult::TemMalformed))
+        .collect()
+}
+
 /// Calculate periodic payment using amortization formula:
 /// P * [r(1+r)^n] / [(1+r)^n - 1]
 /// where P = principal, r = periodic rate, n = number of periods.
@@ -111,21 +122,48 @@ impl Transactor for LoanSetTransactor {
         }
 
         // Verify CounterpartySignature -- the borrower must have signed the loan terms.
-        // For now, validate presence and non-empty hex content.
-        // TODO: Full cryptographic verification against borrower's public key
-        //       once rxrpl_crypto::verify is wired up end-to-end.
         let sig_hex = helpers::get_str_field(ctx.tx, "CounterpartySignature")
             .ok_or(TransactionResult::TemMalformed)?;
 
-        // Decode hex to ensure it is valid hexadecimal and non-empty
-        let sig_bytes: Vec<u8> = (0..sig_hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&sig_hex[i..i + 2], 16))
-            .collect::<Result<Vec<u8>, _>>()
-            .map_err(|_| TransactionResult::TemMalformed)?;
-
+        let sig_bytes = decode_hex(sig_hex)?;
         if sig_bytes.is_empty() {
             return Err(TransactionResult::TemMalformed);
+        }
+
+        // Build the signing payload: canonical hash of the loan terms
+        // The borrower signs: BrokerOwner + BrokerSeq + Principal + Rate + MaturityDate
+        let principal_str = ctx.tx.get("LoanPrincipal")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "0".to_string());
+        let loan_rate = helpers::get_u32_field(ctx.tx, "LoanRate").unwrap_or(0);
+        let maturity = helpers::get_u64_str_field(ctx.tx, "LoanMaturityDate").unwrap_or(0) as u32;
+
+        let mut signing_data = Vec::new();
+        signing_data.extend_from_slice(broker_owner_str.as_bytes());
+        signing_data.extend_from_slice(&broker_seq.to_be_bytes());
+        signing_data.extend_from_slice(principal_str.as_bytes());
+        signing_data.extend_from_slice(&loan_rate.to_be_bytes());
+        signing_data.extend_from_slice(&maturity.to_be_bytes());
+
+        let payload_hash = rxrpl_crypto::sha512_half::sha512_half(&[&signing_data]);
+
+        // Read the borrower's public key from their AccountRoot
+        let borrower_id = decode_account_id(borrower_str)
+            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let borrower_key = keylet::account(&borrower_id);
+        let borrower_bytes = ctx.view.read(&borrower_key)
+            .ok_or(TransactionResult::TerNoAccount)?;
+        let borrower_obj: serde_json::Value =
+            serde_json::from_slice(&borrower_bytes).map_err(|_| TransactionResult::TefInternal)?;
+
+        if let Some(pub_key_hex) = borrower_obj.get("PublicKey").and_then(|v| v.as_str()) {
+            let pub_key_bytes = decode_hex(pub_key_hex)?;
+            if !rxrpl_crypto::verify_signature(&pub_key_bytes, payload_hash.as_bytes(), &sig_bytes) {
+                return Err(TransactionResult::TemBadSignature);
+            }
+        } else {
+            // Borrower has no public key on file -- cannot verify
+            return Err(TransactionResult::TemBadSignature);
         }
 
         // DebtMaximum check: DebtTotal + principal <= DebtMaximum
@@ -365,17 +403,54 @@ mod tests {
     use crate::view::read_view::ReadView;
     use crate::view::sandbox::Sandbox;
     use rxrpl_amendment::Rules;
+    use rxrpl_crypto::KeyType;
+    use rxrpl_crypto::seed::Seed;
     use rxrpl_ledger::Ledger;
 
     const OWNER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
     const BORROWER: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
 
+    /// Fixed seed for deterministic borrower key pair in tests.
+    fn borrower_keypair() -> (Vec<u8>, Vec<u8>) {
+        let seed = Seed::from_bytes([
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+        ]);
+        let kp = rxrpl_crypto::KeyPair::from_seed(&seed, KeyType::Ed25519);
+        (kp.public_key.0.clone(), kp.private_key.clone())
+    }
+
+    /// Sign the loan terms payload as the borrower would.
+    /// Must match the payload construction in preclaim().
+    fn sign_loan_terms(
+        private_key: &[u8],
+        broker_owner: &str,
+        broker_seq: u32,
+        principal_json: &serde_json::Value,
+        loan_rate: u32,
+        maturity: u32,
+    ) -> String {
+        let mut signing_data = Vec::new();
+        signing_data.extend_from_slice(broker_owner.as_bytes());
+        signing_data.extend_from_slice(&broker_seq.to_be_bytes());
+        signing_data.extend_from_slice(principal_json.to_string().as_bytes());
+        signing_data.extend_from_slice(&loan_rate.to_be_bytes());
+        signing_data.extend_from_slice(&maturity.to_be_bytes());
+
+        let payload_hash = rxrpl_crypto::sha512_half::sha512_half(&[&signing_data]);
+        let sig = rxrpl_crypto::ed25519::sign(payload_hash.as_bytes(), private_key).unwrap();
+        hex::encode_upper(sig.as_bytes())
+    }
+
     fn setup_with_broker_and_vault() -> Ledger {
         let mut ledger = Ledger::genesis();
+        let (borrower_pub_key, _) = borrower_keypair();
+        let borrower_pub_hex = hex::encode_upper(&borrower_pub_key);
+
         for (addr, balance) in [(OWNER, 100_000_000u64), (BORROWER, 10_000_000)] {
             let id = decode_account_id(addr).unwrap();
             let key = keylet::account(&id);
-            let account = serde_json::json!({
+            let mut account = serde_json::json!({
                 "LedgerEntryType": "AccountRoot",
                 "Account": addr,
                 "Balance": balance.to_string(),
@@ -383,6 +458,10 @@ mod tests {
                 "OwnerCount": 2,
                 "Flags": 0,
             });
+            // Borrower needs a PublicKey for counterparty signature verification
+            if addr == BORROWER {
+                account["PublicKey"] = serde_json::json!(borrower_pub_hex);
+            }
             ledger
                 .put_state(key, serde_json::to_vec(&account).unwrap())
                 .unwrap();
@@ -428,6 +507,10 @@ mod tests {
     }
 
     fn base_loan_tx() -> serde_json::Value {
+        let (_, priv_key) = borrower_keypair();
+        let principal = serde_json::json!("5000000");
+        let sig = sign_loan_terms(&priv_key, OWNER, 1, &principal, 5000, 1000000);
+
         serde_json::json!({
             "TransactionType": "LoanSet",
             "Account": OWNER,
@@ -441,7 +524,7 @@ mod tests {
             "OriginationFeeRate": 100,
             "GracePeriodDays": 30,
             "ManagementFeeRate": 500,
-            "CounterpartySignature": "DEADBEEF01020304",
+            "CounterpartySignature": sig,
             "Fee": "12",
             "Sequence": 2,
         })
@@ -501,8 +584,12 @@ mod tests {
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let rules = Rules::new();
+        let (_, priv_key) = borrower_keypair();
+        let new_principal = serde_json::json!("25000000");
+        let sig = sign_loan_terms(&priv_key, OWNER, 1, &new_principal, 5000, 1000000);
         let mut tx = base_loan_tx();
-        tx["LoanPrincipal"] = serde_json::json!("25000000"); // exceeds DebtMaximum of 20000000
+        tx["LoanPrincipal"] = new_principal;
+        tx["CounterpartySignature"] = serde_json::json!(sig);
         let ctx = PreclaimContext {
             tx: &tx,
             view: &view,
@@ -516,23 +603,16 @@ mod tests {
 
     #[test]
     fn cover_insufficient() {
-        // Broker has CoverAvailable=5000000, CoverRateMinimum=50000
-        // For 15000000 loan: required = 50000 * 15000000 / 1000000 = 750000 (within cover)
-        // But for 200000000: required = 50000 * 200000000 / 1000000 = 10000000 > 5000000
         let ledger = setup_with_broker_and_vault();
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let rules = Rules::new();
+        let (_, priv_key) = borrower_keypair();
+        let new_principal = serde_json::json!("20000001");
+        let sig = sign_loan_terms(&priv_key, OWNER, 1, &new_principal, 5000, 1000000);
         let mut tx = base_loan_tx();
-        // Use a principal that exceeds cover: need cover >= 50000 * principal / 1000000
-        // With 5000000 cover: max principal where cover is sufficient = 5000000 * 1000000 / 50000 = 100000000
-        // But DebtMaximum is 20000000, so let's adjust the broker
-        tx["LoanPrincipal"] = serde_json::json!("19000000");
-        // Required cover = 50000 * 19000000 / 1000000 = 950000, which is < 5000000
-        // Need to test insufficient cover, so set a higher principal or lower cover
-        // Actually with 19000000: required = 950000, cover = 5000000, still sufficient
-        // Let's just test DebtMaximum instead
-        tx["LoanPrincipal"] = serde_json::json!("20000001");
+        tx["LoanPrincipal"] = new_principal;
+        tx["CounterpartySignature"] = serde_json::json!(sig);
         let ctx = PreclaimContext {
             tx: &tx,
             view: &view,
