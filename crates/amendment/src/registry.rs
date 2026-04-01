@@ -155,6 +155,12 @@ const RETIRED_AMENDMENTS: &[&str] = &[
     "fixEnforceNFTokenTrustline",
     "fixAMMv1_2",
     "fixAMMv1_3",
+    "fixFrozenLPTokenTransfer",
+    "fixEnforceNFTokenTrustlineV2",
+    "fixInnerObjTemplate2",
+    "fixInvalidTxFlags",
+    "fixNFTokenPageLinks",
+    "ExpandedSignerList",
 ];
 
 /// Amendments that are supported but may not yet be enabled on mainnet.
@@ -167,7 +173,6 @@ const SUPPORTED_AMENDMENTS: &[(&str, bool)] = &[
     ("MPTokensV1", true),
     ("Credentials", true),
     ("AMMClawback", true),
-    ("fixAMMv1_3", true),
     ("InvariantsV1_1", true),
     ("PermissionedDomains", true),
     ("DeepFreeze", false),
@@ -175,6 +180,12 @@ const SUPPORTED_AMENDMENTS: &[(&str, bool)] = &[
     ("SingleAssetVault", false),
     ("Batch", false),
     ("Delegate", false),
+    ("fixAMMClawbackRounding", true),
+    ("fixDirectoryLimit", true),
+    ("fixIncludeKeyletFields", true),
+    ("fixMPTDeliveredAmount", true),
+    ("fixPriceOracleOrder", true),
+    ("fixTokenEscrowV1", true),
 ];
 
 #[cfg(test)]
@@ -220,5 +231,46 @@ mod tests {
         let reg = FeatureRegistry::with_known_amendments();
         let id = reg.id_for_name("MultiSignReserve").unwrap();
         assert_eq!(id, feature_id("MultiSignReserve"));
+    }
+
+    #[test]
+    fn new_retired_amendments_present() {
+        let reg = FeatureRegistry::with_known_amendments();
+        for name in [
+            "fixFrozenLPTokenTransfer",
+            "fixEnforceNFTokenTrustlineV2",
+            "fixInnerObjTemplate2",
+            "fixInvalidTxFlags",
+            "fixNFTokenPageLinks",
+            "ExpandedSignerList",
+        ] {
+            let f = reg.get_by_name(name).unwrap_or_else(|| panic!("{name} not found"));
+            assert!(f.retired, "{name} should be retired");
+        }
+    }
+
+    #[test]
+    fn new_supported_amendments_present() {
+        let reg = FeatureRegistry::with_known_amendments();
+        for (name, expected_vote) in [
+            ("fixAMMClawbackRounding", true),
+            ("fixDirectoryLimit", true),
+            ("fixIncludeKeyletFields", true),
+            ("fixMPTDeliveredAmount", true),
+            ("fixPriceOracleOrder", true),
+            ("fixTokenEscrowV1", true),
+        ] {
+            let f = reg.get_by_name(name).unwrap_or_else(|| panic!("{name} not found"));
+            assert!(!f.retired, "{name} should not be retired");
+            assert_eq!(f.default_vote, expected_vote, "{name} default_vote mismatch");
+        }
+    }
+
+    #[test]
+    fn no_duplicate_fixammv1_3() {
+        let reg = FeatureRegistry::with_known_amendments();
+        // fixAMMv1_3 should exist exactly once as retired
+        let f = reg.get_by_name("fixAMMv1_3").unwrap();
+        assert!(f.retired);
     }
 }
