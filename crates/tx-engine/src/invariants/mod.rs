@@ -12,6 +12,7 @@ pub mod transaction_fee_check;
 pub mod valid_amm;
 pub mod valid_clawback;
 pub mod valid_ledger_entry_type;
+pub mod valid_loan;
 pub mod valid_mpt_issuance;
 pub mod valid_new_account_root;
 pub mod valid_permissioned_domain;
@@ -80,6 +81,7 @@ pub fn default_invariant_checks() -> Vec<Box<dyn InvariantCheck>> {
         Box::new(valid_clawback::ValidClawback),
         Box::new(valid_amm::ValidAmm),
         Box::new(valid_mpt_issuance::ValidMptIssuance),
+        Box::new(valid_loan::ValidLoan),
         Box::new(valid_permissioned_domain::ValidPermissionedDomain),
     ]
 }

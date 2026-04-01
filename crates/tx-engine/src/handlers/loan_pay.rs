@@ -112,12 +112,31 @@ impl Transactor for LoanPayTransactor {
         let loan_rate = loan["LoanRate"].as_u64().unwrap_or(0);
         let mgmt_fee_rate = loan["ManagementFeeRate"].as_u64().unwrap_or(0);
 
-        // Calculate accrued interest since last payment
-        // Simple: interest = principal_outstanding * loan_rate / 1_000_000
+        // Time-based interest accrual since last payment (or loan start)
+        let last_payment = loan["LastPaymentDate"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0) as u32;
+        let loan_start = loan["LoanMaturityDate"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0) as u32;
+        let base_time = if last_payment > 0 { last_payment } else { loan_start };
+
+        // Use parent ledger close time as "now"
+        let current_time = ctx.view.parent_close_time();
+
+        // Days elapsed (minimum 1 to avoid zero interest)
+        let seconds_elapsed = current_time.saturating_sub(base_time);
+        let days_elapsed = (seconds_elapsed / 86400).max(1) as u64;
+
+        // Annual rate in parts per million -> daily rate applied over elapsed days
+        // interest = principal * rate * days / (1_000_000 * 365)
         let new_interest = principal_outstanding
             .checked_mul(loan_rate)
+            .and_then(|v| v.checked_mul(days_elapsed))
             .ok_or(TransactionResult::TefInternal)?
-            / 1_000_000;
+            / (1_000_000 * 365);
         let total_interest = interest_accrued + new_interest;
 
         // Calculate management fee on interest

@@ -161,13 +161,15 @@ fn check_permissioned_asset(
     }
 
     // Issuer requires PermissionedDEX -- check if trader has credentials.
-    // Look up the issuer's PermissionedDomain and verify the trader holds
-    // at least one accepted credential type.
-    //
-    // For simplicity, we check the issuer's first PermissionedDomain (seq 0)
-    // and look for a matching credential from the trader.
-    let domain_key = keylet::permissioned_domain(&issuer_id, 0);
-    if let Some(domain_bytes) = ctx.view.read(&domain_key) {
+    // Look up the issuer's PermissionedDomains (seq 0..9) and verify the
+    // trader holds at least one accepted credential type from any domain.
+    for domain_seq in 0..10u32 {
+        let domain_key = keylet::permissioned_domain(&issuer_id, domain_seq);
+        let domain_bytes = match ctx.view.read(&domain_key) {
+            Some(b) => b,
+            None => break, // No more domains
+        };
+
         let domain: Value =
             serde_json::from_slice(&domain_bytes).map_err(|_| TransactionResult::TemMalformed)?;
 
@@ -198,6 +200,6 @@ fn check_permissioned_asset(
         }
     }
 
-    // No valid credential found
+    // No valid credential found in any domain
     Err(TransactionResult::TecNoPermission)
 }
