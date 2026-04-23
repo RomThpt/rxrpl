@@ -2,12 +2,23 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use rxrpl_codec::address::classic::{account_id_from_public_key, encode_account_id};
+use rxrpl_codec::address::classic::{account_id_from_public_key, decode_account_id, encode_account_id};
 use rxrpl_crypto::KeyPair;
+use rxrpl_protocol::keylet;
 
 use crate::context::ServerContext;
 use crate::error::RpcServerError;
 use crate::handlers::common::derive_seed_from_params;
+
+async fn lookup_account_sequence(ctx: &Arc<ServerContext>, account: &str) -> Option<u64> {
+    let ledger = ctx.ledger.as_ref()?;
+    let account_id = decode_account_id(account).ok()?;
+    let key = keylet::account(&account_id);
+    let ledger = ledger.read().await;
+    let data = ledger.get_state(&key)?;
+    let account_data: Value = crate::handlers::common::decode_state_value(data).ok()?;
+    account_data.get("Sequence").and_then(|v| v.as_u64())
+}
 
 pub async fn sign(params: Value, _ctx: &Arc<ServerContext>) -> Result<Value, RpcServerError> {
     let mut tx_json = params
@@ -30,6 +41,20 @@ pub async fn sign(params: Value, _ctx: &Arc<ServerContext>) -> Result<Value, Rpc
                 "Account".to_string(),
                 Value::String(encode_account_id(&account_id)),
             );
+        }
+
+        // Auto-fill Fee from open ledger if missing (rippled parity).
+        if !obj.contains_key("Fee") {
+            obj.insert("Fee".to_string(), Value::String("10".to_string()));
+        }
+
+        // Auto-fill Sequence from account state if missing.
+        if !obj.contains_key("Sequence") {
+            if let Some(account) = obj.get("Account").and_then(|v| v.as_str()) {
+                if let Some(seq) = lookup_account_sequence(_ctx, account).await {
+                    obj.insert("Sequence".to_string(), Value::Number(seq.into()));
+                }
+            }
         }
     }
 

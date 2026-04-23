@@ -39,6 +39,17 @@ pub async fn submit(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
         return Ok(result.get("result").cloned().unwrap_or(result));
     }
 
+    // Rippled's submit method accepts two forms:
+    //   1. { tx_blob: "..." }                      — signed-only submit
+    //   2. { secret: "...", tx_json: { ... } }     — sign-and-submit
+    // Delegate form (2) to sign_and_submit so existing tooling keeps working.
+    if params.get("tx_blob").is_none()
+        && params.get("secret").is_some()
+        && params.get("tx_json").is_some()
+    {
+        return Box::pin(super::sign_and_submit(params, ctx)).await;
+    }
+
     let tx_blob = params
         .get("tx_blob")
         .and_then(|v| v.as_str())
