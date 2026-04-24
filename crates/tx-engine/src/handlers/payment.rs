@@ -139,7 +139,14 @@ impl Transactor for PaymentTransactor {
                 .update(dst_key, dst_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
         } else {
-            // Destination does not exist: create a new AccountRoot
+            // Destination does not exist: must send at least account_reserve
+            // (typically 10 XRP) to fund the new AccountRoot. Otherwise
+            // rippled returns tecNO_DST_INSUF_XRP.
+            let reserve = ctx.fees.account_reserve(0);
+            if amount < reserve {
+                return Err(TransactionResult::TecNoDstInsuf);
+            }
+
             let new_account = serde_json::json!({
                 "LedgerEntryType": "AccountRoot",
                 "Account": destination_str,
@@ -407,11 +414,12 @@ mod tests {
 
     #[test]
     fn apply_creates_new_destination_account() {
-        let ledger = setup_ledger_with_account(SRC_ADDRESS, 10_000_000);
+        // Funding a new account requires sending at least account_reserve.
+        let ledger = setup_ledger_with_account(SRC_ADDRESS, 50_000_000);
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let mut sandbox = Sandbox::new(&view);
-        let tx = make_payment_tx(SRC_ADDRESS, DST_ADDRESS, "1000000", "10");
+        let tx = make_payment_tx(SRC_ADDRESS, DST_ADDRESS, "10000000", "10");
         let rules = Rules::new();
 
         let mut ctx = ApplyContext {
@@ -429,10 +437,31 @@ mod tests {
         let dst_key = keylet::account(&dst_id);
         let dst_bytes = sandbox.read(&dst_key).unwrap();
         let dst: serde_json::Value = serde_json::from_slice(&dst_bytes).unwrap();
-        assert_eq!(dst["Balance"].as_str().unwrap(), "1000000");
+        assert_eq!(dst["Balance"].as_str().unwrap(), "10000000");
         assert_eq!(dst["LedgerEntryType"].as_str().unwrap(), "AccountRoot");
         assert_eq!(dst["Sequence"].as_u64().unwrap(), 1);
         assert_eq!(dst["OwnerCount"].as_u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn apply_below_reserve_fails_to_create_destination() {
+        let ledger = setup_ledger_with_account(SRC_ADDRESS, 50_000_000);
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        // 1 drop is way below the 10 XRP reserve.
+        let tx = make_payment_tx(SRC_ADDRESS, DST_ADDRESS, "1", "10");
+        let rules = Rules::new();
+
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+
+        let result = PaymentTransactor.apply(&mut ctx);
+        assert_eq!(result, Err(TransactionResult::TecNoDstInsuf));
     }
 
     #[test]

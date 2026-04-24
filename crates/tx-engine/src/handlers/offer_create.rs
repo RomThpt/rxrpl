@@ -6,6 +6,7 @@ use rxrpl_protocol::keylet;
 use serde_json::Value;
 
 use crate::helpers;
+use crate::owner_dir::add_to_owner_dir;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 /// OfferCreate transaction handler.
@@ -105,6 +106,8 @@ impl Transactor for OfferCreateTransactor {
         ctx.view
             .insert(offer_key, offer_bytes)
             .map_err(|_| TransactionResult::TemMalformed)?;
+
+        add_to_owner_dir(ctx.view, &account_id, &offer_key)?;
 
         // Update account: increment sequence and owner count
         helpers::increment_sequence(&mut acct);

@@ -4,6 +4,7 @@ use rxrpl_protocol::keylet;
 use serde_json::Value;
 
 use crate::helpers;
+use crate::owner_dir::remove_from_owner_dir;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 /// OfferCancel transaction handler.
@@ -48,7 +49,8 @@ impl Transactor for OfferCancelTransactor {
         let offer_seq = ctx.tx["OfferSequence"].as_u64().unwrap_or(0) as u32;
         let offer_key = keylet::offer(&account_id, offer_seq);
 
-        // Delete the offer
+        // Unlink from owner directory then delete the offer
+        remove_from_owner_dir(ctx.view, &account_id, &offer_key)?;
         ctx.view
             .erase(&offer_key)
             .map_err(|_| TransactionResult::TecNoEntry)?;

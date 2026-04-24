@@ -3,6 +3,7 @@ use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
+use crate::owner_dir::remove_from_owner_dir;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct CheckCancelTransactor;
@@ -108,7 +109,8 @@ impl Transactor for CheckCancelTransactor {
                 .map_err(|_| TransactionResult::TefInternal)?;
         }
 
-        // Delete check
+        // Unlink from owner directory then delete the check
+        remove_from_owner_dir(ctx.view, &check_src_id, &check_key)?;
         ctx.view
             .erase(&check_key)
             .map_err(|_| TransactionResult::TefInternal)?;

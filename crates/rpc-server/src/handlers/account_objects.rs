@@ -6,6 +6,34 @@ use crate::context::ServerContext;
 use crate::error::RpcServerError;
 use crate::handlers::common::{require_account_id, resolve_ledger, walk_owner_directory};
 
+/// Map snake_case `type` aliases to the PascalCase `LedgerEntryType`
+/// values that ledger entries actually carry. Unknown / already-PascalCase
+/// values pass through unchanged so callers using either convention work.
+fn map_type_alias(t: &str) -> &str {
+    match t {
+        "check" => "Check",
+        "deposit_preauth" => "DepositPreauth",
+        "escrow" => "Escrow",
+        "nft_offer" => "NFTokenOffer",
+        "offer" => "Offer",
+        "payment_channel" => "PayChannel",
+        "signer_list" => "SignerList",
+        "state" => "RippleState",
+        "ticket" => "Ticket",
+        "amm" => "AMM",
+        "did" => "DID",
+        "oracle" => "Oracle",
+        "hook" => "Hook",
+        "hook_state" => "HookState",
+        "hook_definition" => "HookDefinition",
+        "mptoken_issuance" => "MPTokenIssuance",
+        "mptoken" => "MPToken",
+        "vault" => "Vault",
+        "credential" => "Credential",
+        other => other,
+    }
+}
+
 pub async fn account_objects(
     params: Value,
     ctx: &Arc<ServerContext>,
@@ -13,7 +41,10 @@ pub async fn account_objects(
     let account_id = require_account_id(&params)?;
     let ledger = resolve_ledger(&params, ctx).await?;
 
-    let type_filter = params.get("type").and_then(|v| v.as_str());
+    let type_filter = params
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map(map_type_alias);
     let limit = params
         .get("limit")
         .and_then(|v| v.as_u64())
