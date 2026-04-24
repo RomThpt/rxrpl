@@ -13,17 +13,26 @@ impl ConnectionRole {
     /// Determine the role from the connecting IP and server configuration.
     ///
     /// Localhost (127.0.0.1, ::1) is always admin. Additional admin IPs
-    /// can be configured via `ServerConfig::admin_ips`.
+    /// can be configured via `ServerConfig::admin_ips`. The strings
+    /// `"0.0.0.0"` and `"::"` are rippled-style sentinels that grant admin
+    /// to any IPv4 / IPv6 client respectively.
     pub fn from_ip(ip: IpAddr, config: &ServerConfig) -> Self {
         if ip.is_loopback() {
             return Self::Admin;
         }
         let ip_str = ip.to_string();
-        if config.admin_ips.contains(&ip_str) {
-            Self::Admin
-        } else {
-            Self::Public
+        for entry in &config.admin_ips {
+            if entry == &ip_str {
+                return Self::Admin;
+            }
+            if entry == "0.0.0.0" && ip.is_ipv4() {
+                return Self::Admin;
+            }
+            if entry == "::" && ip.is_ipv6() {
+                return Self::Admin;
+            }
         }
+        Self::Public
     }
 
     pub fn is_admin(self) -> bool {
@@ -110,6 +119,30 @@ mod tests {
     fn random_ip_is_public() {
         let ip: IpAddr = "203.0.113.42".parse().unwrap();
         assert_eq!(ConnectionRole::from_ip(ip, &default_config()), ConnectionRole::Public);
+    }
+
+    #[test]
+    fn wildcard_ipv4_grants_admin_to_external() {
+        let mut config = default_config();
+        config.admin_ips.push("0.0.0.0".into());
+        let ip: IpAddr = "172.18.0.5".parse().unwrap();
+        assert_eq!(ConnectionRole::from_ip(ip, &config), ConnectionRole::Admin);
+    }
+
+    #[test]
+    fn wildcard_ipv6_grants_admin_to_external() {
+        let mut config = default_config();
+        config.admin_ips.push("::".into());
+        let ip: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(ConnectionRole::from_ip(ip, &config), ConnectionRole::Admin);
+    }
+
+    #[test]
+    fn wildcard_ipv4_does_not_match_ipv6() {
+        let mut config = default_config();
+        config.admin_ips.push("0.0.0.0".into());
+        let ip: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(ConnectionRole::from_ip(ip, &config), ConnectionRole::Public);
     }
 
     #[test]

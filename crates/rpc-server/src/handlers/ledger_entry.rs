@@ -21,7 +21,7 @@ pub async fn ledger_entry(
 
     let data = ledger
         .get_state(&index)
-        .ok_or_else(|| RpcServerError::InvalidParams("entry not found".into()))?;
+        .ok_or(RpcServerError::EntryNotFound)?;
 
     let node: Value = crate::handlers::common::decode_state_value(data)?;
 

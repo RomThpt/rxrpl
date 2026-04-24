@@ -73,9 +73,12 @@ async fn handle_ws_connection(socket: WebSocket, ctx: Arc<ServerContext>, role: 
                     Ok(v) => v,
                     Err(e) => {
                         let err = serde_json::json!({
-                            "error": "invalidJson",
-                            "error_code": 31,
-                            "error_message": format!("invalid JSON: {e}"),
+                            "result": {
+                                "error": "invalidJson",
+                                "error_code": 31,
+                                "error_message": format!("invalid JSON: {e}"),
+                                "status": "error",
+                            },
                             "status": "error",
                             "type": "response",
                         });
@@ -271,9 +274,12 @@ fn ws_response(id: Option<Value>, result: Result<Value, crate::error::RpcServerE
         }
         Err(e) => {
             let mut resp = serde_json::json!({
-                "error": e.token(),
-                "error_code": e.numeric_code(),
-                "error_message": e.human_message(),
+                "result": {
+                    "error": e.token(),
+                    "error_code": e.numeric_code(),
+                    "error_message": e.human_message(),
+                    "status": "error",
+                },
                 "status": "error",
                 "type": "response",
             });

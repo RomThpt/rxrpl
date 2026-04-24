@@ -23,9 +23,7 @@ pub async fn tx(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcSer
             let record = store
                 .get_tx(&hash_bytes)
                 .map_err(|e| RpcServerError::Internal(format!("storage error: {e}")))?
-                .ok_or_else(|| {
-                    RpcServerError::InvalidParams("transaction not found".into())
-                })?;
+                .ok_or(RpcServerError::TxNotFound)?;
 
             let tx_json: Value =
                 serde_json::from_slice(&record.tx_blob).unwrap_or(Value::Null);
@@ -68,7 +66,5 @@ pub async fn tx(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcSer
         }
     }
 
-    Err(RpcServerError::InvalidParams(
-        "transaction not found".into(),
-    ))
+    Err(RpcServerError::TxNotFound)
 }

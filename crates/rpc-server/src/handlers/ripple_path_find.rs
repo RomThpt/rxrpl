@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_pathfind::{PathRequest, parse_amount_issue, path_step_to_json};
+use rxrpl_protocol::keylet;
 
 use crate::context::ServerContext;
 use crate::error::RpcServerError;
@@ -34,7 +35,15 @@ pub async fn ripple_path_find(
         .map_err(|e| RpcServerError::InvalidParams(format!("invalid source_account: {e}")))?;
 
     let destination = decode_account_id(destination_str)
-        .map_err(|e| RpcServerError::InvalidParams(format!("invalid destination_account: {e}")))?;
+        .map_err(|_| RpcServerError::AccountMalformed)?;
+
+    // rippled requires the destination account to exist when sending an
+    // issued currency (non-XRP destination_amount).
+    if !matches!(&destination_amount, serde_json::Value::String(_))
+        && ledger.get_state(&keylet::account(&destination)).is_none()
+    {
+        return Err(RpcServerError::AccountNotFound);
+    }
 
     // Parse optional source_currencies
     let source_currencies =

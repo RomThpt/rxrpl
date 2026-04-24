@@ -10,6 +10,6 @@ pub async fn validator_list_sites(
     _ctx: &Arc<ServerContext>,
 ) -> Result<Value, RpcServerError> {
     Ok(serde_json::json!({
-        "validator_list": [],
+        "validator_sites": [],
     }))
 }

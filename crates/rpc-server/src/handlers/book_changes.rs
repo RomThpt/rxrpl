@@ -89,6 +89,7 @@ pub async fn book_changes(
     }
 
     Ok(serde_json::json!({
+        "type": "bookChanges",
         "ledger_index": ledger.header.sequence,
         "ledger_hash": ledger.header.hash.to_string(),
         "changes": changes,

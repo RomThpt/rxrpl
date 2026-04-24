@@ -41,25 +41,26 @@ pub async fn nft_buy_offers(
     // Use a computed key for the buy offer directory
     let dir_key = Hash256::from(buy_dir_bytes);
 
+    let dir_data = ledger
+        .get_state(&dir_key)
+        .ok_or(RpcServerError::ObjectNotFound)?;
+
+    let dir: Value = crate::handlers::common::decode_state_value(dir_data)?;
+
     let mut offers = Vec::new();
+    if let Some(indexes) = dir.get("Indexes").and_then(|v| v.as_array()) {
+        for idx_val in indexes {
+            if offers.len() >= limit {
+                break;
+            }
+            let idx_str = idx_val.as_str().unwrap_or_default();
+            let idx_hash: Hash256 = idx_str
+                .parse()
+                .map_err(|e| RpcServerError::Internal(format!("invalid index: {e}")))?;
 
-    if let Some(data) = ledger.get_state(&dir_key) {
-        let dir: Value = crate::handlers::common::decode_state_value(data)?;
-
-        if let Some(indexes) = dir.get("Indexes").and_then(|v| v.as_array()) {
-            for idx_val in indexes {
-                if offers.len() >= limit {
-                    break;
-                }
-                let idx_str = idx_val.as_str().unwrap_or_default();
-                let idx_hash: Hash256 = idx_str
-                    .parse()
-                    .map_err(|e| RpcServerError::Internal(format!("invalid index: {e}")))?;
-
-                if let Some(entry_data) = ledger.get_state(&idx_hash) {
-                    let entry: Value = crate::handlers::common::decode_state_value(entry_data)?;
-                    offers.push(entry);
-                }
+            if let Some(entry_data) = ledger.get_state(&idx_hash) {
+                let entry: Value = crate::handlers::common::decode_state_value(entry_data)?;
+                offers.push(entry);
             }
         }
     }

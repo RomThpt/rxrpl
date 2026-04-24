@@ -45,6 +45,15 @@ pub enum RpcServerError {
 
     #[error("Missing field 'transaction'.")]
     FieldNotFoundTransaction,
+
+    #[error("Entry not found.")]
+    EntryNotFound,
+
+    #[error("Transaction not found.")]
+    TxNotFound,
+
+    #[error("Object not found.")]
+    ObjectNotFound,
 }
 
 impl RpcServerError {
@@ -64,6 +73,9 @@ impl RpcServerError {
             Self::NotImplemented => "notImpl",
             Self::UnknownOption => "unknownOption",
             Self::FieldNotFoundTransaction => "fieldNotFoundTransaction",
+            Self::EntryNotFound => "entryNotFound",
+            Self::TxNotFound => "txnNotFound",
+            Self::ObjectNotFound => "objectNotFound",
         }
     }
 
@@ -84,6 +96,9 @@ impl RpcServerError {
             // the xrpl-hive runner (only the token is); keep a stable nonzero.
             Self::UnknownOption => 1,
             Self::FieldNotFoundTransaction => 1,
+            Self::EntryNotFound => 20,
+            Self::TxNotFound => 29,
+            Self::ObjectNotFound => 20,
         }
     }
 
@@ -108,6 +123,9 @@ impl RpcServerError {
             Self::NotImplemented => "not_implemented",
             Self::UnknownOption => "unknown_option",
             Self::FieldNotFoundTransaction => "field_not_found_transaction",
+            Self::EntryNotFound => "entry_not_found",
+            Self::TxNotFound => "tx_not_found",
+            Self::ObjectNotFound => "object_not_found",
         }
     }
 }
