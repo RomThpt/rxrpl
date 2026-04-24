@@ -16,35 +16,60 @@ fn ledger_header_json(ledger: &rxrpl_ledger::Ledger) -> Value {
     })
 }
 
+/// Selector parsed from the `ledger_index` param (string keyword or numeric seq).
+enum LedgerSelector {
+    Current,
+    Closed,
+    Validated,
+    Sequence(u32),
+}
+
+fn parse_ledger_selector(params: &Value) -> Result<LedgerSelector, RpcServerError> {
+    let raw = params.get("ledger_index").unwrap_or(&Value::Null);
+    match raw {
+        Value::Null => Ok(LedgerSelector::Current),
+        Value::String(s) => match s.as_str() {
+            "current" => Ok(LedgerSelector::Current),
+            "closed" => Ok(LedgerSelector::Closed),
+            "validated" => Ok(LedgerSelector::Validated),
+            other => other
+                .parse::<u32>()
+                .map(LedgerSelector::Sequence)
+                .map_err(|_| RpcServerError::InvalidParams(format!("invalid ledger_index: {other}"))),
+        },
+        Value::Number(n) => n
+            .as_u64()
+            .and_then(|u| u32::try_from(u).ok())
+            .map(LedgerSelector::Sequence)
+            .ok_or_else(|| RpcServerError::InvalidParams(format!("invalid ledger_index: {n}"))),
+        _ => Err(RpcServerError::InvalidParams(
+            "invalid ledger_index type".into(),
+        )),
+    }
+}
+
 pub async fn ledger(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcServerError> {
-    let ledger_index = params
-        .get("ledger_index")
-        .and_then(|v| v.as_str())
-        .unwrap_or("current");
+    let selector = parse_ledger_selector(&params)?;
 
     // In reporting mode, query the ledger store for historical headers
     if ctx.reporting_mode {
         if let Some(ref store) = ctx.ledger_store {
-            let seq = match ledger_index {
-                "current" | "closed" | "validated" => {
-                    store
-                        .latest_sequence()
-                        .map_err(|e| RpcServerError::Internal(format!("storage error: {e}")))?
-                        .ok_or_else(|| {
-                            RpcServerError::Internal("no ledger data available yet".into())
-                        })?
-                }
-                index => index.parse::<u32>().map_err(|_| {
-                    RpcServerError::InvalidParams(format!("invalid ledger_index: {index}"))
-                })?,
+            let seq = match selector {
+                LedgerSelector::Current
+                | LedgerSelector::Closed
+                | LedgerSelector::Validated => store
+                    .latest_sequence()
+                    .map_err(|e| RpcServerError::Internal(format!("storage error: {e}")))?
+                    .ok_or_else(|| {
+                        RpcServerError::Internal("no ledger data available yet".into())
+                    })?,
+                LedgerSelector::Sequence(s) => s,
             };
 
             let record = store
                 .get_ledger_header(seq)
                 .map_err(|e| RpcServerError::Internal(format!("storage error: {e}")))?
-                .ok_or_else(|| {
-                    RpcServerError::InvalidParams(format!("ledger {seq} not found"))
-                })?;
+                .ok_or(RpcServerError::LedgerNotFound)?;
 
             return Ok(serde_json::json!({
                 "ledger": {
@@ -59,8 +84,8 @@ pub async fn ledger(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
         ));
     }
 
-    match ledger_index {
-        "current" => {
+    match selector {
+        LedgerSelector::Current => {
             let ledger = ctx
                 .ledger
                 .as_ref()
@@ -68,7 +93,7 @@ pub async fn ledger(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
             let ledger = ledger.read().await;
             Ok(serde_json::json!({ "ledger": ledger_header_json(&ledger) }))
         }
-        "closed" | "validated" => {
+        LedgerSelector::Closed | LedgerSelector::Validated => {
             let closed = ctx
                 .closed_ledgers
                 .as_ref()
@@ -79,11 +104,7 @@ pub async fn ledger(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
                 .ok_or_else(|| RpcServerError::Internal("no closed ledger yet".into()))?;
             Ok(serde_json::json!({ "ledger": ledger_header_json(ledger) }))
         }
-        index => {
-            let seq: u32 = index.parse().map_err(|_| {
-                RpcServerError::InvalidParams(format!("invalid ledger_index: {index}"))
-            })?;
-
+        LedgerSelector::Sequence(seq) => {
             // Check current open ledger first
             if let Some(ref l) = ctx.ledger {
                 let l = l.read().await;
@@ -101,7 +122,7 @@ pub async fn ledger(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
             let ledger = closed
                 .iter()
                 .find(|l| l.header.sequence == seq)
-                .ok_or_else(|| RpcServerError::InvalidParams(format!("ledger {seq} not found")))?;
+                .ok_or(RpcServerError::LedgerNotFound)?;
             Ok(serde_json::json!({ "ledger": ledger_header_json(ledger) }))
         }
     }

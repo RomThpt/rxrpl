@@ -18,7 +18,7 @@ pub async fn ripple_path_find(
     let source_str = params
         .get("source_account")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcServerError::InvalidParams("missing 'source_account'".into()))?;
+        .ok_or(RpcServerError::SourceAccountMissing)?;
 
     let destination_str = params
         .get("destination_account")

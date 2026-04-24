@@ -166,7 +166,5 @@ fn resolve_entry_index(params: &Value) -> Result<Hash256, RpcServerError> {
         return Ok(keylet::ticket(&id, seq as u32));
     }
 
-    Err(RpcServerError::InvalidParams(
-        "must provide 'index' or a type-specific lookup (account_root, offer, ripple_state, directory, check, escrow, pay_channel, deposit_preauth, ticket)".into(),
-    ))
+    Err(RpcServerError::UnknownOption)
 }

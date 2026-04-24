@@ -18,7 +18,8 @@ pub async fn book_offers(params: Value, ctx: &Arc<ServerContext>) -> Result<Valu
         .get("taker_gets")
         .ok_or_else(|| RpcServerError::InvalidParams("missing 'taker_gets'".into()))?;
 
-    let (pays_currency, pays_issuer) = parse_currency_issuer(taker_pays)?;
+    let (pays_currency, pays_issuer) = parse_currency_issuer(taker_pays)
+        .map_err(|_| RpcServerError::SourceCurrencyMalformed)?;
     let (gets_currency, gets_issuer) = parse_currency_issuer(taker_gets)?;
 
     let limit = params

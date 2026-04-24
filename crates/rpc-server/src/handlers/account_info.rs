@@ -22,15 +22,14 @@ pub async fn account_info(
         .as_ref()
         .ok_or_else(|| RpcServerError::Internal("no ledger available".into()))?;
 
-    let account_id = decode_account_id(account)
-        .map_err(|e| RpcServerError::InvalidParams(format!("invalid account: {e}")))?;
+    let account_id = decode_account_id(account).map_err(|_| RpcServerError::AccountMalformed)?;
     let key = keylet::account(&account_id);
 
     let ledger = ledger.read().await;
 
     let data = ledger
         .get_state(&key)
-        .ok_or_else(|| RpcServerError::InvalidParams("account not found".into()))?;
+        .ok_or(RpcServerError::AccountNotFound)?;
 
     let account_data: Value = crate::handlers::common::decode_state_value(data)?;
 

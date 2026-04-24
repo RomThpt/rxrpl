@@ -95,11 +95,31 @@ async fn account_info_existing_account() {
 
 #[tokio::test]
 async fn account_info_nonexistent_account() {
+    use rxrpl_rpc_server::RpcServerError;
     let ctx = test_ctx_with_ledger();
     let params = json!({ "account": "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe" });
 
-    let result = rxrpl_rpc_server::handlers::account_info(params, &ctx).await;
-    assert!(result.is_err());
+    let err = rxrpl_rpc_server::handlers::account_info(params, &ctx)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RpcServerError::AccountNotFound));
+    assert_eq!(err.token(), "actNotFound");
+    assert_eq!(err.numeric_code(), 19);
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn account_info_malformed_account_returns_token_actMalformed() {
+    use rxrpl_rpc_server::RpcServerError;
+    let ctx = test_ctx_with_ledger();
+    let params = json!({ "account": "not_a_valid_address" });
+
+    let err = rxrpl_rpc_server::handlers::account_info(params, &ctx)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RpcServerError::AccountMalformed));
+    assert_eq!(err.token(), "actMalformed");
+    assert_eq!(err.numeric_code(), 35);
 }
 
 #[tokio::test]
@@ -153,11 +173,29 @@ async fn ledger_by_index() {
 
 #[tokio::test]
 async fn ledger_not_found() {
+    use rxrpl_rpc_server::RpcServerError;
     let ctx = test_ctx_with_ledger();
     let params = json!({ "ledger_index": "999" });
 
-    let result = rxrpl_rpc_server::handlers::ledger(params, &ctx).await;
-    assert!(result.is_err());
+    let err = rxrpl_rpc_server::handlers::ledger(params, &ctx)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RpcServerError::LedgerNotFound));
+    assert_eq!(err.token(), "lgrNotFound");
+}
+
+#[tokio::test]
+async fn ledger_not_found_with_numeric_index() {
+    use rxrpl_rpc_server::RpcServerError;
+    let ctx = test_ctx_with_ledger();
+    // rippled accepts ledger_index as a JSON number; rxrpl must as well
+    // and must error rather than silently fall back to current.
+    let params = json!({ "ledger_index": 999_999_999u64 });
+
+    let err = rxrpl_rpc_server::handlers::ledger(params, &ctx)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RpcServerError::LedgerNotFound));
 }
 
 // -- ledger_closed tests --
@@ -231,9 +269,13 @@ async fn tx_not_found() {
 
 #[tokio::test]
 async fn tx_invalid_hash() {
+    use rxrpl_rpc_server::RpcServerError;
     let ctx = test_ctx_with_ledger();
     let params = json!({ "transaction": "not-a-hash" });
 
-    let result = rxrpl_rpc_server::handlers::tx(params, &ctx).await;
-    assert!(result.is_err());
+    let err = rxrpl_rpc_server::handlers::tx(params, &ctx)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RpcServerError::NotImplemented));
+    assert_eq!(err.token(), "notImpl");
 }

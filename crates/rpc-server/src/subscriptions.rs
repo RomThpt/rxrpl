@@ -305,7 +305,7 @@ fn tx_matches_accounts(tx: &Value, accounts: &HashSet<AccountId>) -> bool {
 
 fn parse_account(addr: &str) -> Result<AccountId, RpcServerError> {
     rxrpl_codec::address::classic::decode_account_id(addr)
-        .map_err(|e| RpcServerError::InvalidParams(format!("invalid account: {e}")))
+        .map_err(|_| RpcServerError::AccountMalformed)
 }
 
 #[cfg(test)]
