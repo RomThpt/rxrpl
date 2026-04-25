@@ -12,8 +12,9 @@ on:
         default: 'all'
         type: string
   schedule:
-    # Run weekly on Sunday at 02:00 UTC
-    - cron: '0 2 * * 0'
+    # Run nightly at 02:00 UTC. Phase 1 wire-format compat (PR #15) is the
+    # gate for these to pass; until merged, expect the sync suite to fail.
+    - cron: '0 2 * * *'
 
 env:
   RIPPLED_IMAGE: ${{ inputs.rippled_image || 'rippleci/rippled:2.3.0' }}
