@@ -118,9 +118,25 @@ pub fn book_dir(
     )
 }
 
-/// Compute the keylet for the skip list (ledger hashes).
+/// Compute the keylet for the *most recent* skip list (ledger hashes).
+///
+/// The SLE at this index in any closed ledger contains the hashes of the
+/// 256 most recent ledgers prior to (and including) the current one,
+/// indexed by `seq % 256`. Used to walk the chain backward.
 pub fn skip() -> Hash256 {
     index_hash(LedgerNamespace::Skip, &[])
+}
+
+/// Compute the keylet for a specific skip-list batch.
+///
+/// Each batch covers 256 consecutive ledgers ending at the largest
+/// multiple of 65536 below `seq`. The SLE at this index lists the
+/// hashes of the ledgers at every 256-th sequence boundary inside the
+/// batch (so it can be used to jump back further than the most recent
+/// 256 entries). Matches rippled's `keylet::skip(LedgerIndex)`.
+pub fn skip_seq(seq: u32) -> Hash256 {
+    let batch = (seq >> 16).to_be_bytes();
+    index_hash(LedgerNamespace::Skip, &[&batch])
 }
 
 /// Compute the keylet for the amendments pseudo-object.

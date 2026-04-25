@@ -6,6 +6,7 @@ pub mod error;
 pub mod fees;
 pub mod header;
 pub mod ledger;
+pub mod skip_list;
 pub mod sle_codec;
 pub mod state_table;
 
@@ -13,3 +14,4 @@ pub use error::LedgerError;
 pub use fees::LedgerFees;
 pub use header::LedgerHeader;
 pub use ledger::{Ledger, LedgerState};
+pub use skip_list::SkipListEntry;
