@@ -67,7 +67,15 @@ pub async fn account_objects(
                 true
             }
         })
-        .map(|(_, entry)| entry)
+        .map(|(idx, entry)| {
+            // rippled embeds the entry's ledger index inside each object so
+            // callers can use it as a unique identifier (e.g. CheckCash needs
+            // CheckID = the Check entry's index).
+            let mut obj = entry.as_object().cloned().unwrap_or_default();
+            obj.entry("index".to_string())
+                .or_insert_with(|| Value::String(idx.to_string()));
+            Value::Object(obj)
+        })
         .collect();
 
     let account_str = params["account"].as_str().unwrap_or_default();

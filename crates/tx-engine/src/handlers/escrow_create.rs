@@ -95,6 +95,9 @@ impl Transactor for EscrowCreateTransactor {
             "Account": account_str,
             "Destination": destination_str,
             "Amount": amount.to_string(),
+            // Originating tx Sequence; consumed by EscrowFinish/Cancel
+            // via OfferSequence and surfaced through account_objects.
+            "Sequence": tx_seq,
         });
 
         if let Some(finish_after) = helpers::get_u32_field(ctx.tx, "FinishAfter") {
