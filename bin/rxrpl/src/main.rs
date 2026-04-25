@@ -90,6 +90,12 @@ enum Commands {
         #[arg(long)]
         sync_rpc: Option<String>,
 
+        /// Path to the persistent node store (RocksDB). Implies
+        /// `backend = "rocksdb"` unless explicitly overridden in the config.
+        /// If unset, the configured backend (default: memory) is used.
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+
         /// Shorthand for --mode standalone
         #[arg(long, conflicts_with = "network")]
         standalone: bool,
@@ -328,6 +334,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             close_interval,
             bind,
             sync_rpc,
+            db_path,
             standalone,
             network,
             reporting,
@@ -340,6 +347,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             if let Some(ref dir) = cli.data_dir {
                 config.database.path = dir.clone();
+            }
+
+            // --db-path implies a persistent backend unless the config
+            // already set one explicitly to something other than the default.
+            if let Some(ref path) = db_path {
+                config.database.path = path.clone();
+                if config.database.backend == "memory" {
+                    config.database.backend = "rocksdb".into();
+                }
             }
 
             if reporting {
