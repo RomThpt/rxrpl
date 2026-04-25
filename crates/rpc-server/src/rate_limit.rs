@@ -121,14 +121,6 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Test helper: clear the global bucket map between tests so they do not
-/// leak rate-limit state into each other.
-#[cfg(test)]
-pub fn _clear_for_test() {
-    BUCKETS.clear();
-    LAST_EVICT_MS.store(0, Ordering::Relaxed);
-}
-
 // Silences unused warning in non-test builds where `Arc` is only required
 // by a future expansion that will share buckets across multiple endpoints.
 #[allow(dead_code)]
@@ -141,35 +133,36 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
+    // Tests share a process-global BUCKETS map. To stay independent under
+    // `cargo test`'s parallel scheduler each test owns a unique TEST-NET
+    // IP that no other test (or production code path) ever touches.
+
     #[test]
     fn loopback_bypass() {
-        _clear_for_test();
         assert!(is_loopback(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
     }
 
     #[test]
     fn burst_then_throttle() {
-        _clear_for_test();
-        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let ip: IpAddr = "198.51.100.1".parse().unwrap();
+        BUCKETS.remove(&ip);
         for _ in 0..TOKENS_BURST {
             assert!(try_consume(ip, 1000));
         }
-        // Bucket is now empty.
         assert!(!try_consume(ip, 1000));
+        BUCKETS.remove(&ip);
     }
 
     #[test]
     fn refill_over_time() {
-        _clear_for_test();
-        let ip: IpAddr = "192.0.2.2".parse().unwrap();
+        let ip: IpAddr = "198.51.100.2".parse().unwrap();
+        BUCKETS.remove(&ip);
         for _ in 0..TOKENS_BURST {
             assert!(try_consume(ip, 1000));
         }
-        // Manually rewind the bucket's last_refill to simulate elapsed time.
         if let Some(mut entry) = BUCKETS.get_mut(&ip) {
             entry.last_refill_unix_ms = entry.last_refill_unix_ms.saturating_sub(2_000);
         }
-        // Two seconds of refill = 20 tokens.
         let mut admitted = 0;
         for _ in 0..30 {
             if try_consume(ip, 1000) {
@@ -180,5 +173,6 @@ mod tests {
             (15..=25).contains(&admitted),
             "expected ~20 admitted, got {admitted}"
         );
+        BUCKETS.remove(&ip);
     }
 }
