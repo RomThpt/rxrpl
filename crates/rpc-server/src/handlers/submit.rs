@@ -10,7 +10,6 @@ use crate::context::ServerContext;
 use crate::error::RpcServerError;
 
 pub async fn submit(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcServerError> {
-    tracing::info!("DBG submit RPC called, params keys: {:?}", params.as_object().map(|o| o.keys().collect::<Vec<_>>()));
     // In reporting mode, forward submit requests to the upstream node
     if ctx.reporting_mode {
         let forward_url = ctx
@@ -48,13 +47,7 @@ pub async fn submit(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
         && params.get("secret").is_some()
         && params.get("tx_json").is_some()
     {
-        let r = Box::pin(super::sign_and_submit(params, ctx)).await;
-        tracing::info!(
-            "DBG submit -> sign_and_submit returned: ok={} err={:?}",
-            r.is_ok(),
-            r.as_ref().err()
-        );
-        return r;
+        return Box::pin(super::sign_and_submit(params, ctx)).await;
     }
 
     let tx_blob = params
@@ -132,13 +125,6 @@ pub async fn submit(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
     let result = engine
         .apply(&tx_json, &mut ledger, &rules, fees)
         .map_err(|e| RpcServerError::Internal(format!("tx engine error: {e}")))?;
-    tracing::info!(
-        "DBG submit applied tx type={:?} account={:?} engine_result={} success={}",
-        tx_json.get("TransactionType"),
-        tx_json.get("Account"),
-        result.to_string(),
-        result.is_success()
-    );
 
     // Emit proposed transaction event for WebSocket subscribers
     let _ = ctx

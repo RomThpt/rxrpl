@@ -202,10 +202,6 @@ impl LedgerSyncer {
         if !self.incremental.contains_key(&seq) {
             if let Some(&active_seq) = self.incremental.keys().max() {
                 if seq <= active_seq {
-                    tracing::info!(
-                        "DBG start_incremental_sync #{} skipped: active #{} >= seq",
-                        seq, active_seq
-                    );
                     return Vec::new();
                 }
                 // Replace when the active sync is stuck (zero-add rounds).
@@ -214,10 +210,6 @@ impl LedgerSyncer {
                     .map(|e| e.zero_rounds)
                     .unwrap_or(0);
                 if zero_rounds < 8 {
-                    tracing::info!(
-                        "DBG start_incremental_sync #{} skipped: active #{} (zr={}) < 8",
-                        seq, active_seq, zero_rounds
-                    );
                     return Vec::new();
                 }
                 tracing::info!(
@@ -251,12 +243,7 @@ impl LedgerSyncer {
             return Vec::new();
         }
 
-        let result = entry.map.missing_nodes(hash, MAX_DELTA_NODES_PER_REQUEST);
-        tracing::info!(
-            "DBG start_incremental_sync #{} round={} is_empty={} missing={}",
-            seq, entry.rounds, entry.map.is_empty(), result.len()
-        );
-        result
+        entry.map.missing_nodes(hash, MAX_DELTA_NODES_PER_REQUEST)
     }
 
     /// Feed received nodes into an active incremental sync.

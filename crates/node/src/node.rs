@@ -1193,16 +1193,10 @@ impl Node {
                                 }
                             }
                             ConsensusMessage::LedgerData { hash, seq, nodes } => {
-                                tracing::info!(
+                                tracing::debug!(
                                     "received LedgerData hash={} seq={} nodes={}",
                                     hash, seq, nodes.len()
                                 );
-                                if nodes.is_empty() {
-                                    tracing::warn!(
-                                        "LedgerData seq={} hash={} arrived empty",
-                                        seq, hash
-                                    );
-                                }
                                 if !nodes.is_empty() {
                                     match Node::try_reconstruct_ledger(seq, hash, &nodes, &node_store) {
                                         Ok(reconstructed) => {
@@ -1260,13 +1254,13 @@ impl Node {
                                 }
                             }
                             ConsensusMessage::LedgerHeader { seq, header } => {
-                                tracing::info!(
-                                    "received parsed header for ledger #{} hash={} account_hash={}",
-                                    seq, header.hash, header.account_hash
+                                tracing::debug!(
+                                    "received parsed header for ledger #{} hash={}",
+                                    seq, header.hash
                                 );
                                 // The overlay layer handles incremental sync (liAS_NODE
-                                // requests). We just log receipt here; reconstruction
-                                // happens when LedgerData with the full state arrives.
+                                // requests). LedgerData with the full state triggers
+                                // reconstruction when it arrives.
                             }
                             ConsensusMessage::TxSetAcquired(tx_set) => {
                                 tracing::info!(

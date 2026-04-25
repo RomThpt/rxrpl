@@ -913,47 +913,31 @@ impl PeerManager {
                                 }
                                 self.ledger_syncer.set_ledger_hash(header.sequence, header.hash);
 
-                                let store_opt = self.get_node_store();
-                                tracing::info!(
-                                    "DBG liBASE #{} store={} account_hash={}",
-                                    header.sequence,
-                                    if store_opt.is_some() { "Some" } else { "None" },
-                                    header.account_hash,
-                                );
-                                if let Some(store) = store_opt {
+                                if let Some(store) = self.get_node_store() {
                                     let missing = self.ledger_syncer.start_incremental_sync(
                                         header.sequence,
                                         header.account_hash,
                                         store,
                                     );
-                                    tracing::info!(
-                                        "DBG start_incremental_sync #{} returned {} missing nodes",
-                                        header.sequence, missing.len()
-                                    );
                                     if !missing.is_empty() {
                                         self.send_get_ledger_as_node(header.sequence);
-                                    } else {
-                                        // The state map is already fully resolvable from
-                                        // the local store (e.g. early ledgers whose state
-                                        // matches genesis). Complete the sync immediately
-                                        // and dispatch the leaves to the consensus layer.
-                                        if let Some(leaves) = self
-                                            .ledger_syncer
-                                            .try_complete_sync(header.sequence)
-                                        {
-                                            tracing::info!(
-                                                "incremental sync immediate-complete for ledger #{} ({} leaves)",
-                                                header.sequence, leaves.len()
-                                            );
-                                            self.ledger_syncer.mark_synced(header.sequence);
-                                            let _ = self.consensus_tx.send(
-                                                ConsensusMessage::LedgerData {
-                                                    hash: header.hash,
-                                                    seq: header.sequence,
-                                                    nodes: leaves,
-                                                },
-                                            );
-                                        }
+                                    } else if let Some(leaves) =
+                                        self.ledger_syncer.try_complete_sync(header.sequence)
+                                    {
+                                        // Target state already fully resolvable from the
+                                        // local store (e.g. early ledgers whose state still
+                                        // matches genesis). Dispatch leaves to consensus.
+                                        tracing::info!(
+                                            "incremental sync immediate-complete for ledger #{} ({} leaves)",
+                                            header.sequence, leaves.len()
+                                        );
+                                        self.ledger_syncer.mark_synced(header.sequence);
+                                        let _ =
+                                            self.consensus_tx.send(ConsensusMessage::LedgerData {
+                                                hash: header.hash,
+                                                seq: header.sequence,
+                                                nodes: leaves,
+                                            });
                                     }
                                 }
 
@@ -1806,17 +1790,10 @@ impl PeerManager {
     fn send_get_ledger_as_node(&mut self, seq: u32) {
         let ledger_hash = match self.ledger_syncer.get_ledger_hash(seq) {
             Some(h) => h,
-            None => {
-                tracing::info!("DBG send_get_ledger_as_node #{}: no ledger_hash", seq);
-                return;
-            }
+            None => return,
         };
 
         let missing = self.ledger_syncer.get_missing_node_ids(seq);
-        tracing::info!(
-            "DBG send_get_ledger_as_node #{}: {} missing node_ids",
-            seq, missing.len()
-        );
         if missing.is_empty() {
             return;
         }
@@ -1837,10 +1814,6 @@ impl PeerManager {
         // Split requests across multiple peers so each gets a different subset.
         let best = self.peer_set.best_peers_for_ledger(seq, 3);
         let num_peers = best.len();
-        tracing::info!(
-            "DBG send_get_ledger_as_node #{}: best_peers={} (handles={})",
-            seq, num_peers, self.peer_handles.len()
-        );
         if num_peers == 0 {
             return;
         }
@@ -2084,7 +2057,7 @@ impl PeerManager {
                 return;
             }
         };
-        tracing::info!(
+        tracing::debug!(
             "GetLedger from {} type={} seq={:?} hash_len={} node_ids={}",
             from,
             req.itype,
