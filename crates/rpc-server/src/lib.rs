@@ -10,6 +10,7 @@ pub mod error;
 pub mod events;
 pub mod handlers;
 pub mod metrics;
+pub mod rate_limit;
 pub mod role;
 pub mod router;
 pub mod server;

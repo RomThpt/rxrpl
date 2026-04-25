@@ -1,0 +1,184 @@
+//! Per-IP token-bucket rate limit for the JSON-RPC + WebSocket endpoints.
+//!
+//! Mitigates audit finding **H4** (an unauthenticated client could flood
+//! the RPC port with thousands of cheap requests per second). Implementation
+//! choices:
+//!
+//! - **In-process state.** No external dependency (Redis, tower-governor) is
+//!   warranted for a single-node validator; a `DashMap<IpAddr, Bucket>`
+//!   suffices and avoids cross-task locks.
+//! - **Token bucket.** A 100-token bucket refills at 10 tokens / second,
+//!   so steady throughput is 10 req/s with a 100-burst. Browsers running
+//!   `wscompat`-style suites stay well under that.
+//! - **Privileged loopback bypass.** 127.0.0.0/8 and ::1 always pass —
+//!   admin-only RPC tooling and operator scripts must not be throttled by
+//!   their own host.
+//!
+//! Memory: each `IpAddr` entry is ~32 B; a passive eviction sweep every
+//! `EVICT_INTERVAL` removes idle buckets so the map cannot grow unbounded
+//! from a churn of one-shot client IPs.
+
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::ConnectInfo;
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
+
+const TOKENS_BURST: u64 = 100;
+const TOKENS_PER_SEC: u64 = 10;
+const EVICT_INTERVAL: Duration = Duration::from_secs(300);
+
+struct Bucket {
+    tokens_milli: u64,
+    last_refill_unix_ms: u64,
+}
+
+static BUCKETS: Lazy<DashMap<IpAddr, Bucket>> = Lazy::new(DashMap::new);
+static LAST_EVICT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Axum middleware that throttles per-IP request rate.
+pub async fn rate_limit_by_ip(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let ip = addr.ip();
+    if is_loopback(&ip) {
+        return next.run(request).await;
+    }
+
+    if !try_consume(ip, 1000) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded\n",
+        )
+            .into_response();
+    }
+
+    maybe_evict_idle();
+    next.run(request).await
+}
+
+fn is_loopback(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
+/// Try to deduct `cost_milli` thousandths of a token. Returns true if it succeeded.
+fn try_consume(ip: IpAddr, cost_milli: u64) -> bool {
+    let now_ms = now_unix_ms();
+    let mut entry = BUCKETS.entry(ip).or_insert_with(|| Bucket {
+        tokens_milli: TOKENS_BURST * 1000,
+        last_refill_unix_ms: now_ms,
+    });
+
+    // Refill since last visit.
+    let elapsed_ms = now_ms.saturating_sub(entry.last_refill_unix_ms);
+    let refill_milli = elapsed_ms.saturating_mul(TOKENS_PER_SEC); // tokens_per_sec * (ms/1000) * 1000
+    entry.tokens_milli = entry
+        .tokens_milli
+        .saturating_add(refill_milli)
+        .min(TOKENS_BURST * 1000);
+    entry.last_refill_unix_ms = now_ms;
+
+    if entry.tokens_milli >= cost_milli {
+        entry.tokens_milli -= cost_milli;
+        true
+    } else {
+        false
+    }
+}
+
+fn maybe_evict_idle() {
+    let now_ms = now_unix_ms();
+    let last = LAST_EVICT_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last) < EVICT_INTERVAL.as_millis() as u64 {
+        return;
+    }
+    if LAST_EVICT_MS
+        .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let cutoff_ms = now_ms.saturating_sub(EVICT_INTERVAL.as_millis() as u64);
+    BUCKETS.retain(|_, b| b.last_refill_unix_ms >= cutoff_ms);
+}
+
+fn now_unix_ms() -> u64 {
+    use std::time::SystemTime;
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Test helper: clear the global bucket map between tests so they do not
+/// leak rate-limit state into each other.
+#[cfg(test)]
+pub fn _clear_for_test() {
+    BUCKETS.clear();
+    LAST_EVICT_MS.store(0, Ordering::Relaxed);
+}
+
+// Silences unused warning in non-test builds where `Arc` is only required
+// by a future expansion that will share buckets across multiple endpoints.
+#[allow(dead_code)]
+fn _link_arc() -> Option<Arc<()>> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn loopback_bypass() {
+        _clear_for_test();
+        assert!(is_loopback(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn burst_then_throttle() {
+        _clear_for_test();
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        for _ in 0..TOKENS_BURST {
+            assert!(try_consume(ip, 1000));
+        }
+        // Bucket is now empty.
+        assert!(!try_consume(ip, 1000));
+    }
+
+    #[test]
+    fn refill_over_time() {
+        _clear_for_test();
+        let ip: IpAddr = "192.0.2.2".parse().unwrap();
+        for _ in 0..TOKENS_BURST {
+            assert!(try_consume(ip, 1000));
+        }
+        // Manually rewind the bucket's last_refill to simulate elapsed time.
+        if let Some(mut entry) = BUCKETS.get_mut(&ip) {
+            entry.last_refill_unix_ms = entry.last_refill_unix_ms.saturating_sub(2_000);
+        }
+        // Two seconds of refill = 20 tokens.
+        let mut admitted = 0;
+        for _ in 0..30 {
+            if try_consume(ip, 1000) {
+                admitted += 1;
+            }
+        }
+        assert!(
+            (15..=25).contains(&admitted),
+            "expected ~20 admitted, got {admitted}"
+        );
+    }
+}

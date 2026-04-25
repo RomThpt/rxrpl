@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::extract::connect_info::ConnectInfo;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
@@ -16,6 +17,7 @@ use crate::context::ServerContext;
 use crate::error::RpcServerError;
 use crate::events::{ServerEvent, event_to_json};
 use crate::handlers::{build_path_find_response, parse_path_find_params, run_path_find};
+use crate::rate_limit::rate_limit_by_ip;
 use crate::role::{ConnectionRole, RequestContext};
 use crate::router::dispatch;
 use crate::subscriptions::ConnectionSubscriptions;
@@ -24,10 +26,19 @@ use crate::subscriptions::ConnectionSubscriptions;
 ///
 /// Callers must use `into_make_service_with_connect_info::<SocketAddr>()`
 /// when serving so that `ConnectInfo<SocketAddr>` is available.
+/// Maximum HTTP body size accepted by the JSON-RPC endpoint.
+///
+/// rippled's largest legitimate request is a `submit` with a tx_blob of a
+/// few hundred KB at worst. 1 MiB is generous and stops a remote attacker
+/// from holding an arbitrary amount of memory open per request (audit H3).
+pub const MAX_RPC_BODY: usize = 1024 * 1024;
+
 pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     Router::new()
         .route("/", post(rpc_handler).get(ws_handler))
         .route("/metrics", get(metrics_handler))
+        .layer(DefaultBodyLimit::max(MAX_RPC_BODY))
+        .layer(axum::middleware::from_fn(rate_limit_by_ip))
         .with_state(ctx)
 }
 
