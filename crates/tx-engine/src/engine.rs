@@ -219,11 +219,6 @@ impl TxEngine {
             drops_after,
             tx_for_invariants,
         ) {
-            tracing::warn!(
-                "invariant violated: {} (tx_type={:?})",
-                msg,
-                tx.get("TransactionType").and_then(|v| v.as_str())
-            );
             return Err(TxEngineError::InvariantViolated(msg));
         }
 

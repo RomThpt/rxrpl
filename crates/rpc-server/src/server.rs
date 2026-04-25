@@ -298,7 +298,6 @@ async fn rpc_handler(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let method = body.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    tracing::info!("rpc <- {} from {}", method, addr);
 
     let params = body
         .get("params")
