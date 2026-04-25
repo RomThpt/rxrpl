@@ -2,6 +2,7 @@ use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
+use crate::owner_dir::add_to_owner_dir;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct EscrowCreateTransactor;
@@ -94,6 +95,9 @@ impl Transactor for EscrowCreateTransactor {
             "Account": account_str,
             "Destination": destination_str,
             "Amount": amount.to_string(),
+            // Originating tx Sequence; consumed by EscrowFinish/Cancel
+            // via OfferSequence and surfaced through account_objects.
+            "Sequence": tx_seq,
         });
 
         if let Some(finish_after) = helpers::get_u32_field(ctx.tx, "FinishAfter") {
@@ -111,6 +115,8 @@ impl Transactor for EscrowCreateTransactor {
         ctx.view
             .insert(escrow_key, escrow_data)
             .map_err(|_| TransactionResult::TefInternal)?;
+
+        add_to_owner_dir(ctx.view, &src_id, &escrow_key)?;
 
         Ok(TransactionResult::TesSuccess)
     }

@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use rxrpl_protocol::keylet;
+
 use crate::context::ServerContext;
 use crate::error::RpcServerError;
 use crate::handlers::common::{require_account_id, resolve_ledger, walk_owner_directory};
@@ -12,6 +14,10 @@ pub async fn account_channels(
 ) -> Result<Value, RpcServerError> {
     let account_id = require_account_id(&params)?;
     let ledger = resolve_ledger(&params, ctx).await?;
+
+    if ledger.get_state(&keylet::account(&account_id)).is_none() {
+        return Err(RpcServerError::AccountNotFound);
+    }
 
     let limit = params
         .get("limit")

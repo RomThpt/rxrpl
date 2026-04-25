@@ -14,8 +14,7 @@ pub async fn amm_info(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, 
 
     let amm_key = if let Some(amm_account) = params.get("amm_account").and_then(|v| v.as_str()) {
         // Direct lookup by AMM account
-        let id = decode_account_id(amm_account)
-            .map_err(|e| RpcServerError::InvalidParams(format!("invalid amm_account: {e}")))?;
+        let id = decode_account_id(amm_account).map_err(|_| RpcServerError::AccountMalformed)?;
         keylet::account(&id)
     } else {
         // Lookup by asset pair
@@ -34,7 +33,7 @@ pub async fn amm_info(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, 
 
     let data = ledger
         .get_state(&amm_key)
-        .ok_or_else(|| RpcServerError::InvalidParams("AMM not found".into()))?;
+        .ok_or(RpcServerError::AccountNotFound)?;
 
     let amm: Value = crate::handlers::common::decode_state_value(data)?;
 

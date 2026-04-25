@@ -118,8 +118,7 @@ pub fn require_account_id(params: &Value) -> Result<AccountId, RpcServerError> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcServerError::InvalidParams("missing 'account' field".into()))?;
 
-    decode_account_id(account)
-        .map_err(|e| RpcServerError::InvalidParams(format!("invalid account: {e}")))
+    decode_account_id(account).map_err(|_| RpcServerError::AccountMalformed)
 }
 
 /// Walk an account's owner directory, returning ledger entries with pagination.
@@ -265,6 +264,22 @@ pub fn derive_seed_from_params(
             )));
         }
     };
+
+    // rippled rejects requests carrying more than one of secret/seed/seed_hex/passphrase.
+    let provided_secret_kinds = ["secret", "seed", "seed_hex", "passphrase"]
+        .iter()
+        .filter(|k| {
+            params
+                .get(**k)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty())
+        })
+        .count();
+    if provided_secret_kinds > 1 {
+        return Err(RpcServerError::InvalidParams(
+            "Cannot specify more than one of 'secret', 'seed', 'seed_hex', or 'passphrase'.".into(),
+        ));
+    }
 
     // Try encoded seed first
     if let Some(seed_str) = params.get("seed").and_then(|v| v.as_str()) {

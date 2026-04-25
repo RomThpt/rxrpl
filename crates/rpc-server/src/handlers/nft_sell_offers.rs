@@ -9,6 +9,9 @@ use crate::context::ServerContext;
 use crate::error::RpcServerError;
 use crate::handlers::common::resolve_ledger;
 
+/// `tfSellNFToken` flag — set on the offer when it's a sell offer.
+const TF_SELL_NFTOKEN: u64 = 0x0001;
+
 pub async fn nft_sell_offers(
     params: Value,
     ctx: &Arc<ServerContext>,
@@ -29,39 +32,37 @@ pub async fn nft_sell_offers(
         .unwrap_or(250)
         .min(500) as usize;
 
-    // NFT sell offers directory - similar to buy offers but sell-specific.
-    let mut sell_dir_bytes = [0u8; 32];
-    let nft_bytes = hex::decode(nft_id_str)
-        .map_err(|e| RpcServerError::InvalidParams(format!("invalid nft_id hex: {e}")))?;
-    if nft_bytes.len() == 32 {
-        sell_dir_bytes.copy_from_slice(&nft_bytes);
-        // Differentiate from buy directory by flipping the last byte
-        sell_dir_bytes[31] ^= 0x01;
+    // We don't yet maintain per-NFT sell/buy offer directories; scan the
+    // entire state map for `NFTokenOffer` entries matching this NFT id and
+    // the sell flag. Acceptable for tests; revisit if we ever serve large
+    // open ledgers (rippled keeps two extra DirectoryNode trees per NFT).
+    let mut offers = Vec::new();
+    for (idx, raw) in ledger.state_map.iter_ref() {
+        if offers.len() >= limit {
+            break;
+        }
+        let entry: Value = match crate::handlers::common::decode_state_value(raw) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if entry.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("NFTokenOffer") {
+            continue;
+        }
+        if entry.get("NFTokenID").and_then(|v| v.as_str()) != Some(nft_id_str) {
+            continue;
+        }
+        let flags = entry.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
+        if flags & TF_SELL_NFTOKEN == 0 {
+            continue;
+        }
+        let mut obj = entry.as_object().cloned().unwrap_or_default();
+        obj.entry("nft_offer_index".to_string())
+            .or_insert_with(|| Value::String(idx.to_string()));
+        offers.push(Value::Object(obj));
     }
 
-    let dir_key = Hash256::from(sell_dir_bytes);
-
-    let mut offers = Vec::new();
-
-    if let Some(data) = ledger.get_state(&dir_key) {
-        let dir: Value = crate::handlers::common::decode_state_value(data)?;
-
-        if let Some(indexes) = dir.get("Indexes").and_then(|v| v.as_array()) {
-            for idx_val in indexes {
-                if offers.len() >= limit {
-                    break;
-                }
-                let idx_str = idx_val.as_str().unwrap_or_default();
-                let idx_hash: Hash256 = idx_str
-                    .parse()
-                    .map_err(|e| RpcServerError::Internal(format!("invalid index: {e}")))?;
-
-                if let Some(entry_data) = ledger.get_state(&idx_hash) {
-                    let entry: Value = crate::handlers::common::decode_state_value(entry_data)?;
-                    offers.push(entry);
-                }
-            }
-        }
+    if offers.is_empty() {
+        return Err(RpcServerError::ObjectNotFound);
     }
 
     Ok(serde_json::json!({

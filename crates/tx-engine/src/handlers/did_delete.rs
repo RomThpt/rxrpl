@@ -2,6 +2,7 @@ use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
+use crate::owner_dir::remove_from_owner_dir;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct DIDDeleteTransactor;
@@ -41,6 +42,7 @@ impl Transactor for DIDDeleteTransactor {
         helpers::increment_sequence(&mut account);
 
         let did_key = keylet::did(&account_id);
+        remove_from_owner_dir(ctx.view, &account_id, &did_key)?;
         ctx.view
             .erase(&did_key)
             .map_err(|_| TransactionResult::TefInternal)?;

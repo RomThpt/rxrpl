@@ -2,6 +2,7 @@ use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
+use crate::owner_dir::add_to_owner_dir;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct DIDSetTransactor;
@@ -91,6 +92,7 @@ impl Transactor for DIDSetTransactor {
             ctx.view
                 .insert(did_key, entry_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
+            add_to_owner_dir(ctx.view, &account_id, &did_key)?;
             helpers::adjust_owner_count(&mut account, 1);
         } else {
             ctx.view

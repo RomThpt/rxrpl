@@ -141,7 +141,8 @@ fn tx_map_records_transactions() {
         "TransactionType": "Payment",
         "Account": genesis_addr,
         "Destination": dest_addr,
-        "Amount": "1000000",
+        // Funding a brand-new destination requires >= account_reserve.
+        "Amount": "10000000",
         "Fee": "10",
         "Sequence": 1,
     });

@@ -228,6 +228,18 @@ fn clawback_lifecycle() {
     let engine = make_engine();
     let fees = FeeSettings::default();
 
+    // 0. Enable AllowTrustLineClawback on the issuer (asf=16); rxrpl
+    // mirrors rippled in requiring this flag before any Clawback.
+    let allow_clawback_tx = serde_json::json!({
+        "TransactionType": "AccountSet",
+        "Account": genesis_addr,
+        "SetFlag": 16,
+        "Fee": "12",
+        "Sequence": 1,
+    });
+    let result = Node::apply_transaction(&mut ledger, &engine, &allow_clawback_tx, &fees).unwrap();
+    assert_eq!(result, TransactionResult::TesSuccess);
+
     // 1. Create trust line (dest trusts genesis for USD)
     let trust_tx = serde_json::json!({
         "TransactionType": "TrustSet",
@@ -262,7 +274,8 @@ fn clawback_lifecycle() {
     let binary = rxrpl_ledger::sle_codec::encode_sle(&json_bytes).unwrap();
     ledger.put_state(tl_key, binary).unwrap();
 
-    // 3. Clawback 30 USD
+    // 3. Clawback 30 USD (genesis sequence is now 3 after AccountSet+TrustSet=no,
+    // wait — TrustSet bumps dest, not genesis; genesis seq is 2)
     let clawback_tx = serde_json::json!({
         "TransactionType": "Clawback",
         "Account": genesis_addr,

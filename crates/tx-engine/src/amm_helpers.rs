@@ -20,6 +20,11 @@ pub fn asset_to_bytes(asset: &Value) -> Result<([u8; 20], [u8; 20]), Transaction
             .get("currency")
             .and_then(|v| v.as_str())
             .ok_or(TransactionResult::TemBadCurrency)?;
+        // {currency: "XRP"} is the canonical object form for native XRP and
+        // doesn't carry an issuer.
+        if cur == "XRP" {
+            return Ok(([0u8; 20], [0u8; 20]));
+        }
         let iss = asset
             .get("issuer")
             .and_then(|v| v.as_str())
@@ -124,11 +129,15 @@ pub fn validate_asset(asset: &Value) -> Result<(), TransactionResult> {
         return Err(TransactionResult::TemMalformed);
     }
     if asset.is_object() {
-        asset
+        let cur = asset
             .get("currency")
             .and_then(|v| v.as_str())
             .filter(|c| !c.is_empty())
             .ok_or(TransactionResult::TemBadCurrency)?;
+        // `{currency: "XRP"}` is the canonical XRP object form; no issuer.
+        if cur == "XRP" {
+            return Ok(());
+        }
         asset
             .get("issuer")
             .and_then(|v| v.as_str())
@@ -138,20 +147,24 @@ pub fn validate_asset(asset: &Value) -> Result<(), TransactionResult> {
     Err(TransactionResult::TemMalformed)
 }
 
-/// Check that two asset values are not equal.
+/// Check that two asset values are not equal. Treats `"XRP"` and
+/// `{currency:"XRP"}` as the same asset (both are native XRP).
 pub fn assets_differ(a: &Value, b: &Value) -> bool {
-    if let (Some(sa), Some(sb)) = (a.as_str(), b.as_str()) {
-        return sa != sb;
+    let (cur_a, iss_a) = canonical_asset(a);
+    let (cur_b, iss_b) = canonical_asset(b);
+    cur_a != cur_b || iss_a != iss_b
+}
+
+fn canonical_asset(v: &Value) -> (Option<&str>, Option<&str>) {
+    if let Some(s) = v.as_str() {
+        return (Some(s), None);
     }
-    if a.is_object() && b.is_object() {
-        let cur_a = a.get("currency").and_then(|v| v.as_str());
-        let cur_b = b.get("currency").and_then(|v| v.as_str());
-        let iss_a = a.get("issuer").and_then(|v| v.as_str());
-        let iss_b = b.get("issuer").and_then(|v| v.as_str());
-        return cur_a != cur_b || iss_a != iss_b;
+    let cur = v.get("currency").and_then(|c| c.as_str());
+    if cur == Some("XRP") {
+        return (Some("XRP"), None);
     }
-    // Different shapes (string vs object) are always different
-    true
+    let iss = v.get("issuer").and_then(|i| i.as_str());
+    (cur, iss)
 }
 
 /// Read an AMM entry from the view by its key.
@@ -169,6 +182,37 @@ pub fn get_pool_field(obj: &Value, field: &str) -> u64 {
         .as_str()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
+}
+
+/// Derive an Asset spec from an Amount field.
+///
+/// XRP string `"<drops>"` → `"XRP"` sentinel; IOU object `{currency, issuer,
+/// value}` → `{currency, issuer}` extracted (drops the `value`). Returns
+/// `None` on shapes the AMM can't represent (e.g. missing currency/issuer).
+pub fn asset_spec_from_amount(amount: &Value) -> Option<Value> {
+    if amount.is_string() {
+        return Some(Value::String("XRP".to_string()));
+    }
+    let obj = amount.as_object()?;
+    Some(serde_json::json!({
+        "currency": obj.get("currency")?.clone(),
+        "issuer": obj.get("issuer")?.clone(),
+    }))
+}
+
+/// Parse an Amount field as an integer scalar, accepting both XRP strings
+/// (`"<drops>"`) and IOU objects (`{value: "<numeric>"}`). Truncates IOU
+/// fractional values; rejects negatives.
+pub fn amount_value_drops_or_iou(amount: &Value) -> Option<u64> {
+    if let Some(s) = amount.as_str() {
+        return s.parse().ok();
+    }
+    let obj = amount.as_object()?;
+    let v: f64 = obj.get("value")?.as_str()?.parse().ok()?;
+    if v < 0.0 {
+        return None;
+    }
+    Some(v as u64)
 }
 
 #[cfg(test)]

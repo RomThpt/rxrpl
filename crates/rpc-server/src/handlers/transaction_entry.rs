@@ -16,7 +16,7 @@ pub async fn transaction_entry(
     let tx_hash_str = params
         .get("tx_hash")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| RpcServerError::InvalidParams("missing 'tx_hash'".into()))?;
+        .ok_or(RpcServerError::FieldNotFoundTransaction)?;
 
     let tx_hash = Hash256::from_str(tx_hash_str)
         .map_err(|e| RpcServerError::InvalidParams(format!("invalid tx_hash: {e}")))?;

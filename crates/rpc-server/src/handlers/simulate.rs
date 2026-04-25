@@ -39,9 +39,11 @@ pub async fn simulate(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, 
         .apply(&tx_json, &mut sandbox_ledger, &rules, fees)
         .map_err(|e| RpcServerError::Internal(format!("tx engine error: {e}")))?;
 
+    let token = result.to_string();
     Ok(serde_json::json!({
-        "engine_result": result.to_string(),
+        "engine_result": token,
         "engine_result_code": result.code(),
+        "engine_result_message": format!("Transaction simulated; result: {token}"),
         "tx_json": tx_json,
         "applied": false,
     }))

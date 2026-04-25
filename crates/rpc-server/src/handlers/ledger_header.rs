@@ -14,7 +14,7 @@ pub async fn ledger_header(
     let ledger = resolve_ledger(&params, ctx).await?;
 
     Ok(serde_json::json!({
-        "ledger_header": {
+        "ledger": {
             "ledger_index": ledger.header.sequence,
             "ledger_hash": ledger.header.hash.to_string(),
             "parent_hash": ledger.header.parent_hash.to_string(),

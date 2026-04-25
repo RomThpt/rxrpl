@@ -2,6 +2,7 @@ use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
+use crate::owner_dir::add_to_owner_dir;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct PaymentChannelCreateTransactor;
@@ -112,6 +113,8 @@ impl Transactor for PaymentChannelCreateTransactor {
         ctx.view
             .insert(channel_key, channel_data)
             .map_err(|_| TransactionResult::TefInternal)?;
+
+        add_to_owner_dir(ctx.view, &src_id, &channel_key)?;
 
         Ok(TransactionResult::TesSuccess)
     }

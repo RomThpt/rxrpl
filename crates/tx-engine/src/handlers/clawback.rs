@@ -48,7 +48,14 @@ impl Transactor for ClawbackTransactor {
 
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
         let issuer_str = helpers::get_account(ctx.tx)?;
-        helpers::read_account_by_address(ctx.view, issuer_str)?;
+        let (_, issuer_acct) = helpers::read_account_by_address(ctx.view, issuer_str)?;
+
+        // Issuer must have lsfAllowTrustLineClawback set on its AccountRoot.
+        const LSF_ALLOW_TRUST_LINE_CLAWBACK: u32 = 0x8000_0000;
+        let issuer_flags = helpers::get_flags(&issuer_acct);
+        if issuer_flags & LSF_ALLOW_TRUST_LINE_CLAWBACK == 0 {
+            return Err(TransactionResult::TecNoPermission);
+        }
 
         // Amount.issuer is the holder
         let amount = ctx.tx.get("Amount").unwrap();
@@ -345,9 +352,15 @@ mod tests {
 
     #[test]
     fn reject_no_trust_line() {
+        const LSF_ALLOW_TRUST_LINE_CLAWBACK: u32 = 0x8000_0000;
         let mut ledger = Ledger::genesis();
-        // Setup accounts without trust line
-        for (addr, bal) in [(ISSUER, "100000000"), (HOLDER, "50000000")] {
+        // Setup accounts without trust line. Issuer must have the clawback
+        // flag set so the preclaim's flag check passes and we exercise the
+        // missing-trust-line branch.
+        for (addr, bal, flags) in [
+            (ISSUER, "100000000", LSF_ALLOW_TRUST_LINE_CLAWBACK),
+            (HOLDER, "50000000", 0),
+        ] {
             let id = decode_account_id(addr).unwrap();
             let key = keylet::account(&id);
             let account = serde_json::json!({
@@ -356,7 +369,7 @@ mod tests {
                 "Balance": bal,
                 "Sequence": 1,
                 "OwnerCount": 0,
-                "Flags": 0,
+                "Flags": flags,
             });
             ledger
                 .put_state(key, serde_json::to_vec(&account).unwrap())

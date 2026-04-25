@@ -146,6 +146,24 @@ impl TxQueue {
         Some(entry)
     }
 
+    /// Remove queue entries whose hash satisfies the predicate (typically
+    /// "is now present in the just-closed ledger's tx_map", i.e. the tx has
+    /// been confirmed and must not be re-applied).
+    pub fn remove_if<F>(&mut self, mut should_remove: F)
+    where
+        F: FnMut(&Hash256) -> bool,
+    {
+        let to_drop: Vec<Hash256> = self
+            .by_hash
+            .keys()
+            .copied()
+            .filter(|h| should_remove(h))
+            .collect();
+        for hash in to_drop {
+            self.remove(&hash);
+        }
+    }
+
     /// Remove expired transactions and update metrics.
     pub fn remove_expired(&mut self, current_ledger_seq: u32) {
         let expired: Vec<Hash256> = self

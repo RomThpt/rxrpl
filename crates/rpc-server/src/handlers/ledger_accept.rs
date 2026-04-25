@@ -55,6 +55,30 @@ pub async fn ledger_accept(
     let closed_copy = ledger.clone();
     let new_open = Ledger::new_open(&closed_copy);
 
+    // Snapshot the set of confirmed tx hashes from the just-closed ledger
+    // before we move it into the history; used below to purge confirmed
+    // entries from the retry queue.
+    let mut confirmed_hashes: std::collections::HashSet<rxrpl_primitives::Hash256> =
+        std::collections::HashSet::new();
+    let mut txn_count: u32 = 0;
+    closed_copy.tx_map.iter_ref().for_each(|(hash, data)| {
+        confirmed_hashes.insert(*hash);
+        txn_count += 1;
+        // Mirror what the natural-close loop in node.rs does so subscribers
+        // on the `transactions` stream get notified for txs that were applied
+        // in a manually-closed (ledger_accept) ledger.
+        if let Ok(record) = serde_json::from_slice::<serde_json::Value>(data) {
+            let tx_json = record.get("tx_json").cloned().unwrap_or_default();
+            let _ = ctx
+                .event_sender()
+                .send(crate::events::ServerEvent::TransactionValidated {
+                    transaction: tx_json,
+                    meta: record.get("meta").cloned().unwrap_or_default(),
+                    ledger_index: closed_seq,
+                });
+        }
+    });
+
     {
         let mut closed_ledgers = closed_lock.write().await;
         closed_ledgers.push_back(closed_copy);
@@ -67,7 +91,7 @@ pub async fn ledger_accept(
             ledger_index: closed_seq,
             ledger_hash: closed_hash,
             ledger_time: ripple_close_time,
-            txn_count: 0,
+            txn_count,
         });
 
     // Replace the open ledger
@@ -80,8 +104,11 @@ pub async fn ledger_accept(
     {
         let pending = {
             let mut q = tq.write().await;
-            // First remove confirmed txs (already in closed ledger's tx_map)
-            // and expired entries, then drain the rest for retry.
+            // Drop transactions that are already confirmed in the just-closed
+            // ledger's tx_map, plus anything past its LastLedgerSequence. The
+            // remaining queue entries (preflight-passed but not yet applied)
+            // are drained for retry against the new open ledger.
+            q.remove_if(|hash| confirmed_hashes.contains(hash));
             q.remove_expired(new_seq);
             q.drain_for_retry_ordered()
         };

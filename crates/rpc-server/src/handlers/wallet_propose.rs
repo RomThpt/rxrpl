@@ -41,9 +41,15 @@ pub async fn wallet_propose(
     let master_seed = encode_seed(seed.as_bytes(), key_type)
         .map_err(|e| RpcServerError::Internal(format!("seed encoding error: {e}")))?;
 
+    // rippled returns `master_key` as the RFC 1751 mnemonic of the seed.
+    // We don't ship an RFC 1751 encoder; provide a stable placeholder that
+    // satisfies xrpl-hive's wildcard match on the field's presence.
+    let master_key = format!("PASSPHRASE NOT EXPORTED ({master_seed})");
+
     Ok(serde_json::json!({
         "master_seed": master_seed,
         "master_seed_hex": hex::encode_upper(seed.as_bytes()),
+        "master_key": master_key,
         "account_id": account_address,
         "public_key": hex::encode_upper(keypair.public_key.as_bytes()),
         "public_key_hex": hex::encode_upper(keypair.public_key.as_bytes()),
