@@ -66,6 +66,10 @@ pub struct ServerContext {
     /// `validator_list_sites` RPC method.
     pub validator_list_status:
         Option<Arc<RwLock<serde_json::Value>>>,
+    /// Configured network id (e.g. 0 = mainnet, 21337 = devnet, 10000 = test).
+    /// Used by `sign` to auto-fill `NetworkID` on transactions, which modern
+    /// rippled requires (`telREQUIRES_NETWORK_ID`).
+    pub network_id: Option<u32>,
     event_tx: broadcast::Sender<ServerEvent>,
 }
 
@@ -89,6 +93,7 @@ impl ServerContext {
             reporting_mode: false,
             forward_url: None,
             validator_list_status: None,
+            network_id: None,
             event_tx,
         })
     }
@@ -123,6 +128,7 @@ impl ServerContext {
             reporting_mode: false,
             forward_url: None,
             validator_list_status: None,
+            network_id: None,
             event_tx,
         })
     }
@@ -158,6 +164,7 @@ impl ServerContext {
             reporting_mode: false,
             forward_url: None,
             validator_list_status: None,
+            network_id: None,
             event_tx,
         })
     }
@@ -193,6 +200,7 @@ impl ServerContext {
             reporting_mode: false,
             forward_url: None,
             validator_list_status: None,
+            network_id: None,
             event_tx,
         })
     }
@@ -221,6 +229,7 @@ impl ServerContext {
             reporting_mode: true,
             forward_url: Some(forward_url),
             validator_list_status: None,
+            network_id: None,
             event_tx,
         })
     }
@@ -234,6 +243,15 @@ impl ServerContext {
     ) {
         if let Some(ctx) = Arc::get_mut(self) {
             ctx.validator_list_status = Some(handle);
+        }
+    }
+
+    /// Attach the configured network id so `sign` can auto-fill
+    /// `NetworkID` on outbound transactions. Same get_mut constraint as
+    /// `attach_validator_list_status`.
+    pub fn attach_network_id(self: &mut Arc<Self>, network_id: u32) {
+        if let Some(ctx) = Arc::get_mut(self) {
+            ctx.network_id = Some(network_id);
         }
     }
 

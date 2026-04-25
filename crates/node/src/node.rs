@@ -753,6 +753,7 @@ impl Node {
             self.pruner.shared_state(),
         );
         ctx.attach_validator_list_status(Arc::clone(&vl_status));
+        ctx.attach_network_id(self.config.network.network_id);
         let event_tx = ctx.event_sender().clone();
 
         // Clone ctx for gRPC before moving into RPC router

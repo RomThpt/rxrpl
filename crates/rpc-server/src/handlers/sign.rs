@@ -56,6 +56,19 @@ pub async fn sign(params: Value, _ctx: &Arc<ServerContext>) -> Result<Value, Rpc
                 }
             }
         }
+
+        // Auto-fill NetworkID when the local node is on a non-mainnet network.
+        // Modern rippled (post-NetworkID amendment) requires every tx to
+        // declare its target network or it returns telREQUIRES_NETWORK_ID
+        // and refuses to apply. Mainnet (network_id=0) is the historical
+        // default and rippled accepts a missing field there.
+        if !obj.contains_key("NetworkID") {
+            if let Some(net) = _ctx.network_id {
+                if net != 0 {
+                    obj.insert("NetworkID".to_string(), Value::Number(net.into()));
+                }
+            }
+        }
     }
 
     // Encode for signing
