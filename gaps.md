@@ -10,7 +10,7 @@ Document d'état mis à jour à chaque commit notable. Scores contre [XRPL-Commo
 | wscompat | 5 | 5 | **100%** ✅ |
 | rpccompat | 97 | 97 | **100%** ✅ |
 | txcompat | 22 | 22 | **100%** ✅ |
-| sync | 0 | 1 | en cours d'investigation |
+| sync | 0 | 1 | bloqué externe (bug typo xrpl-hive) |
 | propagation | — | 1 | bloqué externe |
 | **Total actionnable** | **127** | **128** | **99.2%** ✅ |
 
@@ -50,28 +50,39 @@ Document d'état mis à jour à chaque commit notable. Scores contre [XRPL-Commo
 3. **Run #3** : late joiner reach ledger 10 ✓ mais « late-join node doesn't have the account ». Cause : node 0 en mode standalone (pas de P2P listener), donc le late joiner ne se connecte à personne et avance ses propres ledgers locaux → fix xrpl_start.sh (network mode si VALIDATOR_SEED).
 4. **Run #4** (en cours) : si tous les nodes sont en network mode, le late joiner devrait pouvoir se connecter et sync.
 
-### Run #4 (2026-04-25 16:16) — late joiner stalle au sync
-- ✅ Late joiner démarre, écoute P2P, se connecte au peer fixe (192.168.97.2:51235)
-- ✅ Détecte « peer ahead by 14 ledgers, entering sync mode (target #16) »
-- ❌ « sync stalled at #2 for 30s, re-requesting target #X » — boucle indéfiniment, jamais ne dépasse #2
+### Runs #4-#11 (2026-04-25) — fixes appliqués, late joiner sync OK
 
-Diagnostic : `node.rs:1188-1193` envoie `OverlayCommand::RequestLedger {seq: peer_seq, hash: peer_hash}`. La réponse `LedgerData` n'arrive pas, ou arrive vide, ou échoue à `try_reconstruct_ledger`. Probables causes :
-1. `handle_get_ledger` (`peer_manager.rs:2031`) sert depuis `ledger_provider.latest_closed()` — mais le state nodes envoyés peuvent être insuffisants pour reconstruire l'arbre côté late joiner.
-2. La reconstruction côté late joiner (`Node::try_reconstruct_ledger`) requiert tous les nœuds SHAMap accessibles ; la première requête ne précise pas `node_ids` donc serve juste le root + quelques enfants ; le late joiner doit ensuite faire des sous-requêtes (incremental sync via `LedgerSyncer.feed_nodes`) — c'est probablement là que ça coince.
-3. Les peers se déconnectent après ~3 minutes (vu dans les logs) — la reconnect logic recherche peut-être trop tôt.
+Cinq bugs identifiés et corrigés dans le pipeline late-join sync (tous sur `feature/sync-late-joiner`) :
 
-### Prochaines étapes
-1. Activer trace logs P2P (debug niveau) pour voir GetLedger/LedgerData en clair
-2. Vérifier `try_reconstruct_ledger` : retourne-t-il `Ok` ou `Err` ?
-3. Vérifier que `LedgerSyncer.feed_nodes` est invoqué quand des nodes arrivent
-4. Implémenter ou compléter le flow incremental → quand reconstruction échoue, demander spécifiquement les nodes manquants
-5. Tester avec 2 nodes seulement (1 initial + 1 late joiner) pour isoler les variables
+| Commit | Fix |
+|---|---|
+| `c55dd81` | `handle_get_ledger` ignorait le `seq` demandé pour `liBASE` (`itype=0`), retournait toujours `latest_closed()` |
+| `042935f` | `liBASE` doit renvoyer **les 118 bytes du raw header**, pas des leaves de state map |
+| `79a869a` | Client envoyait `NodeId.to_wire_bytes()` (33 bytes path+depth) ; serveur fait `store.fetch(hash)` → jamais de match. Fix : envoyer `MissingNode.hash` (32 bytes content hash) |
+| `24d20ef` | `feed_nodes` strippait 1 byte de queue en supposant le format rippled (avec depth byte). rxrpl envoie raw → corruption du content hash. |
+| `4e43938` | `start_incremental_sync` retourne `0 missing` quand le state target == state local (early ledgers post-genesis). Ajout de `try_complete_sync` qui extrait directement les leaves du store et dispatch `LedgerData` immédiatement. |
+
+**Résultat run #11** : late joiner cascade reconstruct #3 → #4 → #5 → #6 → #7 → #8 → #16, log `catchup complete, resuming consensus at ledger #17`. **Sync pipeline OK.**
+
+### Bug bloquant restant — externe à rxrpl
+
+Le test échoue toujours avec « late-join node doesn't have the account ». Diagnostic via tracing du submit handler (runs #12-14) :
+
+> `Internal("encoding error: invalid checksum")`
+
+L'adresse de destination dans `simulators/sync/main.go:75` — `rPMh7Pi9ct699iZUTWz6CFkakUy5JNb6FG` — a un **checksum base58 invalide** :
+- Stored checksum : `9bba9c55`
+- Expected checksum : `b5b9ca3d`
+- Adresse correcte (1 char diff) : `rPMh7Pi9ct699iZUTWz6CFkakUy5Ju9f9v`
+
+Le seed rxrpl rejette correctement la transaction → aucun payment appliqué → AccountInfo échoue. Bug à corriger dans xrpl-hive (à reporter à XRPL-Commons).
 
 ---
 
 ## Bloqué externe
 
-`propagation/cross-impl-payment` — Dockerfile rippled (clients/rippled/Dockerfile) a un bug `rippled --version` non-zero sur arm64. À reporter à XRPL-Commons.
+1. `sync/late-join-sync` — typo d'adresse dans `simulators/sync/main.go:75` (cf. ci-dessus). 1-char fix nécessaire dans xrpl-hive.
+2. `propagation/cross-impl-payment` — Dockerfile rippled (clients/rippled/Dockerfile) a un bug `rippled --version` non-zero sur arm64. À reporter à XRPL-Commons.
 
 ---
 
