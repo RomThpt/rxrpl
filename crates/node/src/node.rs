@@ -657,6 +657,10 @@ impl Node {
         // 6. Spawn relay bridge: RPC submit -> P2P broadcast
         tokio::spawn(async move {
             while let Some((tx_hash, tx_bytes)) = relay_rx.recv().await {
+                tracing::info!(
+                    "relay bridge: forwarding tx {} ({} bytes) to broadcast",
+                    tx_hash, tx_bytes.len()
+                );
                 let payload = rxrpl_overlay::proto_convert::encode_transaction(&tx_hash, &tx_bytes);
                 let _ = cmd_tx_relay.send(OverlayCommand::Broadcast {
                     msg_type: rxrpl_p2p_proto::MessageType::Transaction,
