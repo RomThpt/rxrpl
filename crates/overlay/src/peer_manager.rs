@@ -123,8 +123,8 @@ pub struct PeerManager {
     ledger_hash: Arc<RwLock<Hash256>>,
     cmd_rx: mpsc::UnboundedReceiver<OverlayCommand>,
     cmd_tx_internal: mpsc::UnboundedSender<OverlayCommand>,
-    event_rx: mpsc::UnboundedReceiver<PeerEvent>,
-    event_tx: mpsc::UnboundedSender<PeerEvent>,
+    event_rx: mpsc::Receiver<PeerEvent>,
+    event_tx: mpsc::Sender<PeerEvent>,
     consensus_tx: mpsc::UnboundedSender<ConsensusMessage>,
     ledger_provider: Option<Arc<dyn LedgerProvider>>,
     node_store: Option<Arc<dyn rxrpl_shamap::NodeStore>>,
@@ -166,7 +166,11 @@ impl PeerManager {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let cmd_tx_internal = cmd_tx.clone();
         let (consensus_tx, consensus_rx) = mpsc::unbounded_channel();
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        // Bounded so a flood of inbound peer messages exerts TCP
+        // backpressure on the offending peer's read loop instead of
+        // growing an unbounded queue (audit finding C4). 8192 is well
+        // above the steady-state of 21 peers x 100 msg/s rate-limited.
+        let (event_tx, event_rx) = mpsc::channel(8192);
         let peer_set = Arc::new(PeerSet::new(config.max_peers));
 
         let seeds = config.seeds.clone();
@@ -1087,8 +1091,13 @@ impl PeerManager {
                         );
 
                         // If we do not have this tx-set locally, fetch it from the peer.
+                        // Cap the in-flight set so a peer spamming HaveTransactionSet
+                        // with unique fake hashes cannot leak unbounded memory
+                        // (audit finding H6).
+                        const MAX_PENDING_TX_SETS: usize = 4096;
                         if !self.has_tx_set(&have_set.hash)
                             && !self.pending_tx_set_fetches.contains(&have_set.hash)
+                            && self.pending_tx_set_fetches.len() < MAX_PENDING_TX_SETS
                         {
                             tracing::info!(
                                 "requesting unknown tx-set {} from peer {}",
@@ -1862,7 +1871,12 @@ impl PeerManager {
         msg: rxrpl_p2p_proto::proto::TmGetObjectByHash,
     ) {
         /// Maximum number of objects to serve in a single response.
-        const MAX_OBJECTS: usize = 16_384;
+        ///
+        /// rippled allows 16384 here, but each object is a `store.fetch`
+        /// (random-read disk I/O on RocksDB). 256 keeps the response handler
+        /// well under a few ms even on cold cache, mitigating the per-peer
+        /// CPU/disk amplification flagged by the audit (H8).
+        const MAX_OBJECTS: usize = 256;
         /// Maximum total payload size for response objects (256 KB).
         const MAX_RESPONSE_SIZE: usize = 256 * 1024;
 
@@ -2133,13 +2147,27 @@ impl PeerManager {
         let mut total_size = 0usize;
         let mut truncated = false;
         const MAX_RESPONSE_SIZE: usize = 256 * 1024;
+        // Cap how many node-ids a single GetLedger may request. Each id can
+        // trigger up to MAX_DEPTH (64) lazy `store.fetch` calls via the
+        // SHAMap path-walk; without this bound a single peer can pin the
+        // request handler with O(n × 64) disk I/O per message.
+        const MAX_GET_LEDGER_NODES: usize = 128;
 
         // Parse requested node_ids from the request as rippled wire format
         // (33 bytes: path[32] + depth[1]). The pre-PR-#14 32-byte content-hash
         // shortcut has been removed in favor of unified rippled compatibility.
-        let request_node_ids: Vec<ShamapNodeId> = req
-            .node_ids
+        let raw_node_ids = &req.node_ids;
+        if raw_node_ids.len() > MAX_GET_LEDGER_NODES {
+            tracing::warn!(
+                "GetLedger from {} requested {} node_ids; truncating to {}",
+                from,
+                raw_node_ids.len(),
+                MAX_GET_LEDGER_NODES
+            );
+        }
+        let request_node_ids: Vec<ShamapNodeId> = raw_node_ids
             .iter()
+            .take(MAX_GET_LEDGER_NODES)
             .filter_map(|id_bytes| {
                 if id_bytes.len() == 33 {
                     let path: [u8; 32] = id_bytes[..32].try_into().ok()?;
@@ -2378,7 +2406,7 @@ async fn try_connect_outbound(
     network_id: u32,
     ledger_seq: &AtomicU32,
     ledger_hash: &RwLock<Hash256>,
-    event_tx: &mpsc::UnboundedSender<PeerEvent>,
+    event_tx: &mpsc::Sender<PeerEvent>,
     peer_set: &PeerSet,
     tls_client: &Arc<SslConnector>,
 ) -> Result<Hash256, OverlayError> {
@@ -2416,11 +2444,13 @@ async fn try_connect_outbound(
     }
 
     let write_tx = spawn_peer_loops(peer_node_id, framed, event_tx.clone());
-    let _ = event_tx.send(PeerEvent::Connected {
-        node_id: peer_node_id,
-        info,
-        write_tx,
-    });
+    let _ = event_tx
+        .send(PeerEvent::Connected {
+            node_id: peer_node_id,
+            info,
+            write_tx,
+        })
+        .await;
 
     Ok(peer_node_id)
 }
@@ -2434,7 +2464,7 @@ async fn try_accept_inbound(
     network_id: u32,
     ledger_seq: &AtomicU32,
     ledger_hash: &RwLock<Hash256>,
-    event_tx: &mpsc::UnboundedSender<PeerEvent>,
+    event_tx: &mpsc::Sender<PeerEvent>,
     peer_set: &PeerSet,
     tls_server: &Arc<SslAcceptor>,
 ) -> Result<Hash256, OverlayError> {
@@ -2468,11 +2498,13 @@ async fn try_accept_inbound(
     }
 
     let write_tx = spawn_peer_loops(peer_node_id, framed, event_tx.clone());
-    let _ = event_tx.send(PeerEvent::Connected {
-        node_id: peer_node_id,
-        info,
-        write_tx,
-    });
+    let _ = event_tx
+        .send(PeerEvent::Connected {
+            node_id: peer_node_id,
+            info,
+            write_tx,
+        })
+        .await;
 
     Ok(peer_node_id)
 }
@@ -2482,7 +2514,7 @@ async fn try_accept_inbound(
 fn spawn_peer_loops(
     node_id: Hash256,
     framed: Framed<PeerStream, PeerCodec>,
-    event_tx: mpsc::UnboundedSender<PeerEvent>,
+    event_tx: mpsc::Sender<PeerEvent>,
 ) -> mpsc::Sender<PeerMessage> {
     let (write, read) = framed.split();
     let (tx, rx) = mpsc::channel(256);

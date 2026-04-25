@@ -43,6 +43,12 @@ pub const DEFAULT_REFRESH: Duration = Duration::from_secs(300);
 /// Default per-request HTTP timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum bytes accepted from a single VL response. The mainnet UNL
+/// blob is ~30 KB; 1 MiB is generous and stops a malicious or compromised
+/// publisher (or DNS hijack) from exhausting our memory by streaming an
+/// arbitrarily large body. (Audit finding H1.)
+pub const MAX_VL_BODY: u64 = 1024 * 1024;
+
 /// Shared, mutable set of trusted validator master public keys.
 ///
 /// Cloned (cheaply, via [`Arc`]) into the [`crate::validation_aggregator`]
@@ -169,16 +175,35 @@ impl VlFetcher {
         tracker: &mut ValidatorListTracker,
         manifest_store: &mut ManifestStore,
     ) -> Result<ValidatorListData, FetcherError> {
-        let payload: VlPayload = self
+        let resp = self
             .http
             .get(site)
             .send()
             .await
             .map_err(|e| FetcherError::Http(e.to_string()))?
             .error_for_status()
-            .map_err(|e| FetcherError::Http(e.to_string()))?
-            .json()
+            .map_err(|e| FetcherError::Http(e.to_string()))?;
+        // Reject responses that advertise a body larger than our cap before
+        // we touch the bytes, in case the publisher (or a MITM) tries to
+        // exhaust memory with a giant Content-Length.
+        if let Some(len) = resp.content_length() {
+            if len > MAX_VL_BODY {
+                return Err(FetcherError::Http(format!(
+                    "VL body {len} bytes exceeds cap {MAX_VL_BODY}"
+                )));
+            }
+        }
+        let bytes = resp
+            .bytes()
             .await
+            .map_err(|e| FetcherError::Http(format!("read body: {e}")))?;
+        if bytes.len() as u64 > MAX_VL_BODY {
+            return Err(FetcherError::Http(format!(
+                "VL body {} bytes exceeds cap {MAX_VL_BODY}",
+                bytes.len()
+            )));
+        }
+        let payload: VlPayload = serde_json::from_slice(&bytes)
             .map_err(|e| FetcherError::Http(format!("decode JSON: {e}")))?;
 
         let manifest_bytes = base64_decode(&payload.manifest)
