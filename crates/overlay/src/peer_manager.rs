@@ -486,7 +486,7 @@ impl PeerManager {
     fn handle_command(&mut self, cmd: OverlayCommand) {
         match cmd {
             OverlayCommand::Broadcast { msg_type, payload } => {
-                tracing::info!(
+                tracing::debug!(
                     "broadcast {:?} ({} bytes) to {} peers",
                     msg_type,
                     payload.len(),
@@ -505,8 +505,8 @@ impl PeerManager {
                     }
                 }
                 if full > 0 {
-                    tracing::info!(
-                        "broadcast {:?}: {} sent, {} dropped (channel full)",
+                    tracing::warn!(
+                        "broadcast {:?}: {} sent, {} dropped (peer channel full)",
                         msg_type, sent, full
                     );
                 }

@@ -657,7 +657,7 @@ impl Node {
         // 6. Spawn relay bridge: RPC submit -> P2P broadcast
         tokio::spawn(async move {
             while let Some((tx_hash, tx_bytes)) = relay_rx.recv().await {
-                tracing::info!(
+                tracing::debug!(
                     "relay bridge: forwarding tx {} ({} bytes) to broadcast",
                     tx_hash, tx_bytes.len()
                 );
