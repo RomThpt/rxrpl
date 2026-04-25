@@ -302,12 +302,23 @@ pub fn derive_seed_from_params(
         return Ok((rxrpl_crypto::Seed::from_bytes(arr), key_type));
     }
 
-    // Try passphrase or secret (same behavior)
-    if let Some(passphrase) = params
-        .get("passphrase")
-        .or_else(|| params.get("secret"))
-        .and_then(|v| v.as_str())
-    {
+    // `secret` is rippled-compatible: it expects a base58 family seed
+    // (e.g. `snoPBrXtMeMyMHUVTgbuqAfg1SUTb` for the genesis account).
+    // `passphrase` is hashed instead. Try seed-decode first for `secret`,
+    // and only fall through to passphrase hashing if the input isn't a
+    // valid family seed (preserves the legacy behavior for callers that
+    // really meant a passphrase).
+    if let Some(secret_str) = params.get("secret").and_then(|v| v.as_str()) {
+        if let Ok((entropy, _kt)) =
+            rxrpl_codec::address::seed::decode_seed(secret_str)
+        {
+            return Ok((rxrpl_crypto::Seed::from_bytes(entropy), key_type));
+        }
+        // Fall back to passphrase hashing for non-base58 strings.
+        return Ok((rxrpl_crypto::Seed::from_passphrase(secret_str), key_type));
+    }
+
+    if let Some(passphrase) = params.get("passphrase").and_then(|v| v.as_str()) {
         return Ok((rxrpl_crypto::Seed::from_passphrase(passphrase), key_type));
     }
 
