@@ -553,17 +553,13 @@ impl Node {
         close_interval_secs: u64,
         sync_rpc_url: Option<&str>,
     ) -> Result<(), NodeError> {
-        // 1. Generate/load node identity
-        let identity = if let Some(ref seed_hex) = self.config.peer.node_seed {
-            let bytes = hex::decode(seed_hex)
-                .map_err(|e| NodeError::Config(format!("invalid node_seed hex: {e}")))?;
-            if bytes.len() != 16 {
-                return Err(NodeError::Config(
-                    "node_seed must be 16 bytes (32 hex chars)".into(),
-                ));
-            }
-            let mut seed_bytes = [0u8; 16];
-            seed_bytes.copy_from_slice(&bytes);
+        // 1. Generate/load node identity. node_seed accepts either:
+        //   - 32 hex characters (16 raw seed bytes)
+        //   - a base58 family seed (e.g. "snXxx..." — what rippled-style
+        //     configs and xrpl-hive's XRPL_VALIDATOR_SEED env emit)
+        let identity = if let Some(ref seed_str) = self.config.peer.node_seed {
+            let seed_bytes = parse_node_seed(seed_str)
+                .map_err(|e| NodeError::Config(format!("invalid node_seed: {e}")))?;
             NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_bytes(seed_bytes))
         } else {
             NodeIdentity::generate()
@@ -1258,13 +1254,13 @@ impl Node {
                                 }
                             }
                             ConsensusMessage::LedgerHeader { seq, header } => {
-                                tracing::info!(
-                                    "received parsed header for ledger #{} hash={} account_hash={}",
-                                    seq, header.hash, header.account_hash
+                                tracing::debug!(
+                                    "received parsed header for ledger #{} hash={}",
+                                    seq, header.hash
                                 );
                                 // The overlay layer handles incremental sync (liAS_NODE
-                                // requests). We just log receipt here; reconstruction
-                                // happens when LedgerData with the full state arrives.
+                                // requests). LedgerData with the full state triggers
+                                // reconstruction when it arrives.
                             }
                             ConsensusMessage::TxSetAcquired(tx_set) => {
                                 tracing::info!(
@@ -2119,9 +2115,57 @@ impl Node {
     }
 }
 
+/// Decode a `node_seed` config value into raw 16-byte seed entropy.
+///
+/// Accepts either:
+/// - 32 hex characters (raw entropy)
+/// - a base58 family seed (e.g. `snXxx...`) — what rippled-style configs
+///   and xrpl-hive's `XRPL_VALIDATOR_SEED` env emit
+fn parse_node_seed(s: &str) -> Result<[u8; 16], String> {
+    let trimmed = s.trim();
+
+    // Try hex first (32 chars).
+    if trimmed.len() == 32 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        let bytes = hex::decode(trimmed).map_err(|e| format!("invalid hex: {e}"))?;
+        if bytes.len() != 16 {
+            return Err("hex seed must decode to 16 bytes".into());
+        }
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&bytes);
+        return Ok(out);
+    }
+
+    // Fall back to base58 family seed.
+    let (entropy, _key_type) = rxrpl_codec::address::seed::decode_seed(trimmed)
+        .map_err(|e| format!("invalid base58 family seed: {e}"))?;
+    Ok(entropy)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_node_seed_hex() {
+        let s = "0123456789ABCDEF0123456789ABCDEF";
+        let bytes = parse_node_seed(s).unwrap();
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(bytes[0], 0x01);
+        assert_eq!(bytes[15], 0xEF);
+    }
+
+    #[test]
+    fn parse_node_seed_base58() {
+        // xrpl-hive's first DefaultValidator seed (rippled-style base58).
+        let s = "sneWFZcEqA8TUA5BmJ38xsqaR7dFb";
+        let bytes = parse_node_seed(s).unwrap();
+        assert_eq!(bytes.len(), 16);
+    }
+
+    #[test]
+    fn parse_node_seed_garbage_rejected() {
+        assert!(parse_node_seed("not a seed").is_err());
+    }
 
     #[test]
     fn create_node() {

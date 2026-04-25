@@ -356,9 +356,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     return cmd_node_run(config, &genesis_account, close_interval).await;
                 }
                 RunMode::Network => {
-                    let rpc_url = sync_rpc.as_deref().unwrap_or(&cli.url);
-                    return cmd_network_run(config, &genesis_account, close_interval, rpc_url)
-                        .await;
+                    // Only bootstrap from an external RPC when explicitly
+                    // requested via --sync-rpc. The default --url is for
+                    // client commands; nodes with fixed_peers can sync via
+                    // P2P alone (private/test networks like xrpl-hive).
+                    return cmd_network_run(
+                        config,
+                        &genesis_account,
+                        close_interval,
+                        sync_rpc.as_deref(),
+                    )
+                    .await;
                 }
             }
         }
@@ -643,17 +651,19 @@ async fn cmd_network_run(
     config: rxrpl_config::NodeConfig,
     genesis_account: &str,
     close_interval: u64,
-    sync_rpc_url: &str,
+    sync_rpc_url: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let node = rxrpl_node::Node::new_standalone(config, genesis_account)?;
 
     eprintln!("Starting networked node...");
     eprintln!("  Genesis account: {genesis_account}");
     eprintln!("  Close interval: {close_interval}s");
-    eprintln!("  Sync RPC: {sync_rpc_url}");
+    match sync_rpc_url {
+        Some(url) => eprintln!("  Sync RPC: {url}"),
+        None => eprintln!("  Sync RPC: <none — discover via P2P>"),
+    }
 
-    node.run_networked(close_interval, Some(sync_rpc_url))
-        .await?;
+    node.run_networked(close_interval, sync_rpc_url).await?;
     Ok(())
 }
 

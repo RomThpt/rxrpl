@@ -921,6 +921,23 @@ impl PeerManager {
                                     );
                                     if !missing.is_empty() {
                                         self.send_get_ledger_as_node(header.sequence);
+                                    } else if let Some(leaves) =
+                                        self.ledger_syncer.try_complete_sync(header.sequence)
+                                    {
+                                        // Target state already fully resolvable from the
+                                        // local store (e.g. early ledgers whose state still
+                                        // matches genesis). Dispatch leaves to consensus.
+                                        tracing::info!(
+                                            "incremental sync immediate-complete for ledger #{} ({} leaves)",
+                                            header.sequence, leaves.len()
+                                        );
+                                        self.ledger_syncer.mark_synced(header.sequence);
+                                        let _ =
+                                            self.consensus_tx.send(ConsensusMessage::LedgerData {
+                                                hash: header.hash,
+                                                seq: header.sequence,
+                                                nodes: leaves,
+                                            });
                                     }
                                 }
 
@@ -1781,9 +1798,13 @@ impl PeerManager {
             return;
         }
 
+        // Send the content hash (32 bytes) of each missing node so the server
+        // can locate it via a direct store.fetch lookup. Sending NodeId (path
+        // + depth) would require the server to walk its SHAMap by path,
+        // which the current handle_get_ledger does not do.
         let node_ids: Vec<Vec<u8>> = missing
             .iter()
-            .map(|mn| mn.node_id.to_wire_bytes())
+            .map(|mn| mn.hash.as_bytes().to_vec())
             .collect();
 
         let num_ids = node_ids.len();
@@ -2032,10 +2053,18 @@ impl PeerManager {
         let req = match proto_convert::decode_get_ledger(payload) {
             Ok(r) => r,
             Err(e) => {
-                tracing::debug!("bad GetLedger from {}: {}", from, e);
+                tracing::warn!("bad GetLedger from {}: {}", from, e);
                 return;
             }
         };
+        tracing::debug!(
+            "GetLedger from {} type={} seq={:?} hash_len={} node_ids={}",
+            from,
+            req.itype,
+            req.ledger_seq,
+            req.ledger_hash.as_ref().map(|h| h.len()).unwrap_or(0),
+            req.node_ids.len()
+        );
 
         let provider = match &self.ledger_provider {
             Some(p) => p,
@@ -2061,22 +2090,22 @@ impl PeerManager {
             return;
         }
 
-        let ledger = match req_ledger_type {
-            x if x == LT_CLOSED || x == LT_VALIDATED => {
-                provider.latest_closed()
-            }
-            x if x == LT_HASH => {
-                if req_ledger_hash.len() >= 32 {
-                    let hash = Hash256::new(req_ledger_hash[..32].try_into().unwrap_or([0u8; 32]));
-                    provider.get_by_hash(&hash)
-                } else if req_ledger_seq > 0 {
-                    provider.get_by_seq(req_ledger_seq)
-                } else {
-                    None
-                }
-            }
-            _ => provider.latest_closed(),
+        // Resolve the requested ledger. The selectors are independent of the
+        // node-payload itype: a request that supplies a hash points to that
+        // ledger, otherwise a non-zero seq points to that seq, otherwise
+        // we fall back to the latest closed ledger.
+        let ledger = if req_ledger_hash.len() >= 32 {
+            let hash = Hash256::new(req_ledger_hash[..32].try_into().unwrap_or([0u8; 32]));
+            provider.get_by_hash(&hash)
+        } else if req_ledger_seq > 0 {
+            provider.get_by_seq(req_ledger_seq)
+        } else {
+            provider.latest_closed()
         };
+        // (req_ledger_type tells us *which* SHAMap to serve from — base /
+        // tx_node / as_node — handled below when we serialise the response.)
+        let _ = req_ledger_type;
+        let _ = (LT_CLOSED, LT_VALIDATED, LT_HASH);
 
         let ledger = match ledger {
             Some(l) => l,
@@ -2118,6 +2147,32 @@ impl PeerManager {
                 }
             })
             .collect();
+
+        // For liBASE (itype=0) requests with no specific node ids, the
+        // protocol expects a single node entry containing the raw 118-byte
+        // ledger header — that's what the late joiner parses to set up
+        // its incremental sync. Returning state-map leaves here makes the
+        // late joiner discard the response (header parse fails).
+        const LI_BASE: i32 = 0;
+        if request_node_ids.is_empty() && req_ledger_type == LI_BASE {
+            let header_bytes = ledger.header.to_raw_bytes();
+            nodes.push((vec![], header_bytes));
+
+            let response = proto_convert::encode_ledger_data(
+                &ledger.header.hash,
+                ledger.header.sequence,
+                req_ledger_type,
+                nodes,
+                req_cookie,
+            );
+            if let Some(handle) = self.peer_handles.get(&from) {
+                let _ = handle.tx.try_send(PeerMessage {
+                    msg_type: MessageType::LedgerData,
+                    payload: response,
+                });
+            }
+            return;
+        }
 
         if !request_node_ids.is_empty() {
             // Delta sync: serve specific nodes by hash from the backing store.

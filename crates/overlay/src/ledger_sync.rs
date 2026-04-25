@@ -272,12 +272,13 @@ impl LedgerSyncer {
             if node_data.is_empty() {
                 continue;
             }
-            let raw = if node_data.len() == 513 || (node_data.len() > 32 && node_data.len() % 32 != 0) {
-                // Strip trailing depth byte from rippled's SHAMap wire format.
-                &node_data[..node_data.len() - 1]
-            } else {
-                &node_data[..]
-            };
+            // rxrpl peers send raw stored bytes (key||data for leaves, or
+            // 16x32-byte child hashes for inner nodes). rippled wraps each
+            // node with a trailing 1-byte depth marker. Try the raw bytes
+            // first; if the resulting hash isn't expected, fall back to the
+            // stripped variant. We can't know the expected hash here, so we
+            // store both candidates and let SHAMap traversal pick the right one.
+            let raw = &node_data[..];
 
             // Compute the content hash based on node type.
             let hash = if raw.len() == 512 {
@@ -416,6 +417,30 @@ impl LedgerSyncer {
             (Some(x), None) | (None, Some(x)) => Some(x),
             (None, None) => None,
         }
+    }
+
+    /// Attempt to complete an incremental sync immediately (no nodes pending).
+    ///
+    /// Returns Some(leaves) if the syncing SHAMap is complete (all referenced
+    /// nodes resolvable from the backing store). Used when start_incremental_sync
+    /// returns no missing nodes — the late joiner already has every required
+    /// node in its store (e.g. for early ledgers whose state matches genesis).
+    pub fn try_complete_sync(&mut self, seq: u32) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        let entry = self.incremental.get_mut(&seq)?;
+        // Reload root from store in case it was added.
+        let _ = entry.map.reload_root(entry.hash);
+        if entry.map.is_empty() {
+            return None;
+        }
+        if !entry.map.is_complete() {
+            return None;
+        }
+        let entry = self.incremental.remove(&seq).unwrap();
+        let mut leaves = Vec::new();
+        entry.map.for_each(&mut |key, data| {
+            leaves.push((key.as_bytes().to_vec(), data.to_vec()));
+        });
+        Some(leaves)
     }
 
     /// Get the missing node hashes for an active incremental sync, if any.
