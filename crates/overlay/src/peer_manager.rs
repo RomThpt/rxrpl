@@ -486,11 +486,29 @@ impl PeerManager {
     fn handle_command(&mut self, cmd: OverlayCommand) {
         match cmd {
             OverlayCommand::Broadcast { msg_type, payload } => {
+                tracing::debug!(
+                    "broadcast {:?} ({} bytes) to {} peers",
+                    msg_type,
+                    payload.len(),
+                    self.peer_handles.len()
+                );
+                let mut sent = 0usize;
+                let mut full = 0usize;
                 for handle in self.peer_handles.values() {
-                    let _ = handle.tx.try_send(PeerMessage {
+                    match handle.tx.try_send(PeerMessage {
                         msg_type,
                         payload: payload.clone(),
-                    });
+                    }) {
+                        Ok(()) => sent += 1,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => full += 1,
+                        Err(_) => {}
+                    }
+                }
+                if full > 0 {
+                    tracing::warn!(
+                        "broadcast {:?}: {} sent, {} dropped (peer channel full)",
+                        msg_type, sent, full
+                    );
                 }
             }
             OverlayCommand::SendTo {
