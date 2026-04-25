@@ -58,6 +58,7 @@ pub async fn sign(params: Value, _ctx: &Arc<ServerContext>) -> Result<Value, Rpc
         }
     }
 
+    tracing::info!("DBG sign tx_json before encode_for_signing: {}", tx_json);
     // Encode for signing
     let signing_bytes = rxrpl_codec::binary::encode_for_signing(&tx_json)
         .map_err(|e| RpcServerError::Internal(format!("encoding error: {e}")))?;
