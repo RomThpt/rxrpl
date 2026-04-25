@@ -108,6 +108,20 @@ impl ValidationAggregator {
             return None;
         }
 
+        // Cap how many distinct (seq, hash) buckets we keep before garbage
+        // accumulates faster than `cleanup` can drain it. Honest validators
+        // produce one bucket per ledger; an attacker spamming unique fake
+        // hashes per seq would otherwise grow this map unbounded between
+        // quorum-triggered cleanups (audit finding M5).
+        const MAX_BUCKETS: usize = 8192;
+        if self.by_ledger.len() >= MAX_BUCKETS && !self.by_ledger.contains_key(&(seq, hash)) {
+            tracing::debug!(
+                "validation aggregator: by_ledger at cap {} entries; dropping new (seq={}, hash={})",
+                MAX_BUCKETS, seq, hash
+            );
+            return None;
+        }
+
         let key = (seq, hash);
         let validations = self.by_ledger.entry(key).or_default();
 

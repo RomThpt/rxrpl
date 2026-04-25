@@ -1366,7 +1366,18 @@ impl Node {
                                 // target at `peer_seq - 1024` (saturating).
                                 // Subsequent peers can still raise the
                                 // target via the regular sync path.
-                                if recent_anchor_pending && checkpoint_anchor.is_none() {
+                                //
+                                // Sanity cap on `peer_seq`: a malicious
+                                // first peer could announce u32::MAX,
+                                // making the anchor wait for an impossible
+                                // ledger forever (audit finding M1).
+                                // Mainnet tip is ~10^8; 10^9 is generous
+                                // and rules out adversarial overflows.
+                                const MAX_PLAUSIBLE_LEDGER_SEQ: u32 = 1_000_000_000;
+                                if recent_anchor_pending
+                                    && checkpoint_anchor.is_none()
+                                    && peer_seq <= MAX_PLAUSIBLE_LEDGER_SEQ
+                                {
                                     let target = peer_seq.saturating_sub(1024).max(1);
                                     tracing::info!(
                                         "checkpoint bootstrap (recent): tracking anchor for ledger #{} (peer at #{})",
