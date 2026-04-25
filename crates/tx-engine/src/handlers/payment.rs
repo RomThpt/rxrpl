@@ -29,20 +29,25 @@ impl Transactor for PaymentTransactor {
         // Destination must be present
         helpers::get_destination(ctx.tx)?;
 
-        // Amount must be present and be a valid XRP drops string
-        let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
-
-        // Amount must be positive
-        if amount == 0 {
-            return Err(TransactionResult::TemBadAmount);
-        }
-
-        // Destination must differ from Account (no self-payment)
         let account = helpers::get_account(ctx.tx)?;
         let destination = helpers::get_destination(ctx.tx)?;
-
         if account == destination {
             return Err(TransactionResult::TemBadSend);
+        }
+
+        // IOU payment: Amount is an object {currency, issuer, value}
+        if let Some((_, _, value)) = helpers::get_iou_amount(ctx.tx) {
+            let v: f64 = value.parse().map_err(|_| TransactionResult::TemBadAmount)?;
+            if v <= 0.0 {
+                return Err(TransactionResult::TemBadAmount);
+            }
+            return Ok(());
+        }
+
+        // XRP payment: Amount is a u64 string of drops
+        let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
+        if amount == 0 {
+            return Err(TransactionResult::TemBadAmount);
         }
 
         Ok(())
@@ -68,6 +73,12 @@ impl Transactor for PaymentTransactor {
         let dst_key = keylet::account(&dst_id);
         let _dst_exists = ctx.view.exists(&dst_key);
 
+        // IOU path: trust line existence is checked in apply; here we only
+        // need the source account itself (for fee deduction by the engine).
+        if helpers::get_iou_amount(ctx.tx).is_some() {
+            return Ok(());
+        }
+
         let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
         let fee = helpers::get_fee(ctx.tx);
 
@@ -87,6 +98,12 @@ impl Transactor for PaymentTransactor {
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let destination_str = helpers::get_destination(ctx.tx)?;
+
+        // IOU branch: dispatch to issuer-mint handler.
+        if let Some((currency, issuer, value)) = helpers::get_iou_amount(ctx.tx) {
+            return apply_iou(ctx, account_str, destination_str, currency, issuer, value);
+        }
+
         let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
 
         // Parse account IDs
@@ -164,6 +181,104 @@ impl Transactor for PaymentTransactor {
         }
 
         Ok(TransactionResult::TesSuccess)
+    }
+}
+
+/// Apply a Payment whose Amount is an Issued-Currency object.
+///
+/// Currently scoped to the issuer-mint case (Account == Amount.issuer):
+/// the issuer credits the holder's trust line balance for `value` units.
+/// Non-issuer IOU sends require trust-line balance arithmetic on the
+/// source side and end-to-end pathfinding; left as a follow-up.
+fn apply_iou(
+    ctx: &mut ApplyContext<'_>,
+    account_str: &str,
+    destination_str: &str,
+    currency: &str,
+    issuer: &str,
+    value: &str,
+) -> Result<TransactionResult, TransactionResult> {
+    if account_str != issuer {
+        // Non-issuer IOU send is not yet supported.
+        return Err(TransactionResult::TemMalformed);
+    }
+
+    let issuer_id =
+        decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let dest_id =
+        decode_account_id(destination_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+
+    let cur_bytes = helpers::currency_to_bytes(currency);
+    let trust_key = keylet::trust_line(&issuer_id, &dest_id, &cur_bytes);
+    let trust_bytes = ctx.view.read(&trust_key).ok_or(TransactionResult::TecPathDry)?;
+    let mut trust: serde_json::Value =
+        serde_json::from_slice(&trust_bytes).map_err(|_| TransactionResult::TefInternal)?;
+
+    let new_value = adjust_iou_balance(&trust, value, &issuer_id, &dest_id)?;
+    trust["Balance"]["value"] = serde_json::Value::String(new_value);
+
+    let trust_data = serde_json::to_vec(&trust).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(trust_key, trust_data)
+        .map_err(|_| TransactionResult::TefInternal)?;
+
+    // Bump issuer Sequence (engine deducts the XRP fee separately).
+    let issuer_key = keylet::account(&issuer_id);
+    let issuer_bytes = ctx
+        .view
+        .read(&issuer_key)
+        .ok_or(TransactionResult::TerNoAccount)?;
+    let mut issuer_acct: serde_json::Value =
+        serde_json::from_slice(&issuer_bytes).map_err(|_| TransactionResult::TefInternal)?;
+    helpers::increment_sequence(&mut issuer_acct);
+    let issuer_data =
+        serde_json::to_vec(&issuer_acct).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(issuer_key, issuer_data)
+        .map_err(|_| TransactionResult::TefInternal)?;
+
+    Ok(TransactionResult::TesSuccess)
+}
+
+/// Compute the new RippleState Balance.value after an issuer mint.
+///
+/// RippleState Balance is stored from the low-account perspective.
+/// `+value` means the high account owes the low account that much;
+/// `-value` means the low account owes the high account.
+/// When the issuer mints to the holder:
+/// - issuer = low → holder owes more → balance += delta
+/// - issuer = high → holder owes more (to high) → balance -= delta
+fn adjust_iou_balance(
+    trust: &serde_json::Value,
+    delta_str: &str,
+    issuer_id: &rxrpl_primitives::AccountId,
+    holder_id: &rxrpl_primitives::AccountId,
+) -> Result<String, TransactionResult> {
+    let current: f64 = trust
+        .get("Balance")
+        .and_then(|b| b.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("0")
+        .parse()
+        .map_err(|_| TransactionResult::TefInternal)?;
+    let delta: f64 = delta_str
+        .parse()
+        .map_err(|_| TransactionResult::TemBadAmount)?;
+    let issuer_is_low = issuer_id.as_bytes() < holder_id.as_bytes();
+    let new = if issuer_is_low {
+        current + delta
+    } else {
+        current - delta
+    };
+    Ok(format_iou_value(new))
+}
+
+/// Render an IOU value back as a string in a stable form.
+fn format_iou_value(v: f64) -> String {
+    if v == v.trunc() {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
     }
 }
 

@@ -9,27 +9,43 @@ pub struct AMMCreateTransactor;
 
 impl Transactor for AMMCreateTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
-        let asset = ctx.tx.get("Asset").ok_or(TransactionResult::TemMalformed)?;
+        // rippled's AMMCreate derives Asset/Asset2 from Amount/Amount2 when
+        // they're absent. Mirror that so xrpl-hive's two-arg payload is
+        // accepted.
+        let amount_field = ctx.tx.get("Amount").ok_or(TransactionResult::TemBadAmount)?;
+        let amount2_field = ctx
+            .tx
+            .get("Amount2")
+            .ok_or(TransactionResult::TemBadAmount)?;
+
+        let asset = ctx
+            .tx
+            .get("Asset")
+            .cloned()
+            .or_else(|| amm_helpers::asset_spec_from_amount(amount_field))
+            .ok_or(TransactionResult::TemMalformed)?;
         let asset2 = ctx
             .tx
             .get("Asset2")
+            .cloned()
+            .or_else(|| amm_helpers::asset_spec_from_amount(amount2_field))
             .ok_or(TransactionResult::TemMalformed)?;
 
-        amm_helpers::validate_asset(asset)?;
-        amm_helpers::validate_asset(asset2)?;
+        amm_helpers::validate_asset(&asset)?;
+        amm_helpers::validate_asset(&asset2)?;
 
-        if !amm_helpers::assets_differ(asset, asset2) {
+        if !amm_helpers::assets_differ(&asset, &asset2) {
             return Err(TransactionResult::TemMalformed);
         }
 
-        let amount =
-            helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
+        let amount = amm_helpers::amount_value_drops_or_iou(amount_field)
+            .ok_or(TransactionResult::TemBadAmount)?;
         if amount == 0 {
             return Err(TransactionResult::TemBadAmount);
         }
 
-        let amount2 =
-            helpers::get_u64_str_field(ctx.tx, "Amount2").ok_or(TransactionResult::TemBadAmount)?;
+        let amount2 = amm_helpers::amount_value_drops_or_iou(amount2_field)
+            .ok_or(TransactionResult::TemBadAmount)?;
         if amount2 == 0 {
             return Err(TransactionResult::TemBadAmount);
         }
@@ -47,21 +63,22 @@ impl Transactor for AMMCreateTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         let (_, account) = helpers::read_account_by_address(ctx.view, account_str)?;
 
-        // AMM must not already exist
-        let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
+        // AMM must not already exist (use derived assets when absent).
+        let amm_key = amm_key_from_tx_with_derivation(ctx.tx)?;
         if ctx.view.exists(&amm_key) {
             return Err(TransactionResult::TecDuplicate);
         }
 
-        // Creator must have sufficient balance for both deposits
+        // Creator must have sufficient XRP balance for the XRP leg(s) only.
+        // For IOU legs, trust-line balance enforcement is out of scope here
+        // (covered by a future trust-line debit pass).
         let balance = helpers::get_balance(&account);
-        let amount = helpers::get_u64_str_field(ctx.tx, "Amount").unwrap_or(0);
-        let amount2 = helpers::get_u64_str_field(ctx.tx, "Amount2").unwrap_or(0);
-
-        let total_needed = amount
-            .checked_add(amount2)
+        let amount_field = ctx.tx.get("Amount").ok_or(TransactionResult::TemBadAmount)?;
+        let amount2_field = ctx.tx.get("Amount2").ok_or(TransactionResult::TemBadAmount)?;
+        let xrp_needed = xrp_drops_from_amount(amount_field)
+            .checked_add(xrp_drops_from_amount(amount2_field))
             .ok_or(TransactionResult::TemBadAmount)?;
-        if balance < total_needed {
+        if balance < xrp_needed {
             return Err(TransactionResult::TecUnfunded);
         }
 
@@ -73,19 +90,33 @@ impl Transactor for AMMCreateTransactor {
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        let amount =
-            helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
-        let amount2 =
-            helpers::get_u64_str_field(ctx.tx, "Amount2").ok_or(TransactionResult::TemBadAmount)?;
+        let amount_field = ctx.tx.get("Amount").ok_or(TransactionResult::TemBadAmount)?;
+        let amount2_field = ctx.tx.get("Amount2").ok_or(TransactionResult::TemBadAmount)?;
+
+        let amount = amm_helpers::amount_value_drops_or_iou(amount_field)
+            .ok_or(TransactionResult::TemBadAmount)?;
+        let amount2 = amm_helpers::amount_value_drops_or_iou(amount2_field)
+            .ok_or(TransactionResult::TemBadAmount)?;
 
         let trading_fee = helpers::get_u32_field(ctx.tx, "TradingFee").unwrap_or(0);
 
         // Compute LP tokens
         let lp_tokens = amm_helpers::compute_lp_tokens_initial(amount, amount2);
 
-        // Build AMM entry
-        let asset = ctx.tx.get("Asset").unwrap().clone();
-        let asset2 = ctx.tx.get("Asset2").unwrap().clone();
+        // Build AMM entry — Asset/Asset2 may have been omitted by the caller;
+        // derive from Amount/Amount2 in that case.
+        let asset = ctx
+            .tx
+            .get("Asset")
+            .cloned()
+            .or_else(|| amm_helpers::asset_spec_from_amount(amount_field))
+            .ok_or(TransactionResult::TemMalformed)?;
+        let asset2 = ctx
+            .tx
+            .get("Asset2")
+            .cloned()
+            .or_else(|| amm_helpers::asset_spec_from_amount(amount2_field))
+            .ok_or(TransactionResult::TemMalformed)?;
 
         let amm = serde_json::json!({
             "LedgerEntryType": "AMM",
@@ -101,13 +132,15 @@ impl Transactor for AMMCreateTransactor {
             "Flags": 0,
         });
 
-        let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
+        let amm_key = amm_key_from_tx_with_derivation(ctx.tx)?;
         let amm_data = serde_json::to_vec(&amm).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .insert(amm_key, amm_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Deduct deposits from creator
+        // Deduct only XRP legs from the creator's AccountRoot. IOU legs would
+        // need a trust-line debit (out of scope until non-issuer IOU sends
+        // are implemented in payment.rs).
         let acct_key = keylet::account(&account_id);
         let acct_bytes = ctx
             .view
@@ -116,9 +149,10 @@ impl Transactor for AMMCreateTransactor {
         let mut account: serde_json::Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
+        let xrp_deducted = xrp_drops_from_amount(amount_field)
+            .saturating_add(xrp_drops_from_amount(amount2_field));
         let balance = helpers::get_balance(&account);
-        let total_deducted = amount + amount2;
-        helpers::set_balance(&mut account, balance.saturating_sub(total_deducted));
+        helpers::set_balance(&mut account, balance.saturating_sub(xrp_deducted));
         helpers::increment_sequence(&mut account);
         helpers::adjust_owner_count(&mut account, 1);
 
@@ -129,6 +163,32 @@ impl Transactor for AMMCreateTransactor {
 
         Ok(TransactionResult::TesSuccess)
     }
+}
+
+/// Compute the AMM keylet from a tx, deriving Asset/Asset2 from Amount/Amount2
+/// when explicit Asset fields are absent.
+fn amm_key_from_tx_with_derivation(
+    tx: &serde_json::Value,
+) -> Result<rxrpl_primitives::Hash256, TransactionResult> {
+    let asset = tx
+        .get("Asset")
+        .cloned()
+        .or_else(|| tx.get("Amount").and_then(amm_helpers::asset_spec_from_amount))
+        .ok_or(TransactionResult::TemMalformed)?;
+    let asset2 = tx
+        .get("Asset2")
+        .cloned()
+        .or_else(|| tx.get("Amount2").and_then(amm_helpers::asset_spec_from_amount))
+        .ok_or(TransactionResult::TemMalformed)?;
+    amm_helpers::compute_amm_key(&asset, &asset2)
+}
+
+/// Return the XRP drops carried by an Amount field, 0 if it's an IOU.
+fn xrp_drops_from_amount(amount: &serde_json::Value) -> u64 {
+    amount
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

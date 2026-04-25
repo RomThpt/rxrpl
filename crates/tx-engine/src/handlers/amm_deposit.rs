@@ -18,19 +18,23 @@ impl Transactor for AMMDepositTransactor {
         amm_helpers::validate_asset(asset)?;
         amm_helpers::validate_asset(asset2)?;
 
-        let amount =
-            helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
-        if amount == 0 {
-            return Err(TransactionResult::TemBadAmount);
-        }
+        // Two-asset deposit (default) requires both Amount + Amount2; the
+        // tfSingleAsset variant requires exactly one of them.
+        let amount = ctx
+            .tx
+            .get("Amount")
+            .and_then(amm_helpers::amount_value_drops_or_iou);
+        let amount2 = ctx
+            .tx
+            .get("Amount2")
+            .and_then(amm_helpers::amount_value_drops_or_iou);
 
-        let amount2 =
-            helpers::get_u64_str_field(ctx.tx, "Amount2").ok_or(TransactionResult::TemBadAmount)?;
-        if amount2 == 0 {
-            return Err(TransactionResult::TemBadAmount);
+        match (amount, amount2) {
+            (Some(a), Some(b)) if a > 0 && b > 0 => Ok(()),
+            (Some(a), None) if a > 0 => Ok(()),
+            (None, Some(b)) if b > 0 => Ok(()),
+            _ => Err(TransactionResult::TemBadAmount),
         }
-
-        Ok(())
     }
 
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
@@ -48,10 +52,17 @@ impl Transactor for AMMDepositTransactor {
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        let deposit1 =
-            helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
-        let deposit2 =
-            helpers::get_u64_str_field(ctx.tx, "Amount2").ok_or(TransactionResult::TemBadAmount)?;
+        let amount_field = ctx.tx.get("Amount");
+        let amount2_field = ctx.tx.get("Amount2");
+        let deposit1 = amount_field
+            .and_then(amm_helpers::amount_value_drops_or_iou)
+            .unwrap_or(0);
+        let deposit2 = amount2_field
+            .and_then(amm_helpers::amount_value_drops_or_iou)
+            .unwrap_or(0);
+        if deposit1 == 0 && deposit2 == 0 {
+            return Err(TransactionResult::TemBadAmount);
+        }
 
         let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
         let mut amm = amm_helpers::read_amm(ctx.view, &amm_key)?;
@@ -60,9 +71,16 @@ impl Transactor for AMMDepositTransactor {
         let pool2 = amm_helpers::get_pool_field(&amm, "PoolBalance2");
         let total_lp = amm_helpers::get_pool_field(&amm, "LPTokenBalance");
 
-        // Compute new LP tokens
-        let new_lp =
-            amm_helpers::compute_lp_tokens_deposit(pool1, pool2, deposit1, deposit2, total_lp);
+        // For two-asset proportional deposits, mint LP based on the first leg.
+        // For single-asset (only one of deposit1/deposit2 is non-zero), mint
+        // LP based on the non-zero leg's share of its pool.
+        let new_lp = if deposit1 > 0 && deposit2 > 0 {
+            amm_helpers::compute_lp_tokens_deposit(pool1, pool2, deposit1, deposit2, total_lp)
+        } else if deposit1 > 0 {
+            amm_helpers::compute_lp_tokens_deposit(pool1, pool2, deposit1, 0, total_lp)
+        } else {
+            amm_helpers::compute_lp_tokens_deposit(pool2, pool1, deposit2, 0, total_lp)
+        };
 
         // Update AMM entry
         amm["PoolBalance1"] = serde_json::Value::String((pool1 + deposit1).to_string());
@@ -83,9 +101,12 @@ impl Transactor for AMMDepositTransactor {
         let mut account: serde_json::Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
+        // Only deduct the XRP leg(s) from the AccountRoot balance; IOU
+        // legs would require trust-line debits (out of scope).
+        let xrp_deducted = xrp_drops_from_amount_opt(amount_field)
+            .saturating_add(xrp_drops_from_amount_opt(amount2_field));
         let balance = helpers::get_balance(&account);
-        let total_deducted = deposit1 + deposit2;
-        helpers::set_balance(&mut account, balance.saturating_sub(total_deducted));
+        helpers::set_balance(&mut account, balance.saturating_sub(xrp_deducted));
         helpers::increment_sequence(&mut account);
 
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
@@ -95,6 +116,13 @@ impl Transactor for AMMDepositTransactor {
 
         Ok(TransactionResult::TesSuccess)
     }
+}
+
+fn xrp_drops_from_amount_opt(amount: Option<&serde_json::Value>) -> u64 {
+    amount
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -314,7 +342,8 @@ mod tests {
     }
 
     #[test]
-    fn reject_missing_amount2() {
+    fn accept_single_asset_amount_only() {
+        // Per AMMDeposit single-asset variant, only Amount may be present.
         let tx = serde_json::json!({
             "TransactionType": "AMMDeposit",
             "Account": BOB,
@@ -330,9 +359,6 @@ mod tests {
             rules: &rules,
             fees: &fees,
         };
-        assert_eq!(
-            AMMDepositTransactor.preflight(&ctx),
-            Err(TransactionResult::TemBadAmount)
-        );
+        assert_eq!(AMMDepositTransactor.preflight(&ctx), Ok(()));
     }
 }

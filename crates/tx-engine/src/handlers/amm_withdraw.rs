@@ -18,9 +18,20 @@ impl Transactor for AMMWithdrawTransactor {
         amm_helpers::validate_asset(asset)?;
         amm_helpers::validate_asset(asset2)?;
 
-        let lp_in = helpers::get_u64_str_field(ctx.tx, "LPTokenIn")
-            .ok_or(TransactionResult::TemBadAmount)?;
-        if lp_in == 0 {
+        // Accept either LPTokenIn (full or partial proportional withdraw) or
+        // Amount/Amount2 (single-asset withdraw via tfSingleAsset).
+        let lp_in = helpers::get_u64_str_field(ctx.tx, "LPTokenIn").unwrap_or(0);
+        let amount = ctx
+            .tx
+            .get("Amount")
+            .and_then(amm_helpers::amount_value_drops_or_iou)
+            .unwrap_or(0);
+        let amount2 = ctx
+            .tx
+            .get("Amount2")
+            .and_then(amm_helpers::amount_value_drops_or_iou)
+            .unwrap_or(0);
+        if lp_in == 0 && amount == 0 && amount2 == 0 {
             return Err(TransactionResult::TemBadAmount);
         }
 
@@ -48,9 +59,6 @@ impl Transactor for AMMWithdrawTransactor {
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        let lp_in = helpers::get_u64_str_field(ctx.tx, "LPTokenIn")
-            .ok_or(TransactionResult::TemBadAmount)?;
-
         let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
         let mut amm = amm_helpers::read_amm(ctx.view, &amm_key)?;
 
@@ -58,20 +66,57 @@ impl Transactor for AMMWithdrawTransactor {
         let pool2 = amm_helpers::get_pool_field(&amm, "PoolBalance2");
         let total_lp = amm_helpers::get_pool_field(&amm, "LPTokenBalance");
 
-        let (payout1, payout2) =
-            amm_helpers::compute_withdraw_amounts(pool1, pool2, lp_in, total_lp);
+        let lp_in = helpers::get_u64_str_field(ctx.tx, "LPTokenIn").unwrap_or(0);
+        let withdraw1 = ctx
+            .tx
+            .get("Amount")
+            .and_then(amm_helpers::amount_value_drops_or_iou)
+            .unwrap_or(0);
+        let withdraw2 = ctx
+            .tx
+            .get("Amount2")
+            .and_then(amm_helpers::amount_value_drops_or_iou)
+            .unwrap_or(0);
+
+        let (payout1, payout2, lp_burned) = if lp_in > 0 {
+            let (p1, p2) = amm_helpers::compute_withdraw_amounts(pool1, pool2, lp_in, total_lp);
+            (p1, p2, lp_in)
+        } else if withdraw1 > 0 || withdraw2 > 0 {
+            // Single-asset withdraw: burn LP proportional to the amount taken
+            // from its pool. Approximation: lp_burned = amount * total_lp / pool.
+            let (payout, pool_for_payout, slot) = if withdraw1 > 0 {
+                (withdraw1, pool1, 1)
+            } else {
+                (withdraw2, pool2, 2)
+            };
+            if pool_for_payout == 0 {
+                return Err(TransactionResult::TecAmmEmpty);
+            }
+            let lp = ((payout as u128) * (total_lp as u128) / (pool_for_payout as u128)) as u64;
+            if slot == 1 {
+                (payout.min(pool1), 0, lp)
+            } else {
+                (0, payout.min(pool2), lp)
+            }
+        } else {
+            return Err(TransactionResult::TemBadAmount);
+        };
+
+        let lp_to_burn = lp_burned.min(total_lp);
 
         // Update AMM entry
-        amm["PoolBalance1"] = serde_json::Value::String((pool1 - payout1).to_string());
-        amm["PoolBalance2"] = serde_json::Value::String((pool2 - payout2).to_string());
-        amm["LPTokenBalance"] = serde_json::Value::String((total_lp - lp_in).to_string());
+        amm["PoolBalance1"] = serde_json::Value::String(pool1.saturating_sub(payout1).to_string());
+        amm["PoolBalance2"] = serde_json::Value::String(pool2.saturating_sub(payout2).to_string());
+        amm["LPTokenBalance"] =
+            serde_json::Value::String(total_lp.saturating_sub(lp_to_burn).to_string());
 
         let amm_data = serde_json::to_vec(&amm).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(amm_key, amm_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Credit payouts to withdrawer
+        // Credit only XRP payouts to the AccountRoot balance; IOU payouts
+        // require trust-line credits (out of scope).
         let acct_key = keylet::account(&account_id);
         let acct_bytes = ctx
             .view
@@ -80,9 +125,12 @@ impl Transactor for AMMWithdrawTransactor {
         let mut account: serde_json::Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
+        let asset_field = ctx.tx.get("Asset");
+        let asset2_field = ctx.tx.get("Asset2");
+        let xrp_payout = if asset_is_xrp(asset_field) { payout1 } else { 0 }
+            + if asset_is_xrp(asset2_field) { payout2 } else { 0 };
         let balance = helpers::get_balance(&account);
-        let total_payout = payout1 + payout2;
-        helpers::set_balance(&mut account, balance + total_payout);
+        helpers::set_balance(&mut account, balance.saturating_add(xrp_payout));
         helpers::increment_sequence(&mut account);
 
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
@@ -92,6 +140,14 @@ impl Transactor for AMMWithdrawTransactor {
 
         Ok(TransactionResult::TesSuccess)
     }
+}
+
+fn asset_is_xrp(asset: Option<&serde_json::Value>) -> bool {
+    let Some(a) = asset else { return false };
+    if a.as_str() == Some("XRP") {
+        return true;
+    }
+    a.get("currency").and_then(|c| c.as_str()) == Some("XRP")
 }
 
 #[cfg(test)]
@@ -184,12 +240,13 @@ mod tests {
         assert_eq!(amm["PoolBalance2"].as_str().unwrap(), "0");
         assert_eq!(amm["LPTokenBalance"].as_str().unwrap(), "0");
 
-        // BOB gets credited: 10M + 5M = 15M total payout
+        // BOB gets credited only the XRP leg (PoolBalance1 = 10M XRP).
+        // The USD leg (5M units) goes to the trust line, not AccountRoot.
         let bob_id = decode_account_id(BOB).unwrap();
         let bob_key = keylet::account(&bob_id);
         let bob_bytes = sandbox.read(&bob_key).unwrap();
         let bob: serde_json::Value = serde_json::from_slice(&bob_bytes).unwrap();
-        assert_eq!(bob["Balance"].as_str().unwrap(), "65000000");
+        assert_eq!(bob["Balance"].as_str().unwrap(), "60000000");
     }
 
     #[test]
