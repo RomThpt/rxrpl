@@ -9,6 +9,6 @@ pub mod node;
 pub mod pruner;
 pub mod reporting;
 
-pub use checkpoint::{AnchorConfig, CheckpointAnchor};
+pub use checkpoint::{AnchorConfig, CheckpointAnchor, StartingLedger};
 pub use error::NodeError;
 pub use node::Node;

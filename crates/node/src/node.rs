@@ -552,6 +552,7 @@ impl Node {
         &self,
         close_interval_secs: u64,
         sync_rpc_url: Option<&str>,
+        starting_ledger: Option<crate::checkpoint::StartingLedger>,
     ) -> Result<(), NodeError> {
         // 1. Generate/load node identity. node_seed accepts either:
         //   - 32 hex characters (16 raw seed bytes)
@@ -906,6 +907,20 @@ impl Node {
             None
         };
 
+        // Initial checkpoint anchor (if --starting-ledger was passed).
+        // - Seq(s):   create immediately for sequence `s`.
+        // - Recent:   wait until we have observed at least one peer, then
+        //             anchor at `max_peer_seq - 1024` (saturating).
+        // - Hash(h):  not yet wired — header-by-hash lookup is the missing
+        //             piece. Logged on entry.
+        let starting_ledger_for_loop = starting_ledger;
+        if let Some(crate::checkpoint::StartingLedger::Hash(h)) = starting_ledger_for_loop {
+            tracing::warn!(
+                "checkpoint bootstrap by hash {} not yet implemented; node will start from genesis",
+                h
+            );
+        }
+
         tokio::spawn(async move {
             let node_id = NodeId(identity.node_id);
             let consensus_params = ConsensusParams::default();
@@ -926,6 +941,28 @@ impl Node {
                 tracing::info!("validation aggregator: trust filter enabled (UNL-bound)");
             }
             tracing::info!("validation quorum initialized to {}", initial_quorum);
+
+            // Checkpoint bootstrap state (consumed once the anchor resolves).
+            let mut checkpoint_anchor: Option<crate::checkpoint::CheckpointAnchor> =
+                match starting_ledger_for_loop {
+                    Some(crate::checkpoint::StartingLedger::Seq(s)) => {
+                        tracing::info!(
+                            "checkpoint bootstrap: tracking anchor for ledger #{} (quorum {})",
+                            s, initial_quorum
+                        );
+                        Some(crate::checkpoint::CheckpointAnchor::new(
+                            crate::checkpoint::AnchorConfig {
+                                target_seq: s,
+                                quorum: initial_quorum,
+                            },
+                        ))
+                    }
+                    Some(crate::checkpoint::StartingLedger::Recent) => None,
+                    Some(crate::checkpoint::StartingLedger::Hash(_)) | None => None,
+                };
+            // True until --starting-ledger=recent has computed its target seq.
+            let mut recent_anchor_pending =
+                matches!(starting_ledger_for_loop, Some(crate::checkpoint::StartingLedger::Recent));
 
             // Collect amendment votes from received validations for the current round.
             // Reset after each ledger close.
@@ -1156,6 +1193,36 @@ impl Node {
                                     amendment_votes.len(),
                                 );
 
+                                // Feed into the checkpoint anchor first (if active). On
+                                // resolution we directly request the agreed ledger and
+                                // retire the anchor so we don't re-trigger.
+                                if let Some(anchor) = checkpoint_anchor.as_mut() {
+                                    if let Some(anchor_hash) = anchor.add(&validation) {
+                                        let anchor_seq = anchor.target_seq();
+                                        tracing::info!(
+                                            "checkpoint anchor resolved: ledger #{} hash={}",
+                                            anchor_seq, anchor_hash
+                                        );
+                                        let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
+                                            seq: anchor_seq,
+                                            hash: Some(anchor_hash),
+                                        });
+                                        if !syncing {
+                                            syncing = true;
+                                            timer.on_phase_change(
+                                                rxrpl_consensus::ConsensusPhase::Open,
+                                            );
+                                            sync_started_at = Some(tokio::time::Instant::now());
+                                            last_sync_seq =
+                                                ledger_seq_shared.load(Ordering::Relaxed);
+                                        }
+                                        if anchor_seq > max_peer_seq {
+                                            max_peer_seq = anchor_seq;
+                                        }
+                                        checkpoint_anchor = None;
+                                    }
+                                }
+
                                 // Aggregate validation and check for quorum
                                 if let Some(validated) = val_aggregator.add_validation(validation) {
                                     tracing::info!(
@@ -1258,6 +1325,27 @@ impl Node {
                                 });
                                 if peer_seq > max_peer_seq {
                                     max_peer_seq = peer_seq;
+                                }
+                                // --starting-ledger=recent: once we know a
+                                // peer's current sequence, lock the anchor
+                                // target at `peer_seq - 1024` (saturating).
+                                // Subsequent peers can still raise the
+                                // target via the regular sync path.
+                                if recent_anchor_pending && checkpoint_anchor.is_none() {
+                                    let target = peer_seq.saturating_sub(1024).max(1);
+                                    tracing::info!(
+                                        "checkpoint bootstrap (recent): tracking anchor for ledger #{} (peer at #{})",
+                                        target, peer_seq
+                                    );
+                                    checkpoint_anchor = Some(
+                                        crate::checkpoint::CheckpointAnchor::new(
+                                            crate::checkpoint::AnchorConfig {
+                                                target_seq: target,
+                                                quorum: initial_quorum,
+                                            },
+                                        ),
+                                    );
+                                    recent_anchor_pending = false;
                                 }
                                 if peer_seq > our_seq + 1 {
                                     if !syncing {
