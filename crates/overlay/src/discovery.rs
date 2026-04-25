@@ -149,6 +149,7 @@ mod tests {
             reputation: crate::reputation::PeerReputation::new(),
             scoring: crate::peer_score::PeerScore::new(),
             rate_limiter: crate::rate_limiter::PeerRateLimiter::default(),
+            software: crate::peer_set::PeerSoftware::Unknown,
         });
         peer_set.add(info);
 
