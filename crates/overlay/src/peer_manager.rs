@@ -913,11 +913,22 @@ impl PeerManager {
                                 }
                                 self.ledger_syncer.set_ledger_hash(header.sequence, header.hash);
 
-                                if let Some(store) = self.get_node_store() {
+                                let store_opt = self.get_node_store();
+                                tracing::info!(
+                                    "DBG liBASE #{} store={} account_hash={}",
+                                    header.sequence,
+                                    if store_opt.is_some() { "Some" } else { "None" },
+                                    header.account_hash,
+                                );
+                                if let Some(store) = store_opt {
                                     let missing = self.ledger_syncer.start_incremental_sync(
                                         header.sequence,
                                         header.account_hash,
                                         store,
+                                    );
+                                    tracing::info!(
+                                        "DBG start_incremental_sync #{} returned {} missing nodes",
+                                        header.sequence, missing.len()
                                     );
                                     if !missing.is_empty() {
                                         self.send_get_ledger_as_node(header.sequence);
@@ -1773,10 +1784,17 @@ impl PeerManager {
     fn send_get_ledger_as_node(&mut self, seq: u32) {
         let ledger_hash = match self.ledger_syncer.get_ledger_hash(seq) {
             Some(h) => h,
-            None => return,
+            None => {
+                tracing::info!("DBG send_get_ledger_as_node #{}: no ledger_hash", seq);
+                return;
+            }
         };
 
         let missing = self.ledger_syncer.get_missing_node_ids(seq);
+        tracing::info!(
+            "DBG send_get_ledger_as_node #{}: {} missing node_ids",
+            seq, missing.len()
+        );
         if missing.is_empty() {
             return;
         }
@@ -1793,6 +1811,10 @@ impl PeerManager {
         // Split requests across multiple peers so each gets a different subset.
         let best = self.peer_set.best_peers_for_ledger(seq, 3);
         let num_peers = best.len();
+        tracing::info!(
+            "DBG send_get_ledger_as_node #{}: best_peers={} (handles={})",
+            seq, num_peers, self.peer_handles.len()
+        );
         if num_peers == 0 {
             return;
         }
