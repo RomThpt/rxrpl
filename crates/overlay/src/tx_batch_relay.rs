@@ -177,7 +177,9 @@ pub fn encode_transactions_batch(txs: &[(Hash256, Vec<u8>)]) -> Vec<u8> {
             .iter()
             .map(|(_hash, data)| TmTransaction {
                 raw_transaction: Some(data.clone()),
-                status: Some(0),
+                // tsNEW = 1; see encode_transaction in proto_convert.rs
+                // for why Some(0) is silently dropped on the wire.
+                status: Some(1),
                 receive_timestamp: Some(0),
                 deferred: Some(false),
             })

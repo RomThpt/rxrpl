@@ -191,10 +191,16 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
 // --- Transaction ---
 
 pub fn encode_transaction(_tx_hash: &Hash256, tx_data: &[u8]) -> Vec<u8> {
-    // rippled-compatible: raw_transaction contains the serialized tx directly.
+    // Rippled's `proto2` schema declares `status` as REQUIRED (TransactionStatus
+    // enum). prost's `optional int32` with `Some(0)` is silently dropped on the
+    // wire because 0 is the default for `int32`, so rippled rejects the
+    // message with "missing required fields: status" and disconnects.
+    // tsNEW = 1 (rippled's TransactionStatus enum) is the correct value for a
+    // freshly-broadcast tx and is non-zero, so it gets serialized.
+    const TS_NEW: i32 = 1;
     let msg = TmTransaction {
         raw_transaction: Some(tx_data.to_vec()),
-        status: Some(0),
+        status: Some(TS_NEW),
         receive_timestamp: Some(0),
         deferred: Some(false),
     };
