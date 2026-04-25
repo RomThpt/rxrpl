@@ -58,11 +58,26 @@ pub async fn ledger_accept(
     // Snapshot the set of confirmed tx hashes from the just-closed ledger
     // before we move it into the history; used below to purge confirmed
     // entries from the retry queue.
-    let confirmed_hashes: std::collections::HashSet<rxrpl_primitives::Hash256> = closed_copy
-        .tx_map
-        .iter_ref()
-        .map(|(hash, _)| *hash)
-        .collect();
+    let mut confirmed_hashes: std::collections::HashSet<rxrpl_primitives::Hash256> =
+        std::collections::HashSet::new();
+    let mut txn_count: u32 = 0;
+    closed_copy.tx_map.iter_ref().for_each(|(hash, data)| {
+        confirmed_hashes.insert(*hash);
+        txn_count += 1;
+        // Mirror what the natural-close loop in node.rs does so subscribers
+        // on the `transactions` stream get notified for txs that were applied
+        // in a manually-closed (ledger_accept) ledger.
+        if let Ok(record) = serde_json::from_slice::<serde_json::Value>(data) {
+            let tx_json = record.get("tx_json").cloned().unwrap_or_default();
+            let _ = ctx
+                .event_sender()
+                .send(crate::events::ServerEvent::TransactionValidated {
+                    transaction: tx_json,
+                    meta: record.get("meta").cloned().unwrap_or_default(),
+                    ledger_index: closed_seq,
+                });
+        }
+    });
 
     {
         let mut closed_ledgers = closed_lock.write().await;
@@ -76,7 +91,7 @@ pub async fn ledger_accept(
             ledger_index: closed_seq,
             ledger_hash: closed_hash,
             ledger_time: ripple_close_time,
-            txn_count: 0,
+            txn_count,
         });
 
     // Replace the open ledger
