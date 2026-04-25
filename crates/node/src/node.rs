@@ -921,6 +921,30 @@ impl Node {
             );
         }
 
+        // SECURITY: --starting-ledger requires a trusted UNL. Without one,
+        // the anchor would resolve on any 28 fake validator keys (Sybil),
+        // letting an attacker bootstrap us onto a forged chain. Refuse to
+        // start in that configuration. `Hash(_)` is a planned manual-trust
+        // mode and exempt because it logs and falls back to genesis above.
+        if matches!(
+            starting_ledger_for_loop,
+            Some(crate::checkpoint::StartingLedger::Seq(_))
+                | Some(crate::checkpoint::StartingLedger::Recent)
+        ) {
+            let has_unl = !self.config.validators.validator_list_sites.is_empty()
+                && !self.config.validators.validator_list_keys.is_empty()
+                && self.config.validators.require_trusted_validators;
+            if !has_unl {
+                return Err(NodeError::Config(
+                    "--starting-ledger requires `validators.validator_list_sites` + \
+                     `validators.validator_list_keys` to be configured and \
+                     `require_trusted_validators` to be true; \
+                     refusing to bootstrap from an unverified checkpoint"
+                        .into(),
+                ));
+            }
+        }
+
         tokio::spawn(async move {
             let node_id = NodeId(identity.node_id);
             let consensus_params = ConsensusParams::default();
@@ -1196,8 +1220,19 @@ impl Node {
                                 // Feed into the checkpoint anchor first (if active). On
                                 // resolution we directly request the agreed ledger and
                                 // retire the anchor so we don't re-trigger.
+                                //
+                                // SECURITY: only count UNL-trusted validations toward
+                                // the anchor. Without this gate, 28 fake validators
+                                // could resolve the anchor on a forged hash and
+                                // bootstrap the node onto an attacker-chosen chain.
+                                let anchor_trustable =
+                                    val_aggregator.is_trusted(&validation.public_key);
                                 if let Some(anchor) = checkpoint_anchor.as_mut() {
-                                    if let Some(anchor_hash) = anchor.add(&validation) {
+                                    if !anchor_trustable {
+                                        // Drop silently — the same validation may
+                                        // still be processed by the regular aggregator
+                                        // below (which also gates on trust).
+                                    } else if let Some(anchor_hash) = anchor.add(&validation) {
                                         let anchor_seq = anchor.target_seq();
                                         tracing::info!(
                                             "checkpoint anchor resolved: ledger #{} hash={}",

@@ -61,9 +61,15 @@ impl ValidationAggregator {
         self.min_validations = new_quorum.max(1);
     }
 
-    /// Internal: check whether `public_key` is in the trusted set, if any.
+    /// Check whether `public_key` is in the trusted set, if any.
     /// When no trusted set is configured, every key is considered trusted.
-    fn is_trusted(&self, public_key: &[u8]) -> bool {
+    ///
+    /// Public so other consensus-loop helpers (e.g.
+    /// [`crate::vl_fetcher`] downstream consumers and the checkpoint
+    /// bootstrap path in `rxrpl-node`) can apply the same gate before
+    /// counting a validation toward their own quorum without round-tripping
+    /// through `add_validation`.
+    pub fn is_trusted(&self, public_key: &[u8]) -> bool {
         let Some(ref trusted) = self.trusted else {
             return true;
         };
