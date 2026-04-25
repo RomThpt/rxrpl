@@ -11,6 +11,7 @@ use rxrpl_consensus::types::{Proposal, TxSet, Validation};
 use rxrpl_p2p_proto::MessageType;
 use rxrpl_p2p_proto::codec::{PeerCodec, PeerMessage};
 use rxrpl_primitives::Hash256;
+use rxrpl_shamap::NodeId as ShamapNodeId;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, RwLock, mpsc};
 use tokio_util::codec::Framed;
@@ -1798,13 +1799,12 @@ impl PeerManager {
             return;
         }
 
-        // Send the content hash (32 bytes) of each missing node so the server
-        // can locate it via a direct store.fetch lookup. Sending NodeId (path
-        // + depth) would require the server to walk its SHAMap by path,
-        // which the current handle_get_ledger does not do.
+        // Send the SHAMap NodeId (33 bytes: path[32] + depth[1]) of each
+        // missing node, matching rippled's TMGetLedger wire format. The
+        // server walks its SHAMap by (path, depth) to locate the node.
         let node_ids: Vec<Vec<u8>> = missing
             .iter()
-            .map(|mn| mn.hash.as_bytes().to_vec())
+            .map(|mn| mn.node_id.to_wire_bytes())
             .collect();
 
         let num_ids = node_ids.len();
@@ -2134,14 +2134,17 @@ impl PeerManager {
         let mut truncated = false;
         const MAX_RESPONSE_SIZE: usize = 256 * 1024;
 
-        // Parse requested node_ids from the request for delta sync.
-        let request_node_ids: Vec<Hash256> = req
+        // Parse requested node_ids from the request as rippled wire format
+        // (33 bytes: path[32] + depth[1]). The pre-PR-#14 32-byte content-hash
+        // shortcut has been removed in favor of unified rippled compatibility.
+        let request_node_ids: Vec<ShamapNodeId> = req
             .node_ids
             .iter()
             .filter_map(|id_bytes| {
-                if id_bytes.len() >= 32 {
-                    let arr: [u8; 32] = id_bytes[..32].try_into().ok()?;
-                    Some(Hash256::new(arr))
+                if id_bytes.len() == 33 {
+                    let path: [u8; 32] = id_bytes[..32].try_into().ok()?;
+                    let depth = id_bytes[32];
+                    Some(ShamapNodeId::new(depth, &Hash256::new(path)))
                 } else {
                     None
                 }
@@ -2175,19 +2178,22 @@ impl PeerManager {
         }
 
         if !request_node_ids.is_empty() {
-            // Delta sync: serve specific nodes by hash from the backing store.
-            for node_hash in &request_node_ids {
-                if let Some(store) = ledger.state_map.store() {
-                    if let Ok(Some(data)) = store.fetch(node_hash) {
-                        let entry_size = node_hash.as_bytes().len() + data.len();
-                        if total_size + entry_size <= MAX_RESPONSE_SIZE {
-                            nodes.push((node_hash.as_bytes().to_vec(), data));
-                            total_size += entry_size;
-                        } else {
-                            truncated = true;
-                            break;
-                        }
-                    }
+            // Delta sync: serve specific nodes by walking the SHAMap to the
+            // requested (path, depth). Outgoing nodedata appends a trailing
+            // depth byte to match rippled's TMLedgerNode wire format.
+            for node_id in &request_node_ids {
+                let Some((_content_hash, mut raw)) = ledger.state_map.node_at(*node_id) else {
+                    continue;
+                };
+                raw.push(node_id.depth());
+                let id_bytes = node_id.to_wire_bytes();
+                let entry_size = id_bytes.len() + raw.len();
+                if total_size + entry_size <= MAX_RESPONSE_SIZE {
+                    nodes.push((id_bytes, raw));
+                    total_size += entry_size;
+                } else {
+                    truncated = true;
+                    break;
                 }
             }
 
@@ -2387,7 +2393,7 @@ async fn try_connect_outbound(
     let seq = ledger_seq.load(Ordering::Relaxed);
     let hash = *ledger_hash.read().await;
 
-    let (peer_node_id, framed) =
+    let (peer_node_id, software, framed) =
         handshake::handshake_outbound_http(stream, identity, network_id, seq, &hash).await?;
 
     if peer_set.get(&peer_node_id).is_some() {
@@ -2402,6 +2408,7 @@ async fn try_connect_outbound(
         reputation: PeerReputation::new(),
         scoring: PeerScore::new(),
         rate_limiter: crate::rate_limiter::PeerRateLimiter::default(),
+        software,
     });
 
     if !peer_set.add(Arc::clone(&info)) {
@@ -2438,7 +2445,7 @@ async fn try_accept_inbound(
     let seq = ledger_seq.load(Ordering::Relaxed);
     let hash = *ledger_hash.read().await;
 
-    let (peer_node_id, framed) =
+    let (peer_node_id, software, framed) =
         handshake::handshake_inbound_http(stream, identity, network_id, seq, &hash).await?;
 
     if peer_set.get(&peer_node_id).is_some() {
@@ -2453,6 +2460,7 @@ async fn try_accept_inbound(
         reputation: PeerReputation::new(),
         scoring: PeerScore::new(),
         rate_limiter: crate::rate_limiter::PeerRateLimiter::default(),
+        software,
     });
 
     if !peer_set.add(Arc::clone(&info)) {

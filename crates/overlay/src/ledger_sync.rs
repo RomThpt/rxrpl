@@ -266,19 +266,13 @@ impl LedgerSyncer {
 
         let mut added = 0;
         for (_node_id, node_data) in nodes {
-            // rippled sends nodedata as: serialized_node_bytes + depth_byte.
-            // Strip the trailing depth byte to get pure node data.
-            // Then compute the content hash to store it correctly.
-            if node_data.is_empty() {
+            // TMLedgerNode wire format (rippled-compatible): serialized node
+            // bytes followed by a 1-byte depth marker. Strip it before
+            // computing the content hash that addresses the node in the store.
+            if node_data.len() < 2 {
                 continue;
             }
-            // rxrpl peers send raw stored bytes (key||data for leaves, or
-            // 16x32-byte child hashes for inner nodes). rippled wraps each
-            // node with a trailing 1-byte depth marker. Try the raw bytes
-            // first; if the resulting hash isn't expected, fall back to the
-            // stripped variant. We can't know the expected hash here, so we
-            // store both candidates and let SHAMap traversal pick the right one.
-            let raw = &node_data[..];
+            let raw = &node_data[..node_data.len() - 1];
 
             // Compute the content hash based on node type.
             let hash = if raw.len() == 512 {
@@ -296,7 +290,7 @@ impl LedgerSyncer {
             };
 
             tracing::debug!(
-                "feed_nodes #{}: computed hash={} size={} bytes (stripped from {})",
+                "feed_nodes #{}: computed hash={} size={} bytes (depth-byte stripped from {})",
                 seq, hash, raw.len(), node_data.len()
             );
 

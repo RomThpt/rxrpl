@@ -847,6 +847,40 @@ impl SHAMap {
 
     // --- Delta sync methods ---
 
+    /// Look up a SHAMap node by its `NodeId` (path + depth).
+    ///
+    /// Walks from the root following `select_branch(node_id.id(), d)` for
+    /// `d in 0..node_id.depth()`. Returns the node found at that position
+    /// (loaded from the backing store if not in memory) along with its
+    /// content hash and serialized bytes.
+    ///
+    /// Wire format (matching rippled's `serializeShallow`):
+    /// - Inner node: 16 × 32 = 512 bytes (concatenated child hashes)
+    /// - Leaf node: key(32) || data
+    ///
+    /// Used by `handle_get_ledger` to serve rippled-style 33-byte NodeId
+    /// requests (path + depth). Returns `None` if any branch on the path
+    /// is empty or unloadable from the store.
+    pub fn node_at(&self, node_id: NodeId) -> Option<(Hash256, Vec<u8>)> {
+        let target_depth = node_id.depth();
+        let key = *node_id.id();
+        let mut current: &Arc<SHAMapNode> = &self.root;
+
+        for d in 0..target_depth {
+            let inner = match current.as_ref() {
+                SHAMapNode::Inner(i) => i,
+                SHAMapNode::Leaf(_) => return None,
+            };
+            let branch = select_branch(&key, d);
+            current = inner
+                .child_with_store(branch, self.store.as_ref(), self.leaf_ctor)
+                .ok()
+                .flatten()?;
+        }
+
+        Some(serialize_node_shallow(current))
+    }
+
     /// Compute hashes of missing nodes needed to complete the tree toward a target root.
     ///
     /// Walks the tree comparing known inner node hashes against what is in the
@@ -1079,6 +1113,30 @@ impl SHAMap {
     }
 }
 
+/// Serialize a SHAMap node to its on-the-wire shallow form.
+///
+/// Mirrors `collect_dirty_nodes`: inner = 16x32 child hashes, leaf = key||data.
+/// The trailing depth byte expected by rippled's TMLedgerNode wire format is
+/// NOT appended here; that is the caller's responsibility (since depth comes
+/// from the NodeId being requested, not the node itself).
+fn serialize_node_shallow(node: &Arc<SHAMapNode>) -> (Hash256, Vec<u8>) {
+    match node.as_ref() {
+        SHAMapNode::Inner(inner) => {
+            let mut data = Vec::with_capacity(16 * 32);
+            for i in 0..16u8 {
+                data.extend_from_slice(inner.child_hash(i).as_bytes());
+            }
+            (inner.hash(), data)
+        }
+        SHAMapNode::Leaf(leaf) => {
+            let mut data = Vec::with_capacity(32 + leaf.data().len());
+            data.extend_from_slice(leaf.key().as_bytes());
+            data.extend_from_slice(leaf.data());
+            (leaf.hash(), data)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1094,6 +1152,52 @@ mod tests {
         let mut map = SHAMap::account_state();
         assert!(map.is_empty());
         assert_eq!(map.root_hash(), Hash256::ZERO);
+    }
+
+    #[test]
+    fn node_at_root_returns_root_inner() {
+        let mut map = SHAMap::account_state();
+        for i in 0u8..16 {
+            let mut k = [0u8; 32];
+            k[0] = i << 4;
+            map.put(Hash256::new(k), vec![i, i, i]).unwrap();
+        }
+        map.flush().unwrap();
+
+        let (hash, bytes) = map.node_at(NodeId::ROOT).expect("root must exist");
+        assert_eq!(hash, map.root_hash());
+        assert_eq!(bytes.len(), 16 * 32, "inner root serializes as 16 hashes");
+    }
+
+    #[test]
+    fn node_at_leaf_round_trip() {
+        let mut map = SHAMap::account_state();
+        let key = make_key("ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789");
+        let data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        map.put(key, data.clone()).unwrap();
+        map.flush().unwrap();
+
+        // Find the leaf via node_at by walking the same path.
+        // For this single-leaf tree the leaf sits as a direct child of the root.
+        let branch = select_branch(&key, 0);
+        let _ = branch; // depth=1 lookup
+        let leaf_node_id = NodeId::new(1, &key);
+        let (_h, bytes) = map.node_at(leaf_node_id).expect("leaf must exist");
+        assert_eq!(&bytes[..32], key.as_bytes(), "leaf bytes start with key");
+        assert_eq!(&bytes[32..], &data[..], "then leaf data");
+    }
+
+    #[test]
+    fn node_at_missing_branch_returns_none() {
+        let mut map = SHAMap::account_state();
+        let key = make_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        map.put(key, vec![1]).unwrap();
+        map.flush().unwrap();
+
+        // Try to walk a path that doesn't exist.
+        let other = make_key("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
+        let missing = NodeId::new(5, &other);
+        assert!(map.node_at(missing).is_none());
     }
 
     #[test]

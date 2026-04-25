@@ -13,6 +13,40 @@ pub struct PeerSet {
     max_peers: usize,
 }
 
+/// Software identity of a remote peer (parsed from `User-Agent` header).
+///
+/// Used for telemetry and (in the future) protocol-version-specific behavior.
+/// The wire layer is unified on rippled format and does not branch on this.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeerSoftware {
+    /// Another rxrpl node. Carries the version string.
+    Rxrpl(String),
+    /// A rippled node. Carries the version string.
+    Rippled(String),
+    /// Anything else. Carries the raw `User-Agent` value.
+    Other(String),
+    /// Peer did not advertise a `User-Agent`.
+    Unknown,
+}
+
+impl PeerSoftware {
+    /// Parse a raw `User-Agent` header value (e.g. `rippled-2.5.0` or `rxrpl/0.1.0`).
+    pub fn parse(ua: &str) -> Self {
+        let trimmed = ua.trim();
+        if trimmed.is_empty() {
+            return PeerSoftware::Unknown;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("rxrpl/").or_else(|| lower.strip_prefix("rxrpl-")) {
+            PeerSoftware::Rxrpl(rest.to_string())
+        } else if let Some(rest) = lower.strip_prefix("rippled-").or_else(|| lower.strip_prefix("rippled/")) {
+            PeerSoftware::Rippled(rest.to_string())
+        } else {
+            PeerSoftware::Other(trimmed.to_string())
+        }
+    }
+}
+
 /// Information about a connected peer.
 #[derive(Debug)]
 pub struct PeerInfo {
@@ -30,6 +64,8 @@ pub struct PeerInfo {
     pub scoring: PeerScore,
     /// Per-peer message rate limiter.
     pub rate_limiter: PeerRateLimiter,
+    /// Peer's software identity from the handshake `User-Agent` header.
+    pub software: PeerSoftware,
 }
 
 impl PeerSet {
@@ -173,7 +209,25 @@ mod tests {
             reputation: PeerReputation::new(),
             scoring: PeerScore::new(),
             rate_limiter: PeerRateLimiter::default(),
+            software: PeerSoftware::Unknown,
         })
+    }
+
+    #[test]
+    fn parse_user_agent() {
+        assert_eq!(
+            PeerSoftware::parse("rippled-2.5.0"),
+            PeerSoftware::Rippled("2.5.0".into())
+        );
+        assert_eq!(
+            PeerSoftware::parse("rxrpl/0.1.0"),
+            PeerSoftware::Rxrpl("0.1.0".into())
+        );
+        assert_eq!(
+            PeerSoftware::parse("totally-different-impl/1"),
+            PeerSoftware::Other("totally-different-impl/1".into())
+        );
+        assert_eq!(PeerSoftware::parse(""), PeerSoftware::Unknown);
     }
 
     #[test]

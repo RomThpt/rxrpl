@@ -9,8 +9,12 @@ use tokio_util::codec::Framed;
 use crate::error::OverlayError;
 use crate::http;
 use crate::identity::NodeIdentity;
+use crate::peer_set::PeerSoftware;
 use crate::proto_convert;
 use crate::tls::{self, PeerStream};
+
+/// Our outgoing `User-Agent` advertised in the HTTP upgrade headers.
+const OUR_USER_AGENT: &str = concat!("rxrpl/", env!("CARGO_PKG_VERSION"));
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -110,6 +114,7 @@ fn build_upgrade_headers(
         ("Session-Signature".into(), sig_b64),
         ("Network-ID".into(), network_id.to_string()),
         ("Crawl".into(), "public".into()),
+        ("User-Agent".into(), OUR_USER_AGENT.into()),
     ];
     // Only send Closed-Ledger if we have a real ledger hash (rippled expects hex uint256)
     if *ledger_hash != Hash256::ZERO {
@@ -149,13 +154,14 @@ async fn read_until_header_end(stream: &mut PeerStream) -> Result<Vec<u8>, Overl
 
 /// Verify a peer's identity from HTTP upgrade headers against the TLS session cookie.
 ///
-/// Returns the peer's node ID (SHA-512-Half of their public key).
+/// Returns `(peer_node_id, peer_software)` where `peer_software` is parsed from
+/// the `User-Agent` header (if present, otherwise [`PeerSoftware::Unknown`]).
 fn verify_peer_http_headers(
     headers: &[(String, String)],
     cookie: &Hash256,
     our_identity: &NodeIdentity,
     expected_network_id: u32,
-) -> Result<Hash256, OverlayError> {
+) -> Result<(Hash256, PeerSoftware), OverlayError> {
     // Extract required headers
     let peer_pubkey_hex = http::get_header(headers, "Public-Key")
         .ok_or_else(|| OverlayError::Handshake("missing Public-Key header".into()))?;
@@ -202,7 +208,11 @@ fn verify_peer_http_headers(
         return Err(OverlayError::Handshake("self-connection detected".into()));
     }
 
-    Ok(peer_node_id)
+    let software = http::get_header(headers, "User-Agent")
+        .map(PeerSoftware::parse)
+        .unwrap_or(PeerSoftware::Unknown);
+
+    Ok((peer_node_id, software))
 }
 
 /// Perform outbound HTTP upgrade handshake (rippled-compatible).
@@ -216,7 +226,7 @@ pub async fn handshake_outbound_http(
     network_id: u32,
     _ledger_seq: u32,
     ledger_hash: &Hash256,
-) -> Result<(Hash256, Framed<PeerStream, PeerCodec>), OverlayError> {
+) -> Result<(Hash256, PeerSoftware, Framed<PeerStream, PeerCodec>), OverlayError> {
     let cookie = tls::extract_session_cookie(&stream)?;
     let headers = build_upgrade_headers(identity, &cookie, network_id, ledger_hash);
     let request = http::format_http_request(&headers);
@@ -251,11 +261,11 @@ pub async fn handshake_outbound_http(
     }
 
     // Verify peer identity from response headers
-    let peer_node_id =
+    let (peer_node_id, software) =
         verify_peer_http_headers(&resp_headers, &cookie, identity, network_id)?;
 
     let framed = Framed::new(stream, PeerCodec);
-    Ok((peer_node_id, framed))
+    Ok((peer_node_id, software, framed))
 }
 
 /// Perform inbound HTTP upgrade handshake (rippled-compatible).
@@ -269,7 +279,7 @@ pub async fn handshake_inbound_http(
     network_id: u32,
     _ledger_seq: u32,
     ledger_hash: &Hash256,
-) -> Result<(Hash256, Framed<PeerStream, PeerCodec>), OverlayError> {
+) -> Result<(Hash256, PeerSoftware, Framed<PeerStream, PeerCodec>), OverlayError> {
     let cookie = tls::extract_session_cookie(&stream)?;
 
     // Read HTTP upgrade request
@@ -282,7 +292,7 @@ pub async fn handshake_inbound_http(
         .map_err(|e| OverlayError::Handshake(format!("parse HTTP request: {e}")))?;
 
     // Verify peer identity from request headers
-    let peer_node_id =
+    let (peer_node_id, software) =
         verify_peer_http_headers(&req_headers, &cookie, identity, network_id)?;
 
     // Send HTTP 101 response with our identity
@@ -300,7 +310,7 @@ pub async fn handshake_inbound_http(
         .map_err(|e| OverlayError::Handshake(format!("flush HTTP response: {e}")))?;
 
     let framed = Framed::new(stream, PeerCodec);
-    Ok((peer_node_id, framed))
+    Ok((peer_node_id, software, framed))
 }
 
 #[cfg(test)]
@@ -338,7 +348,7 @@ mod tests {
             handshake_outbound_http(stream, &id_a, network_id, 1, &ledger_hash).await;
         assert!(result.is_ok(), "outbound failed: {:?}", result.err());
 
-        let (peer_id_from_client, _framed_client) = result.unwrap();
+        let (peer_id_from_client, client_seen_software, _framed_client) = result.unwrap();
 
         let inbound_result = handle.await.unwrap();
         assert!(
@@ -346,13 +356,16 @@ mod tests {
             "inbound failed: {:?}",
             inbound_result.err()
         );
-        let (peer_id_from_server, _framed_server) = inbound_result.unwrap();
+        let (peer_id_from_server, server_seen_software, _framed_server) = inbound_result.unwrap();
 
         assert_eq!(
             peer_id_from_client,
             NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("http-node-b")).node_id
         );
         assert_eq!(peer_id_from_server, id_a.node_id);
+        // Both sides should see each other's User-Agent as rxrpl/<version>.
+        assert!(matches!(client_seen_software, PeerSoftware::Rxrpl(_)));
+        assert!(matches!(server_seen_software, PeerSoftware::Rxrpl(_)));
     }
 
     #[tokio::test]
