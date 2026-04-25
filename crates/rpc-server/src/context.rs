@@ -61,6 +61,11 @@ pub struct ServerContext {
     pub reporting_mode: bool,
     /// URL to forward write requests to when in reporting mode.
     pub forward_url: Option<String>,
+    /// Live status snapshot of the UNL fetcher, populated by the overlay
+    /// layer when `validator_list_sites` are configured. Read by the
+    /// `validator_list_sites` RPC method.
+    pub validator_list_status:
+        Option<Arc<RwLock<serde_json::Value>>>,
     event_tx: broadcast::Sender<ServerEvent>,
 }
 
@@ -83,6 +88,7 @@ impl ServerContext {
             ledger_store: None,
             reporting_mode: false,
             forward_url: None,
+            validator_list_status: None,
             event_tx,
         })
     }
@@ -116,6 +122,7 @@ impl ServerContext {
             ledger_store: None,
             reporting_mode: false,
             forward_url: None,
+            validator_list_status: None,
             event_tx,
         })
     }
@@ -150,6 +157,7 @@ impl ServerContext {
             ledger_store: None,
             reporting_mode: false,
             forward_url: None,
+            validator_list_status: None,
             event_tx,
         })
     }
@@ -184,6 +192,7 @@ impl ServerContext {
             ledger_store: None,
             reporting_mode: false,
             forward_url: None,
+            validator_list_status: None,
             event_tx,
         })
     }
@@ -211,8 +220,21 @@ impl ServerContext {
             ledger_store: Some(ledger_store),
             reporting_mode: true,
             forward_url: Some(forward_url),
+            validator_list_status: None,
             event_tx,
         })
+    }
+
+    /// Attach a UNL status handle. Must be called *before* the context is
+    /// shared with other tasks (i.e. while the strong count is 1), otherwise
+    /// the call is a silent no-op.
+    pub fn attach_validator_list_status(
+        self: &mut Arc<Self>,
+        handle: Arc<RwLock<serde_json::Value>>,
+    ) {
+        if let Some(ctx) = Arc::get_mut(self) {
+            ctx.validator_list_status = Some(handle);
+        }
     }
 
     /// Get a reference to the event broadcast sender.

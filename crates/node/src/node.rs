@@ -14,7 +14,7 @@ use rxrpl_consensus::{
 use rxrpl_ledger::Ledger;
 use rxrpl_overlay::{
     ConsensusMessage, LedgerProvider, NetworkConsensusAdapter, NodeIdentity, OverlayCommand,
-    PeerManager, PeerManagerConfig,
+    PeerManager, PeerManagerConfig, VlFetcher, new_trusted_keys,
 };
 use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
@@ -664,8 +664,79 @@ impl Node {
             }
         });
 
+        // 6c. Optional UNL fetcher. When `validators.validator_list_sites`
+        // is non-empty and at least one publisher key is configured, spawn
+        // a background task that periodically fetches and verifies the
+        // signed validator list, publishing the trusted master-key set
+        // into a shared handle consumed by `ValidationAggregator`.
+        let trusted_validators = new_trusted_keys();
+        let vl_status: Arc<RwLock<serde_json::Value>> =
+            Arc::new(RwLock::new(serde_json::Value::Array(Vec::new())));
+        let vl_sites = self.config.validators.validator_list_sites.clone();
+        let vl_publisher_keys: Vec<rxrpl_primitives::PublicKey> = self
+            .config
+            .validators
+            .validator_list_keys
+            .iter()
+            .filter_map(|hex_key| {
+                hex::decode(hex_key)
+                    .ok()
+                    .and_then(|b| rxrpl_primitives::PublicKey::from_slice(&b).ok())
+            })
+            .collect();
+        if !vl_sites.is_empty() && !vl_publisher_keys.is_empty() {
+            let trusted_clone = Arc::clone(&trusted_validators);
+            let status_clone = Arc::clone(&vl_status);
+            let sites_for_fetcher = vl_sites.clone();
+            let keys_for_fetcher = vl_publisher_keys.clone();
+            let fetcher_status_handle: rxrpl_overlay::StatusHandle =
+                Arc::new(RwLock::new(Vec::new()));
+            let fetcher_status_for_publish = Arc::clone(&fetcher_status_handle);
+            tokio::spawn(async move {
+                let fetcher = match VlFetcher::new(
+                    sites_for_fetcher,
+                    keys_for_fetcher,
+                    trusted_clone,
+                    fetcher_status_handle,
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!("failed to start VL fetcher: {}", e);
+                        return;
+                    }
+                };
+                // Bridge the typed status snapshot into the JSON value the
+                // RPC handler reads from `ctx.validator_list_status`.
+                let publish_handle = Arc::clone(&fetcher_status_for_publish);
+                let publish_target = Arc::clone(&status_clone);
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(Duration::from_secs(15));
+                    loop {
+                        tick.tick().await;
+                        let snapshot = publish_handle.read().await.clone();
+                        let json = serde_json::Value::Array(
+                            snapshot
+                                .into_iter()
+                                .map(|s| {
+                                    serde_json::json!({
+                                        "site": s.site,
+                                        "last_fetch_unix": s.last_fetch_unix,
+                                        "last_sequence": s.last_sequence,
+                                        "last_validator_count": s.last_validator_count,
+                                        "last_error": s.last_error,
+                                    })
+                                })
+                                .collect(),
+                        );
+                        *publish_target.write().await = json;
+                    }
+                });
+                fetcher.run().await;
+            });
+        }
+
         // 7. Start RPC server
-        let ctx = ServerContext::with_node_state_and_pruner(
+        let mut ctx = ServerContext::with_node_state_and_pruner(
             self.config.server.clone(),
             Arc::clone(&self.ledger),
             Arc::clone(&self.closed_ledgers),
@@ -676,6 +747,7 @@ impl Node {
             Some(relay_tx),
             self.pruner.shared_state(),
         );
+        ctx.attach_validator_list_status(Arc::clone(&vl_status));
         let event_tx = ctx.event_sender().clone();
 
         // Clone ctx for gRPC before moving into RPC router
@@ -825,6 +897,14 @@ impl Node {
         let ledger_seq_shared = Arc::clone(&ledger_seq);
         let ledger_hash_shared = Arc::clone(&ledger_hash);
         let configured_quorum = self.config.validators.quorum;
+        let trusted_validators_for_aggregator = if self.config.validators.require_trusted_validators
+            && !self.config.validators.validator_list_sites.is_empty()
+            && !vl_publisher_keys.is_empty()
+        {
+            Some(Arc::clone(&trusted_validators))
+        } else {
+            None
+        };
 
         tokio::spawn(async move {
             let node_id = NodeId(identity.node_id);
@@ -839,7 +919,12 @@ impl Node {
             // Track validations from network peers to determine validated ledgers.
             // Default quorum of 28 (~80% of typical 35-validator UNL).
             let initial_quorum = configured_quorum.unwrap_or(28);
-            let mut val_aggregator = rxrpl_overlay::validation_aggregator::ValidationAggregator::new(initial_quorum);
+            let mut val_aggregator =
+                rxrpl_overlay::validation_aggregator::ValidationAggregator::new(initial_quorum);
+            if let Some(ref trusted) = trusted_validators_for_aggregator {
+                val_aggregator = val_aggregator.with_trusted_keys(Arc::clone(trusted));
+                tracing::info!("validation aggregator: trust filter enabled (UNL-bound)");
+            }
             tracing::info!("validation quorum initialized to {}", initial_quorum);
 
             // Collect amendment votes from received validations for the current round.

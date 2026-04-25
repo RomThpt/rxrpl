@@ -252,6 +252,16 @@ pub struct ValidatorConfig {
     /// Validation quorum override. None = auto-compute from validator list size.
     #[serde(default)]
     pub quorum: Option<usize>,
+    /// When true, the validation aggregator only counts validations whose
+    /// signing key is in the trusted UNL. Default: true (mainnet behavior).
+    /// Tests / isolated multi-node sims should set this to false because they
+    /// run with no UNL configured.
+    #[serde(default = "default_require_trusted")]
+    pub require_trusted_validators: bool,
+}
+
+fn default_require_trusted() -> bool {
+    true
 }
 
 impl Default for ValidatorConfig {
@@ -262,6 +272,7 @@ impl Default for ValidatorConfig {
             validator_list_sites: Vec::new(),
             validator_list_keys: Vec::new(),
             quorum: None,
+            require_trusted_validators: default_require_trusted(),
         }
     }
 }
