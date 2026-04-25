@@ -932,6 +932,28 @@ impl PeerManager {
                                     );
                                     if !missing.is_empty() {
                                         self.send_get_ledger_as_node(header.sequence);
+                                    } else {
+                                        // The state map is already fully resolvable from
+                                        // the local store (e.g. early ledgers whose state
+                                        // matches genesis). Complete the sync immediately
+                                        // and dispatch the leaves to the consensus layer.
+                                        if let Some(leaves) = self
+                                            .ledger_syncer
+                                            .try_complete_sync(header.sequence)
+                                        {
+                                            tracing::info!(
+                                                "incremental sync immediate-complete for ledger #{} ({} leaves)",
+                                                header.sequence, leaves.len()
+                                            );
+                                            self.ledger_syncer.mark_synced(header.sequence);
+                                            let _ = self.consensus_tx.send(
+                                                ConsensusMessage::LedgerData {
+                                                    hash: header.hash,
+                                                    seq: header.sequence,
+                                                    nodes: leaves,
+                                                },
+                                            );
+                                        }
                                     }
                                 }
 

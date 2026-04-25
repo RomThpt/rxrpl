@@ -432,6 +432,30 @@ impl LedgerSyncer {
         }
     }
 
+    /// Attempt to complete an incremental sync immediately (no nodes pending).
+    ///
+    /// Returns Some(leaves) if the syncing SHAMap is complete (all referenced
+    /// nodes resolvable from the backing store). Used when start_incremental_sync
+    /// returns no missing nodes — the late joiner already has every required
+    /// node in its store (e.g. for early ledgers whose state matches genesis).
+    pub fn try_complete_sync(&mut self, seq: u32) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        let entry = self.incremental.get_mut(&seq)?;
+        // Reload root from store in case it was added.
+        let _ = entry.map.reload_root(entry.hash);
+        if entry.map.is_empty() {
+            return None;
+        }
+        if !entry.map.is_complete() {
+            return None;
+        }
+        let entry = self.incremental.remove(&seq).unwrap();
+        let mut leaves = Vec::new();
+        entry.map.for_each(&mut |key, data| {
+            leaves.push((key.as_bytes().to_vec(), data.to_vec()));
+        });
+        Some(leaves)
+    }
+
     /// Get the missing node hashes for an active incremental sync, if any.
     ///
     /// Called by `send_get_ledger` to populate `node_ids` in the request.
