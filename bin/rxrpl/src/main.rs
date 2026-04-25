@@ -96,6 +96,16 @@ enum Commands {
         #[arg(long)]
         db_path: Option<PathBuf>,
 
+        /// Bootstrap from a checkpoint instead of replaying from genesis.
+        /// Accepts:
+        ///   - a sequence number (decimal, e.g. `90000000`)
+        ///   - a 64-char hex ledger hash
+        ///   - the literal `recent` to anchor at "tip - 1024"
+        /// Requires `validator_list_sites` + `validator_list_keys` to
+        /// establish a UNL-quorum trust anchor for the chosen ledger.
+        #[arg(long)]
+        starting_ledger: Option<String>,
+
         /// Shorthand for --mode standalone
         #[arg(long, conflicts_with = "network")]
         standalone: bool,
@@ -335,10 +345,28 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             bind,
             sync_rpc,
             db_path,
+            starting_ledger,
             standalone,
             network,
             reporting,
         } => {
+            // Validate (without resolving — actual lookup happens on the
+            // running node once the UNL has produced a trust anchor).
+            if let Some(ref s) = starting_ledger {
+                let trimmed = s.trim();
+                let kind = match trimmed {
+                    "recent" => "recent",
+                    h if h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()) => "hash",
+                    n if n.parse::<u32>().is_ok() => "seq",
+                    _ => {
+                        eprintln!(
+                            "Error: --starting-ledger must be `recent`, a 64-char hex hash, or a u32 sequence."
+                        );
+                        std::process::exit(2);
+                    }
+                };
+                tracing::info!("checkpoint bootstrap requested ({kind}={trimmed})");
+            }
             let mut config = if let Some(ref config_path) = cli.config {
                 rxrpl_config::load_config(config_path)?
             } else {
