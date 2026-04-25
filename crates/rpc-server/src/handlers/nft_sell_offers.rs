@@ -33,12 +33,21 @@ pub async fn nft_sell_offers(
         .min(500) as usize;
 
     // We don't yet maintain per-NFT sell/buy offer directories; scan the
-    // entire state map for `NFTokenOffer` entries matching this NFT id and
-    // the sell flag. Acceptable for tests; revisit if we ever serve large
-    // open ledgers (rippled keeps two extra DirectoryNode trees per NFT).
+    // state map for `NFTokenOffer` entries matching this NFT id with the
+    // sell flag. Cap the number of *visited* entries (not just matched) so
+    // a query for an NFT with no offers cannot walk every state entry on
+    // mainnet (audit finding H2, sibling of nft_buy_offers).
+    const MAX_SCANNED_ENTRIES: usize = 50_000;
     let mut offers = Vec::new();
+    let mut scanned = 0usize;
+    let mut truncated = false;
     for (idx, raw) in ledger.state_map.iter_ref() {
         if offers.len() >= limit {
+            break;
+        }
+        scanned += 1;
+        if scanned > MAX_SCANNED_ENTRIES {
+            truncated = true;
             break;
         }
         let entry: Value = match crate::handlers::common::decode_state_value(raw) {
@@ -59,6 +68,12 @@ pub async fn nft_sell_offers(
         obj.entry("nft_offer_index".to_string())
             .or_insert_with(|| Value::String(idx.to_string()));
         offers.push(Value::Object(obj));
+    }
+    if truncated {
+        tracing::warn!(
+            "nft_sell_offers scan truncated at {} entries for nft_id={}",
+            MAX_SCANNED_ENTRIES, nft_id_str
+        );
     }
 
     if offers.is_empty() {

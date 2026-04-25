@@ -119,6 +119,12 @@ impl ConnectionSubscriptions {
 
     /// Apply a `subscribe` command. Returns the response value.
     pub fn apply_subscribe(&mut self, params: &Value) -> Result<Value, RpcServerError> {
+        // Per-connection subscription caps. Bound the size of each subscription
+        // set so a single client cannot make us fan out to thousands of
+        // accounts per ledger close (audit finding M6).
+        const MAX_ACCOUNTS_PER_CONN: usize = 1000;
+        const MAX_ORDER_BOOKS_PER_CONN: usize = 200;
+
         if let Some(streams) = params.get("streams").and_then(|v| v.as_array()) {
             for s in streams {
                 if let Some(name) = s.as_str() {
@@ -135,6 +141,11 @@ impl ConnectionSubscriptions {
 
         if let Some(accounts) = params.get("accounts").and_then(|v| v.as_array()) {
             for a in accounts {
+                if self.accounts.len() >= MAX_ACCOUNTS_PER_CONN {
+                    return Err(RpcServerError::InvalidParams(format!(
+                        "accounts subscription cap ({MAX_ACCOUNTS_PER_CONN}) reached"
+                    )));
+                }
                 if let Some(addr) = a.as_str() {
                     let id = parse_account(addr)?;
                     self.accounts.insert(id);
@@ -144,6 +155,11 @@ impl ConnectionSubscriptions {
 
         if let Some(accounts) = params.get("accounts_proposed").and_then(|v| v.as_array()) {
             for a in accounts {
+                if self.accounts_proposed.len() >= MAX_ACCOUNTS_PER_CONN {
+                    return Err(RpcServerError::InvalidParams(format!(
+                        "accounts_proposed subscription cap ({MAX_ACCOUNTS_PER_CONN}) reached"
+                    )));
+                }
                 if let Some(addr) = a.as_str() {
                     let id = parse_account(addr)?;
                     self.accounts_proposed.insert(id);
@@ -152,6 +168,11 @@ impl ConnectionSubscriptions {
         }
 
         if let Some(books) = params.get("books").and_then(|v| v.as_array()) {
+            if self.order_books.len() + books.len() > MAX_ORDER_BOOKS_PER_CONN {
+                return Err(RpcServerError::InvalidParams(format!(
+                    "order_books subscription cap ({MAX_ORDER_BOOKS_PER_CONN}) reached"
+                )));
+            }
             for book in books {
                 let taker_pays = book.get("taker_pays").cloned().unwrap_or(Value::Null);
                 let taker_gets = book.get("taker_gets").cloned().unwrap_or(Value::Null);
