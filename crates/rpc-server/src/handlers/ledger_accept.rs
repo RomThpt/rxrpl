@@ -55,6 +55,15 @@ pub async fn ledger_accept(
     let closed_copy = ledger.clone();
     let new_open = Ledger::new_open(&closed_copy);
 
+    // Snapshot the set of confirmed tx hashes from the just-closed ledger
+    // before we move it into the history; used below to purge confirmed
+    // entries from the retry queue.
+    let confirmed_hashes: std::collections::HashSet<rxrpl_primitives::Hash256> = closed_copy
+        .tx_map
+        .iter_ref()
+        .map(|(hash, _)| *hash)
+        .collect();
+
     {
         let mut closed_ledgers = closed_lock.write().await;
         closed_ledgers.push_back(closed_copy);
@@ -80,8 +89,11 @@ pub async fn ledger_accept(
     {
         let pending = {
             let mut q = tq.write().await;
-            // First remove confirmed txs (already in closed ledger's tx_map)
-            // and expired entries, then drain the rest for retry.
+            // Drop transactions that are already confirmed in the just-closed
+            // ledger's tx_map, plus anything past its LastLedgerSequence. The
+            // remaining queue entries (preflight-passed but not yet applied)
+            // are drained for retry against the new open ledger.
+            q.remove_if(|hash| confirmed_hashes.contains(hash));
             q.remove_expired(new_seq);
             q.drain_for_retry_ordered()
         };
