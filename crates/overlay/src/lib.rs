@@ -30,6 +30,7 @@ pub mod tls;
 pub mod tx_batch_relay;
 pub mod validation_aggregator;
 pub mod validator_list;
+pub mod vl_fetcher;
 
 pub use cluster::ClusterManager;
 pub use command::OverlayCommand;
@@ -48,3 +49,4 @@ pub use relay::RelayFilter;
 pub use reputation::PeerReputation;
 pub use shard_sync::ShardSyncer;
 pub use validator_list::ValidatorListTracker;
+pub use vl_fetcher::{SiteStatus, StatusHandle, TrustedKeys, VlFetcher, new_trusted_keys};

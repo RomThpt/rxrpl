@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 
 use rxrpl_consensus::types::Validation;
-use rxrpl_primitives::Hash256;
+use rxrpl_primitives::{Hash256, PublicKey};
+
+use crate::vl_fetcher::TrustedKeys;
 
 /// Result when a ledger achieves validation quorum.
 #[derive(Debug, Clone)]
@@ -28,6 +30,10 @@ pub struct ValidationAggregator {
     pub highest_validated_seq: u32,
     /// Hash of the highest validated ledger.
     pub highest_validated_hash: Hash256,
+    /// Optional trust filter. When `Some`, validations whose `public_key`
+    /// is not in the set are silently dropped. When `None`, every full
+    /// validation is counted (legacy / test behavior).
+    trusted: Option<TrustedKeys>,
 }
 
 impl ValidationAggregator {
@@ -38,12 +44,39 @@ impl ValidationAggregator {
             min_validations: min_validations.max(1),
             highest_validated_seq: 0,
             highest_validated_hash: Hash256::ZERO,
+            trusted: None,
         }
+    }
+
+    /// Attach a [`TrustedKeys`] handle so that incoming validations are
+    /// filtered against the UNL before counting. The handle can be updated
+    /// concurrently by [`crate::vl_fetcher::VlFetcher`].
+    pub fn with_trusted_keys(mut self, trusted: TrustedKeys) -> Self {
+        self.trusted = Some(trusted);
+        self
     }
 
     /// Update the quorum threshold dynamically (e.g. from validator list).
     pub fn update_quorum(&mut self, new_quorum: usize) {
         self.min_validations = new_quorum.max(1);
+    }
+
+    /// Internal: check whether `public_key` is in the trusted set, if any.
+    /// When no trusted set is configured, every key is considered trusted.
+    fn is_trusted(&self, public_key: &[u8]) -> bool {
+        let Some(ref trusted) = self.trusted else {
+            return true;
+        };
+        let Ok(pk) = PublicKey::from_slice(public_key) else {
+            return false;
+        };
+        // try_read avoids a blocking call from the consensus loop. If the
+        // VL fetcher is currently swapping the set we briefly behave as if
+        // the key is untrusted, which is the safe default during a refresh.
+        match trusted.try_read() {
+            Ok(guard) => guard.contains(&pk),
+            Err(_) => false,
+        }
     }
 
     /// Add a validation and check if quorum is reached.
@@ -61,6 +94,11 @@ impl ValidationAggregator {
 
         // Only process full validations
         if !validation.full {
+            return None;
+        }
+
+        // Trust filter: ignore validations from validators not in the UNL.
+        if !self.is_trusted(&validation.public_key) {
             return None;
         }
 
@@ -241,5 +279,30 @@ mod tests {
         let mut val = make_validation(1, 5, Hash256::new([0xDD; 32]));
         val.full = false;
         assert!(agg.add_validation(val).is_none());
+    }
+
+    #[tokio::test]
+    async fn untrusted_validation_dropped() {
+        use crate::vl_fetcher::new_trusted_keys;
+        use rxrpl_primitives::PublicKey;
+
+        let trusted = new_trusted_keys();
+        // Trust only one specific key.
+        let trusted_key_bytes = [0xED; 33];
+        let trusted_pk = PublicKey::from_slice(&trusted_key_bytes).unwrap();
+        trusted.write().await.insert(trusted_pk);
+
+        let mut agg = ValidationAggregator::new(1).with_trusted_keys(trusted);
+
+        // A validation signed by an untrusted key is silently dropped.
+        let mut val = make_validation(1, 5, Hash256::new([0xAA; 32]));
+        val.public_key = vec![0xED; 33];
+        val.public_key[1] = 0xFF; // diverges from the trusted key
+        assert!(agg.add_validation(val).is_none());
+
+        // A validation signed by the trusted key is accepted.
+        let mut val = make_validation(2, 5, Hash256::new([0xAA; 32]));
+        val.public_key = trusted_key_bytes.to_vec();
+        assert!(agg.add_validation(val).is_some());
     }
 }
