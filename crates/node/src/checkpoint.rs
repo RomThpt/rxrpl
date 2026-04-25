@@ -15,9 +15,46 @@
 //! `crates/node/src/node.rs`).
 
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use rxrpl_consensus::types::Validation;
 use rxrpl_primitives::{Hash256, PublicKey};
+
+/// User-facing starting-ledger selector parsed from `--starting-ledger`.
+///
+/// `Recent` means "anchor at the tip of what peers report, less a small
+/// safety margin"; `Seq` means "anchor at this exact sequence"; `Hash`
+/// means "trust this exact ledger hash" (advanced; bypasses the
+/// UNL-quorum cross-check on the seq side, since we can't know the seq
+/// until we fetch the header).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartingLedger {
+    Recent,
+    Seq(u32),
+    Hash(Hash256),
+}
+
+impl StartingLedger {
+    /// Parse the CLI string. Accepts `recent`, a u32 (decimal), or a
+    /// 64-character hex hash.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let trimmed = s.trim();
+        if trimmed.eq_ignore_ascii_case("recent") {
+            return Ok(StartingLedger::Recent);
+        }
+        if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Hash256::from_str(trimmed)
+                .map(StartingLedger::Hash)
+                .map_err(|e| format!("bad hex hash: {e}"));
+        }
+        if let Ok(seq) = trimmed.parse::<u32>() {
+            return Ok(StartingLedger::Seq(seq));
+        }
+        Err(format!(
+            "{trimmed:?} is not `recent`, a u32 sequence, or a 64-char hex hash"
+        ))
+    }
+}
 
 /// Configuration for [`CheckpointAnchor`].
 #[derive(Clone, Debug)]
@@ -106,6 +143,20 @@ mod tests {
     use super::*;
     use rxrpl_consensus::types::NodeId;
 
+    #[test]
+    fn starting_ledger_parses() {
+        assert_eq!(StartingLedger::parse("recent"), Ok(StartingLedger::Recent));
+        assert_eq!(StartingLedger::parse("RECENT"), Ok(StartingLedger::Recent));
+        assert_eq!(StartingLedger::parse("12345"), Ok(StartingLedger::Seq(12345)));
+        let h = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
+        match StartingLedger::parse(h).unwrap() {
+            StartingLedger::Hash(_) => {}
+            other => panic!("expected Hash, got {other:?}"),
+        }
+        assert!(StartingLedger::parse("garbage").is_err());
+        assert!(StartingLedger::parse("123abc").is_err());
+    }
+
     fn val(node_byte: u8, seq: u32, hash: Hash256, pk_byte: u8) -> Validation {
         Validation {
             node_id: NodeId(Hash256::new([node_byte; 32])),
@@ -175,6 +226,24 @@ mod tests {
         let mut v = val(1, 100, Hash256::new([0xCC; 32]), 1);
         v.full = false;
         assert!(anchor.add(&v).is_none());
+    }
+
+    #[test]
+    fn anchor_replays_post_resolution_for_matching_hash() {
+        let mut anchor = CheckpointAnchor::new(AnchorConfig {
+            target_seq: 50,
+            quorum: 2,
+        });
+        let h = Hash256::new([0x42; 32]);
+        assert!(anchor.add(&val(1, 50, h, 1)).is_none());
+        assert_eq!(anchor.add(&val(2, 50, h, 2)), Some(h));
+        // Late validations matching the resolved hash still report it
+        // (callers can use this to forward those signatures to the regular
+        // aggregator without re-running their own bookkeeping).
+        assert_eq!(anchor.add(&val(3, 50, h, 3)), Some(h));
+        // A divergent validation post-resolution returns None.
+        let other = Hash256::new([0x77; 32]);
+        assert_eq!(anchor.add(&val(4, 50, other, 4)), None);
     }
 
     #[test]

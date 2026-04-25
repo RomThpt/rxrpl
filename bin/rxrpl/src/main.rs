@@ -352,20 +352,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             // Validate (without resolving — actual lookup happens on the
             // running node once the UNL has produced a trust anchor).
-            if let Some(ref s) = starting_ledger {
-                let trimmed = s.trim();
-                let kind = match trimmed {
-                    "recent" => "recent",
-                    h if h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()) => "hash",
-                    n if n.parse::<u32>().is_ok() => "seq",
-                    _ => {
-                        eprintln!(
-                            "Error: --starting-ledger must be `recent`, a 64-char hex hash, or a u32 sequence."
-                        );
-                        std::process::exit(2);
-                    }
-                };
-                tracing::info!("checkpoint bootstrap requested ({kind}={trimmed})");
+            let parsed_starting = starting_ledger
+                .as_deref()
+                .map(rxrpl_node::StartingLedger::parse)
+                .transpose()
+                .map_err(|e| {
+                    eprintln!("Error: --starting-ledger: {e}");
+                    std::process::exit(2)
+                })
+                .unwrap();
+            if let Some(s) = parsed_starting {
+                tracing::info!("checkpoint bootstrap requested: {:?}", s);
             }
             let mut config = if let Some(ref config_path) = cli.config {
                 rxrpl_config::load_config(config_path)?
@@ -409,6 +406,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         &genesis_account,
                         close_interval,
                         sync_rpc.as_deref(),
+                        parsed_starting,
                     )
                     .await;
                 }
@@ -696,6 +694,7 @@ async fn cmd_network_run(
     genesis_account: &str,
     close_interval: u64,
     sync_rpc_url: Option<&str>,
+    starting_ledger: Option<rxrpl_node::StartingLedger>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let node = rxrpl_node::Node::new_standalone(config, genesis_account)?;
 
@@ -706,8 +705,12 @@ async fn cmd_network_run(
         Some(url) => eprintln!("  Sync RPC: {url}"),
         None => eprintln!("  Sync RPC: <none — discover via P2P>"),
     }
+    if let Some(s) = starting_ledger {
+        eprintln!("  Starting ledger: {s:?}");
+    }
 
-    node.run_networked(close_interval, sync_rpc_url).await?;
+    node.run_networked(close_interval, sync_rpc_url, starting_ledger)
+        .await?;
     Ok(())
 }
 
