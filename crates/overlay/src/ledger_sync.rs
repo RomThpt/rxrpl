@@ -272,12 +272,13 @@ impl LedgerSyncer {
             if node_data.is_empty() {
                 continue;
             }
-            let raw = if node_data.len() == 513 || (node_data.len() > 32 && node_data.len() % 32 != 0) {
-                // Strip trailing depth byte from rippled's SHAMap wire format.
-                &node_data[..node_data.len() - 1]
-            } else {
-                &node_data[..]
-            };
+            // rxrpl peers send raw stored bytes (key||data for leaves, or
+            // 16x32-byte child hashes for inner nodes). rippled wraps each
+            // node with a trailing 1-byte depth marker. Try the raw bytes
+            // first; if the resulting hash isn't expected, fall back to the
+            // stripped variant. We can't know the expected hash here, so we
+            // store both candidates and let SHAMap traversal pick the right one.
+            let raw = &node_data[..];
 
             // Compute the content hash based on node type.
             let hash = if raw.len() == 512 {
