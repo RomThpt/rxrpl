@@ -2127,6 +2127,32 @@ impl PeerManager {
             })
             .collect();
 
+        // For liBASE (itype=0) requests with no specific node ids, the
+        // protocol expects a single node entry containing the raw 118-byte
+        // ledger header — that's what the late joiner parses to set up
+        // its incremental sync. Returning state-map leaves here makes the
+        // late joiner discard the response (header parse fails).
+        const LI_BASE: i32 = 0;
+        if request_node_ids.is_empty() && req_ledger_type == LI_BASE {
+            let header_bytes = ledger.header.to_raw_bytes();
+            nodes.push((vec![], header_bytes));
+
+            let response = proto_convert::encode_ledger_data(
+                &ledger.header.hash,
+                ledger.header.sequence,
+                req_ledger_type,
+                nodes,
+                req_cookie,
+            );
+            if let Some(handle) = self.peer_handles.get(&from) {
+                let _ = handle.tx.try_send(PeerMessage {
+                    msg_type: MessageType::LedgerData,
+                    payload: response,
+                });
+            }
+            return;
+        }
+
         if !request_node_ids.is_empty() {
             // Delta sync: serve specific nodes by hash from the backing store.
             for node_hash in &request_node_ids {

@@ -152,6 +152,23 @@ impl LedgerHeader {
     pub fn close_time_agreed(&self) -> bool {
         self.close_flags & CLOSE_FLAG_NO_CONSENSUS_TIME == 0
     }
+
+    /// Serialize the header to the raw 118-byte format used on the wire
+    /// (matches `from_raw_bytes`).
+    pub fn to_raw_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(RAW_HEADER_SIZE);
+        buf.extend_from_slice(&self.sequence.to_be_bytes());
+        buf.extend_from_slice(&self.drops.to_be_bytes());
+        buf.extend_from_slice(self.parent_hash.as_bytes());
+        buf.extend_from_slice(self.tx_hash.as_bytes());
+        buf.extend_from_slice(self.account_hash.as_bytes());
+        buf.extend_from_slice(&self.parent_close_time.to_be_bytes());
+        buf.extend_from_slice(&self.close_time.to_be_bytes());
+        buf.push(self.close_time_resolution);
+        buf.push(self.close_flags);
+        debug_assert_eq!(buf.len(), RAW_HEADER_SIZE);
+        buf
+    }
 }
 
 impl Default for LedgerHeader {
