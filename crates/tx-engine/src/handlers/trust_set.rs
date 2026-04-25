@@ -4,6 +4,7 @@ use rxrpl_protocol::keylet;
 use serde_json::Value;
 
 use crate::helpers;
+use crate::owner_dir::add_to_owner_dir;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 /// TrustSet transaction handler.
@@ -154,6 +155,10 @@ impl Transactor for TrustSetTransactor {
             ctx.view
                 .insert(tl_key, bytes)
                 .map_err(|_| TransactionResult::TemMalformed)?;
+
+            // Link the new RippleState into the calling account's owner
+            // directory so account_lines / account_objects can find it.
+            add_to_owner_dir(ctx.view, &account_id, &tl_key)?;
 
             // Increment owner count for the account
             let acct_key = keylet::account(&account_id);
