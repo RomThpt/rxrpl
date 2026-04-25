@@ -1799,9 +1799,13 @@ impl PeerManager {
             return;
         }
 
+        // Send the content hash (32 bytes) of each missing node so the server
+        // can locate it via a direct store.fetch lookup. Sending NodeId (path
+        // + depth) would require the server to walk its SHAMap by path,
+        // which the current handle_get_ledger does not do.
         let node_ids: Vec<Vec<u8>> = missing
             .iter()
-            .map(|mn| mn.node_id.to_wire_bytes())
+            .map(|mn| mn.hash.as_bytes().to_vec())
             .collect();
 
         let num_ids = node_ids.len();
