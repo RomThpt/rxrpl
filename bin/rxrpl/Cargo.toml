@@ -9,6 +9,10 @@ license.workspace = true
 name = "rxrpl"
 path = "src/main.rs"
 
+[features]
+default = ["rocksdb"]
+rocksdb = ["rxrpl-node/rocksdb"]
+
 [dependencies]
 rxrpl = { workspace = true, features = ["full", "autofill"] }
 rxrpl-node = { workspace = true }
