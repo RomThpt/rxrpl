@@ -246,6 +246,28 @@ mod tests {
         assert_eq!(anchor.add(&val(4, 50, other, 4)), None);
     }
 
+    /// Documents the C1 invariant enforced in `node.rs::run_networked`:
+    /// callers MUST gate `anchor.add(...)` on `val_aggregator.is_trusted(...)`.
+    /// The anchor itself does NOT consult the UNL — it counts every distinct
+    /// signing key — so untrusted callers would otherwise resolve on Sybil.
+    /// This test pins the dangerous behavior: 28 fake keys all "agreeing"
+    /// resolve the anchor when fed in directly. The trust gate lives one
+    /// layer up.
+    #[test]
+    fn anchor_alone_is_sybil_vulnerable_callers_must_gate() {
+        let mut anchor = CheckpointAnchor::new(AnchorConfig {
+            target_seq: 100,
+            quorum: 28,
+        });
+        let h = Hash256::new([0x66; 32]);
+        for i in 0u8..28 {
+            let _ = anchor.add(&val(i, 100, h, i));
+        }
+        assert_eq!(anchor.resolved_hash(), Some(h),
+            "anchor on its own treats all distinct keys as quorum — \
+             callers (run_networked) MUST pre-filter via UNL trust");
+    }
+
     #[test]
     fn split_brain_does_not_resolve() {
         let mut anchor = CheckpointAnchor::new(AnchorConfig {
