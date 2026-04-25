@@ -15,7 +15,7 @@ use crate::tls::PeerStream;
 pub async fn run_peer_read_loop(
     node_id: Hash256,
     mut read: SplitStream<Framed<PeerStream, PeerCodec>>,
-    event_tx: mpsc::UnboundedSender<PeerEvent>,
+    event_tx: mpsc::Sender<PeerEvent>,
 ) {
     loop {
         match read.next().await {
@@ -29,18 +29,18 @@ pub async fn run_peer_read_loop(
                     msg_type: msg.msg_type,
                     payload: msg.payload,
                 };
-                if event_tx.send(event).is_err() {
+                if event_tx.send(event).await.is_err() {
                     break;
                 }
             }
             Some(Err(e)) => {
                 tracing::debug!("peer {} read error: {}", node_id, e);
-                let _ = event_tx.send(PeerEvent::Disconnected { node_id });
+                let _ = event_tx.send(PeerEvent::Disconnected { node_id }).await;
                 break;
             }
             None => {
                 tracing::debug!("peer {} connection closed", node_id);
-                let _ = event_tx.send(PeerEvent::Disconnected { node_id });
+                let _ = event_tx.send(PeerEvent::Disconnected { node_id }).await;
                 break;
             }
         }

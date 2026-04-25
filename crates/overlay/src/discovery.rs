@@ -73,7 +73,18 @@ impl PeerDiscovery {
 
     /// Process a received Peers response, connecting to new peers.
     pub async fn handle_peers_response(&self, peers: Vec<(String, u16)>) {
+        // Bound the number of fresh addresses any single TMEndpoints message
+        // can contribute, and the total set we remember. Without these, a
+        // malicious peer can advertise tens of thousands of fake addresses
+        // and force us into an unbounded HashSet (audit finding H7).
+        const MAX_KNOWN_PEERS: usize = 50_000;
+        const MAX_NEW_PER_RESPONSE: usize = 100;
+
+        let mut accepted = 0usize;
         for (ip, port) in peers {
+            if accepted >= MAX_NEW_PER_RESPONSE {
+                break;
+            }
             let addr = format!("{}:{}", ip, port);
             if self.peer_set.len() >= self.max_peers {
                 break;
@@ -82,8 +93,16 @@ impl PeerDiscovery {
             if known.contains(&addr) {
                 continue;
             }
+            if known.len() >= MAX_KNOWN_PEERS {
+                tracing::debug!(
+                    "known_peers cap reached ({}); ignoring further announcements",
+                    MAX_KNOWN_PEERS
+                );
+                break;
+            }
             known.insert(addr.clone());
             drop(known);
+            accepted += 1;
 
             tracing::debug!("discovered new peer: {}", addr);
             let _ = self.cmd_tx.send(OverlayCommand::ConnectTo { addr });
