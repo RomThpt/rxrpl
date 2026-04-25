@@ -48,7 +48,13 @@ pub async fn submit(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
         && params.get("secret").is_some()
         && params.get("tx_json").is_some()
     {
-        return Box::pin(super::sign_and_submit(params, ctx)).await;
+        let r = Box::pin(super::sign_and_submit(params, ctx)).await;
+        tracing::info!(
+            "DBG submit -> sign_and_submit returned: ok={} err={:?}",
+            r.is_ok(),
+            r.as_ref().err()
+        );
+        return r;
     }
 
     let tx_blob = params
