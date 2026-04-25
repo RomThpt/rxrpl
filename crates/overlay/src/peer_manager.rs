@@ -2069,22 +2069,22 @@ impl PeerManager {
             return;
         }
 
-        let ledger = match req_ledger_type {
-            x if x == LT_CLOSED || x == LT_VALIDATED => {
-                provider.latest_closed()
-            }
-            x if x == LT_HASH => {
-                if req_ledger_hash.len() >= 32 {
-                    let hash = Hash256::new(req_ledger_hash[..32].try_into().unwrap_or([0u8; 32]));
-                    provider.get_by_hash(&hash)
-                } else if req_ledger_seq > 0 {
-                    provider.get_by_seq(req_ledger_seq)
-                } else {
-                    None
-                }
-            }
-            _ => provider.latest_closed(),
+        // Resolve the requested ledger. The selectors are independent of the
+        // node-payload itype: a request that supplies a hash points to that
+        // ledger, otherwise a non-zero seq points to that seq, otherwise
+        // we fall back to the latest closed ledger.
+        let ledger = if req_ledger_hash.len() >= 32 {
+            let hash = Hash256::new(req_ledger_hash[..32].try_into().unwrap_or([0u8; 32]));
+            provider.get_by_hash(&hash)
+        } else if req_ledger_seq > 0 {
+            provider.get_by_seq(req_ledger_seq)
+        } else {
+            provider.latest_closed()
         };
+        // (req_ledger_type tells us *which* SHAMap to serve from — base /
+        // tx_node / as_node — handled below when we serialise the response.)
+        let _ = req_ledger_type;
+        let _ = (LT_CLOSED, LT_VALIDATED, LT_HASH);
 
         let ledger = match ledger {
             Some(l) => l,
