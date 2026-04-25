@@ -1193,10 +1193,16 @@ impl Node {
                                 }
                             }
                             ConsensusMessage::LedgerData { hash, seq, nodes } => {
-                                tracing::debug!(
+                                tracing::info!(
                                     "received LedgerData hash={} seq={} nodes={}",
                                     hash, seq, nodes.len()
                                 );
+                                if nodes.is_empty() {
+                                    tracing::warn!(
+                                        "LedgerData seq={} hash={} arrived empty",
+                                        seq, hash
+                                    );
+                                }
                                 if !nodes.is_empty() {
                                     match Node::try_reconstruct_ledger(seq, hash, &nodes, &node_store) {
                                         Ok(reconstructed) => {

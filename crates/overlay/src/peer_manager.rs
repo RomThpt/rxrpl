@@ -2032,10 +2032,18 @@ impl PeerManager {
         let req = match proto_convert::decode_get_ledger(payload) {
             Ok(r) => r,
             Err(e) => {
-                tracing::debug!("bad GetLedger from {}: {}", from, e);
+                tracing::warn!("bad GetLedger from {}: {}", from, e);
                 return;
             }
         };
+        tracing::info!(
+            "GetLedger from {} type={} seq={:?} hash_len={} node_ids={}",
+            from,
+            req.itype,
+            req.ledger_seq,
+            req.ledger_hash.as_ref().map(|h| h.len()).unwrap_or(0),
+            req.node_ids.len()
+        );
 
         let provider = match &self.ledger_provider {
             Some(p) => p,
