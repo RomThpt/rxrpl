@@ -13,7 +13,7 @@ use rxrpl_p2p_proto::codec::{PeerCodec, PeerMessage};
 use rxrpl_primitives::Hash256;
 use rxrpl_shamap::NodeId as ShamapNodeId;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, RwLock, mpsc};
+use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
 use tokio_util::codec::Framed;
 
 use crate::cluster::ClusterManager;
@@ -150,6 +150,11 @@ pub struct PeerManager {
     fixed_peer_node_ids: HashMap<Hash256, String>,
     /// Signalled on shutdown to cancel pending reconnection tasks.
     shutdown_notify: Arc<Notify>,
+    /// Caps the number of concurrent inbound TLS handshakes. Each
+    /// handshake spawns a task that performs CPU-heavy crypto; without
+    /// this bound a remote attacker could open thousands of half-open
+    /// TCP connections and saturate the runtime (audit finding H5).
+    inbound_handshake_permits: Arc<Semaphore>,
 }
 
 impl PeerManager {
@@ -210,6 +215,12 @@ impl PeerManager {
             fixed_peer_notifiers: HashMap::new(),
             fixed_peer_node_ids: HashMap::new(),
             shutdown_notify: Arc::new(Notify::new()),
+            // Allow up to 64 in-flight inbound handshakes. With OpenSSL ~5ms
+            // per handshake on commodity hardware that is ~12k handshakes/s,
+            // well above any honest peer rate. Saturated handshake slots
+            // simply cause new TCP connections to wait, which Linux's accept
+            // queue absorbs naturally.
+            inbound_handshake_permits: Arc::new(Semaphore::new(64)),
         };
 
         (mgr, cmd_tx, consensus_rx)
@@ -444,8 +455,16 @@ impl PeerManager {
         let event_tx = self.event_tx.clone();
         let peer_set = Arc::clone(&self.peer_set);
         let tls_server = self.config.tls_server.clone();
+        let permits = Arc::clone(&self.inbound_handshake_permits);
 
         tokio::spawn(async move {
+            // Hold a permit for the lifetime of the handshake. When the
+            // semaphore is saturated, new attempts wait here instead of
+            // burning CPU on TLS negotiation.
+            let _permit = match permits.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return, // semaphore closed -> shutdown
+            };
             if let Err(e) = try_accept_inbound(
                 stream,
                 &addr,

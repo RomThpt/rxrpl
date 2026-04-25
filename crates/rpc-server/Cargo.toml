@@ -34,6 +34,8 @@ reqwest = { workspace = true }
 futures-util = "0.3"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+dashmap = "6"
+once_cell = "1"
 
 [dev-dependencies]
 tokio = { workspace = true }
