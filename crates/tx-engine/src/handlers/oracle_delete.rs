@@ -2,6 +2,7 @@ use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
+use crate::owner_dir::remove_from_owner_dir;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct OracleDeleteTransactor;
@@ -46,6 +47,7 @@ impl Transactor for OracleDeleteTransactor {
 
         let doc_id = helpers::get_u32_field(ctx.tx, "OracleDocumentID").unwrap();
         let oracle_key = keylet::oracle(&account_id, doc_id);
+        remove_from_owner_dir(ctx.view, &account_id, &oracle_key)?;
         ctx.view
             .erase(&oracle_key)
             .map_err(|_| TransactionResult::TefInternal)?;

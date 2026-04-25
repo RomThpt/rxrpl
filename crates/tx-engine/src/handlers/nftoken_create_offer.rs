@@ -3,6 +3,7 @@ use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
 use crate::helpers;
+use crate::owner_dir::add_to_owner_dir;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 /// tfSellNFToken flag
@@ -88,6 +89,8 @@ impl Transactor for NFTokenCreateOfferTransactor {
         ctx.view
             .insert(offer_key, offer_data)
             .map_err(|_| TransactionResult::TefInternal)?;
+
+        add_to_owner_dir(ctx.view, &account_id, &offer_key)?;
 
         Ok(TransactionResult::TesSuccess)
     }

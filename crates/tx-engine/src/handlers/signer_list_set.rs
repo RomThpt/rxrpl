@@ -4,6 +4,7 @@ use rxrpl_protocol::keylet;
 use serde_json::Value;
 
 use crate::helpers;
+use crate::owner_dir::{add_to_owner_dir, remove_from_owner_dir};
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 /// SignerListSet transaction handler.
@@ -88,6 +89,7 @@ impl Transactor for SignerListSetTransactor {
             if !existing {
                 return Err(TransactionResult::TecNoEntry);
             }
+            remove_from_owner_dir(ctx.view, &account_id, &sl_key)?;
             ctx.view
                 .erase(&sl_key)
                 .map_err(|_| TransactionResult::TecNoEntry)?;
@@ -127,6 +129,7 @@ impl Transactor for SignerListSetTransactor {
                 ctx.view
                     .insert(sl_key, sl_bytes)
                     .map_err(|_| TransactionResult::TemMalformed)?;
+                add_to_owner_dir(ctx.view, &account_id, &sl_key)?;
             }
 
             // Update account
