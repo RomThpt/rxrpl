@@ -73,18 +73,71 @@ sync, but keep the proposal in a holding pen so it can be processed
 once sync completes) would unblock this — rxrpl currently discards
 the proposal and only triggers sync as a side-effect.
 
-## Suggested next PR scope
+## What landed in PR #32
 
-Fix `consensus::engine::peer_proposal` to:
-- Hold proposals whose `prev_ledger` we do not yet know rather than
-  rejecting them outright.
-- Replay the holding pen when catchup completes for a ledger that
-  matches a held proposal's `prev_ledger`.
-- Drop holding pen entries older than ~60 seconds to prevent
-  unbounded growth.
+Done. `consensus::engine::peer_proposal` now:
+- Holds proposals whose `prev_ledger` we do not yet know in a bounded
+  pen (`future_proposals`), keyed by their `prev_ledger` hash.
+- Replays held proposals into `pending_proposals` when `start_round`
+  moves us to a matching prev_ledger.
+- Evicts entries older than 5 ledger seqs, caps at 64 distinct keys
+  and 16 proposals per key with per-node dedup.
 
-This is a consensus/orchestration change, not a wire format change.
-It does not depend on the SHAMap PRs and could land independently.
+Plus a follow-up fix to `peer_proposal`: treat `proposal.ledger_seq
+== 0` as "unknown" and trust the prev_ledger equality. rippled's
+`TMProposeSet` wire format does not carry ledger_seq, so
+`proto_convert::decode_propose_set` always emits 0; the prior
+seq-mismatch guard rejected every cross-impl proposal.
+
+End-to-end measurement (xrpl-hive prop_v11.log with `--client
+rxrpl,rippled_2.3.0 --docker.nocache rxrpl`):
+
+```
+proposals received  : 23
+proposals held      : 20
+proposals replayed  : 4
+proposals accepted  : 3
+proposals broadcast : 8
+validations broadcast: 4
+ledgers closed locally: 4
+ledgers adopted via sync: 4
+```
+
+rxrpl now participates in consensus rounds with rippled. Held
+proposals get replayed cleanly after catchup. The cross-impl-payment
+test still fails for a *different* downstream reason described
+below.
+
+## Remaining gap: rippled silently drops rxrpl's TMValidation
+
+```
+rxrpl  : validations broadcast = 4
+rippled: validations received  = 0
+```
+
+Rippled never logs receipt of any validation from rxrpl, even though
+rxrpl serializes and writes them on the open peer connection. Both
+peers stay connected throughout the test. Likely causes (untested):
+
+1. TMValidation STObject encoding has a field rippled refuses to
+   deserialize (e.g. ordering, an extra optional field, missing
+   sfBaseFee, sfReserveBase, etc.).
+2. The validator's master signature is missing or computed over a
+   different signing payload than what rippled expects from a
+   manifest-less validator (no token, just a `[validation_seed]`).
+3. The relay path on rippled silently discards messages whose source
+   peer ID does not match the manifest-claimed key.
+
+Diagnostic next step: enable rippled's `Protocol:DBG` and
+`Validations:DBG` log levels in the hive client config, then look
+for `Invalid signature`, `dup validation`, `wrong signing key`, or
+`unknown validator`. If nothing logs, capture the raw bytes of the
+TMValidation frame leaving rxrpl and feed it into a rippled
+unit-test harness offline.
+
+This is the next concrete blocker after the 4 PRs in the SHAMap +
+consensus stack land. It is independent of any of them and would be
+its own follow-up PR.
 
 ## How to reproduce locally
 
