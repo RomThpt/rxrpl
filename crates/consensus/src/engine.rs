@@ -450,9 +450,14 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             return;
         }
 
-        // Reject proposals for a different ledger sequence
+        // Reject proposals for a different ledger sequence.
+        // Peers may transmit `ledger_seq = 0` when the wire encoding does
+        // not carry the field (rippled's TMProposeSet only includes
+        // `previousledger` and `propose_seq`; `ledger_seq` is inferred from
+        // the prev_ledger context). Treat 0 as "unknown" and trust the
+        // prev_ledger match we just verified above.
         if let Some(ref our) = self.our_position {
-            if proposal.ledger_seq != our.ledger_seq {
+            if proposal.ledger_seq != 0 && proposal.ledger_seq != our.ledger_seq {
                 tracing::debug!(
                     "rejected proposal: seq mismatch (ours={}, theirs={})",
                     our.ledger_seq, proposal.ledger_seq
