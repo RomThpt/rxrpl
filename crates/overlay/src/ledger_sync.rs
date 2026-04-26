@@ -21,6 +21,113 @@ pub struct SyncedLedgerData {
     pub nodes: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/// rippled `SHAMapTreeNode::wireType*` constants.
+/// See `include/xrpl/shamap/SHAMapTreeNode.h:17-21`.
+const WIRE_TYPE_TRANSACTION: u8 = 0;
+const WIRE_TYPE_ACCOUNT_STATE: u8 = 1;
+const WIRE_TYPE_INNER: u8 = 2;
+const WIRE_TYPE_COMPRESSED_INNER: u8 = 3;
+const WIRE_TYPE_TRANSACTION_WITH_META: u8 = 4;
+
+const HASH_PREFIX_INNER: [u8; 4] = [b'M', b'I', b'N', 0]; // HashPrefix::innerNode
+const HASH_PREFIX_LEAF: [u8; 4] = [b'M', b'L', b'N', 0]; // HashPrefix::leafNode (account state)
+const HASH_PREFIX_TX_NODE: [u8; 4] = [b'S', b'N', b'D', 0]; // HashPrefix::txNode (tx with meta)
+const HASH_PREFIX_TX_ID: [u8; 4] = [b'T', b'X', b'N', 0]; // HashPrefix::transactionID
+
+/// Decode a rippled-format SHAMap wire node into (content_hash, storage_bytes).
+///
+/// Wire layout (rippled `SHAMapTreeNode::makeFromWire`):
+/// - Inner full (wireType=2): `16 * 32 bytes child hashes || 0x02`
+/// - Inner compressed (wireType=3): `N * (hash[32] || branch[1]) || 0x03`
+/// - Leaf account state (wireType=1): `data || key[32] || 0x01`
+/// - Leaf tx with meta (wireType=4): `data || key[32] || 0x04`
+/// - Leaf tx no meta (wireType=0): `data || 0x00`
+///
+/// Storage format expected by `crates/shamap/src/node_store.rs::deserialize_node`:
+/// - Inner: `16 * 32 bytes` (no prefix, no trailing byte)
+/// - Leaf: `key[32] || data` (rxrpl always prepends the key)
+///
+/// Hash format (matches rippled `serializeWithPrefix`, post-PR #30):
+/// - Inner: `SHA512Half(HASH_PREFIX_INNER || 16*32 child hashes)`
+/// - Leaf account state: `SHA512Half(HASH_PREFIX_LEAF || data || key)`
+/// - Leaf tx with meta: `SHA512Half(HASH_PREFIX_TX_NODE || data || key)`
+/// - Leaf tx no meta: `SHA512Half(HASH_PREFIX_TX_ID || data)`
+fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
+    if node_data.len() < 2 {
+        return None;
+    }
+    let wire_type = node_data[node_data.len() - 1];
+    let payload = &node_data[..node_data.len() - 1];
+
+    match wire_type {
+        WIRE_TYPE_INNER => {
+            if payload.len() != 16 * 32 {
+                return None;
+            }
+            let hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, payload]);
+            Some((hash, payload.to_vec()))
+        }
+        WIRE_TYPE_COMPRESSED_INNER => {
+            // N * (hash[32] || branch[1])
+            if payload.is_empty() || payload.len() % 33 != 0 {
+                return None;
+            }
+            let mut full = vec![0u8; 16 * 32];
+            for chunk in payload.chunks_exact(33) {
+                let branch = chunk[32] as usize;
+                if branch >= 16 {
+                    return None;
+                }
+                full[branch * 32..(branch + 1) * 32].copy_from_slice(&chunk[..32]);
+            }
+            let hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &full]);
+            Some((hash, full))
+        }
+        WIRE_TYPE_ACCOUNT_STATE => {
+            // payload = data || key[32]
+            if payload.len() < 32 {
+                return None;
+            }
+            let split = payload.len() - 32;
+            let data = &payload[..split];
+            let key = &payload[split..];
+            let hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_LEAF, data, key]);
+            // Convert wire layout (data || key) to storage layout (key || data).
+            let mut storage = Vec::with_capacity(payload.len());
+            storage.extend_from_slice(key);
+            storage.extend_from_slice(data);
+            Some((hash, storage))
+        }
+        WIRE_TYPE_TRANSACTION_WITH_META => {
+            // payload = data || key[32]
+            if payload.len() < 32 {
+                return None;
+            }
+            let split = payload.len() - 32;
+            let data = &payload[..split];
+            let key = &payload[split..];
+            let hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_NODE, data, key]);
+            let mut storage = Vec::with_capacity(payload.len());
+            storage.extend_from_slice(key);
+            storage.extend_from_slice(data);
+            Some((hash, storage))
+        }
+        WIRE_TYPE_TRANSACTION => {
+            // payload = data only; key = SHA512Half(TXN || data) i.e. the tx hash
+            if payload.is_empty() {
+                return None;
+            }
+            let key = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_ID, payload]);
+            // For tx-no-meta, key IS the hash. Storage = key || data.
+            let mut storage = Vec::with_capacity(32 + payload.len());
+            storage.extend_from_slice(key.as_bytes());
+            storage.extend_from_slice(payload);
+            Some((key, storage))
+        }
+        _ => None,
+    }
+}
+
 /// Result of feeding nodes into an incremental sync.
 pub enum FeedResult {
     /// Sync is still in progress; continue with tree-based requests.
@@ -266,41 +373,22 @@ impl LedgerSyncer {
 
         let mut added = 0;
         for (_node_id, node_data) in nodes {
-            // TMLedgerNode wire format (rippled-compatible): serialized node
-            // bytes followed by a 1-byte depth marker. Strip it before
-            // computing the content hash that addresses the node in the store.
-            if node_data.len() < 2 {
-                continue;
-            }
-            let raw = &node_data[..node_data.len() - 1];
-
-            // Compute the content hash based on node type.
-            let hash = if raw.len() == 512 {
-                // Inner node: hash = SHA-512-Half("MIN\0" || raw)
-                let prefix: [u8; 4] = [0x4D, 0x49, 0x4E, 0x00]; // "MIN\0"
-                rxrpl_crypto::sha512_half::sha512_half(&[&prefix, raw])
-            } else if raw.len() >= 32 {
-                // Leaf node: hash = SHA-512-Half("MLN\0" || raw)
-                // Wire format is key(32) || data; hash covers both in that order.
-                let prefix: [u8; 4] = [0x4D, 0x4C, 0x4E, 0x00]; // "MLN\0"
-                rxrpl_crypto::sha512_half::sha512_half(&[&prefix, raw])
-            } else {
-                // Too small, skip.
+            let Some((hash, storage_bytes)) = decode_wire_node(node_data) else {
                 continue;
             };
 
             tracing::debug!(
-                "feed_nodes #{}: computed hash={} size={} bytes (depth-byte stripped from {})",
-                seq, hash, raw.len(), node_data.len()
+                "feed_nodes #{}: computed hash={} storage_size={} wire_size={}",
+                seq, hash, storage_bytes.len(), node_data.len()
             );
 
-            match entry.map.add_raw_node(hash, raw.to_vec()) {
+            match entry.map.add_raw_node(hash, storage_bytes) {
                 Ok(true) => added += 1,
                 Ok(false) => {}
                 Err(e) => {
                     tracing::debug!(
-                        "feed_nodes #{}: failed to add node {} ({} bytes): {}",
-                        seq, hash, raw.len(), e
+                        "feed_nodes #{}: failed to add node {}: {}",
+                        seq, hash, e
                     );
                 }
             }
@@ -459,6 +547,141 @@ impl Default for LedgerSyncer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_inner_full_round_trips_to_storage() {
+        // 16 distinct child hashes
+        let mut payload = Vec::with_capacity(16 * 32);
+        for i in 0..16u8 {
+            let mut h = [0u8; 32];
+            h[0] = i;
+            payload.extend_from_slice(&h);
+        }
+        let mut wire = payload.clone();
+        wire.push(WIRE_TYPE_INNER);
+
+        let (hash, storage) = decode_wire_node(&wire).expect("decode");
+        assert_eq!(storage.len(), 16 * 32);
+        assert_eq!(storage, payload);
+        let expected_hash =
+            rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &payload]);
+        assert_eq!(hash, expected_hash);
+    }
+
+    #[test]
+    fn decode_inner_compressed_expands_branches() {
+        // Two branches set: index 0 and index 5
+        let mut payload = Vec::new();
+        let mut h0 = [0u8; 32];
+        h0[0] = 0xAA;
+        payload.extend_from_slice(&h0);
+        payload.push(0); // branch
+        let mut h5 = [0u8; 32];
+        h5[0] = 0xBB;
+        payload.extend_from_slice(&h5);
+        payload.push(5); // branch
+        let mut wire = payload.clone();
+        wire.push(WIRE_TYPE_COMPRESSED_INNER);
+
+        let (hash, storage) = decode_wire_node(&wire).expect("decode");
+        assert_eq!(storage.len(), 16 * 32);
+        // branch 0 has h0
+        assert_eq!(&storage[0..32], &h0);
+        // branch 1..5 zero
+        assert!(storage[32..5 * 32].iter().all(|&b| b == 0));
+        // branch 5 has h5
+        assert_eq!(&storage[5 * 32..6 * 32], &h5);
+        // branch 6..16 zero
+        assert!(storage[6 * 32..].iter().all(|&b| b == 0));
+        let expected =
+            rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &storage]);
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn decode_account_state_reorders_data_and_key() {
+        let key = [0xAB; 32];
+        let data = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+        let mut wire = data.clone();
+        wire.extend_from_slice(&key);
+        wire.push(WIRE_TYPE_ACCOUNT_STATE);
+
+        let (hash, storage) = decode_wire_node(&wire).expect("decode");
+        // Storage layout = key || data
+        assert_eq!(&storage[..32], &key);
+        assert_eq!(&storage[32..], &data[..]);
+        // Hash uses rippled order (data || key)
+        let expected =
+            rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_LEAF, &data, &key]);
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn decode_tx_with_meta_uses_snd_prefix() {
+        let key = [0xCC; 32];
+        let data = vec![0x10, 0x20, 0x30];
+        let mut wire = data.clone();
+        wire.extend_from_slice(&key);
+        wire.push(WIRE_TYPE_TRANSACTION_WITH_META);
+
+        let (hash, storage) = decode_wire_node(&wire).expect("decode");
+        assert_eq!(&storage[..32], &key);
+        assert_eq!(&storage[32..], &data[..]);
+        let expected =
+            rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_NODE, &data, &key]);
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn decode_tx_no_meta_derives_key_from_data() {
+        let data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let mut wire = data.clone();
+        wire.push(WIRE_TYPE_TRANSACTION);
+
+        let (hash, storage) = decode_wire_node(&wire).expect("decode");
+        let expected_key =
+            rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_ID, &data]);
+        // Hash IS the tx hash
+        assert_eq!(hash, expected_key);
+        // Storage = key || data
+        assert_eq!(&storage[..32], expected_key.as_bytes());
+        assert_eq!(&storage[32..], &data[..]);
+    }
+
+    #[test]
+    fn decode_unknown_wire_type_returns_none() {
+        let wire = vec![0x00, 0x99]; // wireType 0x99 unknown
+        assert!(decode_wire_node(&wire).is_none());
+    }
+
+    #[test]
+    fn decode_too_short_returns_none() {
+        assert!(decode_wire_node(&[]).is_none());
+        assert!(decode_wire_node(&[0x01]).is_none());
+    }
+
+    #[test]
+    fn decode_inner_full_wrong_size_returns_none() {
+        let mut wire = vec![0u8; 100];
+        wire.push(WIRE_TYPE_INNER);
+        assert!(decode_wire_node(&wire).is_none());
+    }
+
+    #[test]
+    fn decode_inner_compressed_wrong_alignment_returns_none() {
+        // 50 bytes is not a multiple of 33
+        let mut wire = vec![0u8; 50];
+        wire.push(WIRE_TYPE_COMPRESSED_INNER);
+        assert!(decode_wire_node(&wire).is_none());
+    }
+
+    #[test]
+    fn decode_inner_compressed_invalid_branch_returns_none() {
+        let mut wire = vec![0u8; 32];
+        wire.push(99); // branch >= 16
+        wire.push(WIRE_TYPE_COMPRESSED_INNER);
+        assert!(decode_wire_node(&wire).is_none());
+    }
 
     #[test]
     fn needs_sync_when_behind() {
