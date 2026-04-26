@@ -135,6 +135,56 @@ for `Invalid signature`, `dup validation`, `wrong signing key`, or
 TMValidation frame leaving rxrpl and feed it into a rippled
 unit-test harness offline.
 
+### What the trace logs revealed (prop_v13)
+
+Re-ran with `--sim.loglevel 5` to put rippled at trace severity.
+Rippled log only grew to 348 lines for a 3-min sim, suggesting the
+`[rpc_startup] log_level` mechanism does not actually elevate the
+file-logger severity.
+
+The single useful artefact in the trace log:
+
+```
+Protocol:NFO [001] processLedgerRequest: Got request for 1 nodes at depth 2, return 4 nodes
+```
+
+repeated four times during the sim. This proves rxrpl's TMGetLedger
+messages **do** reach rippled and dispatch into `processLedgerRequest`
+correctly — so wire framing (4-byte BE size + 2-byte type + payload)
+and the protobuf decoding of TMGetLedger are not the problem.
+
+What is conspicuously absent: no `onMessage(TMValidation)` traces,
+no `Validation:` messages of any flavour, no exception-from-parse
+warnings. rxrpl broadcasts 4 validations, rippled records 0.
+
+Two remaining hypotheses for the next investigator:
+
+1. Rippled dispatches by `protocol::MessageType` enum; rxrpl emits
+   the right value (41 = mtVALIDATION, verified against
+   `xrpl.proto`). But `onReadMessage` may filter by maximum frame
+   size differently for validations than for GetLedger, or apply a
+   per-message-type rate limit that drops 100% in this scenario.
+
+2. rxrpl's outbound TMValidation has `Some(stobj)` where the inner
+   STObject has a field rippled's `STObject(SerialIter, ...)`
+   constructor refuses (e.g. unknown sf, wrong type tag, etc.). The
+   exception would normally hit the catch at `PeerImp.cpp:2346`
+   (warn level), but if the message is rate-limited *before* reaching
+   `onMessage(TMValidation)` then the warn never fires.
+
+Concrete next steps that would actually nail this:
+
+- Add an LLDB breakpoint on `PeerImp::onMessage(TMValidation)` in
+  the hive rippled container, or rebuild rippled with an extra
+  unconditional log line at the top of that method.
+- Or capture the raw 158-byte TMValidation frame from rxrpl with
+  tcpdump on the docker bridge and replay it through a rippled unit
+  test harness (`STValidation_test.cpp`) to see the exact parse
+  error.
+
+Out of scope for the current SHAMap+consensus PR stack — would be
+its own focused PR once root cause is known.
+
 This is the next concrete blocker after the 4 PRs in the SHAMap +
 consensus stack land. It is independent of any of them and would be
 its own follow-up PR.
