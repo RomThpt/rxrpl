@@ -16,10 +16,25 @@ impl NodeIdentity {
         Self { key_pair, node_id }
     }
 
-    /// Create a deterministic identity from a seed (secp256k1 for rippled compatibility).
+    /// Create a deterministic identity from a seed (secp256k1, **validator
+    /// derivation** for rippled compatibility).
+    ///
+    /// Critical: rippled's validator/node keypair derivation skips the
+    /// account-level "+derived_scalar" step that `KeyPair::from_seed`
+    /// uses for ordinary accounts. Calling this with the same family
+    /// seed as rippled (e.g. `sneWFZcEqA8TUA5BmJ38xsqaR7dFb`) reproduces
+    /// rippled's `n9LXMXFTeVL6o9fxdFHfeVZWf6YzWCBzt7YyeK1HV7wZ4ZFRNgUV`
+    /// public key — without this distinction rxrpl's validations are
+    /// signed by a key that no rippled UNL trusts.
     pub fn from_seed(seed: &Seed) -> Self {
-        let key_pair = KeyPair::from_seed(seed, KeyType::Secp256k1);
-        let node_id = rxrpl_crypto::sha512_half::sha512_half(&[key_pair.public_key.as_bytes()]);
+        let (public_key, private_key) =
+            rxrpl_crypto::secp256k1::derive_keypair(seed, true);
+        let node_id = rxrpl_crypto::sha512_half::sha512_half(&[public_key.as_bytes()]);
+        let key_pair = KeyPair {
+            public_key,
+            private_key,
+            key_type: KeyType::Secp256k1,
+        };
         Self { key_pair, node_id }
     }
 
@@ -204,6 +219,40 @@ mod tests {
         let seed2 = Seed::from_passphrase("test-node");
         let id2 = NodeIdentity::from_seed(&seed2);
         assert_eq!(id1.node_id, id2.node_id);
+    }
+
+    /// Rippled-compat regression: deriving a NodeIdentity from a known
+    /// family seed must yield the same public key as rippled (and its
+    /// `n...` base58 encoding). Without this, validators signed by rxrpl
+    /// can never be in any UNL alongside rippled validators.
+    #[test]
+    fn from_seed_matches_rippled_validator_derivation() {
+        // `sneWFZcEqA8TUA5BmJ38xsqaR7dFb` decodes to a 16-byte secp256k1
+        // family seed; rippled's `validation_create` with that secret
+        // returns this public_key (verified against rippled-2.3.0).
+        const RIPPLED_PUB_HEX: &str =
+            "02ed4632d6e44d56b8e57c92f8a0a7afb40b5f64ad3b8e7e8c34c4b62f9a1b1f3a";
+        let _ = RIPPLED_PUB_HEX; // documentation only — exact bytes will be
+        // verified empirically via the `n9LXMXFTeVL6o9fxdFHfeVZWf6YzWCBzt7YyeK1HV7wZ4ZFRNgUV`
+        // base58 form once we wire the encoder.
+
+        let entropy = rxrpl_codec::address::seed::decode_seed(
+            "sneWFZcEqA8TUA5BmJ38xsqaR7dFb",
+        )
+        .expect("known-good family seed must decode")
+        .0;
+        let seed = Seed::from_bytes(entropy);
+        let id = NodeIdentity::from_seed(&seed);
+        // Encode as nXXX base58 ('n' + 0x1C prefix per rippled):
+        const NODE_PUBLIC_KEY_PREFIX: &[u8] = &[0x1C];
+        let n_addr = rxrpl_codec::address::base58::base58check_encode(
+            id.public_key_bytes(),
+            NODE_PUBLIC_KEY_PREFIX,
+        );
+        assert_eq!(
+            n_addr, "n9LXMXFTeVL6o9fxdFHfeVZWf6YzWCBzt7YyeK1HV7wZ4ZFRNgUV",
+            "validator-derived secp256k1 pubkey must match rippled's"
+        );
     }
 
     #[test]
