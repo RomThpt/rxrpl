@@ -199,6 +199,7 @@ mod tests {
             sign_time: 100,
             signature: None,
             amendments: vec![],
+            signing_payload: None,
         }
     }
 

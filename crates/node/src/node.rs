@@ -877,11 +877,32 @@ impl Node {
         });
 
         // 7. Build UNL from config
+        // Accept both rippled-style base58 `nXXX` keys (the format that
+        // appears in validators.txt and our own xrpl_start.sh) and raw
+        // hex 33-byte secp256k1 keys for compatibility with older configs.
         let unl = {
+            const NODE_PUBLIC_KEY_PREFIX: &[u8] = &[0x1C];
             let mut trusted = HashSet::new();
-            for pk_hex in &self.config.validators.trusted {
-                if let Ok(bytes) = hex::decode(pk_hex) {
-                    trusted.insert(NodeId::from_public_key(&bytes));
+            for entry in &self.config.validators.trusted {
+                let trimmed = entry.trim();
+                let bytes = if let Ok(decoded) =
+                    rxrpl_codec::address::base58::base58check_decode(trimmed)
+                {
+                    // Strip the 1-byte 0x1C node-public-key prefix.
+                    if decoded.len() == 1 + 33 && decoded[..1] == NODE_PUBLIC_KEY_PREFIX[..] {
+                        Some(decoded[1..].to_vec())
+                    } else {
+                        None
+                    }
+                } else if let Ok(decoded) = hex::decode(trimmed) {
+                    Some(decoded)
+                } else {
+                    None
+                };
+                if let Some(b) = bytes {
+                    trusted.insert(NodeId::from_public_key(&b));
+                } else {
+                    tracing::warn!("ignoring invalid validator key: {trimmed}");
                 }
             }
             if !trusted.is_empty() {
@@ -889,6 +910,16 @@ impl Node {
             }
             TrustedValidatorList::new(trusted)
         };
+        let trusted_unl_size = self
+            .config
+            .validators
+            .trusted
+            .iter()
+            .filter(|s| {
+                rxrpl_codec::address::base58::base58check_decode(s.trim()).is_ok()
+                    || hex::decode(s.trim()).is_ok()
+            })
+            .count();
 
         // 8. Consensus loop with multi-round convergence
         let ledger = Arc::clone(&self.ledger);
@@ -961,8 +992,16 @@ impl Node {
             let mut max_peer_seq: u32 = 0;
             let mut pending_close_time = 0u32;
             // Track validations from network peers to determine validated ledgers.
-            // Default quorum of 28 (~80% of typical 35-validator UNL).
-            let initial_quorum = configured_quorum.unwrap_or(28);
+            // Quorum is 80% of the trusted UNL size (rippled convention),
+            // floored at 1. Falls back to 28 only if no UNL is configured
+            // and no explicit override was provided.
+            let initial_quorum = configured_quorum.unwrap_or_else(|| {
+                if trusted_unl_size > 0 {
+                    Node::compute_quorum(trusted_unl_size)
+                } else {
+                    28
+                }
+            });
             let mut val_aggregator =
                 rxrpl_overlay::validation_aggregator::ValidationAggregator::new(initial_quorum);
             if let Some(ref trusted) = trusted_validators_for_aggregator {
@@ -1720,6 +1759,7 @@ impl Node {
                 sign_time: effective_close_time,
                 signature: None,
                 amendments: our_amendment_votes,
+                signing_payload: None,
             };
             identity.sign_validation(&mut validation);
             let payload = rxrpl_overlay::proto_convert::encode_validation(
@@ -2514,6 +2554,7 @@ mod tests {
                 sign_time: 100,
                 signature: None,
                 amendments: vec![],
+                signing_payload: None,
             };
             assert!(val_aggregator.add_validation(v).is_none());
         }
@@ -2529,6 +2570,7 @@ mod tests {
             sign_time: 100,
             signature: None,
             amendments: vec![],
+            signing_payload: None,
         };
         let result = val_aggregator.add_validation(v28);
         assert!(result.is_some());
@@ -2563,6 +2605,7 @@ mod tests {
                 sign_time: 100,
                 signature: None,
                 amendments: vec![],
+                signing_payload: None,
             };
             assert!(val_aggregator.add_validation(v).is_none());
         }
@@ -2576,6 +2619,7 @@ mod tests {
             sign_time: 100,
             signature: None,
             amendments: vec![],
+            signing_payload: None,
         };
         assert!(val_aggregator.add_validation(v5).is_some());
     }
