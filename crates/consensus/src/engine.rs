@@ -68,9 +68,34 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     /// `prev_ledger` than ours. Keyed by (node_id -> their prev_ledger).
     /// Used to detect when we are on the wrong chain.
     wrong_prev_ledger_votes: HashMap<NodeId, Hash256>,
+    /// Holding pen for proposals whose `prev_ledger` we do not yet know.
+    /// Keyed by their `prev_ledger` hash. When `start_round` is called with
+    /// a matching prev_ledger, the held proposals are moved into
+    /// `pending_proposals` for replay.
+    ///
+    /// Capped at FUTURE_PROPOSALS_MAX_KEYS distinct prev_ledger keys to
+    /// prevent a malicious peer from exhausting memory by spamming
+    /// proposals with random hashes. Also evicted in `start_round` for any
+    /// entry whose `ledger_seq` is more than FUTURE_PROPOSALS_STALE_LEDGERS
+    /// behind the current seq (rxrpl can't catch up that far in one
+    /// round).
+    future_proposals: HashMap<Hash256, Vec<Proposal>>,
     /// Adaptive close-time resolution tracker.
     adaptive_close_time: AdaptiveCloseTime,
 }
+
+/// Maximum number of distinct `prev_ledger` hashes held in
+/// `future_proposals`. Beyond this, the oldest entry by insertion order is
+/// dropped to bound memory under adversarial spam.
+const FUTURE_PROPOSALS_MAX_KEYS: usize = 64;
+/// Maximum number of proposals held per `prev_ledger` key. A trusted peer
+/// would not send more than one position per round, so a small cap
+/// suffices and keeps the worst case bounded.
+const FUTURE_PROPOSALS_MAX_PER_KEY: usize = 16;
+/// Drop a held proposal when its `ledger_seq` is more than this many seqs
+/// behind the current round. rxrpl can't catch up that far in time so the
+/// proposal is no longer actionable.
+const FUTURE_PROPOSALS_STALE_LEDGERS: u32 = 5;
 
 impl<A: ConsensusAdapter> ConsensusEngine<A> {
     pub fn new(adapter: A, node_id: NodeId, params: ConsensusParams) -> Self {
@@ -104,6 +129,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             negative_unl_tracker: NegativeUnlTracker::new(),
             pending_proposals: Vec::new(),
             wrong_prev_ledger_votes: HashMap::new(),
+            future_proposals: HashMap::new(),
             adaptive_close_time,
         }
     }
@@ -305,9 +331,50 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.accepted_close_flags = 0;
         self.accepted_validation = None;
         self.wrong_prev_ledger_votes.clear();
+        // Move any held proposals matching this prev_ledger into the pending
+        // buffer so they get replayed after close_ledger().
+        if let Some(matching) = self.future_proposals.remove(&prev_ledger) {
+            tracing::debug!(
+                "replaying {} held proposal(s) matching new prev_ledger {}",
+                matching.len(),
+                prev_ledger
+            );
+            self.pending_proposals.extend(matching);
+        }
+        // Drop held proposals that are too far behind to still be useful.
+        self.future_proposals.retain(|_, props| {
+            props.retain(|p| p.ledger_seq + FUTURE_PROPOSALS_STALE_LEDGERS >= ledger_seq);
+            !props.is_empty()
+        });
         // Note: pending_proposals is NOT cleared here -- they will be
         // replayed in close_ledger() which follows start_round().
-        let _ = ledger_seq;
+    }
+
+    /// Insert a proposal into the holding pen, applying per-key and global
+    /// caps. Oldest entries are dropped when caps are exceeded.
+    fn hold_future_proposal(&mut self, proposal: Proposal) {
+        let key = proposal.prev_ledger;
+        let entry = self.future_proposals.entry(key).or_default();
+        // Per-key cap: drop the oldest if at capacity.
+        if entry.len() >= FUTURE_PROPOSALS_MAX_PER_KEY {
+            entry.remove(0);
+        }
+        // Replace any existing entry from the same node (a peer can only
+        // hold one position per round).
+        entry.retain(|p| p.node_id != proposal.node_id);
+        entry.push(proposal);
+        // Global cap: if too many distinct prev_ledger keys, drop the
+        // smallest-by-min-seq group (oldest unfulfilled).
+        if self.future_proposals.len() > FUTURE_PROPOSALS_MAX_KEYS {
+            if let Some(victim) = self
+                .future_proposals
+                .iter()
+                .min_by_key(|(_, ps)| ps.iter().map(|p| p.ledger_seq).min().unwrap_or(u32::MAX))
+                .map(|(k, _)| *k)
+            {
+                self.future_proposals.remove(&victim);
+            }
+        }
     }
 
     /// Close the open phase and begin establishing consensus.
@@ -366,15 +433,20 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         }
 
         // Track proposals referencing a different previous ledger.
-        // These are rejected from normal consensus but counted toward
-        // wrong-prev-ledger detection so we can switch chains if needed.
+        // These are recorded for wrong-prev-ledger detection AND held in
+        // `future_proposals` so they can be replayed once we catch up to
+        // the matching prev_ledger in `start_round`. Without the hold, a
+        // peer running 16-second consensus rounds (rippled) is always at
+        // least one ledger ahead of our catchup loop and we never get to
+        // participate.
         if proposal.prev_ledger != self.prev_ledger {
             tracing::debug!(
-                "rejected proposal: prev_ledger mismatch (ours={}, theirs={}), tracking for recovery",
+                "holding proposal for future prev_ledger (ours={}, theirs={})",
                 self.prev_ledger, proposal.prev_ledger
             );
             self.wrong_prev_ledger_votes
                 .insert(proposal.node_id, proposal.prev_ledger);
+            self.hold_future_proposal(proposal);
             return;
         }
 
@@ -1167,6 +1239,119 @@ mod tests {
 
         assert!(engine.converge());
         assert_eq!(engine.phase(), ConsensusPhase::Accepted);
+    }
+
+    // --- Future-proposal holding pen tests ---
+
+    #[test]
+    fn future_proposal_held_when_prev_ledger_unknown() {
+        let unl = make_unl(&[1, 2]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
+
+        let future_prev = Hash256::new([0xAA; 32]);
+        engine.peer_proposal(proposal_for(node(2), set.hash, future_prev, 2));
+
+        // Held, not accepted.
+        assert!(engine.peer_positions.is_empty());
+        assert_eq!(engine.future_proposals.get(&future_prev).map(|v| v.len()), Some(1));
+    }
+
+    #[test]
+    fn held_proposal_replayed_on_matching_start_round() {
+        let unl = make_unl(&[1, 2]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
+
+        let future_prev = Hash256::new([0xBB; 32]);
+        engine.peer_proposal(proposal_for(node(2), set.hash, future_prev, 2));
+        assert!(engine.future_proposals.contains_key(&future_prev));
+
+        // Catch up to the future ledger.
+        engine.start_round(future_prev, 2);
+        // Held proposal is moved to pending, ready for replay in close_ledger.
+        assert!(!engine.future_proposals.contains_key(&future_prev));
+        assert_eq!(engine.pending_proposals.len(), 1);
+
+        // Replay path: close_ledger drains pending_proposals.
+        let new_set = TxSet::new(vec![]);
+        engine.close_ledger(new_set.clone(), 100, 2).unwrap();
+        assert_eq!(engine.peer_positions.len(), 1);
+        assert!(engine.peer_positions.contains_key(&node(2)));
+    }
+
+    #[test]
+    fn held_proposal_evicted_when_too_stale() {
+        let unl = make_unl(&[1, 2]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
+
+        // Hold a stale proposal (seq=2)
+        let stale_prev = Hash256::new([0xCC; 32]);
+        engine.peer_proposal(proposal_for(node(2), set.hash, stale_prev, 2));
+        assert!(engine.future_proposals.contains_key(&stale_prev));
+
+        // Jump forward many rounds. Stale proposals get evicted.
+        engine.start_round(Hash256::new([0xDD; 32]), 2 + FUTURE_PROPOSALS_STALE_LEDGERS + 1);
+        assert!(engine.future_proposals.is_empty());
+    }
+
+    #[test]
+    fn hold_dedups_per_node() {
+        let unl = make_unl(&[1, 2]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
+
+        let prev = Hash256::new([0xEE; 32]);
+        engine.peer_proposal(proposal_for(node(2), set.hash, prev, 2));
+        engine.peer_proposal(proposal_for(node(2), set.hash, prev, 2));
+        engine.peer_proposal(proposal_for(node(2), set.hash, prev, 2));
+        // Same node, same key: only the latest is kept.
+        assert_eq!(engine.future_proposals.get(&prev).map(|v| v.len()), Some(1));
+    }
+
+    #[test]
+    fn hold_caps_global_keys() {
+        let unl = make_unl(&[1, 2]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
+
+        // Push proposals with FUTURE_PROPOSALS_MAX_KEYS + 5 distinct prev_ledger
+        // keys. The map should never grow past the cap.
+        for i in 0u8..(FUTURE_PROPOSALS_MAX_KEYS as u8 + 5) {
+            let mut h = [0u8; 32];
+            h[0] = i.wrapping_add(1);
+            let p = proposal_for(node(2), set.hash, Hash256::new(h), 100 + i as u32);
+            engine.peer_proposal(p);
+        }
+        assert!(engine.future_proposals.len() <= FUTURE_PROPOSALS_MAX_KEYS);
     }
 
     // --- Wrong prev_ledger recovery tests ---
