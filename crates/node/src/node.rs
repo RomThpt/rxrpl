@@ -1720,6 +1720,7 @@ impl Node {
                 sign_time: effective_close_time,
                 signature: None,
                 amendments: our_amendment_votes,
+                signing_payload: None,
             };
             identity.sign_validation(&mut validation);
             let payload = rxrpl_overlay::proto_convert::encode_validation(
@@ -2514,6 +2515,7 @@ mod tests {
                 sign_time: 100,
                 signature: None,
                 amendments: vec![],
+                signing_payload: None,
             };
             assert!(val_aggregator.add_validation(v).is_none());
         }
@@ -2529,6 +2531,7 @@ mod tests {
             sign_time: 100,
             signature: None,
             amendments: vec![],
+            signing_payload: None,
         };
         let result = val_aggregator.add_validation(v28);
         assert!(result.is_some());
@@ -2563,6 +2566,7 @@ mod tests {
                 sign_time: 100,
                 signature: None,
                 amendments: vec![],
+                signing_payload: None,
             };
             assert!(val_aggregator.add_validation(v).is_none());
         }
@@ -2576,6 +2580,7 @@ mod tests {
             sign_time: 100,
             signature: None,
             amendments: vec![],
+            signing_payload: None,
         };
         assert!(val_aggregator.add_validation(v5).is_some());
     }

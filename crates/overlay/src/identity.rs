@@ -134,30 +134,40 @@ pub fn verify_validation_signature(validation: &rxrpl_consensus::types::Validati
     // HashPrefix::validation = 'V','A','L',0 = 0x56414C00
     const HASH_PREFIX_VALIDATION: [u8; 4] = [0x56, 0x41, 0x4C, 0x00];
 
-    // Build signing data: prefix + STObject fields (without sfSignature)
-    // Must match the exact field order used by sign_validation.
-    let mut signing_data = Vec::with_capacity(128);
-    signing_data.extend_from_slice(&HASH_PREFIX_VALIDATION);
+    // Preferred path: the decoder stashed the strip-result of the
+    // received STObject (every field except sfSignature/sfMasterSignature).
+    // This is the only correct way to verify signatures from rippled,
+    // which signs over its full canonical STObject including optional
+    // fields (LoadFee, ReserveBase, Cookie, Amendments, ...) that vary
+    // per validator and per amendment epoch. The ad-hoc 5-field
+    // reconstruction below cannot match a rippled validator's input.
+    let signing_data = match validation.signing_payload.as_ref() {
+        Some(stripped) => {
+            let mut buf = Vec::with_capacity(4 + stripped.len());
+            buf.extend_from_slice(&HASH_PREFIX_VALIDATION);
+            buf.extend_from_slice(stripped);
+            buf
+        }
+        None => {
+            // Fallback for locally-constructed validations (tests, our own
+            // outbound). Reconstructs the same canonical STObject the
+            // legacy `sign_validation` produced with these 5 fields.
+            let mut signing_data = Vec::with_capacity(128);
+            signing_data.extend_from_slice(&HASH_PREFIX_VALIDATION);
+            let flags: u32 = if validation.full {
+                0x80000001
+            } else {
+                0x00000000
+            };
+            stobject::put_uint32(&mut signing_data, 2, flags);
+            stobject::put_uint32(&mut signing_data, 6, validation.ledger_seq);
+            stobject::put_uint32(&mut signing_data, 9, validation.sign_time);
+            stobject::put_hash256(&mut signing_data, 1, validation.ledger_hash.as_bytes());
+            stobject::put_vl(&mut signing_data, 3, &validation.public_key);
+            signing_data
+        }
+    };
 
-    // sfFlags (UINT32, field 2)
-    let flags: u32 = if validation.full { 0x80000001 } else { 0x00000000 };
-    stobject::put_uint32(&mut signing_data, 2, flags);
-
-    // sfLedgerSequence (UINT32, field 6)
-    stobject::put_uint32(&mut signing_data, 6, validation.ledger_seq);
-
-    // sfSigningTime (UINT32, field 9)
-    stobject::put_uint32(&mut signing_data, 9, validation.sign_time);
-
-    // sfLedgerHash (UINT256, field 1)
-    stobject::put_hash256(&mut signing_data, 1, validation.ledger_hash.as_bytes());
-
-    // sfSigningPubKey (VL, field 3)
-    stobject::put_vl(&mut signing_data, 3, &validation.public_key);
-
-    // Verify: the signature was produced by signing signing_data with secp256k1
-    // (sign_validation always uses secp256k1 regardless of key type prefix,
-    // because NodeIdentity is always secp256k1 for rippled compatibility).
     let is_ed25519 = validation.public_key.first() == Some(&0xED);
     if is_ed25519 {
         rxrpl_crypto::ed25519::verify(&signing_data, &validation.public_key, sig)
@@ -225,6 +235,7 @@ mod tests {
             sign_time: 1000,
             signature: None,
             amendments: vec![],
+            signing_payload: None,
         };
 
         // Unsigned validation should fail verification
@@ -252,6 +263,7 @@ mod tests {
             sign_time: 1000,
             signature: None,
             amendments: vec![],
+            signing_payload: None,
         };
 
         id.sign_validation(&mut validation);
@@ -279,6 +291,7 @@ mod tests {
             sign_time: 1000,
             signature: None,
             amendments: vec![],
+            signing_payload: None,
         };
 
         id1.sign_validation(&mut validation);
@@ -305,6 +318,7 @@ mod tests {
             sign_time: 1000,
             signature: None,
             amendments: vec![],
+            signing_payload: None,
         };
 
         assert!(!verify_validation_signature(&validation));
@@ -326,6 +340,7 @@ mod tests {
             sign_time: 1000,
             signature: None,
             amendments: vec![],
+            signing_payload: None,
         };
 
         id.sign_validation(&mut validation);

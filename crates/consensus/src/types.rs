@@ -59,6 +59,20 @@ pub struct Validation {
     /// Carried in the validation message so that amendment voting
     /// can be tallied across the trusted validator set.
     pub amendments: Vec<Hash256>,
+    /// Raw STObject bytes used as the signature input.
+    ///
+    /// Rippled signs the *full* canonical STObject of the validation,
+    /// less the `sfSignature` and `sfMasterSignature` VL fields. Verifiers
+    /// must therefore have access to the same byte sequence — reconstructing
+    /// the signing data from a fixed subset of fields breaks every time
+    /// rippled adds an optional field (LoadFee, ReserveBase, Cookie,
+    /// Amendments, ...). The decoder stashes the strip-result here.
+    ///
+    /// `None` when the validation was constructed locally (e.g. tests, or
+    /// our own outbound validations); in that case verifiers fall back to
+    /// the legacy field-by-field reconstruction in
+    /// `rxrpl_overlay::identity::verify_validation_signature`.
+    pub signing_payload: Option<Vec<u8>>,
 }
 
 impl Proposal {
@@ -339,6 +353,7 @@ mod tests {
             sign_time: 101,
             signature: None,
             amendments: vec![],
+            signing_payload: None,
         };
 
         validation.sign(&kp.private_key, kp.key_type);

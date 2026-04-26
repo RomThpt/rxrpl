@@ -101,72 +101,115 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
 
     let payload = msg.validation.unwrap_or_default();
 
-    // Parse STObject fields
+    // Parse STObject fields and simultaneously rebuild the canonical signing
+    // payload (every field EXCEPT sfSignature 7/6 and sfMasterSignature 7/18).
+    // Rippled signs over the full STObject minus those two fields, so a
+    // verifier that reconstructs from a fixed subset breaks every time
+    // rippled adds a new optional field. Carrying the strip-result lets
+    // verification stay correct as the schema evolves.
     let mut ledger_hash = Hash256::ZERO;
     let mut ledger_seq = 0u32;
     let mut sign_time = 0u32;
+    let mut close_time = 0u32;
     let mut full = false;
     let mut signature: Option<Vec<u8>> = None;
     let mut signing_pub_key: Vec<u8> = Vec::new();
+    let mut amendments: Vec<Hash256> = Vec::new();
+    let mut signing_payload = Vec::with_capacity(payload.len());
 
     let mut pos = 0;
     while pos < payload.len() {
+        let field_start = pos;
         let (type_id, field_id, hdr_len) =
             crate::stobject::decode_field_id(&payload[pos..])
                 .ok_or_else(|| OverlayError::Codec("invalid STObject field header".into()))?;
         pos += hdr_len;
 
+        // Determine the value's byte range for this field.
+        let value_start = pos;
+        let value_len: usize = match type_id {
+            // UINT16
+            1 => 2,
+            // UINT32
+            2 => 4,
+            // UINT64
+            3 => 8,
+            // UINT128
+            4 => 16,
+            // UINT256
+            5 => 32,
+            // AMOUNT (8 for XRP, 48 for IOU)
+            6 => {
+                if pos >= payload.len() {
+                    return Err(OverlayError::Codec("truncated Amount field".into()));
+                }
+                if payload[pos] & 0x80 != 0 { 48 } else { 8 }
+            }
+            // VL-prefixed (Blob, AccountID)
+            7 | 8 => {
+                let (vl_len, vl_hdr) = crate::stobject::decode_vl_length(&payload[pos..])
+                    .ok_or_else(|| OverlayError::Codec("invalid VL length".into()))?;
+                pos += vl_hdr;
+                vl_len
+            }
+            // VECTOR256 (Amendments etc.) — VL-prefixed array of Hash256.
+            19 => {
+                let (vl_len, vl_hdr) = crate::stobject::decode_vl_length(&payload[pos..])
+                    .ok_or_else(|| OverlayError::Codec("invalid VL length".into()))?;
+                pos += vl_hdr;
+                vl_len
+            }
+            // UINT8
+            16 => 1,
+            // Unknown type — we cannot determine its length, so we cannot
+            // continue parsing safely. Bail out preserving what we have.
+            _ => {
+                tracing::debug!(
+                    "decode_validation: unknown STObject type_id={} field_id={}, stopping parse",
+                    type_id, field_id
+                );
+                break;
+            }
+        };
+        if value_start + value_len > payload.len() {
+            return Err(OverlayError::Codec(format!(
+                "STObject field {type_id}/{field_id} truncated"
+            )));
+        }
+        let value = &payload[value_start..value_start + value_len];
+
+        // Extract fields we care about.
         match (type_id, field_id) {
-            // UINT32 fields
             (2, 2) => {
                 // sfFlags
-                if pos + 4 > payload.len() { break; }
-                let v = u32::from_be_bytes(payload[pos..pos + 4].try_into().unwrap());
+                let v = u32::from_be_bytes(value.try_into().unwrap());
                 full = (v & 0x80000001) == 0x80000001;
-                pos += 4;
             }
-            (2, fid) => {
-                // Other UINT32
-                if pos + 4 > payload.len() { break; }
-                let v = u32::from_be_bytes(payload[pos..pos + 4].try_into().unwrap());
-                match fid {
-                    6 => ledger_seq = v,  // sfLedgerSequence
-                    9 => sign_time = v,   // sfSigningTime
-                    _ => {}
+            (2, 6) => ledger_seq = u32::from_be_bytes(value.try_into().unwrap()),
+            (2, 7) => close_time = u32::from_be_bytes(value.try_into().unwrap()),
+            (2, 9) => sign_time = u32::from_be_bytes(value.try_into().unwrap()),
+            (5, 1) => ledger_hash = hash256_from_bytes(value)?,
+            (7, 3) => signing_pub_key = value.to_vec(),
+            (7, 6) => signature = Some(value.to_vec()),
+            (19, 4) => {
+                // sfAmendments — concatenated 32-byte hashes
+                for chunk in value.chunks_exact(32) {
+                    if let Ok(h) = hash256_from_bytes(chunk) {
+                        amendments.push(h);
+                    }
                 }
-                pos += 4;
             }
-            // UINT64 fields
-            (3, _) => {
-                if pos + 8 > payload.len() { break; }
-                pos += 8;
-            }
-            // UINT256 fields
-            (5, fid) => {
-                if pos + 32 > payload.len() { break; }
-                if fid == 1 {
-                    // sfLedgerHash
-                    ledger_hash = hash256_from_bytes(&payload[pos..pos + 32])?;
-                }
-                pos += 32;
-            }
-            // VL fields
-            (7, fid) => {
-                let (vl_len, vl_hdr) =
-                    crate::stobject::decode_vl_length(&payload[pos..])
-                        .ok_or_else(|| OverlayError::Codec("invalid VL length".into()))?;
-                pos += vl_hdr;
-                if pos + vl_len > payload.len() { break; }
-                match fid {
-                    3 => signing_pub_key = payload[pos..pos + vl_len].to_vec(),
-                    6 => signature = Some(payload[pos..pos + vl_len].to_vec()),
-                    _ => {}
-                }
-                pos += vl_len;
-            }
-            // Skip unknown types
-            _ => break,
+            _ => {}
         }
+
+        // Append to the signing payload UNLESS this field is a signature.
+        // sfSignature = 7/6, sfMasterSignature = 7/18.
+        let is_signature_field = matches!((type_id, field_id), (7, 6) | (7, 18));
+        if !is_signature_field {
+            signing_payload.extend_from_slice(&payload[field_start..value_start + value_len]);
+        }
+
+        pos = value_start + value_len;
     }
 
     let node_id = if !signing_pub_key.is_empty() {
@@ -181,10 +224,11 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
         ledger_hash,
         ledger_seq,
         full,
-        close_time: sign_time,
+        close_time: if close_time != 0 { close_time } else { sign_time },
         sign_time,
         signature,
-        amendments: vec![],
+        amendments,
+        signing_payload: Some(signing_payload),
     })
 }
 
