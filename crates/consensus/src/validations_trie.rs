@@ -95,6 +95,14 @@ impl ValidationsTrie {
                 // Same vote already counted — no-op.
                 return false;
             }
+            // Reject older validations (audit pass 2 C1): a stale validation
+            // would otherwise overwrite the node's current vote in the trie.
+            if validation.ledger_seq < prev.ledger_seq {
+                return false;
+            }
+            if validation.ledger_seq == prev.ledger_seq && validation.sign_time <= prev.sign_time {
+                return false;
+            }
             // Switched ledger: pull old support out before crediting new.
             self.trie.remove(&[prev.ledger_hash], 1);
         }
@@ -261,6 +269,60 @@ mod tests {
         // A subsequent add from the now-untrusted node must be ignored.
         assert!(!agg.add(validation(1, 0xAA, 6, 200)));
         assert_eq!(agg.count_for(&hash(0xAA)), 1);
+    }
+
+    #[test]
+    fn replay_older_ledger_seq_rejected() {
+        // Audit pass 2 C1: a validation with a strictly older ledger_seq
+        // must NOT overwrite the node's current vote. Otherwise an
+        // attacker can replay a stale validation and flip the trie's
+        // preferred-branch vote.
+        let mut agg = ValidationsTrie::new();
+        agg.add_trusted(node(1));
+
+        assert!(agg.add(validation(1, 0xAA, 10, 100)));
+        assert_eq!(agg.count_for(&hash(0xAA)), 1);
+
+        // Replay an older seq for the same node — must be rejected.
+        let stale = validation(1, 0xBB, 5, 200);
+        assert!(!agg.add(stale), "older ledger_seq must be rejected");
+        assert_eq!(agg.count_for(&hash(0xAA)), 1, "current vote unchanged");
+        assert_eq!(agg.count_for(&hash(0xBB)), 0, "stale vote not counted");
+        assert_eq!(agg.get_preferred(10), Some(hash(0xAA)));
+    }
+
+    #[test]
+    fn replay_same_seq_older_sign_time_rejected() {
+        // Audit pass 2 C1: at the same ledger_seq, a validation whose
+        // sign_time is <= the current vote's sign_time must be rejected.
+        let mut agg = ValidationsTrie::new();
+        agg.add_trusted(node(1));
+
+        assert!(agg.add(validation(1, 0xAA, 5, 100)));
+        // Older sign_time at same seq — rejected.
+        assert!(!agg.add(validation(1, 0xBB, 5, 50)));
+        assert_eq!(agg.count_for(&hash(0xAA)), 1);
+        assert_eq!(agg.count_for(&hash(0xBB)), 0);
+
+        // Equal sign_time at same seq (different hash) — also rejected,
+        // since strict monotonicity is required.
+        assert!(!agg.add(validation(1, 0xCC, 5, 100)));
+        assert_eq!(agg.count_for(&hash(0xAA)), 1);
+        assert_eq!(agg.count_for(&hash(0xCC)), 0);
+    }
+
+    #[test]
+    fn replay_newer_sign_time_at_same_seq_accepted() {
+        // Audit pass 2 C1: a validation at the same ledger_seq with a
+        // strictly newer sign_time IS the legitimate "vote update" path
+        // and must be accepted.
+        let mut agg = ValidationsTrie::new();
+        agg.add_trusted(node(1));
+
+        assert!(agg.add(validation(1, 0xAA, 5, 100)));
+        assert!(agg.add(validation(1, 0xBB, 5, 150)));
+        assert_eq!(agg.count_for(&hash(0xAA)), 0, "old vote removed");
+        assert_eq!(agg.count_for(&hash(0xBB)), 1, "new vote counted");
     }
 
     #[test]

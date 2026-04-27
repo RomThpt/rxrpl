@@ -465,7 +465,38 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
     /// materially changed trie state (new vote, or a switched ledger).
     /// Untrusted validators are ignored — call
     /// [`Self::add_trusted_validator`] first to enrol them.
+    ///
+    /// # Audit pass 2 C3 — caller MUST pre-verify the signature
+    ///
+    /// `rxrpl-consensus` does not depend on `rxrpl-overlay` (where the
+    /// canonical signature verifier lives), so this method cannot itself
+    /// run `verify_validation_signature`. Callers MUST verify the
+    /// validation's signature against `validation.public_key` BEFORE
+    /// invoking this entry point. Feeding an unverified validation here
+    /// lets an attacker drive the 60% wrong-prev-ledger detector with
+    /// forged votes.
+    ///
+    /// To prevent key laundering (a caller submits a validation whose
+    /// `node_id` does not derive from the supplied `public_key`), this
+    /// method enforces `node_id == sha512_half(public_key)` and rejects
+    /// the call otherwise. An empty `public_key` also fails this check,
+    /// so locally-constructed validations missing a key cannot bypass
+    /// the binding.
+    #[doc(hidden)]
     pub fn record_trusted_validation(&mut self, validation: Validation) -> bool {
+        // C3: bind node_id to public_key — prevents a caller from
+        // submitting a validation whose node_id is unrelated to the key
+        // that (allegedly) signed it.
+        let derived_node_id = NodeId(rxrpl_crypto::sha512_half::sha512_half(&[
+            validation.public_key.as_slice(),
+        ]));
+        if validation.node_id != derived_node_id {
+            tracing::warn!(
+                target: "consensus",
+                "record_trusted_validation_node_id_mismatch"
+            );
+            return false;
+        }
         self.validations_trie.add(validation)
     }
 
@@ -1648,8 +1679,24 @@ mod tests {
     use crate::unl::TrustedValidatorList;
     use std::collections::HashSet;
 
+    /// Synthetic per-id "public key" for tests. 33 bytes (secp256k1
+    /// length), prefix `0x02` so the verifier path treats it as a
+    /// secp256k1-shaped key, with the id byte filling the rest. Distinct
+    /// per `id` so derived NodeIds don't collide.
+    fn test_pk(id: u8) -> Vec<u8> {
+        let mut pk = vec![0x02; 33];
+        for byte in pk.iter_mut().skip(1) {
+            *byte = id;
+        }
+        pk
+    }
+
     fn node(id: u8) -> NodeId {
-        NodeId(Hash256::new([id; 32]))
+        // Derive from the synthetic test public key so that validations
+        // built with `validation_for(node(n), ...)` carry a matching
+        // (node_id, public_key) pair for the C3 binding check in
+        // `record_trusted_validation`.
+        NodeId::from_public_key(&test_pk(id))
     }
 
     fn make_unl(ids: &[u8]) -> TrustedValidatorList {
@@ -2073,9 +2120,19 @@ mod tests {
     // --- T17: ValidationsTrie wiring into wrong-prev-ledger detection ---
 
     fn validation_for(node_id: NodeId, ledger_hash: Hash256, ledger_seq: u32) -> Validation {
+        // Recover the synthetic test public key matching `node_id`. We
+        // tried each `id` byte 0..=255 because the test helper `node(id)`
+        // derives via `from_public_key(test_pk(id))`. Falling back to an
+        // empty key keeps unrelated callers compiling but will fail the
+        // C3 binding check (intentional — test_node_id_mismatch_rejected
+        // exercises that path).
+        let public_key = (0u8..=255)
+            .find(|id| node(*id) == node_id)
+            .map(test_pk)
+            .unwrap_or_default();
         Validation {
             node_id,
-            public_key: vec![],
+            public_key,
             ledger_hash,
             ledger_seq,
             full: true,
@@ -2192,6 +2249,51 @@ mod tests {
 
         let alt = Hash256::new([0xEE; 32]);
         assert!(!engine.record_trusted_validation(validation_for(node(99), alt, 0)));
+        assert_eq!(engine.validations_trie().count_for(&alt), 0);
+    }
+
+    #[test]
+    fn record_trusted_validation_rejects_node_id_public_key_mismatch() {
+        // Audit pass 2 C3: a validation whose node_id does NOT derive
+        // from its public_key must be rejected, even when the node is
+        // trusted — otherwise a forged validation can be attributed to
+        // any UNL member by lying about the node_id field.
+        let unl = make_unl(&[1, 2]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        engine.add_trusted_validator(node(2));
+
+        let alt = Hash256::new([0x55; 32]);
+        // Build a validation that *claims* to be from node(2) but
+        // carries a public_key for node(3). The binding check must
+        // reject it before it touches the trie.
+        let mut forged = validation_for(node(2), alt, 0);
+        forged.public_key = test_pk(3);
+
+        assert!(
+            !engine.record_trusted_validation(forged),
+            "node_id/public_key mismatch must be rejected"
+        );
+        assert_eq!(
+            engine.validations_trie().count_for(&alt),
+            0,
+            "forged vote must not enter the trie"
+        );
+
+        // A validation with an empty public_key is also rejected
+        // (the empty-key digest does not match any node(n)).
+        let mut empty_key = validation_for(node(2), alt, 0);
+        empty_key.public_key = vec![];
+        assert!(
+            !engine.record_trusted_validation(empty_key),
+            "empty public_key must be rejected"
+        );
         assert_eq!(engine.validations_trie().count_for(&alt), 0);
     }
 
