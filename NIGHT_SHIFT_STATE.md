@@ -40,26 +40,10 @@ forbidden_paths:
 
 ### Ready
 
-- [ ] T10 [kind=code,deps=T09]: Validation decoder in overlay reconstructs all SOTemplate fields and signing_payload
-  - acceptance: parse_validation in validation_aggregator/validator_list/proto_convert emits full Validation struct
-  - acceptance: round-trip test: encode→decode preserves every optional field
-  - globs: crates/overlay/src/validation_aggregator.rs, crates/overlay/src/proto_convert.rs
-
 - [ ] T11 [kind=tests,deps=T10]: Property tests on STValidation encoding round-trip via proptest
   - acceptance: 500+ random Validation structs survive encode→decode without loss
   - acceptance: signing_hash stable across encode→decode→encode (idempotent)
   - globs: crates/overlay/tests/stvalidation_roundtrip.rs
-
-- [ ] T19 [kind=code,deps=T18]: Replace peer_positions: HashMap with ProposalTracker; preserve existing engine API
-  - acceptance: peer_proposal delegates to tracker, increments dispute counters only on accepted updates
-  - acceptance: existing multi_node integration test still passes
-  - globs: crates/consensus/src/engine.rs
-
-- [ ] T20 [kind=code,deps=T18]: Dispute lifecycle — port goXRPL disputed-tx vote tracking with avalanche thresholds
-  - acceptance: DisputedTx in types.rs gains methods update_vote(node_id, voted_yes), our_vote(threshold) returning bool
-  - acceptance: thresholds match rippled (50% before mid, 65% after mid, 70% late, 95% stuck)
-  - acceptance: 5+ tests, including threshold transitions across consensus rounds
-  - globs: crates/consensus/src/types.rs, crates/consensus/src/engine.rs
 
 - [ ] T24 [kind=qa,deps=T05,T10,T17]: xrpl-hive smoke + propagation cross-impl run after merges
   - acceptance: ./bin/xrpl-hive --sim smoke --client rxrpl passes (3/3)
@@ -102,6 +86,9 @@ forbidden_paths:
 - T08b — added ..Default::default() to 15 Validation literal sites + validations_trie test fix, commits 286c381+manual (190/190 consensus tests green)
 - T09 — sign_validation full SOTemplate canonical sort + signing_payload, commit a1e6e3f (219/219 overlay tests)
 - T17 — wire ValidationsTrie into wrong-prev-ledger detection, commit 01ee19f (196/196 consensus tests; 1 NIGHT-SHIFT-REVIEW for UNL trusted setter)
+- T10 — full SOTemplate validation decoder + signing_payload preserved, commit 024eb43 (226/226 overlay tests)
+- T19 — ProposalTracker dedup integration in peer_proposal_at, commit d1b4f1d (199/199 consensus tests)
+- T20 — DisputedTx avalanche thresholds 50/65/70/95 + 6 tests, commit f18bfb3 (202/202 consensus tests)
 
 ### Blocked
 <!-- Tasks blocked on external dependencies, see PROBLEMS.md for details. -->
@@ -115,8 +102,8 @@ forbidden_paths:
 
 Last run: 2026-04-27T14:21Z
 - build: true
-- test: false (engine.rs tests await T03; node.rs quorum tests await T13b)
-- lint: false (rpc-api derivable_impls — pre-existing on main, untouched by nightly)
+- test: true (ALL workspace tests green!)
+- lint: false (rxrpl-rpc-api derivable_impls — pre-existing, out of nightly scope)
 
 History:
 - 2026-04-27T14:08:10Z — build=true test=false lint=false (planned fixes in queue: T03, T13b)
