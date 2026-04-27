@@ -1666,10 +1666,17 @@ impl Node {
         pruner: &Arc<LedgerPruner>,
         node_store: &Option<Arc<dyn NodeStore>>,
     ) {
-        let effective_close_time = consensus
-            .accepted_close_time()
-            .unwrap_or(pending_close_time);
+        // Prefer the consensus-converged close_time (median + rounded); when
+        // no quorum was reached, round the local fallback to the current
+        // adaptive resolution so a peer closing within the same bucket
+        // produces an identical hash. Without this rounding, two
+        // independently-clocked validators always disagree by their
+        // wall-clock skew and never converge on the same hash.
         let close_flags = consensus.accepted_close_flags();
+        let effective_close_time = consensus.accepted_close_time().unwrap_or_else(|| {
+            let res = consensus.adaptive_close_time().resolution();
+            rxrpl_consensus::round_close_time(pending_close_time, res)
+        });
         tracing::debug!(
             "closing with effective_close_time={} close_flags={} pending_close_time={}",
             effective_close_time, close_flags, pending_close_time
