@@ -3,11 +3,24 @@
 /// When enough validators (quorum) agree on a ledger hash for a given
 /// sequence, that ledger is considered "validated" by the network.
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use rxrpl_consensus::is_current;
 use rxrpl_consensus::types::Validation;
+use rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET;
 use rxrpl_primitives::{Hash256, PublicKey};
 
 use crate::vl_fetcher::TrustedKeys;
+
+/// Returns the current XRPL ripple time (seconds since 2000-01-01 UTC).
+fn ripple_now() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(RIPPLE_EPOCH_OFFSET) as u32
+}
 
 /// Result when a ledger achieves validation quorum.
 #[derive(Debug, Clone)]
@@ -34,6 +47,11 @@ pub struct ValidationAggregator {
     /// is not in the set are silently dropped. When `None`, every full
     /// validation is counted (legacy / test behavior).
     trusted: Option<TrustedKeys>,
+    /// Counter of validations dropped because they failed the
+    /// [`is_current`] freshness check (sign_time outside the rippled
+    /// `validationCURRENT_*` window). Mirrors rippled's
+    /// `validation_dropped_stale_total` metric.
+    dropped_stale_total: AtomicU64,
 }
 
 impl ValidationAggregator {
@@ -45,7 +63,14 @@ impl ValidationAggregator {
             highest_validated_seq: 0,
             highest_validated_hash: Hash256::ZERO,
             trusted: None,
+            dropped_stale_total: AtomicU64::new(0),
         }
+    }
+
+    /// Number of validations dropped because they failed the freshness
+    /// check (`is_current`). Monotonic across the lifetime of the aggregator.
+    pub fn dropped_stale_total(&self) -> u64 {
+        self.dropped_stale_total.load(Ordering::Relaxed)
     }
 
     /// Attach a [`TrustedKeys`] handle so that incoming validations are
@@ -90,6 +115,16 @@ impl ValidationAggregator {
     /// Returns `Some(ValidatedLedger)` if this validation caused the ledger
     /// to reach quorum for the first time.
     pub fn add_validation(&mut self, validation: Validation) -> Option<ValidatedLedger> {
+        self.add_validation_at(validation, ripple_now())
+    }
+
+    /// Like [`add_validation`] but with `now` injected (XRPL ripple time).
+    /// Useful for deterministic tests of the freshness window.
+    pub fn add_validation_at(
+        &mut self,
+        validation: Validation,
+        now: u32,
+    ) -> Option<ValidatedLedger> {
         let seq = validation.ledger_seq;
         let hash = validation.ledger_hash;
 
@@ -100,6 +135,23 @@ impl ValidationAggregator {
 
         // Only process full validations
         if !validation.full {
+            return None;
+        }
+
+        // Freshness gate: drop validations whose sign_time is outside the
+        // rippled `validationCURRENT_*` window. The `Validation` struct has
+        // no `seen_time` field, so we pass 0 (NetClock sentinel = unset),
+        // which matches rippled's behavior when no local seen-time is known.
+        if !is_current(now, validation.sign_time, 0) {
+            self.dropped_stale_total.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                target: "consensus",
+                stale_validation = true,
+                public_key = %hex::encode(&validation.public_key),
+                sign_time = validation.sign_time,
+                now = now,
+                "stale_validation",
+            );
             return None;
         }
 
@@ -188,6 +240,11 @@ mod tests {
     use super::*;
     use rxrpl_consensus::types::NodeId;
 
+    /// Fixed ripple time used by deterministic tests. Sign times below are
+    /// set equal to this so they fall inside the `is_current` freshness
+    /// window when the suite uses [`ValidationAggregator::add_validation_at`].
+    const TEST_NOW: u32 = 1_000_000;
+
     fn make_validation(node_byte: u8, seq: u32, hash: Hash256) -> Validation {
         Validation {
             node_id: NodeId(Hash256::new([node_byte; 32])),
@@ -195,8 +252,8 @@ mod tests {
             ledger_hash: hash,
             ledger_seq: seq,
             full: true,
-            close_time: 100,
-            sign_time: 100,
+            close_time: TEST_NOW,
+            sign_time: TEST_NOW,
             signature: None,
             amendments: vec![],
             signing_payload: None,
@@ -208,9 +265,13 @@ mod tests {
         let mut agg = ValidationAggregator::new(3);
         let hash = Hash256::new([0xAA; 32]);
 
-        assert!(agg.add_validation(make_validation(1, 10, hash)).is_none());
-        assert!(agg.add_validation(make_validation(2, 10, hash)).is_none());
-        let result = agg.add_validation(make_validation(3, 10, hash));
+        assert!(agg
+            .add_validation_at(make_validation(1, 10, hash), TEST_NOW)
+            .is_none());
+        assert!(agg
+            .add_validation_at(make_validation(2, 10, hash), TEST_NOW)
+            .is_none());
+        let result = agg.add_validation_at(make_validation(3, 10, hash), TEST_NOW);
         assert!(result.is_some());
 
         let vl = result.unwrap();
@@ -224,11 +285,15 @@ mod tests {
         let mut agg = ValidationAggregator::new(2);
         let hash = Hash256::new([0xBB; 32]);
 
-        agg.add_validation(make_validation(1, 5, hash));
+        agg.add_validation_at(make_validation(1, 5, hash), TEST_NOW);
         // Same node again
-        assert!(agg.add_validation(make_validation(1, 5, hash)).is_none());
+        assert!(agg
+            .add_validation_at(make_validation(1, 5, hash), TEST_NOW)
+            .is_none());
         // Different node reaches quorum
-        assert!(agg.add_validation(make_validation(2, 5, hash)).is_some());
+        assert!(agg
+            .add_validation_at(make_validation(2, 5, hash), TEST_NOW)
+            .is_some());
     }
 
     #[test]
@@ -237,8 +302,8 @@ mod tests {
         let hash_a = Hash256::new([0xAA; 32]);
         let hash_b = Hash256::new([0xBB; 32]);
 
-        agg.add_validation(make_validation(1, 10, hash_a));
-        agg.add_validation(make_validation(2, 10, hash_b));
+        agg.add_validation_at(make_validation(1, 10, hash_a), TEST_NOW);
+        agg.add_validation_at(make_validation(2, 10, hash_b), TEST_NOW);
         // Neither reached quorum
         assert_eq!(agg.validation_count(10, &hash_a), 1);
         assert_eq!(agg.validation_count(10, &hash_b), 1);
@@ -249,9 +314,13 @@ mod tests {
         let mut agg = ValidationAggregator::new(1);
         let hash = Hash256::new([0xCC; 32]);
 
-        assert!(agg.add_validation(make_validation(1, 5, hash)).is_some());
+        assert!(agg
+            .add_validation_at(make_validation(1, 5, hash), TEST_NOW)
+            .is_some());
         // Already validated, skip
-        assert!(agg.add_validation(make_validation(2, 5, hash)).is_none());
+        assert!(agg
+            .add_validation_at(make_validation(2, 5, hash), TEST_NOW)
+            .is_none());
     }
 
     #[test]
@@ -260,10 +329,10 @@ mod tests {
         let hash_5 = Hash256::new([0x55; 32]);
         let hash_10 = Hash256::new([0xAA; 32]);
 
-        agg.add_validation(make_validation(1, 5, hash_5));
+        agg.add_validation_at(make_validation(1, 5, hash_5), TEST_NOW);
         assert_eq!(agg.highest_validated_seq, 5);
 
-        agg.add_validation(make_validation(1, 10, hash_10));
+        agg.add_validation_at(make_validation(1, 10, hash_10), TEST_NOW);
         assert_eq!(agg.highest_validated_seq, 10);
         assert_eq!(agg.highest_validated_hash, hash_10);
     }
@@ -274,15 +343,23 @@ mod tests {
         let hash = Hash256::new([0xEE; 32]);
 
         // With quorum=1, a single validation reaches quorum
-        assert!(agg.add_validation(make_validation(1, 10, hash)).is_some());
+        assert!(agg
+            .add_validation_at(make_validation(1, 10, hash), TEST_NOW)
+            .is_some());
 
         // Raise quorum to 3
         agg.update_quorum(3);
 
         // Now need 3 validations for next sequence
-        assert!(agg.add_validation(make_validation(1, 20, hash)).is_none());
-        assert!(agg.add_validation(make_validation(2, 20, hash)).is_none());
-        assert!(agg.add_validation(make_validation(3, 20, hash)).is_some());
+        assert!(agg
+            .add_validation_at(make_validation(1, 20, hash), TEST_NOW)
+            .is_none());
+        assert!(agg
+            .add_validation_at(make_validation(2, 20, hash), TEST_NOW)
+            .is_none());
+        assert!(agg
+            .add_validation_at(make_validation(3, 20, hash), TEST_NOW)
+            .is_some());
     }
 
     #[test]
@@ -291,7 +368,9 @@ mod tests {
         agg.update_quorum(0); // should clamp to 1
         let hash = Hash256::new([0xFF; 32]);
         // Single validation should still reach quorum (floor=1)
-        assert!(agg.add_validation(make_validation(1, 10, hash)).is_some());
+        assert!(agg
+            .add_validation_at(make_validation(1, 10, hash), TEST_NOW)
+            .is_some());
     }
 
     #[test]
@@ -299,7 +378,7 @@ mod tests {
         let mut agg = ValidationAggregator::new(1);
         let mut val = make_validation(1, 5, Hash256::new([0xDD; 32]));
         val.full = false;
-        assert!(agg.add_validation(val).is_none());
+        assert!(agg.add_validation_at(val, TEST_NOW).is_none());
     }
 
     #[tokio::test]
@@ -319,11 +398,55 @@ mod tests {
         let mut val = make_validation(1, 5, Hash256::new([0xAA; 32]));
         val.public_key = vec![0xED; 33];
         val.public_key[1] = 0xFF; // diverges from the trusted key
-        assert!(agg.add_validation(val).is_none());
+        assert!(agg.add_validation_at(val, TEST_NOW).is_none());
 
         // A validation signed by the trusted key is accepted.
         let mut val = make_validation(2, 5, Hash256::new([0xAA; 32]));
         val.public_key = trusted_key_bytes.to_vec();
-        assert!(agg.add_validation(val).is_some());
+        assert!(agg.add_validation_at(val, TEST_NOW).is_some());
+    }
+
+    #[test]
+    fn fresh_validation_accepted() {
+        // sign_time == now: well inside the freshness window, must be accepted.
+        let mut agg = ValidationAggregator::new(1);
+        let hash = Hash256::new([0x11; 32]);
+        let val = make_validation(1, 42, hash);
+        assert!(agg.add_validation_at(val, TEST_NOW).is_some());
+        assert_eq!(agg.dropped_stale_total(), 0);
+    }
+
+    #[test]
+    fn future_validation_dropped_bumps_counter() {
+        // sign_time = now + 10 minutes is past the WALL ceiling (5 min).
+        let mut agg = ValidationAggregator::new(1);
+        let hash = Hash256::new([0x22; 32]);
+        let mut val = make_validation(1, 42, hash);
+        val.sign_time = TEST_NOW + 10 * 60;
+        assert!(agg.add_validation_at(val, TEST_NOW).is_none());
+        assert_eq!(agg.dropped_stale_total(), 1);
+        // And the validation must NOT have been recorded.
+        assert_eq!(agg.validation_count(42, &hash), 0);
+    }
+
+    #[test]
+    fn past_validation_dropped_bumps_counter() {
+        // sign_time = now - 10 minutes is past the EARLY floor (3 min).
+        let mut agg = ValidationAggregator::new(1);
+        let hash_future = Hash256::new([0x33; 32]);
+        let hash_past = Hash256::new([0x44; 32]);
+
+        // First, a future-stale to bring counter to 1.
+        let mut val = make_validation(1, 50, hash_future);
+        val.sign_time = TEST_NOW + 10 * 60;
+        assert!(agg.add_validation_at(val, TEST_NOW).is_none());
+        assert_eq!(agg.dropped_stale_total(), 1);
+
+        // Then a past-stale to bring counter to 2.
+        let mut val = make_validation(2, 51, hash_past);
+        val.sign_time = TEST_NOW.saturating_sub(10 * 60);
+        assert!(agg.add_validation_at(val, TEST_NOW).is_none());
+        assert_eq!(agg.dropped_stale_total(), 2);
+        assert_eq!(agg.validation_count(51, &hash_past), 0);
     }
 }
