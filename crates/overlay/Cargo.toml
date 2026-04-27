@@ -35,3 +35,4 @@ reqwest = { workspace = true, features = ["json"] }
 
 [dev-dependencies]
 proptest = "1"
+bytes = { workspace = true }

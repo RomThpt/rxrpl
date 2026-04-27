@@ -59,25 +59,46 @@ pub fn decode_propose_set(data: &[u8]) -> Result<Proposal, OverlayError> {
 
 /// Encode a validation as a rippled-compatible STObject inside TMValidation.
 ///
-/// When `validation.signing_payload` is populated (the canonical strip-result
-/// produced by [`crate::identity::NodeIdentity::sign_validation`]), the
-/// emitted STObject is `signing_payload || sfSignature`. This keeps the
-/// wire byte image in lock-step with the bytes that were signed, so a peer
-/// receiving the message can verify the signature by replaying the
-/// strip-result verbatim.
+/// The strip-result produced by [`crate::identity::NodeIdentity::sign_validation`]
+/// is laid out in canonical `(type_code, field_code)` ascending order — the
+/// only fields it omits are `sfSignature (7,6)` and `sfMasterSignature (7,18)`.
+/// To produce the on-wire STObject we have to splice `sfSignature` back into
+/// its canonical position. With the rxrpl-supported SOTemplate that means
+/// inserting it BEFORE `sfAmendments (19,3)` when the latter is present, and
+/// appending it at the end otherwise.
 ///
-/// When `signing_payload` is `None` (legacy / locally-built validations
-/// that haven't been re-signed via T09), we fall back to the pre-T09
-/// 5-field encoding (sfFlags, sfLedgerSequence, sfSigningTime, sfLedgerHash,
-/// sfSigningPubKey) followed by sfSignature. This preserves byte-image
-/// compatibility with any code path that still expects the old encoding.
+/// This matches goXRPL's `SerializeSTValidation` (the goXRPLd reference
+/// implementation that interoperates with rippled) and rippled's own
+/// `STObject` serializer, which sorts fields by `fieldCode` ascending.
+/// Emitting `sfSignature` after `sfAmendments` produces a non-canonical byte
+/// image — rippled's deduplication, signature verification, and trace logs
+/// still see "valid bytes" but the suppression hash diverges from what the
+/// network expects, so the validation is treated as a stray packet and never
+/// fed into the trusted-validator aggregator.
+///
+/// When `signing_payload` is `None` (legacy / locally-built validations that
+/// haven't been re-signed via T09), we fall back to the pre-T09 5-field
+/// encoding followed by `sfSignature`. That path has no `sfAmendments` so the
+/// canonical-order question is moot.
 pub fn encode_validation(validation: &Validation, public_key: &[u8]) -> Vec<u8> {
     use crate::stobject;
 
     let mut stobj = Vec::with_capacity(256);
 
     if let Some(stripped) = validation.signing_payload.as_ref() {
-        stobj.extend_from_slice(stripped);
+        // The strip-result is already canonically sorted. Insert sfSignature
+        // at its canonical position by splitting at the first field whose
+        // (type<<16)|field key is greater than sfSignature's key (0x70006).
+        // For the STValidation SOTemplate the only such field is sfAmendments
+        // (key 0x130003), but we walk generically so any future field added
+        // to the SOTemplate behind sfSignature is handled correctly without
+        // an additional code change.
+        let split = canonical_signature_insert_offset(stripped);
+        stobj.extend_from_slice(&stripped[..split]);
+        if let Some(ref sig) = validation.signature {
+            stobject::put_vl(&mut stobj, 6, sig);
+        }
+        stobj.extend_from_slice(&stripped[split..]);
     } else {
         // Legacy 5-field fallback. Matches the pre-T09 byte image.
         let flags: u32 = if validation.full { 0x80000001 } else { 0x00000000 };
@@ -86,17 +107,67 @@ pub fn encode_validation(validation: &Validation, public_key: &[u8]) -> Vec<u8> 
         stobject::put_uint32(&mut stobj, 9, validation.sign_time);
         stobject::put_hash256(&mut stobj, 1, validation.ledger_hash.as_bytes());
         stobject::put_vl(&mut stobj, 3, public_key);
-    }
-
-    // sfSignature (VL, field 6) -- emitted last (notSigning field).
-    if let Some(ref sig) = validation.signature {
-        stobject::put_vl(&mut stobj, 6, sig);
+        if let Some(ref sig) = validation.signature {
+            stobject::put_vl(&mut stobj, 6, sig);
+        }
     }
 
     let msg = TmValidation {
         validation: Some(stobj),
     };
     msg.encode_to_vec()
+}
+
+/// Walk the canonical strip-result and return the byte offset at which
+/// `sfSignature (7,6)` should be inserted so the resulting STObject stays in
+/// `(type_code, field_code)` ascending order.
+///
+/// Returns `stripped.len()` if every field already encoded sorts before
+/// `sfSignature` (the common case when no `sfAmendments` are voted on).
+///
+/// Robust against mid-buffer parse failures: if a field header looks
+/// malformed we conservatively return the current offset, matching the
+/// pre-fix "append at end" behaviour for that field.
+fn canonical_signature_insert_offset(stripped: &[u8]) -> usize {
+    use crate::stobject;
+
+    // sfSignature canonical sort key.
+    const SIG_KEY: u32 = (7u32 << 16) | 6;
+
+    let mut pos = 0usize;
+    while pos < stripped.len() {
+        let field_start = pos;
+        let Some((type_id, field_id, hdr_len)) =
+            stobject::decode_field_id(&stripped[pos..])
+        else {
+            return field_start;
+        };
+        let key = ((type_id as u32) << 16) | field_id as u32;
+        if key > SIG_KEY {
+            return field_start;
+        }
+        pos += hdr_len;
+
+        // Skip the value. We only need to recognise the type IDs that
+        // sign_validation can emit before sfAmendments, which are exactly
+        // UINT32(2), UINT64(3), UINT256(5), AMOUNT(6) and Blob/VL(7).
+        let consumed = match type_id {
+            2 => stobject::decode_uint32(&stripped[pos..]).map(|(_, n)| n),
+            3 => stobject::decode_uint64(&stripped[pos..]).map(|(_, n)| n),
+            5 => stobject::decode_hash256(&stripped[pos..]).map(|(_, n)| n),
+            6 => stobject::decode_amount_xrp(&stripped[pos..]).map(|(_, n)| n),
+            7 => stobject::decode_vl(&stripped[pos..]).map(|(_, n)| n),
+            // Vector256 is the only other type the encoder produces; if we
+            // see one its key (>= 0x130000) is already > SIG_KEY so the
+            // early `return field_start` above caught it.
+            _ => return field_start,
+        };
+        let Some(consumed) = consumed else {
+            return field_start;
+        };
+        pos += consumed;
+    }
+    stripped.len()
 }
 
 /// Decode a validation from rippled STObject format.
