@@ -40,12 +40,6 @@ forbidden_paths:
 
 ### Ready
 
-- [ ] T04 [kind=code,deps=T01]: Implement effCloseTime clamp to prior_close_time+1
-  - acceptance: new fn eff_close_time(close_time: u32, resolution: u32, prior_close_time: u32) -> u32 returns max(round_close_time(...), prior+1) when close_time != 0
-  - acceptance: returns 0 when close_time == 0 (matches rippled "untrusted close time" sentinel)
-  - acceptance: 4+ unit tests including clamp-active, clamp-inactive, zero passthrough
-  - globs: crates/consensus/src/engine.rs
-
 - [ ] T05 [kind=code,deps=T04]: Apply eff_close_time in establish-phase aggregation (replace bare round_close_time call sites)
   - acceptance: engine.rs:572 and engine.rs:577 + sibling call sites use eff_close_time(_, _, prior_close_time)
   - acceptance: ConsensusEngine carries prior_close_time field, set by start_round
@@ -106,22 +100,11 @@ forbidden_paths:
   - acceptance: 5+ tests, including threshold transitions across consensus rounds
   - globs: crates/consensus/src/types.rs, crates/consensus/src/engine.rs
 
-- [ ] T21 [kind=code,deps=]: Manifest signing — outbound creation + relay broadcast
-  - acceptance: new fn manifest::create_signed(master: &KeyPair, ephemeral: &KeyPair, sequence: u32, domain: Option<&str>) -> Vec<u8> producing rippled-compatible bytes
-  - acceptance: relay path forwards manifests on receipt to peer set excluding origin
-  - acceptance: round-trip test encode→parse→verify_signatures green
-  - globs: crates/overlay/src/manifest.rs
-
 - [ ] T22 [kind=tests,deps=T07]: Fuzz harness for STObject parser (decode_field_id + decode_vl_length)
   - acceptance: new fuzz/fuzz_targets/stobject_decode.rs feeds arbitrary bytes into decode_field_id and decode_vl_length
   - acceptance: cargo +nightly fuzz build stobject_decode succeeds
   - acceptance: registered in fuzz/Cargo.toml
   - globs: fuzz/fuzz_targets/stobject_decode.rs, fuzz/Cargo.toml
-
-- [ ] T23 [kind=tests,deps=T15]: Unit tests for LedgerTrie covering 12+ scenarios from rippled LedgerTrie_test.cpp
-  - acceptance: tests cover empty trie, single-branch, fork-equal-support, fork-tilted-support, removal, deep-trie (depth>20)
-  - acceptance: file mirrors structure of rippled test
-  - globs: crates/consensus/src/ledger_trie.rs (inline #[cfg(test)] mod tests)
 
 - [ ] T24 [kind=qa,deps=T05,T10,T17]: xrpl-hive smoke + propagation cross-impl run after merges
   - acceptance: ./bin/xrpl-hive --sim smoke --client rxrpl passes (3/3)
@@ -157,6 +140,9 @@ forbidden_paths:
 - T03 — wire next_resolution into engine, commit 04a1799 (126/126 consensus tests green)
 - T13b — fix node.rs quorum tests for freshness gate, commit d75a81f (40/40 node tests green)
 - T15 — LedgerTrie data structure, commit 900846a (13 tests green; 2 NIGHT-SHIFT-REVIEW for span compression deferred)
+- T04 — eff_close_time clamp prior+1 in engine.rs, commit 5b24c17 (143/143 consensus tests green)
+- T21 — manifest::create_signed outbound + 3 round-trip tests, commit 580689c (217/217 overlay tests green)
+- T23 — 27 new LedgerTrie tests ported from rippled (40 total), commit 9cf032b
 
 ### Blocked
 <!-- Tasks blocked on external dependencies, see PROBLEMS.md for details. -->

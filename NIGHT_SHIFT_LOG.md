@@ -11,3 +11,4 @@
 [2026-04-27T13:59:45Z] [orchestrator] lock-state.sh + verify-lock.sh patched: cutoff moved from "## Validation results" to "## Tasks" (Tasks subsections now mutable). Lock regenerated, hash 828a809c. Resuming Phase 2.
 [2026-04-27T14:08:39Z] [orchestrator] iter 1 — 2 done (T02,T13), 1 WIP (T08), validation build=true test=false lint=false (planned T03/T13b/T08b will resolve)
 [2026-04-27T14:21:55Z] [orchestrator] iter 2 — 3 done (T03,T13b,T15), 1 collateral fix (peer_handshake test 3-tuple), validation build=true test=false (1 known will be fixed by T09/T10) lint=false (out-of-scope)
+[2026-04-27T14:29:58Z] [orchestrator] iter 3 — 3 done (T04,T21,T23)
