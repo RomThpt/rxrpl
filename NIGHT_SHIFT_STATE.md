@@ -207,3 +207,13 @@ After pass 1 + pass 2 surfaced 2 critical + 16 high findings (15 deferred to fol
 **Cross-impl convergence (TODO end-to-end)**:
 The local cargo+fuzz suite is GREEN. The xrpl-hive cross-impl-payment sim has NOT been run against this branch yet (push blocked). Expected behavior given the substantial RCL port (T01-T20): close_time bins now match rippled (10/20/30/60/90/120), STValidation full SOTemplate, ValidationsTrie wired into wrong-prev-ledger detection, dispute avalanche thresholds 50/65/70/95, ProposalTracker dedup. Should improve hash convergence vs the 9 prior PRs but exact fix unknown without sim run.
 
+
+### Audit pass 2 fixes applied (5 batches, 10 findings resolved)
+- Fix C1+C3 — validations_trie monotonicity + record_trusted_validation node_id check (commit 2ae2eca)
+- Fix H4+H5 — ledger_trie higher-hash tie-break + validations_trie seq-based pruning (commit 1dffd86)
+- Fix H6+H8 — ProposalTracker LRU caps (64/16) + peer_proposal_at #[doc(hidden)] (commit a39ecd5)
+- Fix H11+H13 — filter (not clamp) peer close_times + preserve close_time=0 sentinel (commit 4817900)
+- Fix H12+H16 — canonical STObject ordering check + strict UTF-8 manifest domain (commit eac6c93)
+
+Final validation: build=true test=true lint=false (rxrpl-rpc-api pre-existing, out of scope).
+
