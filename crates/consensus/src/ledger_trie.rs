@@ -3,8 +3,7 @@
 //! Single-writer, no concurrency. Used by ValidationsTrie for
 //! preferred-branch discovery — at each fork the branch with the most
 //! cumulative support (`branch_support`) wins; ties broken deterministically
-//! by lower hash (matches rippled's `span.startID()` tie-break direction
-//! when applied to per-hash nodes).
+//! by HIGHER hash (matches rippled's `LedgerTrie.h` tie-break direction).
 //!
 //! NIGHT-SHIFT-REVIEW: rippled uses a *compressed* trie of variable-length
 //! `Span`s plus a `seqSupport` map keyed by ledger sequence so that
@@ -196,8 +195,9 @@ impl LedgerTrie {
     /// Walk the trie greedily and return the hash of the preferred tip.
     ///
     /// At each level, follow the child with the largest `branch_support`.
-    /// Ties are broken deterministically by the lower hash (mirrors
-    /// rippled's `span.startID()` tie-break, applied to per-hash nodes).
+    /// Ties are broken deterministically by the HIGHER hash (matches
+    /// rippled's `LedgerTrie.h` tie-break — see the `preferredChild`
+    /// comparison that prefers the larger `span.startID()`).
     /// Stops descending when the current node's `tip_support` is at least
     /// as large as the best child's `branch_support` — i.e. switching to a
     /// deeper branch with strictly less cumulative support is rejected
@@ -218,14 +218,14 @@ impl LedgerTrie {
 
         loop {
             // Pick the child with the highest branch_support; tie-break
-            // on lower hash for determinism.
+            // on higher hash for determinism (matches rippled).
             let mut best: Option<&Node> = None;
             for child in curr.children.values() {
                 best = Some(match best {
                     None => child,
                     Some(b) => {
                         if child.branch_support > b.branch_support
-                            || (child.branch_support == b.branch_support && child.hash < b.hash)
+                            || (child.branch_support == b.branch_support && child.hash > b.hash)
                         {
                             child
                         } else {
@@ -286,9 +286,10 @@ mod tests {
     }
 
     #[test]
-    fn equal_support_fork_breaks_tie_by_lower_hash() {
+    fn equal_support_fork_breaks_tie_by_higher_hash() {
         // Two branches diverging at depth 1: [1,2] and [1,3], each with
-        // support 1. Tie-break = lower hash, so h(2) wins over h(3).
+        // support 1. Tie-break = higher hash (rippled-compatible),
+        // so h(3) wins over h(2).
         let mut trie = LedgerTrie::new();
         trie.insert(&[h(1), h(2)], 1);
         trie.insert(&[h(1), h(3)], 1);
@@ -296,7 +297,7 @@ mod tests {
         assert_eq!(trie.branch_support(&h(1)), 2);
         assert_eq!(trie.branch_support(&h(2)), 1);
         assert_eq!(trie.branch_support(&h(3)), 1);
-        assert_eq!(trie.get_preferred(), Some(h(2)));
+        assert_eq!(trie.get_preferred(), Some(h(3)));
     }
 
     #[test]
@@ -479,12 +480,8 @@ mod tests {
     // The scenarios below cover everything else and are sufficient to
     // exercise structural insert/remove/preferred logic.
     //
-    // NIGHT-SHIFT-REVIEW: rippled breaks ties on the LARGER `span.startID()`
-    // (see `LedgerTrie.h:721`). The T15 port chose the LOWER hash instead
-    // (see `get_preferred()` and existing test
-    // `equal_support_fork_breaks_tie_by_lower_hash`). Tests below match the
-    // port's chosen direction; rippled's exact assertions on tie-breaking
-    // would need to flip accordingly.
+    // Tie-breaking: this port matches rippled's LARGER `span.startID()`
+    // tie-break direction (see `LedgerTrie.h`).
     // -----------------------------------------------------------------
 
     /// Build the branch for a string prefix. `prefix_branch("abc")` returns
