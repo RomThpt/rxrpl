@@ -29,6 +29,14 @@ const PROPOSAL_FRESHNESS_SECS: u32 = 30;
 /// (2000-01-01), used to convert wall-clock time to ripple time.
 const RIPPLE_EPOCH_OFFSET_SECS: u64 = 946_684_800;
 
+/// Hard cap on the number of proposals buffered in `pending_proposals`
+/// while we are outside `Establish` phase. Without this cap a peer can
+/// flood the Open phase and exhaust memory (audit pass 2 C2). 1024 is
+/// generous: it covers a full UNL of distinct trusted peers each sending
+/// a handful of proposals per round, while bounding the worst-case Vec
+/// growth to ~O(1024 * sizeof(Proposal)).
+const PENDING_PROPOSALS_MAX: usize = 1024;
+
 /// Result of checking whether trusted peers disagree on prev_ledger.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WrongPrevLedgerDetected {
@@ -672,7 +680,28 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
     /// deterministic. Production code should call [`Self::peer_proposal`].
     pub fn peer_proposal_at(&mut self, proposal: Proposal, now: u32) {
         if self.phase != ConsensusPhase::Establish {
-            // Buffer proposals received outside Establish phase
+            // Apply UNL + freshness gates BEFORE buffering to prevent
+            // pre-Establish memory amplification (audit pass 2 C2). Without
+            // these checks any peer (untrusted, stale, malicious) could
+            // flood the Open phase and exhaust memory via unbounded
+            // pending_proposals growth.
+            if !self.unl.is_empty() && !self.unl.is_trusted(&proposal.node_id) {
+                return;
+            }
+            let delta = now.abs_diff(proposal.close_time);
+            if delta > PROPOSAL_FRESHNESS_SECS {
+                self.proposal_dropped_stale_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if self.pending_proposals.len() >= PENDING_PROPOSALS_MAX {
+                tracing::warn!(
+                    target: "consensus",
+                    cap = PENDING_PROPOSALS_MAX,
+                    "pending_proposals cap reached, dropping"
+                );
+                return;
+            }
             self.pending_proposals.push(proposal);
             return;
         }
@@ -2512,6 +2541,105 @@ mod tests {
         engine.peer_proposal_at(future, now);
         assert_eq!(engine.proposal_dropped_stale_total(), 2);
         assert!(engine.peer_positions.is_empty());
+    }
+
+    // --- Audit pass 2 C2: pending_proposals gating in Open phase ---
+
+    /// Engine in Open phase (no `close_ledger` so phase != Establish), with
+    /// a 2-node UNL trusting nodes 1 and 2. Used to exercise the
+    /// pre-Establish UNL/freshness/cap gates on `pending_proposals`.
+    fn open_phase_engine() -> ConsensusEngine<SimpleAdapter> {
+        let unl = make_unl(&[1, 2]);
+        let mut engine = ConsensusEngine::new_with_unl(
+            SimpleAdapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+        debug_assert_eq!(engine.phase(), ConsensusPhase::Open);
+        engine
+    }
+
+    #[test]
+    fn pending_proposals_drops_untrusted_in_open_phase() {
+        // Audit pass 2 C2: an untrusted peer must not be able to push into
+        // pending_proposals during Open phase. Without the gate this is the
+        // primary memory-amplification vector.
+        let mut engine = open_phase_engine();
+        let now = 1_000_000u32;
+        let p = Proposal {
+            node_id: node(99), // not in UNL
+            public_key: vec![0x02; 33],
+            tx_set_hash: Hash256::ZERO,
+            close_time: now,
+            prop_seq: 0,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(p, now);
+        assert!(engine.pending_proposals.is_empty());
+    }
+
+    #[test]
+    fn pending_proposals_drops_stale_in_open_phase_and_bumps_counter() {
+        // Audit pass 2 C2: a trusted but stale-time proposal must be
+        // counted and dropped, never buffered. Mirrors the Establish-phase
+        // freshness gate.
+        let mut engine = open_phase_engine();
+        let now = 1_000_000u32;
+        let stale = Proposal {
+            node_id: node(2), // trusted
+            public_key: vec![0x02; 33],
+            tx_set_hash: Hash256::ZERO,
+            close_time: now - 100, // delta = 100 > PROPOSAL_FRESHNESS_SECS
+            prop_seq: 0,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(stale, now);
+        assert_eq!(engine.proposal_dropped_stale_total(), 1);
+        assert!(engine.pending_proposals.is_empty());
+    }
+
+    #[test]
+    fn pending_proposals_capped_in_open_phase() {
+        // Audit pass 2 C2: even when every proposal passes UNL + freshness,
+        // pending_proposals must be capped at PENDING_PROPOSALS_MAX so a
+        // trusted peer (or compromised key) cannot exhaust memory.
+        let mut engine = open_phase_engine();
+        let now = 1_000_000u32;
+        for i in 0..PENDING_PROPOSALS_MAX {
+            let p = Proposal {
+                node_id: node(2),
+                public_key: vec![0x02; 33],
+                tx_set_hash: Hash256::ZERO,
+                close_time: now,
+                prop_seq: i as u32,
+                ledger_seq: 1,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            };
+            engine.peer_proposal_at(p, now);
+        }
+        assert_eq!(engine.pending_proposals.len(), PENDING_PROPOSALS_MAX);
+
+        // The 1025th proposal must be dropped, not buffered.
+        let overflow = Proposal {
+            node_id: node(2),
+            public_key: vec![0x02; 33],
+            tx_set_hash: Hash256::ZERO,
+            close_time: now,
+            prop_seq: PENDING_PROPOSALS_MAX as u32,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(overflow, now);
+        assert_eq!(engine.pending_proposals.len(), PENDING_PROPOSALS_MAX);
     }
 
     // --- T19: ProposalTracker dedup tests ---
