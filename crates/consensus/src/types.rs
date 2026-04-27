@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use rxrpl_primitives::Hash256;
 
 /// Unique identifier for a consensus participant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct NodeId(pub Hash256);
 
 impl NodeId {
@@ -36,7 +36,7 @@ pub struct Proposal {
 }
 
 /// A ledger validation from a validator.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Validation {
     /// The validator's node ID.
     pub node_id: NodeId,
@@ -73,6 +73,32 @@ pub struct Validation {
     /// the legacy field-by-field reconstruction in
     /// `rxrpl_overlay::identity::verify_validation_signature`.
     pub signing_payload: Option<Vec<u8>>,
+    /// Optional `sfLoadFee` (UINT32) — server's local load-fee multiplier.
+    pub load_fee: Option<u32>,
+    /// Optional `sfBaseFee` (UINT64) — base fee in drops as encoded by rippled.
+    pub base_fee: Option<u64>,
+    /// Optional `sfReserveBase` (UINT32) — reserve base in legacy units.
+    pub reserve_base: Option<u32>,
+    /// Optional `sfReserveIncrement` (UINT32) — reserve increment in legacy units.
+    pub reserve_increment: Option<u32>,
+    /// Optional `sfCookie` (UINT64) — random cookie used for validator deduplication.
+    pub cookie: Option<u64>,
+    /// Optional `sfConsensusHash` (HASH256) — hash of the consensus tx set.
+    pub consensus_hash: Option<Hash256>,
+    /// Optional `sfValidatedHash` (HASH256) — hash of the most recently
+    /// validated ledger (used as a freshness witness).
+    pub validated_hash: Option<Hash256>,
+    /// Optional `sfServerVersion` (UINT64) — encoded rippled server version.
+    pub server_version: Option<u64>,
+    /// Optional `sfBaseFeeDrops` (UINT64) — XRP-amount-encoded base fee
+    /// (post-XRPFees amendment).
+    pub base_fee_drops: Option<u64>,
+    /// Optional `sfReserveBaseDrops` (UINT64) — XRP-amount-encoded reserve
+    /// base (post-XRPFees amendment).
+    pub reserve_base_drops: Option<u64>,
+    /// Optional `sfReserveIncrementDrops` (UINT64) — XRP-amount-encoded
+    /// reserve increment (post-XRPFees amendment).
+    pub reserve_increment_drops: Option<u64>,
 }
 
 impl Proposal {
@@ -354,6 +380,7 @@ mod tests {
             signature: None,
             amendments: vec![],
             signing_payload: None,
+            ..Default::default()
         };
 
         validation.sign(&kp.private_key, kp.key_type);
