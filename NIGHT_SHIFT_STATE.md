@@ -40,12 +40,6 @@ forbidden_paths:
 
 ### Ready
 
-- [ ] T09 [kind=code,deps=T08]: Update identity::sign_validation to encode full SOTemplate (canonical sort by field tag)
-  - acceptance: builder appends fields in canonical SField order; sfSignature excluded from signing payload
-  - acceptance: signing_payload populated with the strip-result so verifier can replay
-  - acceptance: parity test against a captured rippled validation hex (hardcoded fixture) passes
-  - globs: crates/overlay/src/identity.rs
-
 - [ ] T10 [kind=code,deps=T09]: Validation decoder in overlay reconstructs all SOTemplate fields and signing_payload
   - acceptance: parse_validation in validation_aggregator/validator_list/proto_convert emits full Validation struct
   - acceptance: round-trip test: encode→decode preserves every optional field
@@ -55,11 +49,6 @@ forbidden_paths:
   - acceptance: 500+ random Validation structs survive encode→decode without loss
   - acceptance: signing_hash stable across encode→decode→encode (idempotent)
   - globs: crates/overlay/tests/stvalidation_roundtrip.rs
-
-- [ ] T17 [kind=code,deps=T16]: Wire ValidationsTrie into ConsensusEngine.start_round to detect wrong-prev-ledger via preferred-branch
-  - acceptance: when ValidationsTrie.preferred() != engine.prev_ledger and trusted-validator support >= WRONG_PREV_LEDGER_THRESHOLD, return WrongPrevLedgerDetected
-  - acceptance: existing wrong_prev_ledger_votes HashMap path becomes secondary (kept for proposals only)
-  - globs: crates/consensus/src/engine.rs
 
 - [ ] T19 [kind=code,deps=T18]: Replace peer_positions: HashMap with ProposalTracker; preserve existing engine API
   - acceptance: peer_proposal delegates to tracker, increments dispute counters only on accepted updates
@@ -111,6 +100,8 @@ forbidden_paths:
 - T16 — ValidationsTrie aggregator over LedgerTrie, commit f4c2a83 (9/9 tests; 2 NIGHT-SHIFT-REVIEW deferrals)
 - T08 — Validation type extended with 11 SOTemplate fields, commit a357cda (initial WIP, unblocked by T08b)
 - T08b — added ..Default::default() to 15 Validation literal sites + validations_trie test fix, commits 286c381+manual (190/190 consensus tests green)
+- T09 — sign_validation full SOTemplate canonical sort + signing_payload, commit a1e6e3f (219/219 overlay tests)
+- T17 — wire ValidationsTrie into wrong-prev-ledger detection, commit 01ee19f (196/196 consensus tests; 1 NIGHT-SHIFT-REVIEW for UNL trusted setter)
 
 ### Blocked
 <!-- Tasks blocked on external dependencies, see PROBLEMS.md for details. -->
