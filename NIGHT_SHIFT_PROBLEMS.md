@@ -48,3 +48,9 @@ Resolution requires user decision:
 3. OR redesign orchestrator to track task status via Checkpoints (mutable) only, never mutating the Ready/Done sections — which contradicts the spec.
 
 Halting Phase 2 with `<promise>NIGHTSHIFT_PHASE_2_COMPLETE</promise>` so user can decide.
+
+## [WIP] stobject_validation_roundtrip — 2026-04-27T14:21Z
+Test in crates/overlay/tests/peer_handshake.rs:217 fails `decoded.signature.is_some()`. Will be addressed by T09 (sign_validation rewrite) + T10 (decoder reconstruction) — defer.
+
+## [WIP] rxrpl-rpc-api clippy::derivable_impls — 2026-04-27T14:21Z
+Pre-existing on main, NOT in nightly whitelist. crates/rpc-api/src/lib.rs:5 ApiVersion enum has manual Default impl that clippy 1.91 wants to derive. Out of scope for nightly run.
