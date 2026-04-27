@@ -52,6 +52,13 @@ pub struct ValidationAggregator {
     /// `validationCURRENT_*` window). Mirrors rippled's
     /// `validation_dropped_stale_total` metric.
     dropped_stale_total: AtomicU64,
+    /// Counter of validations dropped because their cryptographic signature
+    /// did not verify against the embedded public key. Bumped on the
+    /// defense-in-depth verify performed inside `add_validation_at`
+    /// (production builds) and on every call into
+    /// [`Self::verify_and_add_validation_at`]. Mirrors rippled's
+    /// `validation_dropped_bad_sig_total` metric in spirit.
+    dropped_invalid_signature_total: AtomicU64,
 }
 
 impl ValidationAggregator {
@@ -64,6 +71,7 @@ impl ValidationAggregator {
             highest_validated_hash: Hash256::ZERO,
             trusted: None,
             dropped_stale_total: AtomicU64::new(0),
+            dropped_invalid_signature_total: AtomicU64::new(0),
         }
     }
 
@@ -71,6 +79,15 @@ impl ValidationAggregator {
     /// check (`is_current`). Monotonic across the lifetime of the aggregator.
     pub fn dropped_stale_total(&self) -> u64 {
         self.dropped_stale_total.load(Ordering::Relaxed)
+    }
+
+    /// Number of validations dropped because their cryptographic signature
+    /// did not verify against the embedded public key. Monotonic across the
+    /// lifetime of the aggregator. Bumped both by the defense-in-depth check
+    /// inside `add_validation_at` (production builds) and by the explicit
+    /// [`Self::verify_and_add_validation_at`] entry point.
+    pub fn dropped_invalid_signature_total(&self) -> u64 {
+        self.dropped_invalid_signature_total.load(Ordering::Relaxed)
     }
 
     /// Attach a [`TrustedKeys`] handle so that incoming validations are
@@ -118,6 +135,43 @@ impl ValidationAggregator {
         self.add_validation_at(validation, ripple_now())
     }
 
+    /// Add a validation, but unconditionally verify its cryptographic
+    /// signature first. Use this entry point when the caller cannot
+    /// guarantee that [`crate::identity::verify_validation_signature`] was
+    /// already invoked on the wire-decoded value (e.g. checkpoint bootstrap,
+    /// catch-up resync, future code paths).
+    ///
+    /// On signature failure the validation is dropped, the
+    /// `dropped_invalid_signature_total` counter is incremented, a warning
+    /// is emitted on the `consensus` target, and `None` is returned without
+    /// ever touching the freshness/trust/quorum logic.
+    ///
+    /// In `cfg(not(test))` builds `add_validation_at` performs the same
+    /// check internally as a defense-in-depth measure (audit pass 1 H#10),
+    /// so calling this method from production code is harmless duplication
+    /// rather than a correctness requirement. The dedicated method exists
+    /// so test code that intentionally constructs unsigned validations can
+    /// continue to use `add_validation_at` while real callers can opt in to
+    /// strict verification regardless of the build flag.
+    pub fn verify_and_add_validation_at(
+        &mut self,
+        validation: Validation,
+        now: u32,
+    ) -> Option<ValidatedLedger> {
+        if !crate::identity::verify_validation_signature(&validation) {
+            self.dropped_invalid_signature_total
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                target: "consensus",
+                public_key = %hex::encode(&validation.public_key),
+                ledger_seq = validation.ledger_seq,
+                "validation_dropped_invalid_signature"
+            );
+            return None;
+        }
+        self.add_validation_at(validation, now)
+    }
+
     /// Like [`add_validation`] but with `now` injected (XRPL ripple time).
     /// Useful for deterministic tests of the freshness window.
     pub fn add_validation_at(
@@ -151,6 +205,27 @@ impl ValidationAggregator {
                 sign_time = validation.sign_time,
                 now = now,
                 "stale_validation",
+            );
+            return None;
+        }
+
+        // Defense-in-depth: verify the cryptographic signature even if a
+        // caller forgot to call `verify_validation_signature` before handing
+        // the validation off (audit pass 1 H#10). Production builds always
+        // enforce this; `cfg(test)` skips it so the existing test suite —
+        // which constructs unsigned validations on purpose — continues to
+        // exercise the freshness, trust, dedup and quorum logic in
+        // isolation. Tests that want to exercise the verify path should
+        // call [`Self::verify_and_add_validation_at`] instead.
+        #[cfg(any(not(test), feature = "verify-on-add"))]
+        if !crate::identity::verify_validation_signature(&validation) {
+            self.dropped_invalid_signature_total
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                target: "consensus",
+                public_key = %hex::encode(&validation.public_key),
+                ledger_seq = validation.ledger_seq,
+                "validation_dropped_invalid_signature"
             );
             return None;
         }
@@ -428,6 +503,89 @@ mod tests {
         assert_eq!(agg.dropped_stale_total(), 1);
         // And the validation must NOT have been recorded.
         assert_eq!(agg.validation_count(42, &hash), 0);
+    }
+
+    #[test]
+    fn invalid_signature_validation_dropped() {
+        // Defense-in-depth (audit pass 1 H#10): the explicit
+        // `verify_and_add_validation_at` path must drop validations whose
+        // signature does not verify, bump the counter, and never touch the
+        // freshness/trust/quorum logic.
+        use crate::identity::{NodeIdentity, verify_validation_signature};
+        use rxrpl_consensus::types::Validation;
+
+        let id = NodeIdentity::generate();
+        let hash = Hash256::new([0x77; 32]);
+
+        // Build a properly-signed validation, then tamper with the signature
+        // so verification fails.
+        let mut val = Validation {
+            node_id: NodeId(id.node_id),
+            public_key: id.public_key_bytes().to_vec(),
+            ledger_hash: hash,
+            ledger_seq: 99,
+            full: true,
+            close_time: TEST_NOW,
+            sign_time: TEST_NOW,
+            signature: None,
+            amendments: vec![],
+            signing_payload: None,
+            ..Default::default()
+        };
+        id.sign_validation(&mut val);
+        // Sanity: the freshly-signed validation must verify before we tamper.
+        assert!(verify_validation_signature(&val));
+
+        // Flip a bit in the signature — verification must now fail.
+        let sig = val.signature.as_mut().expect("signature present");
+        sig[0] ^= 0x01;
+        assert!(!verify_validation_signature(&val));
+
+        let mut agg = ValidationAggregator::new(1);
+        // The explicit verify-and-add path drops the validation and bumps
+        // the dedicated counter.
+        assert!(agg
+            .verify_and_add_validation_at(val, TEST_NOW)
+            .is_none());
+        assert_eq!(agg.dropped_invalid_signature_total(), 1);
+        // Nothing was recorded in the aggregator.
+        assert_eq!(agg.validation_count(99, &hash), 0);
+        assert!(!agg.is_validated(99));
+        // The freshness counter must be untouched — bad signatures and
+        // stale times are different drop reasons.
+        assert_eq!(agg.dropped_stale_total(), 0);
+    }
+
+    #[test]
+    fn valid_signature_validation_accepted_via_verify_and_add() {
+        // Sister test to `invalid_signature_validation_dropped`: a properly
+        // signed validation must flow through `verify_and_add_validation_at`
+        // and reach quorum without bumping the bad-signature counter.
+        use crate::identity::NodeIdentity;
+        use rxrpl_consensus::types::Validation;
+
+        let id = NodeIdentity::generate();
+        let hash = Hash256::new([0x88; 32]);
+
+        let mut val = Validation {
+            node_id: NodeId(id.node_id),
+            public_key: id.public_key_bytes().to_vec(),
+            ledger_hash: hash,
+            ledger_seq: 100,
+            full: true,
+            close_time: TEST_NOW,
+            sign_time: TEST_NOW,
+            signature: None,
+            amendments: vec![],
+            signing_payload: None,
+            ..Default::default()
+        };
+        id.sign_validation(&mut val);
+
+        let mut agg = ValidationAggregator::new(1);
+        let result = agg.verify_and_add_validation_at(val, TEST_NOW);
+        assert!(result.is_some());
+        assert_eq!(agg.dropped_invalid_signature_total(), 0);
     }
 
     #[test]
