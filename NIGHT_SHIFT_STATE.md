@@ -154,3 +154,9 @@ History:
 - Two-stage `check_wrong_prev_ledger` is thoughtful design
 - signing_payload byte-fidelity end-to-end (sign → encode → decode → verify)
 
+
+### Audit pass 1 fixes applied
+- Fix #1 — round_close_time u32 overflow → saturating_add (commit 1b77305)
+- Fix #10 — verify_and_add_validation_at as strict-verify entry point (commit 38b5a4d + revert cfg-test gating which fails cross-crate)
+- Remaining 8 highs deferred to audit pass 2/3 verification or follow-up PR
+
