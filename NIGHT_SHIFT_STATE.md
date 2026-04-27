@@ -40,11 +40,6 @@ forbidden_paths:
 
 ### Ready
 
-- [ ] T06 [kind=tests,deps=T05]: Property tests for adaptive bins and effCloseTime via proptest
-  - acceptance: proptest harness in tests/close_time_props.rs round-trips next_resolution and asserts eff_close_time(_, _, prior) > prior whenever non-zero input
-  - acceptance: 200+ generated cases, no panics
-  - globs: crates/consensus/tests/close_time_props.rs, crates/consensus/Cargo.toml
-
 - [ ] T09 [kind=code,deps=T08]: Update identity::sign_validation to encode full SOTemplate (canonical sort by field tag)
   - acceptance: builder appends fields in canonical SField order; sfSignature excluded from signing payload
   - acceptance: signing_payload populated with the strip-result so verifier can replay
@@ -60,17 +55,6 @@ forbidden_paths:
   - acceptance: 500+ random Validation structs survive encode→decode without loss
   - acceptance: signing_hash stable across encode→decode→encode (idempotent)
   - globs: crates/overlay/tests/stvalidation_roundtrip.rs
-
-- [ ] T14 [kind=code,deps=T12]: Apply same freshness check to incoming proposals (proposal staleness)
-  - acceptance: ConsensusEngine.peer_proposal rejects when |now - close_time| > PROPOSAL_FRESHNESS (use 30s like rippled propRELAY_INTERVAL)
-  - acceptance: tracing::debug log with reason; counter proposal_dropped_stale_total
-  - globs: crates/consensus/src/engine.rs
-
-- [ ] T16 [kind=code,deps=T15,T13]: Build ValidationsTrie aggregator on top of LedgerTrie + validation_aggregator
-  - acceptance: new struct ValidationsTrie tracks (NodeId -> latest Validation) and feeds counts into LedgerTrie
-  - acceptance: get_preferred(current_seq) returns hash of preferred branch tip at or above current_seq
-  - acceptance: 5+ tests including conflicting validations from same node (latest wins) and trusted-set filter
-  - globs: crates/consensus/src/validations_trie.rs, crates/consensus/src/lib.rs
 
 - [ ] T17 [kind=code,deps=T16]: Wire ValidationsTrie into ConsensusEngine.start_round to detect wrong-prev-ledger via preferred-branch
   - acceptance: when ValidationsTrie.preferred() != engine.prev_ledger and trusted-validator support >= WRONG_PREV_LEDGER_THRESHOLD, return WrongPrevLedgerDetected
@@ -128,6 +112,9 @@ forbidden_paths:
 - T05 — apply eff_close_time + prior_close_time field, commit ed05efd (172/172 consensus tests green)
 - T18 — ProposalTracker module, commit f41061e (7/7 tests green)
 - T22 — stobject_decode fuzz harness, commit dea175f (cargo fuzz build OK)
+- T06 — proptest harness 600 cases for next_resolution + eff_close_time, commit 3c6e5a6
+- T14 — proposal staleness gate PROPOSAL_FRESHNESS_SECS=30 + counter, commit 8595c70 (181/181 consensus tests)
+- T16 — ValidationsTrie aggregator over LedgerTrie, commit f4c2a83 (9/9 tests; 2 NIGHT-SHIFT-REVIEW deferrals)
 
 ### Blocked
 <!-- Tasks blocked on external dependencies, see PROBLEMS.md for details. -->
