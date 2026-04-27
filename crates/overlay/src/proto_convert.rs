@@ -143,6 +143,12 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
     let mut validation = Validation::default();
     let mut signing_pub_key: Vec<u8> = Vec::new();
     let mut signing_payload = Vec::with_capacity(payload.len());
+    // Track whether sfCloseTime (2,7) was actually present on the wire,
+    // so we can distinguish "field absent" (legacy fallback to sign_time)
+    // from "field present and explicitly zero" (the rippled
+    // "no opinion on close time" sentinel that engine::eff_close_time
+    // pattern-matches on). See H13.
+    let mut seen_close_time = false;
 
     let mut pos = 0;
     while pos < payload.len() {
@@ -165,7 +171,10 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
                 match field_id {
                     2 => validation.full = (v & 0x80000001) == 0x80000001,
                     6 => validation.ledger_seq = v,
-                    7 => validation.close_time = v,
+                    7 => {
+                        validation.close_time = v;
+                        seen_close_time = true;
+                    }
                     9 => validation.sign_time = v,
                     24 => validation.load_fee = Some(v),
                     31 => validation.reserve_base = Some(v),
@@ -268,9 +277,13 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
     validation.node_id = node_id;
     validation.public_key = signing_pub_key;
     validation.signing_payload = Some(signing_payload);
-    // For backward-compat with the previous decoder, fall back to
-    // `sign_time` when the wire payload omits sfCloseTime.
-    if validation.close_time == 0 {
+    // Fall back to `sign_time` ONLY when sfCloseTime was absent on the
+    // wire. A field that was present-but-zero is the rippled "no
+    // opinion on close time" sentinel: it MUST be preserved verbatim so
+    // that downstream consensus code (engine::eff_close_time, peer
+    // bucketing) can pattern-match on the zero value rather than seeing
+    // a manufactured close_time copied from sign_time. See H13.
+    if !seen_close_time {
         validation.close_time = validation.sign_time;
     }
 
@@ -1173,5 +1186,74 @@ mod tests {
         assert_eq!(decoded.signing_payload, original.signing_payload);
 
         assert!(verify_validation_signature(&decoded));
+    }
+
+    /// H13 regression: a validation that explicitly carries `sfCloseTime
+    /// = 0` on the wire (the rippled "no opinion on close_time"
+    /// sentinel) MUST decode with `close_time == 0`. The pre-fix
+    /// decoder rewrote any zero close_time to `sign_time`, destroying
+    /// the sentinel and feeding fabricated close_times into the
+    /// consensus bucket logic.
+    #[test]
+    fn h13_explicit_zero_close_time_is_preserved() {
+        use crate::stobject;
+
+        // Build a hand-crafted STObject containing every field the
+        // decoder needs for a well-formed validation, with sfCloseTime
+        // (2,7) explicitly present and set to 0.
+        let mut stobj: Vec<u8> = Vec::new();
+        stobject::put_uint32(&mut stobj, 2, 0x80000001); // sfFlags (full=true)
+        stobject::put_uint32(&mut stobj, 6, 42); // sfLedgerSequence
+        stobject::put_uint32(&mut stobj, 7, 0); // sfCloseTime — explicit 0
+        stobject::put_uint32(&mut stobj, 9, 770_000_001); // sfSigningTime
+        stobject::put_hash256(&mut stobj, 1, &[0xCD; 32]); // sfLedgerHash
+        stobject::put_vl(&mut stobj, 3, &[0x02u8; 33]); // sfSigningPubKey
+
+        let msg = TmValidation {
+            validation: Some(stobj),
+        };
+        let wire = msg.encode_to_vec();
+
+        let decoded = decode_validation(&wire).expect("decode must succeed");
+
+        // The wire payload had sfCloseTime explicitly set to 0; the
+        // decoder MUST preserve that value rather than substituting
+        // sign_time.
+        assert_eq!(
+            decoded.close_time, 0,
+            "explicit sfCloseTime=0 sentinel was rewritten to {} \
+             (sign_time={}) — H13 regression",
+            decoded.close_time, decoded.sign_time
+        );
+        // Sanity: sign_time still decodes correctly.
+        assert_eq!(decoded.sign_time, 770_000_001);
+    }
+
+    /// Companion to the H13 regression: when sfCloseTime is *absent*
+    /// from the wire, the decoder MUST still fall back to `sign_time`
+    /// for backward compatibility with the existing encoder, which
+    /// never emits sfCloseTime.
+    #[test]
+    fn h13_absent_close_time_falls_back_to_sign_time() {
+        use crate::stobject;
+
+        let mut stobj: Vec<u8> = Vec::new();
+        stobject::put_uint32(&mut stobj, 2, 0x80000001); // sfFlags
+        stobject::put_uint32(&mut stobj, 6, 42); // sfLedgerSequence
+        // sfCloseTime intentionally omitted.
+        stobject::put_uint32(&mut stobj, 9, 770_000_001); // sfSigningTime
+        stobject::put_hash256(&mut stobj, 1, &[0xCD; 32]); // sfLedgerHash
+        stobject::put_vl(&mut stobj, 3, &[0x02u8; 33]); // sfSigningPubKey
+
+        let msg = TmValidation {
+            validation: Some(stobj),
+        };
+        let wire = msg.encode_to_vec();
+        let decoded = decode_validation(&wire).expect("decode must succeed");
+
+        assert_eq!(
+            decoded.close_time, 770_000_001,
+            "absent sfCloseTime should fall back to sign_time"
+        );
     }
 }
