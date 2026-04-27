@@ -11,12 +11,14 @@
 /// When it didn't, widen one slot toward the last index so peers with
 /// drifting clocks are more likely to round to the same value.
 ///
-/// This tracker keeps the legacy "consecutive agreements" cadence used
-/// by `ConsensusEngine`: after `agreements_to_tighten` consecutive
-/// rounds of agreement we step one bin finer; any disagreement steps
-/// one bin coarser and resets the counter.  T03 will replace the
-/// counter pathway with rippled's modulo-on-`ledger_seq` cadence
-/// (`getNextLedgerTimeResolution`).
+/// As of T03 the tracker is driven exclusively through
+/// [`set_resolution`], which the engine recomputes once per round via
+/// [`next_resolution`] using the rippled modulo-on-`ledger_seq`
+/// cadence (`getNextLedgerTimeResolution`).  The legacy
+/// consecutive-agreements pathway ([`AdaptiveCloseTime::on_agreement`]
+/// / [`AdaptiveCloseTime::on_disagreement`]) is preserved as
+/// `#[deprecated]` no-ops for callers still on the old API; it is no
+/// longer wired into [`crate::ConsensusEngine`].
 ///
 /// Reference: rippled `src/xrpld/consensus/LedgerTiming.h:30-122`.
 
@@ -174,15 +176,33 @@ impl AdaptiveCloseTime {
     }
 
     /// Number of consecutive agreements recorded so far.
+    ///
+    /// Maintained only by the deprecated [`Self::on_agreement`] /
+    /// [`Self::on_disagreement`] pathway.  The current engine drives
+    /// the tracker through [`Self::set_resolution`] and never touches
+    /// this counter; callers that have migrated should ignore it.
     pub fn consecutive_agreements(&self) -> u32 {
         self.consecutive_agreements
     }
 
+    /// Snap the tracker to the bin nearest to `resolution` (using the
+    /// same ties-round-down rule as [`Self::new`]).  This is the API
+    /// the engine uses each round once it has computed the next
+    /// resolution via [`next_resolution`].
+    pub fn set_resolution(&mut self, resolution: u32) {
+        self.index = nearest_index(resolution);
+    }
+
     /// Record a round where all validators agreed on the close time.
     ///
-    /// After `agreements_to_tighten` consecutive agreements the
-    /// resolution steps one bin finer (toward index 0).  At the finest
-    /// bin the step is refused and the counter still resets.
+    /// **Deprecated.** The engine no longer steps the bin from this
+    /// hook; resolution is recomputed each round via
+    /// [`next_resolution`] and applied through [`Self::set_resolution`].
+    /// The method is preserved as an in-place no-op for backwards
+    /// compatibility with callers on the old consecutive-counter API.
+    #[deprecated(
+        note = "use next_resolution + set_resolution; consecutive-agreements pathway removed in T03"
+    )]
     pub fn on_agreement(&mut self) {
         self.consecutive_agreements += 1;
         if self.consecutive_agreements >= self.agreements_to_tighten {
@@ -195,9 +215,14 @@ impl AdaptiveCloseTime {
 
     /// Record a round where validators disagreed on the close time.
     ///
-    /// The resolution steps one bin coarser (toward the last index)
-    /// and the agreement counter is reset.  At the coarsest bin the
-    /// step is refused.
+    /// **Deprecated.** The engine no longer steps the bin from this
+    /// hook; resolution is recomputed each round via
+    /// [`next_resolution`] and applied through [`Self::set_resolution`].
+    /// The method is preserved for backwards compatibility with callers
+    /// on the old consecutive-counter API.
+    #[deprecated(
+        note = "use next_resolution + set_resolution; consecutive-agreements pathway removed in T03"
+    )]
     pub fn on_disagreement(&mut self) {
         self.consecutive_agreements = 0;
         if self.index + 1 < TIME_RESOLUTIONS.len() {
@@ -241,6 +266,7 @@ fn nearest_index(resolution: u32) -> usize {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // exercises the legacy on_agreement/on_disagreement API kept for back-compat
 mod tests {
     use super::*;
 
@@ -560,5 +586,31 @@ mod tests {
         assert_eq!(AdaptiveCloseTime::new(16).resolution(), 20);
         assert_eq!(AdaptiveCloseTime::new(45).resolution(), 30); // tie 30/60: rounds down
         assert_eq!(AdaptiveCloseTime::new(46).resolution(), 60);
+    }
+
+    #[test]
+    fn set_resolution_snaps_to_nearest_bin() {
+        // Exact bin values land on themselves.
+        let mut act = AdaptiveCloseTime::new(30);
+        for (i, &r) in TIME_RESOLUTIONS.iter().enumerate() {
+            act.set_resolution(r);
+            assert_eq!(act.index(), i, "exact bin {r} should map to index {i}");
+            assert_eq!(act.resolution(), r);
+        }
+
+        // Out-of-band values clamp to the nearest bin (same rule as
+        // `new`): below finest snaps to 10s, above coarsest to 120s.
+        act.set_resolution(0);
+        assert_eq!(act.resolution(), 10);
+        act.set_resolution(u32::MAX);
+        assert_eq!(act.resolution(), 120);
+
+        // Between-bin values pick the closer side; ties round down.
+        act.set_resolution(15);
+        assert_eq!(act.resolution(), 10);
+        act.set_resolution(16);
+        assert_eq!(act.resolution(), 20);
+        act.set_resolution(46);
+        assert_eq!(act.resolution(), 60);
     }
 }

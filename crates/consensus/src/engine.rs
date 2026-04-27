@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use rxrpl_primitives::Hash256;
 
 use crate::adapter::ConsensusAdapter;
-use crate::close_resolution::AdaptiveCloseTime;
+use crate::close_resolution::{next_resolution, AdaptiveCloseTime};
 use crate::error::ConsensusError;
 use crate::negative_unl::{NegativeUnlChange, NegativeUnlTracker};
 use crate::params::ConsensusParams;
@@ -82,6 +82,13 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     future_proposals: HashMap<Hash256, Vec<Proposal>>,
     /// Adaptive close-time resolution tracker.
     adaptive_close_time: AdaptiveCloseTime,
+    /// Did the previous round agree on close time (within the
+    /// then-current resolution)?  Initialised to `true` so the very
+    /// first round behaves like rippled's `previousAgree=true` boot
+    /// state — no spurious widening on startup.  Updated in
+    /// [`Self::accept`] and consumed in [`Self::start_round`] to
+    /// drive the rippled `getNextLedgerTimeResolution` cadence.
+    previous_close_agreed: bool,
 }
 
 /// Maximum number of distinct `prev_ledger` hashes held in
@@ -131,6 +138,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             wrong_prev_ledger_votes: HashMap::new(),
             future_proposals: HashMap::new(),
             adaptive_close_time,
+            previous_close_agreed: true,
         }
     }
 
@@ -342,6 +350,18 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
 
     /// Start a new consensus round for the next ledger.
     pub fn start_round(&mut self, prev_ledger: Hash256, ledger_seq: u32) {
+        // Recompute the close-time resolution for THIS round using the
+        // rippled `getNextLedgerTimeResolution` cadence: keyed on the
+        // new ledger sequence and the prior round's agreement flag, NOT
+        // on a count of consecutive agreements.  Mirrors rippled
+        // `RCLConsensus::Adaptor::onStartRound` which calls
+        // `getNextLedgerTimeResolution(parent.closeTimeResolution,
+        //  parent.closeAgree, ledgerSeq)` before each round.
+        let parent_resolution = self.adaptive_close_time.resolution();
+        let new_resolution =
+            next_resolution(parent_resolution, self.previous_close_agreed, ledger_seq);
+        self.adaptive_close_time.set_resolution(new_resolution);
+
         self.phase = ConsensusPhase::Open;
         self.our_position = None;
         self.our_set = None;
@@ -763,9 +783,18 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         let close_time = self.effective_close_time();
         self.accepted_close_time = Some(close_time);
 
-        // Check if peers disagree on close time
+        // Check whether peers agreed on close time.  The result is
+        // recorded on `previous_close_agreed` and consumed by the next
+        // `start_round`, which feeds it into `next_resolution` to pick
+        // the bin for the upcoming ledger.  This replaces the legacy
+        // `AdaptiveCloseTime::on_agreement` / `on_disagreement`
+        // pathway (deprecated in T03).
         let current_resolution = self.adaptive_close_time.resolution();
-        if !self.peer_positions.is_empty() {
+        let agreed = if self.peer_positions.is_empty() {
+            // Solo mode: no peers to disagree with, treat as agreement
+            // so the cadence keeps pushing toward finer bins.
+            true
+        } else {
             let our_time = self
                 .our_position
                 .as_ref()
@@ -777,16 +806,12 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             }
             let min = *times.iter().min().unwrap();
             let max = *times.iter().max().unwrap();
-            if max - min > current_resolution {
-                self.accepted_close_flags = 1;
-                self.adaptive_close_time.on_disagreement();
-            } else {
-                self.adaptive_close_time.on_agreement();
-            }
-        } else {
-            // Solo mode: always counts as agreement
-            self.adaptive_close_time.on_agreement();
+            max - min <= current_resolution
+        };
+        if !agreed {
+            self.accepted_close_flags = 1;
         }
+        self.previous_close_agreed = agreed;
 
         // Ask adapter to apply the tx set and get ledger hash
         let our_set = match &self.our_set {
@@ -1648,30 +1673,42 @@ mod tests {
 
     #[test]
     fn solo_rounds_count_as_agreement() {
+        // Solo mode (no peers) treats every round as agreement, so the
+        // rippled `getNextLedgerTimeResolution` cadence steps one bin
+        // finer at every multiple of `INCREASE_LEDGER_TIME_RESOLUTION_EVERY`
+        // (= 8).  Starting at the default 30s bin (index 2), the first
+        // tightening fires when `start_round` is called with seq == 8.
         let adapter = SimpleAdapter;
         let mut engine = ConsensusEngine::new(adapter, node(1), ConsensusParams::default());
 
-        // Run 5 solo rounds (each counts as agreement)
-        for seq in 1..=5 {
+        for seq in 1..=8 {
             engine.start_round(Hash256::ZERO, seq);
             let set = TxSet::new(vec![]);
             engine.close_ledger(set, 100, seq).unwrap();
             engine.converge();
         }
 
-        // After 5 agreements, resolution should halve: 30 -> 15
-        assert_eq!(engine.close_time_resolution(), 15);
+        // 8 agreed rounds: at seq == 8 the modulo gate fires and the
+        // bin steps from 30s (index 2) to 20s (index 1) — one bin
+        // finer, matching rippled.
+        assert_eq!(engine.close_time_resolution(), 20);
     }
 
     #[test]
     fn close_time_agreement_tightens_resolution() {
+        // Run 8 consecutive rounds where the peer agrees on the
+        // close-time bucket (spread of 0 ≤ resolution).  The first 7
+        // are no-ops at the bin level — only the call to `start_round`
+        // for seq == 8 (multiple of the rippled
+        // `INCREASE_LEDGER_TIME_RESOLUTION_EVERY = 8` cadence) triggers
+        // a step finer.  Starting at 30s (index 2) the bin moves to
+        // 20s (index 1).
         let adapter = SimpleAdapter;
         let node_a = node(0xA0);
         let node_b = node(0xB0);
         let mut engine = ConsensusEngine::new(adapter, node_a, ConsensusParams::default());
 
-        // Run 5 rounds where all peers agree on close time (within resolution)
-        for seq in 1..=5u32 {
+        for seq in 1..=8u32 {
             engine.start_round(Hash256::ZERO, seq);
             let set = TxSet::new(vec![]);
             engine.close_ledger(set.clone(), 100, seq).unwrap();
@@ -1691,113 +1728,120 @@ mod tests {
             engine.converge();
         }
 
-        // 5 agreements -> resolution halved from 30 to 15
-        assert_eq!(engine.close_time_resolution(), 15);
+        // 8 agreed rounds -> bin stepped one finer: 30s -> 20s.
+        assert_eq!(engine.close_time_resolution(), 20);
     }
 
     #[test]
     fn close_time_disagreement_loosens_resolution() {
+        // The rippled `getNextLedgerTimeResolution` cadence widens the
+        // bin on disagreement at every multiple of
+        // `DECREASE_LEDGER_TIME_RESOLUTION_EVERY = 1`, i.e. on the very
+        // next `start_round` after the disagreement is observed.
+        // Default starts at 30s; one disagreed round followed by a
+        // fresh start_round steps the bin one COARSER to 60s.
         let adapter = SimpleAdapter;
         let node_a = node(0xA0);
         let node_b = node(0xB0);
         let mut engine = ConsensusEngine::new(adapter, node_a, ConsensusParams::default());
 
-        // First: tighten by running 5 agreeing rounds
-        for seq in 1..=5u32 {
-            engine.start_round(Hash256::ZERO, seq);
-            let set = TxSet::new(vec![]);
-            engine.close_ledger(set.clone(), 100, seq).unwrap();
-            engine.peer_proposal(Proposal {
-                node_id: node_b,
-                public_key: vec![0x02; 33],
-                tx_set_hash: set.hash,
-                close_time: 100,
-                prop_seq: 0,
-                ledger_seq: seq,
-                prev_ledger: Hash256::ZERO,
-                signature: None,
-            });
-            engine.converge();
-        }
-        assert_eq!(engine.close_time_resolution(), 15);
-
-        // Now: disagreement (spread > 15)
-        engine.start_round(Hash256::ZERO, 6);
+        // Round 1: peers disagree (spread of 100 > 30s resolution).
+        // `accept` records `previous_close_agreed = false`.
+        engine.start_round(Hash256::ZERO, 1);
         let set = TxSet::new(vec![]);
-        engine.close_ledger(set.clone(), 100, 6).unwrap();
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
         engine.peer_proposal(Proposal {
             node_id: node_b,
             public_key: vec![0x02; 33],
             tx_set_hash: set.hash,
-            close_time: 200, // spread of 100 > 15
+            close_time: 200, // spread of 100 > 30
             prop_seq: 0,
-            ledger_seq: 6,
+            ledger_seq: 1,
             prev_ledger: Hash256::ZERO,
             signature: None,
         });
         engine.converge();
-
-        // Resolution doubled from 15 to 30
+        // The disagreement flag is set, but the bin step happens on
+        // the NEXT `start_round` (rippled recomputes resolution at the
+        // top of each round, not in `accept`).
+        assert_eq!(engine.accepted_close_flags(), 1);
         assert_eq!(engine.close_time_resolution(), 30);
+
+        // Round 2: `start_round` calls
+        // `next_resolution(30, false, 2)` → 60 (one bin coarser).
+        engine.start_round(Hash256::ZERO, 2);
+        assert_eq!(engine.close_time_resolution(), 60);
     }
 
     #[test]
     fn adaptive_resolution_used_for_rounding() {
+        // Verify that once the bin steps finer through the rippled
+        // cadence, downstream close-time rounding uses the NEW bin
+        // (not the params-default).  Run 8 agreed solo rounds to
+        // step from 30s -> 20s, then submit a round whose proposals
+        // straddle a 20s boundary and check the accepted close time.
         let adapter = SimpleAdapter;
         let node_a = node(0xA0);
         let node_b = node(0xB0);
+        let mut engine = ConsensusEngine::new(adapter, node_a, ConsensusParams::default());
 
-        // Use custom params with resolution 10 for easier testing
-        let params = ConsensusParams {
-            close_time_resolution: 10,
-            ..ConsensusParams::default()
-        };
-        let mut engine = ConsensusEngine::new(adapter, node_a, params);
-
-        // Run 5 solo rounds to halve resolution: 10 -> 5
-        for seq in 1..=5 {
+        for seq in 1..=8 {
             engine.start_round(Hash256::ZERO, seq);
             let set = TxSet::new(vec![]);
             engine.close_ledger(set, 100, seq).unwrap();
             engine.converge();
         }
-        assert_eq!(engine.close_time_resolution(), 5);
+        assert_eq!(engine.close_time_resolution(), 20);
 
-        // Now verify that close time rounding uses the new resolution
-        engine.start_round(Hash256::ZERO, 6);
+        // Round 9: peer proposes a close_time within the 20s bin so
+        // the round still counts as agreement.  Both 100 and 105 round
+        // to bucket 100 at resolution 20 ((100+10)/20*20 = 100,
+        // (105+10)/20*20 = 100), giving an unambiguous winner.
+        engine.start_round(Hash256::ZERO, 9);
         let set = TxSet::new(vec![]);
-        engine.close_ledger(set.clone(), 97, 6).unwrap();
+        engine.close_ledger(set.clone(), 100, 9).unwrap();
         engine.peer_proposal(Proposal {
             node_id: node_b,
             public_key: vec![0x02; 33],
             tx_set_hash: set.hash,
-            close_time: 103,
+            close_time: 105,
             prop_seq: 0,
-            ledger_seq: 6,
+            ledger_seq: 9,
             prev_ledger: Hash256::ZERO,
             signature: None,
         });
         engine.converge();
 
-        // Median of [97, 103] = 103 (index 1 of 2)
-        // Rounded to resolution 5: (103 + 2) / 5 * 5 = 105
-        assert_eq!(engine.accepted_close_time(), Some(105));
+        // Both proposals round to bucket 100 at resolution 20 → winner is 100.
+        assert_eq!(engine.accepted_close_time(), Some(100));
     }
 
     #[test]
     fn adaptive_resolution_getter_reflects_state() {
+        // The engine drives `AdaptiveCloseTime` exclusively through
+        // `set_resolution` now (T03), so the legacy
+        // `consecutive_agreements` counter stays at 0.  The visible
+        // state to assert is `resolution()`: stable at the default 30s
+        // bin until the modulo cadence fires at seq == 8.
         let adapter = SimpleAdapter;
         let mut engine = ConsensusEngine::new(adapter, node(1), ConsensusParams::default());
 
         assert_eq!(engine.adaptive_close_time().resolution(), 30);
-        assert_eq!(engine.adaptive_close_time().consecutive_agreements(), 0);
 
-        // One solo round
+        // Seq 1: agreement (solo) but seq % 8 != 0 → resolution holds.
         engine.start_round(Hash256::ZERO, 1);
         let set = TxSet::new(vec![]);
         engine.close_ledger(set, 100, 1).unwrap();
         engine.converge();
+        assert_eq!(engine.adaptive_close_time().resolution(), 30);
 
-        assert_eq!(engine.adaptive_close_time().consecutive_agreements(), 1);
+        // Walk to seq == 8 — the cadence fires and the bin tightens.
+        for seq in 2..=8 {
+            engine.start_round(Hash256::ZERO, seq);
+            let set = TxSet::new(vec![]);
+            engine.close_ledger(set, 100, seq).unwrap();
+            engine.converge();
+        }
+        assert_eq!(engine.adaptive_close_time().resolution(), 20);
     }
 }
