@@ -59,31 +59,36 @@ pub fn decode_propose_set(data: &[u8]) -> Result<Proposal, OverlayError> {
 
 /// Encode a validation as a rippled-compatible STObject inside TMValidation.
 ///
-/// The STObject contains: sfFlags, sfLedgerHash, sfLedgerSequence,
-/// sfSigningTime, sfSigningPubKey, sfSignature.
+/// When `validation.signing_payload` is populated (the canonical strip-result
+/// produced by [`crate::identity::NodeIdentity::sign_validation`]), the
+/// emitted STObject is `signing_payload || sfSignature`. This keeps the
+/// wire byte image in lock-step with the bytes that were signed, so a peer
+/// receiving the message can verify the signature by replaying the
+/// strip-result verbatim.
+///
+/// When `signing_payload` is `None` (legacy / locally-built validations
+/// that haven't been re-signed via T09), we fall back to the pre-T09
+/// 5-field encoding (sfFlags, sfLedgerSequence, sfSigningTime, sfLedgerHash,
+/// sfSigningPubKey) followed by sfSignature. This preserves byte-image
+/// compatibility with any code path that still expects the old encoding.
 pub fn encode_validation(validation: &Validation, public_key: &[u8]) -> Vec<u8> {
     use crate::stobject;
 
-    // Build the signing data (without signature) for hashing
     let mut stobj = Vec::with_capacity(256);
 
-    // sfFlags (UINT32, field 2) -- 0x80000001 = vfFullValidation if full
-    let flags: u32 = if validation.full { 0x80000001 } else { 0x00000000 };
-    stobject::put_uint32(&mut stobj, 2, flags);
+    if let Some(stripped) = validation.signing_payload.as_ref() {
+        stobj.extend_from_slice(stripped);
+    } else {
+        // Legacy 5-field fallback. Matches the pre-T09 byte image.
+        let flags: u32 = if validation.full { 0x80000001 } else { 0x00000000 };
+        stobject::put_uint32(&mut stobj, 2, flags);
+        stobject::put_uint32(&mut stobj, 6, validation.ledger_seq);
+        stobject::put_uint32(&mut stobj, 9, validation.sign_time);
+        stobject::put_hash256(&mut stobj, 1, validation.ledger_hash.as_bytes());
+        stobject::put_vl(&mut stobj, 3, public_key);
+    }
 
-    // sfLedgerSequence (UINT32, field 6)
-    stobject::put_uint32(&mut stobj, 6, validation.ledger_seq);
-
-    // sfSigningTime (UINT32, field 9)
-    stobject::put_uint32(&mut stobj, 9, validation.sign_time);
-
-    // sfLedgerHash (UINT256, field 1)
-    stobject::put_hash256(&mut stobj, 1, validation.ledger_hash.as_bytes());
-
-    // sfSigningPubKey (VL, field 3)
-    stobject::put_vl(&mut stobj, 3, public_key);
-
-    // sfSignature (VL, field 6) -- must be last (notSigning field)
+    // sfSignature (VL, field 6) -- emitted last (notSigning field).
     if let Some(ref sig) = validation.signature {
         stobject::put_vl(&mut stobj, 6, sig);
     }
@@ -95,121 +100,164 @@ pub fn encode_validation(validation: &Validation, public_key: &[u8]) -> Vec<u8> 
 }
 
 /// Decode a validation from rippled STObject format.
+///
+/// Walks the STObject byte stream, extracting every recognised SOTemplate
+/// field defined for STValidation, and reconstructs the canonical signing
+/// payload (the strip-result that excludes only `sfSignature` (7,6) and
+/// `sfMasterSignature` (7,18)). The strip-result is stashed in
+/// `Validation::signing_payload` so that
+/// [`crate::identity::verify_validation_signature`] can replay the exact
+/// byte sequence rippled signed over — without it, verification of any
+/// validation that carries an optional field unknown to the local schema
+/// would fail.
+///
+/// Field map (canonical, as encoded by rippled and by T09's encoder):
+/// - `(2,2)` sfFlags          → derives `full = (flags & 0x80000001) == 0x80000001`
+/// - `(2,6)` sfLedgerSequence → `ledger_seq`
+/// - `(2,7)` sfCloseTime      → `close_time`
+/// - `(2,9)` sfSigningTime    → `sign_time`
+/// - `(2,24)` sfLoadFee       → `load_fee`
+/// - `(2,31)` sfReserveBase   → `reserve_base`
+/// - `(2,32)` sfReserveIncrement → `reserve_increment`
+/// - `(3,5)` sfBaseFee        → `base_fee`
+/// - `(3,10)` sfCookie        → `cookie`
+/// - `(3,11)` sfServerVersion → `server_version`
+/// - `(5,1)` sfLedgerHash     → `ledger_hash`
+/// - `(5,23)` sfConsensusHash → `consensus_hash`
+/// - `(5,25)` sfValidatedHash → `validated_hash`
+/// - `(6,22)` sfBaseFeeDrops  → `base_fee_drops`
+/// - `(6,23)` sfReserveBaseDrops → `reserve_base_drops`
+/// - `(6,24)` sfReserveIncrementDrops → `reserve_increment_drops`
+/// - `(7,3)` sfSigningPubKey  → `public_key`
+/// - `(7,6)` sfSignature      → `signature` (excluded from signing_payload)
+/// - `(7,18)` sfMasterSignature → ignored, but still excluded from signing_payload
+/// - `(19,3)` sfAmendments    → `amendments`
 pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
+    use crate::stobject;
+
     let msg = TmValidation::decode(data)
         .map_err(|e| OverlayError::Codec(format!("decode Validation: {e}")))?;
 
     let payload = msg.validation.unwrap_or_default();
 
-    // Parse STObject fields and simultaneously rebuild the canonical signing
-    // payload (every field EXCEPT sfSignature 7/6 and sfMasterSignature 7/18).
-    // Rippled signs over the full STObject minus those two fields, so a
-    // verifier that reconstructs from a fixed subset breaks every time
-    // rippled adds a new optional field. Carrying the strip-result lets
-    // verification stay correct as the schema evolves.
-    let mut ledger_hash = Hash256::ZERO;
-    let mut ledger_seq = 0u32;
-    let mut sign_time = 0u32;
-    let mut close_time = 0u32;
-    let mut full = false;
-    let mut signature: Option<Vec<u8>> = None;
+    let mut validation = Validation::default();
     let mut signing_pub_key: Vec<u8> = Vec::new();
-    let mut amendments: Vec<Hash256> = Vec::new();
     let mut signing_payload = Vec::with_capacity(payload.len());
 
     let mut pos = 0;
     while pos < payload.len() {
         let field_start = pos;
-        let (type_id, field_id, hdr_len) =
-            crate::stobject::decode_field_id(&payload[pos..])
-                .ok_or_else(|| OverlayError::Codec("invalid STObject field header".into()))?;
+        let (type_id, field_id, hdr_len) = stobject::decode_field_id(&payload[pos..])
+            .ok_or_else(|| OverlayError::Codec("invalid STObject field header".into()))?;
         pos += hdr_len;
 
-        // Determine the value's byte range for this field.
-        let value_start = pos;
-        let value_len: usize = match type_id {
-            // UINT16
-            1 => 2,
+        // Decode the value and advance `pos` past it. We dispatch on
+        // type_id and use the matching stobject helper. The total
+        // bytes consumed for this field (header + value, including any
+        // VL length prefix) is `value_end - field_start` — that's the
+        // span we copy verbatim into the signing buffer for
+        // non-signature fields.
+        let value_end: usize = match type_id {
             // UINT32
-            2 => 4,
-            // UINT64
-            3 => 8,
-            // UINT128
-            4 => 16,
-            // UINT256
-            5 => 32,
-            // AMOUNT (8 for XRP, 48 for IOU)
-            6 => {
-                if pos >= payload.len() {
-                    return Err(OverlayError::Codec("truncated Amount field".into()));
+            2 => {
+                let (v, consumed) = stobject::decode_uint32(&payload[pos..])
+                    .ok_or_else(|| OverlayError::Codec("truncated UINT32".into()))?;
+                match field_id {
+                    2 => validation.full = (v & 0x80000001) == 0x80000001,
+                    6 => validation.ledger_seq = v,
+                    7 => validation.close_time = v,
+                    9 => validation.sign_time = v,
+                    24 => validation.load_fee = Some(v),
+                    31 => validation.reserve_base = Some(v),
+                    32 => validation.reserve_increment = Some(v),
+                    _ => {}
                 }
-                if payload[pos] & 0x80 != 0 { 48 } else { 8 }
+                pos + consumed
             }
-            // VL-prefixed (Blob, AccountID)
-            7 | 8 => {
-                let (vl_len, vl_hdr) = crate::stobject::decode_vl_length(&payload[pos..])
-                    .ok_or_else(|| OverlayError::Codec("invalid VL length".into()))?;
-                pos += vl_hdr;
-                vl_len
+            // UINT64
+            3 => {
+                let (v, consumed) = stobject::decode_uint64(&payload[pos..])
+                    .ok_or_else(|| OverlayError::Codec("truncated UINT64".into()))?;
+                match field_id {
+                    5 => validation.base_fee = Some(v),
+                    10 => validation.cookie = Some(v),
+                    11 => validation.server_version = Some(v),
+                    _ => {}
+                }
+                pos + consumed
             }
-            // VECTOR256 (Amendments etc.) — VL-prefixed array of Hash256.
+            // UINT256
+            5 => {
+                let (h, consumed) = stobject::decode_hash256(&payload[pos..])
+                    .ok_or_else(|| OverlayError::Codec("truncated UINT256".into()))?;
+                let hash = Hash256::new(h);
+                match field_id {
+                    1 => validation.ledger_hash = hash,
+                    23 => validation.consensus_hash = Some(hash),
+                    25 => validation.validated_hash = Some(hash),
+                    _ => {}
+                }
+                pos + consumed
+            }
+            // AMOUNT — only XRP-native amounts are valid in STValidation.
+            6 => {
+                let (drops, consumed) = stobject::decode_amount_xrp(&payload[pos..])
+                    .ok_or_else(|| OverlayError::Codec("invalid Amount (non-XRP in STValidation)".into()))?;
+                match field_id {
+                    22 => validation.base_fee_drops = Some(drops),
+                    23 => validation.reserve_base_drops = Some(drops),
+                    24 => validation.reserve_increment_drops = Some(drops),
+                    _ => {}
+                }
+                pos + consumed
+            }
+            // VL (Blob): sfSigningPubKey, sfSignature, sfMasterSignature.
+            7 => {
+                let (bytes, consumed) = stobject::decode_vl(&payload[pos..])
+                    .ok_or_else(|| OverlayError::Codec("invalid VL Blob".into()))?;
+                match field_id {
+                    3 => signing_pub_key = bytes,
+                    6 => validation.signature = Some(bytes),
+                    // 18 (sfMasterSignature) is intentionally not stored
+                    // by `Validation`; we still consume it and exclude
+                    // it from the signing payload below.
+                    _ => {}
+                }
+                pos + consumed
+            }
+            // VECTOR256 (Amendments).
             19 => {
-                let (vl_len, vl_hdr) = crate::stobject::decode_vl_length(&payload[pos..])
-                    .ok_or_else(|| OverlayError::Codec("invalid VL length".into()))?;
-                pos += vl_hdr;
-                vl_len
+                let (entries, consumed) = stobject::decode_vector256(&payload[pos..])
+                    .ok_or_else(|| OverlayError::Codec("invalid Vector256".into()))?;
+                if field_id == 3 {
+                    validation.amendments =
+                        entries.into_iter().map(Hash256::new).collect();
+                }
+                pos + consumed
             }
-            // UINT8
-            16 => 1,
             // Unknown type — we cannot determine its length, so we cannot
-            // continue parsing safely. Bail out preserving what we have.
+            // continue parsing safely. Stop and keep what we already have.
             _ => {
                 tracing::debug!(
                     "decode_validation: unknown STObject type_id={} field_id={}, stopping parse",
-                    type_id, field_id
+                    type_id,
+                    field_id
                 );
                 break;
             }
         };
-        if value_start + value_len > payload.len() {
-            return Err(OverlayError::Codec(format!(
-                "STObject field {type_id}/{field_id} truncated"
-            )));
-        }
-        let value = &payload[value_start..value_start + value_len];
 
-        // Extract fields we care about.
-        match (type_id, field_id) {
-            (2, 2) => {
-                // sfFlags
-                let v = u32::from_be_bytes(value.try_into().unwrap());
-                full = (v & 0x80000001) == 0x80000001;
-            }
-            (2, 6) => ledger_seq = u32::from_be_bytes(value.try_into().unwrap()),
-            (2, 7) => close_time = u32::from_be_bytes(value.try_into().unwrap()),
-            (2, 9) => sign_time = u32::from_be_bytes(value.try_into().unwrap()),
-            (5, 1) => ledger_hash = hash256_from_bytes(value)?,
-            (7, 3) => signing_pub_key = value.to_vec(),
-            (7, 6) => signature = Some(value.to_vec()),
-            (19, 4) => {
-                // sfAmendments — concatenated 32-byte hashes
-                for chunk in value.chunks_exact(32) {
-                    if let Ok(h) = hash256_from_bytes(chunk) {
-                        amendments.push(h);
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        // Append to the signing payload UNLESS this field is a signature.
-        // sfSignature = 7/6, sfMasterSignature = 7/18.
+        // Append this field's full bytes (header + VL prefix + value) to
+        // the signing payload UNLESS it's sfSignature (7,6) or
+        // sfMasterSignature (7,18). This must match T09's
+        // `sign_validation` strip-rule byte-for-byte so that the verifier
+        // can replay the signing buffer.
         let is_signature_field = matches!((type_id, field_id), (7, 6) | (7, 18));
         if !is_signature_field {
-            signing_payload.extend_from_slice(&payload[field_start..value_start + value_len]);
+            signing_payload.extend_from_slice(&payload[field_start..value_end]);
         }
 
-        pos = value_start + value_len;
+        pos = value_end;
     }
 
     let node_id = if !signing_pub_key.is_empty() {
@@ -217,20 +265,16 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
     } else {
         NodeId(Hash256::ZERO)
     };
+    validation.node_id = node_id;
+    validation.public_key = signing_pub_key;
+    validation.signing_payload = Some(signing_payload);
+    // For backward-compat with the previous decoder, fall back to
+    // `sign_time` when the wire payload omits sfCloseTime.
+    if validation.close_time == 0 {
+        validation.close_time = validation.sign_time;
+    }
 
-    Ok(Validation {
-        node_id,
-        public_key: signing_pub_key,
-        ledger_hash,
-        ledger_seq,
-        full,
-        close_time: if close_time != 0 { close_time } else { sign_time },
-        sign_time,
-        signature,
-        amendments,
-        signing_payload: Some(signing_payload),
-        ..Default::default()
-    })
+    Ok(validation)
 }
 
 // --- Transaction ---
@@ -1001,5 +1045,133 @@ mod tests {
         let encoded = encode_cluster(&[]);
         let decoded = decode_cluster(&encoded).unwrap();
         assert!(decoded.is_empty());
+    }
+
+    /// T10 round-trip: build a `Validation` populated with every optional
+    /// SOTemplate field, sign it via T09 `sign_validation`, encode it
+    /// through `encode_validation`, and decode it back. Every field
+    /// (including the strip-result `signing_payload`) must survive the
+    /// trip unchanged.
+    #[test]
+    fn validation_full_sotemplate_roundtrip() {
+        use crate::identity::{NodeIdentity, verify_validation_signature};
+        use rxrpl_consensus::types::Validation;
+
+        let id = NodeIdentity::generate();
+        let mut original = Validation {
+            node_id: NodeId(id.node_id),
+            public_key: id.public_key_bytes().to_vec(),
+            ledger_hash: Hash256::new([0xAB; 32]),
+            ledger_seq: 12_345_678,
+            full: true,
+            close_time: 0, // sfCloseTime is not emitted by sign_validation
+            sign_time: 770_000_001,
+            signature: None,
+            amendments: vec![Hash256::new([0x11; 32]), Hash256::new([0x22; 32])],
+            signing_payload: None,
+            load_fee: Some(256),
+            base_fee: Some(10),
+            reserve_base: Some(10_000_000),
+            reserve_increment: Some(2_000_000),
+            cookie: Some(0xDEAD_BEEF_CAFE_F00D),
+            consensus_hash: Some(Hash256::new([0x33; 32])),
+            validated_hash: Some(Hash256::new([0x44; 32])),
+            server_version: Some(0x0102_0003_0000_0000),
+            base_fee_drops: Some(10),
+            reserve_base_drops: Some(10_000_000),
+            reserve_increment_drops: Some(2_000_000),
+        };
+
+        // Sign: stashes the canonical strip-result into `signing_payload`.
+        id.sign_validation(&mut original);
+        assert!(original.signature.is_some(), "signing must produce a signature");
+        assert!(
+            original.signing_payload.is_some(),
+            "signing must stash the strip-result"
+        );
+
+        // Encode → decode.
+        let wire = encode_validation(&original, id.public_key_bytes());
+        let decoded = decode_validation(&wire).expect("decode must succeed");
+
+        // Every SOTemplate field round-trips. `close_time` is special:
+        // `sign_validation` does not emit sfCloseTime, so on the wire
+        // there's no close_time field and the decoder falls back to
+        // `sign_time`. We assert that semantics explicitly.
+        assert_eq!(decoded.public_key, original.public_key);
+        assert_eq!(decoded.node_id, original.node_id);
+        assert_eq!(decoded.ledger_hash, original.ledger_hash);
+        assert_eq!(decoded.ledger_seq, original.ledger_seq);
+        assert_eq!(decoded.full, original.full);
+        assert_eq!(decoded.sign_time, original.sign_time);
+        assert_eq!(decoded.close_time, original.sign_time);
+        assert_eq!(decoded.signature, original.signature);
+        assert_eq!(decoded.amendments, original.amendments);
+        assert_eq!(decoded.load_fee, original.load_fee);
+        assert_eq!(decoded.base_fee, original.base_fee);
+        assert_eq!(decoded.reserve_base, original.reserve_base);
+        assert_eq!(decoded.reserve_increment, original.reserve_increment);
+        assert_eq!(decoded.cookie, original.cookie);
+        assert_eq!(decoded.consensus_hash, original.consensus_hash);
+        assert_eq!(decoded.validated_hash, original.validated_hash);
+        assert_eq!(decoded.server_version, original.server_version);
+        assert_eq!(decoded.base_fee_drops, original.base_fee_drops);
+        assert_eq!(decoded.reserve_base_drops, original.reserve_base_drops);
+        assert_eq!(decoded.reserve_increment_drops, original.reserve_increment_drops);
+        // The strip-result must be byte-identical: any divergence here
+        // would break signature verification on the receiving side.
+        assert_eq!(
+            decoded.signing_payload, original.signing_payload,
+            "strip-result must round-trip byte-for-byte"
+        );
+
+        // And the signature must verify against the decoded validation.
+        assert!(
+            verify_validation_signature(&decoded),
+            "decoded validation signature must verify"
+        );
+    }
+
+    /// T10 round-trip — minimal Validation (no optional fields). Verifies
+    /// that the legacy 5-field byte image still round-trips after the
+    /// decoder rewrite.
+    #[test]
+    fn validation_minimal_roundtrip() {
+        use crate::identity::{NodeIdentity, verify_validation_signature};
+        use rxrpl_consensus::types::Validation;
+
+        let id = NodeIdentity::generate();
+        let mut original = Validation {
+            node_id: NodeId(id.node_id),
+            public_key: id.public_key_bytes().to_vec(),
+            ledger_hash: Hash256::new([0xCC; 32]),
+            ledger_seq: 42,
+            full: true,
+            close_time: 1000,
+            sign_time: 1000,
+            signature: None,
+            amendments: vec![],
+            signing_payload: None,
+            ..Default::default()
+        };
+        id.sign_validation(&mut original);
+
+        let wire = encode_validation(&original, id.public_key_bytes());
+        let decoded = decode_validation(&wire).expect("decode must succeed");
+
+        assert_eq!(decoded.public_key, original.public_key);
+        assert_eq!(decoded.ledger_hash, original.ledger_hash);
+        assert_eq!(decoded.ledger_seq, original.ledger_seq);
+        assert_eq!(decoded.full, original.full);
+        assert_eq!(decoded.sign_time, original.sign_time);
+        assert_eq!(decoded.signature, original.signature);
+        assert!(decoded.amendments.is_empty());
+        assert!(decoded.load_fee.is_none());
+        assert!(decoded.base_fee.is_none());
+        assert!(decoded.cookie.is_none());
+        assert!(decoded.consensus_hash.is_none());
+        assert_eq!(decoded.signing_payload, original.signing_payload);
+
+        assert!(verify_validation_signature(&decoded));
     }
 }
