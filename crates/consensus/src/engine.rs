@@ -942,6 +942,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             signature: None,
             amendments: vec![],
             signing_payload: None,
+            ..Default::default()
         };
 
         self.adapter.on_accept(&validation);

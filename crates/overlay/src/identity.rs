@@ -285,6 +285,7 @@ mod tests {
             signature: None,
             amendments: vec![],
             signing_payload: None,
+            ..Default::default()
         };
 
         // Unsigned validation should fail verification
@@ -313,6 +314,7 @@ mod tests {
             signature: None,
             amendments: vec![],
             signing_payload: None,
+            ..Default::default()
         };
 
         id.sign_validation(&mut validation);
@@ -341,6 +343,7 @@ mod tests {
             signature: None,
             amendments: vec![],
             signing_payload: None,
+            ..Default::default()
         };
 
         id1.sign_validation(&mut validation);
@@ -368,6 +371,7 @@ mod tests {
             signature: None,
             amendments: vec![],
             signing_payload: None,
+            ..Default::default()
         };
 
         assert!(!verify_validation_signature(&validation));
@@ -390,6 +394,7 @@ mod tests {
             signature: None,
             amendments: vec![],
             signing_payload: None,
+            ..Default::default()
         };
 
         id.sign_validation(&mut validation);

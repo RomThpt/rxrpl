@@ -174,6 +174,7 @@ mod tests {
             signature: None,
             amendments: vec![],
             signing_payload: None,
+            ..Default::default()
         }
     }
 

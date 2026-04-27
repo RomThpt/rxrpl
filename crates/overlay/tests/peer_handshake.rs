@@ -202,6 +202,7 @@ fn stobject_validation_roundtrip() {
         signature: None,
         amendments: vec![],
         signing_payload: None,
+        ..Default::default()
     };
 
     id.sign_validation(&mut validation);

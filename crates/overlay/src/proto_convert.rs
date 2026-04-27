@@ -229,6 +229,7 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
         signature,
         amendments,
         signing_payload: Some(signing_payload),
+        ..Default::default()
     })
 }
 

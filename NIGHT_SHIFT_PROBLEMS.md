@@ -21,6 +21,11 @@ Tags: `[UNCERTAINTY]` `[ASSUMPTION]` `[BLOCKED]` `[UNFIXED]` `[TEST_GAP]` `[DEPE
 
 <!-- Active problems still affecting the run. -->
 
+[BLOCKED] T08b — crates/consensus/src/validations_trie.rs:142 outside whitelist.
+- Context: T08b whitelist enumerated 15 sites the T08 agent identified, but `crates/consensus/src/validations_trie.rs:142` (a test helper) also constructs a `Validation { ... }` literal and now fails to compile with E0063 (missing 11 new fields). Production lib build of rxrpl-consensus passes; only `cargo test -p rxrpl-consensus` is broken. rxrpl-overlay and rxrpl-node tests compile cleanly.
+- Attempts: Tried to add `..Default::default()` to the literal — denied by whitelist enforcement.
+- Suggested next step: Either (a) widen the T08b whitelist by one file and re-run, or (b) spawn a tiny T08c with whitelist `crates/consensus/src/validations_trie.rs` only. The fix is mechanical: add `..Default::default()` after `signing_payload: None,` at line 152.
+
 [ASSUMPTION] T14 — peer_proposal freshness gate forced edits OUTSIDE the engine.rs whitelist.
 - Context: Adding the wall-clock freshness check to `ConsensusEngine::peer_proposal` makes any caller passing a frozen close_time (e.g. 100) fail. Two such callers live outside the whitelist: `crates/consensus/src/simulator.rs` (drives `simulator::tests::*` lib tests) and `crates/consensus/tests/multi_node.rs` (integration test). Without their migration `cargo test -p rxrpl-consensus --lib` would regress on the simulator tests.
 - Attempts: Updated both files to call `peer_proposal_at(p, p.close_time)` so the freshness anchor is the proposal's own close_time (delta=0 always).

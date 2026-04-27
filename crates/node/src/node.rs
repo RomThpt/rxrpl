@@ -1808,6 +1808,7 @@ impl Node {
                 signature: None,
                 amendments: our_amendment_votes,
                 signing_payload: None,
+                ..Default::default()
             };
             identity.sign_validation(&mut validation);
             let payload = rxrpl_overlay::proto_convert::encode_validation(
@@ -2620,6 +2621,7 @@ mod tests {
                 signature: None,
                 amendments: vec![],
                 signing_payload: None,
+                ..Default::default()
             };
             assert!(val_aggregator.add_validation_at(v, 100).is_none());
         }
@@ -2636,6 +2638,7 @@ mod tests {
             signature: None,
             amendments: vec![],
             signing_payload: None,
+            ..Default::default()
         };
         let result = val_aggregator.add_validation_at(v28, 100);
         assert!(result.is_some());
@@ -2671,6 +2674,7 @@ mod tests {
                 signature: None,
                 amendments: vec![],
                 signing_payload: None,
+                ..Default::default()
             };
             assert!(val_aggregator.add_validation_at(v, 100).is_none());
         }
@@ -2685,6 +2689,7 @@ mod tests {
             signature: None,
             amendments: vec![],
             signing_payload: None,
+            ..Default::default()
         };
         assert!(val_aggregator.add_validation_at(v5, 100).is_some());
     }
