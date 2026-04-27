@@ -36,7 +36,7 @@
 //! also invoke [`Self::prune_below`] to evict stale entries from
 //! `self.latest` and the persistent trie so the fast path applies.
 
-use std::cell::RefCell;
+use std::sync::Mutex;
 use std::collections::{HashMap, HashSet};
 
 use rxrpl_primitives::Hash256;
@@ -76,7 +76,7 @@ pub struct ValidationsTrie {
     /// Memoised slow-path answer: `(current_seq, generation_at_compute,
     /// preferred_hash)`. Behind a [`RefCell`] so `get_preferred` can stay
     /// `&self` (callers treat it as a pure read).
-    preferred_cache: RefCell<Option<(u32, u64, Option<Hash256>)>>,
+    preferred_cache: std::sync::Mutex<Option<(u32, u64, Option<Hash256>)>>,
 }
 
 impl Default for ValidationsTrie {
@@ -93,7 +93,7 @@ impl ValidationsTrie {
             latest: HashMap::new(),
             trusted: HashSet::new(),
             generation: 0,
-            preferred_cache: RefCell::new(None),
+            preferred_cache: Mutex::new(None),
         }
     }
 
@@ -102,7 +102,9 @@ impl ValidationsTrie {
     /// hash.
     fn invalidate_cache(&mut self) {
         self.generation = self.generation.wrapping_add(1);
-        self.preferred_cache.get_mut().take();
+        if let Ok(mut guard) = self.preferred_cache.lock() {
+            *guard = None;
+        }
     }
 
     /// Mark `node` as trusted. Subsequent [`add`](Self::add) calls from this
@@ -220,9 +222,11 @@ impl ValidationsTrie {
 
         // Slow path with memoisation: if the cached entry was computed at
         // the same generation and same `current_seq`, reuse it.
-        if let Some((cached_seq, cached_gen, cached_hash)) = *self.preferred_cache.borrow() {
-            if cached_seq == current_seq && cached_gen == self.generation {
-                return cached_hash;
+        if let Ok(guard) = self.preferred_cache.lock() {
+            if let Some((cached_seq, cached_gen, cached_hash)) = *guard {
+                if cached_seq == current_seq && cached_gen == self.generation {
+                    return cached_hash;
+                }
             }
         }
 
@@ -233,7 +237,9 @@ impl ValidationsTrie {
             }
         }
         let preferred = filtered.get_preferred();
-        *self.preferred_cache.borrow_mut() = Some((current_seq, self.generation, preferred));
+        if let Ok(mut guard) = self.preferred_cache.lock() {
+            *guard = Some((current_seq, self.generation, preferred));
+        }
         preferred
     }
 
