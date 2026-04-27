@@ -2257,17 +2257,22 @@ impl PeerManager {
 
         if !request_node_ids.is_empty() {
             // Delta sync: serve specific nodes by walking the SHAMap to the
-            // requested (path, depth). Outgoing nodedata appends a trailing
-            // depth byte to match rippled's TMLedgerNode wire format.
+            // requested (path, depth). Outgoing nodedata is in rippled
+            // TMLedgerNode wire format: payload || wireType byte.
+            //
+            // - Inner (16*32 bytes in storage): payload as-is + wireType 2.
+            // - Leaf account state (key || data in storage): reorder to
+            //   data || key + wireType 1. State map leaves are always
+            //   account-state for liAS_NODE responses.
             for node_id in &request_node_ids {
-                let Some((_content_hash, mut raw)) = ledger.state_map.node_at(*node_id) else {
+                let Some((_content_hash, raw)) = ledger.state_map.node_at(*node_id) else {
                     continue;
                 };
-                raw.push(node_id.depth());
+                let wire = encode_state_wire_node(&raw);
                 let id_bytes = node_id.to_wire_bytes();
-                let entry_size = id_bytes.len() + raw.len();
+                let entry_size = id_bytes.len() + wire.len();
                 if total_size + entry_size <= MAX_RESPONSE_SIZE {
-                    nodes.push((id_bytes, raw));
+                    nodes.push((id_bytes, wire));
                     total_size += entry_size;
                 } else {
                     truncated = true;
@@ -2282,11 +2287,16 @@ impl PeerManager {
                 );
             }
         } else {
-            // Full sync fallback: serve all leaf nodes.
+            // Full sync fallback: serve all leaf nodes in rippled wire format
+            // (data || key || wireType=1 for account state).
             ledger.state_map.for_each(&mut |key, data| {
-                let entry_size = key.as_bytes().len() + data.len();
+                let mut wire = Vec::with_capacity(data.len() + 33);
+                wire.extend_from_slice(data);
+                wire.extend_from_slice(key.as_bytes());
+                wire.push(1u8); // WIRE_TYPE_ACCOUNT_STATE
+                let entry_size = key.as_bytes().len() + wire.len();
                 if total_size + entry_size <= MAX_RESPONSE_SIZE {
-                    nodes.push((key.as_bytes().to_vec(), data.to_vec()));
+                    nodes.push((key.as_bytes().to_vec(), wire));
                     total_size += entry_size;
                 } else {
                     truncated = true;
@@ -2557,6 +2567,40 @@ async fn try_accept_inbound(
         .await;
 
     Ok(peer_node_id)
+}
+
+/// Convert a SHAMap storage-format node into the rippled `TMLedgerNode.nodedata`
+/// wire format for state-map (account-state) responses.
+///
+/// Storage layout (rxrpl `node_store::deserialize_node`):
+/// - Inner: `16 * 32 bytes` of child hashes
+/// - Leaf account state: `key[32] || data`
+///
+/// Wire layout (rippled `SHAMap{Inner,AccountStateLeaf}Node::serializeForWire`):
+/// - Inner: `16 * 32 bytes || 0x02` (wireTypeInner)
+/// - Leaf account state: `data || key[32] || 0x01` (wireTypeAccountState)
+///
+/// State maps only contain account-state leaves and inner nodes, so we don't
+/// need to dispatch on tx-leaf wire types here.
+fn encode_state_wire_node(storage: &[u8]) -> Vec<u8> {
+    if storage.len() == 16 * 32 {
+        let mut wire = Vec::with_capacity(storage.len() + 1);
+        wire.extend_from_slice(storage);
+        wire.push(2u8); // wireTypeInner
+        wire
+    } else if storage.len() >= 32 {
+        // Leaf: storage = key[32] || data; wire = data || key || 0x01
+        let key = &storage[..32];
+        let data = &storage[32..];
+        let mut wire = Vec::with_capacity(storage.len() + 1);
+        wire.extend_from_slice(data);
+        wire.extend_from_slice(key);
+        wire.push(1u8); // wireTypeAccountState
+        wire
+    } else {
+        // Malformed; emit untyped passthrough so the receiver discards.
+        storage.to_vec()
+    }
 }
 
 /// Split a framed connection and spawn read/write loops.
