@@ -217,3 +217,11 @@ The local cargo+fuzz suite is GREEN. The xrpl-hive cross-impl-payment sim has NO
 
 Final validation: build=true test=true lint=false (rxrpl-rpc-api pre-existing, out of scope).
 
+
+### Final cleanup (post audit fixes)
+- rxrpl-rpc-api ApiVersion derived Default (commit 75dadd6 — fixed clippy::derivable_impls)
+- validations_trie parent_ledger chaining + cache memoisation (commit 485a524 from NSR fixer)
+- validations_trie Mutex instead of RefCell (commit fbb02c3 — needed for Sync across tokio spawn)
+
+Remaining lint errors are PRE-EXISTING workspace-wide clippy warnings (close_resolution.rs:23 doc comment, shamap.rs collapsible blocks, config types.rs derivable impls, codec binary serializer). All on `main` BEFORE nightly. Not in nightly whitelist scope. Should be addressed in a separate clippy-cleanup PR.
+
