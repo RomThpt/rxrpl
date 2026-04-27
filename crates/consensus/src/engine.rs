@@ -1138,7 +1138,7 @@ pub fn round_close_time(t: u32, resolution: u32) -> u32 {
     if resolution == 0 {
         return t;
     }
-    (t + resolution / 2) / resolution * resolution
+    t.saturating_add(resolution / 2) / resolution * resolution
 }
 
 /// Compute the effective close time for a ledger, clamping to strictly
@@ -1499,6 +1499,13 @@ mod tests {
         assert_eq!(round_close_time(150, 30), 150);
         assert_eq!(round_close_time(130, 30), 120);
         assert_eq!(round_close_time(100, 0), 100);
+    }
+
+    #[test]
+    fn round_close_time_saturates_near_u32_max() {
+        // prior to fix: (u32::MAX-30 + 60) wrapped, returning a tiny number
+        let r = round_close_time(u32::MAX - 30, 30);
+        assert!(r >= u32::MAX - 60, "expected near u32::MAX, got {}", r);
     }
 
     #[test]
