@@ -998,6 +998,15 @@ impl Node {
             let mut syncing = false;
             let mut max_peer_seq: u32 = 0;
             let mut pending_close_time = 0u32;
+            // Cache of LedgerHeader objects parsed from peer liBASE responses.
+            // We need the full header (parent_hash, parent_close_time,
+            // close_time, drops, close_time_resolution, close_flags) when
+            // reconstructing a catchup ledger so the next consensus round can
+            // close to a hash that matches what the peer would compute.
+            // Without this, `from_catchup` left those fields at zero/default
+            // and the next local close diverged from the peer's chain.
+            let mut catchup_headers: std::collections::HashMap<u32, rxrpl_ledger::LedgerHeader> =
+                std::collections::HashMap::new();
             // Track validations from network peers to determine validated ledgers.
             // Quorum is 80% of the trusted UNL size (rippled convention),
             // floored at 1. Falls back to 28 only if no UNL is configured
@@ -1475,7 +1484,8 @@ impl Node {
                                     hash, seq, nodes.len()
                                 );
                                 if !nodes.is_empty() {
-                                    match Node::try_reconstruct_ledger(seq, hash, &nodes, &node_store) {
+                                    let cached = catchup_headers.get(&seq);
+                                    match Node::try_reconstruct_ledger(seq, hash, &nodes, &node_store, cached) {
                                         Ok(reconstructed) => {
                                             let mut history = closed_ledgers.write().await;
                                             if !history.iter().any(|l| l.header.sequence == seq) {
@@ -1535,9 +1545,19 @@ impl Node {
                                     "received parsed header for ledger #{} hash={}",
                                     seq, header.hash
                                 );
-                                // The overlay layer handles incremental sync (liAS_NODE
-                                // requests). LedgerData with the full state triggers
-                                // reconstruction when it arrives.
+                                // Cache the header so try_reconstruct_ledger
+                                // can populate the full header on the
+                                // catchup-built closed ledger. Bound the cache
+                                // at 256 entries to keep memory finite under
+                                // adversarial peers.
+                                if catchup_headers.len() >= 256 {
+                                    if let Some(min_seq) =
+                                        catchup_headers.keys().min().copied()
+                                    {
+                                        catchup_headers.remove(&min_seq);
+                                    }
+                                }
+                                catchup_headers.insert(seq, header);
                             }
                             ConsensusMessage::TxSetAcquired(tx_set) => {
                                 tracing::info!(
@@ -1859,10 +1879,11 @@ impl Node {
         expected_hash: Hash256,
         nodes: &[(Vec<u8>, Vec<u8>)],
         node_store: &Option<Arc<dyn NodeStore>>,
+        cached_header: Option<&rxrpl_ledger::LedgerHeader>,
     ) -> Result<Ledger, NodeError> {
         let state_map = SHAMap::from_leaf_nodes(nodes)
             .map_err(|e| NodeError::Server(format!("shamap reconstruction failed: {e}")))?;
-        match node_store {
+        let mut ledger = match node_store {
             Some(store) => {
                 let mut ledger = Ledger::from_catchup_with_store(
                     seq,
@@ -1874,10 +1895,26 @@ impl Node {
                     tracing::warn!("failed to flush catchup ledger #{}: {}", seq, e);
                 }
                 ledger.compact();
-                Ok(ledger)
+                ledger
             }
-            None => Ok(Ledger::from_catchup(seq, expected_hash, state_map)),
+            None => Ledger::from_catchup(seq, expected_hash, state_map),
+        };
+        // Populate the full header from the peer-provided liBASE response so
+        // subsequent `Ledger::new_open(&this)` inherits the correct
+        // parent_close_time, drops, close_time_resolution, etc. Without this,
+        // the next local close computes a header hash divergent from the
+        // peer's chain and consensus never reaches quorum.
+        if let Some(h) = cached_header {
+            // Preserve the catchup-derived account_hash and the
+            // expected_hash we were given (those are the trust anchor); the
+            // peer header should agree but we trust our reconstruction.
+            let account_hash = ledger.header.account_hash;
+            let hash = ledger.header.hash;
+            ledger.header = h.clone();
+            ledger.header.account_hash = account_hash;
+            ledger.header.hash = hash;
         }
+        Ok(ledger)
     }
 
     /// Create a genesis ledger with a funded account, optionally backed by a store.
