@@ -17,12 +17,14 @@
 //! the most validators voting for it. Chaining via `parent_ledger` (so common
 //! ancestors share trie nodes) is a follow-up.
 //!
-//! NIGHT-SHIFT-REVIEW: `get_preferred(current_seq)` currently ignores
-//! `current_seq` and delegates straight to [`LedgerTrie::get_preferred`].
-//! Rippled uses the parameter to drop validations whose `ledger_seq` is older
-//! than the caller's anchor sequence (so a stale validator can't pin
-//! consensus to an obsolete ledger). Wire that filter in once the trie holds
-//! per-validation sequences alongside hashes.
+//! `get_preferred(current_seq)` filters out validations whose `ledger_seq`
+//! is strictly less than `current_seq` before computing the preferred
+//! branch — this prevents stale validators from pinning consensus to an
+//! obsolete ledger. The filter is applied at read-time by walking
+//! [`Self::latest`] and rebuilding a transient [`LedgerTrie`] over the
+//! fresh subset; callers that want to amortise the cost across many
+//! `get_preferred` calls can invoke [`Self::prune_below`] first to evict
+//! stale entries from `self.latest` and the persistent trie.
 
 use std::collections::{HashMap, HashSet};
 
@@ -113,11 +115,55 @@ impl ValidationsTrie {
 
     /// Return the preferred ledger hash given an anchor sequence.
     ///
-    /// `current_seq` is accepted for API parity with rippled's
-    /// `getPreferred(largestIssued)`; this minimal port delegates straight
-    /// to [`LedgerTrie::get_preferred`] (see module-level review note).
-    pub fn get_preferred(&self, _current_seq: u32) -> Option<Hash256> {
-        self.trie.get_preferred()
+    /// Only validations whose `ledger_seq >= current_seq` participate in
+    /// the calculation — older ones are treated as stale (a validator that
+    /// hasn't caught up must not be allowed to pin the network to an
+    /// obsolete ledger). When every cached validation is fresh, the
+    /// persistent trie's answer is returned directly; otherwise we
+    /// rebuild a transient trie over just the fresh subset.
+    pub fn get_preferred(&self, current_seq: u32) -> Option<Hash256> {
+        // Fast path: nothing stale -> the persistent trie already reflects
+        // the right answer. Avoids the per-call rebuild for the common
+        // case where pruning has been kept up to date.
+        let any_stale = self
+            .latest
+            .values()
+            .any(|v| v.ledger_seq < current_seq);
+        if !any_stale {
+            return self.trie.get_preferred();
+        }
+
+        let mut filtered = LedgerTrie::new();
+        for validation in self.latest.values() {
+            if validation.ledger_seq >= current_seq {
+                filtered.insert(&[validation.ledger_hash], 1);
+            }
+        }
+        filtered.get_preferred()
+    }
+
+    /// Drop every cached validation whose `ledger_seq < current_seq` and
+    /// remove its support from the persistent trie. Returns the number of
+    /// entries evicted. Idempotent: calling twice with the same threshold
+    /// is a no-op the second time.
+    ///
+    /// Callers that drive consensus over many sequences should invoke this
+    /// whenever the anchor advances so [`Self::get_preferred`] can take
+    /// the fast path.
+    pub fn prune_below(&mut self, current_seq: u32) -> usize {
+        let stale: Vec<NodeId> = self
+            .latest
+            .iter()
+            .filter(|(_, v)| v.ledger_seq < current_seq)
+            .map(|(node_id, _)| *node_id)
+            .collect();
+        let evicted = stale.len();
+        for node_id in stale {
+            if let Some(prev) = self.latest.remove(&node_id) {
+                self.trie.remove(&[prev.ledger_hash], 1);
+            }
+        }
+        evicted
     }
 
     /// Tip support for `hash` — the count of trusted validators whose latest
@@ -199,8 +245,8 @@ mod tests {
         // decremented out of the trie. We seed two trusted validators on
         // hash 0xAA, then have node 1 switch to 0xBB. Only node 2 still
         // votes for 0xAA, so node 1's new vote on 0xBB makes the two tips
-        // tied at one validator each — the lower-hash tie-break in
-        // LedgerTrie picks 0xAA, but the count for 0xBB must be exactly 1
+        // tied at one validator each — the higher-hash tie-break in
+        // LedgerTrie picks 0xBB, but the count for 0xBB must be exactly 1
         // (proving node 1's old 0xAA vote was removed, not duplicated).
         let mut agg = ValidationsTrie::new();
         agg.add_trusted(node(1));
@@ -340,5 +386,100 @@ mod tests {
         assert_eq!(agg.count_for(&hash(0x10)), 2);
         assert_eq!(agg.count_for(&hash(0x20)), 1);
         assert_eq!(agg.get_preferred(5), Some(hash(0x10)));
+    }
+
+    // -----------------------------------------------------------------
+    // H5: get_preferred(current_seq) MUST filter validations whose
+    // ledger_seq < current_seq so a stale validator can't pin consensus
+    // to an obsolete ledger.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn get_preferred_drops_validations_below_current_seq() {
+        // Two stale validators voting for hash 0xAA at seq=4, one fresh
+        // validator voting for hash 0xBB at seq=10. Anchor seq=10 means
+        // only the fresh validator counts: preferred = 0xBB.
+        let mut agg = ValidationsTrie::new();
+        for n in 1u8..=3 {
+            agg.add_trusted(node(n));
+        }
+        agg.add(validation(1, 0xAA, 4, 100));
+        agg.add(validation(2, 0xAA, 4, 101));
+        agg.add(validation(3, 0xBB, 10, 102));
+
+        // Without the seq filter, 0xAA would win 2-1. The filter must drop
+        // the two stale votes, leaving 0xBB as the only counted hash.
+        assert_eq!(agg.get_preferred(10), Some(hash(0xBB)));
+        // A lower anchor seq counts everyone -> 0xAA wins by support.
+        assert_eq!(agg.get_preferred(4), Some(hash(0xAA)));
+    }
+
+    #[test]
+    fn get_preferred_returns_none_when_all_validations_are_stale() {
+        let mut agg = ValidationsTrie::new();
+        agg.add_trusted(node(1));
+        agg.add_trusted(node(2));
+        agg.add(validation(1, 0xAA, 3, 100));
+        agg.add(validation(2, 0xBB, 4, 101));
+
+        // Anchor at seq=10: every cached validation is older.
+        assert_eq!(agg.get_preferred(10), None);
+    }
+
+    #[test]
+    fn get_preferred_keeps_validations_at_current_seq() {
+        // A validation exactly at the anchor sequence is fresh, not stale.
+        let mut agg = ValidationsTrie::new();
+        agg.add_trusted(node(1));
+        agg.add(validation(1, 0xCC, 7, 100));
+
+        assert_eq!(agg.get_preferred(7), Some(hash(0xCC)));
+        assert_eq!(agg.get_preferred(8), None);
+    }
+
+    #[test]
+    fn prune_below_evicts_stale_entries_and_decrements_trie() {
+        let mut agg = ValidationsTrie::new();
+        for n in 1u8..=3 {
+            agg.add_trusted(node(n));
+        }
+        agg.add(validation(1, 0xAA, 4, 100));
+        agg.add(validation(2, 0xAA, 4, 101));
+        agg.add(validation(3, 0xBB, 10, 102));
+
+        let evicted = agg.prune_below(10);
+        assert_eq!(evicted, 2);
+        // Stale tip support must be removed from the persistent trie.
+        assert_eq!(agg.count_for(&hash(0xAA)), 0);
+        assert_eq!(agg.count_for(&hash(0xBB)), 1);
+        // After pruning, get_preferred on the same threshold takes the fast
+        // path and still returns the fresh hash.
+        assert_eq!(agg.get_preferred(10), Some(hash(0xBB)));
+    }
+
+    #[test]
+    fn prune_below_is_idempotent() {
+        let mut agg = ValidationsTrie::new();
+        agg.add_trusted(node(1));
+        agg.add(validation(1, 0xAA, 4, 100));
+
+        assert_eq!(agg.prune_below(10), 1);
+        // Second call: nothing left to evict.
+        assert_eq!(agg.prune_below(10), 0);
+        assert_eq!(agg.count_for(&hash(0xAA)), 0);
+    }
+
+    #[test]
+    fn prune_below_keeps_fresh_entries_intact() {
+        let mut agg = ValidationsTrie::new();
+        agg.add_trusted(node(1));
+        agg.add_trusted(node(2));
+        agg.add(validation(1, 0xAA, 10, 100));
+        agg.add(validation(2, 0xBB, 12, 101));
+
+        // Threshold sits below every cached seq -> nothing evicted.
+        assert_eq!(agg.prune_below(5), 0);
+        assert_eq!(agg.count_for(&hash(0xAA)), 1);
+        assert_eq!(agg.count_for(&hash(0xBB)), 1);
     }
 }
