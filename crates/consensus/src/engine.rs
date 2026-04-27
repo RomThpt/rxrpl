@@ -11,6 +11,7 @@ use crate::params::ConsensusParams;
 use crate::phase::ConsensusPhase;
 use crate::types::{DisputedTx, NodeId, Proposal, TxSet, Validation};
 use crate::unl::TrustedValidatorList;
+use crate::validations_trie::ValidationsTrie;
 
 /// Threshold percentage of trusted validators referencing a different
 /// `prev_ledger` before we consider switching chains.
@@ -79,7 +80,24 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     /// Tracks proposals from trusted peers that reference a different
     /// `prev_ledger` than ours. Keyed by (node_id -> their prev_ledger).
     /// Used to detect when we are on the wrong chain.
+    ///
+    /// Secondary signal: this captures pre-quorum disagreement visible in
+    /// proposal traffic for the *current* round. The primary signal is
+    /// [`Self::validations_trie`], which aggregates trusted validations
+    /// across rounds and is consulted first by
+    /// [`Self::check_wrong_prev_ledger`].
     wrong_prev_ledger_votes: HashMap<NodeId, Hash256>,
+    /// Aggregator over trusted validators' latest validations. The
+    /// preferred-branch tip is the primary input to wrong-prev-ledger
+    /// detection: when [`ValidationsTrie::get_preferred`] returns a hash
+    /// that differs from `self.prev_ledger` and trusted support meets the
+    /// [`WRONG_PREV_LEDGER_THRESHOLD`], we abandon the current chain.
+    validations_trie: ValidationsTrie,
+    /// Sequence number of the current `prev_ledger`. Tracked so that the
+    /// validations-trie preferred-branch query can be anchored to the
+    /// caller-visible sequence (rippled `getPreferred(largestIssued)`).
+    /// Set by [`Self::start_round_with_prior`] to `ledger_seq - 1`.
+    prev_ledger_seq: u32,
     /// Holding pen for proposals whose `prev_ledger` we do not yet know.
     /// Keyed by their `prev_ledger` hash. When `start_round` is called with
     /// a matching prev_ledger, the held proposals are moved into
@@ -140,6 +158,13 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         unl: TrustedValidatorList,
     ) -> Self {
         let adaptive_close_time = AdaptiveCloseTime::new(params.close_time_resolution);
+        // Seed the validations-trie trusted set from the UNL so that
+        // record_trusted_validation() works out of the box for any node
+        // already in the supplied trusted set.
+        let mut validations_trie = ValidationsTrie::new();
+        for n in unl.trusted_set() {
+            validations_trie.add_trusted(*n);
+        }
         Self {
             adapter,
             params,
@@ -159,6 +184,8 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             negative_unl_tracker: NegativeUnlTracker::new(),
             pending_proposals: Vec::new(),
             wrong_prev_ledger_votes: HashMap::new(),
+            validations_trie,
+            prev_ledger_seq: 0,
             future_proposals: HashMap::new(),
             adaptive_close_time,
             previous_close_agreed: true,
@@ -311,15 +338,33 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
     /// Check whether a supermajority of trusted validators reference a
     /// different `prev_ledger` than ours.
     ///
-    /// Returns `Some(WrongPrevLedgerDetected)` when more than 60% of the
-    /// trusted peers that sent proposals disagree with our `prev_ledger`.
-    /// The caller should abort the current round and switch to the
-    /// preferred ledger.
+    /// Two-stage detection:
+    ///
+    /// 1. **Primary** — consult [`Self::validations_trie`]. If its
+    ///    preferred-branch tip differs from `self.prev_ledger` and at
+    ///    least [`WRONG_PREV_LEDGER_THRESHOLD`]% of the trusted set has
+    ///    validated that alternative, return immediately. This is the
+    ///    rippled `getPreferred`-driven path: it sees disagreement that
+    ///    has already been signed off in validations, before the next
+    ///    round of proposals lands.
+    /// 2. **Secondary** — fall back to the proposal-derived
+    ///    [`Self::wrong_prev_ledger_votes`] tally. This catches
+    ///    disagreement that surfaces in the *current* round's proposal
+    ///    traffic before any new validation has been issued.
+    ///
+    /// Returns `Some(WrongPrevLedgerDetected)` when either path crosses
+    /// the threshold. The caller should abort the current round and
+    /// switch to the preferred ledger.
     ///
     /// In solo mode (empty UNL) this always returns `None`.
     pub fn check_wrong_prev_ledger(&self) -> Option<WrongPrevLedgerDetected> {
         if self.unl.is_empty() {
             return None;
+        }
+
+        // Stage 1: validations-trie preferred branch.
+        if let Some(detected) = self.check_wrong_prev_ledger_from_validations() {
+            return Some(detected);
         }
 
         if self.wrong_prev_ledger_votes.is_empty() {
@@ -368,6 +413,74 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         }
     }
 
+    /// Validations-trie path of [`Self::check_wrong_prev_ledger`]. Returns
+    /// `Some` only when the trie's preferred branch differs from
+    /// `self.prev_ledger` AND its tip support meets the
+    /// [`WRONG_PREV_LEDGER_THRESHOLD`]% of the trusted set.
+    ///
+    /// Threshold denominator is `validations_trie.trusted_count()` (the
+    /// full UNL as known to the trie), matching rippled's
+    /// "fraction of UNL whose latest validation backs the alternative".
+    fn check_wrong_prev_ledger_from_validations(&self) -> Option<WrongPrevLedgerDetected> {
+        let trusted_total = self.validations_trie.trusted_count();
+        if trusted_total == 0 {
+            return None;
+        }
+        let preferred = self.validations_trie.get_preferred(self.prev_ledger_seq)?;
+        if preferred == self.prev_ledger {
+            return None;
+        }
+        let support = self.validations_trie.count_for(&preferred);
+        let pct = (support * 100) / trusted_total as u32;
+        if pct >= WRONG_PREV_LEDGER_THRESHOLD {
+            Some(WrongPrevLedgerDetected {
+                preferred_ledger: preferred,
+                peer_count: support as usize,
+                total_trusted: trusted_total,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Record a trusted validator's latest validation in the
+    /// validations-trie aggregator. Returns `true` when the call
+    /// materially changed trie state (new vote, or a switched ledger).
+    /// Untrusted validators are ignored — call
+    /// [`Self::add_trusted_validator`] first to enrol them.
+    pub fn record_trusted_validation(&mut self, validation: Validation) -> bool {
+        self.validations_trie.add(validation)
+    }
+
+    /// Read-only view of the validations-trie aggregator. Exposed for
+    /// metrics and integration tests.
+    pub fn validations_trie(&self) -> &ValidationsTrie {
+        &self.validations_trie
+    }
+
+    /// Mark `node_id` as a trusted validator for the validations-trie
+    /// aggregator, so its future validations contribute to
+    /// preferred-branch detection.
+    ///
+    // NIGHT-SHIFT-REVIEW: T17 — UNL ingestion stays via the existing
+    // `unl_mut()` / constructor / manifest pipeline (TrustedValidatorList
+    // exposes no `add_trusted(NodeId)` setter, and the T17 whitelist
+    // covers only `engine.rs`). Callers that build the UNL by NodeId
+    // outside that pipeline must enrol the same node into the trie via
+    // this method. Unifying both sets when the UNL gains a setter is a
+    // follow-up.
+    pub fn add_trusted_validator(&mut self, node_id: NodeId) {
+        self.validations_trie.add_trusted(node_id);
+    }
+
+    /// Remove `node_id` from the validations-trie trusted set. Any prior
+    /// validation contribution is decremented out of the trie
+    /// immediately. UNL membership is untouched (see paired
+    /// [`Self::add_trusted_validator`] note).
+    pub fn remove_trusted_validator(&mut self, node_id: &NodeId) {
+        self.validations_trie.remove_trusted(node_id);
+    }
+
     /// Get the disputes map.
     pub fn disputes(&self) -> &HashMap<Hash256, DisputedTx> {
         &self.disputes
@@ -413,6 +526,10 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.disputes.clear();
         self.round = 0;
         self.prev_ledger = prev_ledger;
+        // The new round produces ledger `ledger_seq`; its parent
+        // (prev_ledger) therefore lives at `ledger_seq - 1`. Anchor the
+        // validations-trie preferred-branch query to that sequence.
+        self.prev_ledger_seq = ledger_seq.saturating_sub(1);
         self.prior_close_time = prior_close_time;
         self.accepted_close_time = None;
         self.accepted_close_flags = 0;
@@ -1858,6 +1975,151 @@ mod tests {
 
         // 2/4 = 50% < 60% -> no detection
         assert_eq!(engine.check_wrong_prev_ledger(), None);
+    }
+
+    // --- T17: ValidationsTrie wiring into wrong-prev-ledger detection ---
+
+    fn validation_for(node_id: NodeId, ledger_hash: Hash256, ledger_seq: u32) -> Validation {
+        Validation {
+            node_id,
+            public_key: vec![],
+            ledger_hash,
+            ledger_seq,
+            full: true,
+            close_time: 100,
+            sign_time: 100,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn check_wrong_prev_ledger_none_when_trie_and_proposals_empty() {
+        // 5-node UNL, no proposals, no validations recorded -> None.
+        let unl = make_unl(&[1, 2, 3, 4, 5]);
+        let adapter = SimpleAdapter;
+        let engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+
+        assert_eq!(engine.check_wrong_prev_ledger(), None);
+    }
+
+    #[test]
+    fn check_wrong_prev_ledger_via_validations_trie_supermajority() {
+        // 5-node UNL. 4 trusted validators record validations for a hash
+        // that is NOT our prev_ledger. 4/5 = 80% >= 60% threshold.
+        // Detection must come from the validations trie even though no
+        // peer proposals have been received this round.
+        let unl = make_unl(&[1, 2, 3, 4, 5]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+
+        let preferred = Hash256::new([0xCC; 32]);
+        for n in 2u8..=5 {
+            assert!(engine.record_trusted_validation(validation_for(node(n), preferred, 0)));
+        }
+
+        let detected = engine.check_wrong_prev_ledger().expect("must trigger");
+        assert_eq!(detected.preferred_ledger, preferred);
+        assert_eq!(detected.peer_count, 4);
+        assert_eq!(detected.total_trusted, 5);
+    }
+
+    #[test]
+    fn check_wrong_prev_ledger_validations_trie_agrees_with_us_returns_none() {
+        // 3-node UNL. All trusted validators validated OUR prev_ledger.
+        // No peer proposals. The trie's preferred branch == prev_ledger,
+        // so neither stage fires.
+        let unl = make_unl(&[1, 2, 3]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        let our_prev = Hash256::new([0xAA; 32]);
+        engine.start_round(our_prev, 1);
+
+        for n in 2u8..=3 {
+            engine.record_trusted_validation(validation_for(node(n), our_prev, 0));
+        }
+
+        assert_eq!(engine.check_wrong_prev_ledger(), None);
+    }
+
+    #[test]
+    fn check_wrong_prev_ledger_validations_trie_below_threshold_falls_through() {
+        // 5-node UNL. Only 1 trusted validation for an alternative
+        // (1/5 = 20% < 60%). With no proposal-derived disagreement
+        // either, detection must return None — the trie path doesn't
+        // promote a minority hash.
+        let unl = make_unl(&[1, 2, 3, 4, 5]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+
+        let alt = Hash256::new([0xDD; 32]);
+        engine.record_trusted_validation(validation_for(node(2), alt, 0));
+
+        assert_eq!(engine.check_wrong_prev_ledger(), None);
+    }
+
+    #[test]
+    fn record_trusted_validation_ignores_untrusted_node() {
+        // Node 99 is not in the UNL. record_trusted_validation must
+        // return false and the trie must remain empty.
+        let unl = make_unl(&[1, 2, 3]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+
+        let alt = Hash256::new([0xEE; 32]);
+        assert!(!engine.record_trusted_validation(validation_for(node(99), alt, 0)));
+        assert_eq!(engine.validations_trie().count_for(&alt), 0);
+    }
+
+    #[test]
+    fn add_then_remove_trusted_validator_flows_through_trie() {
+        // Solo-mode engine (empty UNL). Enrol node 7 via the new
+        // add_trusted_validator helper, record a validation, then remove
+        // the node — its contribution must be decremented out.
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new(adapter, node(1), ConsensusParams::default());
+
+        let alt = Hash256::new([0x77; 32]);
+        // Pre-enrolment: validation is dropped.
+        assert!(!engine.record_trusted_validation(validation_for(node(7), alt, 0)));
+
+        engine.add_trusted_validator(node(7));
+        assert!(engine.record_trusted_validation(validation_for(node(7), alt, 0)));
+        assert_eq!(engine.validations_trie().count_for(&alt), 1);
+
+        engine.remove_trusted_validator(&node(7));
+        assert_eq!(engine.validations_trie().count_for(&alt), 0);
     }
 
     // --- Adaptive close-time resolution tests ---
