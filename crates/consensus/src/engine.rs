@@ -865,6 +865,29 @@ pub fn round_close_time(t: u32, resolution: u32) -> u32 {
     (t + resolution / 2) / resolution * resolution
 }
 
+/// Compute the effective close time for a ledger, clamping to strictly
+/// greater than `prior_close_time` to enforce monotonicity.
+///
+/// Mirrors rippled's `effCloseTime` (xrpld/consensus/LedgerTiming.h):
+/// - When `close_time == 0`, returns 0 (the "untrusted close time" sentinel
+///   used by rippled when a node has no opinion on the close time).
+/// - Otherwise, rounds `close_time` to the resolution bucket and clamps
+///   the result to be at least `prior_close_time + 1`. The clamp ensures
+///   each ledger's close time is strictly greater than its parent's, which
+///   downstream code relies on for ordering.
+pub fn eff_close_time(close_time: u32, resolution: u32, prior_close_time: u32) -> u32 {
+    if close_time == 0 {
+        return 0;
+    }
+    let rounded = round_close_time(close_time, resolution);
+    let min_allowed = prior_close_time.saturating_add(1);
+    if rounded > min_allowed {
+        rounded
+    } else {
+        min_allowed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1174,6 +1197,45 @@ mod tests {
         assert_eq!(round_close_time(150, 30), 150);
         assert_eq!(round_close_time(130, 30), 120);
         assert_eq!(round_close_time(100, 0), 100);
+    }
+
+    #[test]
+    fn eff_close_time_zero_passthrough() {
+        // close_time == 0 is rippled's "untrusted close time" sentinel and
+        // must propagate unchanged regardless of resolution or prior.
+        assert_eq!(eff_close_time(0, 30, 0), 0);
+        assert_eq!(eff_close_time(0, 30, 12345), 0);
+        assert_eq!(eff_close_time(0, 0, 99), 0);
+    }
+
+    #[test]
+    fn eff_close_time_clamp_active() {
+        // round_close_time(100, 30) == 90, but prior+1 == 121, so clamp wins.
+        assert_eq!(eff_close_time(100, 30, 120), 121);
+        // Rounded equals prior exactly => clamp to prior+1 (strictly greater).
+        // round_close_time(150, 30) == 150, prior 150 -> must return 151.
+        assert_eq!(eff_close_time(150, 30, 150), 151);
+        // Rounded sits below prior by a wide margin.
+        assert_eq!(eff_close_time(50, 10, 200), 201);
+    }
+
+    #[test]
+    fn eff_close_time_clamp_inactive() {
+        // round_close_time(150, 30) == 150 > prior+1 == 101 -> rounded wins.
+        assert_eq!(eff_close_time(150, 30, 100), 150);
+        // round_close_time(145, 30) == 150 > prior+1 == 100 -> rounded wins.
+        assert_eq!(eff_close_time(145, 30, 99), 150);
+        // prior_close_time == 0 (genesis-like) and rounded > 1.
+        assert_eq!(eff_close_time(60, 10, 0), 60);
+    }
+
+    #[test]
+    fn eff_close_time_resolution_zero() {
+        // resolution == 0 makes round_close_time the identity, so eff_close_time
+        // reduces to max(close_time, prior+1) for non-zero inputs.
+        assert_eq!(eff_close_time(100, 0, 50), 100);
+        assert_eq!(eff_close_time(100, 0, 100), 101);
+        assert_eq!(eff_close_time(100, 0, 200), 201);
     }
 
     #[test]
