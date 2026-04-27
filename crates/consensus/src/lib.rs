@@ -21,7 +21,7 @@ pub mod unl;
 
 pub use adapter::ConsensusAdapter;
 pub use close_resolution::AdaptiveCloseTime;
-pub use engine::{ConsensusEngine, WrongPrevLedgerDetected};
+pub use engine::{round_close_time, ConsensusEngine, WrongPrevLedgerDetected};
 pub use error::ConsensusError;
 pub use negative_unl::{NegativeUnlChange, NegativeUnlTracker, FLAG_LEDGER_INTERVAL};
 pub use params::ConsensusParams;
