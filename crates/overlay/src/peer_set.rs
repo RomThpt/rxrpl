@@ -169,30 +169,52 @@ impl PeerSet {
 
     /// Select the best peers for ledger data based on score and ledger proximity.
     /// Prefers peers whose known `ledger_seq >= target_seq` by adding a +200 bonus.
-    /// Only includes peers with non-negative reputation scores.
+    ///
+    /// Tries the non-negative-reputation peers first. If the strict filter
+    /// excludes everyone (e.g. our only peer has accumulated a small
+    /// negative score from an unfamiliar message type), we fall back to
+    /// the full peer set so catch-up can still make progress. A node with
+    /// no candidate peer at all cannot sync.
     pub fn best_peers_for_ledger(&self, target_seq: u32, count: usize) -> Vec<Hash256> {
         const LEDGER_AHEAD_BONUS: i32 = 200;
 
-        let mut candidates: Vec<_> = self
-            .peers
-            .iter()
-            .filter(|r| r.value().reputation.score() >= 0)
-            .map(|r| {
-                let info = r.value();
-                let base_score = info.reputation.score();
-                let peer_seq = info.ledger_seq.load(std::sync::atomic::Ordering::Relaxed);
-                let effective_score = if peer_seq >= target_seq {
-                    base_score + LEDGER_AHEAD_BONUS
-                } else {
-                    base_score
-                };
-                let latency = info.reputation.avg_latency_ms().unwrap_or(u64::MAX);
-                (info.node_id, effective_score, latency)
-            })
-            .collect();
+        fn rank<'a, I>(it: I, target_seq: u32) -> Vec<(Hash256, i32, u64)>
+        where
+            I: Iterator<Item = dashmap::mapref::multiple::RefMulti<'a, Hash256, std::sync::Arc<PeerInfo>>>,
+        {
+            let mut candidates: Vec<_> = it
+                .map(|r| {
+                    let info = r.value();
+                    let base_score = info.reputation.score();
+                    let peer_seq = info.ledger_seq.load(std::sync::atomic::Ordering::Relaxed);
+                    let effective_score = if peer_seq >= target_seq {
+                        base_score + LEDGER_AHEAD_BONUS
+                    } else {
+                        base_score
+                    };
+                    let latency = info.reputation.avg_latency_ms().unwrap_or(u64::MAX);
+                    (info.node_id, effective_score, latency)
+                })
+                .collect();
+            candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+            candidates
+        }
 
-        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
-        candidates.into_iter().take(count).map(|(id, _, _)| id).collect()
+        let strict = rank(
+            self.peers
+                .iter()
+                .filter(|r| r.value().reputation.score() >= 0),
+            target_seq,
+        );
+        if !strict.is_empty() {
+            return strict.into_iter().take(count).map(|(id, _, _)| id).collect();
+        }
+        // Fallback: include negative-rep peers rather than return nothing.
+        rank(self.peers.iter(), target_seq)
+            .into_iter()
+            .take(count)
+            .map(|(id, _, _)| id)
+            .collect()
     }
 }
 

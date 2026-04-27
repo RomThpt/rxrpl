@@ -873,7 +873,7 @@ impl PeerManager {
                 self.handle_get_ledger(from, payload);
             }
             MessageType::LedgerData => {
-                tracing::debug!(
+                tracing::info!(
                     "received LedgerData from {}: {} bytes",
                     from, payload.len()
                 );
@@ -895,6 +895,10 @@ impl PeerManager {
 
                         let ledger_seq = msg.ledger_seq;
                         let info_type = msg.ledger_info_type;
+                        tracing::info!(
+                            "decoded LedgerData seq={} hash={} itype={} nodes={}",
+                            ledger_seq, hash, info_type, nodes.len()
+                        );
 
                         // Handle tx-set candidate responses (liTS_CANDIDATE = 3).
                         if info_type == LI_TS_CANDIDATE {
@@ -2090,13 +2094,22 @@ impl PeerManager {
                     payload,
                 }) {
                     Ok(_) => {
-                        tracing::debug!("sent GetLedger seq={} itype=liBASE", seq);
+                        tracing::info!(
+                            "sent GetLedger seq={} hash={} itype=liBASE to {}",
+                            seq,
+                            hash.map(|h| h.to_string()).unwrap_or_else(|| "none".into()),
+                            node_id
+                        );
                     }
                     Err(e) => tracing::warn!("failed to send GetLedger to {}: {}", node_id, e),
                 }
             }
         } else {
-            tracing::warn!("no peers available for GetLedger seq={}", seq);
+            tracing::warn!(
+                "no peers available for GetLedger seq={} (peer_handles={})",
+                seq,
+                self.peer_handles.len()
+            );
         }
     }
 
