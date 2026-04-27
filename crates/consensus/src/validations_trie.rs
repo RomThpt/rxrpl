@@ -9,23 +9,34 @@
 //! Untrusted validators are ignored entirely, mirroring rippled's behaviour
 //! that only `trusted_set` validations enter the preferred-branch calculation.
 //!
-//! NIGHT-SHIFT-REVIEW: rippled keys ledgers by `LedgerID` and walks per-node
-//! ancestry through the `Adaptor::acquire`-supplied chain. This port takes the
-//! minimal route: each branch passed to [`LedgerTrie`] is a single-element
-//! slice `[ledger_hash]`, i.e. the tip with no parent path. That suffices for
-//! latest-wins aggregation and for `get_preferred` to return the branch with
-//! the most validators voting for it. Chaining via `parent_ledger` (so common
-//! ancestors share trie nodes) is a follow-up.
+//! Two ingestion paths are exposed:
+//! - [`Self::add`] credits a single-element branch `[ledger_hash]` — fast,
+//!   backwards-compatible, but treats every tip as if it had no shared
+//!   ancestry. Sufficient for latest-wins aggregation when callers don't
+//!   know the parent chain.
+//! - [`Self::add_with_parents`] credits the full branch
+//!   `[oldest_ancestor, ..., parent, ledger_hash]`. Sibling validators on
+//!   the same chain then share trie nodes, so `branch_support` accumulates
+//!   correctly at every common ancestor — matching rippled's
+//!   `Validations<Adaptor>` behaviour where the per-node ancestry comes
+//!   from `Adaptor::acquire`.
+//!
+//! Whichever entry point a validator first uses is recorded in
+//! [`Self::latest`] alongside the exact branch slice that was inserted, so
+//! later replacements / evictions decrement the correct path.
 //!
 //! `get_preferred(current_seq)` filters out validations whose `ledger_seq`
 //! is strictly less than `current_seq` before computing the preferred
 //! branch — this prevents stale validators from pinning consensus to an
 //! obsolete ledger. The filter is applied at read-time by walking
 //! [`Self::latest`] and rebuilding a transient [`LedgerTrie`] over the
-//! fresh subset; callers that want to amortise the cost across many
-//! `get_preferred` calls can invoke [`Self::prune_below`] first to evict
-//! stale entries from `self.latest` and the persistent trie.
+//! fresh subset. The rebuild is cached and only re-run when either the
+//! aggregator state changes or the `current_seq` argument moves; callers
+//! that want to amortise the cost across many `get_preferred` calls can
+//! also invoke [`Self::prune_below`] to evict stale entries from
+//! `self.latest` and the persistent trie so the fast path applies.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use rxrpl_primitives::Hash256;
@@ -33,18 +44,39 @@ use rxrpl_primitives::Hash256;
 use crate::ledger_trie::LedgerTrie;
 use crate::types::{NodeId, Validation};
 
+/// What we store per trusted validator: their latest validation plus the
+/// exact branch slice we credited in the trie. The branch is needed so
+/// that replacement, removal, and pruning decrement the same path that
+/// was inserted (single-element vs full ancestry).
+#[derive(Clone, Debug)]
+struct Entry {
+    validation: Validation,
+    /// Branch from oldest known ancestor to tip (inclusive). Always at
+    /// least one element; the last element is `validation.ledger_hash`.
+    branch: Vec<Hash256>,
+}
+
 /// Aggregator that maps `(NodeId -> latest Validation)` and feeds each
 /// trusted validator's latest hash into a [`LedgerTrie`] so that
 /// [`get_preferred`](Self::get_preferred) returns the branch tip with the
 /// most cumulative validator support.
 pub struct ValidationsTrie {
     trie: LedgerTrie,
-    /// Latest validation per node, keyed by `NodeId`. Only populated for
-    /// trusted nodes — untrusted validations never enter the map.
-    latest: HashMap<NodeId, Validation>,
+    /// Latest validation per node, keyed by `NodeId`, plus the branch
+    /// slice that was credited in the trie. Only populated for trusted
+    /// nodes — untrusted validations never enter the map.
+    latest: HashMap<NodeId, Entry>,
     /// Trusted validator set. Validations from nodes outside this set are
     /// dropped on `add` and never contribute to the trie.
     trusted: HashSet<NodeId>,
+    /// Bumps on every mutation that could change a `get_preferred(seq)`
+    /// result. Used together with the cached `(seq, generation, hash)`
+    /// triple to skip the rebuild when neither input has changed.
+    generation: u64,
+    /// Memoised slow-path answer: `(current_seq, generation_at_compute,
+    /// preferred_hash)`. Behind a [`RefCell`] so `get_preferred` can stay
+    /// `&self` (callers treat it as a pure read).
+    preferred_cache: RefCell<Option<(u32, u64, Option<Hash256>)>>,
 }
 
 impl Default for ValidationsTrie {
@@ -60,7 +92,17 @@ impl ValidationsTrie {
             trie: LedgerTrie::new(),
             latest: HashMap::new(),
             trusted: HashSet::new(),
+            generation: 0,
+            preferred_cache: RefCell::new(None),
         }
+    }
+
+    /// Bump the mutation counter and clear any stale memoised slow-path
+    /// answer. Call after any state change that could move the preferred
+    /// hash.
+    fn invalidate_cache(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.preferred_cache.get_mut().take();
     }
 
     /// Mark `node` as trusted. Subsequent [`add`](Self::add) calls from this
@@ -76,11 +118,15 @@ impl ValidationsTrie {
     pub fn remove_trusted(&mut self, node: &NodeId) {
         self.trusted.remove(node);
         if let Some(prev) = self.latest.remove(node) {
-            self.trie.remove(&[prev.ledger_hash], 1);
+            self.trie.remove(&prev.branch, 1);
+            self.invalidate_cache();
         }
     }
 
-    /// Insert or replace `validation`'s contribution.
+    /// Insert or replace `validation`'s contribution using a single-element
+    /// branch `[ledger_hash]` (no parent ancestry). Convenience wrapper —
+    /// callers that know the parent chain should use
+    /// [`Self::add_with_parents`] so common ancestors share trie nodes.
     ///
     /// Returns `true` when the call materially changed the trie state (a new
     /// trusted validator vote, or a trusted validator switched ledgers).
@@ -88,28 +134,65 @@ impl ValidationsTrie {
     /// validation is identical to the latest one already on file (idempotent
     /// re-delivery).
     pub fn add(&mut self, validation: Validation) -> bool {
+        self.add_with_parents(validation, &[])
+    }
+
+    /// Insert or replace `validation`'s contribution using the full
+    /// ancestry path. `parent_branch` is `[oldest_ancestor, ..., parent]`
+    /// — the tip is appended automatically. Pass `&[]` for the
+    /// single-element behaviour.
+    ///
+    /// When two trusted validators vote on tips that share a prefix, the
+    /// shared part of the branch is credited only once per validator (no
+    /// double-counting at the ancestors), matching rippled's
+    /// `LedgerTrie<Ledger>` semantics.
+    ///
+    /// Same return contract as [`Self::add`].
+    pub fn add_with_parents(
+        &mut self,
+        validation: Validation,
+        parent_branch: &[Hash256],
+    ) -> bool {
         let node_id = validation.node_id;
         if !self.trusted.contains(&node_id) {
             return false;
         }
         if let Some(prev) = self.latest.get(&node_id) {
-            if prev.ledger_hash == validation.ledger_hash {
+            if prev.validation.ledger_hash == validation.ledger_hash {
                 // Same vote already counted — no-op.
                 return false;
             }
             // Reject older validations (audit pass 2 C1): a stale validation
             // would otherwise overwrite the node's current vote in the trie.
-            if validation.ledger_seq < prev.ledger_seq {
+            if validation.ledger_seq < prev.validation.ledger_seq {
                 return false;
             }
-            if validation.ledger_seq == prev.ledger_seq && validation.sign_time <= prev.sign_time {
+            if validation.ledger_seq == prev.validation.ledger_seq
+                && validation.sign_time <= prev.validation.sign_time
+            {
                 return false;
             }
-            // Switched ledger: pull old support out before crediting new.
-            self.trie.remove(&[prev.ledger_hash], 1);
         }
-        self.trie.insert(&[validation.ledger_hash], 1);
-        self.latest.insert(node_id, validation);
+
+        // Build the new branch: [parent_branch..., ledger_hash].
+        let mut branch = Vec::with_capacity(parent_branch.len() + 1);
+        branch.extend_from_slice(parent_branch);
+        branch.push(validation.ledger_hash);
+
+        // Switched ledger: pull old support out using the previously
+        // recorded path before crediting the new one.
+        if let Some(prev) = self.latest.get(&node_id) {
+            self.trie.remove(&prev.branch, 1);
+        }
+        self.trie.insert(&branch, 1);
+        self.latest.insert(
+            node_id,
+            Entry {
+                validation,
+                branch,
+            },
+        );
+        self.invalidate_cache();
         true
     }
 
@@ -120,7 +203,9 @@ impl ValidationsTrie {
     /// hasn't caught up must not be allowed to pin the network to an
     /// obsolete ledger). When every cached validation is fresh, the
     /// persistent trie's answer is returned directly; otherwise we
-    /// rebuild a transient trie over just the fresh subset.
+    /// rebuild a transient trie over just the fresh subset and memoise
+    /// the result so repeated calls at the same `current_seq` (between
+    /// mutations) skip the rebuild.
     pub fn get_preferred(&self, current_seq: u32) -> Option<Hash256> {
         // Fast path: nothing stale -> the persistent trie already reflects
         // the right answer. Avoids the per-call rebuild for the common
@@ -128,18 +213,28 @@ impl ValidationsTrie {
         let any_stale = self
             .latest
             .values()
-            .any(|v| v.ledger_seq < current_seq);
+            .any(|e| e.validation.ledger_seq < current_seq);
         if !any_stale {
             return self.trie.get_preferred();
         }
 
-        let mut filtered = LedgerTrie::new();
-        for validation in self.latest.values() {
-            if validation.ledger_seq >= current_seq {
-                filtered.insert(&[validation.ledger_hash], 1);
+        // Slow path with memoisation: if the cached entry was computed at
+        // the same generation and same `current_seq`, reuse it.
+        if let Some((cached_seq, cached_gen, cached_hash)) = *self.preferred_cache.borrow() {
+            if cached_seq == current_seq && cached_gen == self.generation {
+                return cached_hash;
             }
         }
-        filtered.get_preferred()
+
+        let mut filtered = LedgerTrie::new();
+        for entry in self.latest.values() {
+            if entry.validation.ledger_seq >= current_seq {
+                filtered.insert(&entry.branch, 1);
+            }
+        }
+        let preferred = filtered.get_preferred();
+        *self.preferred_cache.borrow_mut() = Some((current_seq, self.generation, preferred));
+        preferred
     }
 
     /// Drop every cached validation whose `ledger_seq < current_seq` and
@@ -154,20 +249,30 @@ impl ValidationsTrie {
         let stale: Vec<NodeId> = self
             .latest
             .iter()
-            .filter(|(_, v)| v.ledger_seq < current_seq)
+            .filter(|(_, e)| e.validation.ledger_seq < current_seq)
             .map(|(node_id, _)| *node_id)
             .collect();
         let evicted = stale.len();
         for node_id in stale {
             if let Some(prev) = self.latest.remove(&node_id) {
-                self.trie.remove(&[prev.ledger_hash], 1);
+                self.trie.remove(&prev.branch, 1);
             }
+        }
+        if evicted > 0 {
+            self.invalidate_cache();
         }
         evicted
     }
 
     /// Tip support for `hash` — the count of trusted validators whose latest
     /// validation is for this exact ledger.
+    ///
+    /// When all callers use the same ingestion API consistently
+    /// (`add` everywhere, or `add_with_parents` everywhere with a
+    /// canonical parent chain), the answer is exact. Mixing the two for
+    /// the same tip hash can split the support across two distinct trie
+    /// nodes — `count_for` returns whichever node `LedgerTrie` finds
+    /// first in its traversal.
     pub fn count_for(&self, hash: &Hash256) -> u32 {
         self.trie.tip_support(hash)
     }
@@ -467,6 +572,97 @@ mod tests {
         // Second call: nothing left to evict.
         assert_eq!(agg.prune_below(10), 0);
         assert_eq!(agg.count_for(&hash(0xAA)), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // add_with_parents: parent-chained ingestion shares trie nodes
+    // across sibling validators voting on overlapping ancestry.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn add_with_parents_credits_branch_support_at_shared_ancestors() {
+        // Two trusted validators agree on parent path [A, B] but vote for
+        // different tips C vs D. Branch support at A and B must be 2,
+        // tip support at C and D must be 1 each.
+        let mut agg = ValidationsTrie::new();
+        agg.add_trusted(node(1));
+        agg.add_trusted(node(2));
+
+        let parent = vec![hash(0xAA), hash(0xBB)];
+        assert!(agg.add_with_parents(validation(1, 0xCC, 5, 100), &parent));
+        assert!(agg.add_with_parents(validation(2, 0xDD, 5, 101), &parent));
+
+        // Tips were never aliased — each appears exactly once.
+        assert_eq!(agg.count_for(&hash(0xCC)), 1);
+        assert_eq!(agg.count_for(&hash(0xDD)), 1);
+        // The fork sits at the tip; preferred picks the higher-hash sibling.
+        assert_eq!(agg.get_preferred(5), Some(hash(0xDD)));
+    }
+
+    #[test]
+    fn add_with_parents_replacement_decrements_full_old_branch() {
+        // A validator first votes via add_with_parents on [A, B, C], then
+        // switches to [A, X, Y] at a higher seq. The old branch must be
+        // fully removed (no leftover support at B or C); the new branch
+        // takes its place. Common prefix [A] survives because the new
+        // branch still uses it.
+        let mut agg = ValidationsTrie::new();
+        agg.add_trusted(node(1));
+
+        assert!(agg.add_with_parents(
+            validation(1, 0xCC, 5, 100),
+            &[hash(0xAA), hash(0xBB)],
+        ));
+        assert_eq!(agg.count_for(&hash(0xCC)), 1);
+
+        assert!(agg.add_with_parents(
+            validation(1, 0xEE, 6, 110),
+            &[hash(0xAA), hash(0xDD)],
+        ));
+        assert_eq!(agg.count_for(&hash(0xCC)), 0, "old tip not removed");
+        assert_eq!(agg.count_for(&hash(0xBB)), 0, "old parent not removed");
+        assert_eq!(agg.count_for(&hash(0xEE)), 1, "new tip credited");
+        assert_eq!(agg.get_preferred(6), Some(hash(0xEE)));
+    }
+
+    #[test]
+    fn add_with_parents_remove_trusted_drops_full_branch() {
+        let mut agg = ValidationsTrie::new();
+        agg.add_trusted(node(1));
+        assert!(agg.add_with_parents(
+            validation(1, 0xCC, 5, 100),
+            &[hash(0xAA), hash(0xBB)],
+        ));
+        assert_eq!(agg.count_for(&hash(0xCC)), 1);
+
+        agg.remove_trusted(&node(1));
+        assert_eq!(agg.count_for(&hash(0xCC)), 0);
+        assert_eq!(agg.count_for(&hash(0xBB)), 0);
+        assert_eq!(agg.get_preferred(5), None);
+    }
+
+    #[test]
+    fn get_preferred_caches_slow_path_until_mutation() {
+        // After two calls at the same seq with no mutation in between,
+        // the second must return the same answer (cache hit). Then a
+        // mutation must invalidate so the next call recomputes.
+        let mut agg = ValidationsTrie::new();
+        agg.add_trusted(node(1));
+        agg.add_trusted(node(2));
+        agg.add(validation(1, 0xAA, 4, 100)); // stale relative to seq=10
+        agg.add(validation(2, 0xBB, 10, 101));
+
+        // Slow path (one stale entry at seq < 10) — first call computes.
+        let first = agg.get_preferred(10);
+        assert_eq!(first, Some(hash(0xBB)));
+        // Cache hit — same answer, same generation.
+        assert_eq!(agg.get_preferred(10), first);
+
+        // Mutate by adding another trusted validator on the fresh tip;
+        // cache must be invalidated and the recompute still picks BB.
+        agg.add_trusted(node(3));
+        agg.add(validation(3, 0xBB, 10, 102));
+        assert_eq!(agg.get_preferred(10), Some(hash(0xBB)));
     }
 
     #[test]

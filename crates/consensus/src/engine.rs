@@ -510,13 +510,12 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
     /// aggregator, so its future validations contribute to
     /// preferred-branch detection.
     ///
-    // NIGHT-SHIFT-REVIEW: T17 — UNL ingestion stays via the existing
-    // `unl_mut()` / constructor / manifest pipeline (TrustedValidatorList
-    // exposes no `add_trusted(NodeId)` setter, and the T17 whitelist
-    // covers only `engine.rs`). Callers that build the UNL by NodeId
-    // outside that pipeline must enrol the same node into the trie via
-    // this method. Unifying both sets when the UNL gains a setter is a
-    // follow-up.
+    // NIGHT-SHIFT-REVIEW: the trusted set on the trie is independent of
+    // the `TrustedValidatorList` UNL because the latter exposes no
+    // `add_trusted(NodeId)` setter. Callers enrolling a node by NodeId
+    // outside the UNL constructor / manifest pipeline must call this
+    // method explicitly — until `TrustedValidatorList` grows a setter
+    // and the two sets can share state.
     pub fn add_trusted_validator(&mut self, node_id: NodeId) {
         self.validations_trie.add_trusted(node_id);
     }
