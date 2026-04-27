@@ -89,12 +89,6 @@ forbidden_paths:
   - acceptance: cargo +nightly fuzz run validation_deser -- -max_total_time=60 — exits clean
   - globs: NIGHT_SHIFT_LOG.md
 
-- [ ] T08b [kind=code,deps=T08]: Update 14 Validation { ... } literal sites to add ..Default::default()
-  - acceptance: nightly-agent-T08-T08 branch merges cleanly into nightly/2026-04-27 with all dependent crates building
-  - acceptance: production sites (engine.rs:808, proto_convert.rs:221, node.rs:1800) compile
-  - acceptance: test sites in identity.rs (5), validation_aggregator.rs, node.rs (4), checkpoint.rs, peer_handshake.rs all compile
-  - globs: crates/consensus/src/engine.rs, crates/overlay/src/proto_convert.rs, crates/overlay/src/identity.rs, crates/overlay/src/validation_aggregator.rs, crates/overlay/tests/peer_handshake.rs, crates/node/src/node.rs, crates/node/src/checkpoint.rs
-
 ### In progress
 
 ### Done
@@ -115,6 +109,8 @@ forbidden_paths:
 - T06 — proptest harness 600 cases for next_resolution + eff_close_time, commit 3c6e5a6
 - T14 — proposal staleness gate PROPOSAL_FRESHNESS_SECS=30 + counter, commit 8595c70 (181/181 consensus tests)
 - T16 — ValidationsTrie aggregator over LedgerTrie, commit f4c2a83 (9/9 tests; 2 NIGHT-SHIFT-REVIEW deferrals)
+- T08 — Validation type extended with 11 SOTemplate fields, commit a357cda (initial WIP, unblocked by T08b)
+- T08b — added ..Default::default() to 15 Validation literal sites + validations_trie test fix, commits 286c381+manual (190/190 consensus tests green)
 
 ### Blocked
 <!-- Tasks blocked on external dependencies, see PROBLEMS.md for details. -->
