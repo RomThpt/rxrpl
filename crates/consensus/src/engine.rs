@@ -89,6 +89,13 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     /// [`Self::accept`] and consumed in [`Self::start_round`] to
     /// drive the rippled `getNextLedgerTimeResolution` cadence.
     previous_close_agreed: bool,
+    /// Parent ledger's close time, used to clamp the effective close
+    /// time of the current round to be strictly greater (rippled
+    /// `effCloseTime` monotonicity guarantee).  Set per round via
+    /// [`Self::start_round_with_prior`]; legacy [`Self::start_round`]
+    /// callers leave it at `0`, which keeps the clamp inactive for
+    /// any rounded close time > 1 (backwards compatible).
+    prior_close_time: u32,
 }
 
 /// Maximum number of distinct `prev_ledger` hashes held in
@@ -139,6 +146,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             future_proposals: HashMap::new(),
             adaptive_close_time,
             previous_close_agreed: true,
+            prior_close_time: 0,
         }
     }
 
@@ -349,7 +357,26 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
     }
 
     /// Start a new consensus round for the next ledger.
+    ///
+    /// Backwards-compatible entry point: leaves `prior_close_time` at
+    /// `0`, which keeps the [`eff_close_time`] monotonicity clamp
+    /// inactive for any rounded close time > 1.  Callers that have the
+    /// parent ledger's close time available should prefer
+    /// [`Self::start_round_with_prior`].
     pub fn start_round(&mut self, prev_ledger: Hash256, ledger_seq: u32) {
+        self.start_round_with_prior(prev_ledger, ledger_seq, 0);
+    }
+
+    /// Start a new consensus round, supplying the parent ledger's
+    /// close time so the effective close time of this round can be
+    /// clamped to strictly greater (rippled `effCloseTime` monotonicity
+    /// guarantee, see `xrpld/consensus/LedgerTiming.h`).
+    pub fn start_round_with_prior(
+        &mut self,
+        prev_ledger: Hash256,
+        ledger_seq: u32,
+        prior_close_time: u32,
+    ) {
         // Recompute the close-time resolution for THIS round using the
         // rippled `getNextLedgerTimeResolution` cadence: keyed on the
         // new ledger sequence and the prior round's agreement flag, NOT
@@ -369,6 +396,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.disputes.clear();
         self.round = 0;
         self.prev_ledger = prev_ledger;
+        self.prior_close_time = prior_close_time;
         self.accepted_close_time = None;
         self.accepted_close_flags = 0;
         self.accepted_validation = None;
@@ -587,17 +615,18 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             None => return 0,
         };
         let resolution = self.adaptive_close_time.resolution();
+        let prior = self.prior_close_time;
 
         if self.peer_positions.is_empty() {
-            return round_close_time(our_time, resolution);
+            return eff_close_time(our_time, resolution, prior);
         }
 
         // Tally votes per rounded close-time bucket.
         let mut votes: HashMap<u32, u32> = HashMap::new();
-        let our_bucket = round_close_time(our_time, resolution);
+        let our_bucket = eff_close_time(our_time, resolution, prior);
         *votes.entry(our_bucket).or_insert(0) += 1;
         for peer in self.peer_positions.values() {
-            let peer_bucket = round_close_time(peer.close_time, resolution);
+            let peer_bucket = eff_close_time(peer.close_time, resolution, prior);
             *votes.entry(peer_bucket).or_insert(0) += 1;
         }
 
@@ -629,13 +658,14 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             return;
         }
         let resolution = self.adaptive_close_time.resolution();
+        let prior = self.prior_close_time;
         let our_time = self.our_position.as_ref().map(|p| p.close_time).unwrap_or(0);
-        let our_bucket = round_close_time(our_time, resolution);
+        let our_bucket = eff_close_time(our_time, resolution, prior);
 
         let mut votes: HashMap<u32, u32> = HashMap::new();
         *votes.entry(our_bucket).or_insert(0) += 1;
         for peer in self.peer_positions.values() {
-            let b = round_close_time(peer.close_time, resolution);
+            let b = eff_close_time(peer.close_time, resolution, prior);
             *votes.entry(b).or_insert(0) += 1;
         }
         let total: u32 = votes.values().sum();
@@ -1905,5 +1935,46 @@ mod tests {
             engine.converge();
         }
         assert_eq!(engine.adaptive_close_time().resolution(), 20);
+    }
+
+    #[test]
+    fn monotonic_close_time_across_rounds() {
+        // Verifies that `eff_close_time` is wired into the establish-phase
+        // aggregation: when a round closes with a `close_time` that would
+        // round to <= `prior_close_time`, the engine's accepted close time
+        // is clamped to `prior_close_time + 1` (rippled `effCloseTime`
+        // monotonicity guarantee).
+        let mut engine = test_engine();
+
+        // Round 1: parent close_time = 100. Our raw close_time = 50 would
+        // round to 60 at the default 30s resolution, but the clamp pushes
+        // it to 101.
+        engine.start_round_with_prior(Hash256::ZERO, 1, 100);
+        engine
+            .close_ledger(TxSet::new(vec![]), 50, 1)
+            .unwrap();
+        assert!(engine.converge());
+        let ct1 = engine.accepted_close_time().expect("round 1 close time");
+        assert!(
+            ct1 >= 101,
+            "round 1 close_time {} should be >= prior+1 (101)",
+            ct1
+        );
+
+        // Round 2: parent close_time = ct1 (>= 101). Same raw close_time
+        // 50, must clamp to >= ct1 + 1 (>= 102), demonstrating monotonicity
+        // across rounds.
+        engine.start_round_with_prior(Hash256::ZERO, 2, ct1);
+        engine
+            .close_ledger(TxSet::new(vec![]), 50, 2)
+            .unwrap();
+        assert!(engine.converge());
+        let ct2 = engine.accepted_close_time().expect("round 2 close time");
+        assert!(
+            ct2 >= ct1 + 1,
+            "round 2 close_time {} should be strictly greater than round 1 ({})",
+            ct2,
+            ct1
+        );
     }
 }
