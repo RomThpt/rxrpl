@@ -40,11 +40,6 @@ forbidden_paths:
 
 ### Ready
 
-- [ ] T11 [kind=tests,deps=T10]: Property tests on STValidation encoding round-trip via proptest
-  - acceptance: 500+ random Validation structs survive encode→decode without loss
-  - acceptance: signing_hash stable across encode→decode→encode (idempotent)
-  - globs: crates/overlay/tests/stvalidation_roundtrip.rs
-
 - [ ] T24 [kind=qa,deps=T05,T10,T17]: xrpl-hive smoke + propagation cross-impl run after merges
   - acceptance: ./bin/xrpl-hive --sim smoke --client rxrpl passes (3/3)
   - acceptance: ./bin/xrpl-hive --sim propagation --client rxrpl,rippled_2.3.0 reaches "validated_ledger.seq advances" cross-impl, no validation rejected with "bad signature"
@@ -89,6 +84,8 @@ forbidden_paths:
 - T10 — full SOTemplate validation decoder + signing_payload preserved, commit 024eb43 (226/226 overlay tests)
 - T19 — ProposalTracker dedup integration in peer_proposal_at, commit d1b4f1d (199/199 consensus tests)
 - T20 — DisputedTx avalanche thresholds 50/65/70/95 + 6 tests, commit f18bfb3 (202/202 consensus tests)
+- T11 — proptest STValidation roundtrip 1000 cases (encode/decode + signing_payload idempotence), commit a686e68
+- T26 (partial) — workspace tests 205+221 green, fuzz stobject_decode 200000 runs no crash; hive sims (T24/T25) blocked on push permission
 
 ### Blocked
 <!-- Tasks blocked on external dependencies, see PROBLEMS.md for details. -->
