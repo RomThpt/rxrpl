@@ -900,6 +900,11 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.align_close_time_with_peers();
 
         let threshold = self.params.threshold_for_round(self.round);
+        // Per-tx dispute resolution uses rippled's avalanche cascade
+        // (50/65/70/95) which tightens faster than the linear
+        // whole-position agreement threshold above. See
+        // [`avalanche_dispute_threshold`].
+        let dispute_threshold = avalanche_dispute_threshold(self.round);
 
         // Resolve disputes and update our set if needed
         let mut set_changed = false;
@@ -907,7 +912,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             let mut new_txs = our_set.txs.clone();
 
             for dispute in self.disputes.values() {
-                let should_include = dispute.should_include(threshold);
+                let should_include = dispute.our_vote(dispute_threshold);
                 if should_include != dispute.our_vote {
                     set_changed = true;
                     if should_include {
@@ -1073,6 +1078,32 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         } else {
             None
         }
+    }
+}
+
+/// Avalanche dispute threshold (percent) for the given consensus round.
+///
+/// Mirrors rippled's tightening cascade in
+/// `include/xrpl/consensus/Consensus.h` — a peer must clear an
+/// increasingly demanding majority for a tx to remain in our position
+/// as the round count climbs:
+///
+/// | round | threshold | rippled constant       |
+/// |------:|----------:|------------------------|
+/// |   0   |   50%     | `avINIT_CONSENSUS_PCT` |
+/// |   1   |   65%     | `avMID_CONSENSUS_PCT`  |
+/// |   2   |   70%     | `avLATE_CONSENSUS_PCT` |
+/// |  3+   |   95%     | `avSTUCK_CONSENSUS_PCT`|
+///
+/// This is *separate* from `ConsensusParams::threshold_for_round` which
+/// gates whole-position agreement; avalanche thresholds gate per-tx
+/// dispute resolution.
+pub fn avalanche_dispute_threshold(round: u32) -> u32 {
+    match round {
+        0 => 50,
+        1 => 65,
+        2 => 70,
+        _ => 95,
     }
 }
 

@@ -255,6 +255,16 @@ impl DisputedTx {
         self.votes.insert(node, include);
     }
 
+    /// Update or insert a peer's vote for this disputed transaction.
+    ///
+    /// Mirrors rippled's `DisputedTx::setVote(NodeID, bool)` — repeated
+    /// calls from the same `node_id` overwrite the prior vote so a peer
+    /// that flips its position between rounds is correctly reflected in
+    /// the running tally.
+    pub fn update_vote(&mut self, node_id: NodeId, voted_yes: bool) {
+        self.votes.insert(node_id, voted_yes);
+    }
+
     /// Number of votes to include this tx (not counting ours).
     pub fn yay_count(&self) -> usize {
         self.votes.values().filter(|&&v| v).count()
@@ -276,6 +286,19 @@ impl DisputedTx {
             return false;
         }
         (yays as u32 * 100) / total as u32 >= threshold
+    }
+
+    /// Compute our vote for this disputed tx at the given avalanche
+    /// threshold percentage.
+    ///
+    /// Returns `true` when the running yes-tally (our current vote plus
+    /// all recorded peer votes) meets or exceeds `threshold_pct`, mirroring
+    /// rippled's `DisputedTx::updateVote` decision rule. Distinct from
+    /// the [`Self::our_vote`](#structfield.our_vote) field, which stores
+    /// the prior round's commitment; this method recomputes whether we
+    /// *should* be voting yes at the supplied threshold.
+    pub fn our_vote(&self, threshold_pct: u32) -> bool {
+        self.should_include(threshold_pct)
     }
 }
 
@@ -416,5 +439,90 @@ mod tests {
         let id2 = NodeId::from_public_key(kp.public_key.as_bytes());
         assert_eq!(id1, id2);
         assert!(!id1.0.is_zero());
+    }
+
+    /// Helper: build a dispute with `our_vote=true` and N peers voting yes,
+    /// M peers voting no. Used to exercise the avalanche thresholds.
+    fn build_dispute(yes_peers: usize, no_peers: usize) -> DisputedTx {
+        let mut tx = DisputedTx::new(Hash256::new([0xAA; 32]), true);
+        for i in 0..yes_peers {
+            tx.update_vote(NodeId(Hash256::new([i as u8 + 1; 32])), true);
+        }
+        for i in 0..no_peers {
+            tx.update_vote(
+                NodeId(Hash256::new([0x80 | (i as u8); 32])),
+                false,
+            );
+        }
+        tx
+    }
+
+    #[test]
+    fn dispute_avalanche_round0_includes_at_50pct() {
+        // 2 peers yes, 1 peer no, plus our yes => 3/4 = 75% (>=50%, round 0)
+        let tx = build_dispute(2, 1);
+        assert!(tx.our_vote(50), "75% should clear avalanche round-0 50%");
+    }
+
+    #[test]
+    fn dispute_avalanche_round1_includes_at_65pct() {
+        // 2 peers yes, 1 peer no, plus our yes => 3/4 = 75% (>=65%, round 1)
+        let tx = build_dispute(2, 1);
+        assert!(tx.our_vote(65), "75% should clear avalanche round-1 65%");
+    }
+
+    #[test]
+    fn dispute_avalanche_round2_excludes_at_70pct_when_66pct() {
+        // 1 peer yes, 1 peer no, plus our yes => 2/3 = 66% (<70%, round 2)
+        let tx = build_dispute(1, 1);
+        assert!(
+            !tx.our_vote(70),
+            "66% must not clear avalanche round-2 70%"
+        );
+    }
+
+    #[test]
+    fn dispute_threshold_transition_flips_our_vote_across_rounds() {
+        // Build a dispute with exactly 60% yes:
+        //   our yes + 2 peer yes + 2 peer no => 3/5 = 60%.
+        // Round 0 (50%): include. Round 1 (65%): exclude. Round 2 (70%):
+        // exclude. Round 3 (95%): exclude. This mirrors rippled tightening
+        // the avalanche threshold each round.
+        let tx = build_dispute(2, 2);
+        assert!(tx.our_vote(50), "60% clears 50%");
+        assert!(!tx.our_vote(65), "60% must not clear 65%");
+        assert!(!tx.our_vote(70), "60% must not clear 70%");
+        assert!(!tx.our_vote(95), "60% must not clear 95%");
+    }
+
+    #[test]
+    fn dispute_avalanche_round3_requires_95pct() {
+        // 18 peers yes, 1 peer no, plus our yes => 19/20 = 95%.
+        let tx = build_dispute(18, 1);
+        assert!(tx.our_vote(95), "95% must clear avalanche stuck-round 95%");
+
+        // Drop one yes => 18/20 = 90% which fails the 95% gate.
+        let tx_below = build_dispute(17, 2);
+        assert!(
+            !tx_below.our_vote(95),
+            "90% must not clear avalanche stuck-round 95%"
+        );
+    }
+
+    #[test]
+    fn dispute_update_vote_overwrites_prior_peer_vote() {
+        let mut tx = DisputedTx::new(Hash256::new([0x77; 32]), true);
+        let peer = NodeId(Hash256::new([0x42; 32]));
+        // Peer first votes yes, then flips to no in a later round.
+        tx.update_vote(peer, true);
+        assert_eq!(tx.yay_count(), 1);
+        assert_eq!(tx.nay_count(), 0);
+        tx.update_vote(peer, false);
+        assert_eq!(
+            tx.yay_count(),
+            0,
+            "flipped peer must not be counted as yes"
+        );
+        assert_eq!(tx.nay_count(), 1, "flipped peer must be counted as no");
     }
 }
