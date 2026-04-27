@@ -906,12 +906,43 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         }
 
         // Tally votes per rounded close-time bucket.
+        //
+        // CRITICAL (H11): peer votes are FILTERED, not clamped. Calling
+        // `eff_close_time(peer_time, ...)` here would silently rewrite
+        // any peer vote with `close_time == 0` (rippled "no opinion"
+        // sentinel) or `close_time < prior + 1` to `prior + 1`,
+        // collapsing distinct adversarial votes into one shared bucket
+        // and manufacturing apparent agreement. We discard those votes
+        // entirely instead, then apply `eff_close_time` only to the
+        // final winning bucket below.
+        let min_allowed = prior.saturating_add(1);
         let mut votes: HashMap<u32, u32> = HashMap::new();
-        let our_bucket = eff_close_time(our_time, resolution, prior);
-        *votes.entry(our_bucket).or_insert(0) += 1;
+        // Our own time is voted only if it is a real opinion (non-zero)
+        // and would not be clamped to the floor bucket. The same filter
+        // we apply to peers applies to us, so self can never manufacture
+        // a vote in the floor bucket either.
+        let our_bucket_raw = round_close_time(our_time, resolution);
+        if our_time != 0 && our_bucket_raw >= min_allowed {
+            *votes.entry(our_bucket_raw).or_insert(0) += 1;
+        }
         for peer in self.peer_positions.values() {
-            let peer_bucket = eff_close_time(peer.close_time, resolution, prior);
-            *votes.entry(peer_bucket).or_insert(0) += 1;
+            // Filter: skip the "no opinion" sentinel and any vote that
+            // would round below the monotonicity floor (those would be
+            // clamped into a single bucket otherwise).
+            if peer.close_time == 0 {
+                continue;
+            }
+            let rounded = round_close_time(peer.close_time, resolution);
+            if rounded < min_allowed {
+                continue;
+            }
+            *votes.entry(rounded).or_insert(0) += 1;
+        }
+
+        // No surviving votes (everyone was filtered out): fall back to
+        // the solo path so we still emit a monotonic close_time.
+        if votes.is_empty() {
+            return eff_close_time(our_time, resolution, prior);
         }
 
         // Pick the bucket with the most votes. On ties, pick the LATER
@@ -919,7 +950,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         // and biasing towards "later" matches the natural drift of each
         // validator's clock forward over time, so the chosen bucket is
         // less likely to fall behind prior_close_time + 1s monotonicity.
-        let mut best_bucket = our_bucket;
+        let mut best_bucket = 0u32;
         let mut best_count = 0u32;
         for (bucket, count) in &votes {
             if *count > best_count || (*count == best_count && *bucket > best_bucket) {
@@ -927,7 +958,10 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
                 best_count = *count;
             }
         }
-        best_bucket
+        // Apply eff_close_time only to the FINAL winning bucket so the
+        // monotonicity guarantee (close_time > prior) still holds for
+        // the accepted ledger.
+        eff_close_time(best_bucket, resolution, prior)
     }
 
     /// Update `our_position.close_time` to match the consensus winner
@@ -944,17 +978,44 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         let resolution = self.adaptive_close_time.resolution();
         let prior = self.prior_close_time;
         let our_time = self.our_position.as_ref().map(|p| p.close_time).unwrap_or(0);
-        let our_bucket = eff_close_time(our_time, resolution, prior);
+        let min_allowed = prior.saturating_add(1);
 
+        // Same filter-don't-clamp policy as `effective_close_time` (H11):
+        // peers with the "no opinion" sentinel (close_time == 0) or with
+        // a rounded vote below the monotonicity floor are dropped, not
+        // rewritten to `prior + 1`. Otherwise two adversarial peers
+        // sending close_time=1 and close_time=2 would both vote into the
+        // same floor bucket, manufacture a strict majority, and force
+        // realignment of our position to a bucket nobody actually voted
+        // for.
         let mut votes: HashMap<u32, u32> = HashMap::new();
-        *votes.entry(our_bucket).or_insert(0) += 1;
-        for peer in self.peer_positions.values() {
-            let b = eff_close_time(peer.close_time, resolution, prior);
-            *votes.entry(b).or_insert(0) += 1;
+        let our_bucket = round_close_time(our_time, resolution);
+        if our_time != 0 && our_bucket >= min_allowed {
+            *votes.entry(our_bucket).or_insert(0) += 1;
         }
-        let total: u32 = votes.values().sum();
+        for peer in self.peer_positions.values() {
+            if peer.close_time == 0 {
+                continue;
+            }
+            let rounded = round_close_time(peer.close_time, resolution);
+            if rounded < min_allowed {
+                continue;
+            }
+            *votes.entry(rounded).or_insert(0) += 1;
+        }
+
+        if votes.is_empty() {
+            return;
+        }
+
+        // Denominator includes filtered voters too: a peer that sent a
+        // garbage close_time still counts as "a voter that didn't agree
+        // with us", so a single surviving honest peer can't flip our
+        // position when the cohort is mostly garbage.
+        let total: u32 = (self.peer_positions.len() as u32).saturating_add(1);
+
         // Find best bucket; tiebreak by latest.
-        let mut best_bucket = our_bucket;
+        let mut best_bucket = 0u32;
         let mut best_count = 0u32;
         for (bucket, count) in &votes {
             if *count > best_count || (*count == best_count && *bucket > best_bucket) {
@@ -2556,6 +2617,126 @@ mod tests {
             "round 2 close_time {} should be strictly greater than round 1 ({})",
             ct2,
             ct1
+        );
+    }
+
+    // --- H11: peer close_time votes are FILTERED, not clamped ---
+
+    /// Two adversarial peers send close_time = 1 and close_time = 2,
+    /// way below `prior_close_time + 1 = 1_000_001`. The pre-fix code
+    /// applied `eff_close_time` to each peer vote, which clamped both
+    /// to `prior + 1 = 1_000_001` and counted them as TWO votes for
+    /// the same floor bucket — manufactured majority, forcing our own
+    /// fresh close_time bucket to lose. The fix FILTERS those votes
+    /// out before bucketing, so our honest fresh vote wins.
+    #[test]
+    fn h11_adversarial_low_close_times_dont_manufacture_agreement() {
+        let prior = 1_000_000u32;
+        let our_time = prior + 5; // fresh, well above the floor
+        let mut engine = test_engine();
+        engine.start_round_with_prior(Hash256::ZERO, 1, prior);
+        engine
+            .close_ledger(TxSet::new(vec![]), our_time, 1)
+            .unwrap();
+
+        // Manually inject two adversarial peer positions with garbage
+        // close_times (below `prior + 1`). Bypassing peer_proposal_at
+        // sidesteps the freshness gate, which would otherwise reject
+        // these proposals before they ever reach the bucket logic — the
+        // freshness gate is a separate defense; H11 is specifically
+        // about what happens when garbage *does* reach the bucket logic
+        // (e.g. from a future code path that bypasses freshness, or from
+        // adversarial peers exploiting clock skew).
+        let our_set_hash = engine.our_set().unwrap().hash;
+        engine.peer_positions.insert(
+            node(2),
+            Proposal {
+                node_id: node(2),
+                public_key: vec![0x02; 33],
+                tx_set_hash: our_set_hash,
+                close_time: 1,
+                prop_seq: 0,
+                ledger_seq: 1,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            },
+        );
+        engine.peer_positions.insert(
+            node(3),
+            Proposal {
+                node_id: node(3),
+                public_key: vec![0x02; 33],
+                tx_set_hash: our_set_hash,
+                close_time: 2,
+                prop_seq: 0,
+                ledger_seq: 1,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            },
+        );
+
+        let ct = engine.effective_close_time();
+        // The accepted close_time MUST come from our honest fresh vote
+        // (rounded to the 30s bucket), then clamped to >= prior + 1.
+        // It MUST NOT collapse to the floor bucket (prior + 1) by way
+        // of two adversarial votes that pre-fix were silently rewritten.
+        let our_rounded = round_close_time(our_time, 30);
+        let expected = eff_close_time(our_rounded, 30, prior);
+        assert_eq!(
+            ct, expected,
+            "expected our honest bucket {} (eff = {}), got {} — adversarial peers manufactured agreement",
+            our_rounded, expected, ct
+        );
+        // Belt-and-braces: the floor bucket prior+1 = 1_000_001 should
+        // NOT win, since no honest voter put their vote there.
+        assert_ne!(
+            ct,
+            prior + 1,
+            "close_time collapsed to the monotonicity floor — bucket clamping resurfaced"
+        );
+    }
+
+    /// `align_close_time_with_peers` must apply the same filter so
+    /// adversarial low close_times can't force a strict-majority
+    /// realignment of our position.
+    #[test]
+    fn h11_align_does_not_realign_to_floor_from_adversarial_votes() {
+        let prior = 1_000_000u32;
+        let our_time = prior + 35; // would round to a different bucket than floor
+        let mut engine = test_engine();
+        engine.start_round_with_prior(Hash256::ZERO, 1, prior);
+        engine
+            .close_ledger(TxSet::new(vec![]), our_time, 1)
+            .unwrap();
+        let our_set_hash = engine.our_set().unwrap().hash;
+
+        // Three adversarial peers all sending garbage close_times.
+        let adversarial: [(u8, u32); 3] = [(2, 0), (3, 1), (4, 2)];
+        for (i, ct) in adversarial {
+            engine.peer_positions.insert(
+                node(i),
+                Proposal {
+                    node_id: node(i),
+                    public_key: vec![0x02; 33],
+                    tx_set_hash: our_set_hash,
+                    close_time: ct,
+                    prop_seq: 0,
+                    ledger_seq: 1,
+                    prev_ledger: Hash256::ZERO,
+                    signature: None,
+                },
+            );
+        }
+
+        let our_pos_before = engine.our_position.as_ref().unwrap().close_time;
+        engine.align_close_time_with_peers();
+        let our_pos_after = engine.our_position.as_ref().unwrap().close_time;
+        // No realignment must have occurred: adversarial votes were
+        // filtered out, leaving only our own bucket — which doesn't
+        // have a strict majority of the (us + peers) cohort.
+        assert_eq!(
+            our_pos_before, our_pos_after,
+            "align_close_time_with_peers realigned us to a manufactured majority bucket"
         );
     }
 
