@@ -15,10 +15,14 @@ pub struct LeafData {
 
 /// A leaf node in the SHAMap.
 ///
-/// Three variants with different hash prefixes:
-/// - AccountState: SHA-512/2(LEAF_NODE || key || data)
+/// Three variants with different hash prefixes (rippled-compatible byte order):
+/// - AccountState: SHA-512/2(LEAF_NODE || data || key)
 /// - TransactionNoMeta: SHA-512/2(TRANSACTION_ID || data)
-/// - TransactionWithMeta: SHA-512/2(TX_NODE || key || data)
+/// - TransactionWithMeta: SHA-512/2(TX_NODE || data || key)
+///
+/// The data-then-key order matches rippled `SHAMapAccountStateLeafNode::updateHash`
+/// and `SHAMapTxPlusMetaLeafNode::updateHash`. Reversing it would compute a
+/// different ledger root hash for any non-empty SHAMap, breaking interop.
 #[derive(Clone, Debug)]
 pub enum LeafNode {
     AccountState(LeafData),
@@ -105,7 +109,7 @@ impl LeafNode {
 
     fn hash_account_state(item: &SHAMapItem) -> Hash256 {
         let prefix = HashPrefix::LEAF_NODE.to_bytes();
-        sha512_half(&[&prefix, item.key().as_bytes(), item.data()])
+        sha512_half(&[&prefix, item.data(), item.key().as_bytes()])
     }
 
     fn hash_tx_no_meta(item: &SHAMapItem) -> Hash256 {
@@ -115,7 +119,7 @@ impl LeafNode {
 
     fn hash_tx_with_meta(item: &SHAMapItem) -> Hash256 {
         let prefix = HashPrefix::TX_NODE.to_bytes();
-        sha512_half(&[&prefix, item.key().as_bytes(), item.data()])
+        sha512_half(&[&prefix, item.data(), item.key().as_bytes()])
     }
 }
 
