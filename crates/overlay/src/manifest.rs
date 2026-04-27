@@ -335,6 +335,62 @@ pub fn build_signing_data(
     buf
 }
 
+/// Sign a message with a keypair, dispatching on key type.
+///
+/// Ed25519 signs the raw message; secp256k1 signs SHA-512/256 of the
+/// message (rippled's `sign()` convention) and DER-encodes the result.
+fn sign_with_keypair(
+    message: &[u8],
+    key_pair: &rxrpl_crypto::KeyPair,
+) -> Result<Vec<u8>, ManifestError> {
+    let sig = match key_pair.key_type {
+        rxrpl_crypto::KeyType::Ed25519 => {
+            rxrpl_crypto::ed25519::sign(message, &key_pair.private_key)
+        }
+        rxrpl_crypto::KeyType::Secp256k1 => {
+            rxrpl_crypto::secp256k1::sign(message, &key_pair.private_key)
+        }
+    }
+    .map_err(|_| ManifestError::MasterSigInvalid)?;
+    Ok(sig.as_bytes().to_vec())
+}
+
+/// Create a fully signed manifest from a master and ephemeral keypair.
+///
+/// Produces rippled-compatible STObject bytes containing:
+///   sfSequence, sfPublicKey (master), sfSigningPubKey (ephemeral),
+///   optional sfDomain, sfSignature (ephemeral sig over body),
+///   sfMasterSignature (master sig over body).
+///
+/// Both signatures cover `HashPrefix::MANIFEST || sfSequence || sfPublicKey ||
+/// sfSigningPubKey || sfDomain?` (i.e. everything except the two signature
+/// fields themselves), matching rippled `Manifest::makeManifest`.
+///
+/// The returned bytes are accepted by `parse_and_verify`.
+pub fn create_signed(
+    master_keypair: &rxrpl_crypto::KeyPair,
+    ephemeral_keypair: &rxrpl_crypto::KeyPair,
+    sequence: u32,
+    domain: Option<&str>,
+) -> Result<Vec<u8>, ManifestError> {
+    let master_pk = master_keypair.public_key.as_bytes();
+    let ephemeral_pk = ephemeral_keypair.public_key.as_bytes();
+
+    let signing_data = build_signing_data(sequence, master_pk, ephemeral_pk, domain);
+
+    let ephemeral_sig = sign_with_keypair(&signing_data, ephemeral_keypair)?;
+    let master_sig = sign_with_keypair(&signing_data, master_keypair)?;
+
+    Ok(build_manifest_bytes(
+        sequence,
+        master_pk,
+        ephemeral_pk,
+        &ephemeral_sig,
+        &master_sig,
+        domain,
+    ))
+}
+
 /// Stores the latest manifest for each validator master key.
 ///
 /// Tracks the ephemeral -> master key mapping and detects revocations.
@@ -671,5 +727,77 @@ mod tests {
 
         let current = store.current_ephemeral_key(&master_pk).unwrap();
         assert_eq!(current, &eph_pk);
+    }
+
+    #[test]
+    fn create_signed_round_trip_ed25519_no_domain() {
+        let master = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("create_signed_master_ed"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let ephemeral = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("create_signed_eph_ed"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+
+        let raw = create_signed(&master, &ephemeral, 7, None).expect("create_signed");
+        let parsed = parse_and_verify(&raw).expect("parse_and_verify");
+
+        assert_eq!(parsed.sequence, 7);
+        assert_eq!(parsed.master_public_key, master.public_key);
+        assert_eq!(
+            parsed.ephemeral_public_key.as_ref().unwrap(),
+            &ephemeral.public_key
+        );
+        assert!(parsed.domain.is_none());
+        assert!(!parsed.is_revoked());
+        assert_eq!(parsed.raw, raw);
+    }
+
+    #[test]
+    fn create_signed_round_trip_with_domain() {
+        let master = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("create_signed_master_dom"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let ephemeral = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("create_signed_eph_dom"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+
+        let raw = create_signed(&master, &ephemeral, 42, Some("example.com"))
+            .expect("create_signed");
+        let parsed = parse_and_verify(&raw).expect("parse_and_verify");
+
+        assert_eq!(parsed.sequence, 42);
+        assert_eq!(parsed.domain.as_deref(), Some("example.com"));
+        assert_eq!(parsed.master_public_key, master.public_key);
+        assert_eq!(
+            parsed.ephemeral_public_key.as_ref().unwrap(),
+            &ephemeral.public_key
+        );
+    }
+
+    #[test]
+    fn create_signed_round_trip_secp256k1_master_ed25519_ephemeral() {
+        // rippled allows mixing key types: master often secp256k1, ephemeral ed25519.
+        let master = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("create_signed_master_secp"),
+            rxrpl_crypto::KeyType::Secp256k1,
+        );
+        let ephemeral = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("create_signed_eph_mixed"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+
+        let raw = create_signed(&master, &ephemeral, 3, None).expect("create_signed");
+        let parsed = parse_and_verify(&raw).expect("parse_and_verify");
+
+        assert_eq!(parsed.sequence, 3);
+        assert_eq!(parsed.master_public_key, master.public_key);
+        assert_eq!(
+            parsed.ephemeral_public_key.as_ref().unwrap(),
+            &ephemeral.public_key
+        );
     }
 }
