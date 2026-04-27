@@ -160,3 +160,27 @@ History:
 - Fix #10 — verify_and_add_validation_at as strict-verify entry point (commit 38b5a4d + revert cfg-test gating which fails cross-crate)
 - Remaining 8 highs deferred to audit pass 2/3 verification or follow-up PR
 
+
+### Audit pass 2/3 — by-file-count split (2026-04-27T16:30Z)
+
+5 agents reviewed in 3 groups (large/medium/tests). NEW findings beyond pass 1:
+
+**CRITICAL (🔴) — must address before merge to main:**
+- C1: `validations_trie::add` accepts older validations (no ledger_seq/sign_time monotonicity check). Attacker can replay stale validation, flip preferred-branch detection at 60% threshold. File: crates/consensus/src/validations_trie.rs:88-104
+- C2: `engine::peer_proposal_at` buffers proposals into unbounded `pending_proposals` Vec BEFORE UNL/freshness gates when phase != Establish. Memory exhaustion risk + slow O(N) replay stall. File: crates/consensus/src/engine.rs:87,673-678
+- C3: `record_trusted_validation` is `pub` API with no signature verification, no public_key↔node_id binding check. Forged validations can drive 60% wrong-prev-ledger detection. File: crates/consensus/src/engine.rs:460-462
+
+**HIGH (🟠) NEW:**
+- H11: `eff_close_time` clamp silently rewrites peer votes < `prior+1` into the floor bucket → manufactures agreement on `prior+1`. File: engine.rs:843,882
+- H12: `decode_validation` duplicate-field exploit: peer can send sfLedgerHash twice with different values; signature still verifies (signed bytes are byte-identical) but `validation.ledger_hash` ends up wrong. Need rippled-style `STObject::checkSorting`. File: proto_convert.rs:589-797
+- H13: `decode_validation` rewrites `close_time=0` sentinel to `sign_time` — loses the rippled "no opinion" semantic. File: proto_convert.rs:265-273
+- H14: Doc on `verify_and_add_validation_at` claims `add_validation_at` cfg-gates verify in production — IT DOESN'T (cross-crate cfg test issue, reverted). Fix doc OR re-implement gating with feature flag. File: validation_aggregator.rs:149-155
+- H15: Flaky test `refuses_recent_without_unl_sites` root cause = `run_networked` binds ports BEFORE UNL guard at node.rs:972. Tests race for port 5005/51235. Move guard before bind. File: crates/node/src/node.rs
+- H16: Manifest `sfDomain` parsed via `String::from_utf8_lossy` — silent U+FFFD substitution invites impersonation. File: manifest.rs:161
+
+**Test gaps**:
+- No test for stale-validation replay (C1)
+- No test for `decode_validation` duplicate-field (H12)
+- No test for `pending_proposals` overflow (C2)
+- Fuzz target only covers 2 of 8 stobject decoders; composite `decode_validation` untouched
+
