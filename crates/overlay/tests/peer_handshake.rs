@@ -178,8 +178,8 @@ async fn http_handshake_with_ledger_hash() {
     let server_result = server_handle.await.unwrap();
     assert!(server_result.is_ok(), "server handshake failed: {:?}", server_result.err());
 
-    let (client_peer_id, _) = client_result.unwrap();
-    let (server_peer_id, _) = server_result.unwrap();
+    let (client_peer_id, _, _) = client_result.unwrap();
+    let (server_peer_id, _, _) = server_result.unwrap();
 
     assert_eq!(client_peer_id, id_server.node_id);
     assert_eq!(server_peer_id, id_client.node_id);
