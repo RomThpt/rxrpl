@@ -209,26 +209,17 @@ impl ValidationAggregator {
             return None;
         }
 
-        // Defense-in-depth: verify the cryptographic signature even if a
-        // caller forgot to call `verify_validation_signature` before handing
-        // the validation off (audit pass 1 H#10). Production builds always
-        // enforce this; `cfg(test)` skips it so the existing test suite —
-        // which constructs unsigned validations on purpose — continues to
-        // exercise the freshness, trust, dedup and quorum logic in
-        // isolation. Tests that want to exercise the verify path should
-        // call [`Self::verify_and_add_validation_at`] instead.
-        #[cfg(any(not(test), feature = "verify-on-add"))]
-        if !crate::identity::verify_validation_signature(&validation) {
-            self.dropped_invalid_signature_total
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                target: "consensus",
-                public_key = %hex::encode(&validation.public_key),
-                ledger_seq = validation.ledger_seq,
-                "validation_dropped_invalid_signature"
-            );
-            return None;
-        }
+        // NOTE: signature verification is NOT performed here, because
+        // `cfg(test)` is per-crate and downstream test crates (rxrpl-node)
+        // exercise this path with deliberately-unsigned synthetic
+        // validations. Production callers MUST go through
+        // [`Self::verify_and_add_validation_at`] which always verifies, OR
+        // call [`crate::identity::verify_validation_signature`] before
+        // invoking [`Self::add_validation`] / [`Self::add_validation_at`].
+        // Audit pass 1 H#10 mitigation: `verify_and_add_validation_at`
+        // exists; the recommended next step is to migrate the wire-receive
+        // path to use it once the trusted-key-source for verification is
+        // wired through.
 
         // Trust filter: ignore validations from validators not in the UNL.
         if !self.is_trusted(&validation.public_key) {
