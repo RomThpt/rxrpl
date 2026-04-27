@@ -460,4 +460,574 @@ mod tests {
         assert!(!trie.remove(&[], 1));
         assert!(!trie.remove(&[h(1)], 0));
     }
+
+    // -----------------------------------------------------------------
+    // T23: scenarios ported from rippled's LedgerTrie_test.cpp.
+    //
+    // Each rippled test addresses a `Ledger` by string prefix (`h["abc"]`)
+    // which implicitly carries the ancestry "a" -> "ab" -> "abc". Our API
+    // takes the explicit branch, so we use `prefix_branch("abc")` =
+    // `[H("a"), H("ab"), H("abc")]`. The per-prefix hash is derived from
+    // length+bytes so that distinct prefixes get distinct hashes and shared
+    // prefixes get identical ones (mirroring rippled's `LedgerHistoryHelper`).
+    //
+    // NIGHT-SHIFT-REVIEW: rippled's `getPreferred(largestSeq)` subtracts
+    // uncommitted support based on a sequence cursor. Our port has no `Seq`
+    // parameter, so the rippled tests that exercise that subtraction
+    // ("Too much uncommitted support", "Changing largestSeq perspective",
+    // "Genesis support is NOT empty" with Seq{0}) cannot be ported as-is.
+    // The scenarios below cover everything else and are sufficient to
+    // exercise structural insert/remove/preferred logic.
+    //
+    // NIGHT-SHIFT-REVIEW: rippled breaks ties on the LARGER `span.startID()`
+    // (see `LedgerTrie.h:721`). The T15 port chose the LOWER hash instead
+    // (see `get_preferred()` and existing test
+    // `equal_support_fork_breaks_tie_by_lower_hash`). Tests below match the
+    // port's chosen direction; rippled's exact assertions on tie-breaking
+    // would need to flip accordingly.
+    // -----------------------------------------------------------------
+
+    /// Build the branch for a string prefix. `prefix_branch("abc")` returns
+    /// `[H("a"), H("ab"), H("abc")]` where each hash is unique per prefix.
+    fn prefix_branch(prefix: &str) -> Vec<Hash256> {
+        let bytes = prefix.as_bytes();
+        (1..=bytes.len()).map(|i| ph(&bytes[..i])).collect()
+    }
+
+    /// Hash of a prefix: byte[0]=length, byte[1..1+len]=prefix bytes.
+    /// Distinct prefixes (including different lengths of the same string)
+    /// always produce distinct hashes; equal prefixes produce equal hashes.
+    fn ph(prefix: &[u8]) -> Hash256 {
+        let mut bytes = [0u8; 32];
+        // length goes first to make sure "a" and "ab" differ even if the
+        // bytes-as-suffix would otherwise collide.
+        bytes[0] = prefix.len() as u8;
+        let copy_len = prefix.len().min(31);
+        bytes[1..1 + copy_len].copy_from_slice(&prefix[..copy_len]);
+        Hash256::new(bytes)
+    }
+
+    /// Convenience: tip support of the leaf identified by a string prefix.
+    fn tip(trie: &LedgerTrie, prefix: &str) -> u32 {
+        trie.tip_support(&ph(prefix.as_bytes()))
+    }
+
+    /// Convenience: branch support of the node identified by a string prefix.
+    fn branch(trie: &LedgerTrie, prefix: &str) -> u32 {
+        trie.branch_support(&ph(prefix.as_bytes()))
+    }
+
+    // ---- testInsert: "Single entry by itself" ----
+
+    #[test]
+    fn insert_same_leaf_twice_increments_tip_and_branch_support() {
+        let mut trie = LedgerTrie::new();
+        let abc = prefix_branch("abc");
+
+        trie.insert(&abc, 1);
+        assert_eq!(tip(&trie, "abc"), 1);
+        assert_eq!(branch(&trie, "abc"), 1);
+
+        trie.insert(&abc, 1);
+        assert_eq!(tip(&trie, "abc"), 2);
+        assert_eq!(branch(&trie, "abc"), 2);
+    }
+
+    // ---- testInsert: "Suffix of existing (extending tree)" ----
+
+    #[test]
+    fn insert_extending_existing_leaf_with_no_siblings() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("abc"), 1);
+        trie.insert(&prefix_branch("abcd"), 1);
+
+        // abc remains a tip (still validated) and now has a descendant.
+        assert_eq!(tip(&trie, "abc"), 1);
+        assert_eq!(branch(&trie, "abc"), 2);
+        assert_eq!(tip(&trie, "abcd"), 1);
+        assert_eq!(branch(&trie, "abcd"), 1);
+    }
+
+    #[test]
+    fn insert_extending_existing_leaf_with_existing_sibling() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("abc"), 1);
+        trie.insert(&prefix_branch("abcd"), 1);
+        trie.insert(&prefix_branch("abce"), 1);
+
+        assert_eq!(tip(&trie, "abc"), 1);
+        assert_eq!(branch(&trie, "abc"), 3);
+        assert_eq!(tip(&trie, "abcd"), 1);
+        assert_eq!(branch(&trie, "abcd"), 1);
+        assert_eq!(tip(&trie, "abce"), 1);
+        assert_eq!(branch(&trie, "abce"), 1);
+    }
+
+    // ---- testInsert: "uncommitted of existing node" (insert ancestor
+    // after descendants — the trie's existing internal node gains tip
+    // support without disturbing children) ----
+
+    #[test]
+    fn insert_ancestor_after_descendants_credits_tip_support_only_to_ancestor() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("abcd"), 1);
+        trie.insert(&prefix_branch("abcdf"), 1);
+        // abcd is now an internal node with tip_support=1, branch_support=2.
+        assert_eq!(tip(&trie, "abcd"), 1);
+        assert_eq!(branch(&trie, "abcd"), 2);
+
+        // Insert the shorter branch — this should add tip_support to the
+        // existing node "abc" without creating a new subtree.
+        trie.insert(&prefix_branch("abc"), 1);
+
+        assert_eq!(tip(&trie, "abc"), 1);
+        assert_eq!(branch(&trie, "abc"), 3);
+        assert_eq!(tip(&trie, "abcd"), 1);
+        assert_eq!(branch(&trie, "abcd"), 2);
+        assert_eq!(tip(&trie, "abcdf"), 1);
+        assert_eq!(branch(&trie, "abcdf"), 1);
+    }
+
+    // ---- testInsert: "Suffix + uncommitted of existing node" — internal
+    // ancestor exists implicitly with tip_support=0 once two siblings are
+    // inserted. ----
+
+    #[test]
+    fn two_siblings_create_internal_ancestor_with_zero_tip_support() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("abcd"), 1);
+        trie.insert(&prefix_branch("abce"), 1);
+
+        // "abc" is an implicit common ancestor: nobody validated it
+        // directly, so tip_support=0, but branch_support=2.
+        assert_eq!(tip(&trie, "abc"), 0);
+        assert_eq!(branch(&trie, "abc"), 2);
+        assert_eq!(tip(&trie, "abcd"), 1);
+        assert_eq!(branch(&trie, "abcd"), 1);
+        assert_eq!(tip(&trie, "abce"), 1);
+        assert_eq!(branch(&trie, "abce"), 1);
+    }
+
+    #[test]
+    fn three_branches_with_shared_grandparent_aggregate_branch_support() {
+        // Mirrors rippled "Suffix + uncommitted with existing child".
+        // abcd : abcde, abcf
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("abcd"), 1);
+        trie.insert(&prefix_branch("abcde"), 1);
+        trie.insert(&prefix_branch("abcf"), 1);
+
+        assert_eq!(tip(&trie, "abc"), 0);
+        assert_eq!(branch(&trie, "abc"), 3);
+        assert_eq!(tip(&trie, "abcd"), 1);
+        assert_eq!(branch(&trie, "abcd"), 2);
+        assert_eq!(tip(&trie, "abcf"), 1);
+        assert_eq!(branch(&trie, "abcf"), 1);
+        assert_eq!(tip(&trie, "abcde"), 1);
+        assert_eq!(branch(&trie, "abcde"), 1);
+    }
+
+    // ---- testInsert: "Multiple counts" ----
+
+    #[test]
+    fn insert_with_explicit_count_credits_count_at_every_ancestor() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("ab"), 4);
+
+        assert_eq!(tip(&trie, "ab"), 4);
+        assert_eq!(branch(&trie, "ab"), 4);
+        assert_eq!(tip(&trie, "a"), 0);
+        assert_eq!(branch(&trie, "a"), 4);
+
+        trie.insert(&prefix_branch("abc"), 2);
+        assert_eq!(tip(&trie, "abc"), 2);
+        assert_eq!(branch(&trie, "abc"), 2);
+        assert_eq!(tip(&trie, "ab"), 4);
+        assert_eq!(branch(&trie, "ab"), 6);
+        assert_eq!(tip(&trie, "a"), 0);
+        assert_eq!(branch(&trie, "a"), 6);
+    }
+
+    // ---- testRemove: "In trie but with 0 tip support" — removing an
+    // implicit internal ancestor must fail without mutating support. ----
+
+    #[test]
+    fn remove_internal_ancestor_with_zero_tip_support_returns_false() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("abcd"), 1);
+        trie.insert(&prefix_branch("abce"), 1);
+        assert_eq!(tip(&trie, "abc"), 0);
+        assert_eq!(branch(&trie, "abc"), 2);
+
+        assert!(!trie.remove(&prefix_branch("abc"), 1));
+        assert_eq!(tip(&trie, "abc"), 0);
+        assert_eq!(branch(&trie, "abc"), 2);
+        // Children untouched.
+        assert_eq!(tip(&trie, "abcd"), 1);
+        assert_eq!(tip(&trie, "abce"), 1);
+    }
+
+    // ---- testRemove: "In trie with > 1 tip support" — three explicit
+    // sub-cases (default-1 remove, count remove, over-remove clamp). ----
+
+    #[test]
+    fn remove_with_count_one_decrements_tip_by_one() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("abc"), 2);
+        assert_eq!(tip(&trie, "abc"), 2);
+
+        assert!(trie.remove(&prefix_branch("abc"), 1));
+        assert_eq!(tip(&trie, "abc"), 1);
+    }
+
+    #[test]
+    fn remove_with_explicit_count_decrements_tip_by_count() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("abc"), 2);
+        assert!(trie.remove(&prefix_branch("abc"), 2));
+        assert_eq!(tip(&trie, "abc"), 0);
+        assert!(trie.is_empty());
+    }
+
+    #[test]
+    fn remove_with_count_exceeding_tip_clamps_to_zero() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("abc"), 3);
+        assert!(trie.remove(&prefix_branch("abc"), 300));
+        assert_eq!(tip(&trie, "abc"), 0);
+        assert_eq!(branch(&trie, "abc"), 0);
+        assert!(trie.is_empty());
+    }
+
+    // ---- testRemove: "= 1 tip support, no children" — leaf prunes
+    // cleanly; parent loses one branch_support, keeps its own tip. ----
+
+    #[test]
+    fn remove_leaf_with_no_children_prunes_node_and_decrements_parent() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("ab"), 1);
+        trie.insert(&prefix_branch("abc"), 1);
+
+        assert_eq!(tip(&trie, "ab"), 1);
+        assert_eq!(branch(&trie, "ab"), 2);
+        assert_eq!(tip(&trie, "abc"), 1);
+        assert_eq!(branch(&trie, "abc"), 1);
+
+        assert!(trie.remove(&prefix_branch("abc"), 1));
+        assert_eq!(tip(&trie, "ab"), 1);
+        assert_eq!(branch(&trie, "ab"), 1);
+        assert_eq!(tip(&trie, "abc"), 0);
+        assert_eq!(branch(&trie, "abc"), 0);
+    }
+
+    // ---- testRemove: "= 1 tip support, 1 child" — internal node loses
+    // its only tip support but retains the descendant subtree. ----
+
+    #[test]
+    fn remove_internal_with_one_child_keeps_node_in_tree() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("ab"), 1);
+        trie.insert(&prefix_branch("abc"), 1);
+        trie.insert(&prefix_branch("abcd"), 1);
+
+        assert_eq!(tip(&trie, "abc"), 1);
+        assert_eq!(branch(&trie, "abc"), 2);
+        assert_eq!(tip(&trie, "abcd"), 1);
+        assert_eq!(branch(&trie, "abcd"), 1);
+
+        assert!(trie.remove(&prefix_branch("abc"), 1));
+        assert_eq!(tip(&trie, "abc"), 0);
+        // Branch support drops by 1 (the removed tip) but the child
+        // subtree keeps it from going to zero.
+        assert_eq!(branch(&trie, "abc"), 1);
+        assert_eq!(tip(&trie, "abcd"), 1);
+        assert_eq!(branch(&trie, "abcd"), 1);
+    }
+
+    // ---- testRemove: "= 1 tip support, > 1 children" — internal node
+    // loses its tip but keeps both children. ----
+
+    #[test]
+    fn remove_internal_with_multiple_children_keeps_node_and_subtree() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("ab"), 1);
+        trie.insert(&prefix_branch("abc"), 1);
+        trie.insert(&prefix_branch("abcd"), 1);
+        trie.insert(&prefix_branch("abce"), 1);
+
+        assert_eq!(tip(&trie, "abc"), 1);
+        assert_eq!(branch(&trie, "abc"), 3);
+
+        assert!(trie.remove(&prefix_branch("abc"), 1));
+        assert_eq!(tip(&trie, "abc"), 0);
+        assert_eq!(branch(&trie, "abc"), 2);
+        // Children still present.
+        assert_eq!(tip(&trie, "abcd"), 1);
+        assert_eq!(tip(&trie, "abce"), 1);
+    }
+
+    // ---- testSupport: queries on hashes never inserted return 0. ----
+
+    #[test]
+    fn support_queries_for_unknown_hashes_return_zero() {
+        let trie = LedgerTrie::new();
+        assert_eq!(tip(&trie, "a"), 0);
+        assert_eq!(tip(&trie, "axy"), 0);
+        assert_eq!(branch(&trie, "a"), 0);
+        assert_eq!(branch(&trie, "axy"), 0);
+    }
+
+    // ---- testSupport: insert / sibling / remove tracks both supports. ----
+
+    #[test]
+    fn branch_and_tip_support_track_inserts_and_removes() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("abc"), 1);
+
+        assert_eq!(tip(&trie, "a"), 0);
+        assert_eq!(tip(&trie, "ab"), 0);
+        assert_eq!(tip(&trie, "abc"), 1);
+        assert_eq!(tip(&trie, "abcd"), 0);
+
+        assert_eq!(branch(&trie, "a"), 1);
+        assert_eq!(branch(&trie, "ab"), 1);
+        assert_eq!(branch(&trie, "abc"), 1);
+        assert_eq!(branch(&trie, "abcd"), 0);
+
+        trie.insert(&prefix_branch("abe"), 1);
+        assert_eq!(tip(&trie, "abc"), 1);
+        assert_eq!(tip(&trie, "abe"), 1);
+        assert_eq!(branch(&trie, "a"), 2);
+        assert_eq!(branch(&trie, "ab"), 2);
+
+        trie.remove(&prefix_branch("abc"), 1);
+        assert_eq!(tip(&trie, "abc"), 0);
+        assert_eq!(tip(&trie, "abe"), 1);
+        assert_eq!(branch(&trie, "a"), 1);
+        assert_eq!(branch(&trie, "ab"), 1);
+        assert_eq!(branch(&trie, "abc"), 0);
+        assert_eq!(branch(&trie, "abe"), 1);
+    }
+
+    // ---- testGetPreferred: "Single node smaller child support" — a tip
+    // with as much support as the deeper branch keeps the parent. ----
+
+    #[test]
+    fn get_preferred_stays_at_parent_when_child_has_equal_or_lesser_support() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("abc"), 1);
+        trie.insert(&prefix_branch("abcd"), 1);
+        // tip(abc)=1, child branch_support(abcd)=1 — descend rule requires
+        // strict greater, so we stop at abc.
+        assert_eq!(trie.get_preferred(), Some(ph(b"abc")));
+    }
+
+    // ---- testGetPreferred: "Single node larger child" — child outweighs
+    // the parent's tip and the walk descends. ----
+
+    #[test]
+    fn get_preferred_descends_when_child_branch_support_strictly_greater() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("abc"), 1);
+        trie.insert(&prefix_branch("abcd"), 2);
+        assert_eq!(trie.get_preferred(), Some(ph(b"abcd")));
+    }
+
+    // ---- testGetPreferred: "Single node larger grand child" — grandchild
+    // accumulates enough cumulative support to pull the walk all the way
+    // through both parents. ----
+
+    #[test]
+    fn get_preferred_descends_through_intermediate_to_largest_grandchild() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("abc"), 1);
+        trie.insert(&prefix_branch("abcd"), 2);
+        trie.insert(&prefix_branch("abcde"), 4);
+        // branch_support: abc=7, abcd=6, abcde=4. tip_support: abc=1,
+        // abcd=2. At abc, best child branch_support=6 > tip 1 -> descend.
+        // At abcd, best child branch_support=4 > tip 2 -> descend to abcde.
+        assert_eq!(trie.get_preferred(), Some(ph(b"abcde")));
+    }
+
+    // ---- testGetPreferred: "Single node smaller children support" —
+    // three-way fork at the same depth where neither child wins outright. ----
+
+    #[test]
+    fn get_preferred_stops_when_no_child_strictly_beats_parent_tip() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("abc"), 1);
+        trie.insert(&prefix_branch("abcd"), 1);
+        trie.insert(&prefix_branch("abce"), 1);
+        // tip(abc)=1, best child branch_support=1 — not strictly greater.
+        assert_eq!(trie.get_preferred(), Some(ph(b"abc")));
+
+        // Doubling abc's tip leaves the answer unchanged.
+        trie.insert(&prefix_branch("abc"), 1);
+        assert_eq!(trie.get_preferred(), Some(ph(b"abc")));
+    }
+
+    // ---- testGetPreferred: "Single node larger children" — adding
+    // support to a single child until it overtakes the parent's tip
+    // support flips the preferred result. ----
+
+    #[test]
+    fn get_preferred_flips_to_child_after_extra_support_makes_it_strictly_greater() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("abc"), 1);
+        trie.insert(&prefix_branch("abcd"), 2);
+        trie.insert(&prefix_branch("abce"), 1);
+        // tip(abc)=1, best child branch_support(abcd)=2 > 1 -> descend.
+        assert_eq!(trie.get_preferred(), Some(ph(b"abcd")));
+
+        // Adding one more abcd vote keeps abcd preferred.
+        trie.insert(&prefix_branch("abcd"), 1);
+        assert_eq!(trie.get_preferred(), Some(ph(b"abcd")));
+    }
+
+    // ---- Insertion-order independence: two equivalent insertion scripts
+    // produce equivalent trie state and equivalent preferred output. ----
+
+    #[test]
+    fn insertion_order_does_not_change_supports_or_preferred() {
+        let mut a = LedgerTrie::new();
+        a.insert(&prefix_branch("abcd"), 1);
+        a.insert(&prefix_branch("abce"), 1);
+        a.insert(&prefix_branch("abc"), 1);
+
+        let mut b = LedgerTrie::new();
+        b.insert(&prefix_branch("abc"), 1);
+        b.insert(&prefix_branch("abcd"), 1);
+        b.insert(&prefix_branch("abce"), 1);
+
+        for prefix in ["a", "ab", "abc", "abcd", "abce"] {
+            assert_eq!(tip(&a, prefix), tip(&b, prefix), "tip mismatch at {prefix}");
+            assert_eq!(
+                branch(&a, prefix),
+                branch(&b, prefix),
+                "branch mismatch at {prefix}"
+            );
+        }
+        assert_eq!(a.get_preferred(), b.get_preferred());
+    }
+
+    // ---- Remove-then-reinsert restores prior state. ----
+
+    #[test]
+    fn remove_then_reinsert_restores_supports_and_preferred() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("abc"), 2);
+        trie.insert(&prefix_branch("abcd"), 1);
+
+        let preferred_before = trie.get_preferred();
+        let tip_before = tip(&trie, "abc");
+        let branch_before = branch(&trie, "abc");
+
+        assert!(trie.remove(&prefix_branch("abc"), 1));
+        trie.insert(&prefix_branch("abc"), 1);
+
+        assert_eq!(tip(&trie, "abc"), tip_before);
+        assert_eq!(branch(&trie, "abc"), branch_before);
+        assert_eq!(trie.get_preferred(), preferred_before);
+    }
+
+    // ---- Multiple-removes coalesce: incremental remove(count=1) calls
+    // produce the same end state as a single bulk remove. ----
+
+    #[test]
+    fn incremental_removes_coalesce_to_single_bulk_remove() {
+        let mut a = LedgerTrie::new();
+        a.insert(&prefix_branch("abc"), 5);
+        for _ in 0..3 {
+            assert!(a.remove(&prefix_branch("abc"), 1));
+        }
+
+        let mut b = LedgerTrie::new();
+        b.insert(&prefix_branch("abc"), 5);
+        assert!(b.remove(&prefix_branch("abc"), 3));
+
+        for prefix in ["a", "ab", "abc"] {
+            assert_eq!(tip(&a, prefix), tip(&b, prefix));
+            assert_eq!(branch(&a, prefix), branch(&b, prefix));
+        }
+        assert_eq!(a.get_preferred(), b.get_preferred());
+    }
+
+    // ---- Branch reorganisation: the preferred answer flips when support
+    // moves from one branch to another. ----
+
+    #[test]
+    fn preferred_branch_flips_when_support_moves_across_fork() {
+        let mut trie = LedgerTrie::new();
+        // Initial: [a, b, c] gets 3 votes, [a, b, d] gets 1 vote.
+        for _ in 0..3 {
+            trie.insert(&[h(0xAA), h(0xBB), h(0xCC)], 1);
+        }
+        trie.insert(&[h(0xAA), h(0xBB), h(0xDD)], 1);
+        assert_eq!(trie.get_preferred(), Some(h(0xCC)));
+
+        // Move 2 votes off [a,b,c] and onto [a,b,d] -> support 1 vs 3.
+        assert!(trie.remove(&[h(0xAA), h(0xBB), h(0xCC)], 2));
+        for _ in 0..2 {
+            trie.insert(&[h(0xAA), h(0xBB), h(0xDD)], 1);
+        }
+        assert_eq!(trie.get_preferred(), Some(h(0xDD)));
+    }
+
+    // ---- Deep trie with mid-branch fork: depth > 20 with a sibling at
+    // depth 25 — ensures recursion and traversal handle deep paths. ----
+
+    #[test]
+    fn deep_trie_with_fork_at_depth_25_returns_correct_preferred() {
+        let mut trie = LedgerTrie::new();
+        let main: Vec<Hash256> = (1u8..=30).map(h).collect();
+        let mut fork: Vec<Hash256> = (1u8..=24).map(h).collect();
+        fork.push(h(200)); // diverges at depth 25
+
+        // Main branch has 3 votes; fork has 1 -> main wins all the way to 30.
+        for _ in 0..3 {
+            trie.insert(&main, 1);
+        }
+        trie.insert(&fork, 1);
+
+        assert_eq!(trie.get_preferred(), Some(h(30)));
+        assert_eq!(trie.branch_support(&h(1)), 4);
+        assert_eq!(trie.branch_support(&h(24)), 4);
+        assert_eq!(trie.branch_support(&h(25)), 3);
+        assert_eq!(trie.branch_support(&h(200)), 1);
+
+        // Remove all main-branch support; the fork becomes preferred and
+        // the trie now stops at depth 25 (the fork tip).
+        assert!(trie.remove(&main, 3));
+        assert_eq!(trie.get_preferred(), Some(h(200)));
+        assert_eq!(trie.branch_support(&h(25)), 0);
+        assert_eq!(trie.branch_support(&h(200)), 1);
+    }
+
+    // ---- Pruning cascades up: removing the only descendant restores
+    // the parent's branch support to just its own tip support. ----
+
+    #[test]
+    fn removing_descendant_subtree_restores_ancestor_branch_support() {
+        let mut trie = LedgerTrie::new();
+        trie.insert(&prefix_branch("ab"), 1);
+        trie.insert(&prefix_branch("abc"), 1);
+        trie.insert(&prefix_branch("abcd"), 1);
+
+        assert_eq!(branch(&trie, "ab"), 3);
+
+        // Remove the deepest tip first (abcd is a leaf with tip=1).
+        assert!(trie.remove(&prefix_branch("abcd"), 1));
+        assert_eq!(branch(&trie, "ab"), 2);
+        assert_eq!(tip(&trie, "abcd"), 0);
+        assert_eq!(branch(&trie, "abcd"), 0);
+
+        // Then remove abc (now a tip with no children).
+        assert!(trie.remove(&prefix_branch("abc"), 1));
+        assert_eq!(branch(&trie, "ab"), 1);
+        assert_eq!(tip(&trie, "ab"), 1);
+
+        // Finally remove ab — trie empties.
+        assert!(trie.remove(&prefix_branch("ab"), 1));
+        assert!(trie.is_empty());
+    }
 }
