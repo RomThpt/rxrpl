@@ -251,9 +251,59 @@ Concrete next steps for whoever picks this up:
   even when it knows it is catching up; closing should wait until
   consensus actually agrees with peers.
 
-This was the next concrete blocker after the SHAMap+consensus stack
-landed. The validation-drop layer is now resolved; the
-chain-divergence layer is the next one.
+### Header reconstruction landed in PR #34
+
+PR #34 caches the parsed `LedgerHeader` from each peer liBASE
+response and uses it to populate the catchup-built ledger so the
+next `Ledger::new_open(&reconstructed)` inherits the right
+parent_close_time, drops, and close_time_resolution from the peer
+chain. Verified via `prop_v15`: cache hit on every catchup, header
+fields propagate.
+
+### Remaining gap: close_time consensus convergence
+
+After PR #34, with header fields correct on the catchup-derived
+ledger, the next *locally-closed* ledger still has a different
+hash than what rippled would compute. Diff is in close_time:
+
+```
+rxrpl:    closed ledger #4 hash=0A597FD…  effective_close_time=830589420 (08:47:17)
+rippled:  CNF Val 1CAF7CC…                close_time=830589440 (08:47:21)
+```
+
+A 4-second gap on the wall clock translates into different
+close_time fields → different ledger hashes even though everything
+else (parent_hash, account_hash, drops, close_time_resolution,
+close_flags) matches.
+
+The consensus engine already implements adaptive close-time
+resolution (`crates/consensus/src/close_resolution.rs`) and median
++ rounding (`engine.rs::effective_close_time`), but the trigger
+sequence in `node.rs::run_networked` does not give peer proposals a
+chance to populate before the local close fires:
+
+1. `TimerAction::CloseLedger` → `consensus.close_ledger()` →
+   transitions to Establish phase
+2. Same tick immediately calls `consensus.converge()` with
+   `peer_positions` still empty (or stale)
+3. `converge()` finds 1 self < 2 quorum, returns false, no accept
+4. The actual close fires later via `TimerAction::Converge`, but
+   the engine has already locked in `our_position.close_time` from
+   step 1
+
+For 2-validator quorum with quorum=2, both validators MUST agree on
+close_time before either closes. This means rxrpl needs to:
+
+- Hold the local close back during the Establish phase until either
+  (a) quorum agrees on a close_time, or (b) the establish phase
+  times out.
+- When converging, replace `our_position.close_time` with the
+  `effective_close_time(median, rounded)` derived from peer
+  proposals, not the original local SystemTime.
+
+This is the next consensus-engine PR. It does not touch wire
+format, hashes, or the adapter — purely the orchestration in
+`run_networked`.
 
 ## How to reproduce locally
 
