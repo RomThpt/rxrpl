@@ -90,3 +90,10 @@ doc = false
 name = "amount_arithmetic"
 path = "fuzz_targets/amount_arithmetic.rs"
 doc = false
+
+[[bin]]
+name = "stobject_decode"
+path = "fuzz_targets/stobject_decode.rs"
+test = false
+doc = false
+bench = false
