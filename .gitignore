@@ -7,3 +7,5 @@ Cargo.lock
 .env
 .idea/
 .vscode/
+.nightly-lock
+.nightshift/

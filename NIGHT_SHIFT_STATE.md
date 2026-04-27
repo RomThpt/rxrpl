@@ -40,12 +40,6 @@ forbidden_paths:
 
 ### Ready
 
-- [ ] T05 [kind=code,deps=T04]: Apply eff_close_time in establish-phase aggregation (replace bare round_close_time call sites)
-  - acceptance: engine.rs:572 and engine.rs:577 + sibling call sites use eff_close_time(_, _, prior_close_time)
-  - acceptance: ConsensusEngine carries prior_close_time field, set by start_round
-  - acceptance: existing engine tests still pass; new test asserts monotonic close_time across two rounds
-  - globs: crates/consensus/src/engine.rs
-
 - [ ] T06 [kind=tests,deps=T05]: Property tests for adaptive bins and effCloseTime via proptest
   - acceptance: proptest harness in tests/close_time_props.rs round-trips next_resolution and asserts eff_close_time(_, _, prior) > prior whenever non-zero input
   - acceptance: 200+ generated cases, no panics
@@ -83,12 +77,6 @@ forbidden_paths:
   - acceptance: existing wrong_prev_ledger_votes HashMap path becomes secondary (kept for proposals only)
   - globs: crates/consensus/src/engine.rs
 
-- [ ] T18 [kind=code,deps=]: Port goXRPL ProposalTracker — peer position lifecycle (received_at, last_seen, prop_seq monotonicity)
-  - acceptance: new module crates/consensus/src/proposal_tracker.rs with track(node_id, proposal) -> bool (false = older or duplicate)
-  - acceptance: rejects out-of-order prop_seq for a given (node_id, prev_ledger)
-  - acceptance: 6+ unit tests
-  - globs: crates/consensus/src/proposal_tracker.rs, crates/consensus/src/lib.rs
-
 - [ ] T19 [kind=code,deps=T18]: Replace peer_positions: HashMap with ProposalTracker; preserve existing engine API
   - acceptance: peer_proposal delegates to tracker, increments dispute counters only on accepted updates
   - acceptance: existing multi_node integration test still passes
@@ -99,12 +87,6 @@ forbidden_paths:
   - acceptance: thresholds match rippled (50% before mid, 65% after mid, 70% late, 95% stuck)
   - acceptance: 5+ tests, including threshold transitions across consensus rounds
   - globs: crates/consensus/src/types.rs, crates/consensus/src/engine.rs
-
-- [ ] T22 [kind=tests,deps=T07]: Fuzz harness for STObject parser (decode_field_id + decode_vl_length)
-  - acceptance: new fuzz/fuzz_targets/stobject_decode.rs feeds arbitrary bytes into decode_field_id and decode_vl_length
-  - acceptance: cargo +nightly fuzz build stobject_decode succeeds
-  - acceptance: registered in fuzz/Cargo.toml
-  - globs: fuzz/fuzz_targets/stobject_decode.rs, fuzz/Cargo.toml
 
 - [ ] T24 [kind=qa,deps=T05,T10,T17]: xrpl-hive smoke + propagation cross-impl run after merges
   - acceptance: ./bin/xrpl-hive --sim smoke --client rxrpl passes (3/3)
@@ -143,6 +125,9 @@ forbidden_paths:
 - T04 — eff_close_time clamp prior+1 in engine.rs, commit 5b24c17 (143/143 consensus tests green)
 - T21 — manifest::create_signed outbound + 3 round-trip tests, commit 580689c (217/217 overlay tests green)
 - T23 — 27 new LedgerTrie tests ported from rippled (40 total), commit 9cf032b
+- T05 — apply eff_close_time + prior_close_time field, commit ed05efd (172/172 consensus tests green)
+- T18 — ProposalTracker module, commit f41061e (7/7 tests green)
+- T22 — stobject_decode fuzz harness, commit dea175f (cargo fuzz build OK)
 
 ### Blocked
 <!-- Tasks blocked on external dependencies, see PROBLEMS.md for details. -->
