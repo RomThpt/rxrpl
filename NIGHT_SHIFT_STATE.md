@@ -123,3 +123,34 @@ History:
 ## Notes for review (morning)
 
 <!-- Auto-aggregated from NIGHT-SHIFT-REVIEW markers + PROBLEMS.md highlights at end of Phase 4. -->
+
+## Audit reports
+
+### Audit pass 1/3 — by-directory split (2026-04-27T15:55Z)
+
+10 agents (5 code-reviewer + 5 security-reviewer) reviewed the 30-file / 5194 LOC nightly diff in 5 directory slices.
+
+**0 critical (🔴)**, **10 high (🟠)**, ~15 medium/low.
+
+**HIGH findings** (must-fix):
+
+| # | Slice | File:line | Severity | Issue | Fix |
+|---|---|---|---|---|---|
+| 1 | 1 sec | engine.rs:1141 round_close_time | 🟠 | `(t + res/2)` u32 overflow near year 2106 | Use `saturating_add` |
+| 2 | 1 code | engine.rs:686-704 | 🟠 | Freshness gate runs BEFORE future-hold; held proposals get re-rejected on replay | Bypass gate on replay or move check |
+| 3 | 1 code | engine.rs:941 | 🟠 | `dispute.our_vote(t)` method collides with `our_vote: bool` field | Rename method |
+| 4 | 2 code | ledger_trie.rs tie-break | 🟠 | Picks LOWER hash; rippled picks HIGHER → fork divergence on ties | Match rippled OR document divergence |
+| 5 | 2 code | validations_trie.rs get_preferred | 🟠 | `current_seq` param ignored → stale validators pin obsolete ledger | Implement seq-based pruning |
+| 6 | 2 sec | proposal_tracker.rs | 🟠 | Unbounded growth via attacker-spoofed `prev_ledger` keys | Add per-prev_ledger LRU cap + UNL gate |
+| 7 | 2 sec | engine.rs:460 record_trusted_validation | 🟠 | No `is_current` check before ValidationsTrie.add | Wire `is_current` at ingress |
+| 8 | 3 sec | engine.rs peer_proposal_at | 🟠 | `pub` test-only API, downstream callers can bypass freshness gate | `#[cfg(test)]` or `#[doc(hidden)]` |
+| 9 | 4 sec | proto_convert.rs:587 | 🟠 | `Vec::with_capacity(payload.len())` from peer-supplied size = memory amplification | Cap at MAX_STVALIDATION_BYTES (~32 KB) |
+| 10 | 4 sec | validation_aggregator.rs:159 | 🟠 | `add_validation` only checks trust, NOT signature | Verify signature inside add_validation |
+
+**Positive notes** (consensus):
+- Excellent rippled cross-references throughout
+- 27 new ledger_trie tests + 6 dispute avalanche tests + 1000-case proptest
+- ProposalTracker dedup correctly drops stale prop_seq before dispute counters
+- Two-stage `check_wrong_prev_ledger` is thoughtful design
+- signing_payload byte-fidelity end-to-end (sign → encode → decode → verify)
+

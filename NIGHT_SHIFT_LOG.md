@@ -21,3 +21,4 @@
 [2026-04-27T15:08:04Z] [orchestrator] iter 6 — 2 done (T08, T08b); 19/26 done; T09/T10/T11 unblocked
 [2026-04-27T15:16:34Z] [orchestrator] iter 7 — 2 done (T09, T17); 21/26 done
 [2026-04-27T15:28:38Z] [orchestrator] iter 8 — 3 done (T10, T19, T20); 24/26 done; ALL TESTS GREEN; only QA tasks remaining
+[2026-04-27T15:37:32Z] [orchestrator] iter 9 — T11 done + T26-partial (local cargo+fuzz green); T24/T25 hive sims [BLOCKED] on push permission
