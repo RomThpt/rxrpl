@@ -182,12 +182,78 @@ Concrete next steps that would actually nail this:
   test harness (`STValidation_test.cpp`) to see the exact parse
   error.
 
-Out of scope for the current SHAMap+consensus PR stack — would be
-its own focused PR once root cause is known.
+### Root cause found in PR #33: NetClock epoch mismatch
 
-This is the next concrete blocker after the 4 PRs in the SHAMap +
-consensus stack land. It is independent of any of them and would be
-its own follow-up PR.
+The "TMValidation silently dropped" symptom turned out to be a
+30-year clock offset. Rxrpl was passing `SystemTime::now() -
+UNIX_EPOCH` as the consensus close_time, which then became the
+sign_time of every broadcast validation. XRPL's `NetClock` counts
+from 2000-01-01 UTC, not 1970, so every validation we sent had a
+sign_time ~30 years in rippled's future. Rippled's `isCurrent`
+check rejects timestamps outside `[now-3min, now+5min]` and drops
+the validation silently at trace severity (`Validation: not
+current`), which is why no warning appeared in the rippled log
+even after enabling debug.
+
+`crates/rpc-server/src/handlers/ledger_accept.rs` already had the
+conversion (with a comment about the XRPL epoch); only the
+consensus loops in `node.rs` were missing it. PR #33 applies the
+fix using the existing `RIPPLE_EPOCH_OFFSET` constant.
+
+Verified end-to-end via `prop_v14`: `closing with
+effective_close_time=830589367` now matches rippled's own clock
+(`We closed at 830589xxx`). The drop at `isCurrent` no longer fires.
+
+### Remaining gap: chain divergence after catchup
+
+Even with the timestamp fix, the cross-impl-payment hive sim still
+fails because rxrpl and rippled close *different ledger hashes* for
+the same sequence:
+
+```
+WARN wrong prev_ledger detected: 1/1 trusted peers reference
+0873169ADD536733CE174E23E37501002FE0796EBBEA78D94A06BBC4DD4B7A5D,
+ours is D7373E4E31B76D102F0D0A14979E8D04892F6B53EE28B3EECC755397261366EB.
+Triggering recovery.
+```
+
+The flow is:
+1. Both nodes start from independently-constructed genesis.
+2. rxrpl closes #2 → hash D7373E (its genesis chain).
+3. rippled closes #2 → hash 0873169A (its genesis chain).
+4. rxrpl receives rippled's TMProposeSet for #N+1 with prev=0873.
+5. `wrong_prev_ledger` fires; rxrpl triggers catchup of rippled's #N.
+6. Catchup adopts rippled's hash; `Ledger::new_open(reconstructed)`
+   makes the next open inherit the adopted parent.
+7. Next consensus tick should now propose against rippled's prev,
+   but by then rippled has moved on to #N+2 → loop.
+
+After the timestamp fix, validations from rxrpl now reach rippled
+without being dropped at `isCurrent`. But because rxrpl validates
+its *own* locally-closed hashes (D7373E…) rather than the
+catchup-adopted ones (0873…), the two never validate the same
+hash, quorum is never met, and `validated_ledger.seq` on rippled
+stays at 0.
+
+Concrete next steps for whoever picks this up:
+- Audit `node.rs::run_networked` close path: after catchup adoption
+  via `*l = new_open(&reconstructed)`, confirm the next consensus
+  tick reads the adopted `parent_hash` and not a stale value
+  (timing race between `syncing=false` flip and the next tick).
+- Cross-check the close pipeline. The state map after adoption
+  should be byte-identical to rippled's reconstructed map (PR #30
+  + #31 made the hashes compatible). If rxrpl's close adds extra
+  state entries (e.g. validator registration, pseudo-tx) that
+  rippled does not, the closed-ledger hash will diverge even if
+  the input states match.
+- Consider deferring local closes when peer proposals indicate a
+  more advanced chain. Today rxrpl always closes on its timer tick
+  even when it knows it is catching up; closing should wait until
+  consensus actually agrees with peers.
+
+This was the next concrete blocker after the SHAMap+consensus stack
+landed. The validation-drop layer is now resolved; the
+chain-divergence layer is the next one.
 
 ## How to reproduce locally
 
