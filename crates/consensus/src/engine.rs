@@ -9,6 +9,7 @@ use crate::error::ConsensusError;
 use crate::negative_unl::{NegativeUnlChange, NegativeUnlTracker};
 use crate::params::ConsensusParams;
 use crate::phase::ConsensusPhase;
+use crate::proposal_tracker::ProposalTracker;
 use crate::types::{DisputedTx, NodeId, Proposal, TxSet, Validation};
 use crate::unl::TrustedValidatorList;
 use crate::validations_trie::ValidationsTrie;
@@ -55,6 +56,13 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     our_set: Option<TxSet>,
     /// Proposals from other validators.
     peer_positions: HashMap<NodeId, Proposal>,
+    /// Authoritative dedup layer for incoming peer proposals, keyed by
+    /// `(NodeId, prev_ledger)`. Mirrors goXRPL `ProposalTracker`: a peer's
+    /// stored entry is only replaced when the new `prop_seq` is strictly
+    /// greater. `peer_positions` is kept in lockstep so existing engine
+    /// APIs (effective close-time, dispute aggregation, wrong-prev-ledger
+    /// detection) continue to read from a single position per peer.
+    proposal_tracker: ProposalTracker,
     /// Disputed transactions (tx_hash -> dispute).
     disputes: HashMap<Hash256, DisputedTx>,
     /// Current consensus round.
@@ -172,6 +180,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             our_position: None,
             our_set: None,
             peer_positions: HashMap::new(),
+            proposal_tracker: ProposalTracker::new(),
             disputes: HashMap::new(),
             round: 0,
             prev_ledger: Hash256::ZERO,
@@ -523,6 +532,10 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.our_position = None;
         self.our_set = None;
         self.peer_positions.clear();
+        // Drop tracker entries anchored on the previous round's prev_ledger.
+        // Entries for the new prev_ledger (e.g. proposals replayed from
+        // future_proposals) survive so their dedup state carries over.
+        self.proposal_tracker.clear_for(&self.prev_ledger);
         self.disputes.clear();
         self.round = 0;
         self.prev_ledger = prev_ledger;
@@ -722,6 +735,19 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
                 );
                 return;
             }
+        }
+
+        // Authoritative dedup: only let proposals through that the
+        // (NodeId, prev_ledger)-keyed ProposalTracker accepts as a strict
+        // `prop_seq` advance. Duplicates and stale-seq replays are dropped
+        // silently here so they never bump dispute counters or rotate the
+        // peer's stored position.
+        if !self.proposal_tracker.track(proposal.clone()) {
+            tracing::debug!(
+                "dropped duplicate/older proposal from {:?} seq={} prop_seq={}",
+                proposal.node_id, proposal.ledger_seq, proposal.prop_seq
+            );
+            return;
         }
 
         tracing::debug!("accepted proposal from {:?} seq={}", proposal.node_id, proposal.ledger_seq);
@@ -2448,5 +2474,227 @@ mod tests {
         engine.peer_proposal_at(future, now);
         assert_eq!(engine.proposal_dropped_stale_total(), 2);
         assert!(engine.peer_positions.is_empty());
+    }
+
+    // --- T19: ProposalTracker dedup tests ---
+
+    /// Build a 3-node engine driven into Establish phase, with us=node(1)
+    /// and a single-tx local set so peer proposals against a *different*
+    /// tx_set materialise dispute votes we can assert on.
+    fn dedup_engine(
+        local_set: TxSet,
+        peer_set: TxSet,
+    ) -> ConsensusEngine<MockAdapter> {
+        let unl = make_unl(&[1, 2, 3]);
+        let adapter = MockAdapter::with_tx_sets(vec![local_set.clone(), peer_set]);
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+        engine.close_ledger(local_set, 100, 1).unwrap();
+        engine
+    }
+
+    #[test]
+    fn duplicate_proposal_does_not_bump_dispute_counters() {
+        // Local set has tx1; peer's set is empty so tx1 becomes a dispute
+        // when peer's proposal lands. Re-delivering the identical proposal
+        // must NOT bump the dispute's nay_count for that peer (the
+        // ProposalTracker drops the second call before it reaches
+        // create_disputes).
+        let tx1 = Hash256::new([0x01; 32]);
+        let local_set = TxSet::new(vec![tx1]);
+        let peer_set = TxSet::new(vec![]);
+        let mut engine = dedup_engine(local_set.clone(), peer_set.clone());
+
+        let p = Proposal {
+            node_id: node(2),
+            public_key: vec![0x02; 33],
+            tx_set_hash: peer_set.hash,
+            close_time: 100,
+            prop_seq: 0,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(p.clone(), 100);
+        assert_eq!(engine.peer_positions.len(), 1);
+        let nay_after_first = engine
+            .disputes()
+            .get(&tx1)
+            .expect("dispute should exist after first proposal")
+            .nay_count();
+        assert_eq!(nay_after_first, 1);
+
+        // Replay identical proposal — same node_id, prev_ledger, prop_seq.
+        engine.peer_proposal_at(p, 100);
+
+        // No new dispute created, peer_positions unchanged, vote count
+        // unchanged (insert into HashMap with same key/value would also
+        // be a no-op, but we want to prove create_disputes was skipped).
+        assert_eq!(engine.peer_positions.len(), 1);
+        assert_eq!(engine.disputes().len(), 1);
+        let nay_after_dup = engine.disputes().get(&tx1).unwrap().nay_count();
+        assert_eq!(nay_after_dup, nay_after_first);
+        // ProposalTracker still holds prop_seq=0.
+        assert_eq!(
+            engine
+                .proposal_tracker
+                .get(&node(2), &Hash256::ZERO)
+                .unwrap()
+                .prop_seq,
+            0
+        );
+    }
+
+    #[test]
+    fn lower_prop_seq_proposal_is_rejected() {
+        // First accept prop_seq=5 with peer_set_a (empty). Then re-deliver
+        // the same node with prop_seq=3 but a *different* tx_set: the
+        // ProposalTracker must reject the older seq, leaving peer_positions
+        // pinned to the prop_seq=5 entry.
+        let tx1 = Hash256::new([0x01; 32]);
+        let tx2 = Hash256::new([0x02; 32]);
+        let local_set = TxSet::new(vec![tx1]);
+        let peer_set_a = TxSet::new(vec![]);
+        let peer_set_b = TxSet::new(vec![tx2]);
+
+        let unl = make_unl(&[1, 2, 3]);
+        let adapter = MockAdapter::with_tx_sets(vec![
+            local_set.clone(),
+            peer_set_a.clone(),
+            peer_set_b.clone(),
+        ]);
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+        engine.close_ledger(local_set, 100, 1).unwrap();
+
+        let high = Proposal {
+            node_id: node(2),
+            public_key: vec![0x02; 33],
+            tx_set_hash: peer_set_a.hash,
+            close_time: 100,
+            prop_seq: 5,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(high, 100);
+        assert_eq!(
+            engine
+                .peer_positions
+                .get(&node(2))
+                .unwrap()
+                .tx_set_hash,
+            peer_set_a.hash
+        );
+
+        // Older prop_seq carrying a different tx_set: rejected silently.
+        let stale = Proposal {
+            node_id: node(2),
+            public_key: vec![0x02; 33],
+            tx_set_hash: peer_set_b.hash,
+            close_time: 100,
+            prop_seq: 3,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(stale, 100);
+
+        // Stored position must still be the prop_seq=5 / peer_set_a entry.
+        let stored = engine.peer_positions.get(&node(2)).unwrap();
+        assert_eq!(stored.prop_seq, 5);
+        assert_eq!(stored.tx_set_hash, peer_set_a.hash);
+        assert_eq!(
+            engine
+                .proposal_tracker
+                .get(&node(2), &Hash256::ZERO)
+                .unwrap()
+                .prop_seq,
+            5
+        );
+    }
+
+    #[test]
+    fn higher_prop_seq_proposal_replaces_existing() {
+        // First accept prop_seq=0 with peer_set_a. Then deliver prop_seq=1
+        // with peer_set_b — ProposalTracker must accept and the engine's
+        // peer_positions entry must rotate to reflect the new tx_set.
+        let tx1 = Hash256::new([0x01; 32]);
+        let tx2 = Hash256::new([0x02; 32]);
+        let local_set = TxSet::new(vec![tx1]);
+        let peer_set_a = TxSet::new(vec![]);
+        let peer_set_b = TxSet::new(vec![tx2]);
+
+        let unl = make_unl(&[1, 2, 3]);
+        let adapter = MockAdapter::with_tx_sets(vec![
+            local_set.clone(),
+            peer_set_a.clone(),
+            peer_set_b.clone(),
+        ]);
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+        engine.close_ledger(local_set, 100, 1).unwrap();
+
+        let first = Proposal {
+            node_id: node(2),
+            public_key: vec![0x02; 33],
+            tx_set_hash: peer_set_a.hash,
+            close_time: 100,
+            prop_seq: 0,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(first, 100);
+        assert_eq!(
+            engine
+                .peer_positions
+                .get(&node(2))
+                .unwrap()
+                .prop_seq,
+            0
+        );
+
+        let updated = Proposal {
+            node_id: node(2),
+            public_key: vec![0x02; 33],
+            tx_set_hash: peer_set_b.hash,
+            close_time: 100,
+            prop_seq: 1,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(updated, 100);
+
+        let stored = engine.peer_positions.get(&node(2)).unwrap();
+        assert_eq!(stored.prop_seq, 1);
+        assert_eq!(stored.tx_set_hash, peer_set_b.hash);
+        assert_eq!(
+            engine
+                .proposal_tracker
+                .get(&node(2), &Hash256::ZERO)
+                .unwrap()
+                .prop_seq,
+            1
+        );
     }
 }
