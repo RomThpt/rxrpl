@@ -305,7 +305,12 @@ impl ConsensusSimulator {
             for (to, msg) in messages {
                 match msg {
                     SimMessage::Proposal(proposal) => {
-                        self.engines[to].peer_proposal(proposal);
+                        // Anchor freshness against the proposal's own
+                        // close_time so the simulator's frozen-time model
+                        // (`close_time = 100`) does not collide with the
+                        // wall-clock check in `peer_proposal`.
+                        let now = proposal.close_time;
+                        self.engines[to].peer_proposal_at(proposal, now);
                     }
                 }
             }

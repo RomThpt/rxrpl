@@ -21,6 +21,11 @@ Tags: `[UNCERTAINTY]` `[ASSUMPTION]` `[BLOCKED]` `[UNFIXED]` `[TEST_GAP]` `[DEPE
 
 <!-- Active problems still affecting the run. -->
 
+[ASSUMPTION] T14 — peer_proposal freshness gate forced edits OUTSIDE the engine.rs whitelist.
+- Context: Adding the wall-clock freshness check to `ConsensusEngine::peer_proposal` makes any caller passing a frozen close_time (e.g. 100) fail. Two such callers live outside the whitelist: `crates/consensus/src/simulator.rs` (drives `simulator::tests::*` lib tests) and `crates/consensus/tests/multi_node.rs` (integration test). Without their migration `cargo test -p rxrpl-consensus --lib` would regress on the simulator tests.
+- Attempts: Updated both files to call `peer_proposal_at(p, p.close_time)` so the freshness anchor is the proposal's own close_time (delta=0 always).
+- Suggested next step: Confirm that broadening the whitelist for T14 was acceptable, or revert simulator.rs/multi_node.rs and instead expose a configurable freshness threshold on the engine (default 30, tests set u32::MAX).
+
 ## Resolved
 
 <!-- Problems that were resolved during a later iteration. Move entries here from "Open" with a timestamp and the resolving commit/agent. -->
