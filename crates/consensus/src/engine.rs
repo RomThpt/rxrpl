@@ -223,6 +223,28 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.accepted_close_time
     }
 
+    /// Returns the rounded median of our and peers' close_time, or None if
+    /// no peer positions are available. Used by the node layer to converge
+    /// on a shared close_time bucket even before formal quorum, so two
+    /// independently-clocked validators produce identical closed-ledger
+    /// hashes.
+    pub fn rounded_close_time(&self) -> Option<u32> {
+        if self.peer_positions.is_empty() {
+            return None;
+        }
+        let our_time = self.our_position.as_ref().map(|p| p.close_time)?;
+        let mut times: Vec<u32> = vec![our_time];
+        for peer in self.peer_positions.values() {
+            times.push(peer.close_time);
+        }
+        times.sort();
+        let median = times[times.len() / 2];
+        Some(round_close_time(
+            median,
+            self.adaptive_close_time.resolution(),
+        ))
+    }
+
     /// Get the accepted close flags.
     pub fn accepted_close_flags(&self) -> u8 {
         self.accepted_close_flags
