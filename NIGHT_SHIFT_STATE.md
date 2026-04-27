@@ -40,12 +40,6 @@ forbidden_paths:
 
 ### Ready
 
-- [ ] T02 [kind=code,deps=T01]: Port getNextLedgerTimeResolution semantics (modulo ledger_seq, not consecutive count)
-  - acceptance: new fn next_resolution(prev_res, prev_agree, ledger_seq) -> u32 mirrors rippled LedgerTiming.h:60-98
-  - acceptance: increase every 8 ledgers when prev_agree, decrease every 1 ledger when !prev_agree
-  - acceptance: 6+ unit tests covering boundary bin indexes (0 and 5) and modulo cadences
-  - globs: crates/consensus/src/close_resolution.rs
-
 - [ ] T03 [kind=code,deps=T02]: Wire next_resolution into ConsensusEngine.start_round; remove on_agreement/on_disagreement consecutive-counter pathway
   - acceptance: start_round records prev_agree from previous round, computes new resolution via next_resolution(prev_res, prev_agree, ledger_seq)
   - acceptance: AdaptiveCloseTime API simplified — old hooks deprecated
@@ -68,11 +62,6 @@ forbidden_paths:
   - acceptance: 200+ generated cases, no panics
   - globs: crates/consensus/tests/close_time_props.rs, crates/consensus/Cargo.toml
 
-- [ ] T08 [kind=code,deps=T07]: Extend Validation type to carry full STValidation optional fields
-  - acceptance: types.rs::Validation gains optional load_fee, base_fee, reserve_base, reserve_increment, cookie, consensus_hash, validated_hash, server_version, base_fee_drops, reserve_base_drops, reserve_increment_drops
-  - acceptance: existing constructors keep compiling via Default impl
-  - globs: crates/consensus/src/types.rs
-
 - [ ] T09 [kind=code,deps=T08]: Update identity::sign_validation to encode full SOTemplate (canonical sort by field tag)
   - acceptance: builder appends fields in canonical SField order; sfSignature excluded from signing payload
   - acceptance: signing_payload populated with the strip-result so verifier can replay
@@ -88,11 +77,6 @@ forbidden_paths:
   - acceptance: 500+ random Validation structs survive encode→decode without loss
   - acceptance: signing_hash stable across encode→decode→encode (idempotent)
   - globs: crates/overlay/tests/stvalidation_roundtrip.rs
-
-- [ ] T13 [kind=code,deps=T12]: Apply is_current() filter in validation_aggregator before accepting validations
-  - acceptance: stale validations dropped with tracing::warn!(stale_validation, %public_key)
-  - acceptance: counter validation_dropped_stale_total bumped
-  - globs: crates/overlay/src/validation_aggregator.rs
 
 - [ ] T14 [kind=code,deps=T12]: Apply same freshness check to incoming proposals (proposal staleness)
   - acceptance: ConsensusEngine.peer_proposal rejects when |now - close_time| > PROPOSAL_FRESHNESS (use 30s like rippled propRELAY_INTERVAL)
@@ -167,16 +151,29 @@ forbidden_paths:
   - acceptance: cargo +nightly fuzz run validation_deser -- -max_total_time=60 — exits clean
   - globs: NIGHT_SHIFT_LOG.md
 
+- [ ] T08b [kind=code,deps=T08]: Update 14 Validation { ... } literal sites to add ..Default::default()
+  - acceptance: nightly-agent-T08-T08 branch merges cleanly into nightly/2026-04-27 with all dependent crates building
+  - acceptance: production sites (engine.rs:808, proto_convert.rs:221, node.rs:1800) compile
+  - acceptance: test sites in identity.rs (5), validation_aggregator.rs, node.rs (4), checkpoint.rs, peer_handshake.rs all compile
+  - globs: crates/consensus/src/engine.rs, crates/overlay/src/proto_convert.rs, crates/overlay/src/identity.rs, crates/overlay/src/validation_aggregator.rs, crates/overlay/tests/peer_handshake.rs, crates/node/src/node.rs, crates/node/src/checkpoint.rs
+
+- [ ] T13b [kind=code,deps=T13]: Fix 2 pre-existing node.rs tests broken by T13 freshness gate
+  - acceptance: tests `quorum_auto_set_integration` and `quorum_not_overridden_when_configured` in crates/node/src/node.rs use ripple_now()-aligned sign_time or call add_validation_at(v, now) instead of add_validation
+  - acceptance: cargo test -p rxrpl-node --lib green
+  - globs: crates/node/src/node.rs
+
 ### In progress
-- T02 (agent-T02) — branch nightly-agent-T02-T02 — started 2026-04-27T14:00:30Z
-- T08 (agent-T08) — branch nightly-agent-T08-T08 — started 2026-04-27T14:00:30Z
-- T13 (agent-T13) — branch nightly-agent-T13-T13 — started 2026-04-27T14:00:30Z
-<!-- Tasks currently being worked on by an agent. -->
+- T03 (agent-T03) — branch nightly-agent-T03-T03 — started 2026-04-27T14:10:04Z
+- T13b (agent-T13b) — branch nightly-agent-T13b-T13b — started 2026-04-27T14:10:04Z
+- T15 (agent-T15) — branch nightly-agent-T15-T15 — started 2026-04-27T14:10:04Z
+- T08 (agent-T08) — branch nightly-agent-T08-T08 — fields added but blocks 14 consumer sites, awaiting T08b
 
 ### Done
-- T01 — close_resolution.rs rippled bins [10,20,30,60,90,120], commit 85ccdc0 (engine.rs tests fail until T03)
-- T07 — stobject SOTemplate fields for STValidation, commit 1734f6f (211/211 overlay lib tests green)
+- T01 — close_resolution.rs rippled bins [10,20,30,60,90,120], commit 85ccdc0
+- T02 — close_resolution next_resolution port, commit f78e4ba (23 tests green)
+- T07 — stobject SOTemplate fields for STValidation, commit 1734f6f (211/211 tests green)
 - T12 — validation_current.rs freshness window, commit b0f2d47 (7/7 tests green)
+- T13 — validation_aggregator freshness gate, commit 27b3f77 (12/12 tests green; 2 node tests need T13b fix)
 
 ### Blocked
 <!-- Tasks blocked on external dependencies, see PROBLEMS.md for details. -->
@@ -188,12 +185,13 @@ forbidden_paths:
 
 ## Validation results
 
-Last run: never
-- build: null
-- test: null
-- lint: null
+Last run: 2026-04-27T14:08:10Z
+- build: true
+- test: false (engine.rs tests await T03; node.rs quorum tests await T13b)
+- lint: false (rpc-api derivable_impls — pre-existing on main, untouched by nightly)
 
 History:
+- 2026-04-27T14:08:10Z — build=true test=false lint=false (planned fixes in queue: T03, T13b)
 
 ---
 
