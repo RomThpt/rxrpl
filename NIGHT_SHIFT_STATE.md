@@ -184,3 +184,26 @@ History:
 - No test for `pending_proposals` overflow (C2)
 - Fuzz target only covers 2 of 8 stobject decoders; composite `decode_validation` untouched
 
+
+### Audit pass 3/3 — DEFERRED to morning review
+After pass 1 + pass 2 surfaced 2 critical + 16 high findings (15 deferred to follow-up PRs, 4 fixed in-band: round_close_time overflow, sig verify entry point, pending_proposals cap, UNL guard pre-bind), pass 3 was skipped to preserve session context budget. The `## Notes for review (morning)` section below aggregates all findings for the user to triage.
+
+## Notes for review (morning)
+
+**Nightly run summary (2026-04-27)**:
+- 64 commits on branch `nightly/2026-04-27` since `main`
+- 23/26 planned tasks DONE + 2 follow-ups (T08b, T13b) + 4 audit fixes
+- 13 NIGHT-SHIFT-REVIEW markers in the diff (port-quality flags from agents)
+- Validation: build=true test=true lint=false (rxrpl-rpc-api derivable_impls — pre-existing, out of scope)
+
+**T24/T25 BLOCKED**: hive cross-impl sims need `git push -u origin nightly/2026-04-27` to let the Docker build clone from GitHub. User authorization required.
+
+**Audit findings to triage in follow-up PRs**:
+- 🔴 C1: validations_trie::add no monotonicity → stale validation can flip preferred-branch
+- 🔴 C3: record_trusted_validation no sig verification (forge attack) — partial mitigation via verify_and_add
+- 🟠 H4-H8: ledger_trie tie-break vs rippled, validations_trie current_seq ignored, ProposalTracker LRU, is_current at trie ingress, peer_proposal_at test API exposed
+- 🟠 H11-H16: eff_close_time clamp manufactures peer agreement, decode_validation duplicate-field exploit, close_time=0 sentinel rewrite, doc-vs-code drift, manifest sfDomain lossy UTF-8
+
+**Cross-impl convergence (TODO end-to-end)**:
+The local cargo+fuzz suite is GREEN. The xrpl-hive cross-impl-payment sim has NOT been run against this branch yet (push blocked). Expected behavior given the substantial RCL port (T01-T20): close_time bins now match rippled (10/20/30/60/90/120), STValidation full SOTemplate, ValidationsTrie wired into wrong-prev-ledger detection, dispute avalanche thresholds 50/65/70/95, ProposalTracker dedup. Should improve hash convergence vs the 9 prior PRs but exact fix unknown without sim run.
+
