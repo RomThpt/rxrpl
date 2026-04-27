@@ -2,6 +2,42 @@
 
 Document d'état mis à jour à chaque commit notable. Scores contre [XRPL-Commons/xrpl-hive](https://github.com/XRPL-Commons/xrpl-hive).
 
+## T27 — byte-level diff goXRPLd vs rxrpl TMValidation (2026-04-28)
+
+**Divergence trouvée** : `crates/overlay/src/proto_convert.rs::encode_validation`
+émettait `sfSignature` (type 7, field 6) APRÈS `sfAmendments` (type 19, field 3),
+violant l'ordre canonical `(type<<16)|field` croissant que rippled
+(`STObject::add` dans `src/libxrpl/protocol/STObject.cpp`) et goXRPLd
+(`internal/consensus/adaptor/stvalidation.go::SerializeSTValidation` lignes
+~250) appliquent. Sur les flag-ledgers où amendments sont émis, le suppression
+hash rxrpl divergeait de celui calculé par les peers, et la validation était
+silencieusement classée comme "stray packet" par rippled — explicant les **0
+validations reçues** observées dans les sims `propagation/cross-impl-payment`.
+
+Vérifications croisées contre les 7 critères du spec T27 :
+
+| # | Critère | Statut rxrpl |
+|---|---|---|
+| 1 | `sfFlags = 0x80000001` (vfFullyCanonicalSig\|vfFullValidation) | OK (`identity.rs:125` pour `full=true`) |
+| 2 | Ordre canonique `(type, field)` ascendant | **CASSÉ avant T27** sur amendments → corrigé |
+| 3 | `sfAmendments` = type 19 (Vector256), field 3, header `[0x03, 0x13]` | OK (`stobject.rs::put_vector256`) |
+| 4 | secp256k1 = signature DER (pas R\|\|S brut) | OK (`crypto/src/secp256k1.rs::sign` ligne 139, `der::encode_der_signature`) |
+| 5 | `sfSigningPubKey` VL-prefixé + 33 bytes secp256k1 compressé | OK (`stobject.rs::put_vl`) |
+| 6 | `HashPrefix::validation = 0x56414C00` (`"VAL\0"`) prepend signing | OK (`identity.rs:117` + verifier ligne 255) |
+| 7 | Frame header 6 bytes (4 length+flags BE / 2 type=41 BE) | OK (`p2p-proto/src/codec.rs::PeerCodec`) |
+
+**Fix** : insère `sfSignature` à sa position canonique (avant `sfAmendments`)
+via `canonical_signature_insert_offset()`. Régression couverte par
+`crates/overlay/tests/wire_diff_validation.rs` (9 tests, 1 par critère).
+
+**Note connexe** (non-bloquante, conservée pour audit ultérieur) : le décodeur
+rxrpl exige `(flags & 0x80000001) == 0x80000001` pour marquer `full=true`
+(`proto_convert.rs:172`). goXRPLd utilise `(flags & vfFullValidation) != 0`
+(`stvalidation.go::parseSTValidation`). En pratique, rippled émet TOUJOURS
+`vfFullyCanonicalSig`, donc la divergence est latente — mais une validation
+partial signée par un peer non-canonical-strict serait classée full=false par
+rxrpl. Documenté ici comme suivi possible si une nouvelle divergence émerge.
+
 ## Score actuel (2026-04-25)
 
 | Simulator | Passés | Total | Taux |

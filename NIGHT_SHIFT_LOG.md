@@ -24,3 +24,5 @@
 [2026-04-27T15:37:32Z] [orchestrator] iter 9 — T11 done + T26-partial (local cargo+fuzz green); T24/T25 hive sims [BLOCKED] on push permission
 [2026-04-27T16:29:06Z] [orchestrator] phase 3 complete (passes 1+2, 4 fixes); phase 4 finalize start
 [2026-04-27T16:30:18Z] [orchestrator] phase 4 complete — draft PR #39 opened https://github.com/RomThpt/rxrpl/pull/39
+
+[2026-04-28T00:00:00Z] [night-coder] T27 wire-diff: identified non-canonical sfSignature placement (after sfAmendments) in encode_validation; fix splices sfSignature at canonical (7,6) position; +9 regression tests in tests/wire_diff_validation.rs; cargo test -p rxrpl-overlay green (241 tests).
