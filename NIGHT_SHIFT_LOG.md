@@ -20,3 +20,4 @@
 [2026-04-27T14:57:55Z] [orchestrator] iter 5 — 3 done (T06,T14,T16); 17/26 done
 [2026-04-27T15:08:04Z] [orchestrator] iter 6 — 2 done (T08, T08b); 19/26 done; T09/T10/T11 unblocked
 [2026-04-27T15:16:34Z] [orchestrator] iter 7 — 2 done (T09, T17); 21/26 done
+[2026-04-27T15:28:38Z] [orchestrator] iter 8 — 3 done (T10, T19, T20); 24/26 done; ALL TESTS GREEN; only QA tasks remaining

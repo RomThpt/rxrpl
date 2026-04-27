@@ -64,3 +64,13 @@ Test in crates/overlay/tests/peer_handshake.rs:217 fails `decoded.signature.is_s
 
 ## [WIP] rxrpl-rpc-api clippy::derivable_impls — 2026-04-27T14:21Z
 Pre-existing on main, NOT in nightly whitelist. crates/rpc-api/src/lib.rs:5 ApiVersion enum has manual Default impl that clippy 1.91 wants to derive. Out of scope for nightly run.
+
+## [BLOCKED] T24/T25 require push of nightly branch to origin — 2026-04-27T15:30Z
+xrpl-hive's Docker build clones rxrpl from `git@github.com:RomThpt/rxrpl.git` and checks out the configured tag. To run the cross-impl sim against the nightly branch, the local commits on `nightly/2026-04-27` must be pushed to origin so the Docker container can fetch them.
+
+User authorization needed:
+```bash
+git push -u origin nightly/2026-04-27
+```
+
+Once pushed, T24 (smoke + propagation sim) and T25 (consensus + sync sim) can run via `./bin/xrpl-hive --sim ... --client rxrpl,rippled_2.3.0` from `~/Developer/xrpl-hive`.
