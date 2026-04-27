@@ -109,14 +109,17 @@ fn three_nodes_same_set_converge() {
     let p2 = engine2.our_position().unwrap().clone();
     let p3 = engine3.our_position().unwrap().clone();
 
-    engine1.peer_proposal(p2.clone());
-    engine1.peer_proposal(p3.clone());
+    // Anchor freshness against each proposal's own close_time so the
+    // integration test's frozen-time model (close_time=100) does not
+    // collide with the wall-clock check inside `peer_proposal`.
+    engine1.peer_proposal_at(p2.clone(), p2.close_time);
+    engine1.peer_proposal_at(p3.clone(), p3.close_time);
 
-    engine2.peer_proposal(p1.clone());
-    engine2.peer_proposal(p3.clone());
+    engine2.peer_proposal_at(p1.clone(), p1.close_time);
+    engine2.peer_proposal_at(p3.clone(), p3.close_time);
 
-    engine3.peer_proposal(p1.clone());
-    engine3.peer_proposal(p2.clone());
+    engine3.peer_proposal_at(p1.clone(), p1.close_time);
+    engine3.peer_proposal_at(p2.clone(), p2.close_time);
 
     // quorum = ceil(3*0.8) = 3, all 3 agree -> converge
     assert!(engine1.converge());
@@ -149,9 +152,10 @@ fn two_vs_one_dispute_resolution() {
         .close_ledger(set_minority.clone(), 100, seq)
         .unwrap();
 
-    // Nodes 2, 3, 4, 5 all propose the majority set
+    // Nodes 2, 3, 4, 5 all propose the majority set.
+    // proposal_for sets close_time=100; anchor `now` accordingly.
     for id in [2, 3, 4, 5] {
-        engine1.peer_proposal(proposal_for(node(id), set_majority.hash, prev, seq));
+        engine1.peer_proposal_at(proposal_for(node(id), set_majority.hash, prev, seq), 100);
     }
 
     // Converge: tx2 has only 1/5 support (us), should be dropped
