@@ -675,9 +675,19 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.peer_proposal_at(proposal, now);
     }
 
-    /// Test-friendly variant of [`Self::peer_proposal`] that accepts an
-    /// explicit `now` (ripple-epoch seconds) so the freshness check is
-    /// deterministic. Production code should call [`Self::peer_proposal`].
+    /// **Test-only entry point** — production code MUST call
+    /// [`Self::peer_proposal`].
+    ///
+    /// Exposes the freshness-anchor seam to tests by accepting an explicit
+    /// `now` (ripple-epoch seconds) so the freshness check is deterministic.
+    /// Downstream callers must NOT supply an attacker-controlled `now` value,
+    /// since doing so would bypass the [`PROPOSAL_FRESHNESS_SECS`] gate that
+    /// [`Self::peer_proposal`] anchors to the local wall-clock.
+    ///
+    /// Kept `pub` (rather than `pub(crate)`) only because the
+    /// `crates/consensus/tests/multi_node.rs` integration test needs a
+    /// deterministic clock; hidden from rustdoc to discourage external use.
+    #[doc(hidden)]
     pub fn peer_proposal_at(&mut self, proposal: Proposal, now: u32) {
         if self.phase != ConsensusPhase::Establish {
             // Apply UNL + freshness gates BEFORE buffering to prevent
