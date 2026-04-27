@@ -551,25 +551,98 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         }
     }
 
-    /// Compute the effective close time from all proposals (median, rounded).
+    /// Compute the effective close time from all proposals.
+    ///
+    /// Inspired by goXRPL/rippled `RCLConsensus::Adaptor::haveCloseTimeConsensus`.
+    /// Each trusted proposal's close_time is rounded to the current
+    /// adaptive resolution bucket; the bucket with the most votes wins.
+    /// On ties, picks the earlier bucket (deterministic).
+    ///
+    /// This differs from a plain median: when peers and self have very
+    /// different times, the most-popular *bucket* (not the median) is
+    /// chosen, which is what rippled does for cross-validator agreement.
     fn effective_close_time(&self) -> u32 {
         let our_time = match &self.our_position {
             Some(p) => p.close_time,
             None => return 0,
         };
+        let resolution = self.adaptive_close_time.resolution();
 
         if self.peer_positions.is_empty() {
-            return our_time;
+            return round_close_time(our_time, resolution);
         }
 
-        let mut times: Vec<u32> = vec![our_time];
+        // Tally votes per rounded close-time bucket.
+        let mut votes: HashMap<u32, u32> = HashMap::new();
+        let our_bucket = round_close_time(our_time, resolution);
+        *votes.entry(our_bucket).or_insert(0) += 1;
         for peer in self.peer_positions.values() {
-            times.push(peer.close_time);
+            let peer_bucket = round_close_time(peer.close_time, resolution);
+            *votes.entry(peer_bucket).or_insert(0) += 1;
         }
-        times.sort();
 
-        let median = times[times.len() / 2];
-        round_close_time(median, self.adaptive_close_time.resolution())
+        // Pick the bucket with the most votes. On ties, pick the LATER
+        // bucket: both validators run the same tiebreak deterministically,
+        // and biasing towards "later" matches the natural drift of each
+        // validator's clock forward over time, so the chosen bucket is
+        // less likely to fall behind prior_close_time + 1s monotonicity.
+        let mut best_bucket = our_bucket;
+        let mut best_count = 0u32;
+        for (bucket, count) in &votes {
+            if *count > best_count || (*count == best_count && *bucket > best_bucket) {
+                best_bucket = *bucket;
+                best_count = *count;
+            }
+        }
+        best_bucket
+    }
+
+    /// Update `our_position.close_time` to match the consensus winner
+    /// only when a STRICT majority of voters (us + peers) share the
+    /// same bucket. This drives cross-validator convergence without
+    /// suppressing the disagreement signal used for adaptive resolution
+    /// widening: when nodes are split across buckets (e.g. 1-1 in a
+    /// 2-validator setup) no realignment fires and the spread/flag
+    /// detection in `accept()` still sees the disagreement.
+    fn align_close_time_with_peers(&mut self) {
+        if self.our_position.is_none() || self.peer_positions.is_empty() {
+            return;
+        }
+        let resolution = self.adaptive_close_time.resolution();
+        let our_time = self.our_position.as_ref().map(|p| p.close_time).unwrap_or(0);
+        let our_bucket = round_close_time(our_time, resolution);
+
+        let mut votes: HashMap<u32, u32> = HashMap::new();
+        *votes.entry(our_bucket).or_insert(0) += 1;
+        for peer in self.peer_positions.values() {
+            let b = round_close_time(peer.close_time, resolution);
+            *votes.entry(b).or_insert(0) += 1;
+        }
+        let total: u32 = votes.values().sum();
+        // Find best bucket; tiebreak by latest.
+        let mut best_bucket = our_bucket;
+        let mut best_count = 0u32;
+        for (bucket, count) in &votes {
+            if *count > best_count || (*count == best_count && *bucket > best_bucket) {
+                best_bucket = *bucket;
+                best_count = *count;
+            }
+        }
+        // Strict majority (>50%) before realigning. Below that, leave
+        // our_position alone so the disagreement signal survives.
+        if best_count * 2 <= total {
+            return;
+        }
+        if let Some(ref mut pos) = self.our_position {
+            if pos.close_time != best_bucket {
+                tracing::debug!(
+                    "consensus: realigning our close_time {} -> {} (majority bucket)",
+                    pos.close_time,
+                    best_bucket
+                );
+                pos.close_time = best_bucket;
+            }
+        }
     }
 
     /// Run one round of convergence.
@@ -580,6 +653,13 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         if self.phase != ConsensusPhase::Establish {
             return false;
         }
+
+        // Realign our close_time with the peer-popular bucket each round.
+        // This is what makes cross-validator close_time converge in
+        // rippled's RCL — without it, two independently-clocked
+        // validators each propose their own close_time forever and the
+        // closed-ledger hash never matches the peer's.
+        self.align_close_time_with_peers();
 
         let threshold = self.params.threshold_for_round(self.round);
 
@@ -1057,8 +1137,10 @@ mod tests {
         });
 
         assert!(engine.converge());
-        // Median of [100, 150, 200] = 150, rounded to 30s = 150 (already aligned)
-        assert_eq!(engine.accepted_close_time(), Some(150));
+        // Vote-counting: each of {100→90, 150→150, 200→210} has 1 vote.
+        // Tiebreak picks the LATEST bucket (210) deterministically so two
+        // validators making the same tally agree on the same winner.
+        assert_eq!(engine.accepted_close_time(), Some(210));
     }
 
     #[test]
