@@ -2621,7 +2621,7 @@ mod tests {
                 amendments: vec![],
                 signing_payload: None,
             };
-            assert!(val_aggregator.add_validation(v).is_none());
+            assert!(val_aggregator.add_validation_at(v, 100).is_none());
         }
 
         // 28th validation reaches quorum
@@ -2637,7 +2637,7 @@ mod tests {
             amendments: vec![],
             signing_payload: None,
         };
-        let result = val_aggregator.add_validation(v28);
+        let result = val_aggregator.add_validation_at(v28, 100);
         assert!(result.is_some());
         assert_eq!(result.unwrap().validation_count, 28);
     }
@@ -2672,7 +2672,7 @@ mod tests {
                 amendments: vec![],
                 signing_payload: None,
             };
-            assert!(val_aggregator.add_validation(v).is_none());
+            assert!(val_aggregator.add_validation_at(v, 100).is_none());
         }
         let v5 = rxrpl_consensus::types::Validation {
             node_id: rxrpl_consensus::types::NodeId(Hash256::new([5; 32])),
@@ -2686,7 +2686,7 @@ mod tests {
             amendments: vec![],
             signing_payload: None,
         };
-        assert!(val_aggregator.add_validation(v5).is_some());
+        assert!(val_aggregator.add_validation_at(v5, 100).is_some());
     }
 
     #[test]
