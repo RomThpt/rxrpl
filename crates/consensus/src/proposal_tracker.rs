@@ -9,6 +9,24 @@
 //! The (NodeId, prev_ledger) pair acts as the round key: a peer building on a
 //! different prev_ledger is treated as an independent track, so out-of-order
 //! `prop_seq` values from a different round do not poison the new round.
+//!
+//! ## DoS hardening (audit pass 2 H6)
+//!
+//! The tracker enforces two capacity bounds to prevent unbounded memory growth
+//! from peers (trusted or untrusted, since [`track`] is called before any UNL
+//! gate by callers like the simulator and tests):
+//!
+//! - [`MAX_DISTINCT_PREV_LEDGERS`]: total number of distinct `prev_ledger`
+//!   hashes the tracker will retain. When a *new* prev_ledger arrives and the
+//!   cap is reached, the oldest prev_ledger (by insertion order) is evicted
+//!   along with all proposals keyed on it. This is a coarse FIFO/LRU.
+//! - [`MAX_PROPOSALS_PER_PREV`]: per-prev_ledger node count. Updates to an
+//!   existing `(node_id, prev_ledger)` entry always proceed (subject to the
+//!   `prop_seq` rule); only *new* node insertions for an already-saturated
+//!   prev_ledger are rejected. The cap is sized well above a typical UNL so
+//!   honest rounds are unaffected.
+//!
+//! [`track`]: ProposalTracker::track
 
 use std::collections::HashMap;
 
@@ -16,10 +34,33 @@ use rxrpl_primitives::Hash256;
 
 use crate::types::{NodeId, Proposal};
 
+/// Maximum number of distinct `prev_ledger` hashes the tracker will retain.
+///
+/// When a proposal arrives with a `prev_ledger` not yet tracked AND this cap
+/// is already reached, the oldest tracked `prev_ledger` (by insertion order)
+/// and every proposal keyed on it are evicted to make room. Sized to comfortably
+/// cover normal in-flight rounds (typically 1-2 prev_ledgers concurrently)
+/// while bounding memory under adversarial fan-out.
+pub const MAX_DISTINCT_PREV_LEDGERS: usize = 64;
+
+/// Maximum number of distinct nodes whose proposals are tracked per
+/// `prev_ledger`.
+///
+/// Sized as "16 distinct nodes per round", which exceeds typical UNL sizes
+/// for the keys actually relevant to a single round; updates to an
+/// already-tracked `(node_id, prev_ledger)` entry are not rejected by this
+/// cap.
+pub const MAX_PROPOSALS_PER_PREV: usize = 16;
+
 /// Tracks the latest accepted proposal for each `(NodeId, prev_ledger)`.
 #[derive(Debug, Default)]
 pub struct ProposalTracker {
     proposals: HashMap<(NodeId, Hash256), Proposal>,
+    /// Insertion-order list of distinct `prev_ledger` hashes currently
+    /// represented in `proposals`. Front = oldest, back = newest. Used to
+    /// evict the oldest prev_ledger track when [`MAX_DISTINCT_PREV_LEDGERS`]
+    /// is exceeded.
+    prev_ledger_order: Vec<Hash256>,
 }
 
 impl ProposalTracker {
@@ -27,22 +68,55 @@ impl ProposalTracker {
     pub fn new() -> Self {
         Self {
             proposals: HashMap::new(),
+            prev_ledger_order: Vec::new(),
         }
     }
 
     /// Insert or update the proposal for its `(node_id, prev_ledger)` key.
     ///
     /// Returns `true` if accepted (new entry, or strictly newer `prop_seq`),
-    /// `false` if the proposal is older than or duplicates the stored one.
+    /// `false` if rejected because:
+    /// - the proposal is older than or duplicates the stored one, OR
+    /// - this is a new node entry for `prev_ledger` and the per-prev_ledger
+    ///   cap [`MAX_PROPOSALS_PER_PREV`] is already saturated.
+    ///
+    /// Side-effect: if `proposal.prev_ledger` is not already tracked and the
+    /// distinct-prev_ledger cap [`MAX_DISTINCT_PREV_LEDGERS`] would be
+    /// exceeded, the oldest tracked prev_ledger is evicted along with all
+    /// proposals keyed on it (FIFO).
     pub fn track(&mut self, proposal: Proposal) -> bool {
         let key = (proposal.node_id, proposal.prev_ledger);
-        match self.proposals.get(&key) {
-            Some(existing) if existing.prop_seq >= proposal.prop_seq => false,
-            _ => {
-                self.proposals.insert(key, proposal);
-                true
+
+        // Existing entry: standard prop_seq replacement rule, no caps apply.
+        if let Some(existing) = self.proposals.get(&key) {
+            if existing.prop_seq >= proposal.prop_seq {
+                return false;
             }
+            self.proposals.insert(key, proposal);
+            return true;
         }
+
+        // New entry. First check the per-prev_ledger node count cap.
+        let prev_ledger = proposal.prev_ledger;
+        let is_new_prev = !self.prev_ledger_order.contains(&prev_ledger);
+        if !is_new_prev {
+            let count = self.count_for(&prev_ledger);
+            if count >= MAX_PROPOSALS_PER_PREV {
+                return false;
+            }
+        } else if self.prev_ledger_order.len() >= MAX_DISTINCT_PREV_LEDGERS {
+            // New prev_ledger and we're at the distinct-prev_ledger cap.
+            // Evict the oldest tracked prev_ledger (FIFO) and every proposal
+            // keyed on it.
+            let oldest = self.prev_ledger_order.remove(0);
+            self.proposals.retain(|(_, prev), _| prev != &oldest);
+        }
+
+        self.proposals.insert(key, proposal);
+        if is_new_prev {
+            self.prev_ledger_order.push(prev_ledger);
+        }
+        true
     }
 
     /// Return the stored proposal for `(node_id, prev_ledger)`, if any.
@@ -71,6 +145,7 @@ impl ProposalTracker {
     /// Drop all proposals tracked for `prev_ledger`.
     pub fn clear_for(&mut self, prev_ledger: &Hash256) {
         self.proposals.retain(|(_, prev), _| prev != prev_ledger);
+        self.prev_ledger_order.retain(|h| h != prev_ledger);
     }
 
     /// Total number of `(node, prev_ledger)` entries currently tracked.
@@ -81,6 +156,12 @@ impl ProposalTracker {
     /// Whether the tracker has no entries.
     pub fn is_empty(&self) -> bool {
         self.proposals.is_empty()
+    }
+
+    /// Number of distinct `prev_ledger` hashes currently tracked. Exposed for
+    /// tests and metrics around the [`MAX_DISTINCT_PREV_LEDGERS`] cap.
+    pub fn distinct_prev_ledgers(&self) -> usize {
+        self.prev_ledger_order.len()
     }
 }
 
@@ -94,6 +175,12 @@ mod tests {
 
     fn ledger(byte: u8) -> Hash256 {
         Hash256::new([byte; 32])
+    }
+
+    fn ledger_from_index(i: usize) -> Hash256 {
+        let mut b = [0u8; 32];
+        b[0..8].copy_from_slice(&(i as u64).to_be_bytes());
+        Hash256::new(b)
     }
 
     fn make_proposal(node_id: NodeId, prev_ledger: Hash256, prop_seq: u32) -> Proposal {
@@ -202,5 +289,84 @@ mod tests {
         assert_eq!(tracker.count_for(&ledger(0x10)), 0);
         assert_eq!(tracker.count_for(&ledger(0x20)), 1);
         assert!(tracker.get(&node(0x01), &ledger(0x20)).is_some());
+        assert_eq!(tracker.distinct_prev_ledgers(), 1);
+    }
+
+    // --- DoS hardening (audit pass 2 H6) ---
+
+    #[test]
+    fn distinct_prev_ledger_cap_evicts_oldest() {
+        let mut tracker = ProposalTracker::new();
+
+        // Insert MAX_DISTINCT_PREV_LEDGERS distinct prev_ledger keys, each
+        // from a single node so len() == MAX_DISTINCT_PREV_LEDGERS.
+        for i in 0..MAX_DISTINCT_PREV_LEDGERS {
+            let prev = ledger_from_index(i);
+            assert!(tracker.track(make_proposal(node(0x01), prev, 0)));
+        }
+        assert_eq!(tracker.distinct_prev_ledgers(), MAX_DISTINCT_PREV_LEDGERS);
+        assert_eq!(tracker.len(), MAX_DISTINCT_PREV_LEDGERS);
+
+        // Insert one more distinct prev_ledger: cap holds at
+        // MAX_DISTINCT_PREV_LEDGERS, oldest (index 0) evicted.
+        let new_prev = ledger_from_index(MAX_DISTINCT_PREV_LEDGERS);
+        assert!(tracker.track(make_proposal(node(0x01), new_prev, 0)));
+        assert_eq!(tracker.distinct_prev_ledgers(), MAX_DISTINCT_PREV_LEDGERS);
+        assert_eq!(tracker.len(), MAX_DISTINCT_PREV_LEDGERS);
+
+        // Oldest (index 0) was evicted along with its proposal.
+        let evicted = ledger_from_index(0);
+        assert!(tracker.get(&node(0x01), &evicted).is_none());
+        assert_eq!(tracker.count_for(&evicted), 0);
+
+        // The newly inserted prev_ledger is present.
+        assert!(tracker.get(&node(0x01), &new_prev).is_some());
+
+        // The next-oldest (index 1) survives.
+        let survivor = ledger_from_index(1);
+        assert!(tracker.get(&node(0x01), &survivor).is_some());
+    }
+
+    #[test]
+    fn per_prev_ledger_cap_rejects_overflow_node() {
+        let mut tracker = ProposalTracker::new();
+        let prev = ledger(0x10);
+
+        // Fill exactly to MAX_PROPOSALS_PER_PREV with distinct nodes.
+        for i in 0..MAX_PROPOSALS_PER_PREV {
+            let n = node((i + 1) as u8);
+            assert!(tracker.track(make_proposal(n, prev, 0)));
+        }
+        assert_eq!(tracker.count_for(&prev), MAX_PROPOSALS_PER_PREV);
+
+        // The (MAX+1)-th distinct node MUST be rejected.
+        let overflow_node = node(0xFF);
+        assert!(!tracker.track(make_proposal(overflow_node, prev, 0)));
+        assert_eq!(tracker.count_for(&prev), MAX_PROPOSALS_PER_PREV);
+        assert!(tracker.get(&overflow_node, &prev).is_none());
+
+        // Updates to an *existing* tracked node are still accepted (cap only
+        // gates new node entries).
+        let existing = node(1);
+        assert!(tracker.track(make_proposal(existing, prev, 99)));
+        assert_eq!(tracker.count_for(&prev), MAX_PROPOSALS_PER_PREV);
+        assert_eq!(tracker.get(&existing, &prev).unwrap().prop_seq, 99);
+    }
+
+    #[test]
+    fn per_prev_cap_is_independent_across_prev_ledgers() {
+        // Saturating one prev_ledger does not affect another.
+        let mut tracker = ProposalTracker::new();
+        let prev_a = ledger(0xA0);
+        let prev_b = ledger(0xB0);
+
+        for i in 0..MAX_PROPOSALS_PER_PREV {
+            assert!(tracker.track(make_proposal(node((i + 1) as u8), prev_a, 0)));
+        }
+        assert_eq!(tracker.count_for(&prev_a), MAX_PROPOSALS_PER_PREV);
+
+        // First node on prev_b is accepted even though prev_a is saturated.
+        assert!(tracker.track(make_proposal(node(0x01), prev_b, 0)));
+        assert_eq!(tracker.count_for(&prev_b), 1);
     }
 }
