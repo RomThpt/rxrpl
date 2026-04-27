@@ -18,6 +18,7 @@ pub mod stall;
 pub mod timer;
 pub mod types;
 pub mod unl;
+pub mod validation_current;
 
 pub use adapter::ConsensusAdapter;
 pub use close_resolution::AdaptiveCloseTime;
@@ -30,3 +31,6 @@ pub use stall::{StallAction, StallMetrics};
 pub use timer::{ConsensusTimer, TimerAction};
 pub use types::{DisputedTx, NodeId, Proposal, TxSet, Validation};
 pub use unl::TrustedValidatorList;
+pub use validation_current::{
+    is_current, VALIDATION_CURRENT_EARLY, VALIDATION_CURRENT_LOCAL, VALIDATION_CURRENT_WALL,
+};
