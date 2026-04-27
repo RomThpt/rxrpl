@@ -26,3 +26,5 @@
 [2026-04-27T16:30:18Z] [orchestrator] phase 4 complete — draft PR #39 opened https://github.com/RomThpt/rxrpl/pull/39
 
 [2026-04-28T00:00:00Z] [night-coder] T27 wire-diff: identified non-canonical sfSignature placement (after sfAmendments) in encode_validation; fix splices sfSignature at canonical (7,6) position; +9 regression tests in tests/wire_diff_validation.rs; cargo test -p rxrpl-overlay green (241 tests).
+[2026-04-28 02:30:00] [orchestrator] iter — T27 wire-diff DONE (root cause found: sfSignature emitted after sfAmendments, fix in commit 672608d), T26 fuzz validation_deser DONE (1306558 runs, no crash), T24/T25 moved to Blocked pending hive re-run with T27 fix
+[2026-04-28 02:30:00] [orchestrator] replenished 12 tasks (cycle 1) — T28-T39 covering H12/H16/H9 audit-fix re-application (claimed-but-not-merged), 4 test gaps from audit pass 2, observability counters, NIGHT-SHIFT-REVIEW resolution, criterion benches (T36/T37 require whitelist extension), T38 hive re-run (depends on push), T39 manifest publisher rotation. Architect explicitly NOT returning NO_FURTHER_WORK — at least one more cycle expected.

@@ -40,26 +40,80 @@ forbidden_paths:
 
 ### Ready
 
-- [ ] T24 [kind=qa,deps=T05,T10,T17]: xrpl-hive smoke + propagation cross-impl run after merges
-  - acceptance: ./bin/xrpl-hive --sim smoke --client rxrpl passes (3/3)
-  - acceptance: ./bin/xrpl-hive --sim propagation --client rxrpl,rippled_2.3.0 reaches "validated_ledger.seq advances" cross-impl, no validation rejected with "bad signature"
-  - acceptance: log excerpt + workspace/logs path captured in NIGHT_SHIFT_LOG.md
-  - globs: NIGHT_SHIFT_LOG.md, gaps.md
+- [ ] T28 [kind=code,deps=]: H16 strict-UTF-8 sfDomain in manifest parser (re-apply unmerged audit fix)
+  - acceptance: parse_raw returns new ManifestError::InvalidDomain when sfDomain VL bytes are not valid UTF-8 (no from_utf8_lossy)
+  - acceptance: regression test parse_rejects_manifest_with_invalid_utf8_domain constructs a manifest with 0xFF in sfDomain, signs it correctly, asserts Err(ManifestError::InvalidDomain)
+  - acceptance: existing manifest tests stay green
+  - globs: crates/overlay/src/manifest.rs, crates/overlay/tests/**/*.rs
 
-- [ ] T25 [kind=qa,deps=T24]: xrpl-hive consensus + sync sims pass cross-impl
-  - acceptance: ./bin/xrpl-hive --sim consensus --client rxrpl,rippled_2.3.0 — at least 1 round closed with rxrpl validator participating
-  - acceptance: ./bin/xrpl-hive --sim sync --client rxrpl — late joiner reaches mainnet_seq within 60s
+- [ ] T29 [kind=code,deps=]: H12 STObject canonical-order check in decode_validation (duplicate-field exploit)
+  - acceptance: decode_validation rejects payloads where any (type_id, field_id) pair appears twice OR fields are not in strictly ascending (type_id<<16 | field_id) order
+  - acceptance: new test decode_validation_rejects_duplicate_ledger_hash + decode_validation_rejects_out_of_order_fields
+  - acceptance: existing 226 overlay tests stay green
+  - globs: crates/overlay/src/proto_convert.rs, crates/overlay/src/stobject.rs, crates/overlay/tests/**/*.rs
+
+- [ ] T30 [kind=code,deps=]: H9 cap Vec::with_capacity(payload.len()) at MAX_STVALIDATION_BYTES (memory amplification)
+  - acceptance: decode_validation allocates signing_payload with min(payload.len(), MAX_STVALIDATION_BYTES = 32 KiB)
+  - acceptance: new test feeds a TMValidation claiming 16 MiB length — decoder errors or allocates ≤32 KiB
+  - globs: crates/overlay/src/proto_convert.rs, crates/overlay/tests/**/*.rs
+
+- [ ] T31 [kind=tests,deps=]: stale-validation replay regression test (audit-pass-2 C1 coverage gap)
+  - acceptance: integration test in crates/consensus/tests/ adds two validations from same node (seq=10 then seq=9), asserts second rejected, asserts get_preferred does not flip
+  - acceptance: covers same-seq-older-sign_time and same-seq-same-sign_time edge cases
+  - globs: crates/consensus/tests/**/*.rs
+
+- [ ] T32 [kind=tests,deps=]: pending_proposals overflow test (C2 coverage gap)
+  - acceptance: test drives peer_proposal_at repeatedly during phase != Establish and asserts pending_proposals.len() bounded; if no cap exists, T32 surfaces this and a fix lands in same task
+  - acceptance: stale entries (older than FUTURE_PROPOSALS_STALE_LEDGERS) get dropped on next tick
+  - globs: crates/consensus/src/engine.rs, crates/consensus/tests/**/*.rs
+
+- [ ] T33 [kind=tests,deps=]: composite decode_validation fuzz target
+  - acceptance: new fuzz target fuzz/fuzz_targets/decode_validation_composite.rs invokes rxrpl_overlay::proto_convert::decode_validation with arbitrary bytes
+  - acceptance: registered in fuzz/Cargo.toml, runs without panic for ≥200_000 iterations
+  - acceptance: corpus seeded from a real captured TMValidation payload
+  - globs: fuzz/fuzz_targets/**/*.rs, fuzz/Cargo.toml
+
+- [ ] T34 [kind=code,deps=]: observability counters for the four missing metrics
+  - acceptance: AtomicU64 counters + accessors for proposals_held_pending_prev_ledger_total, validations_dropped_stale_total, validations_dropped_freshness_total, proposals_dropped_dedup_total
+  - acceptance: each counter has unit test driving rejection path, asserting increment
+  - globs: crates/consensus/src/engine.rs, crates/consensus/src/proposal_tracker.rs, crates/overlay/src/validation_aggregator.rs
+
+- [ ] T35 [kind=code,deps=]: NIGHT-SHIFT-REVIEW resolution — Span compression in ledger_trie + largestSeq subtraction
+  - acceptance: implement rippled's compressed Span<Ledger> OR document why per-hash version is acceptable + benchmark showing ≤O(branch_len)
+  - acceptance: get_preferred(largest_seq) seq-based subtraction OR remove NIGHT-SHIFT-REVIEW with ADR comment
+  - acceptance: 5 new tests covering tie-break with seq parameter
+  - globs: crates/consensus/src/ledger_trie.rs, crates/consensus/tests/**/*.rs
+
+- [ ] T36 [kind=code,deps=,whitelist_extension_required]: criterion benchmark harness for SHAMap insert/lookup
+  - REQUIRES whitelist extension: crates/shamap/benches/**/*.rs + crates/shamap/Cargo.toml
+  - acceptance: new crates/shamap/benches/shamap_ops.rs with criterion benches insert_1k_keys, lookup_existing_key, lookup_missing_key, iterate_full_map_1k
+  - acceptance: cargo bench -p rxrpl-shamap --no-run compiles
+  - globs: crates/shamap/benches/**/*.rs, crates/shamap/Cargo.toml
+
+- [ ] T37 [kind=code,deps=,whitelist_extension_required]: criterion benchmark harness for ledger_trie + validations_trie hot paths
+  - REQUIRES whitelist extension: crates/consensus/benches/**/*.rs
+  - acceptance: new crates/consensus/benches/consensus_hot_paths.rs with benches ledger_trie_insert_branch_len_64, ledger_trie_get_preferred_after_1k_inserts, validations_trie_add_then_preferred, proposal_tracker_track_at_cap
+  - acceptance: cargo bench -p rxrpl-consensus --no-run compiles
+  - globs: crates/consensus/benches/**/*.rs, crates/consensus/Cargo.toml
+
+- [ ] T38 [kind=qa,deps=T27,T28,T29]: re-run T24 (xrpl-hive smoke + propagation cross-impl) with T27 wire fix in place
+  - acceptance: branch nightly/2026-04-27 (incl. commit 672608d) is fetched by xrpl-hive Docker build
+  - acceptance: rerun ./bin/xrpl-hive --sim cross-impl-payment --client rxrpl,rippled_2.3.0; log full output to NIGHT_SHIFT_LOG.md
+  - acceptance: capture rippled's TMValidation accept/drop count from journal
+  - acceptance: if STILL dropped, run tcpdump on rxrpl outbound and dump first 158 bytes hex; if accepted, mark [UNFIXED] resolved
   - globs: NIGHT_SHIFT_LOG.md
 
-- [ ] T26 [kind=qa,deps=T11,T22,T23]: Run full property test + fuzz smoke (60s each) and surface any crash
-  - acceptance: cargo test -p rxrpl-consensus -p rxrpl-overlay --all-features green
-  - acceptance: cargo +nightly fuzz run stobject_decode -- -max_total_time=60 — exits clean
-  - acceptance: cargo +nightly fuzz run validation_deser -- -max_total_time=60 — exits clean
-  - globs: NIGHT_SHIFT_LOG.md
+- [ ] T39 [kind=code,deps=T28]: manifest publisher list rotation + master-key revocation flow deepening
+  - acceptance: validator_list.rs exposes rotate_publisher_signing_key(new_pk, master_sig) verifying under existing master, atomically swaps cached signing pk
+  - acceptance: revocation manifest (sequence == MANIFEST_REVOKED_SEQ) invalidates ALL VLs cached under that publisher's master_pk and emits tracing::warn
+  - acceptance: 3 new tests rotate_signing_key_accepts_valid_chain, rotate_signing_key_rejects_unsigned, revocation_drops_all_cached_vls
+  - globs: crates/overlay/src/validator_list.rs, crates/overlay/src/manifest.rs, crates/overlay/src/vl_fetcher.rs
 
 ### In progress
 
 ### Done
+- T27 — byte-level diff goXRPL vs rxrpl TMValidation, FOUND divergence: rxrpl emitted sfSignature AFTER sfAmendments instead of in canonical (type<<16|field) position. Fix splices sfSignature before sfAmendments via canonical_signature_insert_offset() helper (commits 672608d + a2975fb). 9 new regression tests in crates/overlay/tests/wire_diff_validation.rs all green. 241/241 overlay tests green. THIS IS LIKELY THE ROOT CAUSE OF rippled SILENT DROP.
+- T26 — fuzz validation_deser 1306558 runs in 61s, no crash (commits already in tree). T26 fully complete.
 - T01 — close_resolution.rs rippled bins [10,20,30,60,90,120], commit 85ccdc0
 - T02 — close_resolution next_resolution port, commit f78e4ba (23 tests green)
 - T07 — stobject SOTemplate fields for STValidation, commit 1734f6f (211/211 tests green)
@@ -88,7 +142,8 @@ forbidden_paths:
 - T26 (partial) — workspace tests 205+221 green, fuzz stobject_decode 200000 runs no crash; hive sims (T24/T25) blocked on push permission
 
 ### Blocked
-<!-- Tasks blocked on external dependencies, see PROBLEMS.md for details. -->
+- T24 — xrpl-hive smoke + propagation cross-impl, BLOCKED on `[UNFIXED] xrpl-hive cross-impl-payment still fails post-nightly` in PROBLEMS.md (rippled silently drops rxrpl's TMValidation; needs byte-level diff vs goXRPL).
+- T25 — xrpl-hive consensus + sync sims, BLOCKED on T24 + same root cause.
 
 ### WIP (max retries reached)
 <!-- Tasks marked [WIP] after 3 unsuccessful fix attempts. -->
@@ -97,12 +152,14 @@ forbidden_paths:
 
 ## Validation results
 
-Last run: 2026-04-27T14:21Z
+Last run: 2026-04-27T22:11:46Z (post-T27 merge)
 - build: true
-- test: true (ALL workspace tests green!)
-- lint: false (rxrpl-rpc-api derivable_impls — pre-existing, out of nightly scope)
+- test: true
+- lint: false (clippy::needless_range_loop in rxrpl-codec field.rs:4, rxrpl-codec serializer.rs:14, rxrpl-consensus close_resolution.rs:23 + simulator.rs:234 — all PRE-EXISTING, out of nightly whitelist scope)
 
 History:
+- 2026-04-27T22:11:46Z — build=true test=true lint=false (post-T27 + T26 fuzz; pre-existing clippy unchanged)
+- 2026-04-27T14:21:00Z — build=true test=true lint=false (post-audit-fixes)
 - 2026-04-27T14:08:10Z — build=true test=false lint=false (planned fixes in queue: T03, T13b)
 
 ---
@@ -111,6 +168,7 @@ History:
 
 - 2026-04-27T11:48:21Z — phase 0 — initialized
 - 2026-04-27T13:55:00Z — phase 1 — plan written, 26 tasks, 11 whitelist globs
+- 2026-04-28T02:30:00Z — phase 2 cycle 1 — replenished 12 tasks (T28-T39); root cause of rippled silent drop FOUND in T27 (sfSignature canonical position)
 
 ---
 
