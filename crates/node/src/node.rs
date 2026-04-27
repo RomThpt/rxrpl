@@ -331,10 +331,17 @@ impl Node {
             loop {
                 interval.tick().await;
 
+                // XRPL NetClock is seconds since 2000-01-01 UTC, NOT Unix epoch.
+                // rippled's `isCurrent` validation check rejects timestamps
+                // outside a small window around its own NetClock; using Unix
+                // epoch here puts us 30 years in rippled's future and every
+                // validation we broadcast would be silently dropped at
+                // rippled's `Validation: not current` filter.
                 let close_time = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_secs() as u32;
+                    .as_secs()
+                    .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
 
                 // Read current ledger state
                 let l = ledger.read().await;
@@ -1064,10 +1071,17 @@ impl Node {
                         if let Some(action) = timer.tick() {
                             match action {
                                 TimerAction::CloseLedger => {
+                                    // XRPL NetClock = seconds since 2000-01-01 UTC.
+                                    // See the matching comment in the consensus
+                                    // task above; passing Unix epoch here would
+                                    // put broadcast validations 30 years in
+                                    // rippled's future and they would be
+                                    // dropped at the `isCurrent` check.
                                     let close_time = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
-                                        .as_secs() as u32;
+                                        .as_secs()
+                                        .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
 
                                     let l = ledger.read().await;
                                     let prev_hash = l.header.parent_hash;
