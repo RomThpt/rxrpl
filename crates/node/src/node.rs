@@ -555,12 +555,51 @@ impl Node {
     ///
     /// Starts the RPC server, P2P peer manager, and a consensus loop that
     /// processes both local ledger close ticks and incoming network messages.
+    /// Validate that `--starting-ledger` (Seq or Recent) is only used with a
+    /// trusted UNL configured. Without one, the `CheckpointAnchor` would
+    /// resolve on any 28 fake validator keys (Sybil), letting an attacker
+    /// bootstrap us onto a forged chain. `Hash(_)` is a planned manual-trust
+    /// mode and exempt; the run loop logs and falls back to genesis for it.
+    ///
+    /// This MUST run before any port bind or async task spawn so that a
+    /// misconfiguration is reported deterministically rather than racing
+    /// `EADDRINUSE` against another process bound to the same port.
+    fn validate_starting_ledger_unl(
+        &self,
+        starting_ledger: Option<&crate::checkpoint::StartingLedger>,
+    ) -> Result<(), NodeError> {
+        if matches!(
+            starting_ledger,
+            Some(crate::checkpoint::StartingLedger::Seq(_))
+                | Some(crate::checkpoint::StartingLedger::Recent)
+        ) {
+            let has_unl = !self.config.validators.validator_list_sites.is_empty()
+                && !self.config.validators.validator_list_keys.is_empty()
+                && self.config.validators.require_trusted_validators;
+            if !has_unl {
+                return Err(NodeError::Config(
+                    "--starting-ledger requires `validators.validator_list_sites` + \
+                     `validators.validator_list_keys` to be configured and \
+                     `require_trusted_validators` to be true; \
+                     refusing to bootstrap from an unverified checkpoint"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn run_networked(
         &self,
         close_interval_secs: u64,
         sync_rpc_url: Option<&str>,
         starting_ledger: Option<crate::checkpoint::StartingLedger>,
     ) -> Result<(), NodeError> {
+        // 0. SECURITY: validate UNL/checkpoint guard BEFORE any port bind or
+        // task spawn so a misconfiguration is reported deterministically
+        // rather than racing `EADDRINUSE` (port collision in parallel tests).
+        self.validate_starting_ledger_unl(starting_ledger.as_ref())?;
+
         // 1. Generate/load node identity. node_seed accepts either:
         //   - 32 hex characters (16 raw seed bytes)
         //   - a base58 family seed (e.g. "snXxx..." — what rippled-style
@@ -964,29 +1003,9 @@ impl Node {
             );
         }
 
-        // SECURITY: --starting-ledger requires a trusted UNL. Without one,
-        // the anchor would resolve on any 28 fake validator keys (Sybil),
-        // letting an attacker bootstrap us onto a forged chain. Refuse to
-        // start in that configuration. `Hash(_)` is a planned manual-trust
-        // mode and exempt because it logs and falls back to genesis above.
-        if matches!(
-            starting_ledger_for_loop,
-            Some(crate::checkpoint::StartingLedger::Seq(_))
-                | Some(crate::checkpoint::StartingLedger::Recent)
-        ) {
-            let has_unl = !self.config.validators.validator_list_sites.is_empty()
-                && !self.config.validators.validator_list_keys.is_empty()
-                && self.config.validators.require_trusted_validators;
-            if !has_unl {
-                return Err(NodeError::Config(
-                    "--starting-ledger requires `validators.validator_list_sites` + \
-                     `validators.validator_list_keys` to be configured and \
-                     `require_trusted_validators` to be true; \
-                     refusing to bootstrap from an unverified checkpoint"
-                        .into(),
-                ));
-            }
-        }
+        // SECURITY: --starting-ledger guard is enforced at the top of
+        // `run_networked` via `validate_starting_ledger_unl` so the error
+        // surfaces before any port bind or task spawn.
 
         tokio::spawn(async move {
             let node_id = NodeId(identity.node_id);
