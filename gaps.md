@@ -137,3 +137,30 @@ cd /Users/romt/Developer/xrpl-hive
 ```
 
 Logs : `/Users/romt/Developer/xrpl-hive/workspace/logs/*.json` + `details/*.log`.
+
+## T31 — stale-validation replay regression coverage (2026-04-28)
+
+**Audit pass 2 finding** : `ValidationsTrie::add` n'enforçait pas la
+monotonicité — un `Validation` avec `ledger_seq` plus ancien (ou
+`sign_time` <= courant à `ledger_seq` égal) provenant du même `NodeId`
+écrasait silencieusement le vote courant dans le `LedgerTrie` sous-jacent.
+Un attaquant rejouant une validation capturée pouvait donc faire basculer
+la détection de preferred-branch utilisée pour le seuil de consensus 60%.
+
+**Fix landed** : commit `2ae2eca` (rejet des replays avec older `ledger_seq`,
+ou same `ledger_seq` + older/equal `sign_time`).
+
+**Gap fermé par T31** : couverture de régression explicite manquante au
+niveau du test d'intégration. Ajout de
+`crates/consensus/tests/validations_trie_stale_replay.rs` avec 3 tests qui
+épinglent le contrat à la frontière API publique
+(`rxrpl_consensus::ValidationsTrie::{add, get_preferred, count_for}`) :
+
+| Test | Scénario | Assertion clé |
+|---|---|---|
+| `stale_seq_validation_rejected_after_newer` | seq=10 puis seq=9 même node | second `add` retourne `false`, `count_for(stale_hash)==0`, `get_preferred(11)` retourne `None` (PAS la branche stale) |
+| `same_seq_older_sign_time_rejected` | seq=10 sign_time=1000 puis seq=10 sign_time=999 | second rejeté, preferred inchangé |
+| `same_seq_same_sign_time_idempotent` | même validation livrée 3x | tip support reste à 1, preferred constant entre les appels |
+
+`cargo test -p rxrpl-consensus` : 228 lib + 3 (close_time_props) + 3
+(multi_node) + 3 (validations_trie_stale_replay) tests verts, 0 échec.
