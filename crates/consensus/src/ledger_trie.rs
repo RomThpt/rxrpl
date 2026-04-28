@@ -5,14 +5,32 @@
 //! cumulative support (`branch_support`) wins; ties broken deterministically
 //! by HIGHER hash (matches rippled's `LedgerTrie.h` tie-break direction).
 //!
-//! NIGHT-SHIFT-REVIEW: rippled uses a *compressed* trie of variable-length
-//! `Span`s plus a `seqSupport` map keyed by ledger sequence so that
-//! `getPreferred(largestIssued)` can subtract uncommitted support. This port
-//! is the simpler per-hash-node version: each node holds one ledger hash,
-//! children keyed by the next hash. API matches the T15 task spec
-//! (`insert(branch, count)` / `get_preferred() -> Option<Hash256>`).
-//! For the full rippled algorithm with span compression and uncommitted
-//! support, port `Span<Ledger>` and the `seqSupport` map next.
+//! DESIGN: rippled uses a *compressed* trie of variable-length `Span`s
+//! plus a `seqSupport` map keyed by ledger sequence. rxrpl deliberately
+//! ships the simpler per-hash-node form for two reasons:
+//!
+//! 1. Bounded width and depth. The trusted UNL is bounded (XRPL mainnet:
+//!    ~35 validators; rxrpl target profile: ≤35) so the maximum branching
+//!    factor at any node is ≤ N_unl. Validators feed at most one branch
+//!    each via [`crate::validations_trie::ValidationsTrie::add_with_parents`],
+//!    and the typical branch length is the in-flight ledger window
+//!    (single-digits in steady state). Total node count stays
+//!    O(N_unl · D_window) = a few hundred nodes; the per-call walk cost is
+//!    negligible. Span compression in rippled targets the much larger
+//!    historical trie that retains ledgers across many epochs — a use case
+//!    we don't have here because [`Self::remove`] already prunes
+//!    zero-support nodes on every decrement (see `remove_walk` below).
+//! 2. Seq-based subtraction is handled one layer up. rippled's
+//!    `getPreferred(largestSeq)` interleaves "drop validations whose seq <
+//!    largestSeq" with the trie walk by maintaining a `seqSupport` map
+//!    inside each node. rxrpl's
+//!    [`crate::validations_trie::ValidationsTrie::get_preferred`] does the
+//!    same filtering up front (audit fix H5): it iterates `self.latest`,
+//!    rebuilds a transient trie over the fresh subset, and memoises the
+//!    answer. The architectural split — content-addressed trie below,
+//!    seq-aware aggregator above — keeps each layer single-purpose and
+//!    avoids embedding sequence metadata in a structure that is otherwise
+//!    purely about hash ancestry.
 
 use std::collections::HashMap;
 
@@ -203,12 +221,15 @@ impl LedgerTrie {
     /// deeper branch with strictly less cumulative support is rejected
     /// (the "deeper-fork-with-less-support" case).
     ///
-    /// NIGHT-SHIFT-REVIEW: this is the simplified preferred-branch rule.
-    /// Rippled additionally subtracts `uncommitted` support (validators
-    /// that have not yet voted at this seq) from the margin and takes a
-    /// `largestIssued` parameter. The simpler rule is sufficient for the
-    /// tests required by T15 and matches the spec's `get_preferred()`
-    /// signature.
+    /// DESIGN: rippled's `getPreferred(largestIssued)` additionally
+    /// subtracts uncommitted support (validators known to the trusted
+    /// set whose latest validation is at a seq <= largestIssued and
+    /// therefore "in flight"). rxrpl applies that filter at the layer
+    /// above — see [`crate::validations_trie::ValidationsTrie::get_preferred`]
+    /// — by rebuilding a transient trie from only the fresh subset of
+    /// `latest` entries. Keeping the trie itself content-addressed by
+    /// hash (no embedded seq metadata) means this method stays a pure
+    /// O(D) walk and the seq-aware policy lives in one place.
     pub fn get_preferred(&self) -> Option<Hash256> {
         if self.is_empty() {
             return None;
@@ -472,13 +493,17 @@ mod tests {
     // length+bytes so that distinct prefixes get distinct hashes and shared
     // prefixes get identical ones (mirroring rippled's `LedgerHistoryHelper`).
     //
-    // NIGHT-SHIFT-REVIEW: rippled's `getPreferred(largestSeq)` subtracts
-    // uncommitted support based on a sequence cursor. Our port has no `Seq`
-    // parameter, so the rippled tests that exercise that subtraction
+    // DESIGN: rippled's `getPreferred(largestSeq)` subtracts uncommitted
+    // support based on a sequence cursor. rxrpl applies that filter at the
+    // ValidationsTrie layer (see `validations_trie.rs::get_preferred` and
+    // its `get_preferred_drops_validations_below_current_seq` test), so
+    // the rippled scenarios that exercise the subtraction directly
     // ("Too much uncommitted support", "Changing largestSeq perspective",
-    // "Genesis support is NOT empty" with Seq{0}) cannot be ported as-is.
-    // The scenarios below cover everything else and are sufficient to
-    // exercise structural insert/remove/preferred logic.
+    // "Genesis support is NOT empty" with Seq{0}) live as integration
+    // tests against the aggregator (`tests/ledger_trie_seq.rs`) rather
+    // than as unit tests on the bare trie. The structural insert/remove/
+    // preferred scenarios below cover everything that is intrinsic to
+    // the trie's hash-only API.
     //
     // Tie-breaking: this port matches rippled's LARGER `span.startID()`
     // tie-break direction (see `LedgerTrie.h`).
@@ -1026,5 +1051,71 @@ mod tests {
         // Finally remove ab — trie empties.
         assert!(trie.remove(&prefix_branch("ab"), 1));
         assert!(trie.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // T35: explicit coverage of the tie-break direction and structural
+    // edge cases that surface from the design review. The seq-aware
+    // tests live alongside ValidationsTrie in
+    // `crates/consensus/tests/ledger_trie_seq.rs` because the seq cursor
+    // is applied at that layer, not on the bare trie.
+    // -----------------------------------------------------------------
+
+    /// Identical-seq tie at a deep fork must be broken by the HIGHER hash.
+    /// Mirrors rippled's `LedgerTrie.h` `preferredChild` which compares
+    /// `span.startID()` and prefers the larger one. The audit fix H4
+    /// flipped our direction to match; this test pins the contract.
+    #[test]
+    fn equal_branch_support_at_deep_fork_breaks_to_higher_hash() {
+        let mut trie = LedgerTrie::new();
+        // Two siblings under a shared 4-deep prefix, both with support 2.
+        trie.insert(&[h(1), h(2), h(3), h(4), h(5)], 2);
+        trie.insert(&[h(1), h(2), h(3), h(4), h(9)], 2);
+
+        // Branch supports equal at depth 5; tie-break picks h(9) > h(5).
+        assert_eq!(trie.branch_support(&h(5)), 2);
+        assert_eq!(trie.branch_support(&h(9)), 2);
+        assert_eq!(trie.get_preferred(), Some(h(9)));
+    }
+
+    /// Tie at the FIRST level (children of the sentinel root) must also
+    /// resolve to the higher hash. Edge case: the root has tip_support 0,
+    /// so the early-stop rule never fires here — the comparator must do
+    /// all the work. Surfaced by reading `get_preferred` and noticing the
+    /// sentinel's tip_support of 0 makes level-0 a clean test for the
+    /// raw comparator.
+    #[test]
+    fn equal_support_tie_at_root_resolves_to_higher_anchor_hash() {
+        let mut trie = LedgerTrie::new();
+        // Two anchors directly under root, both with support 1 at the tip.
+        trie.insert(&[h(0x10)], 1);
+        trie.insert(&[h(0xF0)], 1);
+
+        assert_eq!(trie.branch_support(&h(0x10)), 1);
+        assert_eq!(trie.branch_support(&h(0xF0)), 1);
+        // Higher anchor hash wins.
+        assert_eq!(trie.get_preferred(), Some(h(0xF0)));
+    }
+
+    /// Stress: 35 sibling branches at depth 1 (one per validator on a
+    /// max-sized rxrpl UNL). Confirms the per-hash trie scales fine at
+    /// the worst-case width the DESIGN justification commits to. Each
+    /// branch has support 1 except one which has support 2 — that one
+    /// must win, and no tie-break ambiguity should arise.
+    #[test]
+    fn unl_sized_fan_out_picks_unique_majority_branch() {
+        const UNL_SIZE: u8 = 35;
+        let mut trie = LedgerTrie::new();
+        // 35 sibling tips at depth 1 from a shared anchor h(1).
+        for tip_id in 2u8..2 + UNL_SIZE {
+            trie.insert(&[h(1), h(tip_id)], 1);
+        }
+        // Boost one specific tip in the middle to support 2.
+        let winner = h(20);
+        trie.insert(&[h(1), winner], 1);
+
+        assert_eq!(trie.branch_support(&h(1)), (UNL_SIZE as u32) + 1);
+        assert_eq!(trie.branch_support(&winner), 2);
+        assert_eq!(trie.get_preferred(), Some(winner));
     }
 }
