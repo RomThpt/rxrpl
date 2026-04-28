@@ -11,6 +11,25 @@ use rxrpl_primitives::Hash256;
 use crate::error::OverlayError;
 use crate::identity::NodeIdentity;
 
+/// Maximum permitted size of an STValidation payload (the inner STObject
+/// carried in `TMValidation.validation`).
+///
+/// rippled's `STValidation` is a small, fixed-shape STObject — every
+/// field defined in the SOTemplate (flags, ledger seq, hashes, fees,
+/// optional `sfAmendments` vector, signatures, etc.) fits comfortably
+/// within a few hundred bytes; the upper bound on the wire is dominated
+/// by `sfAmendments` (a Vector256 of amendment hashes) plus the two
+/// signatures. Even with every optional field populated the encoded size
+/// stays well under 32 KiB, so we use that as a hard ceiling. This bound
+/// matches the conservative cap rippled itself enforces on validation
+/// payloads in `OverlayImpl::onMessage(TMValidation)` and exists to
+/// prevent peer-controlled memory amplification: without a cap, the
+/// `Vec::with_capacity(payload.len())` allocation in `decode_validation`
+/// would honour any `payload.len()` a peer claims, allowing a single
+/// crafted message to coerce the node into a multi-MiB allocation per
+/// peer per validation. See audit pass 1 finding H9.
+pub const MAX_STVALIDATION_BYTES: usize = 32 * 1024;
+
 // --- ProposeSet ---
 
 pub fn encode_propose_set(proposal: &Proposal) -> Vec<u8> {
@@ -211,9 +230,26 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
 
     let payload = msg.validation.unwrap_or_default();
 
+    // H9: reject grossly oversized payloads up front (peer-controlled).
+    // We use a factor-of-2 leniency over MAX_STVALIDATION_BYTES so that
+    // any borderline-but-legitimate payload still parses; anything beyond
+    // that is malformed by definition and we refuse to read further.
+    if payload.len() > MAX_STVALIDATION_BYTES * 2 {
+        return Err(OverlayError::Codec(format!(
+            "STValidation payload too large: {} bytes (max {})",
+            payload.len(),
+            MAX_STVALIDATION_BYTES * 2
+        )));
+    }
+
     let mut validation = Validation::default();
     let mut signing_pub_key: Vec<u8> = Vec::new();
-    let mut signing_payload = Vec::with_capacity(payload.len());
+    // H9: cap the initial allocation at MAX_STVALIDATION_BYTES even if
+    // `payload.len()` is large, so a peer cannot coerce a multi-MiB
+    // allocation through a crafted (but not yet rejected above) payload.
+    // The Vec will grow on demand if a legitimate payload happens to
+    // exceed the soft cap — this only bounds the *initial* reservation.
+    let mut signing_payload = Vec::with_capacity(payload.len().min(MAX_STVALIDATION_BYTES));
     // Track whether sfCloseTime (2,7) was actually present on the wire,
     // so we can distinguish "field absent" (legacy fallback to sign_time)
     // from "field present and explicitly zero" (the rippled
@@ -1346,4 +1382,38 @@ mod tests {
             "absent sfCloseTime should fall back to sign_time"
         );
     }
+
+    /// H9 regression: a peer-supplied TMValidation whose inner
+    /// `validation` STObject claims to be larger than 2 *
+    /// MAX_STVALIDATION_BYTES MUST be rejected as malformed *before*
+    /// the decoder allocates its `signing_payload` buffer. This bounds
+    /// the worst-case allocation per decoded message at 32 KiB even
+    /// when a peer ships a 16 MiB blob, preventing the
+    /// `Vec::with_capacity(payload.len())` memory amplification
+    /// described in audit pass 1 H9.
+    #[test]
+    fn decode_validation_caps_oversize_signing_payload_alloc() {
+        // 16 MiB of zeros — well above 2 * MAX_STVALIDATION_BYTES (64
+        // KiB). The bytes themselves don't have to parse: the size
+        // check fires before the STObject walker runs.
+        let oversize_payload = vec![0u8; 16 * 1024 * 1024];
+
+        let msg = TmValidation {
+            validation: Some(oversize_payload),
+        };
+        let wire = msg.encode_to_vec();
+
+        let result = decode_validation(&wire);
+        assert!(
+            result.is_err(),
+            "oversize STValidation payload must be rejected before allocation"
+        );
+        let err = result.unwrap_err();
+        let err_msg = format!("{err}");
+        assert!(
+            err_msg.contains("STValidation payload too large"),
+            "error must identify the cap violation, got: {err_msg}"
+        );
+    }
+
 }
