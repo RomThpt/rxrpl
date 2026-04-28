@@ -31,3 +31,4 @@
 [2026-04-28T01:30:00Z] [night-tester] T31 stale-validation replay: +3 integration tests for C1 monotonicity. 237 consensus tests green.
 [2026-04-28T12:20:00Z] [night-coder] T35 ledger_trie review: 3 NIGHT-SHIFT-REVIEW markers resolved via DESIGN justification + 5 new tests. 239 consensus tests green.
 [2026-04-28T12:20:53Z] [night-tester] T33 composite validation fuzz: decode_validation_composite target + 2 corpus seeds. 2,411,346 runs in 61s, no crash.
+[2026-04-28T13:30:00Z] [night-coder] T39 publisher-rotation: extended ValidatorListTracker with publishers HashMap, register_publisher, rotate_publisher_signing_key (HashPrefix::MANIFEST verified), apply_publisher_manifest (drops VLs + tracing::warn on MANIFEST_REVOKED_SEQ); +3 tests + 2 new error variants. 229 lib + 16 integration tests green.
