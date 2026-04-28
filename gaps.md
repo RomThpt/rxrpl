@@ -2,6 +2,41 @@
 
 Document d'état mis à jour à chaque commit notable. Scores contre [XRPL-Commons/xrpl-hive](https://github.com/XRPL-Commons/xrpl-hive).
 
+## T32 — pending_proposals cap regression coverage (2026-04-27)
+
+**Cap status** : OK. `PENDING_PROPOSALS_MAX = 1024` exists in
+`crates/consensus/src/engine.rs:38` and is enforced in `peer_proposal_at`
+(line 737) for the pre-Establish buffer. White-box inline tests already
+cover the cap (`pending_proposals_capped_in_open_phase` line 2900,
+`pending_proposals_drops_untrusted_in_open_phase` line 2857,
+`pending_proposals_drops_stale_in_open_phase_and_bumps_counter` line 2878).
+
+**Spec/code mismatch (documented, not blocking)** : the T32 task spec
+referred to "pending_proposals stale eviction past
+FUTURE_PROPOSALS_STALE_LEDGERS". In production this constant
+(`engine.rs:162`, value 5) applies to `future_proposals` (the unknown-
+prev_ledger holding pen), NOT to `pending_proposals` (which is drained
+within a single `close_ledger` call and never persists across rounds).
+The integration test `pending_proposals_evicts_stale` in
+`crates/consensus/tests/engine_pending_proposals_cap.rs` therefore
+verifies the actual stale-eviction path on `future_proposals`.
+
+**[TEST_GAP] integration black-box observability of `pending_proposals.len()`**
+: the field is private and no `pub` accessor exists. Integration tests in
+`tests/` cannot directly assert `pending_proposals.len() ==
+PENDING_PROPOSALS_MAX`. The new black-box test
+`pending_proposals_bounded_during_non_establish` instead asserts:
+- engine survives a 2000-proposal flood without panic / OOM
+- `proposal_dropped_stale_total()` stays at 0 (cap drops are silent, freshness drops are counted — distinct paths)
+- post-replay `disputes()` and `rounded_close_time()` remain bounded
+- final dispute `nay_count <= PENDING_PROPOSALS_MAX (1024)`
+
+A white-box assertion (`pending_proposals.len() == 1024`) would require
+exposing a `pub fn pending_proposals_len(&self) -> usize` accessor, which
+is out of scope for T32 (whitelist excludes engine.rs to avoid conflict
+with parallel T34). Resume condition: when an accessor is added (T34 or
+later), tighten the assertion in the integration test.
+
 ## T27 — byte-level diff goXRPLd vs rxrpl TMValidation (2026-04-28)
 
 **Divergence trouvée** : `crates/overlay/src/proto_convert.rs::encode_validation`
