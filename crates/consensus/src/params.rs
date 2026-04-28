@@ -20,7 +20,7 @@ pub struct ConsensusParams {
 impl Default for ConsensusParams {
     fn default() -> Self {
         Self {
-            ledger_idle_interval_ms: 15_000,
+            ledger_idle_interval_ms: 20_000,
             propose_interval_ms: 1_250,
             initial_threshold: 50,
             threshold_increase: 10,
