@@ -337,11 +337,20 @@ impl Node {
                 // epoch here puts us 30 years in rippled's future and every
                 // validation we broadcast would be silently dropped at
                 // rippled's `Validation: not current` filter.
-                let close_time = std::time::SystemTime::now()
+                let raw_close_time = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs()
                     .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
+
+                // Round to the current close_time_resolution so that two nodes
+                // closing within the same window produce the same close_time
+                // (and thus the same ledger hash). Without this, two fresh
+                // bootstrapping nodes whose wall-clocks drift by 1-2s would
+                // close ledger #2 with different hashes and never converge —
+                // rippled's "Got proposal for X but we are on Y" reject path.
+                let resolution = consensus.close_time_resolution();
+                let close_time = rxrpl_consensus::round_close_time(raw_close_time, resolution);
 
                 // Read current ledger state
                 let l = ledger.read().await;
@@ -1105,11 +1114,15 @@ impl Node {
                                     // put broadcast validations 30 years in
                                     // rippled's future and they would be
                                     // dropped at the `isCurrent` check.
-                                    let close_time = std::time::SystemTime::now()
+                                    let raw_close_time = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs()
                                         .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
+                                    // Align to current close_time_resolution for cross-impl
+                                    // bootstrap convergence — see node.rs:340 for context.
+                                    let resolution = consensus.close_time_resolution();
+                                    let close_time = rxrpl_consensus::round_close_time(raw_close_time, resolution);
 
                                     let l = ledger.read().await;
                                     let prev_hash = l.header.parent_hash;
