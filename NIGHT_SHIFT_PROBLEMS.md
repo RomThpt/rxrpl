@@ -153,6 +153,23 @@ Each round: rxrpl is ~15s behind rippled when its proposal arrives. The proposal
 
 **Decision**: stop here. The wire/signature/encoding stack is now genuinely complete and rippled-compatible (T27 + T40 alone would let any rxrpl-rxrpl network converge with a single rippled observer following). Cross-impl 2-validator fresh-bootstrap convergence is a non-trivial consensus algorithm engineering task that needs its own dedicated PR cycle, not a one-liner.
 
+### Update 2026-04-28T18:55Z — yield-to-peer-leader (T43) attempted
+
+Commit 016d9c2 added pre-close check: `if max_peer_seq > seq { yield + trigger catchup }`.
+
+**Result**: zero yield events fired in run #11. Reason: by the time the close timer fires, rxrpl has just completed catchup (max_peer_seq == open_seq), so the inequality is false. The chase happens at a finer temporal granularity than the seq-based check can detect — rippled closes its next ledger 1-5s AFTER rxrpl catches up but BEFORE rxrpl's own close timer fires.
+
+**Conclusion**: The seq-based yield is necessary but not sufficient. To break the chase loop, we need *time-based* yield: "if I have peers and have NOT received any peer proposal/position for my current prev_ledger within the last 3s, wait another 3s before closing." But this can deadlock if both nodes wait for each other.
+
+The proper fix is the standard XRPL trick: wait for `peerProposers >= 1` in the establish phase and only close when *we* are the proposer-leader (lowest node-id among UNL). This requires implementing rippled's full proposal/establish state machine, which is a multi-PR effort.
+
+**Final status of cross-impl convergence**:
+- Wire format: ✅ rippled accepts validation + proposal as `trusted` (signature verifies)
+- Catchup: ✅ rxrpl follows rippled's chain via GetLedger
+- Bootstrap: ❌ chase loop persists; requires consensus-phase synchronization
+
+This nightly session has taken cross-impl from "0 validations received" to "byte-perfect mutual peering with chase-loop divergence" — a genuine net improvement, but not a passing cross-impl-payment test.
+
 The signature/wire-format work (T27, T40) is genuinely complete — rippled's trusted-proposal acceptance proves the proposal byte-image is byte-perfect. The remaining gap is consensus-bootstrap protocol semantics, not implementation correctness.
 
 ## [RESOLVED] xrpl-hive TMValidation drop — root cause was sfSignature canonical position — 2026-04-28T02:35Z
