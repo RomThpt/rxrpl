@@ -12,11 +12,8 @@
 [2026-04-27T14:08:39Z] [orchestrator] iter 1 — 2 done (T02,T13), 1 WIP (T08), validation build=true test=false lint=false (planned T03/T13b/T08b will resolve)
 [2026-04-27T14:21:55Z] [orchestrator] iter 2 — 3 done (T03,T13b,T15), 1 collateral fix (peer_handshake test 3-tuple), validation build=true test=false (1 known will be fixed by T09/T10) lint=false (out-of-scope)
 [2026-04-27T14:29:58Z] [orchestrator] iter 3 — 3 done (T04,T21,T23)
-<<<<<<< Updated upstream
-[2026-04-27T15:00:00Z] [night-coder] T14 added PROPOSAL_FRESHNESS_SECS=30 + AtomicU64 counter, peer_proposal_at(now) helper, freshness gate in peer_proposal_at, 3 new tests (fresh/stale/future); migrated existing peer_proposal call sites in engine.rs/simulator.rs/multi_node.rs to peer_proposal_at. cargo test -p rxrpl-consensus --lib green (181 passed)
-=======
 [2026-04-27T14:35:42Z] [orchestrator] iter 4 — 3 done (T05,T18,T22)
->>>>>>> Stashed changes
+[2026-04-27T15:00:00Z] [night-coder] T14 added PROPOSAL_FRESHNESS_SECS=30 + AtomicU64 counter, peer_proposal_at(now) helper, freshness gate in peer_proposal_at, 3 new tests (fresh/stale/future); migrated existing peer_proposal call sites in engine.rs/simulator.rs/multi_node.rs to peer_proposal_at. cargo test -p rxrpl-consensus --lib green (181 passed)
 [2026-04-27T14:57:55Z] [orchestrator] iter 5 — 3 done (T06,T14,T16); 17/26 done
 [2026-04-27T15:08:04Z] [orchestrator] iter 6 — 2 done (T08, T08b); 19/26 done; T09/T10/T11 unblocked
 [2026-04-27T15:16:34Z] [orchestrator] iter 7 — 2 done (T09, T17); 21/26 done
@@ -27,5 +24,6 @@
 
 [2026-04-28T00:00:00Z] [night-coder] T27 wire-diff: identified non-canonical sfSignature placement (after sfAmendments) in encode_validation; fix splices sfSignature at canonical (7,6) position; +9 regression tests in tests/wire_diff_validation.rs; cargo test -p rxrpl-overlay green (241 tests).
 [2026-04-28 02:30:00] [orchestrator] iter — T27 wire-diff DONE (root cause found: sfSignature emitted after sfAmendments, fix in commit 672608d), T26 fuzz validation_deser DONE (1306558 runs, no crash), T24/T25 moved to Blocked pending hive re-run with T27 fix
-[2026-04-28 02:30:00] [orchestrator] replenished 12 tasks (cycle 1) — T28-T39 covering H12/H16/H9 audit-fix re-application (claimed-but-not-merged), 4 test gaps from audit pass 2, observability counters, NIGHT-SHIFT-REVIEW resolution, criterion benches (T36/T37 require whitelist extension), T38 hive re-run (depends on push), T39 manifest publisher rotation. Architect explicitly NOT returning NO_FURTHER_WORK — at least one more cycle expected.
-[2026-04-28 02:35:00] [orchestrator] T38 hive cross-impl-payment RE-RUN with T27 fix: WIRE-FORMAT FIXED (373 Validations processed by rippled vs 0 before T27, both validators trusted in UNL with quorum=2). Test still fails on consensus convergence ("Need validated ledger") — separate problem, not silent drop. PROBLEMS.md [UNFIXED] entry → [RESOLVED]. Hive logs: workspace/logs/rippled/client-3a2b712a72aa0ed832aec5ae31e6f28ff5dcac0d847a155d361447bfa417f0e2.log.
+[2026-04-28 02:30:00] [orchestrator] replenished 12 tasks (cycle 1) — T28-T39 covering H12/H16/H9 audit-fix re-application (claimed-but-not-merged), 4 test gaps from audit pass 2, observability counters, NIGHT-SHIFT-REVIEW resolution, criterion benches (T36/T37 require whitelist extension), T38 hive re-run (depends on push), T39 manifest publisher rotation.
+[2026-04-28 02:35:00] [orchestrator] T38 hive cross-impl-payment RE-RUN with T27 fix: WIRE-FORMAT FIXED (373 Validations processed by rippled vs 0 before T27, both validators trusted in UNL with quorum=2). Test still fails on consensus convergence ("Need validated ledger") — separate problem, not silent drop. PROBLEMS.md [UNFIXED] entry → [RESOLVED].
+[2026-04-28T12:15:46Z] [night-coder] T28 manifest-utf8: parse_raw sfDomain switched from from_utf8_lossy to strict String::from_utf8 returning new ManifestError::InvalidDomain; +1 regression test. cargo test -p rxrpl-overlay --lib manifest green (13/13).
