@@ -2154,13 +2154,30 @@ impl PeerManager {
             return;
         }
 
-        // Resolve the requested ledger. The selectors are independent of the
-        // node-payload itype: a request that supplies a hash points to that
-        // ledger, otherwise a non-zero seq points to that seq, otherwise
-        // we fall back to the latest closed ledger.
+        // Resolve the requested ledger. Selectors:
+        // - hash present  -> try by-hash; if miss AND seq present, fall back to by-seq
+        //   (peer may be probing; let it discover the divergence rather than timing out)
+        // - else if seq>0 -> by-seq
+        // - else          -> latest closed
         let ledger = if req_ledger_hash.len() >= 32 {
             let hash = Hash256::new(req_ledger_hash[..32].try_into().unwrap_or([0u8; 32]));
-            provider.get_by_hash(&hash)
+            match provider.get_by_hash(&hash) {
+                Some(l) => Some(l),
+                None if req_ledger_seq > 0 => {
+                    tracing::debug!(
+                        "GetLedger from {} hash={} not found, falling back to seq={}",
+                        from, hash, req_ledger_seq
+                    );
+                    provider.get_by_seq(req_ledger_seq)
+                }
+                None => {
+                    tracing::debug!(
+                        "GetLedger from {} hash={} not found, no seq fallback",
+                        from, hash
+                    );
+                    None
+                }
+            }
         } else if req_ledger_seq > 0 {
             provider.get_by_seq(req_ledger_seq)
         } else {
