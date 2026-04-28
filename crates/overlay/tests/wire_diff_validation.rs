@@ -309,6 +309,77 @@ fn no_amendments_path_unchanged() {
     assert_eq!(keys, expected, "no-amendments wire layout regressed");
 }
 
+/// (T29 / H12) `decode_validation` MUST reject any STObject payload that
+/// repeats the same `(type_code, field_code)` pair.  rippled's
+/// `STObject::checkSorting` (src/libxrpl/protocol/STObject.cpp) treats a
+/// duplicate field as an unrecoverable parse error: a peer that crafts e.g.
+/// two distinct `sfLedgerHash` fields could otherwise convince the local
+/// node to validate hash A while the suppression-hash bookkeeping (which
+/// runs over the raw bytes) sees hash B.  Either field accepted by the
+/// decoder — first-wins or last-wins — would split the network's view of
+/// the validation.  The only safe behaviour is to reject the payload.
+#[test]
+fn decode_validation_rejects_duplicate_ledger_hash() {
+    use rxrpl_overlay::stobject;
+
+    // Hand-craft an STObject that is byte-valid (every field encoding
+    // parses, every length matches) but carries sfLedgerHash twice with
+    // different 32-byte values.  Field order otherwise follows the
+    // canonical layout the decoder expects.
+    let mut stobj: Vec<u8> = Vec::new();
+    stobject::put_uint32(&mut stobj, 2, 0x80000001); // sfFlags
+    stobject::put_uint32(&mut stobj, 6, 42); // sfLedgerSequence
+    stobject::put_uint32(&mut stobj, 9, 770_000_001); // sfSigningTime
+    stobject::put_hash256(&mut stobj, 1, &[0xAA; 32]); // sfLedgerHash #1
+    stobject::put_hash256(&mut stobj, 1, &[0xBB; 32]); // sfLedgerHash #2 — duplicate
+    stobject::put_vl(&mut stobj, 3, &[0x02u8; 33]); // sfSigningPubKey
+
+    let msg = TmValidation {
+        validation: Some(stobj),
+    };
+    let wire = msg.encode_to_vec();
+
+    let result = decode_validation(&wire);
+    assert!(
+        result.is_err(),
+        "decode_validation must reject duplicate sfLedgerHash field, got {:?}",
+        result
+    );
+}
+
+/// (T29 / H12) `decode_validation` MUST reject any STObject payload whose
+/// fields are not in strictly ascending `(type_code << 16) | field_code`
+/// order.  Swapping two adjacent fields (here sfSigningTime (2,9) and
+/// sfLedgerSequence (2,6)) produces a non-canonical layout that rippled
+/// would reject; accepting it locally would let an attacker probe whether
+/// our parser is order-tolerant and use that to bypass dedup logic.
+#[test]
+fn decode_validation_rejects_out_of_order_fields() {
+    use rxrpl_overlay::stobject;
+
+    // sfSigningTime (key 0x20009) emitted BEFORE sfLedgerSequence
+    // (key 0x20006) — both UINT32, so the byte structure parses fine
+    // but the canonical-order invariant is violated.
+    let mut stobj: Vec<u8> = Vec::new();
+    stobject::put_uint32(&mut stobj, 2, 0x80000001); // sfFlags (2,2)
+    stobject::put_uint32(&mut stobj, 9, 770_000_001); // sfSigningTime (2,9) — out of order
+    stobject::put_uint32(&mut stobj, 6, 42); // sfLedgerSequence (2,6) — should precede (2,9)
+    stobject::put_hash256(&mut stobj, 1, &[0xCD; 32]); // sfLedgerHash
+    stobject::put_vl(&mut stobj, 3, &[0x02u8; 33]); // sfSigningPubKey
+
+    let msg = TmValidation {
+        validation: Some(stobj),
+    };
+    let wire = msg.encode_to_vec();
+
+    let result = decode_validation(&wire);
+    assert!(
+        result.is_err(),
+        "decode_validation must reject out-of-order fields, got {:?}",
+        result
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Local helpers: minimal STObject walkers reimplemented in the test crate so
 // the assertions don't depend on private rxrpl-overlay APIs.

@@ -220,12 +220,31 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
     // "no opinion on close time" sentinel that engine::eff_close_time
     // pattern-matches on). See H13.
     let mut seen_close_time = false;
+    // Track the canonical sort key of the previous field so we can enforce
+    // strict `(type_code << 16) | field_code` ascending order. This mirrors
+    // rippled's `STObject::checkSorting` (src/libxrpl/protocol/STObject.cpp),
+    // which rejects both duplicate fields and out-of-order fields. Without
+    // this check a peer could craft a payload where, e.g., sfLedgerHash
+    // appears twice with different values: the local decoder would accept
+    // the latter while the suppression-hash logic on rippled would see the
+    // first, splitting the network's view of the validation. See audit
+    // pass-2 H12.
+    let mut last_key: Option<u32> = None;
 
     let mut pos = 0;
     while pos < payload.len() {
         let field_start = pos;
         let (type_id, field_id, hdr_len) = stobject::decode_field_id(&payload[pos..])
             .ok_or_else(|| OverlayError::Codec("invalid STObject field header".into()))?;
+        let key = ((type_id as u32) << 16) | field_id as u32;
+        if let Some(prev) = last_key {
+            if key <= prev {
+                return Err(OverlayError::Codec(
+                    "non-canonical STObject ordering".into(),
+                ));
+            }
+        }
+        last_key = Some(key);
         pos += hdr_len;
 
         // Decode the value and advance `pos` past it. We dispatch on
