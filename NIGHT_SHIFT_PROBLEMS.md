@@ -100,6 +100,29 @@ After T27 (validation wire fix) and T40 (handle_get_ledger seq fallback), hive c
 
 **Out of scope for autonomous nightly**. T27 alone is a major win (validations work end-to-end). Full consensus convergence in fresh-bootstrap 2-node test requires either rippled-side debug or coordinated genesis-bootstrap behavior that needs cross-impl protocol negotiation.
 
+### Update 2026-04-28T17:38Z — root cause identified via rippled trace logs
+
+After bumping `XRPL_LOGLEVEL=5` in `xrpl-hive/xrplsim/topology.go` and rebuilding hive (run #8), rippled trace shows:
+
+```
+2026-Apr-28 15:34:28 Protocol:TRC [...] Proposal: trusted
+2026-Apr-28 15:34:28 JobQueue:TRC Doing trustedProposaljob
+2026-Apr-28 15:34:28 Protocol:TRC [...] Checking trusted proposal
+2026-Apr-28 15:34:28 LedgerConsensus:DBG PROPOSAL proposal: previous_ledger: 28DDBE9AA965DE1A6DAAD7CDF6B046E176E1B2B46EFF202CF76BF1C77CE65F6B [...]
+2026-Apr-28 15:34:28 LedgerConsensus:DBG Got proposal for 28DDBE9AA965DE1A6DAAD7CDF6B046E176E1B2B46EFF202CF76BF1C77CE65F6B but we are on ECDBBB0EA5D537BEABFA4FEDCC40145BF3D29F65C1129941F4CCF8195C04F5F5
+```
+
+**Confirmed**: rippled accepts the proposal as trusted (signature verifies), parses it, but **DROPS** it because `prev_ledger` doesn't match its own LCL. rxrpl is on chain `28DDBE9A...`, rippled is on chain `ECDBBB0E...`. Different empty-ledger hashes for the same seq because both bootstrap independently with slightly different `close_time`.
+
+**Root cause**: cross-impl bootstrap divergence. Both validators close empty ledgers via the idle-timer fallback (`timeSincePrevClose >= idleInterval (20s)`) BEFORE peering establishes a consensus mesh. Each node uses wall-clock-derived `close_time` independently → different hashes → never converge.
+
+**Possible fixes (none trivial)**:
+1. Align `close_time` computation to a coarse network-time grid (e.g., round to 10s boundaries, matching rippled's `ledger_close_time_resolution`).
+2. Implement "wait for peer quorum" before closing first ledger (skip the idle-close fallback when `peers > 0` but `proposersValidated == 0`).
+3. Use a deterministic ledger #2 derivation from genesis (same `close_time = genesis_close_time + close_resolution`) — would only work if BOTH impls do it the same way; would need to be a cross-impl protocol agreement.
+
+The signature/wire-format work (T27, T40) is genuinely complete — rippled's trusted-proposal acceptance proves the proposal byte-image is byte-perfect. The remaining gap is consensus-bootstrap protocol semantics, not implementation correctness.
+
 ## [RESOLVED] xrpl-hive TMValidation drop — root cause was sfSignature canonical position — 2026-04-28T02:35Z
 
 **Resolved by T27** (commit `672608d`): rxrpl's `encode_validation` was emitting `sfSignature` (key 0x70006) AFTER `sfAmendments` (key 0x130003), violating the rippled `STObject::add` canonical `(type<<16|field)` ascending sort. On flag ledgers (where amendments are emitted) the suppression hash diverged and rippled silently classified the validation as a stray packet.
