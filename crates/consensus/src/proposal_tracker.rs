@@ -29,6 +29,7 @@
 //! [`track`]: ProposalTracker::track
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rxrpl_primitives::Hash256;
 
@@ -61,6 +62,14 @@ pub struct ProposalTracker {
     /// evict the oldest prev_ledger track when [`MAX_DISTINCT_PREV_LEDGERS`]
     /// is exceeded.
     prev_ledger_order: Vec<Hash256>,
+    /// Counter: proposals rejected by [`Self::track`] because the existing
+    /// entry's `prop_seq` is greater-than-or-equal to the incoming one
+    /// (duplicate or stale-seq replay). Mirrors rippled's
+    /// `Counter[ConsensusProposals.duplicateOrStaleSeq]` JLOG metric.
+    /// Capacity-bound rejections (per-prev-ledger node cap) are NOT
+    /// counted here; only the strict prop_seq monotonicity rule.
+    /// Exposed via [`Self::proposals_dropped_dedup_total`].
+    proposals_dropped_dedup_total: AtomicU64,
 }
 
 impl ProposalTracker {
@@ -69,7 +78,17 @@ impl ProposalTracker {
         Self {
             proposals: HashMap::new(),
             prev_ledger_order: Vec::new(),
+            proposals_dropped_dedup_total: AtomicU64::new(0),
         }
+    }
+
+    /// Total number of proposals rejected by [`Self::track`] because their
+    /// `prop_seq` was less than or equal to the already-tracked entry for
+    /// the same `(node_id, prev_ledger)` key. Mirrors rippled's
+    /// `Counter[ConsensusProposals.duplicateOrStaleSeq]` JLOG metric.
+    /// Cap-driven evictions (per-prev-ledger node cap) are NOT included.
+    pub fn proposals_dropped_dedup_total(&self) -> u64 {
+        self.proposals_dropped_dedup_total.load(Ordering::Relaxed)
     }
 
     /// Insert or update the proposal for its `(node_id, prev_ledger)` key.
@@ -90,6 +109,8 @@ impl ProposalTracker {
         // Existing entry: standard prop_seq replacement rule, no caps apply.
         if let Some(existing) = self.proposals.get(&key) {
             if existing.prop_seq >= proposal.prop_seq {
+                self.proposals_dropped_dedup_total
+                    .fetch_add(1, Ordering::Relaxed);
                 return false;
             }
             self.proposals.insert(key, proposal);

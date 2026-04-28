@@ -146,6 +146,12 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     /// drifted more than [`PROPOSAL_FRESHNESS_SECS`] from the local
     /// ripple time. Exposed via [`Self::proposal_dropped_stale_total`].
     proposal_dropped_stale_total: AtomicU64,
+    /// Counter: incoming peer proposals buffered into the holding pen
+    /// (`future_proposals`) because their `prev_ledger` does not match our
+    /// current `prev_ledger` and we have not yet caught up. Mirrors the
+    /// rippled `Counter[ConsensusProposals.heldFutureLedger]` JLOG metric.
+    /// Exposed via [`Self::proposals_held_pending_prev_ledger_total`].
+    proposals_held_pending_prev_ledger_total: AtomicU64,
 }
 
 /// Maximum number of distinct `prev_ledger` hashes held in
@@ -208,6 +214,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             previous_close_agreed: true,
             prior_close_time: 0,
             proposal_dropped_stale_total: AtomicU64::new(0),
+            proposals_held_pending_prev_ledger_total: AtomicU64::new(0),
         }
     }
 
@@ -685,6 +692,16 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.proposal_dropped_stale_total.load(Ordering::Relaxed)
     }
 
+    /// Total number of incoming peer proposals buffered into the holding
+    /// pen (`future_proposals`) because their `prev_ledger` was unknown to
+    /// us at the time the proposal arrived. Mirrors rippled's
+    /// `Counter[ConsensusProposals.heldFutureLedger]` JLOG metric (held
+    /// pending prev-ledger catch-up).
+    pub fn proposals_held_pending_prev_ledger_total(&self) -> u64 {
+        self.proposals_held_pending_prev_ledger_total
+            .load(Ordering::Relaxed)
+    }
+
     /// Compute the current time in ripple-epoch seconds (seconds since
     /// 2000-01-01 UTC). Returns `0` if the system clock is before the
     /// ripple epoch (which would only happen on a misconfigured host).
@@ -786,6 +803,8 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             );
             self.wrong_prev_ledger_votes
                 .insert(proposal.node_id, proposal.prev_ledger);
+            self.proposals_held_pending_prev_ledger_total
+                .fetch_add(1, Ordering::Relaxed);
             self.hold_future_proposal(proposal);
             return;
         }

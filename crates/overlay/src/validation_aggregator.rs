@@ -50,8 +50,24 @@ pub struct ValidationAggregator {
     /// Counter of validations dropped because they failed the
     /// [`is_current`] freshness check (sign_time outside the rippled
     /// `validationCURRENT_*` window). Mirrors rippled's
-    /// `validation_dropped_stale_total` metric.
+    /// `Counter[ConsensusValidations.staleValidations]` JLOG metric
+    /// (rippled `Validations.cpp` increments this when a validation falls
+    /// outside the `validationCURRENT_EARLY` / `validationCURRENT_WALL`
+    /// window). Exposed by [`Self::dropped_stale_total`] (legacy short
+    /// name) and [`Self::validations_dropped_stale_total`] (canonical name
+    /// matching the rippled metric).
     dropped_stale_total: AtomicU64,
+    /// Counter of validations dropped at the `validation_current` freshness
+    /// gate inside [`Self::add_validation_at`]. Distinct from
+    /// `dropped_stale_total` only in name: both observers fire at the same
+    /// rejection site and increment together. The freshness counter mirrors
+    /// rippled's `Counter[ConsensusValidations.dropped_freshness]`
+    /// observability hook (`Validations::checkValidations` reject branch)
+    /// while the stale counter mirrors `staleValidations`. Audit pass 2
+    /// (T34) requested both names exposed so dashboards can rename without
+    /// data loss. Exposed by
+    /// [`Self::validations_dropped_freshness_total`].
+    validations_dropped_freshness_total: AtomicU64,
     /// Counter of validations dropped because their cryptographic signature
     /// did not verify against the embedded public key. Bumped on the
     /// defense-in-depth verify performed inside `add_validation_at`
@@ -71,6 +87,7 @@ impl ValidationAggregator {
             highest_validated_hash: Hash256::ZERO,
             trusted: None,
             dropped_stale_total: AtomicU64::new(0),
+            validations_dropped_freshness_total: AtomicU64::new(0),
             dropped_invalid_signature_total: AtomicU64::new(0),
         }
     }
@@ -79,6 +96,26 @@ impl ValidationAggregator {
     /// check (`is_current`). Monotonic across the lifetime of the aggregator.
     pub fn dropped_stale_total(&self) -> u64 {
         self.dropped_stale_total.load(Ordering::Relaxed)
+    }
+
+    /// Canonical-name accessor for the stale-validation counter. Mirrors
+    /// rippled's `Counter[ConsensusValidations.staleValidations]` JLOG
+    /// metric. Returns the same underlying value as
+    /// [`Self::dropped_stale_total`] (the older short-named accessor is
+    /// kept for backwards compatibility with existing dashboards).
+    pub fn validations_dropped_stale_total(&self) -> u64 {
+        self.dropped_stale_total.load(Ordering::Relaxed)
+    }
+
+    /// Number of validations dropped at the `validation_current` freshness
+    /// gate inside [`Self::add_validation_at`] (NOT the trust-filter or
+    /// signature-verify gates). Mirrors rippled's
+    /// `Counter[ConsensusValidations.dropped_freshness]` observability
+    /// hook. Monotonic across the lifetime of the aggregator. Bumped at
+    /// the same call site as [`Self::dropped_stale_total`].
+    pub fn validations_dropped_freshness_total(&self) -> u64 {
+        self.validations_dropped_freshness_total
+            .load(Ordering::Relaxed)
     }
 
     /// Number of validations dropped because their cryptographic signature
@@ -198,6 +235,8 @@ impl ValidationAggregator {
         // which matches rippled's behavior when no local seen-time is known.
         if !is_current(now, validation.sign_time, 0) {
             self.dropped_stale_total.fetch_add(1, Ordering::Relaxed);
+            self.validations_dropped_freshness_total
+                .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 target: "consensus",
                 stale_validation = true,
