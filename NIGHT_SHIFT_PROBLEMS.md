@@ -75,6 +75,31 @@ git push -u origin nightly/2026-04-27
 
 Once pushed, T24 (smoke + propagation sim) and T25 (consensus + sync sim) can run via `./bin/xrpl-hive --sim ... --client rxrpl,rippled_2.3.0` from `~/Developer/xrpl-hive`.
 
+## [UNFIXED] xrpl-hive cross-impl-payment consensus convergence — 2026-04-28T15:00Z
+
+After T27 (validation wire fix) and T40 (handle_get_ledger seq fallback), hive cross-impl-payment STILL fails at "node rippled did not reach ledger 5: timeout".
+
+**Diagnostic findings (run #6, post T40)**:
+- rxrpl IS sending TMProposeSet (`sending ProposeSet (184 bytes)` repeatedly, 13 sends)
+- rippled `proposersClosed: 0`, `peer positions: 0` — **rippled never observes ANY peer proposal**
+- rippled DOES receive validations (T27 still working)
+- rippled `InboundLedger:WRN 7 timeouts for ledger 2/4/7/10` — header fetch keeps timing out
+- rxrpl IS sending `LedgerData (164 bytes)` to every GetLedger (76 GetLedger handled)
+- rippled flips between STATE→connected/tracking/full repeatedly — unstable sync
+
+**Two distinct sub-bugs identified**:
+
+1. **TMProposeSet received but not registered** — rippled's `info` log level hides `recvPropose` traces. Either (a) signature verification fails on rippled side (despite matching goXRPL signing format byte-for-byte: `HashPrefix::proposal(4) || prop_seq(4 BE) || close_time(4 BE NetClock) || prev_ledger(32) || tx_set_hash(32)` then sha512Half then secp256k1 DER); OR (b) rippled rejects because `prev_ledger` references rxrpl's chain (different hash from rippled's local at same seq).
+
+2. **InboundLedger 7-timeouts loop** — rippled fetches header via TMGetLedger LI_BASE then state map via LI_AS_NODE. rxrpl serves the 118-byte header (164-byte response) but rippled never proceeds to ask for state-map nodes. Either header response format is subtly wrong (`node_id=empty` may be incorrect) or hash-mismatch causes rejection before LI_AS_NODE follow-up.
+
+**Next steps require rippled-side visibility**:
+- Set `XRPL_LOGLEVEL=5` in hive rippled config to expose `recvPropose` + `InboundLedger::onTimer`
+- OR patch rippled with `JLOG(p_journal_.warn())` at `PeerImp::onMessage(TMProposeSet)` entry + signature-verify result
+- OR rebuild hive's rippled image with debug symbols and attach gdb
+
+**Out of scope for autonomous nightly**. T27 alone is a major win (validations work end-to-end). Full consensus convergence in fresh-bootstrap 2-node test requires either rippled-side debug or coordinated genesis-bootstrap behavior that needs cross-impl protocol negotiation.
+
 ## [RESOLVED] xrpl-hive TMValidation drop — root cause was sfSignature canonical position — 2026-04-28T02:35Z
 
 **Resolved by T27** (commit `672608d`): rxrpl's `encode_validation` was emitting `sfSignature` (key 0x70006) AFTER `sfAmendments` (key 0x130003), violating the rippled `STObject::add` canonical `(type<<16|field)` ascending sort. On flag ledgers (where amendments are emitted) the suppression hash diverged and rippled silently classified the validation as a stray packet.
