@@ -291,6 +291,23 @@ impl Ledger {
         // Compute ledger hash
         self.header.hash = self.header.compute_hash();
 
+        // Debug: dump every field that feeds into compute_hash so we can
+        // diff against rippled's equivalent CLOSE log when investigating
+        // cross-impl ledger-hash divergence.
+        tracing::debug!(
+            "CLOSE_DUMP seq={} drops={} parent_hash={} tx_hash={} account_hash={} parent_close_time={} close_time={} close_time_resolution={} close_flags={} hash={}",
+            self.header.sequence,
+            self.header.drops,
+            self.header.parent_hash,
+            self.header.tx_hash,
+            self.header.account_hash,
+            self.header.parent_close_time,
+            self.header.close_time,
+            self.header.close_time_resolution,
+            self.header.close_flags,
+            self.header.hash,
+        );
+
         // Make maps immutable
         self.state_map.set_immutable();
         self.tx_map.set_immutable();
