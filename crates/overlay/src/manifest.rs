@@ -72,6 +72,8 @@ pub enum ManifestError {
     MasterSigInvalid,
     #[error("manifest revoked")]
     Revoked,
+    #[error("sfDomain field is not valid UTF-8")]
+    InvalidDomain,
 }
 
 /// Intermediate parse result before verification.
@@ -157,8 +159,12 @@ fn parse_raw(data: &[u8]) -> Result<RawManifest, ManifestError> {
                         signature = Some(value);
                     }
                     7 => {
-                        // sfDomain
-                        domain = Some(String::from_utf8_lossy(&value).to_string());
+                        // sfDomain: strict UTF-8 (rippled rejects non-UTF-8 to prevent
+                        // U+FFFD impersonation via lossy substitution).
+                        domain = Some(
+                            String::from_utf8(value.to_vec())
+                                .map_err(|_| ManifestError::InvalidDomain)?,
+                        );
                         signing_ranges.push((field_start, pos));
                     }
                     _ => {
@@ -776,6 +782,56 @@ mod tests {
             parsed.ephemeral_public_key.as_ref().unwrap(),
             &ephemeral.public_key
         );
+    }
+
+    #[test]
+    fn parse_rejects_manifest_with_invalid_utf8_domain() {
+        // Build a valid manifest with master + ephemeral keys signed correctly,
+        // but place invalid UTF-8 bytes (0xFF, 0xFE) in the sfDomain VL field.
+        // parse_raw must reject it with ManifestError::InvalidDomain instead of
+        // silently substituting U+FFFD (which would allow domain impersonation).
+        let master_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("invalid_utf8_domain_master"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let eph_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("invalid_utf8_domain_eph"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+
+        let invalid_domain: &[u8] = &[0xFF, 0xFE];
+
+        // Build signing data manually with the raw (non-UTF-8) domain bytes,
+        // matching the on-wire field order used by build_signing_data.
+        let prefix = rxrpl_crypto::hash_prefix::HashPrefix::MANIFEST.to_bytes();
+        let mut signing_data = Vec::with_capacity(256);
+        signing_data.extend_from_slice(&prefix);
+        stobject::put_uint32(&mut signing_data, 1, 1);
+        stobject::put_vl(&mut signing_data, 1, master_kp.public_key.as_bytes());
+        stobject::put_vl(&mut signing_data, 3, eph_kp.public_key.as_bytes());
+        stobject::put_vl(&mut signing_data, 7, invalid_domain);
+
+        let eph_sig =
+            rxrpl_crypto::ed25519::sign(&signing_data, &eph_kp.private_key).unwrap();
+        let master_sig =
+            rxrpl_crypto::ed25519::sign(&signing_data, &master_kp.private_key).unwrap();
+
+        // Build the wire-format manifest with the invalid-UTF-8 domain bytes.
+        let mut buf = Vec::with_capacity(256);
+        stobject::put_uint32(&mut buf, 1, 1);
+        stobject::put_vl(&mut buf, 1, master_kp.public_key.as_bytes());
+        stobject::put_vl(&mut buf, 3, eph_kp.public_key.as_bytes());
+        stobject::put_vl(&mut buf, 7, invalid_domain);
+        stobject::put_vl(&mut buf, 6, eph_sig.as_bytes());
+        stobject::put_vl(&mut buf, 4, master_sig.as_bytes());
+
+        match parse_raw(&buf) {
+            Err(ManifestError::InvalidDomain) => {}
+            other => panic!(
+                "expected InvalidDomain error for non-UTF-8 sfDomain, got {:?}",
+                other.map(|_| "Ok").map_err(|e| format!("{:?}", e))
+            ),
+        }
     }
 
     #[test]
