@@ -121,6 +121,38 @@ After bumping `XRPL_LOGLEVEL=5` in `xrpl-hive/xrplsim/topology.go` and rebuildin
 2. Implement "wait for peer quorum" before closing first ledger (skip the idle-close fallback when `peers > 0` but `proposersValidated == 0`).
 3. Use a deterministic ledger #2 derivation from genesis (same `close_time = genesis_close_time + close_resolution`) — would only work if BOTH impls do it the same way; would need to be a cross-impl protocol agreement.
 
+### Update 2026-04-28T18:00Z — partial fixes attempted
+
+Two follow-up fixes applied (commits 8e9aa03, 3fe5f6d):
+- T41: round close_time to current `close_time_resolution` at both close sites in node.rs
+- T42: bump `ledger_idle_interval_ms` from 15s → 20s to match rippled
+
+**Result of run #10 (post T41+T42)**:
+- Both nodes now close at ~20s cadence, close_times rounded to resolution boundaries
+- rxrpl successfully catches up rippled's chain via GetLedger every round
+- BUT rippled STILL drops rxrpl proposals: `Got proposal for X but we are on Y`
+
+**Refined diagnosis — chase loop**:
+```
+16:01:22  rxrpl  close ledger #2 hash=A236210D   (own)
+16:01:37  rippled receives proposal for A236210D, but rippled already on F6B5D33 (#3)
+16:01:40  rxrpl  catchup ledger #3 hash=F6B5D33  (from rippled)
+16:02:07  rxrpl  close ledger #4 hash=8B36342A   (own)
+16:02:22  rippled receives proposal for 8B36342A, but rippled already on 64208307 (#5)
+16:02:24  rxrpl  catchup ledger #5 hash=64208307 (from rippled)
+...
+```
+Each round: rxrpl is ~15s behind rippled when its proposal arrives. The proposals are byte-perfect (rippled accepts as `trusted`) but reference a `prev_ledger` rippled has already advanced past.
+
+**Root cause finally**: this is the bootstrap deadlock for a 2-validator fresh network. Neither node can wait for the other because both rely on the idle-close timer (no transactions, no peer positions counted). rippled closes faster than rxrpl in this race because rippled's consensus engine can drive itself forward via "wrongLedger → proposing" recovery that adopts rxrpl's chain at any time, while rxrpl's consensus loop still has to pause for catchup before opening the next round.
+
+**Truly fundamental fix would require**:
+- Either: rxrpl skips its own close when a peer is observed at higher seq (yield to peer leader)
+- Or: both nodes wait for `proposersValidated >= quorum-1` peer validations to arrive in current round before closing (not just timer expiry)
+- Or: use a deterministic empty-ledger schedule from genesis (genesis + N * 10s = expected close_time of ledger N+1)
+
+**Decision**: stop here. The wire/signature/encoding stack is now genuinely complete and rippled-compatible (T27 + T40 alone would let any rxrpl-rxrpl network converge with a single rippled observer following). Cross-impl 2-validator fresh-bootstrap convergence is a non-trivial consensus algorithm engineering task that needs its own dedicated PR cycle, not a one-liner.
+
 The signature/wire-format work (T27, T40) is genuinely complete — rippled's trusted-proposal acceptance proves the proposal byte-image is byte-perfect. The remaining gap is consensus-bootstrap protocol semantics, not implementation correctness.
 
 ## [RESOLVED] xrpl-hive TMValidation drop — root cause was sfSignature canonical position — 2026-04-28T02:35Z
