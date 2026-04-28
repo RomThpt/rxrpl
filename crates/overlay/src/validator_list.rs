@@ -18,7 +18,7 @@
 
 use rxrpl_primitives::PublicKey;
 
-use crate::manifest::{self, ManifestStore};
+use crate::manifest::{self, ManifestStore, MANIFEST_REVOKED_SEQ};
 
 /// A parsed and verified validator list.
 #[derive(Clone, Debug)]
@@ -50,6 +50,10 @@ pub enum ValidatorListError {
     MissingData,
     #[error("stale validator list (seq {got} <= {have})")]
     StaleSequence { got: u64, have: u64 },
+    #[error("publisher master key not registered")]
+    UnknownPublisher,
+    #[error("rotation master signature invalid")]
+    RotationSignatureInvalid,
 }
 
 /// Verify and parse a ValidatorList message.
@@ -164,13 +168,33 @@ fn verify_blob_signature(blob_bytes: &[u8], public_key: &[u8], signature: &[u8])
     }
 }
 
-/// Track trusted VL publishers and their latest sequence numbers.
+/// Cached state for a single VL publisher.
+///
+/// Holds the publisher's currently-valid signing public key (used to verify
+/// VL blob signatures) plus every VL accepted under this publisher. When the
+/// master key is revoked all cached VLs are dropped.
+#[derive(Clone, Debug)]
+pub struct PublisherState {
+    /// The publisher's master (long-lived) public key.
+    pub master_pk: PublicKey,
+    /// The currently-valid signing key used to verify VL signatures.
+    pub signing_pk: PublicKey,
+    /// VLs accepted under this publisher.
+    pub vls: Vec<ValidatorListData>,
+    /// True once a revocation manifest has been observed for this master.
+    pub revoked: bool,
+}
+
+/// Track trusted VL publishers, their latest sequence numbers, and the
+/// signing key currently authorized for VL signature verification.
 #[derive(Debug, Default)]
 pub struct ValidatorListTracker {
     /// Publisher master key hex -> latest sequence seen.
     latest_sequences: std::collections::HashMap<String, u64>,
     /// Set of trusted publisher master key hex strings.
     trusted_publishers: std::collections::HashSet<String>,
+    /// Per-publisher state: cached signing key + accepted VLs.
+    publishers: std::collections::HashMap<String, PublisherState>,
 }
 
 impl ValidatorListTracker {
@@ -201,6 +225,154 @@ impl ValidatorListTracker {
             false
         }
     }
+
+    /// Register (or replace) a publisher with its initial signing key.
+    ///
+    /// Required before [`Self::rotate_publisher_signing_key`] or
+    /// [`Self::cache_validator_list`] can be called for that master key.
+    pub fn register_publisher(&mut self, master_pk: PublicKey, signing_pk: PublicKey) {
+        let hex_key = hex::encode(master_pk.as_bytes());
+        self.publishers.insert(
+            hex_key,
+            PublisherState {
+                master_pk,
+                signing_pk,
+                vls: Vec::new(),
+                revoked: false,
+            },
+        );
+    }
+
+    /// Cache a verified VL under its publisher master key.
+    pub fn cache_validator_list(&mut self, vl: ValidatorListData) -> Result<(), ValidatorListError> {
+        let hex_key = hex::encode(vl.publisher_master_key.as_bytes());
+        let state = self
+            .publishers
+            .get_mut(&hex_key)
+            .ok_or(ValidatorListError::UnknownPublisher)?;
+        if state.revoked {
+            return Err(ValidatorListError::PublisherRevoked);
+        }
+        state.vls.push(vl);
+        Ok(())
+    }
+
+    /// Borrow the cached state for a publisher, if any.
+    pub fn publisher_state(&self, master_pk: &PublicKey) -> Option<&PublisherState> {
+        self.publishers.get(&hex::encode(master_pk.as_bytes()))
+    }
+
+    /// Return the currently-valid signing key for `master_pk`, if known.
+    pub fn signing_key_for(&self, master_pk: &PublicKey) -> Option<&PublicKey> {
+        self.publisher_state(master_pk).map(|s| &s.signing_pk)
+    }
+
+    /// Atomically rotate a publisher's signing key.
+    ///
+    /// Verifies that `master_sig` is a valid signature from the currently
+    /// registered master key over the rotation payload
+    /// `HashPrefix::MANIFEST || master_pk || new_signing_pk`, then swaps
+    /// the cached signing key. Existing cached VLs are kept (they were
+    /// already verified under the previous signing key); only future VL
+    /// fetches will be checked against `new_signing_pk`.
+    ///
+    // NIGHT-SHIFT-REVIEW: rotation payload format is
+    // `HashPrefix::MANIFEST || master_pk || new_signing_pk` rather than the
+    // full rippled STObject manifest body (sequence + sfPublicKey +
+    // sfSigningPubKey + optional sfDomain). Chosen because the spec does
+    // not mandate STObject framing for the rotation message and a minimal
+    // domain-separated payload keeps the API surface narrow. If wire
+    // compatibility with rippled-emitted rotation manifests is required,
+    // swap this for a `manifest::parse_and_verify`-based implementation
+    // that consumes rippled-format manifest bytes directly.
+    ///
+    /// Returns `Err(UnknownPublisher)` if no publisher is registered for
+    /// `master_pk`, `Err(PublisherRevoked)` if the master key has been
+    /// revoked, or `Err(RotationSignatureInvalid)` if the master signature
+    /// fails to verify.
+    pub fn rotate_publisher_signing_key(
+        &mut self,
+        master_pk: &PublicKey,
+        new_signing_pk: PublicKey,
+        master_sig: &[u8],
+    ) -> Result<(), ValidatorListError> {
+        let hex_key = hex::encode(master_pk.as_bytes());
+        let state = self
+            .publishers
+            .get_mut(&hex_key)
+            .ok_or(ValidatorListError::UnknownPublisher)?;
+        if state.revoked {
+            return Err(ValidatorListError::PublisherRevoked);
+        }
+
+        let payload = rotation_signing_payload(master_pk, &new_signing_pk);
+        if !verify_blob_signature(&payload, master_pk.as_bytes(), master_sig) {
+            return Err(ValidatorListError::RotationSignatureInvalid);
+        }
+
+        state.signing_pk = new_signing_pk;
+        Ok(())
+    }
+
+    /// Apply a publisher manifest, dropping cached VLs on revocation.
+    ///
+    /// When `manifest.sequence == MANIFEST_REVOKED_SEQ`, the publisher is
+    /// marked revoked and ALL cached VLs under that master key are
+    /// invalidated. A `tracing::warn!` is emitted with the master-key
+    /// fingerprint.
+    ///
+    /// Returns `true` if a revocation was applied (cached VLs dropped),
+    /// `false` otherwise (non-revocation manifest or unknown publisher).
+    pub fn apply_publisher_manifest(&mut self, manifest: &manifest::Manifest) -> bool {
+        if manifest.sequence != MANIFEST_REVOKED_SEQ {
+            return false;
+        }
+        let hex_key = hex::encode(manifest.master_public_key.as_bytes());
+        let Some(state) = self.publishers.get_mut(&hex_key) else {
+            return false;
+        };
+        let dropped = state.vls.len();
+        state.vls.clear();
+        state.revoked = true;
+        tracing::warn!(
+            "publisher master key revoked: {} (dropped {} cached VLs)",
+            hex::encode(manifest.master_public_key.as_bytes()),
+            dropped,
+        );
+        true
+    }
+}
+
+/// Build the bytes a publisher master key signs to authorize a new signing
+/// key. Uses the standard XRPL manifest hash prefix as a domain separator
+/// so a stray signature cannot be replayed against unrelated payloads.
+fn rotation_signing_payload(master_pk: &PublicKey, new_signing_pk: &PublicKey) -> Vec<u8> {
+    let prefix = rxrpl_crypto::hash_prefix::HashPrefix::MANIFEST.to_bytes();
+    let mut buf = Vec::with_capacity(prefix.len() + master_pk.as_bytes().len() + new_signing_pk.as_bytes().len());
+    buf.extend_from_slice(&prefix);
+    buf.extend_from_slice(master_pk.as_bytes());
+    buf.extend_from_slice(new_signing_pk.as_bytes());
+    buf
+}
+
+/// Sign the rotation payload for `(master_pk, new_signing_pk)` with the
+/// caller-provided master keypair. Used by tests and node operators that
+/// need to produce a valid `master_sig` for [`ValidatorListTracker::rotate_publisher_signing_key`].
+pub fn sign_rotation_payload(
+    master_keypair: &rxrpl_crypto::KeyPair,
+    new_signing_pk: &PublicKey,
+) -> Result<Vec<u8>, ValidatorListError> {
+    let payload = rotation_signing_payload(&master_keypair.public_key, new_signing_pk);
+    let sig = match master_keypair.key_type {
+        rxrpl_crypto::KeyType::Ed25519 => {
+            rxrpl_crypto::ed25519::sign(&payload, &master_keypair.private_key)
+        }
+        rxrpl_crypto::KeyType::Secp256k1 => {
+            rxrpl_crypto::secp256k1::sign(&payload, &master_keypair.private_key)
+        }
+    }
+    .map_err(|_| ValidatorListError::RotationSignatureInvalid)?;
+    Ok(sig.as_bytes().to_vec())
 }
 
 #[cfg(test)]
@@ -347,5 +519,167 @@ mod tests {
         assert!(!tracker.is_trusted_publisher(&pk));
         tracker.add_trusted_publisher(&pk);
         assert!(tracker.is_trusted_publisher(&pk));
+    }
+
+    /// T39: rotating the publisher signing key with a valid master signature
+    /// succeeds and subsequent VL fetches will be checked against the new key.
+    #[test]
+    fn rotate_signing_key_accepts_valid_chain() {
+        let master_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("t39_rotate_master"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let initial_signing_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("t39_rotate_signing_a"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let new_signing_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("t39_rotate_signing_b"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+
+        let mut tracker = ValidatorListTracker::new();
+        tracker.register_publisher(
+            master_kp.public_key.clone(),
+            initial_signing_kp.public_key.clone(),
+        );
+        assert_eq!(
+            tracker.signing_key_for(&master_kp.public_key).unwrap(),
+            &initial_signing_kp.public_key
+        );
+
+        let sig = sign_rotation_payload(&master_kp, &new_signing_kp.public_key)
+            .expect("rotation signing must succeed");
+
+        tracker
+            .rotate_publisher_signing_key(
+                &master_kp.public_key,
+                new_signing_kp.public_key.clone(),
+                &sig,
+            )
+            .expect("rotation must verify and apply");
+
+        assert_eq!(
+            tracker.signing_key_for(&master_kp.public_key).unwrap(),
+            &new_signing_kp.public_key,
+            "subsequent VL fetches must use the rotated signing key"
+        );
+    }
+
+    /// T39: rotation request signed by something other than the registered
+    /// master key is rejected and the cached signing key is left unchanged.
+    #[test]
+    fn rotate_signing_key_rejects_unsigned() {
+        let master_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("t39_reject_master"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let initial_signing_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("t39_reject_signing_a"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let new_signing_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("t39_reject_signing_b"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let attacker_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("t39_attacker"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+
+        let mut tracker = ValidatorListTracker::new();
+        tracker.register_publisher(
+            master_kp.public_key.clone(),
+            initial_signing_kp.public_key.clone(),
+        );
+
+        // Forge a rotation signed by the attacker, not the real master.
+        let bad_sig = sign_rotation_payload(&attacker_kp, &new_signing_kp.public_key)
+            .expect("attacker can produce a sig over the payload");
+
+        let err = tracker
+            .rotate_publisher_signing_key(
+                &master_kp.public_key,
+                new_signing_kp.public_key.clone(),
+                &bad_sig,
+            )
+            .expect_err("rotation must fail when not signed by the registered master");
+        assert!(matches!(err, ValidatorListError::RotationSignatureInvalid));
+
+        assert_eq!(
+            tracker.signing_key_for(&master_kp.public_key).unwrap(),
+            &initial_signing_kp.public_key,
+            "cached signing key must be unchanged after a rejected rotation"
+        );
+    }
+
+    /// T39: a revocation manifest (sequence == MANIFEST_REVOKED_SEQ) for a
+    /// registered publisher must invalidate every cached VL under that
+    /// master key.
+    #[test]
+    fn revocation_drops_all_cached_vls() {
+        let master_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("t39_revoke_master"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let signing_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("t39_revoke_signing"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+
+        let mut tracker = ValidatorListTracker::new();
+        tracker.register_publisher(
+            master_kp.public_key.clone(),
+            signing_kp.public_key.clone(),
+        );
+
+        let vl_a = ValidatorListData {
+            sequence: 1,
+            expiration: 999_999_999,
+            validators: vec![PublicKey(vec![0xED; 33])],
+            validator_manifests: vec![],
+            publisher_master_key: master_kp.public_key.clone(),
+        };
+        let vl_b = ValidatorListData {
+            sequence: 2,
+            expiration: 999_999_999,
+            validators: vec![PublicKey(vec![0xED; 33]), PublicKey(vec![0x02; 33])],
+            validator_manifests: vec![],
+            publisher_master_key: master_kp.public_key.clone(),
+        };
+        tracker.cache_validator_list(vl_a).expect("cache vl_a");
+        tracker.cache_validator_list(vl_b).expect("cache vl_b");
+        assert_eq!(tracker.publisher_state(&master_kp.public_key).unwrap().vls.len(), 2);
+
+        // Build the revocation manifest the way rippled does: sequence == u32::MAX.
+        let revoke_manifest = manifest::Manifest {
+            sequence: MANIFEST_REVOKED_SEQ,
+            master_public_key: master_kp.public_key.clone(),
+            ephemeral_public_key: None,
+            domain: None,
+            raw: vec![],
+        };
+
+        let dropped = tracker.apply_publisher_manifest(&revoke_manifest);
+        assert!(dropped, "revocation must report it dropped state");
+
+        let state = tracker
+            .publisher_state(&master_kp.public_key)
+            .expect("publisher entry remains so revocation is observable");
+        assert!(state.revoked, "publisher must be flagged revoked");
+        assert!(state.vls.is_empty(), "all cached VLs must be dropped");
+
+        // Subsequent attempts to cache a VL under the revoked publisher fail.
+        let vl_c = ValidatorListData {
+            sequence: 3,
+            expiration: 999_999_999,
+            validators: vec![],
+            validator_manifests: vec![],
+            publisher_master_key: master_kp.public_key.clone(),
+        };
+        let err = tracker
+            .cache_validator_list(vl_c)
+            .expect_err("post-revocation caching must be refused");
+        assert!(matches!(err, ValidatorListError::PublisherRevoked));
     }
 }

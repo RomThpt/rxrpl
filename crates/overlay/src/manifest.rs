@@ -72,6 +72,8 @@ pub enum ManifestError {
     MasterSigInvalid,
     #[error("manifest revoked")]
     Revoked,
+    #[error("sfDomain field is not valid UTF-8")]
+    InvalidDomain,
 }
 
 /// Intermediate parse result before verification.
@@ -157,8 +159,12 @@ fn parse_raw(data: &[u8]) -> Result<RawManifest, ManifestError> {
                         signature = Some(value);
                     }
                     7 => {
-                        // sfDomain
-                        domain = Some(String::from_utf8_lossy(&value).to_string());
+                        // sfDomain: strict UTF-8 (rippled rejects non-UTF-8 to prevent
+                        // U+FFFD impersonation via lossy substitution).
+                        domain = Some(
+                            String::from_utf8(value.to_vec())
+                                .map_err(|_| ManifestError::InvalidDomain)?,
+                        );
                         signing_ranges.push((field_start, pos));
                     }
                     _ => {
@@ -333,6 +339,62 @@ pub fn build_signing_data(
     }
 
     buf
+}
+
+/// Sign a message with a keypair, dispatching on key type.
+///
+/// Ed25519 signs the raw message; secp256k1 signs SHA-512/256 of the
+/// message (rippled's `sign()` convention) and DER-encodes the result.
+fn sign_with_keypair(
+    message: &[u8],
+    key_pair: &rxrpl_crypto::KeyPair,
+) -> Result<Vec<u8>, ManifestError> {
+    let sig = match key_pair.key_type {
+        rxrpl_crypto::KeyType::Ed25519 => {
+            rxrpl_crypto::ed25519::sign(message, &key_pair.private_key)
+        }
+        rxrpl_crypto::KeyType::Secp256k1 => {
+            rxrpl_crypto::secp256k1::sign(message, &key_pair.private_key)
+        }
+    }
+    .map_err(|_| ManifestError::MasterSigInvalid)?;
+    Ok(sig.as_bytes().to_vec())
+}
+
+/// Create a fully signed manifest from a master and ephemeral keypair.
+///
+/// Produces rippled-compatible STObject bytes containing:
+///   sfSequence, sfPublicKey (master), sfSigningPubKey (ephemeral),
+///   optional sfDomain, sfSignature (ephemeral sig over body),
+///   sfMasterSignature (master sig over body).
+///
+/// Both signatures cover `HashPrefix::MANIFEST || sfSequence || sfPublicKey ||
+/// sfSigningPubKey || sfDomain?` (i.e. everything except the two signature
+/// fields themselves), matching rippled `Manifest::makeManifest`.
+///
+/// The returned bytes are accepted by `parse_and_verify`.
+pub fn create_signed(
+    master_keypair: &rxrpl_crypto::KeyPair,
+    ephemeral_keypair: &rxrpl_crypto::KeyPair,
+    sequence: u32,
+    domain: Option<&str>,
+) -> Result<Vec<u8>, ManifestError> {
+    let master_pk = master_keypair.public_key.as_bytes();
+    let ephemeral_pk = ephemeral_keypair.public_key.as_bytes();
+
+    let signing_data = build_signing_data(sequence, master_pk, ephemeral_pk, domain);
+
+    let ephemeral_sig = sign_with_keypair(&signing_data, ephemeral_keypair)?;
+    let master_sig = sign_with_keypair(&signing_data, master_keypair)?;
+
+    Ok(build_manifest_bytes(
+        sequence,
+        master_pk,
+        ephemeral_pk,
+        &ephemeral_sig,
+        &master_sig,
+        domain,
+    ))
 }
 
 /// Stores the latest manifest for each validator master key.
@@ -671,5 +733,127 @@ mod tests {
 
         let current = store.current_ephemeral_key(&master_pk).unwrap();
         assert_eq!(current, &eph_pk);
+    }
+
+    #[test]
+    fn create_signed_round_trip_ed25519_no_domain() {
+        let master = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("create_signed_master_ed"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let ephemeral = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("create_signed_eph_ed"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+
+        let raw = create_signed(&master, &ephemeral, 7, None).expect("create_signed");
+        let parsed = parse_and_verify(&raw).expect("parse_and_verify");
+
+        assert_eq!(parsed.sequence, 7);
+        assert_eq!(parsed.master_public_key, master.public_key);
+        assert_eq!(
+            parsed.ephemeral_public_key.as_ref().unwrap(),
+            &ephemeral.public_key
+        );
+        assert!(parsed.domain.is_none());
+        assert!(!parsed.is_revoked());
+        assert_eq!(parsed.raw, raw);
+    }
+
+    #[test]
+    fn create_signed_round_trip_with_domain() {
+        let master = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("create_signed_master_dom"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let ephemeral = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("create_signed_eph_dom"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+
+        let raw = create_signed(&master, &ephemeral, 42, Some("example.com"))
+            .expect("create_signed");
+        let parsed = parse_and_verify(&raw).expect("parse_and_verify");
+
+        assert_eq!(parsed.sequence, 42);
+        assert_eq!(parsed.domain.as_deref(), Some("example.com"));
+        assert_eq!(parsed.master_public_key, master.public_key);
+        assert_eq!(
+            parsed.ephemeral_public_key.as_ref().unwrap(),
+            &ephemeral.public_key
+        );
+    }
+
+    #[test]
+    fn parse_rejects_manifest_with_invalid_utf8_domain() {
+        // Build a valid manifest with master + ephemeral keys signed correctly,
+        // but place invalid UTF-8 bytes (0xFF, 0xFE) in the sfDomain VL field.
+        // parse_raw must reject it with ManifestError::InvalidDomain instead of
+        // silently substituting U+FFFD (which would allow domain impersonation).
+        let master_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("invalid_utf8_domain_master"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let eph_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("invalid_utf8_domain_eph"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+
+        let invalid_domain: &[u8] = &[0xFF, 0xFE];
+
+        // Build signing data manually with the raw (non-UTF-8) domain bytes,
+        // matching the on-wire field order used by build_signing_data.
+        let prefix = rxrpl_crypto::hash_prefix::HashPrefix::MANIFEST.to_bytes();
+        let mut signing_data = Vec::with_capacity(256);
+        signing_data.extend_from_slice(&prefix);
+        stobject::put_uint32(&mut signing_data, 1, 1);
+        stobject::put_vl(&mut signing_data, 1, master_kp.public_key.as_bytes());
+        stobject::put_vl(&mut signing_data, 3, eph_kp.public_key.as_bytes());
+        stobject::put_vl(&mut signing_data, 7, invalid_domain);
+
+        let eph_sig =
+            rxrpl_crypto::ed25519::sign(&signing_data, &eph_kp.private_key).unwrap();
+        let master_sig =
+            rxrpl_crypto::ed25519::sign(&signing_data, &master_kp.private_key).unwrap();
+
+        // Build the wire-format manifest with the invalid-UTF-8 domain bytes.
+        let mut buf = Vec::with_capacity(256);
+        stobject::put_uint32(&mut buf, 1, 1);
+        stobject::put_vl(&mut buf, 1, master_kp.public_key.as_bytes());
+        stobject::put_vl(&mut buf, 3, eph_kp.public_key.as_bytes());
+        stobject::put_vl(&mut buf, 7, invalid_domain);
+        stobject::put_vl(&mut buf, 6, eph_sig.as_bytes());
+        stobject::put_vl(&mut buf, 4, master_sig.as_bytes());
+
+        match parse_raw(&buf) {
+            Err(ManifestError::InvalidDomain) => {}
+            other => panic!(
+                "expected InvalidDomain error for non-UTF-8 sfDomain, got {:?}",
+                other.map(|_| "Ok").map_err(|e| format!("{:?}", e))
+            ),
+        }
+    }
+
+    #[test]
+    fn create_signed_round_trip_secp256k1_master_ed25519_ephemeral() {
+        // rippled allows mixing key types: master often secp256k1, ephemeral ed25519.
+        let master = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("create_signed_master_secp"),
+            rxrpl_crypto::KeyType::Secp256k1,
+        );
+        let ephemeral = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("create_signed_eph_mixed"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+
+        let raw = create_signed(&master, &ephemeral, 3, None).expect("create_signed");
+        let parsed = parse_and_verify(&raw).expect("parse_and_verify");
+
+        assert_eq!(parsed.sequence, 3);
+        assert_eq!(parsed.master_public_key, master.public_key);
+        assert_eq!(
+            parsed.ephemeral_public_key.as_ref().unwrap(),
+            &ephemeral.public_key
+        );
     }
 }

@@ -13,3 +13,6 @@ hex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 rand = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

@@ -1,14 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 /// XRPL API version.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApiVersion {
+    #[default]
     V1 = 1,
     V2 = 2,
-}
-
-impl Default for ApiVersion {
-    fn default() -> Self {
-        Self::V1
-    }
 }

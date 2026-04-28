@@ -84,39 +84,144 @@ impl NodeIdentity {
 
     /// Sign a consensus validation with this node's key (STObject format).
     ///
-    /// Produces a signature over the STObject signing hash:
-    /// SHA-512-Half(HashPrefix::validation || STObject_without_signature)
+    /// Produces a signature over the rippled-canonical signing hash:
+    /// `SHA-512-Half(HashPrefix::validation || canonical_STObject)` where
+    /// `canonical_STObject` is the validation's full SOTemplate **sorted by
+    /// `(type_code, field_code)`** with `sfSignature` and `sfMasterSignature`
+    /// excluded. The strip-result (everything after the 4-byte prefix) is
+    /// stashed in `validation.signing_payload` so that
+    /// [`verify_validation_signature`] can replay the exact byte sequence
+    /// and remain in lock-step with rippled validators that include any
+    /// subset of the optional fields (LoadFee, ReserveBase, Cookie,
+    /// Amendments, ...).
+    ///
+    /// The encoded field set:
+    /// - sfFlags, sfLedgerSequence, sfSigningTime, sfLedgerHash,
+    ///   sfSigningPubKey (always present)
+    /// - sfLoadFee, sfReserveBase, sfReserveIncrement, sfBaseFee,
+    ///   sfCookie, sfServerVersion, sfConsensusHash, sfValidatedHash,
+    ///   sfBaseFeeDrops, sfReserveBaseDrops, sfReserveIncrementDrops,
+    ///   sfAmendments (emitted only when set / non-empty)
+    ///
+    /// `sfCloseTime` is intentionally not emitted: the `Validation` struct
+    /// stores it as a non-optional `u32`, so there is no signal to skip it
+    /// for rxrpl-locally-built validations and emitting it unconditionally
+    /// would change the byte-image (and thus the signature) of every
+    /// validation rxrpl produces today. Validations decoded from the wire
+    /// carry their own `signing_payload` and so include `sfCloseTime` when
+    /// the originating validator did.
     pub fn sign_validation(&self, validation: &mut rxrpl_consensus::types::Validation) {
         use crate::stobject;
 
         // HashPrefix::validation = 'V','A','L',0 = 0x56414C00
         const HASH_PREFIX_VALIDATION: [u8; 4] = [0x56, 0x41, 0x4C, 0x00];
 
-        // Build signing data: prefix + STObject fields (without sfSignature)
-        let mut signing_data = Vec::with_capacity(128);
-        signing_data.extend_from_slice(&HASH_PREFIX_VALIDATION);
+        // Build the strip-result (canonical STObject without
+        // sfSignature/sfMasterSignature). Fields are emitted in canonical
+        // (type_code, field_code) order.
+        let mut stripped = Vec::with_capacity(192);
 
-        // sfFlags (UINT32, field 2)
+        // (2,2) sfFlags — always
         let flags: u32 = if validation.full { 0x80000001 } else { 0x00000000 };
-        stobject::put_uint32(&mut signing_data, 2, flags);
+        stobject::put_uint32(&mut stripped, 2, flags);
 
-        // sfLedgerSequence (UINT32, field 6)
-        stobject::put_uint32(&mut signing_data, 6, validation.ledger_seq);
+        // (2,6) sfLedgerSequence — always
+        stobject::put_uint32(&mut stripped, 6, validation.ledger_seq);
 
-        // sfSigningTime (UINT32, field 9)
-        stobject::put_uint32(&mut signing_data, 9, validation.sign_time);
+        // (2,7) sfCloseTime — skipped (see fn-doc).
 
-        // sfLedgerHash (UINT256, field 1)
-        stobject::put_hash256(&mut signing_data, 1, validation.ledger_hash.as_bytes());
+        // (2,9) sfSigningTime — always
+        stobject::put_uint32(&mut stripped, 9, validation.sign_time);
 
-        // sfSigningPubKey (VL, field 3)
-        stobject::put_vl(&mut signing_data, 3, self.public_key_bytes());
+        // (2,24) sfLoadFee — optional
+        if let Some(v) = validation.load_fee {
+            stobject::put_uint32(&mut stripped, 24, v);
+        }
 
-        // Sign: SHA-512-Half(signing_data) then ECDSA
+        // (2,31) sfReserveBase — optional
+        if let Some(v) = validation.reserve_base {
+            stobject::put_uint32(&mut stripped, 31, v);
+        }
+
+        // (2,32) sfReserveIncrement — optional
+        if let Some(v) = validation.reserve_increment {
+            stobject::put_uint32(&mut stripped, 32, v);
+        }
+
+        // (3,5) sfBaseFee — optional
+        if let Some(v) = validation.base_fee {
+            stobject::put_uint64(&mut stripped, 5, v);
+        }
+
+        // (3,10) sfCookie — optional
+        if let Some(v) = validation.cookie {
+            stobject::put_uint64(&mut stripped, 10, v);
+        }
+
+        // (3,11) sfServerVersion — optional
+        if let Some(v) = validation.server_version {
+            stobject::put_uint64(&mut stripped, 11, v);
+        }
+
+        // (5,1) sfLedgerHash — always
+        stobject::put_hash256(&mut stripped, 1, validation.ledger_hash.as_bytes());
+
+        // (5,23) sfConsensusHash — optional
+        if let Some(h) = validation.consensus_hash.as_ref() {
+            stobject::put_hash256(&mut stripped, 23, h.as_bytes());
+        }
+
+        // (5,25) sfValidatedHash — optional
+        if let Some(h) = validation.validated_hash.as_ref() {
+            stobject::put_hash256(&mut stripped, 25, h.as_bytes());
+        }
+
+        // (6,22) sfBaseFeeDrops — optional
+        if let Some(v) = validation.base_fee_drops {
+            stobject::put_amount_xrp(&mut stripped, 22, v);
+        }
+
+        // (6,23) sfReserveBaseDrops — optional
+        if let Some(v) = validation.reserve_base_drops {
+            stobject::put_amount_xrp(&mut stripped, 23, v);
+        }
+
+        // (6,24) sfReserveIncrementDrops — optional
+        if let Some(v) = validation.reserve_increment_drops {
+            stobject::put_amount_xrp(&mut stripped, 24, v);
+        }
+
+        // (7,3) sfSigningPubKey — always
+        stobject::put_vl(&mut stripped, 3, self.public_key_bytes());
+
+        // sfSignature (7,6) and sfMasterSignature (7,18) are EXCLUDED
+        // from the signing buffer by definition.
+
+        // (19,3) sfAmendments — optional (emitted only when non-empty)
+        if !validation.amendments.is_empty() {
+            let entries: Vec<[u8; 32]> = validation
+                .amendments
+                .iter()
+                .map(|h| *h.as_bytes())
+                .collect();
+            stobject::put_vector256(&mut stripped, 3, &entries);
+        }
+
+        // Compose the full signing input: prefix || stripped STObject.
+        let mut signing_data = Vec::with_capacity(4 + stripped.len());
+        signing_data.extend_from_slice(&HASH_PREFIX_VALIDATION);
+        signing_data.extend_from_slice(&stripped);
+
+        // Sign: secp256k1 over SHA-512-Half(signing_data) (the secp256k1
+        // wrapper hashes internally). Validator keys are always secp256k1
+        // in the current codepath (see `from_seed`/`generate`).
         let sig = rxrpl_crypto::secp256k1::sign(&signing_data, &self.key_pair.private_key)
             .map(|s| s.as_bytes().to_vec());
         if let Ok(sig) = sig {
             validation.signature = Some(sig);
+            // Stash the strip-result so the verifier can replay the exact
+            // byte sequence (matching the rippled-decoded path).
+            validation.signing_payload = Some(stripped);
         }
     }
 
@@ -285,6 +390,7 @@ mod tests {
             signature: None,
             amendments: vec![],
             signing_payload: None,
+            ..Default::default()
         };
 
         // Unsigned validation should fail verification
@@ -313,12 +419,17 @@ mod tests {
             signature: None,
             amendments: vec![],
             signing_payload: None,
+            ..Default::default()
         };
 
         id.sign_validation(&mut validation);
 
-        // Tamper with ledger hash
+        // Tamper with ledger hash. Since `sign_validation` now stashes the
+        // strip-result in `signing_payload` (the source of truth for the
+        // verifier's preferred path), we must clear it so the fallback
+        // re-encodes from the tampered fields and rejects the signature.
         validation.ledger_hash = Hash256::new([0xDD; 32]);
+        validation.signing_payload = None;
         assert!(!verify_validation_signature(&validation));
     }
 
@@ -341,6 +452,7 @@ mod tests {
             signature: None,
             amendments: vec![],
             signing_payload: None,
+            ..Default::default()
         };
 
         id1.sign_validation(&mut validation);
@@ -368,9 +480,112 @@ mod tests {
             signature: None,
             amendments: vec![],
             signing_payload: None,
+            ..Default::default()
         };
 
         assert!(!verify_validation_signature(&validation));
+    }
+
+    /// Sign a Validation that sets every optional SOTemplate field and
+    /// verify it via `verify_validation_signature`. Exercises the canonical
+    /// (type_code, field_code) ordering and the strip-result roundtrip
+    /// through `signing_payload`.
+    #[test]
+    fn validation_with_all_optionals_roundtrip() {
+        use rxrpl_consensus::types::{NodeId, Validation};
+        use rxrpl_primitives::Hash256;
+
+        let id = NodeIdentity::generate();
+        let mut validation = Validation {
+            node_id: NodeId(id.node_id),
+            public_key: id.public_key_bytes().to_vec(),
+            ledger_hash: Hash256::new([0xAB; 32]),
+            ledger_seq: 12_345_678,
+            full: true,
+            close_time: 770_000_000,
+            sign_time: 770_000_001,
+            signature: None,
+            amendments: vec![Hash256::new([0x11; 32]), Hash256::new([0x22; 32])],
+            signing_payload: None,
+            load_fee: Some(256),
+            base_fee: Some(10),
+            reserve_base: Some(10_000_000),
+            reserve_increment: Some(2_000_000),
+            cookie: Some(0xDEAD_BEEF_CAFE_F00D),
+            consensus_hash: Some(Hash256::new([0x33; 32])),
+            validated_hash: Some(Hash256::new([0x44; 32])),
+            server_version: Some(0x0102_0003_0000_0000),
+            base_fee_drops: Some(10),
+            reserve_base_drops: Some(10_000_000),
+            reserve_increment_drops: Some(2_000_000),
+        };
+
+        id.sign_validation(&mut validation);
+        assert!(validation.signature.is_some());
+        // The signing payload must have been stashed so the verifier
+        // takes the preferred (replay) path rather than the legacy fallback.
+        assert!(validation.signing_payload.is_some());
+        assert!(verify_validation_signature(&validation));
+
+        // Tampering with any optional field after-the-fact must NOT affect
+        // verification when the strip-result is replayed verbatim — but
+        // tampering with the strip-result itself must.
+        let mut tampered = validation.clone();
+        if let Some(buf) = tampered.signing_payload.as_mut() {
+            // Flip a bit somewhere in the middle.
+            let mid = buf.len() / 2;
+            buf[mid] ^= 0x01;
+        }
+        assert!(!verify_validation_signature(&tampered));
+    }
+
+    /// Backward-compat guard: signing a Validation with all optionals
+    /// `None` must produce the byte-identical strip-result that the
+    /// pre-T09 5-field encoder produced (flags, ledger_seq, sign_time,
+    /// ledger_hash, signing_pubkey — in that order). Without this, every
+    /// validation rxrpl signs today changes hash and any previously
+    /// captured signature stops verifying.
+    #[test]
+    fn validation_default_optionals_preserves_legacy_signing_buffer() {
+        use crate::stobject;
+        use rxrpl_consensus::types::{NodeId, Validation};
+        use rxrpl_primitives::Hash256;
+
+        let id = NodeIdentity::generate();
+        let mut validation = Validation {
+            node_id: NodeId(id.node_id),
+            public_key: id.public_key_bytes().to_vec(),
+            ledger_hash: Hash256::new([0xCC; 32]),
+            ledger_seq: 42,
+            full: true,
+            close_time: 1000,
+            sign_time: 1000,
+            signature: None,
+            amendments: vec![],
+            signing_payload: None,
+            ..Default::default()
+        };
+        id.sign_validation(&mut validation);
+
+        // Reconstruct the legacy 5-field encoding and compare bytes.
+        let mut expected = Vec::new();
+        stobject::put_uint32(&mut expected, 2, 0x80000001);
+        stobject::put_uint32(&mut expected, 6, 42);
+        stobject::put_uint32(&mut expected, 9, 1000);
+        stobject::put_hash256(&mut expected, 1, &[0xCC; 32]);
+        stobject::put_vl(&mut expected, 3, id.public_key_bytes());
+
+        assert_eq!(
+            validation.signing_payload.as_ref().unwrap(),
+            &expected,
+            "all-None signing buffer must match the pre-T09 byte image"
+        );
+        // And the fallback verify path (which reconstructs the same 5
+        // fields) must accept the signature even if signing_payload is
+        // cleared, proving backward compatibility.
+        let mut without_payload = validation.clone();
+        without_payload.signing_payload = None;
+        assert!(verify_validation_signature(&without_payload));
     }
 
     #[test]
@@ -390,6 +605,7 @@ mod tests {
             signature: None,
             amendments: vec![],
             signing_payload: None,
+            ..Default::default()
         };
 
         id.sign_validation(&mut validation);

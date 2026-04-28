@@ -2,6 +2,77 @@
 
 Document d'état mis à jour à chaque commit notable. Scores contre [XRPL-Commons/xrpl-hive](https://github.com/XRPL-Commons/xrpl-hive).
 
+## T32 — pending_proposals cap regression coverage (2026-04-27)
+
+**Cap status** : OK. `PENDING_PROPOSALS_MAX = 1024` exists in
+`crates/consensus/src/engine.rs:38` and is enforced in `peer_proposal_at`
+(line 737) for the pre-Establish buffer. White-box inline tests already
+cover the cap (`pending_proposals_capped_in_open_phase` line 2900,
+`pending_proposals_drops_untrusted_in_open_phase` line 2857,
+`pending_proposals_drops_stale_in_open_phase_and_bumps_counter` line 2878).
+
+**Spec/code mismatch (documented, not blocking)** : the T32 task spec
+referred to "pending_proposals stale eviction past
+FUTURE_PROPOSALS_STALE_LEDGERS". In production this constant
+(`engine.rs:162`, value 5) applies to `future_proposals` (the unknown-
+prev_ledger holding pen), NOT to `pending_proposals` (which is drained
+within a single `close_ledger` call and never persists across rounds).
+The integration test `pending_proposals_evicts_stale` in
+`crates/consensus/tests/engine_pending_proposals_cap.rs` therefore
+verifies the actual stale-eviction path on `future_proposals`.
+
+**[TEST_GAP] integration black-box observability of `pending_proposals.len()`**
+: the field is private and no `pub` accessor exists. Integration tests in
+`tests/` cannot directly assert `pending_proposals.len() ==
+PENDING_PROPOSALS_MAX`. The new black-box test
+`pending_proposals_bounded_during_non_establish` instead asserts:
+- engine survives a 2000-proposal flood without panic / OOM
+- `proposal_dropped_stale_total()` stays at 0 (cap drops are silent, freshness drops are counted — distinct paths)
+- post-replay `disputes()` and `rounded_close_time()` remain bounded
+- final dispute `nay_count <= PENDING_PROPOSALS_MAX (1024)`
+
+A white-box assertion (`pending_proposals.len() == 1024`) would require
+exposing a `pub fn pending_proposals_len(&self) -> usize` accessor, which
+is out of scope for T32 (whitelist excludes engine.rs to avoid conflict
+with parallel T34). Resume condition: when an accessor is added (T34 or
+later), tighten the assertion in the integration test.
+
+## T27 — byte-level diff goXRPLd vs rxrpl TMValidation (2026-04-28)
+
+**Divergence trouvée** : `crates/overlay/src/proto_convert.rs::encode_validation`
+émettait `sfSignature` (type 7, field 6) APRÈS `sfAmendments` (type 19, field 3),
+violant l'ordre canonical `(type<<16)|field` croissant que rippled
+(`STObject::add` dans `src/libxrpl/protocol/STObject.cpp`) et goXRPLd
+(`internal/consensus/adaptor/stvalidation.go::SerializeSTValidation` lignes
+~250) appliquent. Sur les flag-ledgers où amendments sont émis, le suppression
+hash rxrpl divergeait de celui calculé par les peers, et la validation était
+silencieusement classée comme "stray packet" par rippled — explicant les **0
+validations reçues** observées dans les sims `propagation/cross-impl-payment`.
+
+Vérifications croisées contre les 7 critères du spec T27 :
+
+| # | Critère | Statut rxrpl |
+|---|---|---|
+| 1 | `sfFlags = 0x80000001` (vfFullyCanonicalSig\|vfFullValidation) | OK (`identity.rs:125` pour `full=true`) |
+| 2 | Ordre canonique `(type, field)` ascendant | **CASSÉ avant T27** sur amendments → corrigé |
+| 3 | `sfAmendments` = type 19 (Vector256), field 3, header `[0x03, 0x13]` | OK (`stobject.rs::put_vector256`) |
+| 4 | secp256k1 = signature DER (pas R\|\|S brut) | OK (`crypto/src/secp256k1.rs::sign` ligne 139, `der::encode_der_signature`) |
+| 5 | `sfSigningPubKey` VL-prefixé + 33 bytes secp256k1 compressé | OK (`stobject.rs::put_vl`) |
+| 6 | `HashPrefix::validation = 0x56414C00` (`"VAL\0"`) prepend signing | OK (`identity.rs:117` + verifier ligne 255) |
+| 7 | Frame header 6 bytes (4 length+flags BE / 2 type=41 BE) | OK (`p2p-proto/src/codec.rs::PeerCodec`) |
+
+**Fix** : insère `sfSignature` à sa position canonique (avant `sfAmendments`)
+via `canonical_signature_insert_offset()`. Régression couverte par
+`crates/overlay/tests/wire_diff_validation.rs` (9 tests, 1 par critère).
+
+**Note connexe** (non-bloquante, conservée pour audit ultérieur) : le décodeur
+rxrpl exige `(flags & 0x80000001) == 0x80000001` pour marquer `full=true`
+(`proto_convert.rs:172`). goXRPLd utilise `(flags & vfFullValidation) != 0`
+(`stvalidation.go::parseSTValidation`). En pratique, rippled émet TOUJOURS
+`vfFullyCanonicalSig`, donc la divergence est latente — mais une validation
+partial signée par un peer non-canonical-strict serait classée full=false par
+rxrpl. Documenté ici comme suivi possible si une nouvelle divergence émerge.
+
 ## Score actuel (2026-04-25)
 
 | Simulator | Passés | Total | Taux |
@@ -101,3 +172,30 @@ cd /Users/romt/Developer/xrpl-hive
 ```
 
 Logs : `/Users/romt/Developer/xrpl-hive/workspace/logs/*.json` + `details/*.log`.
+
+## T31 — stale-validation replay regression coverage (2026-04-28)
+
+**Audit pass 2 finding** : `ValidationsTrie::add` n'enforçait pas la
+monotonicité — un `Validation` avec `ledger_seq` plus ancien (ou
+`sign_time` <= courant à `ledger_seq` égal) provenant du même `NodeId`
+écrasait silencieusement le vote courant dans le `LedgerTrie` sous-jacent.
+Un attaquant rejouant une validation capturée pouvait donc faire basculer
+la détection de preferred-branch utilisée pour le seuil de consensus 60%.
+
+**Fix landed** : commit `2ae2eca` (rejet des replays avec older `ledger_seq`,
+ou same `ledger_seq` + older/equal `sign_time`).
+
+**Gap fermé par T31** : couverture de régression explicite manquante au
+niveau du test d'intégration. Ajout de
+`crates/consensus/tests/validations_trie_stale_replay.rs` avec 3 tests qui
+épinglent le contrat à la frontière API publique
+(`rxrpl_consensus::ValidationsTrie::{add, get_preferred, count_for}`) :
+
+| Test | Scénario | Assertion clé |
+|---|---|---|
+| `stale_seq_validation_rejected_after_newer` | seq=10 puis seq=9 même node | second `add` retourne `false`, `count_for(stale_hash)==0`, `get_preferred(11)` retourne `None` (PAS la branche stale) |
+| `same_seq_older_sign_time_rejected` | seq=10 sign_time=1000 puis seq=10 sign_time=999 | second rejeté, preferred inchangé |
+| `same_seq_same_sign_time_idempotent` | même validation livrée 3x | tip support reste à 1, preferred constant entre les appels |
+
+`cargo test -p rxrpl-consensus` : 228 lib + 3 (close_time_props) + 3
+(multi_node) + 3 (validations_trie_stale_replay) tests verts, 0 échec.

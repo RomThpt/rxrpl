@@ -1,19 +1,41 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rxrpl_primitives::Hash256;
 
 use crate::adapter::ConsensusAdapter;
-use crate::close_resolution::AdaptiveCloseTime;
+use crate::close_resolution::{next_resolution, AdaptiveCloseTime};
 use crate::error::ConsensusError;
 use crate::negative_unl::{NegativeUnlChange, NegativeUnlTracker};
 use crate::params::ConsensusParams;
 use crate::phase::ConsensusPhase;
+use crate::proposal_tracker::ProposalTracker;
 use crate::types::{DisputedTx, NodeId, Proposal, TxSet, Validation};
 use crate::unl::TrustedValidatorList;
+use crate::validations_trie::ValidationsTrie;
 
 /// Threshold percentage of trusted validators referencing a different
 /// `prev_ledger` before we consider switching chains.
 const WRONG_PREV_LEDGER_THRESHOLD: u32 = 60;
+
+/// Maximum permitted skew (in seconds) between the local ripple time and
+/// the `close_time` of an incoming peer proposal. Mirrors rippled's
+/// `propRELAY_INTERVAL` (xrpld/consensus/Consensus.h): proposals older or
+/// further in the future than this are dropped as stale and never reach
+/// the position aggregation pipeline.
+const PROPOSAL_FRESHNESS_SECS: u32 = 30;
+
+/// Seconds between the Unix epoch (1970-01-01) and the Ripple epoch
+/// (2000-01-01), used to convert wall-clock time to ripple time.
+const RIPPLE_EPOCH_OFFSET_SECS: u64 = 946_684_800;
+
+/// Hard cap on the number of proposals buffered in `pending_proposals`
+/// while we are outside `Establish` phase. Without this cap a peer can
+/// flood the Open phase and exhaust memory (audit pass 2 C2). 1024 is
+/// generous: it covers a full UNL of distinct trusted peers each sending
+/// a handful of proposals per round, while bounding the worst-case Vec
+/// growth to ~O(1024 * sizeof(Proposal)).
+const PENDING_PROPOSALS_MAX: usize = 1024;
 
 /// Result of checking whether trusted peers disagree on prev_ledger.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +64,13 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     our_set: Option<TxSet>,
     /// Proposals from other validators.
     peer_positions: HashMap<NodeId, Proposal>,
+    /// Authoritative dedup layer for incoming peer proposals, keyed by
+    /// `(NodeId, prev_ledger)`. Mirrors goXRPL `ProposalTracker`: a peer's
+    /// stored entry is only replaced when the new `prop_seq` is strictly
+    /// greater. `peer_positions` is kept in lockstep so existing engine
+    /// APIs (effective close-time, dispute aggregation, wrong-prev-ledger
+    /// detection) continue to read from a single position per peer.
+    proposal_tracker: ProposalTracker,
     /// Disputed transactions (tx_hash -> dispute).
     disputes: HashMap<Hash256, DisputedTx>,
     /// Current consensus round.
@@ -67,7 +96,24 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     /// Tracks proposals from trusted peers that reference a different
     /// `prev_ledger` than ours. Keyed by (node_id -> their prev_ledger).
     /// Used to detect when we are on the wrong chain.
+    ///
+    /// Secondary signal: this captures pre-quorum disagreement visible in
+    /// proposal traffic for the *current* round. The primary signal is
+    /// [`Self::validations_trie`], which aggregates trusted validations
+    /// across rounds and is consulted first by
+    /// [`Self::check_wrong_prev_ledger`].
     wrong_prev_ledger_votes: HashMap<NodeId, Hash256>,
+    /// Aggregator over trusted validators' latest validations. The
+    /// preferred-branch tip is the primary input to wrong-prev-ledger
+    /// detection: when [`ValidationsTrie::get_preferred`] returns a hash
+    /// that differs from `self.prev_ledger` and trusted support meets the
+    /// [`WRONG_PREV_LEDGER_THRESHOLD`], we abandon the current chain.
+    validations_trie: ValidationsTrie,
+    /// Sequence number of the current `prev_ledger`. Tracked so that the
+    /// validations-trie preferred-branch query can be anchored to the
+    /// caller-visible sequence (rippled `getPreferred(largestIssued)`).
+    /// Set by [`Self::start_round_with_prior`] to `ledger_seq - 1`.
+    prev_ledger_seq: u32,
     /// Holding pen for proposals whose `prev_ledger` we do not yet know.
     /// Keyed by their `prev_ledger` hash. When `start_round` is called with
     /// a matching prev_ledger, the held proposals are moved into
@@ -82,6 +128,30 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     future_proposals: HashMap<Hash256, Vec<Proposal>>,
     /// Adaptive close-time resolution tracker.
     adaptive_close_time: AdaptiveCloseTime,
+    /// Did the previous round agree on close time (within the
+    /// then-current resolution)?  Initialised to `true` so the very
+    /// first round behaves like rippled's `previousAgree=true` boot
+    /// state — no spurious widening on startup.  Updated in
+    /// [`Self::accept`] and consumed in [`Self::start_round`] to
+    /// drive the rippled `getNextLedgerTimeResolution` cadence.
+    previous_close_agreed: bool,
+    /// Parent ledger's close time, used to clamp the effective close
+    /// time of the current round to be strictly greater (rippled
+    /// `effCloseTime` monotonicity guarantee).  Set per round via
+    /// [`Self::start_round_with_prior`]; legacy [`Self::start_round`]
+    /// callers leave it at `0`, which keeps the clamp inactive for
+    /// any rounded close time > 1 (backwards compatible).
+    prior_close_time: u32,
+    /// Counter: incoming proposals dropped because their `close_time`
+    /// drifted more than [`PROPOSAL_FRESHNESS_SECS`] from the local
+    /// ripple time. Exposed via [`Self::proposal_dropped_stale_total`].
+    proposal_dropped_stale_total: AtomicU64,
+    /// Counter: incoming peer proposals buffered into the holding pen
+    /// (`future_proposals`) because their `prev_ledger` does not match our
+    /// current `prev_ledger` and we have not yet caught up. Mirrors the
+    /// rippled `Counter[ConsensusProposals.heldFutureLedger]` JLOG metric.
+    /// Exposed via [`Self::proposals_held_pending_prev_ledger_total`].
+    proposals_held_pending_prev_ledger_total: AtomicU64,
 }
 
 /// Maximum number of distinct `prev_ledger` hashes held in
@@ -110,6 +180,13 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         unl: TrustedValidatorList,
     ) -> Self {
         let adaptive_close_time = AdaptiveCloseTime::new(params.close_time_resolution);
+        // Seed the validations-trie trusted set from the UNL so that
+        // record_trusted_validation() works out of the box for any node
+        // already in the supplied trusted set.
+        let mut validations_trie = ValidationsTrie::new();
+        for n in unl.trusted_set() {
+            validations_trie.add_trusted(*n);
+        }
         Self {
             adapter,
             params,
@@ -117,6 +194,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             our_position: None,
             our_set: None,
             peer_positions: HashMap::new(),
+            proposal_tracker: ProposalTracker::new(),
             disputes: HashMap::new(),
             round: 0,
             prev_ledger: Hash256::ZERO,
@@ -129,8 +207,14 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             negative_unl_tracker: NegativeUnlTracker::new(),
             pending_proposals: Vec::new(),
             wrong_prev_ledger_votes: HashMap::new(),
+            validations_trie,
+            prev_ledger_seq: 0,
             future_proposals: HashMap::new(),
             adaptive_close_time,
+            previous_close_agreed: true,
+            prior_close_time: 0,
+            proposal_dropped_stale_total: AtomicU64::new(0),
+            proposals_held_pending_prev_ledger_total: AtomicU64::new(0),
         }
     }
 
@@ -278,15 +362,33 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
     /// Check whether a supermajority of trusted validators reference a
     /// different `prev_ledger` than ours.
     ///
-    /// Returns `Some(WrongPrevLedgerDetected)` when more than 60% of the
-    /// trusted peers that sent proposals disagree with our `prev_ledger`.
-    /// The caller should abort the current round and switch to the
-    /// preferred ledger.
+    /// Two-stage detection:
+    ///
+    /// 1. **Primary** — consult [`Self::validations_trie`]. If its
+    ///    preferred-branch tip differs from `self.prev_ledger` and at
+    ///    least [`WRONG_PREV_LEDGER_THRESHOLD`]% of the trusted set has
+    ///    validated that alternative, return immediately. This is the
+    ///    rippled `getPreferred`-driven path: it sees disagreement that
+    ///    has already been signed off in validations, before the next
+    ///    round of proposals lands.
+    /// 2. **Secondary** — fall back to the proposal-derived
+    ///    [`Self::wrong_prev_ledger_votes`] tally. This catches
+    ///    disagreement that surfaces in the *current* round's proposal
+    ///    traffic before any new validation has been issued.
+    ///
+    /// Returns `Some(WrongPrevLedgerDetected)` when either path crosses
+    /// the threshold. The caller should abort the current round and
+    /// switch to the preferred ledger.
     ///
     /// In solo mode (empty UNL) this always returns `None`.
     pub fn check_wrong_prev_ledger(&self) -> Option<WrongPrevLedgerDetected> {
         if self.unl.is_empty() {
             return None;
+        }
+
+        // Stage 1: validations-trie preferred branch.
+        if let Some(detected) = self.check_wrong_prev_ledger_from_validations() {
+            return Some(detected);
         }
 
         if self.wrong_prev_ledger_votes.is_empty() {
@@ -335,20 +437,158 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         }
     }
 
+    /// Validations-trie path of [`Self::check_wrong_prev_ledger`]. Returns
+    /// `Some` only when the trie's preferred branch differs from
+    /// `self.prev_ledger` AND its tip support meets the
+    /// [`WRONG_PREV_LEDGER_THRESHOLD`]% of the trusted set.
+    ///
+    /// Threshold denominator is `validations_trie.trusted_count()` (the
+    /// full UNL as known to the trie), matching rippled's
+    /// "fraction of UNL whose latest validation backs the alternative".
+    fn check_wrong_prev_ledger_from_validations(&self) -> Option<WrongPrevLedgerDetected> {
+        let trusted_total = self.validations_trie.trusted_count();
+        if trusted_total == 0 {
+            return None;
+        }
+        let preferred = self.validations_trie.get_preferred(self.prev_ledger_seq)?;
+        if preferred == self.prev_ledger {
+            return None;
+        }
+        let support = self.validations_trie.count_for(&preferred);
+        let pct = (support * 100) / trusted_total as u32;
+        if pct >= WRONG_PREV_LEDGER_THRESHOLD {
+            Some(WrongPrevLedgerDetected {
+                preferred_ledger: preferred,
+                peer_count: support as usize,
+                total_trusted: trusted_total,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Record a trusted validator's latest validation in the
+    /// validations-trie aggregator. Returns `true` when the call
+    /// materially changed trie state (new vote, or a switched ledger).
+    /// Untrusted validators are ignored — call
+    /// [`Self::add_trusted_validator`] first to enrol them.
+    ///
+    /// # Audit pass 2 C3 — caller MUST pre-verify the signature
+    ///
+    /// `rxrpl-consensus` does not depend on `rxrpl-overlay` (where the
+    /// canonical signature verifier lives), so this method cannot itself
+    /// run `verify_validation_signature`. Callers MUST verify the
+    /// validation's signature against `validation.public_key` BEFORE
+    /// invoking this entry point. Feeding an unverified validation here
+    /// lets an attacker drive the 60% wrong-prev-ledger detector with
+    /// forged votes.
+    ///
+    /// To prevent key laundering (a caller submits a validation whose
+    /// `node_id` does not derive from the supplied `public_key`), this
+    /// method enforces `node_id == sha512_half(public_key)` and rejects
+    /// the call otherwise. An empty `public_key` also fails this check,
+    /// so locally-constructed validations missing a key cannot bypass
+    /// the binding.
+    #[doc(hidden)]
+    pub fn record_trusted_validation(&mut self, validation: Validation) -> bool {
+        // C3: bind node_id to public_key — prevents a caller from
+        // submitting a validation whose node_id is unrelated to the key
+        // that (allegedly) signed it.
+        let derived_node_id = NodeId(rxrpl_crypto::sha512_half::sha512_half(&[
+            validation.public_key.as_slice(),
+        ]));
+        if validation.node_id != derived_node_id {
+            tracing::warn!(
+                target: "consensus",
+                "record_trusted_validation_node_id_mismatch"
+            );
+            return false;
+        }
+        self.validations_trie.add(validation)
+    }
+
+    /// Read-only view of the validations-trie aggregator. Exposed for
+    /// metrics and integration tests.
+    pub fn validations_trie(&self) -> &ValidationsTrie {
+        &self.validations_trie
+    }
+
+    /// Mark `node_id` as a trusted validator for the validations-trie
+    /// aggregator, so its future validations contribute to
+    /// preferred-branch detection.
+    ///
+    // NIGHT-SHIFT-REVIEW: the trusted set on the trie is independent of
+    // the `TrustedValidatorList` UNL because the latter exposes no
+    // `add_trusted(NodeId)` setter. Callers enrolling a node by NodeId
+    // outside the UNL constructor / manifest pipeline must call this
+    // method explicitly — until `TrustedValidatorList` grows a setter
+    // and the two sets can share state.
+    pub fn add_trusted_validator(&mut self, node_id: NodeId) {
+        self.validations_trie.add_trusted(node_id);
+    }
+
+    /// Remove `node_id` from the validations-trie trusted set. Any prior
+    /// validation contribution is decremented out of the trie
+    /// immediately. UNL membership is untouched (see paired
+    /// [`Self::add_trusted_validator`] note).
+    pub fn remove_trusted_validator(&mut self, node_id: &NodeId) {
+        self.validations_trie.remove_trusted(node_id);
+    }
+
     /// Get the disputes map.
     pub fn disputes(&self) -> &HashMap<Hash256, DisputedTx> {
         &self.disputes
     }
 
     /// Start a new consensus round for the next ledger.
+    ///
+    /// Backwards-compatible entry point: leaves `prior_close_time` at
+    /// `0`, which keeps the [`eff_close_time`] monotonicity clamp
+    /// inactive for any rounded close time > 1.  Callers that have the
+    /// parent ledger's close time available should prefer
+    /// [`Self::start_round_with_prior`].
     pub fn start_round(&mut self, prev_ledger: Hash256, ledger_seq: u32) {
+        self.start_round_with_prior(prev_ledger, ledger_seq, 0);
+    }
+
+    /// Start a new consensus round, supplying the parent ledger's
+    /// close time so the effective close time of this round can be
+    /// clamped to strictly greater (rippled `effCloseTime` monotonicity
+    /// guarantee, see `xrpld/consensus/LedgerTiming.h`).
+    pub fn start_round_with_prior(
+        &mut self,
+        prev_ledger: Hash256,
+        ledger_seq: u32,
+        prior_close_time: u32,
+    ) {
+        // Recompute the close-time resolution for THIS round using the
+        // rippled `getNextLedgerTimeResolution` cadence: keyed on the
+        // new ledger sequence and the prior round's agreement flag, NOT
+        // on a count of consecutive agreements.  Mirrors rippled
+        // `RCLConsensus::Adaptor::onStartRound` which calls
+        // `getNextLedgerTimeResolution(parent.closeTimeResolution,
+        //  parent.closeAgree, ledgerSeq)` before each round.
+        let parent_resolution = self.adaptive_close_time.resolution();
+        let new_resolution =
+            next_resolution(parent_resolution, self.previous_close_agreed, ledger_seq);
+        self.adaptive_close_time.set_resolution(new_resolution);
+
         self.phase = ConsensusPhase::Open;
         self.our_position = None;
         self.our_set = None;
         self.peer_positions.clear();
+        // Drop tracker entries anchored on the previous round's prev_ledger.
+        // Entries for the new prev_ledger (e.g. proposals replayed from
+        // future_proposals) survive so their dedup state carries over.
+        self.proposal_tracker.clear_for(&self.prev_ledger);
         self.disputes.clear();
         self.round = 0;
         self.prev_ledger = prev_ledger;
+        // The new round produces ledger `ledger_seq`; its parent
+        // (prev_ledger) therefore lives at `ledger_seq - 1`. Anchor the
+        // validations-trie preferred-branch query to that sequence.
+        self.prev_ledger_seq = ledger_seq.saturating_sub(1);
+        self.prior_close_time = prior_close_time;
         self.accepted_close_time = None;
         self.accepted_close_flags = 0;
         self.accepted_validation = None;
@@ -431,19 +671,94 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.our_set = Some(our_set);
         self.phase = ConsensusPhase::Establish;
 
-        // Replay any proposals buffered while we were in Open phase
+        // Replay any proposals buffered while we were in Open phase.
+        // Use our own `close_time` as the freshness anchor so that a
+        // burst of proposals queued before phase=Establish are evaluated
+        // against the round's local time instead of wall-clock drift,
+        // matching the close-time bucket aggregation that follows.
         let pending = std::mem::take(&mut self.pending_proposals);
         for p in pending {
-            self.peer_proposal(p);
+            self.peer_proposal_at(p, close_time);
         }
 
         Ok(())
     }
 
+    /// Total number of incoming proposals dropped because their
+    /// `close_time` was more than [`PROPOSAL_FRESHNESS_SECS`] seconds away
+    /// from the local ripple time when received. Mirrors rippled's
+    /// `propRELAY_INTERVAL` filter, exposed for metrics scraping.
+    pub fn proposal_dropped_stale_total(&self) -> u64 {
+        self.proposal_dropped_stale_total.load(Ordering::Relaxed)
+    }
+
+    /// Total number of incoming peer proposals buffered into the holding
+    /// pen (`future_proposals`) because their `prev_ledger` was unknown to
+    /// us at the time the proposal arrived. Mirrors rippled's
+    /// `Counter[ConsensusProposals.heldFutureLedger]` JLOG metric (held
+    /// pending prev-ledger catch-up).
+    pub fn proposals_held_pending_prev_ledger_total(&self) -> u64 {
+        self.proposals_held_pending_prev_ledger_total
+            .load(Ordering::Relaxed)
+    }
+
+    /// Compute the current time in ripple-epoch seconds (seconds since
+    /// 2000-01-01 UTC). Returns `0` if the system clock is before the
+    /// ripple epoch (which would only happen on a misconfigured host).
+    fn current_ripple_time() -> u32 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.as_secs().saturating_sub(RIPPLE_EPOCH_OFFSET_SECS)) as u32)
+            .unwrap_or(0)
+    }
+
     /// Receive a proposal from a peer.
+    ///
+    /// Uses the local wall-clock for the freshness check against
+    /// [`PROPOSAL_FRESHNESS_SECS`]. For deterministic tests prefer
+    /// [`Self::peer_proposal_at`].
     pub fn peer_proposal(&mut self, proposal: Proposal) {
+        let now = Self::current_ripple_time();
+        self.peer_proposal_at(proposal, now);
+    }
+
+    /// **Test-only entry point** — production code MUST call
+    /// [`Self::peer_proposal`].
+    ///
+    /// Exposes the freshness-anchor seam to tests by accepting an explicit
+    /// `now` (ripple-epoch seconds) so the freshness check is deterministic.
+    /// Downstream callers must NOT supply an attacker-controlled `now` value,
+    /// since doing so would bypass the [`PROPOSAL_FRESHNESS_SECS`] gate that
+    /// [`Self::peer_proposal`] anchors to the local wall-clock.
+    ///
+    /// Kept `pub` (rather than `pub(crate)`) only because the
+    /// `crates/consensus/tests/multi_node.rs` integration test needs a
+    /// deterministic clock; hidden from rustdoc to discourage external use.
+    #[doc(hidden)]
+    pub fn peer_proposal_at(&mut self, proposal: Proposal, now: u32) {
         if self.phase != ConsensusPhase::Establish {
-            // Buffer proposals received outside Establish phase
+            // Apply UNL + freshness gates BEFORE buffering to prevent
+            // pre-Establish memory amplification (audit pass 2 C2). Without
+            // these checks any peer (untrusted, stale, malicious) could
+            // flood the Open phase and exhaust memory via unbounded
+            // pending_proposals growth.
+            if !self.unl.is_empty() && !self.unl.is_trusted(&proposal.node_id) {
+                return;
+            }
+            let delta = now.abs_diff(proposal.close_time);
+            if delta > PROPOSAL_FRESHNESS_SECS {
+                self.proposal_dropped_stale_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if self.pending_proposals.len() >= PENDING_PROPOSALS_MAX {
+                tracing::warn!(
+                    target: "consensus",
+                    cap = PENDING_PROPOSALS_MAX,
+                    "pending_proposals cap reached, dropping"
+                );
+                return;
+            }
             self.pending_proposals.push(proposal);
             return;
         }
@@ -451,6 +766,26 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         // UNL filtering: if UNL is non-empty, only accept trusted nodes
         if !self.unl.is_empty() && !self.unl.is_trusted(&proposal.node_id) {
             tracing::debug!("rejected proposal from untrusted {:?}", proposal.node_id);
+            return;
+        }
+
+        // Freshness gate (T14): drop proposals whose `close_time` is too
+        // far from our local ripple time. Mirrors rippled
+        // `propRELAY_INTERVAL` (xrpld/consensus/Consensus.h). Sits before
+        // the prev_ledger / future-hold logic so stale proposals never
+        // pollute `wrong_prev_ledger_votes` or the holding pen.
+        let delta = now.abs_diff(proposal.close_time);
+        if delta > PROPOSAL_FRESHNESS_SECS {
+            self.proposal_dropped_stale_total
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                target: "consensus",
+                public_key = ?proposal.public_key,
+                close_time = proposal.close_time,
+                now,
+                delta,
+                "proposal_dropped_stale"
+            );
             return;
         }
 
@@ -468,6 +803,8 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             );
             self.wrong_prev_ledger_votes
                 .insert(proposal.node_id, proposal.prev_ledger);
+            self.proposals_held_pending_prev_ledger_total
+                .fetch_add(1, Ordering::Relaxed);
             self.hold_future_proposal(proposal);
             return;
         }
@@ -486,6 +823,19 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
                 );
                 return;
             }
+        }
+
+        // Authoritative dedup: only let proposals through that the
+        // (NodeId, prev_ledger)-keyed ProposalTracker accepts as a strict
+        // `prop_seq` advance. Duplicates and stale-seq replays are dropped
+        // silently here so they never bump dispute counters or rotate the
+        // peer's stored position.
+        if !self.proposal_tracker.track(proposal.clone()) {
+            tracing::debug!(
+                "dropped duplicate/older proposal from {:?} seq={} prop_seq={}",
+                proposal.node_id, proposal.ledger_seq, proposal.prop_seq
+            );
+            return;
         }
 
         tracing::debug!("accepted proposal from {:?} seq={}", proposal.node_id, proposal.ledger_seq);
@@ -567,18 +917,50 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             None => return 0,
         };
         let resolution = self.adaptive_close_time.resolution();
+        let prior = self.prior_close_time;
 
         if self.peer_positions.is_empty() {
-            return round_close_time(our_time, resolution);
+            return eff_close_time(our_time, resolution, prior);
         }
 
         // Tally votes per rounded close-time bucket.
+        //
+        // CRITICAL (H11): peer votes are FILTERED, not clamped. Calling
+        // `eff_close_time(peer_time, ...)` here would silently rewrite
+        // any peer vote with `close_time == 0` (rippled "no opinion"
+        // sentinel) or `close_time < prior + 1` to `prior + 1`,
+        // collapsing distinct adversarial votes into one shared bucket
+        // and manufacturing apparent agreement. We discard those votes
+        // entirely instead, then apply `eff_close_time` only to the
+        // final winning bucket below.
+        let min_allowed = prior.saturating_add(1);
         let mut votes: HashMap<u32, u32> = HashMap::new();
-        let our_bucket = round_close_time(our_time, resolution);
-        *votes.entry(our_bucket).or_insert(0) += 1;
+        // Our own time is voted only if it is a real opinion (non-zero)
+        // and would not be clamped to the floor bucket. The same filter
+        // we apply to peers applies to us, so self can never manufacture
+        // a vote in the floor bucket either.
+        let our_bucket_raw = round_close_time(our_time, resolution);
+        if our_time != 0 && our_bucket_raw >= min_allowed {
+            *votes.entry(our_bucket_raw).or_insert(0) += 1;
+        }
         for peer in self.peer_positions.values() {
-            let peer_bucket = round_close_time(peer.close_time, resolution);
-            *votes.entry(peer_bucket).or_insert(0) += 1;
+            // Filter: skip the "no opinion" sentinel and any vote that
+            // would round below the monotonicity floor (those would be
+            // clamped into a single bucket otherwise).
+            if peer.close_time == 0 {
+                continue;
+            }
+            let rounded = round_close_time(peer.close_time, resolution);
+            if rounded < min_allowed {
+                continue;
+            }
+            *votes.entry(rounded).or_insert(0) += 1;
+        }
+
+        // No surviving votes (everyone was filtered out): fall back to
+        // the solo path so we still emit a monotonic close_time.
+        if votes.is_empty() {
+            return eff_close_time(our_time, resolution, prior);
         }
 
         // Pick the bucket with the most votes. On ties, pick the LATER
@@ -586,7 +968,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         // and biasing towards "later" matches the natural drift of each
         // validator's clock forward over time, so the chosen bucket is
         // less likely to fall behind prior_close_time + 1s monotonicity.
-        let mut best_bucket = our_bucket;
+        let mut best_bucket = 0u32;
         let mut best_count = 0u32;
         for (bucket, count) in &votes {
             if *count > best_count || (*count == best_count && *bucket > best_bucket) {
@@ -594,7 +976,10 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
                 best_count = *count;
             }
         }
-        best_bucket
+        // Apply eff_close_time only to the FINAL winning bucket so the
+        // monotonicity guarantee (close_time > prior) still holds for
+        // the accepted ledger.
+        eff_close_time(best_bucket, resolution, prior)
     }
 
     /// Update `our_position.close_time` to match the consensus winner
@@ -609,18 +994,46 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             return;
         }
         let resolution = self.adaptive_close_time.resolution();
+        let prior = self.prior_close_time;
         let our_time = self.our_position.as_ref().map(|p| p.close_time).unwrap_or(0);
-        let our_bucket = round_close_time(our_time, resolution);
+        let min_allowed = prior.saturating_add(1);
 
+        // Same filter-don't-clamp policy as `effective_close_time` (H11):
+        // peers with the "no opinion" sentinel (close_time == 0) or with
+        // a rounded vote below the monotonicity floor are dropped, not
+        // rewritten to `prior + 1`. Otherwise two adversarial peers
+        // sending close_time=1 and close_time=2 would both vote into the
+        // same floor bucket, manufacture a strict majority, and force
+        // realignment of our position to a bucket nobody actually voted
+        // for.
         let mut votes: HashMap<u32, u32> = HashMap::new();
-        *votes.entry(our_bucket).or_insert(0) += 1;
-        for peer in self.peer_positions.values() {
-            let b = round_close_time(peer.close_time, resolution);
-            *votes.entry(b).or_insert(0) += 1;
+        let our_bucket = round_close_time(our_time, resolution);
+        if our_time != 0 && our_bucket >= min_allowed {
+            *votes.entry(our_bucket).or_insert(0) += 1;
         }
-        let total: u32 = votes.values().sum();
+        for peer in self.peer_positions.values() {
+            if peer.close_time == 0 {
+                continue;
+            }
+            let rounded = round_close_time(peer.close_time, resolution);
+            if rounded < min_allowed {
+                continue;
+            }
+            *votes.entry(rounded).or_insert(0) += 1;
+        }
+
+        if votes.is_empty() {
+            return;
+        }
+
+        // Denominator includes filtered voters too: a peer that sent a
+        // garbage close_time still counts as "a voter that didn't agree
+        // with us", so a single surviving honest peer can't flip our
+        // position when the cohort is mostly garbage.
+        let total: u32 = (self.peer_positions.len() as u32).saturating_add(1);
+
         // Find best bucket; tiebreak by latest.
-        let mut best_bucket = our_bucket;
+        let mut best_bucket = 0u32;
         let mut best_count = 0u32;
         for (bucket, count) in &votes {
             if *count > best_count || (*count == best_count && *bucket > best_bucket) {
@@ -662,6 +1075,11 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.align_close_time_with_peers();
 
         let threshold = self.params.threshold_for_round(self.round);
+        // Per-tx dispute resolution uses rippled's avalanche cascade
+        // (50/65/70/95) which tightens faster than the linear
+        // whole-position agreement threshold above. See
+        // [`avalanche_dispute_threshold`].
+        let dispute_threshold = avalanche_dispute_threshold(self.round);
 
         // Resolve disputes and update our set if needed
         let mut set_changed = false;
@@ -669,7 +1087,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             let mut new_txs = our_set.txs.clone();
 
             for dispute in self.disputes.values() {
-                let should_include = dispute.should_include(threshold);
+                let should_include = dispute.our_vote(dispute_threshold);
                 if should_include != dispute.our_vote {
                     set_changed = true;
                     if should_include {
@@ -763,9 +1181,18 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         let close_time = self.effective_close_time();
         self.accepted_close_time = Some(close_time);
 
-        // Check if peers disagree on close time
+        // Check whether peers agreed on close time.  The result is
+        // recorded on `previous_close_agreed` and consumed by the next
+        // `start_round`, which feeds it into `next_resolution` to pick
+        // the bin for the upcoming ledger.  This replaces the legacy
+        // `AdaptiveCloseTime::on_agreement` / `on_disagreement`
+        // pathway (deprecated in T03).
         let current_resolution = self.adaptive_close_time.resolution();
-        if !self.peer_positions.is_empty() {
+        let agreed = if self.peer_positions.is_empty() {
+            // Solo mode: no peers to disagree with, treat as agreement
+            // so the cadence keeps pushing toward finer bins.
+            true
+        } else {
             let our_time = self
                 .our_position
                 .as_ref()
@@ -777,16 +1204,12 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             }
             let min = *times.iter().min().unwrap();
             let max = *times.iter().max().unwrap();
-            if max - min > current_resolution {
-                self.accepted_close_flags = 1;
-                self.adaptive_close_time.on_disagreement();
-            } else {
-                self.adaptive_close_time.on_agreement();
-            }
-        } else {
-            // Solo mode: always counts as agreement
-            self.adaptive_close_time.on_agreement();
+            max - min <= current_resolution
+        };
+        if !agreed {
+            self.accepted_close_flags = 1;
         }
+        self.previous_close_agreed = agreed;
 
         // Ask adapter to apply the tx set and get ledger hash
         let our_set = match &self.our_set {
@@ -816,6 +1239,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             signature: None,
             amendments: vec![],
             signing_payload: None,
+            ..Default::default()
         };
 
         self.adapter.on_accept(&validation);
@@ -832,12 +1256,61 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
     }
 }
 
+/// Avalanche dispute threshold (percent) for the given consensus round.
+///
+/// Mirrors rippled's tightening cascade in
+/// `include/xrpl/consensus/Consensus.h` — a peer must clear an
+/// increasingly demanding majority for a tx to remain in our position
+/// as the round count climbs:
+///
+/// | round | threshold | rippled constant       |
+/// |------:|----------:|------------------------|
+/// |   0   |   50%     | `avINIT_CONSENSUS_PCT` |
+/// |   1   |   65%     | `avMID_CONSENSUS_PCT`  |
+/// |   2   |   70%     | `avLATE_CONSENSUS_PCT` |
+/// |  3+   |   95%     | `avSTUCK_CONSENSUS_PCT`|
+///
+/// This is *separate* from `ConsensusParams::threshold_for_round` which
+/// gates whole-position agreement; avalanche thresholds gate per-tx
+/// dispute resolution.
+pub fn avalanche_dispute_threshold(round: u32) -> u32 {
+    match round {
+        0 => 50,
+        1 => 65,
+        2 => 70,
+        _ => 95,
+    }
+}
+
 /// Round a close time to the nearest resolution boundary.
 pub fn round_close_time(t: u32, resolution: u32) -> u32 {
     if resolution == 0 {
         return t;
     }
-    (t + resolution / 2) / resolution * resolution
+    t.saturating_add(resolution / 2) / resolution * resolution
+}
+
+/// Compute the effective close time for a ledger, clamping to strictly
+/// greater than `prior_close_time` to enforce monotonicity.
+///
+/// Mirrors rippled's `effCloseTime` (xrpld/consensus/LedgerTiming.h):
+/// - When `close_time == 0`, returns 0 (the "untrusted close time" sentinel
+///   used by rippled when a node has no opinion on the close time).
+/// - Otherwise, rounds `close_time` to the resolution bucket and clamps
+///   the result to be at least `prior_close_time + 1`. The clamp ensures
+///   each ledger's close time is strictly greater than its parent's, which
+///   downstream code relies on for ordering.
+pub fn eff_close_time(close_time: u32, resolution: u32, prior_close_time: u32) -> u32 {
+    if close_time == 0 {
+        return 0;
+    }
+    let rounded = round_close_time(close_time, resolution);
+    let min_allowed = prior_close_time.saturating_add(1);
+    if rounded > min_allowed {
+        rounded
+    } else {
+        min_allowed
+    }
 }
 
 #[cfg(test)]
@@ -970,26 +1443,32 @@ mod tests {
         engine.close_ledger(set_a, 100, 1).unwrap();
 
         // B and C propose set with only tx1
-        engine.peer_proposal(Proposal {
-            node_id: node_b,
-            public_key: vec![0x02; 33],
-            tx_set_hash: set_bc.hash,
-            close_time: 100,
-            prop_seq: 0,
-            ledger_seq: 1,
-            prev_ledger: Hash256::ZERO,
-            signature: None,
-        });
-        engine.peer_proposal(Proposal {
-            node_id: node_c,
-            public_key: vec![0x02; 33],
-            tx_set_hash: set_bc.hash,
-            close_time: 100,
-            prop_seq: 0,
-            ledger_seq: 1,
-            prev_ledger: Hash256::ZERO,
-            signature: None,
-        });
+        engine.peer_proposal_at(
+            Proposal {
+                node_id: node_b,
+                public_key: vec![0x02; 33],
+                tx_set_hash: set_bc.hash,
+                close_time: 100,
+                prop_seq: 0,
+                ledger_seq: 1,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            },
+            100,
+        );
+        engine.peer_proposal_at(
+            Proposal {
+                node_id: node_c,
+                public_key: vec![0x02; 33],
+                tx_set_hash: set_bc.hash,
+                close_time: 100,
+                prop_seq: 0,
+                ledger_seq: 1,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            },
+            100,
+        );
 
         // Converge: threshold round 0 = 50%, tx2 has 1/3 = 33% -> drop
         assert!(engine.converge());
@@ -1019,26 +1498,32 @@ mod tests {
         engine.close_ledger(set_a, 100, 1).unwrap();
         assert_eq!(engine.our_position().unwrap().prop_seq, 0);
 
-        engine.peer_proposal(Proposal {
-            node_id: node_b,
-            public_key: vec![0x02; 33],
-            tx_set_hash: set_b.hash,
-            close_time: 100,
-            prop_seq: 0,
-            ledger_seq: 1,
-            prev_ledger: Hash256::ZERO,
-            signature: None,
-        });
-        engine.peer_proposal(Proposal {
-            node_id: node_c,
-            public_key: vec![0x02; 33],
-            tx_set_hash: set_b.hash,
-            close_time: 100,
-            prop_seq: 0,
-            ledger_seq: 1,
-            prev_ledger: Hash256::ZERO,
-            signature: None,
-        });
+        engine.peer_proposal_at(
+            Proposal {
+                node_id: node_b,
+                public_key: vec![0x02; 33],
+                tx_set_hash: set_b.hash,
+                close_time: 100,
+                prop_seq: 0,
+                ledger_seq: 1,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            },
+            100,
+        );
+        engine.peer_proposal_at(
+            Proposal {
+                node_id: node_c,
+                public_key: vec![0x02; 33],
+                tx_set_hash: set_b.hash,
+                close_time: 100,
+                prop_seq: 0,
+                ledger_seq: 1,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            },
+            100,
+        );
 
         engine.converge();
         // Position changed, so prop_seq should have incremented
@@ -1058,16 +1543,19 @@ mod tests {
         engine.start_round(Hash256::ZERO, 1);
         engine.close_ledger(set.clone(), 100, 1).unwrap();
 
-        engine.peer_proposal(Proposal {
-            node_id: node_b,
-            public_key: vec![0x02; 33],
-            tx_set_hash: set.hash,
-            close_time: 100,
-            prop_seq: 0,
-            ledger_seq: 1,
-            prev_ledger: Hash256::ZERO,
-            signature: None,
-        });
+        engine.peer_proposal_at(
+            Proposal {
+                node_id: node_b,
+                public_key: vec![0x02; 33],
+                tx_set_hash: set.hash,
+                close_time: 100,
+                prop_seq: 0,
+                ledger_seq: 1,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            },
+            100,
+        );
 
         assert!(engine.disputes().is_empty());
         assert!(engine.converge());
@@ -1087,16 +1575,19 @@ mod tests {
         engine.start_round(Hash256::ZERO, 1);
         engine.close_ledger(set, 100, 1).unwrap();
 
-        engine.peer_proposal(Proposal {
-            node_id: node_b,
-            public_key: vec![0x02; 33],
-            tx_set_hash: Hash256::new([0xFF; 32]), // unknown
-            close_time: 100,
-            prop_seq: 0,
-            ledger_seq: 1,
-            prev_ledger: Hash256::ZERO,
-            signature: None,
-        });
+        engine.peer_proposal_at(
+            Proposal {
+                node_id: node_b,
+                public_key: vec![0x02; 33],
+                tx_set_hash: Hash256::new([0xFF; 32]), // unknown
+                close_time: 100,
+                prop_seq: 0,
+                ledger_seq: 1,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            },
+            100,
+        );
 
         assert!(engine.disputes().is_empty());
     }
@@ -1115,26 +1606,34 @@ mod tests {
         let set = TxSet::new(vec![]);
         engine.close_ledger(set.clone(), 100, 1).unwrap();
 
-        engine.peer_proposal(Proposal {
-            node_id: node_b,
-            public_key: vec![0x02; 33],
-            tx_set_hash: set.hash,
-            close_time: 200,
-            prop_seq: 0,
-            ledger_seq: 1,
-            prev_ledger: Hash256::ZERO,
-            signature: None,
-        });
-        engine.peer_proposal(Proposal {
-            node_id: node_c,
-            public_key: vec![0x02; 33],
-            tx_set_hash: set.hash,
-            close_time: 150,
-            prop_seq: 0,
-            ledger_seq: 1,
-            prev_ledger: Hash256::ZERO,
-            signature: None,
-        });
+        // Use the proposal's own close_time as the freshness anchor so
+        // each peer proposal lands with delta=0 against PROPOSAL_FRESHNESS_SECS.
+        engine.peer_proposal_at(
+            Proposal {
+                node_id: node_b,
+                public_key: vec![0x02; 33],
+                tx_set_hash: set.hash,
+                close_time: 200,
+                prop_seq: 0,
+                ledger_seq: 1,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            },
+            200,
+        );
+        engine.peer_proposal_at(
+            Proposal {
+                node_id: node_c,
+                public_key: vec![0x02; 33],
+                tx_set_hash: set.hash,
+                close_time: 150,
+                prop_seq: 0,
+                ledger_seq: 1,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            },
+            150,
+        );
 
         assert!(engine.converge());
         // Vote-counting: each of {100→90, 150→150, 200→210} has 1 vote.
@@ -1152,6 +1651,52 @@ mod tests {
     }
 
     #[test]
+    fn round_close_time_saturates_near_u32_max() {
+        // prior to fix: (u32::MAX-30 + 60) wrapped, returning a tiny number
+        let r = round_close_time(u32::MAX - 30, 30);
+        assert!(r >= u32::MAX - 60, "expected near u32::MAX, got {}", r);
+    }
+
+    #[test]
+    fn eff_close_time_zero_passthrough() {
+        // close_time == 0 is rippled's "untrusted close time" sentinel and
+        // must propagate unchanged regardless of resolution or prior.
+        assert_eq!(eff_close_time(0, 30, 0), 0);
+        assert_eq!(eff_close_time(0, 30, 12345), 0);
+        assert_eq!(eff_close_time(0, 0, 99), 0);
+    }
+
+    #[test]
+    fn eff_close_time_clamp_active() {
+        // round_close_time(100, 30) == 90, but prior+1 == 121, so clamp wins.
+        assert_eq!(eff_close_time(100, 30, 120), 121);
+        // Rounded equals prior exactly => clamp to prior+1 (strictly greater).
+        // round_close_time(150, 30) == 150, prior 150 -> must return 151.
+        assert_eq!(eff_close_time(150, 30, 150), 151);
+        // Rounded sits below prior by a wide margin.
+        assert_eq!(eff_close_time(50, 10, 200), 201);
+    }
+
+    #[test]
+    fn eff_close_time_clamp_inactive() {
+        // round_close_time(150, 30) == 150 > prior+1 == 101 -> rounded wins.
+        assert_eq!(eff_close_time(150, 30, 100), 150);
+        // round_close_time(145, 30) == 150 > prior+1 == 100 -> rounded wins.
+        assert_eq!(eff_close_time(145, 30, 99), 150);
+        // prior_close_time == 0 (genesis-like) and rounded > 1.
+        assert_eq!(eff_close_time(60, 10, 0), 60);
+    }
+
+    #[test]
+    fn eff_close_time_resolution_zero() {
+        // resolution == 0 makes round_close_time the identity, so eff_close_time
+        // reduces to max(close_time, prior+1) for non-zero inputs.
+        assert_eq!(eff_close_time(100, 0, 50), 100);
+        assert_eq!(eff_close_time(100, 0, 100), 101);
+        assert_eq!(eff_close_time(100, 0, 200), 201);
+    }
+
+    #[test]
     fn close_time_spread_sets_flag() {
         let adapter = SimpleAdapter;
         let node_a = NodeId(Hash256::new([0xA0; 32]));
@@ -1162,17 +1707,23 @@ mod tests {
         let set = TxSet::new(vec![]);
         engine.close_ledger(set.clone(), 100, 1).unwrap();
 
-        // Peer proposes time far away (spread > 30s resolution)
-        engine.peer_proposal(Proposal {
-            node_id: node_b,
-            public_key: vec![0x02; 33],
-            tx_set_hash: set.hash,
-            close_time: 200,
-            prop_seq: 0,
-            ledger_seq: 1,
-            prev_ledger: Hash256::ZERO,
-            signature: None,
-        });
+        // Peer proposes time far away (spread > 30s resolution).
+        // Anchor `now` to the peer's own close_time so the freshness
+        // gate doesn't drop the message — this test exercises the
+        // spread-flag path, not the freshness path.
+        engine.peer_proposal_at(
+            Proposal {
+                node_id: node_b,
+                public_key: vec![0x02; 33],
+                tx_set_hash: set.hash,
+                close_time: 200,
+                prop_seq: 0,
+                ledger_seq: 1,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            },
+            200,
+        );
 
         engine.converge();
         assert_eq!(engine.accepted_close_flags(), 1);
@@ -1217,8 +1768,24 @@ mod tests {
     use crate::unl::TrustedValidatorList;
     use std::collections::HashSet;
 
+    /// Synthetic per-id "public key" for tests. 33 bytes (secp256k1
+    /// length), prefix `0x02` so the verifier path treats it as a
+    /// secp256k1-shaped key, with the id byte filling the rest. Distinct
+    /// per `id` so derived NodeIds don't collide.
+    fn test_pk(id: u8) -> Vec<u8> {
+        let mut pk = vec![0x02; 33];
+        for byte in pk.iter_mut().skip(1) {
+            *byte = id;
+        }
+        pk
+    }
+
     fn node(id: u8) -> NodeId {
-        NodeId(Hash256::new([id; 32]))
+        // Derive from the synthetic test public key so that validations
+        // built with `validation_for(node(n), ...)` carry a matching
+        // (node_id, public_key) pair for the C3 binding check in
+        // `record_trusted_validation`.
+        NodeId::from_public_key(&test_pk(id))
     }
 
     fn make_unl(ids: &[u8]) -> TrustedValidatorList {
@@ -1259,7 +1826,7 @@ mod tests {
         engine.close_ledger(set.clone(), 100, 1).unwrap();
 
         // Node 99 is not trusted
-        engine.peer_proposal(proposal_for(node(99), set.hash, Hash256::ZERO, 1));
+        engine.peer_proposal_at(proposal_for(node(99), set.hash, Hash256::ZERO, 1), 100);
         assert!(engine.peer_positions.is_empty());
     }
 
@@ -1275,7 +1842,7 @@ mod tests {
         engine.close_ledger(set.clone(), 100, 1).unwrap();
 
         // Node 2 is trusted
-        engine.peer_proposal(proposal_for(node(2), set.hash, Hash256::ZERO, 1));
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, Hash256::ZERO, 1), 100);
         assert_eq!(engine.peer_positions.len(), 1);
     }
 
@@ -1292,7 +1859,7 @@ mod tests {
 
         // Different prev_ledger
         let bad_prev = Hash256::new([0xFF; 32]);
-        engine.peer_proposal(proposal_for(node(2), set.hash, bad_prev, 1));
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, bad_prev, 1), 100);
         assert!(engine.peer_positions.is_empty());
     }
 
@@ -1309,8 +1876,8 @@ mod tests {
         engine.close_ledger(set.clone(), 100, 1).unwrap();
 
         // Only nodes 2, 3 agree (+ us = 3 total, need 4)
-        engine.peer_proposal(proposal_for(node(2), set.hash, Hash256::ZERO, 1));
-        engine.peer_proposal(proposal_for(node(3), set.hash, Hash256::ZERO, 1));
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, Hash256::ZERO, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(3), set.hash, Hash256::ZERO, 1), 100);
 
         assert!(!engine.converge());
         assert_eq!(engine.phase(), ConsensusPhase::Establish);
@@ -1328,9 +1895,9 @@ mod tests {
         let set = TxSet::new(vec![]);
         engine.close_ledger(set.clone(), 100, 1).unwrap();
 
-        engine.peer_proposal(proposal_for(node(2), set.hash, Hash256::ZERO, 1));
-        engine.peer_proposal(proposal_for(node(3), set.hash, Hash256::ZERO, 1));
-        engine.peer_proposal(proposal_for(node(4), set.hash, Hash256::ZERO, 1));
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, Hash256::ZERO, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(3), set.hash, Hash256::ZERO, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(4), set.hash, Hash256::ZERO, 1), 100);
 
         assert!(engine.converge());
         assert_eq!(engine.phase(), ConsensusPhase::Accepted);
@@ -1365,11 +1932,47 @@ mod tests {
         engine.close_ledger(set.clone(), 100, 1).unwrap();
 
         let future_prev = Hash256::new([0xAA; 32]);
-        engine.peer_proposal(proposal_for(node(2), set.hash, future_prev, 2));
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, future_prev, 2), 100);
 
         // Held, not accepted.
         assert!(engine.peer_positions.is_empty());
         assert_eq!(engine.future_proposals.get(&future_prev).map(|v| v.len()), Some(1));
+    }
+
+    #[test]
+    fn proposals_held_pending_prev_ledger_counter_bumps_on_hold() {
+        // T34: every time peer_proposal_at routes a proposal into the
+        // future_proposals holding pen because prev_ledger != self.prev_ledger,
+        // the proposals_held_pending_prev_ledger_total counter must increment.
+        let unl = make_unl(&[1, 2, 3]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
+        assert_eq!(engine.proposals_held_pending_prev_ledger_total(), 0);
+
+        let future_prev_a = Hash256::new([0xA1; 32]);
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, future_prev_a, 2), 100);
+        assert_eq!(engine.proposals_held_pending_prev_ledger_total(), 1);
+
+        // A different peer holding on the same future prev_ledger still
+        // bumps the counter (each held proposal counts).
+        engine.peer_proposal_at(proposal_for(node(3), set.hash, future_prev_a, 2), 100);
+        assert_eq!(engine.proposals_held_pending_prev_ledger_total(), 2);
+
+        // A peer on yet another future prev_ledger also counts.
+        let future_prev_b = Hash256::new([0xB2; 32]);
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, future_prev_b, 2), 100);
+        assert_eq!(engine.proposals_held_pending_prev_ledger_total(), 3);
+
+        // A proposal whose prev_ledger MATCHES our current one is NOT held
+        // and must NOT bump the counter.
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, Hash256::ZERO, 1), 100);
+        assert_eq!(engine.proposals_held_pending_prev_ledger_total(), 3);
     }
 
     #[test]
@@ -1385,7 +1988,7 @@ mod tests {
         engine.close_ledger(set.clone(), 100, 1).unwrap();
 
         let future_prev = Hash256::new([0xBB; 32]);
-        engine.peer_proposal(proposal_for(node(2), set.hash, future_prev, 2));
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, future_prev, 2), 100);
         assert!(engine.future_proposals.contains_key(&future_prev));
 
         // Catch up to the future ledger.
@@ -1414,7 +2017,7 @@ mod tests {
 
         // Hold a stale proposal (seq=2)
         let stale_prev = Hash256::new([0xCC; 32]);
-        engine.peer_proposal(proposal_for(node(2), set.hash, stale_prev, 2));
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, stale_prev, 2), 100);
         assert!(engine.future_proposals.contains_key(&stale_prev));
 
         // Jump forward many rounds. Stale proposals get evicted.
@@ -1434,9 +2037,9 @@ mod tests {
         engine.close_ledger(set.clone(), 100, 1).unwrap();
 
         let prev = Hash256::new([0xEE; 32]);
-        engine.peer_proposal(proposal_for(node(2), set.hash, prev, 2));
-        engine.peer_proposal(proposal_for(node(2), set.hash, prev, 2));
-        engine.peer_proposal(proposal_for(node(2), set.hash, prev, 2));
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, prev, 2), 100);
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, prev, 2), 100);
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, prev, 2), 100);
         // Same node, same key: only the latest is kept.
         assert_eq!(engine.future_proposals.get(&prev).map(|v| v.len()), Some(1));
     }
@@ -1458,7 +2061,8 @@ mod tests {
             let mut h = [0u8; 32];
             h[0] = i.wrapping_add(1);
             let p = proposal_for(node(2), set.hash, Hash256::new(h), 100 + i as u32);
-            engine.peer_proposal(p);
+            // proposal_for produces close_time=100; anchor `now` accordingly.
+            engine.peer_proposal_at(p, 100);
         }
         assert!(engine.future_proposals.len() <= FUTURE_PROPOSALS_MAX_KEYS);
     }
@@ -1476,7 +2080,7 @@ mod tests {
         engine.close_ledger(set.clone(), 100, 1).unwrap();
 
         let bad_prev = Hash256::new([0xFF; 32]);
-        engine.peer_proposal(proposal_for(node(2), set.hash, bad_prev, 1));
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, bad_prev, 1), 100);
 
         assert_eq!(engine.check_wrong_prev_ledger(), None);
     }
@@ -1497,10 +2101,10 @@ mod tests {
         engine.close_ledger(set.clone(), 100, 1).unwrap();
 
         let peer_prev = Hash256::new([0xBB; 32]);
-        engine.peer_proposal(proposal_for(node(2), set.hash, peer_prev, 1));
-        engine.peer_proposal(proposal_for(node(3), set.hash, peer_prev, 1));
-        engine.peer_proposal(proposal_for(node(4), set.hash, peer_prev, 1));
-        engine.peer_proposal(proposal_for(node(5), set.hash, peer_prev, 1));
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, peer_prev, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(3), set.hash, peer_prev, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(4), set.hash, peer_prev, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(5), set.hash, peer_prev, 1), 100);
 
         let result = engine.check_wrong_prev_ledger();
         assert!(result.is_some());
@@ -1526,11 +2130,11 @@ mod tests {
 
         let peer_prev = Hash256::new([0xBB; 32]);
         // 1 peer disagrees
-        engine.peer_proposal(proposal_for(node(2), set.hash, peer_prev, 1));
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, peer_prev, 1), 100);
         // 3 peers agree
-        engine.peer_proposal(proposal_for(node(3), set.hash, Hash256::ZERO, 1));
-        engine.peer_proposal(proposal_for(node(4), set.hash, Hash256::ZERO, 1));
-        engine.peer_proposal(proposal_for(node(5), set.hash, Hash256::ZERO, 1));
+        engine.peer_proposal_at(proposal_for(node(3), set.hash, Hash256::ZERO, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(4), set.hash, Hash256::ZERO, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(5), set.hash, Hash256::ZERO, 1), 100);
 
         assert_eq!(engine.check_wrong_prev_ledger(), None);
     }
@@ -1551,11 +2155,11 @@ mod tests {
 
         let peer_prev = Hash256::new([0xBB; 32]);
         // 3 peers disagree
-        engine.peer_proposal(proposal_for(node(2), set.hash, peer_prev, 1));
-        engine.peer_proposal(proposal_for(node(3), set.hash, peer_prev, 1));
-        engine.peer_proposal(proposal_for(node(4), set.hash, peer_prev, 1));
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, peer_prev, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(3), set.hash, peer_prev, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(4), set.hash, peer_prev, 1), 100);
         // 2 peers agree
-        engine.peer_proposal(proposal_for(node(5), set.hash, Hash256::ZERO, 1));
+        engine.peer_proposal_at(proposal_for(node(5), set.hash, Hash256::ZERO, 1), 100);
 
         // total_trusted = 1 agreeing + 3 disagreeing = 4 (node(5) is agreeing, nodes 2,3,4 disagree)
         // pct = 3/4 = 75% >= 60%
@@ -1582,8 +2186,8 @@ mod tests {
 
         let peer_prev = Hash256::new([0xBB; 32]);
         // Untrusted nodes disagree
-        engine.peer_proposal(proposal_for(node(50), set.hash, peer_prev, 1));
-        engine.peer_proposal(proposal_for(node(51), set.hash, peer_prev, 1));
+        engine.peer_proposal_at(proposal_for(node(50), set.hash, peer_prev, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(51), set.hash, peer_prev, 1), 100);
 
         assert_eq!(engine.check_wrong_prev_ledger(), None);
     }
@@ -1602,8 +2206,8 @@ mod tests {
         engine.close_ledger(set.clone(), 100, 1).unwrap();
 
         let peer_prev = Hash256::new([0xBB; 32]);
-        engine.peer_proposal(proposal_for(node(2), set.hash, peer_prev, 1));
-        engine.peer_proposal(proposal_for(node(3), set.hash, peer_prev, 1));
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, peer_prev, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(3), set.hash, peer_prev, 1), 100);
 
         // Should detect (2/2 = 100%)
         assert!(engine.check_wrong_prev_ledger().is_some());
@@ -1629,13 +2233,213 @@ mod tests {
 
         let prev_a = Hash256::new([0xAA; 32]);
         let prev_b = Hash256::new([0xBB; 32]);
-        engine.peer_proposal(proposal_for(node(2), set.hash, prev_a, 1));
-        engine.peer_proposal(proposal_for(node(3), set.hash, prev_a, 1));
-        engine.peer_proposal(proposal_for(node(4), set.hash, prev_b, 1));
-        engine.peer_proposal(proposal_for(node(5), set.hash, prev_b, 1));
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, prev_a, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(3), set.hash, prev_a, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(4), set.hash, prev_b, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(5), set.hash, prev_b, 1), 100);
 
         // 2/4 = 50% < 60% -> no detection
         assert_eq!(engine.check_wrong_prev_ledger(), None);
+    }
+
+    // --- T17: ValidationsTrie wiring into wrong-prev-ledger detection ---
+
+    fn validation_for(node_id: NodeId, ledger_hash: Hash256, ledger_seq: u32) -> Validation {
+        // Recover the synthetic test public key matching `node_id`. We
+        // tried each `id` byte 0..=255 because the test helper `node(id)`
+        // derives via `from_public_key(test_pk(id))`. Falling back to an
+        // empty key keeps unrelated callers compiling but will fail the
+        // C3 binding check (intentional — test_node_id_mismatch_rejected
+        // exercises that path).
+        let public_key = (0u8..=255)
+            .find(|id| node(*id) == node_id)
+            .map(test_pk)
+            .unwrap_or_default();
+        Validation {
+            node_id,
+            public_key,
+            ledger_hash,
+            ledger_seq,
+            full: true,
+            close_time: 100,
+            sign_time: 100,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn check_wrong_prev_ledger_none_when_trie_and_proposals_empty() {
+        // 5-node UNL, no proposals, no validations recorded -> None.
+        let unl = make_unl(&[1, 2, 3, 4, 5]);
+        let adapter = SimpleAdapter;
+        let engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+
+        assert_eq!(engine.check_wrong_prev_ledger(), None);
+    }
+
+    #[test]
+    fn check_wrong_prev_ledger_via_validations_trie_supermajority() {
+        // 5-node UNL. 4 trusted validators record validations for a hash
+        // that is NOT our prev_ledger. 4/5 = 80% >= 60% threshold.
+        // Detection must come from the validations trie even though no
+        // peer proposals have been received this round.
+        let unl = make_unl(&[1, 2, 3, 4, 5]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+
+        let preferred = Hash256::new([0xCC; 32]);
+        for n in 2u8..=5 {
+            assert!(engine.record_trusted_validation(validation_for(node(n), preferred, 0)));
+        }
+
+        let detected = engine.check_wrong_prev_ledger().expect("must trigger");
+        assert_eq!(detected.preferred_ledger, preferred);
+        assert_eq!(detected.peer_count, 4);
+        assert_eq!(detected.total_trusted, 5);
+    }
+
+    #[test]
+    fn check_wrong_prev_ledger_validations_trie_agrees_with_us_returns_none() {
+        // 3-node UNL. All trusted validators validated OUR prev_ledger.
+        // No peer proposals. The trie's preferred branch == prev_ledger,
+        // so neither stage fires.
+        let unl = make_unl(&[1, 2, 3]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        let our_prev = Hash256::new([0xAA; 32]);
+        engine.start_round(our_prev, 1);
+
+        for n in 2u8..=3 {
+            engine.record_trusted_validation(validation_for(node(n), our_prev, 0));
+        }
+
+        assert_eq!(engine.check_wrong_prev_ledger(), None);
+    }
+
+    #[test]
+    fn check_wrong_prev_ledger_validations_trie_below_threshold_falls_through() {
+        // 5-node UNL. Only 1 trusted validation for an alternative
+        // (1/5 = 20% < 60%). With no proposal-derived disagreement
+        // either, detection must return None — the trie path doesn't
+        // promote a minority hash.
+        let unl = make_unl(&[1, 2, 3, 4, 5]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+
+        let alt = Hash256::new([0xDD; 32]);
+        engine.record_trusted_validation(validation_for(node(2), alt, 0));
+
+        assert_eq!(engine.check_wrong_prev_ledger(), None);
+    }
+
+    #[test]
+    fn record_trusted_validation_ignores_untrusted_node() {
+        // Node 99 is not in the UNL. record_trusted_validation must
+        // return false and the trie must remain empty.
+        let unl = make_unl(&[1, 2, 3]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+
+        let alt = Hash256::new([0xEE; 32]);
+        assert!(!engine.record_trusted_validation(validation_for(node(99), alt, 0)));
+        assert_eq!(engine.validations_trie().count_for(&alt), 0);
+    }
+
+    #[test]
+    fn record_trusted_validation_rejects_node_id_public_key_mismatch() {
+        // Audit pass 2 C3: a validation whose node_id does NOT derive
+        // from its public_key must be rejected, even when the node is
+        // trusted — otherwise a forged validation can be attributed to
+        // any UNL member by lying about the node_id field.
+        let unl = make_unl(&[1, 2]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        engine.add_trusted_validator(node(2));
+
+        let alt = Hash256::new([0x55; 32]);
+        // Build a validation that *claims* to be from node(2) but
+        // carries a public_key for node(3). The binding check must
+        // reject it before it touches the trie.
+        let mut forged = validation_for(node(2), alt, 0);
+        forged.public_key = test_pk(3);
+
+        assert!(
+            !engine.record_trusted_validation(forged),
+            "node_id/public_key mismatch must be rejected"
+        );
+        assert_eq!(
+            engine.validations_trie().count_for(&alt),
+            0,
+            "forged vote must not enter the trie"
+        );
+
+        // A validation with an empty public_key is also rejected
+        // (the empty-key digest does not match any node(n)).
+        let mut empty_key = validation_for(node(2), alt, 0);
+        empty_key.public_key = vec![];
+        assert!(
+            !engine.record_trusted_validation(empty_key),
+            "empty public_key must be rejected"
+        );
+        assert_eq!(engine.validations_trie().count_for(&alt), 0);
+    }
+
+    #[test]
+    fn add_then_remove_trusted_validator_flows_through_trie() {
+        // Solo-mode engine (empty UNL). Enrol node 7 via the new
+        // add_trusted_validator helper, record a validation, then remove
+        // the node — its contribution must be decremented out.
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new(adapter, node(1), ConsensusParams::default());
+
+        let alt = Hash256::new([0x77; 32]);
+        // Pre-enrolment: validation is dropped.
+        assert!(!engine.record_trusted_validation(validation_for(node(7), alt, 0)));
+
+        engine.add_trusted_validator(node(7));
+        assert!(engine.record_trusted_validation(validation_for(node(7), alt, 0)));
+        assert_eq!(engine.validations_trie().count_for(&alt), 1);
+
+        engine.remove_trusted_validator(&node(7));
+        assert_eq!(engine.validations_trie().count_for(&alt), 0);
     }
 
     // --- Adaptive close-time resolution tests ---
@@ -1648,156 +2452,762 @@ mod tests {
 
     #[test]
     fn solo_rounds_count_as_agreement() {
+        // Solo mode (no peers) treats every round as agreement, so the
+        // rippled `getNextLedgerTimeResolution` cadence steps one bin
+        // finer at every multiple of `INCREASE_LEDGER_TIME_RESOLUTION_EVERY`
+        // (= 8).  Starting at the default 30s bin (index 2), the first
+        // tightening fires when `start_round` is called with seq == 8.
         let adapter = SimpleAdapter;
         let mut engine = ConsensusEngine::new(adapter, node(1), ConsensusParams::default());
 
-        // Run 5 solo rounds (each counts as agreement)
-        for seq in 1..=5 {
+        for seq in 1..=8 {
             engine.start_round(Hash256::ZERO, seq);
             let set = TxSet::new(vec![]);
             engine.close_ledger(set, 100, seq).unwrap();
             engine.converge();
         }
 
-        // After 5 agreements, resolution should halve: 30 -> 15
-        assert_eq!(engine.close_time_resolution(), 15);
+        // 8 agreed rounds: at seq == 8 the modulo gate fires and the
+        // bin steps from 30s (index 2) to 20s (index 1) — one bin
+        // finer, matching rippled.
+        assert_eq!(engine.close_time_resolution(), 20);
     }
 
     #[test]
     fn close_time_agreement_tightens_resolution() {
+        // Run 8 consecutive rounds where the peer agrees on the
+        // close-time bucket (spread of 0 ≤ resolution).  The first 7
+        // are no-ops at the bin level — only the call to `start_round`
+        // for seq == 8 (multiple of the rippled
+        // `INCREASE_LEDGER_TIME_RESOLUTION_EVERY = 8` cadence) triggers
+        // a step finer.  Starting at 30s (index 2) the bin moves to
+        // 20s (index 1).
         let adapter = SimpleAdapter;
         let node_a = node(0xA0);
         let node_b = node(0xB0);
         let mut engine = ConsensusEngine::new(adapter, node_a, ConsensusParams::default());
 
-        // Run 5 rounds where all peers agree on close time (within resolution)
-        for seq in 1..=5u32 {
+        for seq in 1..=8u32 {
             engine.start_round(Hash256::ZERO, seq);
             let set = TxSet::new(vec![]);
             engine.close_ledger(set.clone(), 100, seq).unwrap();
 
             // Peer proposes same close time
-            engine.peer_proposal(Proposal {
-                node_id: node_b,
-                public_key: vec![0x02; 33],
-                tx_set_hash: set.hash,
-                close_time: 100,
-                prop_seq: 0,
-                ledger_seq: seq,
-                prev_ledger: Hash256::ZERO,
-                signature: None,
-            });
+            engine.peer_proposal_at(
+                Proposal {
+                    node_id: node_b,
+                    public_key: vec![0x02; 33],
+                    tx_set_hash: set.hash,
+                    close_time: 100,
+                    prop_seq: 0,
+                    ledger_seq: seq,
+                    prev_ledger: Hash256::ZERO,
+                    signature: None,
+                },
+                100,
+            );
 
             engine.converge();
         }
 
-        // 5 agreements -> resolution halved from 30 to 15
-        assert_eq!(engine.close_time_resolution(), 15);
+        // 8 agreed rounds -> bin stepped one finer: 30s -> 20s.
+        assert_eq!(engine.close_time_resolution(), 20);
     }
 
     #[test]
     fn close_time_disagreement_loosens_resolution() {
+        // The rippled `getNextLedgerTimeResolution` cadence widens the
+        // bin on disagreement at every multiple of
+        // `DECREASE_LEDGER_TIME_RESOLUTION_EVERY = 1`, i.e. on the very
+        // next `start_round` after the disagreement is observed.
+        // Default starts at 30s; one disagreed round followed by a
+        // fresh start_round steps the bin one COARSER to 60s.
         let adapter = SimpleAdapter;
         let node_a = node(0xA0);
         let node_b = node(0xB0);
         let mut engine = ConsensusEngine::new(adapter, node_a, ConsensusParams::default());
 
-        // First: tighten by running 5 agreeing rounds
-        for seq in 1..=5u32 {
-            engine.start_round(Hash256::ZERO, seq);
-            let set = TxSet::new(vec![]);
-            engine.close_ledger(set.clone(), 100, seq).unwrap();
-            engine.peer_proposal(Proposal {
+        // Round 1: peers disagree (spread of 100 > 30s resolution).
+        // `accept` records `previous_close_agreed = false`.
+        engine.start_round(Hash256::ZERO, 1);
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
+        engine.peer_proposal_at(
+            Proposal {
                 node_id: node_b,
                 public_key: vec![0x02; 33],
                 tx_set_hash: set.hash,
-                close_time: 100,
+                close_time: 200, // spread of 100 > 30
                 prop_seq: 0,
-                ledger_seq: seq,
+                ledger_seq: 1,
                 prev_ledger: Hash256::ZERO,
                 signature: None,
-            });
-            engine.converge();
-        }
-        assert_eq!(engine.close_time_resolution(), 15);
-
-        // Now: disagreement (spread > 15)
-        engine.start_round(Hash256::ZERO, 6);
-        let set = TxSet::new(vec![]);
-        engine.close_ledger(set.clone(), 100, 6).unwrap();
-        engine.peer_proposal(Proposal {
-            node_id: node_b,
-            public_key: vec![0x02; 33],
-            tx_set_hash: set.hash,
-            close_time: 200, // spread of 100 > 15
-            prop_seq: 0,
-            ledger_seq: 6,
-            prev_ledger: Hash256::ZERO,
-            signature: None,
-        });
+            },
+            200,
+        );
         engine.converge();
-
-        // Resolution doubled from 15 to 30
+        // The disagreement flag is set, but the bin step happens on
+        // the NEXT `start_round` (rippled recomputes resolution at the
+        // top of each round, not in `accept`).
+        assert_eq!(engine.accepted_close_flags(), 1);
         assert_eq!(engine.close_time_resolution(), 30);
+
+        // Round 2: `start_round` calls
+        // `next_resolution(30, false, 2)` → 60 (one bin coarser).
+        engine.start_round(Hash256::ZERO, 2);
+        assert_eq!(engine.close_time_resolution(), 60);
     }
 
     #[test]
     fn adaptive_resolution_used_for_rounding() {
+        // Verify that once the bin steps finer through the rippled
+        // cadence, downstream close-time rounding uses the NEW bin
+        // (not the params-default).  Run 8 agreed solo rounds to
+        // step from 30s -> 20s, then submit a round whose proposals
+        // straddle a 20s boundary and check the accepted close time.
         let adapter = SimpleAdapter;
         let node_a = node(0xA0);
         let node_b = node(0xB0);
+        let mut engine = ConsensusEngine::new(adapter, node_a, ConsensusParams::default());
 
-        // Use custom params with resolution 10 for easier testing
-        let params = ConsensusParams {
-            close_time_resolution: 10,
-            ..ConsensusParams::default()
-        };
-        let mut engine = ConsensusEngine::new(adapter, node_a, params);
-
-        // Run 5 solo rounds to halve resolution: 10 -> 5
-        for seq in 1..=5 {
+        for seq in 1..=8 {
             engine.start_round(Hash256::ZERO, seq);
             let set = TxSet::new(vec![]);
             engine.close_ledger(set, 100, seq).unwrap();
             engine.converge();
         }
-        assert_eq!(engine.close_time_resolution(), 5);
+        assert_eq!(engine.close_time_resolution(), 20);
 
-        // Now verify that close time rounding uses the new resolution
-        engine.start_round(Hash256::ZERO, 6);
+        // Round 9: peer proposes a close_time within the 20s bin so
+        // the round still counts as agreement.  Both 100 and 105 round
+        // to bucket 100 at resolution 20 ((100+10)/20*20 = 100,
+        // (105+10)/20*20 = 100), giving an unambiguous winner.
+        engine.start_round(Hash256::ZERO, 9);
         let set = TxSet::new(vec![]);
-        engine.close_ledger(set.clone(), 97, 6).unwrap();
-        engine.peer_proposal(Proposal {
-            node_id: node_b,
-            public_key: vec![0x02; 33],
-            tx_set_hash: set.hash,
-            close_time: 103,
-            prop_seq: 0,
-            ledger_seq: 6,
-            prev_ledger: Hash256::ZERO,
-            signature: None,
-        });
+        engine.close_ledger(set.clone(), 100, 9).unwrap();
+        engine.peer_proposal_at(
+            Proposal {
+                node_id: node_b,
+                public_key: vec![0x02; 33],
+                tx_set_hash: set.hash,
+                close_time: 105,
+                prop_seq: 0,
+                ledger_seq: 9,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            },
+            105,
+        );
         engine.converge();
 
-        // Median of [97, 103] = 103 (index 1 of 2)
-        // Rounded to resolution 5: (103 + 2) / 5 * 5 = 105
-        assert_eq!(engine.accepted_close_time(), Some(105));
+        // Both proposals round to bucket 100 at resolution 20 → winner is 100.
+        assert_eq!(engine.accepted_close_time(), Some(100));
     }
 
     #[test]
     fn adaptive_resolution_getter_reflects_state() {
+        // The engine drives `AdaptiveCloseTime` exclusively through
+        // `set_resolution` now (T03), so the legacy
+        // `consecutive_agreements` counter stays at 0.  The visible
+        // state to assert is `resolution()`: stable at the default 30s
+        // bin until the modulo cadence fires at seq == 8.
         let adapter = SimpleAdapter;
         let mut engine = ConsensusEngine::new(adapter, node(1), ConsensusParams::default());
 
         assert_eq!(engine.adaptive_close_time().resolution(), 30);
-        assert_eq!(engine.adaptive_close_time().consecutive_agreements(), 0);
 
-        // One solo round
+        // Seq 1: agreement (solo) but seq % 8 != 0 → resolution holds.
         engine.start_round(Hash256::ZERO, 1);
         let set = TxSet::new(vec![]);
         engine.close_ledger(set, 100, 1).unwrap();
         engine.converge();
+        assert_eq!(engine.adaptive_close_time().resolution(), 30);
 
-        assert_eq!(engine.adaptive_close_time().consecutive_agreements(), 1);
+        // Walk to seq == 8 — the cadence fires and the bin tightens.
+        for seq in 2..=8 {
+            engine.start_round(Hash256::ZERO, seq);
+            let set = TxSet::new(vec![]);
+            engine.close_ledger(set, 100, seq).unwrap();
+            engine.converge();
+        }
+        assert_eq!(engine.adaptive_close_time().resolution(), 20);
+    }
+
+    #[test]
+    fn monotonic_close_time_across_rounds() {
+        // Verifies that `eff_close_time` is wired into the establish-phase
+        // aggregation: when a round closes with a `close_time` that would
+        // round to <= `prior_close_time`, the engine's accepted close time
+        // is clamped to `prior_close_time + 1` (rippled `effCloseTime`
+        // monotonicity guarantee).
+        let mut engine = test_engine();
+
+        // Round 1: parent close_time = 100. Our raw close_time = 50 would
+        // round to 60 at the default 30s resolution, but the clamp pushes
+        // it to 101.
+        engine.start_round_with_prior(Hash256::ZERO, 1, 100);
+        engine
+            .close_ledger(TxSet::new(vec![]), 50, 1)
+            .unwrap();
+        assert!(engine.converge());
+        let ct1 = engine.accepted_close_time().expect("round 1 close time");
+        assert!(
+            ct1 >= 101,
+            "round 1 close_time {} should be >= prior+1 (101)",
+            ct1
+        );
+
+        // Round 2: parent close_time = ct1 (>= 101). Same raw close_time
+        // 50, must clamp to >= ct1 + 1 (>= 102), demonstrating monotonicity
+        // across rounds.
+        engine.start_round_with_prior(Hash256::ZERO, 2, ct1);
+        engine
+            .close_ledger(TxSet::new(vec![]), 50, 2)
+            .unwrap();
+        assert!(engine.converge());
+        let ct2 = engine.accepted_close_time().expect("round 2 close time");
+        assert!(
+            ct2 >= ct1 + 1,
+            "round 2 close_time {} should be strictly greater than round 1 ({})",
+            ct2,
+            ct1
+        );
+    }
+
+    // --- H11: peer close_time votes are FILTERED, not clamped ---
+
+    /// Two adversarial peers send close_time = 1 and close_time = 2,
+    /// way below `prior_close_time + 1 = 1_000_001`. The pre-fix code
+    /// applied `eff_close_time` to each peer vote, which clamped both
+    /// to `prior + 1 = 1_000_001` and counted them as TWO votes for
+    /// the same floor bucket — manufactured majority, forcing our own
+    /// fresh close_time bucket to lose. The fix FILTERS those votes
+    /// out before bucketing, so our honest fresh vote wins.
+    #[test]
+    fn h11_adversarial_low_close_times_dont_manufacture_agreement() {
+        let prior = 1_000_000u32;
+        let our_time = prior + 5; // fresh, well above the floor
+        let mut engine = test_engine();
+        engine.start_round_with_prior(Hash256::ZERO, 1, prior);
+        engine
+            .close_ledger(TxSet::new(vec![]), our_time, 1)
+            .unwrap();
+
+        // Manually inject two adversarial peer positions with garbage
+        // close_times (below `prior + 1`). Bypassing peer_proposal_at
+        // sidesteps the freshness gate, which would otherwise reject
+        // these proposals before they ever reach the bucket logic — the
+        // freshness gate is a separate defense; H11 is specifically
+        // about what happens when garbage *does* reach the bucket logic
+        // (e.g. from a future code path that bypasses freshness, or from
+        // adversarial peers exploiting clock skew).
+        let our_set_hash = engine.our_set().unwrap().hash;
+        engine.peer_positions.insert(
+            node(2),
+            Proposal {
+                node_id: node(2),
+                public_key: vec![0x02; 33],
+                tx_set_hash: our_set_hash,
+                close_time: 1,
+                prop_seq: 0,
+                ledger_seq: 1,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            },
+        );
+        engine.peer_positions.insert(
+            node(3),
+            Proposal {
+                node_id: node(3),
+                public_key: vec![0x02; 33],
+                tx_set_hash: our_set_hash,
+                close_time: 2,
+                prop_seq: 0,
+                ledger_seq: 1,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            },
+        );
+
+        let ct = engine.effective_close_time();
+        // The accepted close_time MUST come from our honest fresh vote
+        // (rounded to the 30s bucket), then clamped to >= prior + 1.
+        // It MUST NOT collapse to the floor bucket (prior + 1) by way
+        // of two adversarial votes that pre-fix were silently rewritten.
+        let our_rounded = round_close_time(our_time, 30);
+        let expected = eff_close_time(our_rounded, 30, prior);
+        assert_eq!(
+            ct, expected,
+            "expected our honest bucket {} (eff = {}), got {} — adversarial peers manufactured agreement",
+            our_rounded, expected, ct
+        );
+        // Belt-and-braces: the floor bucket prior+1 = 1_000_001 should
+        // NOT win, since no honest voter put their vote there.
+        assert_ne!(
+            ct,
+            prior + 1,
+            "close_time collapsed to the monotonicity floor — bucket clamping resurfaced"
+        );
+    }
+
+    /// `align_close_time_with_peers` must apply the same filter so
+    /// adversarial low close_times can't force a strict-majority
+    /// realignment of our position.
+    #[test]
+    fn h11_align_does_not_realign_to_floor_from_adversarial_votes() {
+        let prior = 1_000_000u32;
+        let our_time = prior + 35; // would round to a different bucket than floor
+        let mut engine = test_engine();
+        engine.start_round_with_prior(Hash256::ZERO, 1, prior);
+        engine
+            .close_ledger(TxSet::new(vec![]), our_time, 1)
+            .unwrap();
+        let our_set_hash = engine.our_set().unwrap().hash;
+
+        // Three adversarial peers all sending garbage close_times.
+        let adversarial: [(u8, u32); 3] = [(2, 0), (3, 1), (4, 2)];
+        for (i, ct) in adversarial {
+            engine.peer_positions.insert(
+                node(i),
+                Proposal {
+                    node_id: node(i),
+                    public_key: vec![0x02; 33],
+                    tx_set_hash: our_set_hash,
+                    close_time: ct,
+                    prop_seq: 0,
+                    ledger_seq: 1,
+                    prev_ledger: Hash256::ZERO,
+                    signature: None,
+                },
+            );
+        }
+
+        let our_pos_before = engine.our_position.as_ref().unwrap().close_time;
+        engine.align_close_time_with_peers();
+        let our_pos_after = engine.our_position.as_ref().unwrap().close_time;
+        // No realignment must have occurred: adversarial votes were
+        // filtered out, leaving only our own bucket — which doesn't
+        // have a strict majority of the (us + peers) cohort.
+        assert_eq!(
+            our_pos_before, our_pos_after,
+            "align_close_time_with_peers realigned us to a manufactured majority bucket"
+        );
+    }
+
+    // --- T14: proposal freshness (propRELAY_INTERVAL) tests ---
+
+    fn freshness_engine() -> ConsensusEngine<SimpleAdapter> {
+        // 2-node UNL with us=node(1), peer=node(2). Drives the engine into
+        // Establish phase via close_ledger so peer_proposal_at exercises the
+        // freshness gate (it short-circuits in non-Establish phases).
+        let unl = make_unl(&[1, 2]);
+        let mut engine = ConsensusEngine::new_with_unl(
+            SimpleAdapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set, 1_000_000, 1).unwrap();
+        engine
+    }
+
+    #[test]
+    fn fresh_proposal_accepted() {
+        let mut engine = freshness_engine();
+        let now = 1_000_000u32;
+        let our_set_hash = engine.our_set().unwrap().hash;
+        let p = Proposal {
+            node_id: node(2),
+            public_key: vec![0x02; 33],
+            tx_set_hash: our_set_hash,
+            close_time: now, // delta = 0 < PROPOSAL_FRESHNESS_SECS
+            prop_seq: 0,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(p, now);
+        assert_eq!(engine.proposal_dropped_stale_total(), 0);
+        assert_eq!(engine.peer_positions.len(), 1);
+    }
+
+    #[test]
+    fn stale_proposal_rejected_increments_counter() {
+        let mut engine = freshness_engine();
+        let now = 1_000_000u32;
+        let our_set_hash = engine.our_set().unwrap().hash;
+        let stale = Proposal {
+            node_id: node(2),
+            public_key: vec![0x02; 33],
+            tx_set_hash: our_set_hash,
+            close_time: now - 100, // delta = 100 > 30
+            prop_seq: 0,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(stale, now);
+        assert_eq!(engine.proposal_dropped_stale_total(), 1);
+        assert!(engine.peer_positions.is_empty());
+    }
+
+    #[test]
+    fn future_proposal_rejected_increments_counter() {
+        let mut engine = freshness_engine();
+        let now = 1_000_000u32;
+        let our_set_hash = engine.our_set().unwrap().hash;
+
+        // First feed a stale proposal so we can verify the counter
+        // accumulates across calls (== 2 after this test, per spec).
+        let stale = Proposal {
+            node_id: node(2),
+            public_key: vec![0x02; 33],
+            tx_set_hash: our_set_hash,
+            close_time: now - 100,
+            prop_seq: 0,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(stale, now);
+        assert_eq!(engine.proposal_dropped_stale_total(), 1);
+
+        let future = Proposal {
+            node_id: node(2),
+            public_key: vec![0x02; 33],
+            tx_set_hash: our_set_hash,
+            close_time: now + 100, // delta = 100 > 30
+            prop_seq: 0,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(future, now);
+        assert_eq!(engine.proposal_dropped_stale_total(), 2);
+        assert!(engine.peer_positions.is_empty());
+    }
+
+    // --- Audit pass 2 C2: pending_proposals gating in Open phase ---
+
+    /// Engine in Open phase (no `close_ledger` so phase != Establish), with
+    /// a 2-node UNL trusting nodes 1 and 2. Used to exercise the
+    /// pre-Establish UNL/freshness/cap gates on `pending_proposals`.
+    fn open_phase_engine() -> ConsensusEngine<SimpleAdapter> {
+        let unl = make_unl(&[1, 2]);
+        let mut engine = ConsensusEngine::new_with_unl(
+            SimpleAdapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+        debug_assert_eq!(engine.phase(), ConsensusPhase::Open);
+        engine
+    }
+
+    #[test]
+    fn pending_proposals_drops_untrusted_in_open_phase() {
+        // Audit pass 2 C2: an untrusted peer must not be able to push into
+        // pending_proposals during Open phase. Without the gate this is the
+        // primary memory-amplification vector.
+        let mut engine = open_phase_engine();
+        let now = 1_000_000u32;
+        let p = Proposal {
+            node_id: node(99), // not in UNL
+            public_key: vec![0x02; 33],
+            tx_set_hash: Hash256::ZERO,
+            close_time: now,
+            prop_seq: 0,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(p, now);
+        assert!(engine.pending_proposals.is_empty());
+    }
+
+    #[test]
+    fn pending_proposals_drops_stale_in_open_phase_and_bumps_counter() {
+        // Audit pass 2 C2: a trusted but stale-time proposal must be
+        // counted and dropped, never buffered. Mirrors the Establish-phase
+        // freshness gate.
+        let mut engine = open_phase_engine();
+        let now = 1_000_000u32;
+        let stale = Proposal {
+            node_id: node(2), // trusted
+            public_key: vec![0x02; 33],
+            tx_set_hash: Hash256::ZERO,
+            close_time: now - 100, // delta = 100 > PROPOSAL_FRESHNESS_SECS
+            prop_seq: 0,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(stale, now);
+        assert_eq!(engine.proposal_dropped_stale_total(), 1);
+        assert!(engine.pending_proposals.is_empty());
+    }
+
+    #[test]
+    fn pending_proposals_capped_in_open_phase() {
+        // Audit pass 2 C2: even when every proposal passes UNL + freshness,
+        // pending_proposals must be capped at PENDING_PROPOSALS_MAX so a
+        // trusted peer (or compromised key) cannot exhaust memory.
+        let mut engine = open_phase_engine();
+        let now = 1_000_000u32;
+        for i in 0..PENDING_PROPOSALS_MAX {
+            let p = Proposal {
+                node_id: node(2),
+                public_key: vec![0x02; 33],
+                tx_set_hash: Hash256::ZERO,
+                close_time: now,
+                prop_seq: i as u32,
+                ledger_seq: 1,
+                prev_ledger: Hash256::ZERO,
+                signature: None,
+            };
+            engine.peer_proposal_at(p, now);
+        }
+        assert_eq!(engine.pending_proposals.len(), PENDING_PROPOSALS_MAX);
+
+        // The 1025th proposal must be dropped, not buffered.
+        let overflow = Proposal {
+            node_id: node(2),
+            public_key: vec![0x02; 33],
+            tx_set_hash: Hash256::ZERO,
+            close_time: now,
+            prop_seq: PENDING_PROPOSALS_MAX as u32,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(overflow, now);
+        assert_eq!(engine.pending_proposals.len(), PENDING_PROPOSALS_MAX);
+    }
+
+    // --- T19: ProposalTracker dedup tests ---
+
+    /// Build a 3-node engine driven into Establish phase, with us=node(1)
+    /// and a single-tx local set so peer proposals against a *different*
+    /// tx_set materialise dispute votes we can assert on.
+    fn dedup_engine(
+        local_set: TxSet,
+        peer_set: TxSet,
+    ) -> ConsensusEngine<MockAdapter> {
+        let unl = make_unl(&[1, 2, 3]);
+        let adapter = MockAdapter::with_tx_sets(vec![local_set.clone(), peer_set]);
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+        engine.close_ledger(local_set, 100, 1).unwrap();
+        engine
+    }
+
+    #[test]
+    fn duplicate_proposal_does_not_bump_dispute_counters() {
+        // Local set has tx1; peer's set is empty so tx1 becomes a dispute
+        // when peer's proposal lands. Re-delivering the identical proposal
+        // must NOT bump the dispute's nay_count for that peer (the
+        // ProposalTracker drops the second call before it reaches
+        // create_disputes).
+        let tx1 = Hash256::new([0x01; 32]);
+        let local_set = TxSet::new(vec![tx1]);
+        let peer_set = TxSet::new(vec![]);
+        let mut engine = dedup_engine(local_set.clone(), peer_set.clone());
+
+        let p = Proposal {
+            node_id: node(2),
+            public_key: vec![0x02; 33],
+            tx_set_hash: peer_set.hash,
+            close_time: 100,
+            prop_seq: 0,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(p.clone(), 100);
+        assert_eq!(engine.peer_positions.len(), 1);
+        let nay_after_first = engine
+            .disputes()
+            .get(&tx1)
+            .expect("dispute should exist after first proposal")
+            .nay_count();
+        assert_eq!(nay_after_first, 1);
+
+        // Replay identical proposal — same node_id, prev_ledger, prop_seq.
+        engine.peer_proposal_at(p, 100);
+
+        // No new dispute created, peer_positions unchanged, vote count
+        // unchanged (insert into HashMap with same key/value would also
+        // be a no-op, but we want to prove create_disputes was skipped).
+        assert_eq!(engine.peer_positions.len(), 1);
+        assert_eq!(engine.disputes().len(), 1);
+        let nay_after_dup = engine.disputes().get(&tx1).unwrap().nay_count();
+        assert_eq!(nay_after_dup, nay_after_first);
+        // ProposalTracker still holds prop_seq=0.
+        assert_eq!(
+            engine
+                .proposal_tracker
+                .get(&node(2), &Hash256::ZERO)
+                .unwrap()
+                .prop_seq,
+            0
+        );
+    }
+
+    #[test]
+    fn lower_prop_seq_proposal_is_rejected() {
+        // First accept prop_seq=5 with peer_set_a (empty). Then re-deliver
+        // the same node with prop_seq=3 but a *different* tx_set: the
+        // ProposalTracker must reject the older seq, leaving peer_positions
+        // pinned to the prop_seq=5 entry.
+        let tx1 = Hash256::new([0x01; 32]);
+        let tx2 = Hash256::new([0x02; 32]);
+        let local_set = TxSet::new(vec![tx1]);
+        let peer_set_a = TxSet::new(vec![]);
+        let peer_set_b = TxSet::new(vec![tx2]);
+
+        let unl = make_unl(&[1, 2, 3]);
+        let adapter = MockAdapter::with_tx_sets(vec![
+            local_set.clone(),
+            peer_set_a.clone(),
+            peer_set_b.clone(),
+        ]);
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+        engine.close_ledger(local_set, 100, 1).unwrap();
+
+        let high = Proposal {
+            node_id: node(2),
+            public_key: vec![0x02; 33],
+            tx_set_hash: peer_set_a.hash,
+            close_time: 100,
+            prop_seq: 5,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(high, 100);
+        assert_eq!(
+            engine
+                .peer_positions
+                .get(&node(2))
+                .unwrap()
+                .tx_set_hash,
+            peer_set_a.hash
+        );
+
+        // Older prop_seq carrying a different tx_set: rejected silently.
+        let stale = Proposal {
+            node_id: node(2),
+            public_key: vec![0x02; 33],
+            tx_set_hash: peer_set_b.hash,
+            close_time: 100,
+            prop_seq: 3,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(stale, 100);
+
+        // Stored position must still be the prop_seq=5 / peer_set_a entry.
+        let stored = engine.peer_positions.get(&node(2)).unwrap();
+        assert_eq!(stored.prop_seq, 5);
+        assert_eq!(stored.tx_set_hash, peer_set_a.hash);
+        assert_eq!(
+            engine
+                .proposal_tracker
+                .get(&node(2), &Hash256::ZERO)
+                .unwrap()
+                .prop_seq,
+            5
+        );
+    }
+
+    #[test]
+    fn higher_prop_seq_proposal_replaces_existing() {
+        // First accept prop_seq=0 with peer_set_a. Then deliver prop_seq=1
+        // with peer_set_b — ProposalTracker must accept and the engine's
+        // peer_positions entry must rotate to reflect the new tx_set.
+        let tx1 = Hash256::new([0x01; 32]);
+        let tx2 = Hash256::new([0x02; 32]);
+        let local_set = TxSet::new(vec![tx1]);
+        let peer_set_a = TxSet::new(vec![]);
+        let peer_set_b = TxSet::new(vec![tx2]);
+
+        let unl = make_unl(&[1, 2, 3]);
+        let adapter = MockAdapter::with_tx_sets(vec![
+            local_set.clone(),
+            peer_set_a.clone(),
+            peer_set_b.clone(),
+        ]);
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+        engine.close_ledger(local_set, 100, 1).unwrap();
+
+        let first = Proposal {
+            node_id: node(2),
+            public_key: vec![0x02; 33],
+            tx_set_hash: peer_set_a.hash,
+            close_time: 100,
+            prop_seq: 0,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(first, 100);
+        assert_eq!(
+            engine
+                .peer_positions
+                .get(&node(2))
+                .unwrap()
+                .prop_seq,
+            0
+        );
+
+        let updated = Proposal {
+            node_id: node(2),
+            public_key: vec![0x02; 33],
+            tx_set_hash: peer_set_b.hash,
+            close_time: 100,
+            prop_seq: 1,
+            ledger_seq: 1,
+            prev_ledger: Hash256::ZERO,
+            signature: None,
+        };
+        engine.peer_proposal_at(updated, 100);
+
+        let stored = engine.peer_positions.get(&node(2)).unwrap();
+        assert_eq!(stored.prop_seq, 1);
+        assert_eq!(stored.tx_set_hash, peer_set_b.hash);
+        assert_eq!(
+            engine
+                .proposal_tracker
+                .get(&node(2), &Hash256::ZERO)
+                .unwrap()
+                .prop_seq,
+            1
+        );
     }
 }
