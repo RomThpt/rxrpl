@@ -1127,7 +1127,30 @@ impl Node {
                                     let l = ledger.read().await;
                                     let prev_hash = l.header.parent_hash;
                                     let seq = l.header.sequence;
+                                    drop(l);
 
+                                    // Yield-to-peer-leader: if any observed peer is on a later
+                                    // sequence, do NOT close our own ledger — wait for catchup
+                                    // (proposal-driven holding-pen → GetLedger → reconstruct).
+                                    // Without this, two fresh nodes chase each other indefinitely
+                                    // ("Got proposal for X but we are on Y" reject loop on rippled).
+                                    if max_peer_seq > seq {
+                                        tracing::debug!(
+                                            "yielding close: peer at seq {} > our open seq {}",
+                                            max_peer_seq, seq
+                                        );
+                                        // Reset the open-phase timer so we don't immediately
+                                        // re-fire CloseLedger on next tick.
+                                        timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
+                                        // Trigger catchup explicitly.
+                                        let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
+                                            seq,
+                                            hash: None,
+                                        });
+                                        continue;
+                                    }
+
+                                    let l = ledger.read().await;
                                     let mut tx_hashes = Vec::new();
                                     l.tx_map.for_each(&mut |tx_hash, _data| {
                                         tx_hashes.push(*tx_hash);
