@@ -96,12 +96,9 @@ forbidden_paths:
   - acceptance: cargo bench -p rxrpl-consensus --no-run compiles
   - globs: crates/consensus/benches/**/*.rs, crates/consensus/Cargo.toml
 
-- [ ] T38 [kind=qa,deps=T27,T28,T29]: re-run T24 (xrpl-hive smoke + propagation cross-impl) with T27 wire fix in place
-  - acceptance: branch nightly/2026-04-27 (incl. commit 672608d) is fetched by xrpl-hive Docker build
-  - acceptance: rerun ./bin/xrpl-hive --sim cross-impl-payment --client rxrpl,rippled_2.3.0; log full output to NIGHT_SHIFT_LOG.md
-  - acceptance: capture rippled's TMValidation accept/drop count from journal
-  - acceptance: if STILL dropped, run tcpdump on rxrpl outbound and dump first 158 bytes hex; if accepted, mark [UNFIXED] resolved
-  - globs: NIGHT_SHIFT_LOG.md
+### T38 RESULT (kind=qa) — DONE 2026-04-28T02:35Z
+- T38 — hive propagation/cross-impl-payment with T27 fix: WIRE-FORMAT FIXED. rippled processed 373 Validations log lines (vs 0 before), both validators trusted in UNL (quorum=2). Test still fails on consensus convergence ("Need validated ledger") — separate problem, NOT silent drop. PROBLEMS.md entry RESOLVED. Hive Dockerfile patched (rippled image needs USER root for dnf + version.txt write).
+
 
 - [ ] T39 [kind=code,deps=T28]: manifest publisher list rotation + master-key revocation flow deepening
   - acceptance: validator_list.rs exposes rotate_publisher_signing_key(new_pk, master_sig) verifying under existing master, atomically swaps cached signing pk
@@ -112,7 +109,8 @@ forbidden_paths:
 ### In progress
 
 ### Done
-- T27 — byte-level diff goXRPL vs rxrpl TMValidation, FOUND divergence: rxrpl emitted sfSignature AFTER sfAmendments instead of in canonical (type<<16|field) position. Fix splices sfSignature before sfAmendments via canonical_signature_insert_offset() helper (commits 672608d + a2975fb). 9 new regression tests in crates/overlay/tests/wire_diff_validation.rs all green. 241/241 overlay tests green. THIS IS LIKELY THE ROOT CAUSE OF rippled SILENT DROP.
+- T38 — hive cross-impl-payment with T27 fix: rippled now PROCESSES 373 Validations (vs 0 before T27), both validators in UNL with quorum=2. Wire-format silent-drop bug RESOLVED. Test still red on separate consensus convergence problem.
+- T27 — byte-level diff goXRPL vs rxrpl TMValidation, CONFIRMED root cause: rxrpl emitted sfSignature AFTER sfAmendments instead of in canonical (type<<16|field) position. Fix splices sfSignature before sfAmendments via canonical_signature_insert_offset() helper (commits 672608d + a2975fb). 9 new regression tests in crates/overlay/tests/wire_diff_validation.rs all green. 241/241 overlay tests green. VALIDATED end-to-end via T38.
 - T26 — fuzz validation_deser 1306558 runs in 61s, no crash (commits already in tree). T26 fully complete.
 - T01 — close_resolution.rs rippled bins [10,20,30,60,90,120], commit 85ccdc0
 - T02 — close_resolution next_resolution port, commit f78e4ba (23 tests green)

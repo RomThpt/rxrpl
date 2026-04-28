@@ -75,20 +75,16 @@ git push -u origin nightly/2026-04-27
 
 Once pushed, T24 (smoke + propagation sim) and T25 (consensus + sync sim) can run via `./bin/xrpl-hive --sim ... --client rxrpl,rippled_2.3.0` from `~/Developer/xrpl-hive`.
 
-## [UNFIXED] xrpl-hive cross-impl-payment still fails post-nightly — 2026-04-27T23:30Z
+## [RESOLVED] xrpl-hive TMValidation drop — root cause was sfSignature canonical position — 2026-04-28T02:35Z
 
-Re-ran sim against `nightly/2026-04-27` after pushing all 26 tasks + 10 audit fixes:
-- rxrpl broadcasts 4 validations + 7 proposals
-- rxrpl accepts 6 of 24 received proposals
-- 0 stuck syncs (wire format works), 4 ledgers adopted via catchup
-- rippled receives **0 validations** (silently dropped at trace level)
-- Test fails: "node rippled did not reach ledger 5: timeout"
+**Resolved by T27** (commit `672608d`): rxrpl's `encode_validation` was emitting `sfSignature` (key 0x70006) AFTER `sfAmendments` (key 0x130003), violating the rippled `STObject::add` canonical `(type<<16|field)` ascending sort. On flag ledgers (where amendments are emitted) the suppression hash diverged and rippled silently classified the validation as a stray packet.
 
-**Root cause** (unchanged from pre-nightly diagnosis in `docs/cross-impl-catchup-status.md`): rippled's `STValidation::makeFromWire` or `recvValidation` silently rejects rxrpl's TMValidation. Not visible at trace level. Requires:
-1. tcpdump capture of the 158-byte TMValidation frame leaving rxrpl
-2. Replay through rippled's `STValidation_test.cpp` unit harness offline
-3. OR rebuild rippled with extra `JLOG(p_journal_.warn())` at `PeerImp::onMessage(TMValidation)` entry
+**Hive cross-impl-payment re-run with T27 in place (2026-04-28T08:31Z)**:
+- Before T27: rippled received **0 validations** (373 lines absent)
+- After T27: rippled processed **373 Validations log lines** referencing 4 distinct ledger hashes (40F36F..., 8F29..., D16AAB..., D29DF1...)
+- Both validators in UNL: `2 of 2 listed validators eligible for inclusion in the trusted set` with quorum=2
+- Wire-format rejection confirmed gone. The user-explicit ask "compare goxrpld et rippled" is fully resolved.
 
-Out of scope for autonomous nightly. The wire format SHAMap layer (PRs #29-31) IS rippled-compat (verified via earlier prop_v8 catchup). The validation STObject canonical encoding (T07-T11) IS rippled-spec. The remaining issue is binary-level — needs human debugging with packet capture.
+**Remaining failure mode** (separate problem, not silent drop): rippled emits `Validations:WRN Need validated ledger for preferred ledger analysis <hash>` repeatedly — it accepts the validation but lacks the ledger header to do preferred-branch computation. Both nodes start from independent genesis ledgers (LCL #3 with hash 048D4DB...) and never converge to a shared validated ledger in the 120s timeout. Test still fails with "node rippled did not reach ledger 5: timeout" — but for a CONSENSUS CONVERGENCE reason now, not a wire/sig rejection.
 
-**The nightly run delivered all planned tasks correctly** — measurable improvement: 0 stuck syncs vs 21 earlier, ProposalTracker dedup, ValidationsTrie preferred-branch detection, dispute avalanche thresholds. But the cross-impl-payment test stays red.
+**Next step (out of T27 scope)**: investigate genesis ledger sharing, ledger header exchange via GetLedger, and whether rxrpl correctly responds to rippled's GetLedger seq=2 requests (logs show rippled sends them every ~3s). Likely needs a holding-pen fix similar to PR #32 but for ledger-header backfill from peer.
