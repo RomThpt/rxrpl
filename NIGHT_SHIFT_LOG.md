@@ -23,7 +23,6 @@
 [2026-04-27T16:30:18Z] [orchestrator] phase 4 complete — draft PR #39 opened https://github.com/RomThpt/rxrpl/pull/39
 
 [2026-04-28T00:00:00Z] [night-coder] T27 wire-diff: identified non-canonical sfSignature placement (after sfAmendments) in encode_validation; fix splices sfSignature at canonical (7,6) position; +9 regression tests in tests/wire_diff_validation.rs; cargo test -p rxrpl-overlay green (241 tests).
-<<<<<<< HEAD
 [2026-04-28 02:30:00] [orchestrator] iter — T27 wire-diff DONE, T26 fuzz validation_deser DONE, T24/T25 moved to Blocked
 [2026-04-28 02:30:00] [orchestrator] replenished 12 tasks (cycle 1) — T28-T39
 [2026-04-28 02:35:00] [orchestrator] T38 hive cross-impl-payment RE-RUN with T27 fix: WIRE-FORMAT FIXED (373 Validations vs 0 before, UNL quorum=2). [UNFIXED] → [RESOLVED].
@@ -32,5 +31,6 @@
 [2026-04-28T01:30:00Z] [night-tester] T31 stale-validation replay: +3 integration tests for C1 monotonicity. 237 consensus tests green.
 [2026-04-28T12:20:00Z] [night-coder] T35 ledger_trie review: 3 NIGHT-SHIFT-REVIEW markers resolved via DESIGN justification + 5 new tests. 239 consensus tests green.
 [2026-04-28T12:20:53Z] [night-tester] T33 composite validation fuzz: decode_validation_composite target + 2 corpus seeds. 2,411,346 runs in 61s, no crash.
-[2026-04-28T13:30:00Z] [night-coder] T39 publisher-rotation: extended ValidatorListTracker with publishers HashMap, register_publisher, rotate_publisher_signing_key (HashPrefix::MANIFEST verified), apply_publisher_manifest (drops VLs + tracing::warn on MANIFEST_REVOKED_SEQ); +3 tests + 2 new error variants. 229 lib + 16 integration tests green.
-[2026-04-28T13:35:00Z] [night-tester] T32 pending_proposals cap regression coverage: PENDING_PROPOSALS_MAX=1024 already in engine.rs:38; +2 black-box integration tests (pending_proposals_bounded_during_non_establish, pending_proposals_evicts_stale). Documented integration observability gap in gaps.md. 236 consensus tests green.
+[2026-04-28T13:30:00Z] [night-coder] T39 publisher-rotation: ValidatorListTracker publishers HashMap + rotate_publisher_signing_key + apply_publisher_manifest (revocation drops VLs); +3 tests. 229 lib + 16 integration tests green.
+[2026-04-28T13:35:00Z] [night-tester] T32 pending_proposals cap regression coverage: PENDING_PROPOSALS_MAX=1024 already in engine.rs:38; +2 black-box integration tests. 236 consensus tests green.
+[2026-04-28T13:00:00Z] [night-coder] T34 observability-counters: added 4 AtomicU64 counters with rippled JLOG refs — proposals_held_pending_prev_ledger_total, proposals_dropped_dedup_total, validations_dropped_freshness_total, validations_dropped_stale_total. +5 unit tests. cargo test -p rxrpl-consensus -p rxrpl-overlay green.
