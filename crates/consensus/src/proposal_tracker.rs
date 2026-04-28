@@ -375,6 +375,55 @@ mod tests {
     }
 
     #[test]
+    fn dedup_counter_bumps_on_prop_seq_reject_only() {
+        // T34: proposals_dropped_dedup_total must increment on every
+        // prop_seq monotonicity rejection and ONLY on those. Cap-driven
+        // rejections (per-prev-ledger node cap) must NOT increment it.
+        let mut tracker = ProposalTracker::new();
+        let prev = ledger(0x10);
+
+        // First insert is accepted, counter unchanged.
+        assert!(tracker.track(make_proposal(node(0x01), prev, 5)));
+        assert_eq!(tracker.proposals_dropped_dedup_total(), 0);
+
+        // Equal prop_seq from same node: rejected as duplicate, counter +1.
+        assert!(!tracker.track(make_proposal(node(0x01), prev, 5)));
+        assert_eq!(tracker.proposals_dropped_dedup_total(), 1);
+
+        // Strictly lower prop_seq: rejected as stale, counter +1.
+        assert!(!tracker.track(make_proposal(node(0x01), prev, 3)));
+        assert_eq!(tracker.proposals_dropped_dedup_total(), 2);
+
+        // Strictly higher prop_seq: accepted, counter unchanged.
+        assert!(tracker.track(make_proposal(node(0x01), prev, 6)));
+        assert_eq!(tracker.proposals_dropped_dedup_total(), 2);
+
+        // A different node sharing the same prev_ledger: a NEW entry is
+        // inserted, no dedup happens.
+        assert!(tracker.track(make_proposal(node(0x02), prev, 0)));
+        assert_eq!(tracker.proposals_dropped_dedup_total(), 2);
+
+        // Saturate the per-prev_ledger cap with fresh nodes, then attempt
+        // an overflow node: this is rejected by the CAP rule, NOT the
+        // dedup rule. Counter must remain unchanged.
+        // Two slots already used (nodes 0x01 + 0x02); fill the rest.
+        for i in 2..MAX_PROPOSALS_PER_PREV {
+            let n = node((i + 1) as u8);
+            assert!(tracker.track(make_proposal(n, prev, 0)));
+        }
+        assert_eq!(tracker.count_for(&prev), MAX_PROPOSALS_PER_PREV);
+
+        let dedup_before_cap_drop = tracker.proposals_dropped_dedup_total();
+        let overflow_node = node(0xFF);
+        assert!(!tracker.track(make_proposal(overflow_node, prev, 0)));
+        // Cap rejection MUST NOT bump the dedup counter.
+        assert_eq!(
+            tracker.proposals_dropped_dedup_total(),
+            dedup_before_cap_drop
+        );
+    }
+
+    #[test]
     fn per_prev_cap_is_independent_across_prev_ledgers() {
         // Saturating one prev_ledger does not affect another.
         let mut tracker = ProposalTracker::new();

@@ -1940,6 +1940,42 @@ mod tests {
     }
 
     #[test]
+    fn proposals_held_pending_prev_ledger_counter_bumps_on_hold() {
+        // T34: every time peer_proposal_at routes a proposal into the
+        // future_proposals holding pen because prev_ledger != self.prev_ledger,
+        // the proposals_held_pending_prev_ledger_total counter must increment.
+        let unl = make_unl(&[1, 2, 3]);
+        let adapter = SimpleAdapter;
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+        );
+        engine.start_round(Hash256::ZERO, 1);
+
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
+        assert_eq!(engine.proposals_held_pending_prev_ledger_total(), 0);
+
+        let future_prev_a = Hash256::new([0xA1; 32]);
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, future_prev_a, 2), 100);
+        assert_eq!(engine.proposals_held_pending_prev_ledger_total(), 1);
+
+        // A different peer holding on the same future prev_ledger still
+        // bumps the counter (each held proposal counts).
+        engine.peer_proposal_at(proposal_for(node(3), set.hash, future_prev_a, 2), 100);
+        assert_eq!(engine.proposals_held_pending_prev_ledger_total(), 2);
+
+        // A peer on yet another future prev_ledger also counts.
+        let future_prev_b = Hash256::new([0xB2; 32]);
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, future_prev_b, 2), 100);
+        assert_eq!(engine.proposals_held_pending_prev_ledger_total(), 3);
+
+        // A proposal whose prev_ledger MATCHES our current one is NOT held
+        // and must NOT bump the counter.
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, Hash256::ZERO, 1), 100);
+        assert_eq!(engine.proposals_held_pending_prev_ledger_total(), 3);
+    }
+
+    #[test]
     fn held_proposal_replayed_on_matching_start_round() {
         let unl = make_unl(&[1, 2]);
         let adapter = SimpleAdapter;

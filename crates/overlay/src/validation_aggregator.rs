@@ -619,6 +619,97 @@ mod tests {
     }
 
     #[test]
+    fn freshness_counter_bumps_only_on_freshness_gate() {
+        // T34: validations_dropped_freshness_total must increment when
+        // add_validation_at rejects via the is_current freshness gate, and
+        // it must NOT increment for the trust-filter or signature-verify
+        // gates. It also tracks 1:1 with dropped_stale_total.
+        let mut agg = ValidationAggregator::new(1);
+        assert_eq!(agg.validations_dropped_freshness_total(), 0);
+        assert_eq!(agg.validations_dropped_stale_total(), 0);
+
+        // A fresh validation is accepted; counters stay at 0.
+        let hash_ok = Hash256::new([0x01; 32]);
+        assert!(agg
+            .add_validation_at(make_validation(1, 100, hash_ok), TEST_NOW)
+            .is_some());
+        assert_eq!(agg.validations_dropped_freshness_total(), 0);
+        assert_eq!(agg.validations_dropped_stale_total(), 0);
+
+        // A future-stale validation triggers the freshness gate exactly
+        // once and bumps both counters in lockstep.
+        let hash_future = Hash256::new([0x02; 32]);
+        let mut future_val = make_validation(2, 200, hash_future);
+        future_val.sign_time = TEST_NOW + 10 * 60; // past WALL ceiling
+        assert!(agg.add_validation_at(future_val, TEST_NOW).is_none());
+        assert_eq!(agg.validations_dropped_freshness_total(), 1);
+        assert_eq!(agg.validations_dropped_stale_total(), 1);
+
+        // A past-stale validation: same gate, both counters bump again.
+        let hash_past = Hash256::new([0x03; 32]);
+        let mut past_val = make_validation(3, 201, hash_past);
+        past_val.sign_time = TEST_NOW.saturating_sub(10 * 60);
+        assert!(agg.add_validation_at(past_val, TEST_NOW).is_none());
+        assert_eq!(agg.validations_dropped_freshness_total(), 2);
+        assert_eq!(agg.validations_dropped_stale_total(), 2);
+
+        // Nothing was ever recorded for the stale buckets.
+        assert_eq!(agg.validation_count(200, &hash_future), 0);
+        assert_eq!(agg.validation_count(201, &hash_past), 0);
+    }
+
+    #[tokio::test]
+    async fn freshness_counter_not_bumped_by_trust_filter() {
+        // T34: rejection by the trust filter must NOT bump the freshness
+        // counter (different rejection reason).
+        use crate::vl_fetcher::new_trusted_keys;
+        use rxrpl_primitives::PublicKey;
+
+        let trusted = new_trusted_keys();
+        let trusted_key_bytes = [0xED; 33];
+        let trusted_pk = PublicKey::from_slice(&trusted_key_bytes).unwrap();
+        trusted.write().await.insert(trusted_pk);
+
+        let mut agg = ValidationAggregator::new(1).with_trusted_keys(trusted);
+
+        // Fresh sign_time but untrusted public_key: dropped by the trust
+        // gate AFTER the freshness gate has already passed.
+        let mut val = make_validation(1, 5, Hash256::new([0xAA; 32]));
+        val.public_key = vec![0xED; 33];
+        val.public_key[1] = 0xFF; // diverges from trusted key
+        assert!(agg.add_validation_at(val, TEST_NOW).is_none());
+
+        assert_eq!(agg.validations_dropped_freshness_total(), 0);
+        assert_eq!(agg.validations_dropped_stale_total(), 0);
+    }
+
+    #[test]
+    fn validations_dropped_stale_total_canonical_accessor() {
+        // T34: the canonical-name accessor must return the same value as
+        // the legacy short-named accessor and increment on every
+        // freshness-gate drop. Documents the rippled JLOG counterpart
+        // (Counter[ConsensusValidations.staleValidations]).
+        let mut agg = ValidationAggregator::new(1);
+        assert_eq!(agg.dropped_stale_total(), 0);
+        assert_eq!(agg.validations_dropped_stale_total(), 0);
+
+        let hash = Hash256::new([0xC0; 32]);
+        let mut val = make_validation(1, 42, hash);
+        val.sign_time = TEST_NOW + 10 * 60; // past freshness window
+        assert!(agg.add_validation_at(val, TEST_NOW).is_none());
+
+        // Legacy and canonical accessors both reflect the increment.
+        assert_eq!(agg.dropped_stale_total(), 1);
+        assert_eq!(agg.validations_dropped_stale_total(), 1);
+        // And remain in lockstep across additional drops.
+        let mut val2 = make_validation(2, 43, hash);
+        val2.sign_time = TEST_NOW.saturating_sub(10 * 60);
+        assert!(agg.add_validation_at(val2, TEST_NOW).is_none());
+        assert_eq!(agg.dropped_stale_total(), 2);
+        assert_eq!(agg.validations_dropped_stale_total(), 2);
+    }
+
+    #[test]
     fn past_validation_dropped_bumps_counter() {
         // sign_time = now - 10 minutes is past the EARLY floor (3 min).
         let mut agg = ValidationAggregator::new(1);
