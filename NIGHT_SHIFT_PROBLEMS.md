@@ -170,6 +170,25 @@ The proper fix is the standard XRPL trick: wait for `peerProposers >= 1` in the 
 
 This nightly session has taken cross-impl from "0 validations received" to "byte-perfect mutual peering with chase-loop divergence" — a genuine net improvement, but not a passing cross-impl-payment test.
 
+### Update 2026-04-28T19:08Z — T44 wait-for-peer-position attempted
+
+Commit 73037a3 added: at close time, if we have peers AND `consensus.peer_position_count() == 0`, defer the close by one tick (~100ms), capped at 100 deferrals (~10s).
+
+**Result of run #12**: zero `close after N deferrals` log lines. The wait condition is never true. Reasons:
+- For ledger #2 (very first close): `max_peer_seq == 0` → no wait. ✓ as expected (true bootstrap).
+- For subsequent ledgers (post-catchup): rxrpl AND rippled now share the same `prev_ledger` after catchup. Rippled's proposal arrives during rxrpl's open phase and lands in `peer_positions` (matches prev_ledger). So `peer_position_count > 0` → no wait → close fires immediately.
+
+**The chase persists because**: rxrpl AND rippled now agree on prev_ledger (both at hash X, ledger N), both propose for ledger N+1, but they compute DIFFERENT N+1 hashes from the same starting point. This means the divergence is in the LEDGER HEADER computation (likely `account_hash` or some other field that's different between the two implementations), NOT in the timing.
+
+To find this we need to:
+- Take a single prev_ledger hash that both nodes have
+- Have both nodes compute their next `Ledger::new_open(&parent)` then `close_ledger(empty_tx_set, close_time)`
+- Diff the resulting headers field-by-field
+
+Likely culprits: `parent_close_time`, `close_flags`, `base_fee`, `reserve_base_drops`, `reserve_inc_drops`, or how `account_hash` is recomputed (does rxrpl carry forward `account_hash` from parent for empty close? rippled does.).
+
+This is a 1-day debug task that needs both impls to dump their next-ledger header bytes side by side. Not in nightly scope.
+
 The signature/wire-format work (T27, T40) is genuinely complete — rippled's trusted-proposal acceptance proves the proposal byte-image is byte-perfect. The remaining gap is consensus-bootstrap protocol semantics, not implementation correctness.
 
 ## [RESOLVED] xrpl-hive TMValidation drop — root cause was sfSignature canonical position — 2026-04-28T02:35Z
