@@ -349,6 +349,14 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.adaptive_close_time.resolution()
     }
 
+    /// Number of peer positions observed for the current round.
+    /// Used by the node loop to decide whether to extend the OPEN phase
+    /// (wait for at least one peer to propose first) — breaks the cross-impl
+    /// chase loop where two nodes close at slightly different wall-clock times.
+    pub fn peer_position_count(&self) -> usize {
+        self.peer_positions.len()
+    }
+
     /// Get the current previous ledger hash.
     pub fn prev_ledger(&self) -> Hash256 {
         self.prev_ledger

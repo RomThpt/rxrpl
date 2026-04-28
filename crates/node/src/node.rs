@@ -1026,6 +1026,10 @@ impl Node {
             let mut syncing = false;
             let mut max_peer_seq: u32 = 0;
             let mut pending_close_time = 0u32;
+            // Counter for how many close ticks we've deferred waiting for a
+            // peer position. Caps the wait at ~10s extra so an offline peer
+            // doesn't block our progress forever.
+            let mut close_deferrals: u32 = 0;
             // Cache of LedgerHeader objects parsed from peer liBASE responses.
             // We need the full header (parent_hash, parent_close_time,
             // close_time, drops, close_time_resolution, close_flags) when
@@ -1132,23 +1136,44 @@ impl Node {
                                     // Yield-to-peer-leader: if any observed peer is on a later
                                     // sequence, do NOT close our own ledger — wait for catchup
                                     // (proposal-driven holding-pen → GetLedger → reconstruct).
-                                    // Without this, two fresh nodes chase each other indefinitely
-                                    // ("Got proposal for X but we are on Y" reject loop on rippled).
                                     if max_peer_seq > seq {
                                         tracing::debug!(
                                             "yielding close: peer at seq {} > our open seq {}",
                                             max_peer_seq, seq
                                         );
-                                        // Reset the open-phase timer so we don't immediately
-                                        // re-fire CloseLedger on next tick.
                                         timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
-                                        // Trigger catchup explicitly.
                                         let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
                                             seq,
                                             hash: None,
                                         });
                                         continue;
                                     }
+
+                                    // Wait-for-peer-position: if no peer has proposed for the
+                                    // current round yet AND we have peers, defer the close by
+                                    // one tick (~100ms). Bounded by `MAX_CLOSE_DEFERRALS` so an
+                                    // unresponsive peer can't block us indefinitely. This breaks
+                                    // the cross-impl chase loop where rxrpl and rippled close at
+                                    // slightly different wall-clock times and never agree on a
+                                    // common prev_ledger to vote on.
+                                    const MAX_CLOSE_DEFERRALS: u32 = 100; // ~10s at 100ms tick
+                                    let have_peers = max_peer_seq > 0;
+                                    let have_peer_position = consensus.peer_position_count() > 0;
+                                    if have_peers && !have_peer_position
+                                        && close_deferrals < MAX_CLOSE_DEFERRALS
+                                    {
+                                        close_deferrals += 1;
+                                        // Don't reset phase timer — we still want CloseLedger
+                                        // to keep firing. Just skip this iteration.
+                                        continue;
+                                    }
+                                    if close_deferrals > 0 {
+                                        tracing::debug!(
+                                            "close after {} deferrals (peer_positions={})",
+                                            close_deferrals, consensus.peer_position_count()
+                                        );
+                                    }
+                                    close_deferrals = 0;
 
                                     let l = ledger.read().await;
                                     let mut tx_hashes = Vec::new();
