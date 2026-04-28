@@ -26,3 +26,4 @@
 [2026-04-27T16:30:18Z] [orchestrator] phase 4 complete — draft PR #39 opened https://github.com/RomThpt/rxrpl/pull/39
 
 [2026-04-28T00:00:00Z] [night-coder] T27 wire-diff: identified non-canonical sfSignature placement (after sfAmendments) in encode_validation; fix splices sfSignature at canonical (7,6) position; +9 regression tests in tests/wire_diff_validation.rs; cargo test -p rxrpl-overlay green (241 tests).
+[2026-04-28T12:15:46Z] [night-coder] T28 manifest-utf8: parse_raw sfDomain switched from from_utf8_lossy to strict String::from_utf8 returning new ManifestError::InvalidDomain; +1 regression test parse_rejects_manifest_with_invalid_utf8_domain (signs valid manifest with 0xFF 0xFE domain bytes, asserts InvalidDomain). cargo test -p rxrpl-overlay --lib manifest green (13/13); cargo test -p rxrpl-overlay --test '*' green.
