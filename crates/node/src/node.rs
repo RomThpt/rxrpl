@@ -1124,29 +1124,23 @@ impl Node {
                                     let parent_close_time = l.header.parent_close_time;
                                     drop(l);
 
-                                    // Cross-impl convergence: sleep until the next wall-clock
-                                    // boundary that's a multiple of close_time_resolution, THEN
-                                    // close with that exact boundary as close_time. Both nodes
-                                    // (rxrpl + rippled, even if their close timers fired at slightly
-                                    // different instants within the same N-second window) wake up
-                                    // at the same wall-clock boundary and close with the same
-                                    // close_time → identical ledger hashes for empty rounds.
+                                    // Cross-impl convergence: ceiling-round close_time to the next
+                                    // resolution boundary (instead of nearest). Two nodes that close
+                                    // within the same N-second window get identical close_time → same
+                                    // ledger hash for empty-close rounds. Tested against rippled:
+                                    // works when both nodes' open phases are aligned within ~5s.
                                     let resolution = consensus.close_time_resolution();
                                     let raw_close_time = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs()
                                         .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
-                                    let target_close = if resolution > 0 {
-                                        ((raw_close_time / resolution) + 1) * resolution
+                                    let close_time = if resolution > 0 {
+                                        ((raw_close_time + resolution - 1) / resolution) * resolution
                                     } else {
                                         raw_close_time
-                                    };
-                                    let sleep_secs = target_close.saturating_sub(raw_close_time);
-                                    if sleep_secs > 0 && sleep_secs <= resolution {
-                                        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs as u64)).await;
                                     }
-                                    let close_time = target_close.max(parent_close_time.saturating_add(1));
+                                    .max(parent_close_time.saturating_add(1));
 
                                     // Yield-to-peer-leader: if any observed peer is on a later
                                     // sequence, do NOT close our own ledger — wait for catchup
@@ -1164,31 +1158,14 @@ impl Node {
                                         continue;
                                     }
 
-                                    // Wait-for-peer-position: if no peer has proposed for the
-                                    // current round yet AND we have peers, defer the close by
-                                    // one tick (~100ms). Bounded by `MAX_CLOSE_DEFERRALS` so an
-                                    // unresponsive peer can't block us indefinitely. This breaks
-                                    // the cross-impl chase loop where rxrpl and rippled close at
-                                    // slightly different wall-clock times and never agree on a
-                                    // common prev_ledger to vote on.
-                                    const MAX_CLOSE_DEFERRALS: u32 = 100; // ~10s at 100ms tick
-                                    let have_peers = max_peer_seq > 0;
-                                    let have_peer_position = consensus.peer_position_count() > 0;
-                                    if have_peers && !have_peer_position
-                                        && close_deferrals < MAX_CLOSE_DEFERRALS
-                                    {
-                                        close_deferrals += 1;
-                                        // Don't reset phase timer — we still want CloseLedger
-                                        // to keep firing. Just skip this iteration.
-                                        continue;
-                                    }
-                                    if close_deferrals > 0 {
-                                        tracing::debug!(
-                                            "close after {} deferrals (peer_positions={})",
-                                            close_deferrals, consensus.peer_position_count()
-                                        );
-                                    }
-                                    close_deferrals = 0;
+                                    // Wait-for-peer-position removed: empirically, rippled never
+                                    // sends a proposal during the open phase (only after closing
+                                    // alone). So waiting for peer_positions deadlocks rxrpl into
+                                    // the deferral cap (100 ticks ≈ 10s) every round, which makes
+                                    // rxrpl close LATER than rippled — exact opposite of what we
+                                    // want. Better to close at the wall-clock-ceiling boundary and
+                                    // let proposals/validations sort it out via wrong-prev-ledger.
+                                    let _ = close_deferrals;
 
                                     let l = ledger.read().await;
                                     let mut tx_hashes = Vec::new();
