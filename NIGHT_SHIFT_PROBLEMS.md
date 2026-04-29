@@ -301,6 +301,27 @@ rxrpl does NOT do this. Without LedgerHashes auto-update on close, rxrpl's accou
 
 **This is a 0.5-1 day task** to port rippled's `Ledger::updateSkipList()` (src/ripple/ledger/Ledger.cpp). After that, all cross-impl ledgers should converge.
 
+### Update 2026-04-29T16:35Z — `updateSkipList` IMPLEMENTED — account_hash byte-perfect
+
+Ported rippled's `Ledger::updateSkipList()` to `crates/ledger/src/ledger.rs` as a private `update_skip_list()` method called at the start of `close()`. Builds the LedgerHashes SLE (LedgerEntryType=0x68 at keylet::skip()) with sfHashes (parent_hash list), sfLastLedgerSequence, sfFlags=0. Re-inserts into state_map BEFORE `account_hash = state_map.root_hash()`.
+
+**Verified via local test (Ledger::new_open(genesis); l2.close(830765670, 0)):**
+```
+GENESIS hash      = B06F8E90DF67B6A383E692A12963425B0E5FA6FBF0704370C137FCE71D88A2D8
+LEDGER_2 acct_hash = 1FC01CE0231D04EE883F89B74C911086E49A4F7E93F77E54DA3F35C9B033942D ← MATCHES rippled standalone exactly
+LEDGER_2 hash      = 8C1F70CCB840DF31D38510F96B774D87422D72BCAD5D591589EDE7C51B90A201 ← MATCHES rippled standalone exactly
+SKIP_SLE bytes     = 1100682200000000201B00000001021320B06F8E90DF67B6A383E692A12963425B0E5FA6FBF0704370C137FCE71D88A2D8 ← byte-identical to rippled's
+```
+
+**Cross-impl in hive (run 36)**:
+- rxrpl computes account_hash 1FC01CE0... at #2 ✓ (matches rippled)
+- BUT ledger hash differs because close_time differs: rxrpl 830788380 vs rippled different
+- The two nodes' close timers fire at slightly different wall-clock instants → ceiling rounding lands them in different 10s windows.
+
+**Final remaining gap**: pure timing-race on close. The two nodes need to fire `close()` at the EXACT same wall-clock instant for #2's close_time to match. Tried (and reverted) sleep-to-grid because it deadlocks vs rippled (rippled doesn't wait for proposals before closing alone). The clean solution is round-leader election: lowest UNL pubkey closes first, others echo. Implementing that requires consensus engine changes beyond a single fn.
+
+**State at this point**: every byte of every protocol structure (wire, sig, SLE encoding, genesis, skip-list) matches rippled exactly. Only the consensus-bootstrap close-time race remains.
+
 **Session deliverables (final, on origin nightly/2026-04-27)**:
 - 35+ commits taking cross-impl from "0 validations + silent mystery" to "byte-perfect wire + tooling + precise root-cause documented"
 - 4 wire/timing fixes that work (T27, T40, T41, T42)
