@@ -1124,29 +1124,29 @@ impl Node {
                                     let parent_close_time = l.header.parent_close_time;
                                     drop(l);
 
-                                    // Cross-impl convergence: round close_time UP (ceiling) to the
-                                    // next resolution boundary instead of nearest. Two nodes that
-                                    // close within the same N-second window will both target the
-                                    // same upper boundary → identical close_time → identical hash.
-                                    // Nearest rounding (the previous default) splits that window
-                                    // at the midpoint, causing same-window closes to drift apart.
+                                    // Cross-impl convergence: sleep until the next wall-clock
+                                    // boundary that's a multiple of close_time_resolution, THEN
+                                    // close with that exact boundary as close_time. Both nodes
+                                    // (rxrpl + rippled, even if their close timers fired at slightly
+                                    // different instants within the same N-second window) wake up
+                                    // at the same wall-clock boundary and close with the same
+                                    // close_time → identical ledger hashes for empty rounds.
+                                    let resolution = consensus.close_time_resolution();
                                     let raw_close_time = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs()
                                         .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
-                                    let resolution = consensus.close_time_resolution();
-                                    let close_time = if resolution == 0 {
-                                        raw_close_time
+                                    let target_close = if resolution > 0 {
+                                        ((raw_close_time / resolution) + 1) * resolution
                                     } else {
-                                        // Ceiling: ((raw + res - 1) / res) * res
                                         raw_close_time
-                                            .saturating_add(resolution.saturating_sub(1))
-                                            / resolution
-                                            * resolution
                                     };
-                                    // Honor parent monotonicity (close_time strictly > parent).
-                                    let close_time = close_time.max(parent_close_time.saturating_add(1));
+                                    let sleep_secs = target_close.saturating_sub(raw_close_time);
+                                    if sleep_secs > 0 && sleep_secs <= resolution {
+                                        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs as u64)).await;
+                                    }
+                                    let close_time = target_close.max(parent_close_time.saturating_add(1));
 
                                     // Yield-to-peer-leader: if any observed peer is on a later
                                     // sequence, do NOT close our own ledger — wait for catchup
