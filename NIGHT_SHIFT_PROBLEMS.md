@@ -253,6 +253,27 @@ Once rippled's master AccountRoot bytes are known, rxrpl can match them exactly.
 
 **This is a 0.5-day codec-alignment task.** The remaining iteration is mechanical: dump → diff → add/remove fields until SLE bytes match exactly. Once done, cross-impl-payment should pass.
 
+### Update 2026-04-29T12:13Z — GENESIS HASH MATCHES rippled exactly
+
+After the Docker BuildKit cache-busting saga (T50+), running hive with the actually-fresh binary produces:
+```
+rxrpl genesis (CLOSE_DUMP seq=1):
+  hash = B06F8E90DF67B6A383E692A12963425B0E5FA6FBF0704370C137FCE71D88A2D8
+  account_hash = EC2F822EDFBC6F2F4DE5AA7C8AFF128F27DB2C194315FD727445A4967DAFD018
+  sle_bytes = identical to rippled's master AccountRoot SLE (87 bytes)
+
+rippled genesis (queried via ledger 2 parent_hash):
+  hash = B06F8E90DF67B6A383E692A12963425B0E5FA6FBF0704370C137FCE71D88A2D8 ✓ MATCH
+```
+
+Required fixes:
+- T49: Add PreviousTxnID/PreviousTxnLgrSeq + OwnerCount to genesis AccountRoot SLE
+- T49b: close_time_resolution=10 at genesis (not 30) — matches rippled's LEDGER_TIME_RESOLUTIONS[0]
+- T49c: Re-enable `insert_genesis_fee_settings` in `genesis_with_funded_account_and_store` — rippled DOES include FeeSettings in standalone genesis (verified via `ledger_data` RPC)
+- T50: Replace `git clone` in Dockerfile with `COPY src` to bypass BuildKit's cargo build caching that returned old binaries despite cachebust args
+
+**Remaining chase-loop at #2+**: even with matching genesis, both nodes close their own #2 (with different close_times → different hashes) before the other proposes. Round-by-round catchup keeps rxrpl 1-2 ledgers behind. The proper protocol fix is round-leader election (lowest UNL pubkey closes first); a session bigger than this remains.
+
 **Session deliverables (final, on origin nightly/2026-04-27)**:
 - 35+ commits taking cross-impl from "0 validations + silent mystery" to "byte-perfect wire + tooling + precise root-cause documented"
 - 4 wire/timing fixes that work (T27, T40, T41, T42)
