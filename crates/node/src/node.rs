@@ -2040,8 +2040,14 @@ impl Node {
             .map_err(|e| NodeError::Config(format!("failed to encode genesis account: {e}")))?;
         genesis.put_state(key, data)?;
 
-        // Add FeeSettings with default values
-        Self::insert_genesis_fee_settings(&mut genesis)?;
+        // FeeSettings intentionally omitted from genesis: rippled doesn't
+        // include it in fresh-network genesis #1 either (it's introduced via
+        // amendment). Including it makes rxrpl's genesis state map differ
+        // from rippled's, producing different ledger #1 hashes and breaking
+        // cross-impl convergence from the very first ledger.
+        // FeeSettings defaults are now provided in-memory via FeeSettings::default()
+        // for the tx engine, not via the state map.
+        // Self::insert_genesis_fee_settings(&mut genesis)?;
 
         genesis.close(0, 0)?;
         Ok(genesis)
