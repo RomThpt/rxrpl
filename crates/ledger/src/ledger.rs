@@ -275,11 +275,72 @@ impl Ledger {
         Ok(())
     }
 
+    /// Update the LedgerHashes (skip-list) SLE before close.
+    /// Mirrors rippled's `Ledger::updateSkipList()` — every closed ledger
+    /// (except genesis) contains a LedgerHashes pseudo-entry that lists
+    /// the parent_hash of the current ledger plus up to 255 prior parents.
+    /// Without this, rxrpl's account_hash diverges from rippled's at every
+    /// non-genesis ledger.
+    fn update_skip_list(&mut self) -> Result<(), LedgerError> {
+        if self.header.sequence <= 1 {
+            return Ok(());
+        }
+        use rxrpl_protocol::keylet;
+        let key = keylet::skip();
+
+        // Read existing SLE if any → extract current hashes
+        let mut hashes: Vec<String> = Vec::with_capacity(256);
+        if let Some(existing) = self.state_map.get(&key) {
+            if let Ok(value) = crate::sle_codec::decode_state(existing) {
+                if let Some(arr) = value.get("Hashes").and_then(|v| v.as_array()) {
+                    for h in arr {
+                        if let Some(s) = h.as_str() {
+                            hashes.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        // Cap at 256: drop oldest if at capacity, then append parent.
+        if hashes.len() >= 256 {
+            hashes.remove(0);
+        }
+        // Hash256 hex format (uppercase, no 0x prefix) — matches rippled JSON.
+        let parent_hex: String = self
+            .header
+            .parent_hash
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect();
+        hashes.push(parent_hex);
+
+        let last_ledger_seq = self.header.sequence - 1;
+        let sle = serde_json::json!({
+            "LedgerEntryType": "LedgerHashes",
+            "Flags": 0,
+            "Hashes": hashes,
+            "LastLedgerSequence": last_ledger_seq,
+        });
+        let json_bytes = serde_json::to_vec(&sle)
+            .map_err(|e| LedgerError::Codec(format!("encode skip SLE json: {e}")))?;
+        let data = crate::sle_codec::encode_sle(&json_bytes)
+            .map_err(|e| LedgerError::Codec(format!("encode skip SLE binary: {e}")))?;
+        self.state_map
+            .put(key, data)
+            .map_err(|e| LedgerError::Codec(format!("put skip SLE failed: {e}")))?;
+        Ok(())
+    }
+
     /// Close this ledger, computing final hashes.
     pub fn close(&mut self, close_time: u32, close_flags: u8) -> Result<(), LedgerError> {
         if !self.is_open() {
             return Err(LedgerError::AlreadyClosed);
         }
+
+        // Update LedgerHashes skip-list SLE BEFORE computing account_hash
+        // so the new SLE is reflected in the state map root.
+        self.update_skip_list()?;
 
         // Compute tree hashes
         self.header.account_hash = self.state_map.root_hash();
