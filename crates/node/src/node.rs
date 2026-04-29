@@ -1124,11 +1124,11 @@ impl Node {
                                     let parent_close_time = l.header.parent_close_time;
                                     drop(l);
 
-                                    // Cross-impl convergence: ceiling-round close_time to the next
-                                    // resolution boundary (instead of nearest). Two nodes that close
-                                    // within the same N-second window get identical close_time → same
-                                    // ledger hash for empty-close rounds. Tested against rippled:
-                                    // works when both nodes' open phases are aligned within ~5s.
+                                    // Cross-impl: floor-round close_time to the resolution grid.
+                                    // Empirically rippled uses floor (its CTime is ~10s behind
+                                    // wall clock during establish phase). Two nodes whose closes
+                                    // fire within the same N-second window agree on close_time =
+                                    // floor(now, N).
                                     let resolution = consensus.close_time_resolution();
                                     let raw_close_time = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
@@ -1136,7 +1136,7 @@ impl Node {
                                         .as_secs()
                                         .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
                                     let close_time = if resolution > 0 {
-                                        ((raw_close_time + resolution - 1) / resolution) * resolution
+                                        (raw_close_time / resolution) * resolution
                                     } else {
                                         raw_close_time
                                     }
