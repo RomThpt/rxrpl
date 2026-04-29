@@ -2026,6 +2026,11 @@ impl Node {
             .map_err(|e| NodeError::Config(format!("invalid genesis address: {e}")))?;
         let key = keylet::account(&account_id);
 
+        // Rippled-compatible genesis AccountRoot: includes PreviousTxnID +
+        // PreviousTxnLgrSeq zero-fields that rippled always emits in its
+        // SLE serialization. Without them, rxrpl's account_hash diverges
+        // from rippled and the genesis #1 ledger hashes don't match,
+        // breaking cross-impl consensus convergence.
         let account = serde_json::json!({
             "LedgerEntryType": "AccountRoot",
             "Account": genesis_address,
@@ -2033,6 +2038,8 @@ impl Node {
             "Sequence": 1,
             "OwnerCount": 0,
             "Flags": 0,
+            "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+            "PreviousTxnLgrSeq": 0,
         });
         let json_bytes =
             serde_json::to_vec(&account).map_err(|e| NodeError::Config(e.to_string()))?;
@@ -2063,6 +2070,11 @@ impl Node {
             .map_err(|e| NodeError::Config(format!("invalid genesis address: {e}")))?;
         let key = keylet::account(&account_id);
 
+        // Rippled-compatible genesis AccountRoot: includes PreviousTxnID +
+        // PreviousTxnLgrSeq zero-fields that rippled always emits in its
+        // SLE serialization. Without them, rxrpl's account_hash diverges
+        // from rippled and the genesis #1 ledger hashes don't match,
+        // breaking cross-impl consensus convergence.
         let account = serde_json::json!({
             "LedgerEntryType": "AccountRoot",
             "Account": genesis_address,
@@ -2070,6 +2082,8 @@ impl Node {
             "Sequence": 1,
             "OwnerCount": 0,
             "Flags": 0,
+            "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+            "PreviousTxnLgrSeq": 0,
         });
         let json_bytes =
             serde_json::to_vec(&account).map_err(|e| NodeError::Config(e.to_string()))?;
