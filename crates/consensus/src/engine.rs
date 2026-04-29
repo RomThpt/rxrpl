@@ -83,6 +83,13 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     public_key: Vec<u8>,
     /// Accepted close time after negotiation.
     accepted_close_time: Option<u32>,
+    /// Most recent close_time observed in any peer proposal/validation,
+    /// regardless of round/prev_ledger. Used as a hint to align our own
+    /// close_time when our_position isn't yet set (chicken-and-egg with
+    /// rounded_close_time). Without this, two cross-impl validators race
+    /// each other on the close-timer wall-clock and produce divergent
+    /// close_time → divergent ledger hashes for the same content.
+    latest_peer_close_time: Option<u32>,
     /// Close flags (1 = peers disagree on close time).
     accepted_close_flags: u8,
     /// Accepted validation after consensus.
@@ -201,6 +208,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             node_id,
             public_key,
             accepted_close_time: None,
+            latest_peer_close_time: None,
             accepted_close_flags: 0,
             accepted_validation: None,
             unl,
@@ -355,6 +363,14 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
     /// chase loop where two nodes close at slightly different wall-clock times.
     pub fn peer_position_count(&self) -> usize {
         self.peer_positions.len()
+    }
+
+    /// Most recent peer-broadcast close_time observed (across any round/prev_ledger).
+    /// The node layer uses this to align its own pending close_time with
+    /// the peer's bucket BEFORE its first proposal is built (chicken-and-egg
+    /// with `rounded_close_time` which requires our_position to exist).
+    pub fn latest_peer_close_time(&self) -> Option<u32> {
+        self.latest_peer_close_time
     }
 
     /// Get the current previous ledger hash.
@@ -744,6 +760,12 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
     /// deterministic clock; hidden from rustdoc to discourage external use.
     #[doc(hidden)]
     pub fn peer_proposal_at(&mut self, proposal: Proposal, now: u32) {
+        // Track most recent peer close_time regardless of round: lets the node
+        // layer adopt the peer's close_time when picking its own pending value
+        // (breaks cross-impl close-timer race).
+        if proposal.close_time > 0 {
+            self.latest_peer_close_time = Some(proposal.close_time);
+        }
         if self.phase != ConsensusPhase::Establish {
             // Apply UNL + freshness gates BEFORE buffering to prevent
             // pre-Establish memory amplification (audit pass 2 C2). Without

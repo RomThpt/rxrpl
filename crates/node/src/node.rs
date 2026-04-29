@@ -1124,21 +1124,25 @@ impl Node {
                                     let parent_close_time = l.header.parent_close_time;
                                     drop(l);
 
-                                    // Cross-impl: floor-round close_time to the resolution grid.
-                                    // Empirically rippled uses floor (its CTime is ~10s behind
-                                    // wall clock during establish phase). Two nodes whose closes
-                                    // fire within the same N-second window agree on close_time =
-                                    // floor(now, N).
+                                    // Cross-impl close_time selection priority:
+                                    // 1) Latest observed peer close_time (rippled's CTime) — adopt
+                                    //    the peer's close_time bucket so we land in the same window.
+                                    // 2) Otherwise floor wall-clock to resolution grid (solo close).
                                     let resolution = consensus.close_time_resolution();
                                     let raw_close_time = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs()
                                         .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
-                                    let close_time = if resolution > 0 {
-                                        (raw_close_time / resolution) * resolution
-                                    } else {
-                                        raw_close_time
+                                    let close_time = match consensus.latest_peer_close_time() {
+                                        Some(peer_ct) if peer_ct > parent_close_time => peer_ct,
+                                        _ => {
+                                            if resolution > 0 {
+                                                (raw_close_time / resolution) * resolution
+                                            } else {
+                                                raw_close_time
+                                            }
+                                        }
                                     }
                                     .max(parent_close_time.saturating_add(1));
 
