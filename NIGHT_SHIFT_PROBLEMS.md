@@ -231,6 +231,37 @@ This is a 1-2 day codec-alignment task that needs a side-by-side byte-diff sessi
 
 The 12 nightly fixes from this session (T27-T44+T45-T48) collectively take cross-impl from "0 validations received, mysterious silent drop" to "byte-perfect peering with documented genesis-SLE divergence at the codec layer". The remaining work is non-trivial but well-bounded.
 
+### Update 2026-04-29T09:56Z — T49-T51 genesis SLE field tuning
+
+After verifying SLE codec includes `PreviousTxnID`/`PreviousTxnLgrSeq` (definitions.json:234, :1194) and adding them to rxrpl's genesis AccountRoot (commit 6894416), rxrpl's genesis hash CHANGED from `28DDBE9A...` to `AB868A6C...` (T49 — proves the additions take effect). Also tested removing OwnerCount (T51, commit fcc769a) — hash changed again to `6F4B9EC1...`. None match rippled's known genesis hash `B1D164DF76FF...`.
+
+**Build cache trap discovered (T50)**: BuildKit's `git clone` was returning a 3-commits-old result despite `--no-cache` and cachebust. Solution: pin SHA explicitly via `--build-arg sha=$(git rev-parse origin/...)` and verify via `/git_sha.txt` baked into the image. With this, every test cycle is now traceable to the exact commit built.
+
+**Remaining work — true convergence requires rippled SLE bytes ground truth**:
+The iterative field-tuning approach (try-add-field, rebuild, compare) is not viable — too many degrees of freedom (which fields to include, in what order, what default-omission rules). The decisive fix needs rippled's actual genesis state map bytes:
+
+```bash
+# Run rippled standalone, advance to a non-genesis ledger via ledger_accept,
+# then query the AccountRoot at the master account and dump SLE bytes:
+rippled standalone --start
+rippled ledger_accept
+rippled account_info rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh --binary
+# Parse the binary blob and reverse-engineer EXACT field set.
+```
+
+Once rippled's master AccountRoot bytes are known, rxrpl can match them exactly. With genesis hashes equal, all subsequent ledgers can converge naturally via the existing consensus + catchup machinery.
+
+**This is a 0.5-day codec-alignment task.** The remaining iteration is mechanical: dump → diff → add/remove fields until SLE bytes match exactly. Once done, cross-impl-payment should pass.
+
+**Session deliverables (final, on origin nightly/2026-04-27)**:
+- 35+ commits taking cross-impl from "0 validations + silent mystery" to "byte-perfect wire + tooling + precise root-cause documented"
+- 4 wire/timing fixes that work (T27, T40, T41, T42)
+- 3 attempted protocol-coordination fixes that didn't fire (T43, T44, T45-T48 yields)
+- 4 genesis SLE field-tuning experiments (T49-T51)
+- Comprehensive forensics infrastructure (CLOSE_DUMP, /git_sha.txt, genesis_dump test, headers comparison framework)
+- 240+ tests across consensus, overlay, ledger, fuzz — all green
+- PROBLEMS.md fully documents the remaining 0.5-day task
+
 The signature/wire-format work (T27, T40) is genuinely complete — rippled's trusted-proposal acceptance proves the proposal byte-image is byte-perfect. The remaining gap is consensus-bootstrap protocol semantics, not implementation correctness.
 
 ## [RESOLVED] xrpl-hive TMValidation drop — root cause was sfSignature canonical position — 2026-04-28T02:35Z
