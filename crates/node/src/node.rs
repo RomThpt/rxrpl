@@ -1124,24 +1124,29 @@ impl Node {
                                     let parent_close_time = l.header.parent_close_time;
                                     drop(l);
 
-                                    // Deterministic close_time = parent.close_time + resolution.
-                                    // Both rxrpl and rippled, given the same parent ledger, will
-                                    // compute the same close_time and therefore the same ledger
-                                    // hash for empty-close rounds. This breaks the cross-impl
-                                    // chase loop where wall-clock-derived close_times drift.
-                                    // For genesis (parent_close_time=0), use wall-clock rounded
-                                    // to resolution boundary so rxrpl can still bootstrap solo.
+                                    // Cross-impl convergence: round close_time UP (ceiling) to the
+                                    // next resolution boundary instead of nearest. Two nodes that
+                                    // close within the same N-second window will both target the
+                                    // same upper boundary → identical close_time → identical hash.
+                                    // Nearest rounding (the previous default) splits that window
+                                    // at the midpoint, causing same-window closes to drift apart.
+                                    let raw_close_time = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs()
+                                        .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
                                     let resolution = consensus.close_time_resolution();
-                                    let close_time = if parent_close_time > 0 {
-                                        parent_close_time + resolution
+                                    let close_time = if resolution == 0 {
+                                        raw_close_time
                                     } else {
-                                        let raw_close_time = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs()
-                                            .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
-                                        rxrpl_consensus::round_close_time(raw_close_time, resolution)
+                                        // Ceiling: ((raw + res - 1) / res) * res
+                                        raw_close_time
+                                            .saturating_add(resolution.saturating_sub(1))
+                                            / resolution
+                                            * resolution
                                     };
+                                    // Honor parent monotonicity (close_time strictly > parent).
+                                    let close_time = close_time.max(parent_close_time.saturating_add(1));
 
                                     // Yield-to-peer-leader: if any observed peer is on a later
                                     // sequence, do NOT close our own ledger — wait for catchup
