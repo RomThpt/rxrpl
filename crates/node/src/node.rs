@@ -1118,20 +1118,30 @@ impl Node {
                                     // put broadcast validations 30 years in
                                     // rippled's future and they would be
                                     // dropped at the `isCurrent` check.
-                                    let raw_close_time = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs()
-                                        .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
-                                    // Align to current close_time_resolution for cross-impl
-                                    // bootstrap convergence — see node.rs:340 for context.
-                                    let resolution = consensus.close_time_resolution();
-                                    let close_time = rxrpl_consensus::round_close_time(raw_close_time, resolution);
-
                                     let l = ledger.read().await;
                                     let prev_hash = l.header.parent_hash;
                                     let seq = l.header.sequence;
+                                    let parent_close_time = l.header.parent_close_time;
                                     drop(l);
+
+                                    // Deterministic close_time = parent.close_time + resolution.
+                                    // Both rxrpl and rippled, given the same parent ledger, will
+                                    // compute the same close_time and therefore the same ledger
+                                    // hash for empty-close rounds. This breaks the cross-impl
+                                    // chase loop where wall-clock-derived close_times drift.
+                                    // For genesis (parent_close_time=0), use wall-clock rounded
+                                    // to resolution boundary so rxrpl can still bootstrap solo.
+                                    let resolution = consensus.close_time_resolution();
+                                    let close_time = if parent_close_time > 0 {
+                                        parent_close_time + resolution
+                                    } else {
+                                        let raw_close_time = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs()
+                                            .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
+                                        rxrpl_consensus::round_close_time(raw_close_time, resolution)
+                                    };
 
                                     // Yield-to-peer-leader: if any observed peer is on a later
                                     // sequence, do NOT close our own ledger — wait for catchup
