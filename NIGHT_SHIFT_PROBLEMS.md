@@ -274,6 +274,33 @@ Required fixes:
 
 **Remaining chase-loop at #2+**: even with matching genesis, both nodes close their own #2 (with different close_times → different hashes) before the other proposes. Round-by-round catchup keeps rxrpl 1-2 ledgers behind. The proper protocol fix is round-leader election (lowest UNL pubkey closes first); a session bigger than this remains.
 
+### Update 2026-04-29T15:21Z — Genesis matches; #2+ requires LedgerHashes SLE auto-update
+
+After T49 fixes (genesis match B06F8E90), tested ceiling-rounded close_time + sleep-to-grid + wait-for-peer-position. All approaches still produce diverging #2 hashes.
+
+**Final root cause found**:
+```
+rxrpl  #2 state map: 2 entries (master AccountRoot + FeeSettings) → account_hash EC2F822E
+rippled #2 state map: 3 entries (master AccountRoot + FeeSettings + LedgerHashes) → account_hash 1FC01CE0
+```
+
+Rippled auto-creates a `LedgerHashes` SLE (LedgerEntryType=0x68, key=0x000...) at every close. This SLE contains:
+- sfFlags = 0
+- sfLastLedgerSequence (field 27) = current_seq - 1  
+- sfHashes (Vector256 field 3) = [parent_hash, grandparent_hash, ...] (skip-list)
+
+rxrpl does NOT do this. Without LedgerHashes auto-update on close, rxrpl's account_hash diverges from rippled's at every ledger.
+
+**To finish the cross-impl convergence**, rxrpl needs:
+1. Pre-close hook in `Ledger::close()` that:
+   - Reads existing LedgerHashes SLE (or creates one if missing)
+   - Updates sfHashes vector with parent_hash at front, max length 256
+   - Updates sfLastLedgerSequence = sequence - 1
+   - Re-inserts the SLE into state_map
+2. Then compute_hash() uses the updated state_map root
+
+**This is a 0.5-1 day task** to port rippled's `Ledger::updateSkipList()` (src/ripple/ledger/Ledger.cpp). After that, all cross-impl ledgers should converge.
+
 **Session deliverables (final, on origin nightly/2026-04-27)**:
 - 35+ commits taking cross-impl from "0 validations + silent mystery" to "byte-perfect wire + tooling + precise root-cause documented"
 - 4 wire/timing fixes that work (T27, T40, T41, T42)
