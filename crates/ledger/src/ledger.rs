@@ -294,7 +294,7 @@ impl Ledger {
         // Debug: dump every field that feeds into compute_hash so we can
         // diff against rippled's equivalent CLOSE log when investigating
         // cross-impl ledger-hash divergence.
-        tracing::debug!(
+        tracing::info!(
             "CLOSE_DUMP seq={} drops={} parent_hash={} tx_hash={} account_hash={} parent_close_time={} close_time={} close_time_resolution={} close_flags={} hash={}",
             self.header.sequence,
             self.header.drops,
