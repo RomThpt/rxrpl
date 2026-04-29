@@ -69,7 +69,9 @@ impl Ledger {
         header.parent_hash = Hash256::ZERO;
         header.parent_close_time = 0;
         header.close_time = 0;
-        header.close_time_resolution = 30;
+        // Rippled uses 10s close-time resolution at genesis (LedgerTimeResolutions[0]).
+        // Using 30 here makes rxrpl's genesis hash diverge from rippled's.
+        header.close_time_resolution = 10;
         header.close_flags = 0;
 
         let state_map = SHAMap::account_state();
@@ -92,7 +94,9 @@ impl Ledger {
         header.parent_hash = Hash256::ZERO;
         header.parent_close_time = 0;
         header.close_time = 0;
-        header.close_time_resolution = 30;
+        // Rippled uses 10s close-time resolution at genesis (LedgerTimeResolutions[0]).
+        // Using 30 here makes rxrpl's genesis hash diverge from rippled's.
+        header.close_time_resolution = 10;
         header.close_flags = 0;
 
         let state_map = SHAMap::account_state_with_store(store.clone());

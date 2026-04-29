@@ -113,7 +113,7 @@ impl LedgerHeader {
             account_hash: Hash256::ZERO,
             parent_close_time: 0,
             close_time: 0,
-            close_time_resolution: 30,
+            close_time_resolution: 10,
             close_flags: 0,
             hash: Hash256::ZERO,
         }
@@ -186,7 +186,7 @@ mod tests {
         let h = LedgerHeader::new();
         assert_eq!(h.sequence, 0);
         assert_eq!(h.drops, INITIAL_XRP_DROPS);
-        assert_eq!(h.close_time_resolution, 30);
+        assert_eq!(h.close_time_resolution, 10);
         assert!(h.close_time_agreed());
     }
 
