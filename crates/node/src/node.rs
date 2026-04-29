@@ -1756,6 +1756,11 @@ impl Node {
         let effective_close_time = consensus
             .accepted_close_time()
             .or_else(|| consensus.rounded_close_time())
+            // Cross-impl bridge: any peer proposal we've seen (even from a
+            // different round) reveals the peer's close_time bucket. Adopt
+            // it so two nodes whose close timers fire ~1s apart still land
+            // in the same close_time and produce identical ledger hashes.
+            .or_else(|| consensus.latest_peer_close_time())
             .unwrap_or_else(|| {
                 let res = consensus.adaptive_close_time().resolution();
                 rxrpl_consensus::round_close_time(pending_close_time, res)
