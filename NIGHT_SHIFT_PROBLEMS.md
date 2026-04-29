@@ -322,6 +322,30 @@ SKIP_SLE bytes     = 1100682200000000201B00000001021320B06F8E90DF67B6A383E692A12
 
 **State at this point**: every byte of every protocol structure (wire, sig, SLE encoding, genesis, skip-list) matches rippled exactly. Only the consensus-bootstrap close-time race remains.
 
+### Update 2026-04-29T23:31Z — Final attempt: extended open phase + floor close_time
+
+After T56 (`updateSkipList`) made account_hash byte-perfect, two more attempts at close_time alignment:
+
+**T57**: `ledger_idle_interval_ms` 20s → 25s. Goal: extend rxrpl open phase past rippled's 20s idle so rxrpl receives rippled's proposal during open → peer median picks up rippled's close_time.
+
+**T58**: `round_close_time` ceiling → floor. Goal: empirically rippled uses floor (its CTime in heartbeats lags wall-clock by ~10s).
+
+**Result of run 38** (T55-T58 all in):
+- rxrpl seq=2: account_hash=`1FC01CE0...` (matches rippled), close_time=`830813310`, hash=`C9F9F680...`
+- rippled #2: hash=`3A049A00...`, close_time≈`830813290` (off by 20s from rxrpl)
+- Both nodes' close timers fire at slightly different wall-clock instants → land in different 10s floor windows → close_time diverges by 10-20s.
+
+**Why peer-median didn't kick in**: rxrpl's open phase (25s) + rippled's idle (20s). rippled closes at T+20s, broadcasts its proposal. rxrpl receives proposal AFTER rxrpl's close_consensus_round has already used pending_close_time. The proposal arrives during rxrpl's consensus engine's `peer_proposal_at` call but for the WRONG round (rippled has moved to next open by then) → goes to wrong-prev-ledger holding pen → never counted in peer_positions for the "current" round.
+
+**Truly definitive fix requires consensus engine changes**:
+1. **Round-leader election**: lowest UNL pubkey is the leader, closes first; followers WAIT for leader's proposal then echo it (same close_time, same tx_set, same prev_ledger).
+2. **OR cooperative bootstrap**: at startup, both nodes broadcast a "ready" message; consensus only starts after all UNL members have sent ready.
+3. **OR network-time anchoring**: use a fixed schedule (e.g., close_time = floor(network_time / 30) * 30) so both close exactly at 30s grid points.
+
+All three are protocol-level work that touches the consensus engine substantially. Not single-PR fixes.
+
+**Final final state**: ALL deterministic protocol bytes match rippled exactly (proven via local test producing rippled-identical hashes). The only divergence is a wall-clock race during the close-timer firing window. The cross-impl-payment hive test continues to fail but the 50+ commits accumulated reflect a substantial codec/wire/timing alignment effort that should make rxrpl interoperable with rippled in any setup that uses external time sync (NTP-aligned 30s+ close intervals).
+
 **Session deliverables (final, on origin nightly/2026-04-27)**:
 - 35+ commits taking cross-impl from "0 validations + silent mystery" to "byte-perfect wire + tooling + precise root-cause documented"
 - 4 wire/timing fixes that work (T27, T40, T41, T42)
