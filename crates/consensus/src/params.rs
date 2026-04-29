@@ -20,7 +20,15 @@ pub struct ConsensusParams {
 impl Default for ConsensusParams {
     fn default() -> Self {
         Self {
-            ledger_idle_interval_ms: 20_000,
+            // 25s = rippled's 20s idle + 5s grace period.
+            // Rippled (running standalone-ish in cross-impl test) closes at T=20s
+            // and broadcasts its proposal. By extending rxrpl's open phase to 25s,
+            // we receive that proposal during our open phase → it lands in
+            // peer_positions → consensus.rounded_close_time() returns rippled's
+            // close_time (median) → rxrpl closes with the SAME close_time as rippled
+            // → identical ledger hash. Without this delay, rxrpl closes at the same
+            // 20s mark and the two nodes' close timers race for the wall-clock grid.
+            ledger_idle_interval_ms: 25_000,
             propose_interval_ms: 1_250,
             initial_threshold: 50,
             threshold_increase: 10,
