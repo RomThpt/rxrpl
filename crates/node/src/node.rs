@@ -2017,10 +2017,14 @@ impl Node {
         genesis_address: &str,
         node_store: &Option<Arc<dyn NodeStore>>,
     ) -> Result<Ledger, NodeError> {
-        let mut genesis = match node_store {
-            Some(store) => Ledger::genesis_with_store(Arc::clone(store)),
-            None => Ledger::genesis(),
-        };
+        // ALWAYS use store-less genesis: store-backed SHAMap produces a
+        // different root_hash than store-less for identical content (likely
+        // because the in-memory tree uses a different hash propagation path).
+        // For cross-impl genesis convergence we need deterministic root_hash,
+        // so build genesis without the store. Subsequent ledgers can use the
+        // store via flush+compact after genesis is constructed.
+        let _ = node_store;
+        let mut genesis = Ledger::genesis();
 
         let account_id = decode_account_id(genesis_address)
             .map_err(|e| NodeError::Config(format!("invalid genesis address: {e}")))?;
@@ -2047,14 +2051,10 @@ impl Node {
             .map_err(|e| NodeError::Config(format!("failed to encode genesis account: {e}")))?;
         genesis.put_state(key, data)?;
 
-        // FeeSettings intentionally omitted from genesis: rippled doesn't
-        // include it in fresh-network genesis #1 either (it's introduced via
-        // amendment). Including it makes rxrpl's genesis state map differ
-        // from rippled's, producing different ledger #1 hashes and breaking
-        // cross-impl convergence from the very first ledger.
-        // FeeSettings defaults are now provided in-memory via FeeSettings::default()
-        // for the tx engine, not via the state map.
-        // Self::insert_genesis_fee_settings(&mut genesis)?;
+        // FeeSettings IS in rippled's genesis (verified by querying rippled
+        // standalone via ledger_data: master AccountRoot + FeeSettings +
+        // LedgerHashes). Without FeeSettings, rxrpl's genesis hash diverges.
+        Self::insert_genesis_fee_settings(&mut genesis)?;
 
         genesis.close(0, 0)?;
         Ok(genesis)
