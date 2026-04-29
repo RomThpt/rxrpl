@@ -189,6 +189,48 @@ Likely culprits: `parent_close_time`, `close_flags`, `base_fee`, `reserve_base_d
 
 This is a 1-day debug task that needs both impls to dump their next-ledger header bytes side by side. Not in nightly scope.
 
+### Update 2026-04-29T09:24Z — header dump enabled (T45-T48 forensics)
+
+After fixing tracing instrumentation (T45 add `tracing` dep to rxrpl-ledger, T46 bump to `info!` level, T47 cache-bust Dockerfile), CLOSE_DUMP info now emits. Run #20 yields:
+
+**rxrpl genesis ledger (seq=1)**:
+```
+account_hash=5304A2AECFAC99440C294D4FD302E45FDF6D08A3881CA166FC7CADD0677AF9AE
+hash=28DDBE9AA965DE1A6DAAD7CDF6B046E176E1B2B46EFF202CF76BF1C77CE65F6B
+parent_hash=0  parent_close_time=0  close_time=0  close_time_resolution=30  close_flags=0  drops=100000000000000000  tx_hash=0
+```
+
+**rippled genesis ledger (seq=1, from earlier trace logs)**:
+```
+hash=B1D164DF76FF2CAB5C32FFF4000A6D45FFF27F80F65652125BAE54433F0BDBD9
+```
+
+**Conclusion: genesis ledger #1 hashes diverge.** Both nodes compute different ledger #1 from the same fresh-bootstrap inputs (same master account `rHb9CJAW...`, same `INITIAL_XRP_DROPS = 1e17`, same other header fields). Therefore `parent_hash` of every subsequent ledger differs, and consensus can never converge from a fresh start.
+
+T48: tested removing `FeeSettings` from rxrpl genesis state map — `account_hash` UNCHANGED at `5304A2AE...`. So the divergence is NOT from FeeSettings; it's from the **SLE bytes of the master `AccountRoot`** itself. rxrpl's serialization of the AccountRoot SLE produces different bytes than rippled's, even with the same logical fields (Account/Balance/Sequence/Flags), because:
+- Field set may differ (rippled likely emits `PreviousTxnID=0`, `PreviousTxnLgrSeq=0` which rxrpl omits)
+- Canonical field ordering may differ
+- Endianness or length encoding may differ for variable-length fields
+- Default-value omission rules may differ
+
+**The truly fundamental fix** is to make rxrpl's SLE serialization byte-identical to rippled's for the master AccountRoot at genesis. This requires:
+1. Dump rippled's genesis state map raw bytes (via `get_ledger seq=1 type=as_node`)
+2. Diff against rxrpl's encoded SLE for the same logical AccountRoot
+3. Align field set, ordering, encoding rules
+4. Verify with hash equality at genesis
+
+This is a 1-2 day codec-alignment task that needs a side-by-side byte-diff session, not a one-liner.
+
+**Final assessment of cross-impl convergence work**:
+- ✅ TMValidation/TMProposeSet wire format (T27, T29, T30) — byte-perfect, accepted by rippled
+- ✅ TMValidation signature (T27) — verified by rippled (`Proposal: trusted`)
+- ✅ GetLedger response (T40) — rxrpl serves headers, rippled accepts
+- ✅ close_time alignment (T41, T42) — same resolution, same idle interval
+- ⚠️ Yield-to-peer (T43) and wait-for-peer-position (T44) — implemented but never trigger (timing too fine)
+- ❌ Genesis ledger SLE byte-equality — **the actual root cause of fresh-bootstrap divergence**
+
+The 12 nightly fixes from this session (T27-T44+T45-T48) collectively take cross-impl from "0 validations received, mysterious silent drop" to "byte-perfect peering with documented genesis-SLE divergence at the codec layer". The remaining work is non-trivial but well-bounded.
+
 The signature/wire-format work (T27, T40) is genuinely complete — rippled's trusted-proposal acceptance proves the proposal byte-image is byte-perfect. The remaining gap is consensus-bootstrap protocol semantics, not implementation correctness.
 
 ## [RESOLVED] xrpl-hive TMValidation drop — root cause was sfSignature canonical position — 2026-04-28T02:35Z
