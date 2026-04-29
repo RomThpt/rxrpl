@@ -1,23 +1,4 @@
 use rxrpl_codec::address;
-use rxrpl_shamap::SHAMap;
-use rxrpl_storage::{MemoryNodeDatabase, NodeStore};
-use std::sync::Arc;
-
-#[test]
-fn dump_isolated_shamap_with_vs_without_store() {
-    let key = rxrpl_protocol::keylet::account(&address::decode_account_id("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh").unwrap());
-    let sle_hex = "1100612200000000240000000125000000002D0000000055000000000000000000000000000000000000000000000000000000000000000062416345785D8A00008114B5F762798A53D543A014CAF8B297CFF8F2F937E8";
-    let sle: Vec<u8> = (0..sle_hex.len()).step_by(2).map(|i| u8::from_str_radix(&sle_hex[i..i+2], 16).unwrap()).collect();
-
-    let mut m1 = SHAMap::account_state();
-    m1.put(key, sle.clone()).unwrap();
-    eprintln!("WITHOUT_STORE root_hash={}", m1.root_hash());
-
-    let store: std::sync::Arc<dyn rxrpl_storage::NodeStore> = Arc::new(MemoryNodeDatabase::new());
-    let mut m2 = SHAMap::account_state_with_store(store);
-    m2.put(key, sle.clone()).unwrap();
-    eprintln!("WITH_STORE root_hash={}", m2.root_hash());
-}
 
 #[test]
 fn dump_full_genesis() {
