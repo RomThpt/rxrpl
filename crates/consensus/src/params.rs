@@ -20,15 +20,14 @@ pub struct ConsensusParams {
 impl Default for ConsensusParams {
     fn default() -> Self {
         Self {
-            // 25s = rippled's 20s idle + 5s grace period.
-            // Rippled (running standalone-ish in cross-impl test) closes at T=20s
-            // and broadcasts its proposal. By extending rxrpl's open phase to 25s,
-            // we receive that proposal during our open phase → it lands in
-            // peer_positions → consensus.rounded_close_time() returns rippled's
-            // close_time (median) → rxrpl closes with the SAME close_time as rippled
-            // → identical ledger hash. Without this delay, rxrpl closes at the same
-            // 20s mark and the two nodes' close timers race for the wall-clock grid.
-            ledger_idle_interval_ms: 25_000,
+            // 5s open phase for fast rounds (~17s/round = 5s open + ~12s establish
+            // max). Cross-impl bootstrap protected separately by the "wait for
+            // first peer status" gate in close_consensus_round — without that,
+            // 5s would close before peer connects (~17s to first StatusChange)
+            // and #2 would diverge. With both fixes: bootstrap waits for peer,
+            // then steady-state runs at rippled's pace so rxrpl can produce
+            // validations fast enough for rippled to advance under quorum=2.
+            ledger_idle_interval_ms: 5_000,
             propose_interval_ms: 1_250,
             initial_threshold: 50,
             threshold_increase: 10,

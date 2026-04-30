@@ -1026,6 +1026,28 @@ impl Node {
             let mut syncing = false;
             let mut max_peer_seq: u32 = 0;
             let mut pending_close_time = 0u32;
+            // Cross-impl bootstrap gate: defer first close until at least one
+            // peer has announced its sequence (max_peer_seq > 0). Without this,
+            // a fast 5s open closes #2 before peer connects (~17s for rippled
+            // StatusChange) and the bootstrap-yield can't fire. After grace
+            // period (60s) we proceed even without peer — that's solo mode.
+            let mut first_close_completed: bool = false;
+            let startup_instant = tokio::time::Instant::now();
+            const FIRST_CLOSE_GRACE: Duration = Duration::from_secs(60);
+            // Cross-impl close-race guard: track last time we observed a peer
+            // StatusChange. If peer is alive but BEHIND our open seq, defer
+            // close to give peer time to advance — that way peer announces
+            // first and rxrpl yields/adopts (deterministic convergence) instead
+            // of racing peer with own close (which risks close_time bucket
+            // mismatch and divergent hashes). Capped at PEER_WAIT_GRACE so a
+            // truly offline peer doesn't block us forever.
+            let mut last_peer_status_at: Option<tokio::time::Instant> = None;
+            // round_open_at: timestamp when the current open seq was opened.
+            // Used to bound how long we'll defer close waiting for peer.
+            let mut round_open_at: Option<tokio::time::Instant> = None;
+            let mut last_round_seq: u32 = 0;
+            const PEER_WAIT_GRACE: Duration = Duration::from_secs(30);
+            const PEER_ALIVE_WINDOW: Duration = Duration::from_secs(30);
             // Counter for how many close ticks we've deferred waiting for a
             // peer position. Caps the wait at ~10s extra so an offline peer
             // doesn't block our progress forever.
@@ -1112,6 +1134,24 @@ impl Node {
                         if let Some(action) = timer.tick() {
                             match action {
                                 TimerAction::CloseLedger => {
+                                    // First-close gate: in cross-impl mode, peer connection
+                                    // takes ~17s. With 5s open, we'd fire CloseLedger before
+                                    // peer is observable (max_peer_seq still 0) and the
+                                    // bootstrap-yield wouldn't trigger. Defer until peer has
+                                    // announced a sequence, capped by FIRST_CLOSE_GRACE for
+                                    // solo mode (no peer at all).
+                                    if !first_close_completed
+                                        && max_peer_seq == 0
+                                        && startup_instant.elapsed() < FIRST_CLOSE_GRACE
+                                    {
+                                        tracing::debug!(
+                                            "deferring first close: no peer status yet (elapsed {:?})",
+                                            startup_instant.elapsed()
+                                        );
+                                        timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
+                                        continue;
+                                    }
+
                                     // XRPL NetClock = seconds since 2000-01-01 UTC.
                                     // See the matching comment in the consensus
                                     // task above; passing Unix epoch here would
@@ -1123,6 +1163,12 @@ impl Node {
                                     let seq = l.header.sequence;
                                     let parent_close_time = l.header.parent_close_time;
                                     drop(l);
+
+                                    // Reset round timer when seq advances (new open ledger).
+                                    if last_round_seq != seq {
+                                        round_open_at = Some(tokio::time::Instant::now());
+                                        last_round_seq = seq;
+                                    }
 
                                     // Cross-impl close_time selection priority:
                                     // 1) Latest observed peer close_time (rippled's CTime) — adopt
@@ -1146,12 +1192,39 @@ impl Node {
                                     }
                                     .max(parent_close_time.saturating_add(1));
 
-                                    // Yield-to-peer-leader: if any observed peer is on a later
-                                    // sequence, do NOT close our own ledger — wait for catchup
-                                    // (proposal-driven holding-pen → GetLedger → reconstruct).
-                                    if max_peer_seq > seq {
+                                    // Cross-impl close strategy:
+                                    //  1) peer ahead/equal (max_peer_seq >= seq) → yield + adopt
+                                    //     peer's chain. Broadcast our validation for adopted hash
+                                    //     so peer reaches quorum.
+                                    //  2) peer behind (max_peer_seq < seq) AND peer alive (recent
+                                    //     StatusChange) AND we haven't waited too long → defer
+                                    //     to let peer advance to our seq. Avoids the close_time
+                                    //     race where we close before peer announces and produce
+                                    //     a divergent bucket → divergent hash.
+                                    //  3) peer behind AND (peer dead OR waited too long) →
+                                    //     close own.
+                                    let peer_alive = last_peer_status_at
+                                        .map(|t| t.elapsed() < PEER_ALIVE_WINDOW)
+                                        .unwrap_or(false);
+                                    let peer_at_or_past = max_peer_seq > 0 && max_peer_seq >= seq;
+                                    let waited = round_open_at
+                                        .map(|t| t.elapsed())
+                                        .unwrap_or(Duration::ZERO);
+                                    let peer_behind_alive = max_peer_seq > 0
+                                        && max_peer_seq < seq
+                                        && peer_alive
+                                        && waited < PEER_WAIT_GRACE;
+                                    if peer_behind_alive {
                                         tracing::debug!(
-                                            "yielding close: peer at seq {} > our open seq {}",
+                                            "deferring close: peer at seq {} < our seq {}, waited {:?}",
+                                            max_peer_seq, seq, waited
+                                        );
+                                        timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
+                                        continue;
+                                    }
+                                    if peer_at_or_past {
+                                        tracing::debug!(
+                                            "yielding close: peer at seq {} >= our open seq {}",
                                             max_peer_seq, seq
                                         );
                                         timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
@@ -1186,6 +1259,7 @@ impl Node {
                                         continue;
                                     }
 
+                                    first_close_completed = true;
                                     pending_close_time = close_time;
                                     timer.on_phase_change(consensus.phase());
 
@@ -1504,6 +1578,7 @@ impl Node {
                                 if peer_seq > max_peer_seq {
                                     max_peer_seq = peer_seq;
                                 }
+                                last_peer_status_at = Some(tokio::time::Instant::now());
                                 // --starting-ledger=recent: once we know a
                                 // peer's current sequence, lock the anchor
                                 // target at `peer_seq - 1024` (saturating).
@@ -1574,7 +1649,14 @@ impl Node {
                                             }
                                             drop(history);
 
-                                            if syncing {
+                                            // Adopt if either:
+                                            //  - We're in explicit sync mode (peer was way ahead), OR
+                                            //  - The reconstructed ledger IS our current open seq
+                                            //    (cross-impl yield path: we asked for peer's #N
+                                            //    while our open=#N to follow peer's chain).
+                                            let our_open_seq = ledger_seq_shared.load(Ordering::Relaxed);
+                                            let should_adopt = syncing || seq == our_open_seq;
+                                            if should_adopt {
                                                 // Adopt the reconstructed ledger: open ledger becomes N+1
                                                 let new_open = Ledger::new_open(&reconstructed);
                                                 let new_seq = new_open.header.sequence;
@@ -1587,6 +1669,56 @@ impl Node {
                                                     "sync: adopted ledger #{}, open ledger is now #{}",
                                                     seq, new_seq
                                                 );
+
+                                                // Cross-impl: broadcast a validation signed by us
+                                                // for the adopted ledger. Without this, peer's
+                                                // quorum (=2) is never met since rxrpl never
+                                                // produces a validation matching peer's hash.
+                                                // We adopt peer's exact bytes, sign with our key,
+                                                // and broadcast — peer receives 2 validations
+                                                // (own + ours) for the same hash, reaches quorum,
+                                                // advances validated_ledger.
+                                                {
+                                                    use rxrpl_consensus::types::Validation;
+                                                    use rxrpl_primitives::Hash256;
+                                                    let our_amendment_votes =
+                                                        amendment_table.read().await.get_votes();
+                                                    // sign_time = current wall-clock NetClock so
+                                                    // rippled's freshness check accepts it. Using
+                                                    // the (potentially old) ledger close_time would
+                                                    // get the validation rejected as stale.
+                                                    let now_netclock = std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .unwrap_or_default()
+                                                        .as_secs()
+                                                        .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
+                                                    let mut validation = Validation {
+                                                        node_id: rxrpl_consensus::types::NodeId(Hash256::new(identity.node_id.0)),
+                                                        public_key: identity.public_key_bytes().to_vec(),
+                                                        ledger_hash: reconstructed.header.hash,
+                                                        ledger_seq: seq,
+                                                        full: true,
+                                                        close_time: reconstructed.header.close_time,
+                                                        sign_time: now_netclock,
+                                                        signature: None,
+                                                        amendments: our_amendment_votes,
+                                                        signing_payload: None,
+                                                        ..Default::default()
+                                                    };
+                                                    identity.sign_validation(&mut validation);
+                                                    let payload = rxrpl_overlay::proto_convert::encode_validation(
+                                                        &validation,
+                                                        identity.public_key_bytes(),
+                                                    );
+                                                    let _ = cmd_tx_catchup.send(OverlayCommand::Broadcast {
+                                                        msg_type: rxrpl_p2p_proto::MessageType::Validation,
+                                                        payload,
+                                                    });
+                                                    tracing::debug!(
+                                                        "adopted ledger #{} validated by us, broadcast Validation",
+                                                        seq
+                                                    );
+                                                }
 
                                                 // Use both max_peer_seq and highest validated
                                                 // to determine if sync is complete
