@@ -72,6 +72,8 @@ impl Transactor for TicketCreateTransactor {
             ctx.view
                 .insert(ticket_key, ticket_bytes)
                 .map_err(|_| TransactionResult::TemMalformed)?;
+            crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &ticket_key)
+                .map_err(|_| TransactionResult::TemMalformed)?;
         }
 
         // Update account: advance sequence past all tickets, increase owner count

@@ -72,6 +72,8 @@ impl Transactor for MPTokenIssuanceCreateTransactor {
             .insert(issuance_key, issuance_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
+        crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &issuance_key)?;
+
         // Update account
         helpers::increment_sequence(&mut acct);
         helpers::adjust_owner_count(&mut acct, 1);
