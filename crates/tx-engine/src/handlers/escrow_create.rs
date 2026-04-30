@@ -50,6 +50,21 @@ impl Transactor for EscrowCreateTransactor {
             return Err(TransactionResult::TecUnfundedPayment);
         }
 
+        // RequireDestTag enforcement on destination.
+        let destination_str = helpers::get_destination(ctx.tx)?;
+        if let Ok((_, dst_account)) = helpers::read_account_by_address(ctx.view, destination_str) {
+            const LSF_REQUIRE_DEST_TAG: u32 = 0x00020000;
+            let dst_flags = dst_account
+                .get("Flags")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            if dst_flags & LSF_REQUIRE_DEST_TAG != 0
+                && helpers::get_u32_field(ctx.tx, "DestinationTag").is_none()
+            {
+                return Err(TransactionResult::TecDstTagNeeded);
+            }
+        }
+
         Ok(())
     }
 
