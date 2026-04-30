@@ -91,6 +91,8 @@ impl Transactor for XChainCreateBridgeTransactor {
             .insert(bridge_key, entry_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
+        crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &bridge_key)?;
+
         // Update source account: increment owner count and sequence
         let src_key = keylet::account(&account_id);
         let src_bytes = ctx

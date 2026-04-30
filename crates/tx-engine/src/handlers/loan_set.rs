@@ -304,6 +304,8 @@ impl Transactor for LoanSetTransactor {
             .insert(loan_key, loan_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
+        crate::owner_dir::add_to_owner_dir(ctx.view, &broker_owner_id, &loan_key)?;
+
         // Update broker: increment LoanSequence, OwnerCount, DebtTotal
         broker["LoanSequence"] = serde_json::Value::from(loan_sequence + 1);
         broker["OwnerCount"] = serde_json::Value::from(broker_owner_count + 1);

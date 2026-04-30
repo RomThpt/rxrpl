@@ -93,6 +93,7 @@ impl Transactor for DelegateSetTransactor {
                 .insert(delegate_key, entry_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
 
+            crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &delegate_key)?;
             helpers::adjust_owner_count(&mut account, 1);
         }
 
@@ -101,6 +102,7 @@ impl Transactor for DelegateSetTransactor {
                 .map_err(|_| TransactionResult::TemInvalidAccountId)?;
             let delegate_key = keylet::delegate(&account_id, &auth_id);
 
+            crate::owner_dir::remove_from_owner_dir(ctx.view, &account_id, &delegate_key)?;
             ctx.view
                 .erase(&delegate_key)
                 .map_err(|_| TransactionResult::TefInternal)?;
