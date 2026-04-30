@@ -71,7 +71,25 @@ impl Transactor for PaymentTransactor {
 
         // Check destination exists
         let dst_key = keylet::account(&dst_id);
-        let _dst_exists = ctx.view.exists(&dst_key);
+        let dst_bytes = ctx.view.read(&dst_key);
+        let _dst_exists = dst_bytes.is_some();
+
+        // DepositAuth: if destination has lsfDepositAuth set, the source must
+        // either be the destination itself OR be pre-authorized via a
+        // DepositPreauth ledger entry. Self-payments are always allowed.
+        // Mirrors rippled's checkDeposit logic.
+        if let Some(bytes) = &dst_bytes {
+            if let Ok(dst_account) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                let dst_flags = dst_account.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                const LSF_DEPOSIT_AUTH: u32 = 0x01000000;
+                if dst_flags & LSF_DEPOSIT_AUTH != 0 && account_str != destination_str {
+                    let preauth_key = keylet::deposit_preauth(&dst_id, &src_id);
+                    if !ctx.view.exists(&preauth_key) {
+                        return Err(TransactionResult::TecNoPermission);
+                    }
+                }
+            }
+        }
 
         // IOU path: trust line existence is checked in apply; here we only
         // need the source account itself (for fee deduction by the engine).
