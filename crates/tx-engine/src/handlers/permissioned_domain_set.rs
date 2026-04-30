@@ -83,6 +83,7 @@ impl Transactor for PermissionedDomainSetTransactor {
             ctx.view
                 .insert(domain_key, entry_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
+            crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &domain_key)?;
             helpers::adjust_owner_count(&mut account, 1);
         } else {
             let entry_bytes = ctx

@@ -139,6 +139,8 @@ impl Transactor for MPTokenAuthorizeTransactor {
                     .insert(mptoken_key, mptoken_data)
                     .map_err(|_| TransactionResult::TefInternal)?;
 
+                crate::owner_dir::add_to_owner_dir(ctx.view, holder_id, &mptoken_key)?;
+
                 // +1 owner count on holder
                 let acct_key = keylet::account(holder_id);
                 let acct_bytes = ctx
@@ -159,6 +161,7 @@ impl Transactor for MPTokenAuthorizeTransactor {
             } else {
                 // Delete MPToken entry (holder opt-out)
                 let mptoken_key = keylet::mptoken(issuance_key.as_bytes(), holder_id);
+                crate::owner_dir::remove_from_owner_dir(ctx.view, holder_id, &mptoken_key)?;
                 ctx.view
                     .erase(&mptoken_key)
                     .map_err(|_| TransactionResult::TefInternal)?;

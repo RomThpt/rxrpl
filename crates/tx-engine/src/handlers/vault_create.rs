@@ -84,6 +84,8 @@ impl Transactor for VaultCreateTransactor {
             .insert(vault_key, vault_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
+        crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &vault_key)?;
+
         // Update account: increment sequence, +1 owner count
         helpers::increment_sequence(&mut account);
         helpers::adjust_owner_count(&mut account, 1);
