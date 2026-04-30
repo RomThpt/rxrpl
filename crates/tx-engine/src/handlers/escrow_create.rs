@@ -109,6 +109,12 @@ impl Transactor for EscrowCreateTransactor {
         if let Some(condition) = helpers::get_str_field(ctx.tx, "Condition") {
             escrow["Condition"] = serde_json::Value::String(condition.to_string());
         }
+        if let Some(source_tag) = helpers::get_u32_field(ctx.tx, "SourceTag") {
+            escrow["SourceTag"] = serde_json::Value::from(source_tag);
+        }
+        if let Some(destination_tag) = helpers::get_u32_field(ctx.tx, "DestinationTag") {
+            escrow["DestinationTag"] = serde_json::Value::from(destination_tag);
+        }
 
         let escrow_data =
             serde_json::to_vec(&escrow).map_err(|_| TransactionResult::TefInternal)?;
