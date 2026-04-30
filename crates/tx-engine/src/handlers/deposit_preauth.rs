@@ -96,6 +96,7 @@ impl Transactor for DepositPreauthTransactor {
                 .insert(dp_key, entry_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
 
+            crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &dp_key)?;
             helpers::adjust_owner_count(&mut account, 1);
         }
 
@@ -104,6 +105,7 @@ impl Transactor for DepositPreauthTransactor {
                 .map_err(|_| TransactionResult::TemInvalidAccountId)?;
             let dp_key = keylet::deposit_preauth(&account_id, &auth_id);
 
+            crate::owner_dir::remove_from_owner_dir(ctx.view, &account_id, &dp_key)?;
             ctx.view
                 .erase(&dp_key)
                 .map_err(|_| TransactionResult::TefInternal)?;
