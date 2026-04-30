@@ -81,6 +81,15 @@ impl Transactor for CheckCreateTransactor {
         if let Some(expiration) = helpers::get_u32_field(ctx.tx, "Expiration") {
             check["Expiration"] = serde_json::Value::from(expiration);
         }
+        if let Some(source_tag) = helpers::get_u32_field(ctx.tx, "SourceTag") {
+            check["SourceTag"] = serde_json::Value::from(source_tag);
+        }
+        if let Some(destination_tag) = helpers::get_u32_field(ctx.tx, "DestinationTag") {
+            check["DestinationTag"] = serde_json::Value::from(destination_tag);
+        }
+        if let Some(invoice_id) = helpers::get_str_field(ctx.tx, "InvoiceID") {
+            check["InvoiceID"] = serde_json::Value::String(invoice_id.to_string());
+        }
 
         let check_data = serde_json::to_vec(&check).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
