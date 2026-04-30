@@ -2,7 +2,11 @@ use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
+use crate::owner_dir::add_to_owner_dir;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
+
+/// lsfAccepted flag — set when issuer == subject (auto-accepted).
+const LSF_ACCEPTED: u32 = 0x00010000;
 
 /// Maximum length of CredentialType field in characters.
 const MAX_CREDENTIAL_TYPE_LEN: usize = 128;
@@ -69,18 +73,30 @@ impl Transactor for CredentialCreateTransactor {
         let credential_type = helpers::get_str_field(ctx.tx, "CredentialType").unwrap();
         let cred_key = keylet::credential(&subject_id, &issuer_id, credential_type.as_bytes());
 
-        let entry = serde_json::json!({
+        // Auto-accept when issuer == subject (rippled behavior).
+        let auto_accept = subject_id == issuer_id;
+        let mut entry = serde_json::json!({
             "LedgerEntryType": "Credential",
             "Subject": subject_str,
             "Issuer": issuer_str,
             "CredentialType": credential_type,
-            "Accepted": false,
-            "Flags": 0,
+            "Accepted": auto_accept,
+            "Flags": if auto_accept { LSF_ACCEPTED } else { 0 },
         });
+        if let Some(uri) = helpers::get_str_field(ctx.tx, "URI") {
+            entry["URI"] = serde_json::Value::String(uri.to_string());
+        }
+        if let Some(expiration) = helpers::get_u32_field(ctx.tx, "Expiration") {
+            entry["Expiration"] = serde_json::Value::from(expiration);
+        }
         let entry_data = serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .insert(cred_key, entry_data)
             .map_err(|_| TransactionResult::TefInternal)?;
+
+        // Add credential to issuer's owner directory so account_objects can
+        // surface it via the ?type=credential filter.
+        add_to_owner_dir(ctx.view, &issuer_id, &cred_key)?;
 
         helpers::adjust_owner_count(&mut account, 1);
 
