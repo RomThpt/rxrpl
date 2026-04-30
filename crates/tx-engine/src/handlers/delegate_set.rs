@@ -81,12 +81,15 @@ impl Transactor for DelegateSetTransactor {
                 decode_account_id(authorize).map_err(|_| TransactionResult::TemInvalidAccountId)?;
             let delegate_key = keylet::delegate(&account_id, &auth_id);
 
-            let entry = serde_json::json!({
+            let mut entry = serde_json::json!({
                 "LedgerEntryType": "Delegate",
                 "Account": account_str,
                 "Authorize": authorize,
                 "Flags": 0,
             });
+            if let Some(permissions) = ctx.tx.get("Permissions") {
+                entry["Permissions"] = permissions.clone();
+            }
             let entry_data =
                 serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
