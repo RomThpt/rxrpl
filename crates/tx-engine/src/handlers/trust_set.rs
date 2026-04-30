@@ -37,6 +37,19 @@ impl Transactor for TrustSetTransactor {
             }
         }
 
+        // Zero limit with non-zero QualityIn/QualityOut is malformed (rippled
+        // doesn't allow setting quality on a zero trust line).
+        let limit_value = limit.get("value").and_then(|v| v.as_str()).unwrap_or("0");
+        let limit_zero =
+            limit_value == "0" || limit_value.parse::<f64>().map(|f| f == 0.0).unwrap_or(false);
+        if limit_zero {
+            let qi = helpers::get_u32_field(ctx.tx, "QualityIn").unwrap_or(0);
+            let qo = helpers::get_u32_field(ctx.tx, "QualityOut").unwrap_or(0);
+            if qi != 0 || qo != 0 {
+                return Err(TransactionResult::TemMalformed);
+            }
+        }
+
         Ok(())
     }
 
@@ -58,8 +71,33 @@ impl Transactor for TrustSetTransactor {
         let issuer_id =
             decode_account_id(issuer_str).map_err(|_| TransactionResult::TemBadIssuer)?;
         let issuer_key = keylet::account(&issuer_id);
-        if !ctx.view.exists(&issuer_key) {
-            return Err(TransactionResult::TecNoDst);
+        let issuer_bytes = ctx
+            .view
+            .read(&issuer_key)
+            .ok_or(TransactionResult::TecNoDst)?;
+
+        // DisallowIncomingTrustline: if issuer set asfDisallowIncomingTrustline
+        // (lsfDisallowIncomingTrustline = 0x40000000), reject TrustSet from a
+        // different account. Holder must already trust BEFORE issuer turns the
+        // flag on; new incoming trust lines are blocked.
+        let issuer_account: serde_json::Value = serde_json::from_slice(&issuer_bytes)
+            .map_err(|_| TransactionResult::TefInternal)?;
+        let issuer_flags = issuer_account
+            .get("Flags")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        const LSF_DISALLOW_INCOMING_TRUSTLINE: u32 = 0x40000000;
+        if issuer_flags & LSF_DISALLOW_INCOMING_TRUSTLINE != 0 && account_str != issuer_str {
+            // Check if a trust line already exists between these two accounts;
+            // updating an existing line is allowed.
+            let existing = keylet::trust_line(
+                &account_id,
+                &issuer_id,
+                &currency_to_bytes(limit["currency"].as_str().unwrap_or("")),
+            );
+            if !ctx.view.exists(&existing) {
+                return Err(TransactionResult::TecNoPermission);
+            }
         }
 
         Ok(())
