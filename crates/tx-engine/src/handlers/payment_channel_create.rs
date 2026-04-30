@@ -39,7 +39,23 @@ impl Transactor for PaymentChannelCreateTransactor {
         let (_, src_account) = helpers::read_account_by_address(ctx.view, account_str)?;
 
         let destination_str = helpers::get_destination(ctx.tx)?;
-        helpers::read_account_by_address(ctx.view, destination_str)?;
+        let (_, dst_account) = helpers::read_account_by_address(ctx.view, destination_str)?;
+
+        // DisallowIncomingPayChan + RequireDestTag enforcement.
+        const LSF_DISALLOW_INCOMING_PAY_CHAN: u32 = 0x10000000;
+        const LSF_REQUIRE_DEST_TAG: u32 = 0x00020000;
+        let dst_flags = dst_account
+            .get("Flags")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        if dst_flags & LSF_DISALLOW_INCOMING_PAY_CHAN != 0 && account_str != destination_str {
+            return Err(TransactionResult::TecNoPermission);
+        }
+        if dst_flags & LSF_REQUIRE_DEST_TAG != 0
+            && helpers::get_u32_field(ctx.tx, "DestinationTag").is_none()
+        {
+            return Err(TransactionResult::TecDstTagNeeded);
+        }
 
         let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
         let fee = helpers::get_fee(ctx.tx);

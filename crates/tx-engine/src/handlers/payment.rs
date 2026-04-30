@@ -77,16 +77,23 @@ impl Transactor for PaymentTransactor {
         // DepositAuth: if destination has lsfDepositAuth set, the source must
         // either be the destination itself OR be pre-authorized via a
         // DepositPreauth ledger entry. Self-payments are always allowed.
-        // Mirrors rippled's checkDeposit logic.
+        // RequireDestTag: if destination has lsfRequireDestTag set, the tx
+        // must include a DestinationTag.
         if let Some(bytes) = &dst_bytes {
             if let Ok(dst_account) = serde_json::from_slice::<serde_json::Value>(bytes) {
                 let dst_flags = dst_account.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 const LSF_DEPOSIT_AUTH: u32 = 0x01000000;
+                const LSF_REQUIRE_DEST_TAG: u32 = 0x00020000;
                 if dst_flags & LSF_DEPOSIT_AUTH != 0 && account_str != destination_str {
                     let preauth_key = keylet::deposit_preauth(&dst_id, &src_id);
                     if !ctx.view.exists(&preauth_key) {
                         return Err(TransactionResult::TecNoPermission);
                     }
+                }
+                if dst_flags & LSF_REQUIRE_DEST_TAG != 0
+                    && helpers::get_u32_field(ctx.tx, "DestinationTag").is_none()
+                {
+                    return Err(TransactionResult::TecDstTagNeeded);
                 }
             }
         }
