@@ -107,6 +107,9 @@ impl Transactor for PaymentChannelCreateTransactor {
         if let Some(dst_tag) = helpers::get_u32_field(ctx.tx, "DestinationTag") {
             channel["DestinationTag"] = serde_json::Value::from(dst_tag);
         }
+        if let Some(src_tag) = helpers::get_u32_field(ctx.tx, "SourceTag") {
+            channel["SourceTag"] = serde_json::Value::from(src_tag);
+        }
 
         let channel_data =
             serde_json::to_vec(&channel).map_err(|_| TransactionResult::TefInternal)?;
