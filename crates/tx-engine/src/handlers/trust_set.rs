@@ -37,9 +37,14 @@ impl Transactor for TrustSetTransactor {
             }
         }
 
+        // Negative limit is invalid (rippled returns temBAD_LIMIT).
+        let limit_value = limit.get("value").and_then(|v| v.as_str()).unwrap_or("0");
+        if limit_value.starts_with('-') {
+            return Err(TransactionResult::TemBadLimit);
+        }
+
         // Zero limit with non-zero QualityIn/QualityOut is malformed (rippled
         // doesn't allow setting quality on a zero trust line).
-        let limit_value = limit.get("value").and_then(|v| v.as_str()).unwrap_or("0");
         let limit_zero =
             limit_value == "0" || limit_value.parse::<f64>().map(|f| f == 0.0).unwrap_or(false);
         if limit_zero {
@@ -86,7 +91,7 @@ impl Transactor for TrustSetTransactor {
             .get("Flags")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
-        const LSF_DISALLOW_INCOMING_TRUSTLINE: u32 = 0x40000000;
+        const LSF_DISALLOW_INCOMING_TRUSTLINE: u32 = 0x20000000;
         if issuer_flags & LSF_DISALLOW_INCOMING_TRUSTLINE != 0 && account_str != issuer_str {
             // Check if a trust line already exists between these two accounts;
             // updating an existing line is allowed.
