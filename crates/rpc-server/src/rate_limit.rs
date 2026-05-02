@@ -30,8 +30,13 @@ use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 
-const TOKENS_BURST: u64 = 100;
-const TOKENS_PER_SEC: u64 = 10;
+// Token bucket: 1000-token burst, 100 tokens/s refill. Steady throughput is
+// 100 req/s per IP with a 1000-burst absorber. Tuned for batch RPC clients
+// (xrpl-hive txcompat) and operator tools that legitimately fire dozens of
+// requests in the first second of a test. Still mitigates trivial floods —
+// an attacker hammering a single IP at >100 req/s sustained will get HTTP 429.
+const TOKENS_BURST: u64 = 1000;
+const TOKENS_PER_SEC: u64 = 100;
 const EVICT_INTERVAL: Duration = Duration::from_secs(300);
 
 struct Bucket {
@@ -160,18 +165,26 @@ mod tests {
         for _ in 0..TOKENS_BURST {
             assert!(try_consume(ip, 1000));
         }
+        // Wind back the clock 1 second so the bucket refills exactly
+        // TOKENS_PER_SEC tokens.
         if let Some(mut entry) = BUCKETS.get_mut(&ip) {
-            entry.last_refill_unix_ms = entry.last_refill_unix_ms.saturating_sub(2_000);
+            entry.last_refill_unix_ms = entry.last_refill_unix_ms.saturating_sub(1_000);
         }
+        let attempts = (TOKENS_PER_SEC as usize) + 30;
         let mut admitted = 0;
-        for _ in 0..30 {
+        for _ in 0..attempts {
             if try_consume(ip, 1000) {
                 admitted += 1;
             }
         }
+        // Refill = TOKENS_PER_SEC tokens; allow ±20% jitter from the
+        // shared clock skew between BUCKETS init and the rewound time.
+        let lower = (TOKENS_PER_SEC * 8 / 10) as usize;
+        let upper = (TOKENS_PER_SEC * 12 / 10) as usize;
         assert!(
-            (15..=25).contains(&admitted),
-            "expected ~20 admitted, got {admitted}"
+            (lower..=upper).contains(&admitted),
+            "expected ~{} admitted (±20%), got {admitted}",
+            TOKENS_PER_SEC
         );
         BUCKETS.remove(&ip);
     }
