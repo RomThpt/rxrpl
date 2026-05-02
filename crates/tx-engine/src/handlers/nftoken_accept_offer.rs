@@ -341,6 +341,14 @@ impl NFTokenAcceptOfferTransactor {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
+        // If sell offer is targeted (has Destination), only that destination
+        // can accept it. Otherwise the offer is open to anyone.
+        if let Some(dst) = sell_offer.get("Destination").and_then(|v| v.as_str()) {
+            if dst != buyer_addr {
+                return Err(TransactionResult::TecNoPermission);
+            }
+        }
+
         // Transfer XRP from buyer to seller
         Self::transfer_xrp(ctx, buyer_addr, &seller_addr, amount)?;
         // Transfer token from seller to buyer
@@ -354,7 +362,7 @@ impl NFTokenAcceptOfferTransactor {
     fn accept_buy_offer(
         &self,
         ctx: &mut ApplyContext<'_>,
-        _seller_addr: &str,
+        seller_addr: &str,
         buy_hex: &str,
     ) -> Result<(), TransactionResult> {
         let (buy_key, buy_offer) = Self::read_offer(ctx, buy_hex)?;
@@ -371,11 +379,35 @@ impl NFTokenAcceptOfferTransactor {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
+        // Caller (seller) must own the NFT to accept a buy offer.
+        // Verify by checking the seller's NFTokenPage contains the token.
+        let seller_id = decode_account_id(seller_addr)
+            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let page_key = keylet::nftoken_page_min(&seller_id);
+        let owns = ctx
+            .view
+            .read(&page_key)
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|page| page.get("NFTokens").cloned())
+            .and_then(|tokens| tokens.as_array().cloned())
+            .map(|toks| {
+                toks.iter().any(|t| {
+                    t.get("NFTokenID")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == nftoken_id)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if !owns {
+            return Err(TransactionResult::TecNoPermission);
+        }
+
         // The accept caller is the token owner (seller)
         // Transfer XRP from buyer to seller (caller)
-        Self::transfer_xrp(ctx, &buyer_addr, _seller_addr, amount)?;
+        Self::transfer_xrp(ctx, &buyer_addr, seller_addr, amount)?;
         // Transfer token from seller (caller) to buyer
-        Self::transfer_token(ctx, &nftoken_id, _seller_addr, &buyer_addr)?;
+        Self::transfer_token(ctx, &nftoken_id, seller_addr, &buyer_addr)?;
         // Erase offer
         Self::erase_offer_and_adjust(ctx, &buy_key, &buyer_addr)?;
 
