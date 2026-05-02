@@ -31,6 +31,20 @@ impl Transactor for NFTokenCreateOfferTransactor {
             }
         }
 
+        // tfOnlyXRP flag is encoded in the first 16 bits of NFTokenID
+        // (big-endian). When set, any offer Amount MUST be XRP — IOU offers
+        // are rejected with temBAD_AMOUNT (mirrors rippled's checkAmount).
+        const NFT_FLAG_ONLY_XRP: u32 = 0x0002;
+        let nft_flags = u32::from_str_radix(&id[..4], 16).unwrap_or(0);
+        if nft_flags & NFT_FLAG_ONLY_XRP != 0 {
+            // If Amount is an IOU object (not a string), reject.
+            if let Some(amt) = ctx.tx.get("Amount") {
+                if amt.is_object() {
+                    return Err(TransactionResult::TemBadAmount);
+                }
+            }
+        }
+
         Ok(())
     }
 
