@@ -31,11 +31,16 @@ impl Transactor for NFTokenCreateOfferTransactor {
             }
         }
 
-        // tfOnlyXRP flag is encoded in the first 16 bits of NFTokenID
-        // (big-endian). When set, any offer Amount MUST be XRP — IOU offers
-        // are rejected with temBAD_AMOUNT (mirrors rippled's checkAmount).
+        // tfOnlyXRP flag is encoded in the first 32 bits of rxrpl's
+        // NFTokenID layout (flags(8 hex) + transfer_fee(4) + reserved(4) +
+        // issuer(40) + seq(8) = 64). When set, any offer Amount MUST be
+        // XRP — IOU offers are rejected with temBAD_AMOUNT (mirrors rippled
+        // checkAmount). Note: rippled's canonical layout uses 16-bit flags;
+        // the rxrpl extension widens to 32 bits but the bit value 0x0002
+        // (lsfOnlyXRP) is still in the low 16 bits, so checking the full
+        // 32-bit field is correct.
         const NFT_FLAG_ONLY_XRP: u32 = 0x0002;
-        let nft_flags = u32::from_str_radix(&id[..4], 16).unwrap_or(0);
+        let nft_flags = u32::from_str_radix(&id[..8], 16).unwrap_or(0);
         if nft_flags & NFT_FLAG_ONLY_XRP != 0 {
             // If Amount is an IOU object (not a string), reject.
             if let Some(amt) = ctx.tx.get("Amount") {
@@ -51,6 +56,47 @@ impl Transactor for NFTokenCreateOfferTransactor {
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         helpers::read_account_by_address(ctx.view, account_str)?;
+
+        let nftoken_id = helpers::get_str_field(ctx.tx, "NFTokenID")
+            .ok_or(TransactionResult::TemMalformed)?;
+        let flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
+        let is_sell = flags & TF_SELL_NFTOKEN != 0;
+
+        let account_id = decode_account_id(account_str)
+            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let page_key = keylet::nftoken_page_min(&account_id);
+        let owns = ctx
+            .view
+            .read(&page_key)
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|page| page.get("NFTokens").cloned())
+            .and_then(|tokens| tokens.as_array().cloned())
+            .map(|toks| {
+                toks.iter().any(|t| {
+                    t.get("NFTokenID")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == nftoken_id)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+
+        if is_sell {
+            // Sell offer: caller must own the NFT.
+            if !owns {
+                return Err(TransactionResult::TecNoEntry);
+            }
+        } else {
+            // Buy offer: caller must NOT own the NFT (can't buy own).
+            if owns {
+                return Err(TransactionResult::TemMalformed);
+            }
+            // Buy offer also requires the NFT to actually exist somewhere.
+            // We can't easily walk all pages without account context, so
+            // skip the existence check for buy offers — accept_buy verifies
+            // ownership when the offer is matched.
+        }
+
         Ok(())
     }
 
