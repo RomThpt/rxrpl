@@ -198,46 +198,134 @@ fn apply_iou(
     issuer: &str,
     value: &str,
 ) -> Result<TransactionResult, TransactionResult> {
-    if account_str != issuer {
-        // Non-issuer IOU send is not yet supported.
-        return Err(TransactionResult::TemMalformed);
-    }
-
-    let issuer_id =
+    let src_id =
         decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
     let dest_id =
         decode_account_id(destination_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-
+    let issuer_id =
+        decode_account_id(issuer).map_err(|_| TransactionResult::TemInvalidAccountId)?;
     let cur_bytes = helpers::currency_to_bytes(currency);
-    let trust_key = keylet::trust_line(&issuer_id, &dest_id, &cur_bytes);
-    let trust_bytes = ctx.view.read(&trust_key).ok_or(TransactionResult::TecPathDry)?;
-    let mut trust: serde_json::Value =
-        serde_json::from_slice(&trust_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-    let new_value = adjust_iou_balance(&trust, value, &issuer_id, &dest_id)?;
-    trust["Balance"]["value"] = serde_json::Value::String(new_value);
+    if account_str == issuer {
+        // Issuer mints IOUs into holder's trust line.
+        let trust_key = keylet::trust_line(&issuer_id, &dest_id, &cur_bytes);
+        let trust_bytes = ctx.view.read(&trust_key).ok_or(TransactionResult::TecPathDry)?;
+        let mut trust: serde_json::Value =
+            serde_json::from_slice(&trust_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-    let trust_data = serde_json::to_vec(&trust).map_err(|_| TransactionResult::TefInternal)?;
-    ctx.view
-        .update(trust_key, trust_data)
+        let new_value = adjust_iou_balance(&trust, value, &issuer_id, &dest_id)?;
+        trust["Balance"]["value"] = serde_json::Value::String(new_value);
+
+        let trust_data = serde_json::to_vec(&trust).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(trust_key, trust_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        let issuer_key = keylet::account(&issuer_id);
+        let issuer_bytes = ctx
+            .view
+            .read(&issuer_key)
+            .ok_or(TransactionResult::TerNoAccount)?;
+        let mut issuer_acct: serde_json::Value =
+            serde_json::from_slice(&issuer_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        helpers::increment_sequence(&mut issuer_acct);
+        let issuer_data =
+            serde_json::to_vec(&issuer_acct).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(issuer_key, issuer_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        return Ok(TransactionResult::TesSuccess);
+    }
+
+    // Non-issuer (holder-to-holder) IOU send: debit source's RippleState
+    // and credit destination's RippleState. Both must exist.
+    let send_value: f64 = value
+        .parse()
+        .map_err(|_| TransactionResult::TemBadAmount)?;
+    if send_value <= 0.0 {
+        return Err(TransactionResult::TemBadAmount);
+    }
+
+    // Source debits ITS trust line balance toward issuer.
+    let src_trust_key = keylet::trust_line(&src_id, &issuer_id, &cur_bytes);
+    let src_trust_bytes = ctx
+        .view
+        .read(&src_trust_key)
+        .ok_or(TransactionResult::TecPathDry)?;
+    let mut src_trust: serde_json::Value = serde_json::from_slice(&src_trust_bytes)
         .map_err(|_| TransactionResult::TefInternal)?;
 
-    // Bump issuer Sequence (engine deducts the XRP fee separately).
-    let issuer_key = keylet::account(&issuer_id);
-    let issuer_bytes = ctx
-        .view
-        .read(&issuer_key)
-        .ok_or(TransactionResult::TerNoAccount)?;
-    let mut issuer_acct: serde_json::Value =
-        serde_json::from_slice(&issuer_bytes).map_err(|_| TransactionResult::TefInternal)?;
-    helpers::increment_sequence(&mut issuer_acct);
-    let issuer_data =
-        serde_json::to_vec(&issuer_acct).map_err(|_| TransactionResult::TefInternal)?;
+    let new_src_value = adjust_iou_balance(
+        &src_trust,
+        &format!("-{}", value),
+        &issuer_id,
+        &src_id,
+    )?;
+    // Source must have sufficient balance (cannot go below 0 from holder's perspective).
+    let src_holder_balance = compute_holder_balance(&src_trust, &issuer_id, &src_id);
+    if src_holder_balance < send_value {
+        return Err(TransactionResult::TecPathPartial);
+    }
+    src_trust["Balance"]["value"] = serde_json::Value::String(new_src_value);
+    let src_trust_data =
+        serde_json::to_vec(&src_trust).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view
-        .update(issuer_key, issuer_data)
+        .update(src_trust_key, src_trust_data)
+        .map_err(|_| TransactionResult::TefInternal)?;
+
+    // Destination credits ITS trust line balance from issuer.
+    let dst_trust_key = keylet::trust_line(&dest_id, &issuer_id, &cur_bytes);
+    let dst_trust_bytes = ctx
+        .view
+        .read(&dst_trust_key)
+        .ok_or(TransactionResult::TecPathDry)?;
+    let mut dst_trust: serde_json::Value = serde_json::from_slice(&dst_trust_bytes)
+        .map_err(|_| TransactionResult::TefInternal)?;
+
+    let new_dst_value = adjust_iou_balance(&dst_trust, value, &issuer_id, &dest_id)?;
+    dst_trust["Balance"]["value"] = serde_json::Value::String(new_dst_value);
+    let dst_trust_data =
+        serde_json::to_vec(&dst_trust).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(dst_trust_key, dst_trust_data)
+        .map_err(|_| TransactionResult::TefInternal)?;
+
+    // Bump source Sequence.
+    let src_key = keylet::account(&src_id);
+    let src_bytes = ctx
+        .view
+        .read(&src_key)
+        .ok_or(TransactionResult::TerNoAccount)?;
+    let mut src_acct: serde_json::Value =
+        serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
+    helpers::increment_sequence(&mut src_acct);
+    let src_acct_data =
+        serde_json::to_vec(&src_acct).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(src_key, src_acct_data)
         .map_err(|_| TransactionResult::TefInternal)?;
 
     Ok(TransactionResult::TesSuccess)
+}
+
+/// Compute holder's IOU balance against the issuer (always non-negative
+/// from holder's perspective). Returns 0 if holder owes issuer.
+fn compute_holder_balance(
+    trust: &serde_json::Value,
+    issuer_id: &rxrpl_primitives::AccountId,
+    holder_id: &rxrpl_primitives::AccountId,
+) -> f64 {
+    let raw: f64 = trust
+        .get("Balance")
+        .and_then(|b| b.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0.0);
+    let issuer_is_low = issuer_id.as_bytes() < holder_id.as_bytes();
+    let holder_view = if issuer_is_low { raw } else { -raw };
+    holder_view.max(0.0)
 }
 
 /// Compute the new RippleState Balance.value after an issuer mint.
