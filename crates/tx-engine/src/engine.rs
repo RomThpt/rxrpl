@@ -107,6 +107,66 @@ impl TxEngine {
         // 5. Preclaim (read-only ledger validation)
         let view = LedgerView::with_fees(ledger, fees.clone());
 
+        // Master/regular key authorization (single-sig only): when a tx is
+        // single-signed (no Signers array), verify the SigningPubKey is
+        // authorized for the Account. Three cases match rippled:
+        //  1. Pubkey derives to Account itself → master key sign. Reject if
+        //     account has lsfDisableMaster (0x00100000) set → tefMASTER_DISABLED.
+        //  2. Pubkey derives to AccountRoot.RegularKey → regular key sign. OK.
+        //  3. Otherwise → tefBAD_AUTH.
+        if !is_pseudo && !self.skip_signature_verification {
+            let has_signers = tx
+                .get("Signers")
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if !has_signers {
+                if let Ok(account_str) = helpers::get_account(tx) {
+                    if let Ok(account_id) = decode_account_id(account_str) {
+                        if let Some(pubkey_hex) =
+                            tx.get("SigningPubKey").and_then(|v| v.as_str())
+                        {
+                            if !pubkey_hex.is_empty() {
+                                if let Ok(pubkey_bytes) = hex::decode(pubkey_hex) {
+                                    let signer_id = rxrpl_codec::address::classic::account_id_from_public_key(&pubkey_bytes);
+                                    let acct_key =
+                                        rxrpl_protocol::keylet::account(&account_id);
+                                    if let Some(acct_bytes) = view.read(&acct_key) {
+                                        if let Ok(acct_obj) =
+                                            serde_json::from_slice::<serde_json::Value>(&acct_bytes)
+                                        {
+                                            if signer_id == account_id {
+                                                // Master key sign — reject if disabled.
+                                                let flags = acct_obj
+                                                    .get("Flags")
+                                                    .and_then(|v| v.as_u64())
+                                                    .unwrap_or(0)
+                                                    as u32;
+                                                const LSF_DISABLE_MASTER: u32 = 0x00100000;
+                                                if flags & LSF_DISABLE_MASTER != 0 {
+                                                    return Ok(TransactionResult::TefMasterDisabled);
+                                                }
+                                            } else {
+                                                // Regular key sign — must match RegularKey.
+                                                let reg_key_str = acct_obj
+                                                    .get("RegularKey")
+                                                    .and_then(|v| v.as_str());
+                                                let reg_id = reg_key_str
+                                                    .and_then(|s| decode_account_id(s).ok());
+                                                if Some(signer_id) != reg_id {
+                                                    return Ok(TransactionResult::TefBadAuth);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Multi-sign stateful check: if the tx has a non-empty Signers array,
         // the Account must have a SignerList SLE AND the sum of weights of
         // included signers must meet the SignerList's quorum. Without this
