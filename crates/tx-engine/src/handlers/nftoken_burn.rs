@@ -41,14 +41,32 @@ impl Transactor for NFTokenBurnTransactor {
             .and_then(|v| v.as_array())
             .ok_or(TransactionResult::TecNoEntry)?;
 
-        let found = tokens.iter().any(|t| {
+        let token = tokens.iter().find(|t| {
             t.get("NFTokenID")
                 .and_then(|v| v.as_str())
                 .map(|s| s == nftoken_id)
                 .unwrap_or(false)
         });
-        if !found {
-            return Err(TransactionResult::TecNoEntry);
+        let token = token.ok_or(TransactionResult::TecNoEntry)?;
+
+        // Permission: caller can always burn its own NFTs. If caller is
+        // attempting to burn someone else's NFT (typical issuer flow), the
+        // NFT must have the lsfBurnable flag (0x0001) set.
+        if account_str != owner_str {
+            const LSF_BURNABLE: u32 = 0x0001;
+            let nft_flags = token.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            if nft_flags & LSF_BURNABLE == 0 {
+                return Err(TransactionResult::TecNoPermission);
+            }
+            // Only the original issuer (encoded in NFTokenID bytes 16..56)
+            // may invoke the burnable-by-issuer path.
+            let issuer_hex_in_id = &nftoken_id[16..56];
+            let account_id_bytes =
+                decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+            let account_hex = hex::encode_upper(account_id_bytes.as_bytes());
+            if !issuer_hex_in_id.eq_ignore_ascii_case(&account_hex) {
+                return Err(TransactionResult::TecNoPermission);
+            }
         }
 
         Ok(())
