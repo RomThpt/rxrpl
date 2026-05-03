@@ -121,6 +121,47 @@ impl Transactor for PaymentChannelClaimTransactor {
 
         let should_close = flags & TF_CLOSE != 0;
 
+        // tfClose semantics:
+        //  - If caller is the channel SOURCE, defer the close: set Expiration
+        //    to (now + SettleDelay). The channel persists until destination
+        //    cashes out OR the expiration is reached on a later claim.
+        //  - If caller is the channel DESTINATION, the close is immediate
+        //    (destination can always release the locked funds back).
+        let caller_is_source = account_str == ch_src_str;
+        if should_close && caller_is_source {
+            let settle_delay = channel
+                .get("SettleDelay")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let now = ctx.view.parent_close_time();
+            let expiration = now.saturating_add(settle_delay);
+            channel["Expiration"] = serde_json::Value::from(expiration);
+            let ch_data =
+                serde_json::to_vec(&channel).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(channel_key, ch_data)
+                .map_err(|_| TransactionResult::TefInternal)?;
+
+            // Bump source's sequence (caller).
+            let src_id = decode_account_id(&ch_src_str)
+                .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+            let src_key = keylet::account(&src_id);
+            let src_bytes = ctx
+                .view
+                .read(&src_key)
+                .ok_or(TransactionResult::TerNoAccount)?;
+            let mut src_account: serde_json::Value =
+                serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
+            helpers::increment_sequence(&mut src_account);
+            let src_data =
+                serde_json::to_vec(&src_account).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(src_key, src_data)
+                .map_err(|_| TransactionResult::TefInternal)?;
+
+            return Ok(TransactionResult::TesSuccess);
+        }
+
         if should_close {
             let final_balance: u64 = channel["Balance"]
                 .as_str()
@@ -365,17 +406,22 @@ mod tests {
         let result = PaymentChannelClaimTransactor.apply(&mut ctx).unwrap();
         assert_eq!(result, TransactionResult::TesSuccess);
 
-        // Channel should be deleted
+        // Source-initiated close defers deletion: channel persists with
+        // Expiration = now + SettleDelay (matching rippled behavior).
         let src_id = decode_account_id(SRC).unwrap();
         let dst_id = decode_account_id(DST).unwrap();
         let channel_key = keylet::pay_channel(&src_id, &dst_id, 1);
-        assert!(!sandbox.exists(&channel_key));
+        assert!(sandbox.exists(&channel_key));
+        let ch_bytes = sandbox.read(&channel_key).unwrap();
+        let ch: serde_json::Value = serde_json::from_slice(&ch_bytes).unwrap();
+        assert!(ch.get("Expiration").is_some());
 
-        // Source gets remaining 10M back
+        // Source balance unchanged on deferred close (no funds returned yet).
         let src_key = keylet::account(&src_id);
         let src_bytes = sandbox.read(&src_key).unwrap();
         let src: serde_json::Value = serde_json::from_slice(&src_bytes).unwrap();
-        assert_eq!(src["Balance"].as_str().unwrap(), "110000000");
-        assert_eq!(src["OwnerCount"].as_u64().unwrap(), 0);
+        assert_eq!(src["Balance"].as_str().unwrap(), "100000000");
+        // OwnerCount unchanged because channel is not deleted (defer close).
+        assert_eq!(src["OwnerCount"].as_u64().unwrap(), 1);
     }
 }
