@@ -114,6 +114,9 @@ impl TxEngine {
         //     account has lsfDisableMaster (0x00100000) set → tefMASTER_DISABLED.
         //  2. Pubkey derives to AccountRoot.RegularKey → regular key sign. OK.
         //  3. Otherwise → tefBAD_AUTH.
+        // Gated on !skip_signature_verification because some local tests
+        // intentionally sign with mismatched keys (relying on the skip flag
+        // to bypass crypto verify); the auth check would reject those.
         if !is_pseudo && !self.skip_signature_verification {
             let has_signers = tx
                 .get("Signers")
@@ -173,7 +176,9 @@ impl TxEngine {
         // gate, rxrpl was silently accepting multi-signed txs from accounts
         // that never registered a signer list (rippled returns
         // tefNOT_MULTI_SIGNING / tefBAD_QUORUM).
-        if !is_pseudo && !self.skip_signature_verification {
+        // Runs regardless of skip_signature_verification — the SignerList /
+        // quorum check is stateful authorization, not cryptographic verify.
+        if !is_pseudo {
             if let Some(signers_arr) = tx.get("Signers").and_then(|v| v.as_array()) {
                 if !signers_arr.is_empty() {
                     if let Ok(account_str) = helpers::get_account(tx) {
