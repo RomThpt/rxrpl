@@ -106,6 +106,71 @@ impl TxEngine {
 
         // 5. Preclaim (read-only ledger validation)
         let view = LedgerView::with_fees(ledger, fees.clone());
+
+        // Multi-sign stateful check: if the tx has a non-empty Signers array,
+        // the Account must have a SignerList SLE AND the sum of weights of
+        // included signers must meet the SignerList's quorum. Without this
+        // gate, rxrpl was silently accepting multi-signed txs from accounts
+        // that never registered a signer list (rippled returns
+        // tefNOT_MULTI_SIGNING / tefBAD_QUORUM).
+        if !is_pseudo && !self.skip_signature_verification {
+            if let Some(signers_arr) = tx.get("Signers").and_then(|v| v.as_array()) {
+                if !signers_arr.is_empty() {
+                    if let Ok(account_str) = helpers::get_account(tx) {
+                        if let Ok(account_id) = decode_account_id(account_str) {
+                            let signer_list_key =
+                                rxrpl_protocol::keylet::signer_list(&account_id);
+                            match view.read(&signer_list_key) {
+                                None => return Ok(TransactionResult::TefNotMultiSigning),
+                                Some(bytes) => {
+                                    if let Ok(sl) =
+                                        serde_json::from_slice::<serde_json::Value>(&bytes)
+                                    {
+                                        let quorum = sl
+                                            .get("SignerQuorum")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0);
+                                        let entries = sl
+                                            .get("SignerEntries")
+                                            .and_then(|v| v.as_array())
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        let mut total_weight: u64 = 0;
+                                        for s in signers_arr {
+                                            let signer_obj = s
+                                                .get("Signer")
+                                                .or(Some(s))
+                                                .cloned()
+                                                .unwrap_or(serde_json::Value::Null);
+                                            let signer_acct = signer_obj
+                                                .get("Account")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            if let Some(weight) = entries.iter().find_map(|e| {
+                                                let entry = e.get("SignerEntry").or(Some(e))?;
+                                                if entry.get("Account").and_then(|v| v.as_str())
+                                                    == Some(signer_acct)
+                                                {
+                                                    entry.get("SignerWeight").and_then(|v| v.as_u64())
+                                                } else {
+                                                    None
+                                                }
+                                            }) {
+                                                total_weight = total_weight.saturating_add(weight);
+                                            }
+                                        }
+                                        if total_weight < quorum {
+                                            return Ok(TransactionResult::TefBadQuorum);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let preclaim_ctx = PreclaimContext {
             tx,
             view: &view,
