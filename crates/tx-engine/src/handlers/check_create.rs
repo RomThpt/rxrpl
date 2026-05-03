@@ -11,10 +11,30 @@ impl Transactor for CheckCreateTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
         helpers::get_destination(ctx.tx)?;
 
-        // SendMax must be present and positive
-        let send_max =
-            helpers::get_u64_str_field(ctx.tx, "SendMax").ok_or(TransactionResult::TemBadAmount)?;
-        if send_max == 0 {
+        // SendMax must be present and positive. Accepts XRP (drops string)
+        // or IOU object {currency, issuer, value}.
+        let send_max = ctx
+            .tx
+            .get("SendMax")
+            .ok_or(TransactionResult::TemBadAmount)?;
+        if let Some(s) = send_max.as_str() {
+            let drops: u64 = s.parse().map_err(|_| TransactionResult::TemBadAmount)?;
+            if drops == 0 {
+                return Err(TransactionResult::TemBadAmount);
+            }
+        } else if let Some(obj) = send_max.as_object() {
+            if obj.get("currency").is_none() || obj.get("issuer").is_none() {
+                return Err(TransactionResult::TemBadCurrency);
+            }
+            let value: f64 = obj
+                .get("value")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+                .ok_or(TransactionResult::TemBadAmount)?;
+            if value <= 0.0 {
+                return Err(TransactionResult::TemBadAmount);
+            }
+        } else {
             return Err(TransactionResult::TemBadAmount);
         }
 
@@ -67,13 +87,18 @@ impl Transactor for CheckCreateTransactor {
         // Create Check entry
         let check_key = keylet::check(&src_id, tx_seq);
 
+        // Pass through SendMax in its original shape — preserves the IOU
+        // object form ({currency, issuer, value}) needed for IOU checks.
+        let send_max_value = ctx
+            .tx
+            .get("SendMax")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String("0".to_string()));
         let mut check = serde_json::json!({
             "LedgerEntryType": "Check",
             "Account": account_str,
             "Destination": destination_str,
-            "SendMax": helpers::get_u64_str_field(ctx.tx, "SendMax")
-                .unwrap_or(0)
-                .to_string(),
+            "SendMax": send_max_value,
             "Sequence": tx_seq,
             "Flags": 0,
         });
