@@ -4,10 +4,12 @@
 /// server, peer networking, database, validators, and network settings.
 pub mod error;
 pub mod loader;
+pub mod seed_loader;
 pub mod types;
 
 pub use error::ConfigError;
 pub use loader::load_config;
+pub use seed_loader::load_seed_file;
 pub use types::{
     ClusterConfig, DatabaseConfig, GenesisConfig, NetworkConfig, NodeConfig, PeerConfig,
     ServerConfig, ShardConfig, ValidatorConfig,
