@@ -349,8 +349,17 @@ impl NFTokenAcceptOfferTransactor {
             }
         }
 
-        // Transfer XRP from buyer to seller
-        Self::transfer_xrp(ctx, buyer_addr, &seller_addr, amount)?;
+        // TransferFee: secondary-sale royalty to original issuer.
+        // NFTokenID rxrpl layout: flags(8)+transfer_fee(4)+reserved(4)+issuer(40)+seq(8).
+        // transfer_fee is in 1/100000 (rippled max 50000 = 50%).
+        let (issuer_cut, seller_take) = compute_transfer_split(&nftoken_id, &seller_addr, amount);
+
+        Self::transfer_xrp(ctx, buyer_addr, &seller_addr, seller_take)?;
+        if issuer_cut > 0 {
+            if let Some(issuer_addr) = issuer_from_nftoken_id(&nftoken_id) {
+                Self::transfer_xrp(ctx, buyer_addr, &issuer_addr, issuer_cut)?;
+            }
+        }
         // Transfer token from seller to buyer
         Self::transfer_token(ctx, &nftoken_id, &seller_addr, buyer_addr)?;
         // Erase offer
@@ -462,6 +471,46 @@ impl NFTokenAcceptOfferTransactor {
 
         Ok(())
     }
+}
+
+/// Compute (issuer_cut, seller_take) for an NFT sale. issuer_cut is 0 on
+/// primary sale (seller == issuer) or when transfer_fee is 0.
+fn compute_transfer_split(nftoken_id: &str, seller_addr: &str, amount: u64) -> (u64, u64) {
+    if amount == 0 {
+        return (0, 0);
+    }
+    let issuer = match issuer_from_nftoken_id(nftoken_id) {
+        Some(s) => s,
+        None => return (0, amount),
+    };
+    if issuer == seller_addr {
+        return (0, amount); // primary sale, no royalty
+    }
+    let transfer_fee = u32::from_str_radix(&nftoken_id[8..12], 16).unwrap_or(0);
+    if transfer_fee == 0 {
+        return (0, amount);
+    }
+    // rippled: transfer_fee in 1/100000 (max 50000 = 50%).
+    let issuer_cut = (amount as u128 * transfer_fee as u128 / 100_000u128) as u64;
+    let seller_take = amount.saturating_sub(issuer_cut);
+    (issuer_cut, seller_take)
+}
+
+/// Decode the issuer AccountID from rxrpl's NFTokenID layout
+/// (flags(8) + transfer_fee(4) + reserved(4) + issuer(40) + seq(8)).
+fn issuer_from_nftoken_id(nftoken_id: &str) -> Option<String> {
+    if nftoken_id.len() != 64 {
+        return None;
+    }
+    let issuer_hex = &nftoken_id[16..56];
+    let bytes = hex::decode(issuer_hex).ok()?;
+    if bytes.len() != 20 {
+        return None;
+    }
+    let mut arr = [0u8; 20];
+    arr.copy_from_slice(&bytes);
+    let id = rxrpl_primitives::AccountId::new(arr);
+    Some(rxrpl_codec::address::classic::encode_account_id(&id))
 }
 
 #[cfg(test)]
