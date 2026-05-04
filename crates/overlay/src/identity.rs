@@ -111,123 +111,106 @@ impl NodeIdentity {
     /// carry their own `signing_payload` and so include `sfCloseTime` when
     /// the originating validator did.
     pub fn sign_validation(&self, validation: &mut rxrpl_consensus::types::Validation) {
-        use crate::stobject;
-
-        // HashPrefix::validation = 'V','A','L',0 = 0x56414C00
-        const HASH_PREFIX_VALIDATION: [u8; 4] = [0x56, 0x41, 0x4C, 0x00];
-
-        // Build the strip-result (canonical STObject without
-        // sfSignature/sfMasterSignature). Fields are emitted in canonical
-        // (type_code, field_code) order.
-        let mut stripped = Vec::with_capacity(192);
-
-        // (2,2) sfFlags — always
-        let flags: u32 = if validation.full { 0x80000001 } else { 0x00000000 };
-        stobject::put_uint32(&mut stripped, 2, flags);
-
-        // (2,6) sfLedgerSequence — always
-        stobject::put_uint32(&mut stripped, 6, validation.ledger_seq);
-
-        // (2,7) sfCloseTime — skipped (see fn-doc).
-
-        // (2,9) sfSigningTime — always
-        stobject::put_uint32(&mut stripped, 9, validation.sign_time);
-
-        // (2,24) sfLoadFee — optional
-        if let Some(v) = validation.load_fee {
-            stobject::put_uint32(&mut stripped, 24, v);
-        }
-
-        // (2,31) sfReserveBase — optional
-        if let Some(v) = validation.reserve_base {
-            stobject::put_uint32(&mut stripped, 31, v);
-        }
-
-        // (2,32) sfReserveIncrement — optional
-        if let Some(v) = validation.reserve_increment {
-            stobject::put_uint32(&mut stripped, 32, v);
-        }
-
-        // (3,5) sfBaseFee — optional
-        if let Some(v) = validation.base_fee {
-            stobject::put_uint64(&mut stripped, 5, v);
-        }
-
-        // (3,10) sfCookie — optional
-        if let Some(v) = validation.cookie {
-            stobject::put_uint64(&mut stripped, 10, v);
-        }
-
-        // (3,11) sfServerVersion — optional
-        if let Some(v) = validation.server_version {
-            stobject::put_uint64(&mut stripped, 11, v);
-        }
-
-        // (5,1) sfLedgerHash — always
-        stobject::put_hash256(&mut stripped, 1, validation.ledger_hash.as_bytes());
-
-        // (5,23) sfConsensusHash — optional
-        if let Some(h) = validation.consensus_hash.as_ref() {
-            stobject::put_hash256(&mut stripped, 23, h.as_bytes());
-        }
-
-        // (5,25) sfValidatedHash — optional
-        if let Some(h) = validation.validated_hash.as_ref() {
-            stobject::put_hash256(&mut stripped, 25, h.as_bytes());
-        }
-
-        // (6,22) sfBaseFeeDrops — optional
-        if let Some(v) = validation.base_fee_drops {
-            stobject::put_amount_xrp(&mut stripped, 22, v);
-        }
-
-        // (6,23) sfReserveBaseDrops — optional
-        if let Some(v) = validation.reserve_base_drops {
-            stobject::put_amount_xrp(&mut stripped, 23, v);
-        }
-
-        // (6,24) sfReserveIncrementDrops — optional
-        if let Some(v) = validation.reserve_increment_drops {
-            stobject::put_amount_xrp(&mut stripped, 24, v);
-        }
-
-        // (7,3) sfSigningPubKey — always
-        stobject::put_vl(&mut stripped, 3, self.public_key_bytes());
-
-        // sfSignature (7,6) and sfMasterSignature (7,18) are EXCLUDED
-        // from the signing buffer by definition.
-
-        // (19,3) sfAmendments — optional (emitted only when non-empty)
-        if !validation.amendments.is_empty() {
-            let entries: Vec<[u8; 32]> = validation
-                .amendments
-                .iter()
-                .map(|h| *h.as_bytes())
-                .collect();
-            stobject::put_vector256(&mut stripped, 3, &entries);
-        }
-
-        // Compose the full signing input: prefix || stripped STObject.
-        let mut signing_data = Vec::with_capacity(4 + stripped.len());
-        signing_data.extend_from_slice(&HASH_PREFIX_VALIDATION);
-        signing_data.extend_from_slice(&stripped);
-
-        // Sign: secp256k1 over SHA-512-Half(signing_data) (the secp256k1
-        // wrapper hashes internally). Validator keys are always secp256k1
-        // in the current codepath (see `from_seed`/`generate`).
-        let sig = rxrpl_crypto::secp256k1::sign(&signing_data, &self.key_pair.private_key)
-            .map(|s| s.as_bytes().to_vec());
-        if let Ok(sig) = sig {
-            validation.signature = Some(sig);
-            // Stash the strip-result so the verifier can replay the exact
-            // byte sequence (matching the rippled-decoded path).
-            validation.signing_payload = Some(stripped);
-        }
+        sign_validation_with_keypair(&self.key_pair, validation);
     }
 
     /// Get the private key bytes (for signing operations).
     pub fn private_key(&self) -> &[u8] {
         &self.key_pair.private_key
+    }
+}
+
+/// Sign a consensus `Validation` with the given keypair, embedding the
+/// strip-result into `validation.signing_payload` so the verifier can replay
+/// the exact bytes. Shared by [`NodeIdentity::sign_validation`] and
+/// [`ValidatorIdentity::sign_validation`] — see `NodeIdentity::sign_validation`
+/// docstring for the canonical-encoding contract.
+fn sign_validation_with_keypair(
+    keypair: &rxrpl_crypto::KeyPair,
+    validation: &mut rxrpl_consensus::types::Validation,
+) {
+    use crate::stobject;
+
+    // HashPrefix::validation = 'V','A','L',0 = 0x56414C00
+    const HASH_PREFIX_VALIDATION: [u8; 4] = [0x56, 0x41, 0x4C, 0x00];
+
+    let mut stripped = Vec::with_capacity(192);
+
+    // (2,2) sfFlags — always
+    let flags: u32 = if validation.full { 0x80000001 } else { 0x00000000 };
+    stobject::put_uint32(&mut stripped, 2, flags);
+
+    // (2,6) sfLedgerSequence — always
+    stobject::put_uint32(&mut stripped, 6, validation.ledger_seq);
+
+    // (2,7) sfCloseTime — skipped (see NodeIdentity::sign_validation doc).
+
+    // (2,9) sfSigningTime — always
+    stobject::put_uint32(&mut stripped, 9, validation.sign_time);
+
+    if let Some(v) = validation.load_fee {
+        stobject::put_uint32(&mut stripped, 24, v);
+    }
+    if let Some(v) = validation.reserve_base {
+        stobject::put_uint32(&mut stripped, 31, v);
+    }
+    if let Some(v) = validation.reserve_increment {
+        stobject::put_uint32(&mut stripped, 32, v);
+    }
+    if let Some(v) = validation.base_fee {
+        stobject::put_uint64(&mut stripped, 5, v);
+    }
+    if let Some(v) = validation.cookie {
+        stobject::put_uint64(&mut stripped, 10, v);
+    }
+    if let Some(v) = validation.server_version {
+        stobject::put_uint64(&mut stripped, 11, v);
+    }
+
+    // (5,1) sfLedgerHash — always
+    stobject::put_hash256(&mut stripped, 1, validation.ledger_hash.as_bytes());
+
+    if let Some(h) = validation.consensus_hash.as_ref() {
+        stobject::put_hash256(&mut stripped, 23, h.as_bytes());
+    }
+    if let Some(h) = validation.validated_hash.as_ref() {
+        stobject::put_hash256(&mut stripped, 25, h.as_bytes());
+    }
+    if let Some(v) = validation.base_fee_drops {
+        stobject::put_amount_xrp(&mut stripped, 22, v);
+    }
+    if let Some(v) = validation.reserve_base_drops {
+        stobject::put_amount_xrp(&mut stripped, 23, v);
+    }
+    if let Some(v) = validation.reserve_increment_drops {
+        stobject::put_amount_xrp(&mut stripped, 24, v);
+    }
+
+    // (7,3) sfSigningPubKey — always
+    stobject::put_vl(&mut stripped, 3, keypair.public_key.as_bytes());
+
+    // sfSignature (7,6) and sfMasterSignature (7,18) are EXCLUDED
+    // from the signing buffer by definition.
+
+    // (19,3) sfAmendments — optional (emitted only when non-empty)
+    if !validation.amendments.is_empty() {
+        let entries: Vec<[u8; 32]> = validation
+            .amendments
+            .iter()
+            .map(|h| *h.as_bytes())
+            .collect();
+        stobject::put_vector256(&mut stripped, 3, &entries);
+    }
+
+    let mut signing_data = Vec::with_capacity(4 + stripped.len());
+    signing_data.extend_from_slice(&HASH_PREFIX_VALIDATION);
+    signing_data.extend_from_slice(&stripped);
+
+    let sig = rxrpl_crypto::secp256k1::sign(&signing_data, &keypair.private_key)
+        .map(|s| s.as_bytes().to_vec());
+    if let Ok(sig) = sig {
+        validation.signature = Some(sig);
+        validation.signing_payload = Some(stripped);
     }
 }
 
@@ -300,6 +283,127 @@ impl std::fmt::Debug for NodeIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeIdentity")
             .field("node_id", &self.node_id)
+            .finish()
+    }
+}
+
+// =====================================================================
+// ValidatorIdentity — two-key signing identity (master + ephemeral)
+// =====================================================================
+
+use rxrpl_primitives::PublicKey;
+
+/// Validator signing identity with **separate master and signing keys**.
+///
+/// In rippled, a UNL validator publishes a manifest signed by a long-term
+/// **master** key that delegates signing authority to a rotatable
+/// **ephemeral signing** key. Day-to-day validations and proposals are
+/// signed by the ephemeral key; the master key only signs the manifest
+/// (and the manifest's revocation, in case of compromise).
+///
+/// Distinct from [`NodeIdentity`], which is the **P2P** identity used in
+/// the peer handshake (driven by `peer.node_seed`). A node can have a
+/// `NodeIdentity` without being a validator; a validator always has both.
+pub struct ValidatorIdentity {
+    master: rxrpl_crypto::KeyPair,
+    signing: rxrpl_crypto::KeyPair,
+}
+
+impl ValidatorIdentity {
+    /// Construct a validator identity with two distinct keys (production
+    /// mainnet form). Both keys are derived using the rippled validator
+    /// derivation (secp256k1).
+    pub fn two_key(master_seed: &Seed, signing_seed: &Seed) -> Self {
+        Self {
+            master: derive_validator_keypair(master_seed),
+            signing: derive_validator_keypair(signing_seed),
+        }
+    }
+
+    /// Construct a validator identity with master == signing (single seed).
+    ///
+    /// Convenience for tests, dev networks, and the legacy single-key
+    /// behaviour. Production validators **must** use [`two_key`] so that a
+    /// compromised signing key can be rotated without abandoning the
+    /// long-term identity.
+    ///
+    /// [`two_key`]: ValidatorIdentity::two_key
+    pub fn self_signed(seed: &Seed) -> Self {
+        let kp = derive_validator_keypair(seed);
+        // Re-derive a second copy because KeyPair is not Clone (private
+        // material). Both copies represent the same key.
+        Self {
+            master: kp,
+            signing: derive_validator_keypair(seed),
+        }
+    }
+
+    /// The long-term master public key (the one published by the UNL).
+    pub fn master_pubkey(&self) -> &PublicKey {
+        &self.master.public_key
+    }
+
+    /// The ephemeral signing public key (embedded in every validation).
+    pub fn signing_pubkey(&self) -> &PublicKey {
+        &self.signing.public_key
+    }
+
+    /// Reference to the master keypair (used to sign manifests only).
+    pub fn master_keypair(&self) -> &rxrpl_crypto::KeyPair {
+        &self.master
+    }
+
+    /// Reference to the signing keypair (used for validations + proposals).
+    pub fn signing_keypair(&self) -> &rxrpl_crypto::KeyPair {
+        &self.signing
+    }
+
+    /// Sign a consensus `Validation` using the **ephemeral signing key**.
+    ///
+    /// Byte-identical to [`NodeIdentity::sign_validation`] when
+    /// `self_signed(seed)` and `NodeIdentity::from_seed(seed)` are derived
+    /// from the same seed. See that doc-comment for the canonical-encoding
+    /// contract.
+    pub fn sign_validation(&self, validation: &mut rxrpl_consensus::types::Validation) {
+        sign_validation_with_keypair(&self.signing, validation);
+    }
+
+    /// Sign a consensus `Proposal` using the **ephemeral signing key**.
+    pub fn sign_proposal(&self, proposal: &mut rxrpl_consensus::types::Proposal) {
+        proposal.sign(&self.signing.private_key, self.signing.key_type);
+    }
+
+    /// Build a signed manifest binding `signing_pubkey` to `master_pubkey`.
+    ///
+    /// `sequence` must be strictly greater than any previously-published
+    /// sequence for the master key (rotation contract). `domain` is
+    /// optional and embedded as `sfDomain` for cross-attestation.
+    pub fn sign_manifest(
+        &self,
+        sequence: u32,
+        domain: Option<&str>,
+    ) -> Result<Vec<u8>, crate::manifest::ManifestError> {
+        crate::manifest::create_signed(&self.master, &self.signing, sequence, domain)
+    }
+}
+
+/// Derive a keypair using the rippled validator-key path (secp256k1, no
+/// account-level scalar). Mirrors [`NodeIdentity::from_seed`].
+fn derive_validator_keypair(seed: &Seed) -> rxrpl_crypto::KeyPair {
+    let (public_key, private_key) =
+        rxrpl_crypto::secp256k1::derive_keypair(seed, true);
+    rxrpl_crypto::KeyPair {
+        public_key,
+        private_key,
+        key_type: rxrpl_crypto::KeyType::Secp256k1,
+    }
+}
+
+impl std::fmt::Debug for ValidatorIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidatorIdentity")
+            .field("master_pubkey", &hex::encode(self.master.public_key.as_bytes()))
+            .field("signing_pubkey", &hex::encode(self.signing.public_key.as_bytes()))
             .finish()
     }
 }
@@ -612,5 +716,121 @@ mod tests {
         // Clear public key
         validation.public_key = Vec::new();
         assert!(!verify_validation_signature(&validation));
+    }
+
+    // -----------------------------------------------------------------
+    // ValidatorIdentity (master + signing key separation, A2)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn validator_identity_two_key_has_distinct_pubkeys() {
+        let master = Seed::from_passphrase("two-key-master");
+        let signing = Seed::from_passphrase("two-key-signing");
+        let id = ValidatorIdentity::two_key(&master, &signing);
+
+        assert_ne!(
+            id.master_pubkey().as_bytes(),
+            id.signing_pubkey().as_bytes(),
+            "master and signing keys must differ in two-key mode"
+        );
+    }
+
+    #[test]
+    fn validator_identity_self_signed_has_equal_pubkeys() {
+        let seed = Seed::from_passphrase("self-signed-test");
+        let id = ValidatorIdentity::self_signed(&seed);
+
+        assert_eq!(
+            id.master_pubkey().as_bytes(),
+            id.signing_pubkey().as_bytes(),
+            "self-signed mode must derive identical master and signing keys"
+        );
+    }
+
+    /// In two-key mode, `sign_validation` must use the **ephemeral signing
+    /// key**, never the master. A peer rejects any validation whose
+    /// signature does not verify against the embedded `sfSigningPubKey`,
+    /// and the signing pubkey is set by the caller (Node) from
+    /// `signing_pubkey()`. So if we accidentally signed with the master,
+    /// the validation would fail signature verification on every peer.
+    #[test]
+    fn validator_identity_two_key_signs_with_signing_key_not_master() {
+        use rxrpl_consensus::types::{NodeId, Validation};
+        use rxrpl_primitives::Hash256;
+
+        let master = Seed::from_passphrase("two-key-sign-master");
+        let signing = Seed::from_passphrase("two-key-sign-signing");
+        let id = ValidatorIdentity::two_key(&master, &signing);
+
+        let mut validation = Validation {
+            node_id: NodeId(Hash256::new([0xAA; 32])),
+            public_key: id.signing_pubkey().as_bytes().to_vec(),
+            ledger_hash: Hash256::new([0xCC; 32]),
+            ledger_seq: 1,
+            full: true,
+            close_time: 100,
+            sign_time: 100,
+            signature: None,
+            amendments: vec![],
+            signing_payload: None,
+            ..Default::default()
+        };
+        id.sign_validation(&mut validation);
+        assert!(verify_validation_signature(&validation), "signing key sig must verify");
+
+        // If we put the master pubkey as the embedded `public_key`, the
+        // verifier must reject (signature was made with signing key, not
+        // master).
+        validation.public_key = id.master_pubkey().as_bytes().to_vec();
+        validation.signing_payload = None; // force re-encode for verifier
+        assert!(
+            !verify_validation_signature(&validation),
+            "verifying against master pubkey must fail — signature is from signing key"
+        );
+    }
+
+    /// `ValidatorIdentity` must produce signatures byte-identical to a
+    /// legacy single-key `NodeIdentity` derived from the same seed —
+    /// otherwise A3's swap-over in `node.rs` would silently change every
+    /// validation's signature and break wire compatibility.
+    #[test]
+    fn validator_identity_sign_validation_matches_node_identity_self_signed() {
+        use rxrpl_consensus::types::{NodeId, Validation};
+        use rxrpl_primitives::Hash256;
+
+        let seed = Seed::from_passphrase("compat-check");
+        let node_id_compat = NodeIdentity::from_seed(&seed);
+        let validator_id = ValidatorIdentity::self_signed(&seed);
+
+        let make = |pubkey: &[u8]| Validation {
+            node_id: NodeId(Hash256::new([0xAA; 32])),
+            public_key: pubkey.to_vec(),
+            ledger_hash: Hash256::new([0xCC; 32]),
+            ledger_seq: 42,
+            full: true,
+            close_time: 1000,
+            sign_time: 1000,
+            signature: None,
+            amendments: vec![],
+            signing_payload: None,
+            ..Default::default()
+        };
+
+        let mut v_node = make(node_id_compat.public_key_bytes());
+        let mut v_val = make(validator_id.signing_pubkey().as_bytes());
+        node_id_compat.sign_validation(&mut v_node);
+        validator_id.sign_validation(&mut v_val);
+
+        assert_eq!(
+            v_node.signing_payload, v_val.signing_payload,
+            "self-signed ValidatorIdentity must produce the same signing payload as legacy NodeIdentity"
+        );
+        // Note: signatures differ across runs because secp256k1 is RFC-6979
+        // deterministic in our impl, so this should equal too if both code
+        // paths sign the same bytes with the same key.
+        assert_eq!(
+            v_node.signature, v_val.signature,
+            "deterministic secp256k1 signatures must match byte-for-byte"
+        );
     }
 }

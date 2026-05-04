@@ -408,6 +408,9 @@ pub struct ManifestStore {
     ephemeral_to_master: HashMap<String, PublicKey>,
     /// Revoked master keys.
     revoked: HashMap<String, ()>,
+    /// Master public key of the manifest published by THIS node, if any.
+    /// `local()` resolves through this into `manifests`.
+    local_master_key: Option<PublicKey>,
 }
 
 impl ManifestStore {
@@ -507,6 +510,34 @@ impl ManifestStore {
     /// Get all raw manifest bytes for relay to peers.
     pub fn all_raw_manifests(&self) -> Vec<Vec<u8>> {
         self.manifests.values().map(|m| m.raw.clone()).collect()
+    }
+
+    /// Register a manifest as the **local** one (this node's own validator
+    /// manifest, signed by `ValidatorIdentity::sign_manifest`).
+    ///
+    /// Also indexes it via `apply()` so all the existing lookups
+    /// (`get_manifest`, `master_key_for_ephemeral`, `all_raw_manifests`)
+    /// see it transparently.
+    ///
+    /// On rotation (newer sequence), the master key stays — we keep
+    /// `local_master_key` pointing at the same long-term identity.
+    pub fn set_local(&mut self, manifest: Manifest) {
+        let master_pk = manifest.master_public_key.clone();
+        // `apply` enforces strict-newer sequence and revocation rules just
+        // like for any peer-supplied manifest.
+        self.apply(manifest);
+        self.local_master_key = Some(master_pk);
+    }
+
+    /// The local manifest (this node's own), if `set_local` was called.
+    pub fn local(&self) -> Option<&Manifest> {
+        let pk = self.local_master_key.as_ref()?;
+        self.manifests.get(&Self::key_hex(pk))
+    }
+
+    /// Master public key of the local manifest, if any.
+    pub fn local_master_key(&self) -> Option<&PublicKey> {
+        self.local_master_key.as_ref()
     }
 }
 
@@ -832,6 +863,62 @@ mod tests {
                 other.map(|_| "Ok").map_err(|e| format!("{:?}", e))
             ),
         }
+    }
+
+    /// `set_local` registers a manifest as our own AND indexes it in the
+    /// regular store, so that all the existing lookups (master_key_for_ephemeral,
+    /// get_manifest, all_raw_manifests) work transparently.
+    #[test]
+    fn manifest_store_set_local_registers_and_indexes() {
+        let (raw, master_pk, eph_pk) = make_test_manifest(1, "local-master", "local-eph");
+        let manifest = parse_and_verify(&raw).expect("parse_and_verify");
+
+        let mut store = ManifestStore::new();
+        assert!(store.local().is_none(), "no local before set_local");
+        store.set_local(manifest.clone());
+
+        assert!(store.local().is_some(), "set_local registers a local manifest");
+        assert_eq!(
+            store.local().unwrap().master_public_key,
+            master_pk,
+            "local() returns the manifest we just set"
+        );
+        assert_eq!(
+            store.get_manifest(&master_pk).unwrap().sequence,
+            1,
+            "set_local also indexes in the regular store"
+        );
+        assert_eq!(
+            store.master_key_for_ephemeral(&eph_pk),
+            Some(&master_pk),
+            "ephemeral->master mapping populated"
+        );
+        assert!(
+            store
+                .all_raw_manifests()
+                .iter()
+                .any(|r| r == &raw),
+            "raw bytes appear in all_raw_manifests so we can broadcast it"
+        );
+    }
+
+    /// Setting a newer local manifest with a higher sequence updates the
+    /// stored copy (rotation contract).
+    #[test]
+    fn manifest_store_set_local_replaces_on_higher_sequence() {
+        let (raw1, _, _) = make_test_manifest(1, "rot-master", "rot-eph-1");
+        let (raw2, master_pk, eph2) = make_test_manifest(2, "rot-master", "rot-eph-2");
+        let m1 = parse_and_verify(&raw1).unwrap();
+        let m2 = parse_and_verify(&raw2).unwrap();
+
+        let mut store = ManifestStore::new();
+        store.set_local(m1);
+        store.set_local(m2);
+
+        let local = store.local().expect("local present after rotation");
+        assert_eq!(local.sequence, 2);
+        assert_eq!(local.master_public_key, master_pk);
+        assert_eq!(local.ephemeral_public_key.as_ref().unwrap(), &eph2);
     }
 
     #[test]

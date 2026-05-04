@@ -279,3 +279,78 @@ async fn tx_invalid_hash() {
     assert!(matches!(err, RpcServerError::NotImplemented));
     assert_eq!(err.token(), "notImpl");
 }
+
+// -- manifest tests (B5) --
+
+fn make_ctx_with_local_manifest_snapshot()
+-> (Arc<ServerContext>, rxrpl_rpc_server::LocalManifestSnapshot) {
+    let snapshot = rxrpl_rpc_server::LocalManifestSnapshot {
+        master_public_key: vec![0xED; 33], // ed25519 prefix
+        ephemeral_public_key: vec![0x02; 33], // secp256k1 compressed prefix
+        sequence: 7,
+        domain: Some("b5.example.com".into()),
+        raw_bytes: vec![0xCA, 0xFE, 0xBA, 0xBE],
+    };
+    let ctx = test_ctx_with_ledger();
+    ctx.set_local_manifest(snapshot.clone()).expect("set once");
+    (ctx, snapshot)
+}
+
+#[tokio::test]
+async fn manifest_returns_local_manifest_when_master_pubkey_matches() {
+    let (ctx, snapshot) = make_ctx_with_local_manifest_snapshot();
+    let master_hex = hex::encode(&snapshot.master_public_key);
+
+    let params = json!({ "public_key": master_hex });
+    let result = rxrpl_rpc_server::handlers::manifest(params, &ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(result["details"]["seq"], 7, "manifest sequence returned");
+    assert_eq!(result["details"]["domain"], "b5.example.com");
+    assert!(
+        result["manifest"].as_str().is_some(),
+        "manifest base64 string returned"
+    );
+}
+
+#[tokio::test]
+async fn manifest_returns_local_manifest_when_signing_pubkey_matches() {
+    let (ctx, snapshot) = make_ctx_with_local_manifest_snapshot();
+    let signing_hex = hex::encode(&snapshot.ephemeral_public_key);
+
+    let params = json!({ "public_key": signing_hex });
+    let result = rxrpl_rpc_server::handlers::manifest(params, &ctx)
+        .await
+        .unwrap();
+
+    assert!(
+        result["manifest"].as_str().is_some(),
+        "lookup by ephemeral pubkey also returns the manifest"
+    );
+}
+
+#[tokio::test]
+async fn manifest_returns_null_when_pubkey_does_not_match() {
+    let (ctx, _) = make_ctx_with_local_manifest_snapshot();
+
+    let params = json!({ "public_key": "01".repeat(33) });
+    let result = rxrpl_rpc_server::handlers::manifest(params, &ctx)
+        .await
+        .unwrap();
+
+    assert!(
+        result["manifest"].is_null(),
+        "manifest must be null for unknown public_key"
+    );
+}
+
+#[tokio::test]
+async fn manifest_returns_null_when_no_local_manifest_configured() {
+    let ctx = test_ctx_with_ledger(); // no local manifest set
+    let params = json!({ "public_key": "00".repeat(33) });
+    let result = rxrpl_rpc_server::handlers::manifest(params, &ctx)
+        .await
+        .unwrap();
+    assert!(result["manifest"].is_null());
+}

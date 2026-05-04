@@ -5,6 +5,7 @@
 pub mod checkpoint;
 pub mod consensus_adapter;
 pub mod error;
+pub mod local_manifest_store;
 pub mod node;
 pub mod pruner;
 pub mod reporting;
