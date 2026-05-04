@@ -879,7 +879,10 @@ mod tests {
         assert!(store.local().is_none(), "no local before set_local");
         store.set_local(manifest.clone());
 
-        assert!(store.local().is_some(), "set_local registers a local manifest");
+        assert!(
+            store.local().is_some(),
+            "set_local registers a local manifest"
+        );
         assert_eq!(
             store.local().unwrap().master_public_key,
             master_pk,
@@ -896,10 +899,7 @@ mod tests {
             "ephemeral->master mapping populated"
         );
         assert!(
-            store
-                .all_raw_manifests()
-                .iter()
-                .any(|r| r == &raw),
+            store.all_raw_manifests().iter().any(|r| r == &raw),
             "raw bytes appear in all_raw_manifests so we can broadcast it"
         );
     }

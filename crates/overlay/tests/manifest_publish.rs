@@ -50,7 +50,10 @@ async fn peer_manager_publishes_local_manifest_signed_by_validator_identity() {
         Arc::new(RwLock::new(Hash256::new([0xAA; 32]))),
     );
 
-    assert!(mgr.local_manifest().is_none(), "no local manifest before set");
+    assert!(
+        mgr.local_manifest().is_none(),
+        "no local manifest before set"
+    );
 
     mgr.set_local_manifest(manifest);
 
@@ -88,8 +91,7 @@ async fn peer_manager_publishes_local_manifest_signed_by_validator_identity() {
 #[tokio::test]
 async fn two_nodes_handshake_and_node_b_receives_node_a_manifest() {
     // Node A: full validator identity + local manifest.
-    let p2p_id_a =
-        NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("b6-a-p2p"));
+    let p2p_id_a = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("b6-a-p2p"));
     let validator_id_a = ValidatorIdentity::two_key(
         &rxrpl_crypto::Seed::from_passphrase("b6-a-master"),
         &rxrpl_crypto::Seed::from_passphrase("b6-a-signing"),
@@ -105,8 +107,7 @@ async fn two_nodes_handshake_and_node_b_receives_node_a_manifest() {
     let port_a = listener_a.local_addr().unwrap().port();
     drop(listener_a);
 
-    let id_for_tls_a =
-        NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("b6-a-p2p"));
+    let id_for_tls_a = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("b6-a-p2p"));
     let cfg_a = PeerManagerConfig {
         listen_port: port_a,
         max_peers: 4,
@@ -129,10 +130,8 @@ async fn two_nodes_handshake_and_node_b_receives_node_a_manifest() {
     mgr_a.set_local_manifest(manifest_a);
 
     // Node B: no validator identity, only acts as receiver.
-    let p2p_id_b =
-        NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("b6-b-p2p"));
-    let id_for_tls_b =
-        NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("b6-b-p2p"));
+    let p2p_id_b = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("b6-b-p2p"));
+    let id_for_tls_b = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("b6-b-p2p"));
     let cfg_b = PeerManagerConfig {
         listen_port: 0,
         max_peers: 4,

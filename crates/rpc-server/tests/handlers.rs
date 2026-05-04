@@ -428,7 +428,7 @@ async fn ledger_info_validated_variant() {
 fn make_ctx_with_local_manifest_snapshot()
 -> (Arc<ServerContext>, rxrpl_rpc_server::LocalManifestSnapshot) {
     let snapshot = rxrpl_rpc_server::LocalManifestSnapshot {
-        master_public_key: vec![0xED; 33], // ed25519 prefix
+        master_public_key: vec![0xED; 33],    // ed25519 prefix
         ephemeral_public_key: vec![0x02; 33], // secp256k1 compressed prefix
         sequence: 7,
         domain: Some("b5.example.com".into()),

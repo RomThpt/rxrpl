@@ -1135,12 +1135,11 @@ impl PeerManager {
                             let relay_payload = proto_convert::encode_manifests(to_relay);
                             for (id, handle) in &self.peer_handles {
                                 if *id != from {
-                                    let _ = handle.tx.try_send(
-                                        rxrpl_p2p_proto::codec::PeerMessage {
+                                    let _ =
+                                        handle.tx.try_send(rxrpl_p2p_proto::codec::PeerMessage {
                                             msg_type: MessageType::Manifests,
                                             payload: relay_payload.clone(),
-                                        },
-                                    );
+                                        });
                                 }
                             }
                         }
@@ -3035,9 +3034,7 @@ mod tests {
             &rxrpl_crypto::Seed::from_passphrase("b2-master"),
             &rxrpl_crypto::Seed::from_passphrase("b2-signing"),
         );
-        let manifest_bytes = validator_id
-            .sign_manifest(1, None)
-            .expect("sign_manifest");
+        let manifest_bytes = validator_id.sign_manifest(1, None).expect("sign_manifest");
         let manifest = parse_and_verify(&manifest_bytes).expect("parse_and_verify");
         let expected_master = manifest.master_public_key.clone();
 
@@ -3173,8 +3170,14 @@ mod tests {
             // for reputation accounting (otherwise peer_info is None and
             // some paths short-circuit).
             mgr.peer_set.add(Arc::clone(&info));
-            mgr.peer_handles
-                .insert(id, PeerHandle { node_id: id, info, tx });
+            mgr.peer_handles.insert(
+                id,
+                PeerHandle {
+                    node_id: id,
+                    info,
+                    tx,
+                },
+            );
         }
 
         mgr.dispatch_message(id_a, MessageType::Manifests, &payload);

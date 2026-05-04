@@ -79,9 +79,8 @@ mod tests {
         use base64::Engine;
         let manifest_b64 = base64::engine::general_purpose::STANDARD.encode(manifest);
         let secret_hex = hex::encode(secret_key);
-        let inner = format!(
-            r#"{{"manifest":"{manifest_b64}","validation_secret_key":"{secret_hex}"}}"#
-        );
+        let inner =
+            format!(r#"{{"manifest":"{manifest_b64}","validation_secret_key":"{secret_hex}"}}"#);
         base64::engine::general_purpose::STANDARD.encode(inner.as_bytes())
     }
 
@@ -134,8 +133,7 @@ mod tests {
     #[test]
     fn rejects_invalid_secret_hex() {
         use base64::Engine;
-        let inner =
-            r#"{"manifest":"AAAA","validation_secret_key":"zzznothex"}"#;
+        let inner = r#"{"manifest":"AAAA","validation_secret_key":"zzznothex"}"#;
         let token = base64::engine::general_purpose::STANDARD.encode(inner.as_bytes());
 
         let err = parse_validator_token(&token).expect_err("must reject");

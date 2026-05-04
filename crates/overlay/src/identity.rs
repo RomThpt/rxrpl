@@ -136,7 +136,11 @@ fn sign_validation_with_keypair(
     let mut stripped = Vec::with_capacity(192);
 
     // (2,2) sfFlags — always
-    let flags: u32 = if validation.full { 0x80000001 } else { 0x00000000 };
+    let flags: u32 = if validation.full {
+        0x80000001
+    } else {
+        0x00000000
+    };
     stobject::put_uint32(&mut stripped, 2, flags);
 
     // (2,6) sfLedgerSequence — always
@@ -389,8 +393,7 @@ impl ValidatorIdentity {
 /// Derive a keypair using the rippled validator-key path (secp256k1, no
 /// account-level scalar). Mirrors [`NodeIdentity::from_seed`].
 fn derive_validator_keypair(seed: &Seed) -> rxrpl_crypto::KeyPair {
-    let (public_key, private_key) =
-        rxrpl_crypto::secp256k1::derive_keypair(seed, true);
+    let (public_key, private_key) = rxrpl_crypto::secp256k1::derive_keypair(seed, true);
     rxrpl_crypto::KeyPair {
         public_key,
         private_key,
@@ -401,8 +404,14 @@ fn derive_validator_keypair(seed: &Seed) -> rxrpl_crypto::KeyPair {
 impl std::fmt::Debug for ValidatorIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ValidatorIdentity")
-            .field("master_pubkey", &hex::encode(self.master.public_key.as_bytes()))
-            .field("signing_pubkey", &hex::encode(self.signing.public_key.as_bytes()))
+            .field(
+                "master_pubkey",
+                &hex::encode(self.master.public_key.as_bytes()),
+            )
+            .field(
+                "signing_pubkey",
+                &hex::encode(self.signing.public_key.as_bytes()),
+            )
             .finish()
     }
 }
@@ -773,7 +782,10 @@ mod tests {
             ..Default::default()
         };
         id.sign_validation(&mut validation);
-        assert!(verify_validation_signature(&validation), "signing key sig must verify");
+        assert!(
+            verify_validation_signature(&validation),
+            "signing key sig must verify"
+        );
 
         // If we put the master pubkey as the embedded `public_key`, the
         // verifier must reject (signature was made with signing key, not

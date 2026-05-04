@@ -280,7 +280,7 @@ impl Default for ValidatorConfig {
 /// All fields default to `None`; an empty `ValidatorIdentityConfig` means
 /// the node will operate as a non-signing observer (still useful for
 /// follower mode and RPC-only nodes).
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct ValidatorIdentityConfig {
     /// Master seed (long-term key, kept offline ideally). Family seed
     /// (`sn...`) or 32-char hex.
@@ -303,19 +303,6 @@ pub struct ValidatorIdentityConfig {
     /// strictly greater than any previously-published sequence.
     #[serde(default)]
     pub sequence: u32,
-}
-
-impl Default for ValidatorIdentityConfig {
-    fn default() -> Self {
-        Self {
-            master_secret: None,
-            ephemeral_seed: None,
-            validator_token: None,
-            validator_token_path: None,
-            domain: None,
-            sequence: 0,
-        }
-    }
 }
 
 /// Network configuration.

@@ -186,8 +186,14 @@ mod tests {
 
         let config = load_config_str(toml).unwrap();
         let id = &config.validator_identity;
-        assert_eq!(id.master_secret.as_deref(), Some("snoPBrXtMeMyMHUVTgbuqAfg1SUTb"));
-        assert_eq!(id.ephemeral_seed.as_deref(), Some("shKqkZcvNqLLHvw1XBmRb1tYMu1z2"));
+        assert_eq!(
+            id.master_secret.as_deref(),
+            Some("snoPBrXtMeMyMHUVTgbuqAfg1SUTb")
+        );
+        assert_eq!(
+            id.ephemeral_seed.as_deref(),
+            Some("shKqkZcvNqLLHvw1XBmRb1tYMu1z2")
+        );
         assert_eq!(id.domain.as_deref(), Some("validator.example.com"));
         assert_eq!(id.sequence, 7);
         assert!(id.validator_token.is_none());

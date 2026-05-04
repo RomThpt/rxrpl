@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, OnceLock};
 
 use rxrpl_config::ServerConfig;
 use rxrpl_ledger::Ledger;
