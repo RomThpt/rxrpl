@@ -254,6 +254,23 @@ impl PeerManager {
         self.tx_sets = Some(tx_sets);
     }
 
+    /// Register the **local** validator manifest (this node's own,
+    /// produced by [`ValidatorIdentity::sign_manifest`](crate::identity::ValidatorIdentity::sign_manifest)).
+    ///
+    /// Indexes it alongside peer manifests so all the existing lookups
+    /// (master_key_for_ephemeral, get_manifest, all_raw_manifests) see it
+    /// transparently. B2 will broadcast it after each handshake; B3 will
+    /// include it in `all_raw_manifests` returns.
+    pub fn set_local_manifest(&mut self, manifest: crate::manifest::Manifest) {
+        self.manifest_store.set_local(manifest);
+    }
+
+    /// The local validator manifest, if [`set_local_manifest`] has been
+    /// called.
+    pub fn local_manifest(&self) -> Option<&crate::manifest::Manifest> {
+        self.manifest_store.local()
+    }
+
     /// Check if a transaction set is known locally.
     fn has_tx_set(&self, hash: &Hash256) -> bool {
         self.tx_sets

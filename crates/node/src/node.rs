@@ -638,6 +638,32 @@ impl Node {
             );
         }
 
+        // 1c. Build our own signed manifest from the validator identity, so
+        // peers can bind our `signing_pubkey` to our `master_pubkey` when
+        // they receive our validations. Without this, rippled classifies
+        // our validations as `untrusted`. The ManifestStore registration
+        // happens after PeerManager construction below (`peer_mgr.set_local_manifest`).
+        let local_manifest = match validator_id.as_deref() {
+            Some(vid) => {
+                let seq = self.config.validator_identity.sequence.max(1);
+                let domain = self.config.validator_identity.domain.as_deref();
+                let bytes = vid.sign_manifest(seq, domain).map_err(|e| {
+                    NodeError::Config(format!("failed to build local manifest: {e:?}"))
+                })?;
+                let parsed = rxrpl_overlay::manifest::parse_and_verify(&bytes).map_err(|e| {
+                    NodeError::Config(format!(
+                        "self-built manifest failed parse_and_verify (bug): {e:?}"
+                    ))
+                })?;
+                tracing::info!(
+                    "local manifest built: sequence={}, domain={:?}",
+                    parsed.sequence, domain,
+                );
+                Some(parsed)
+            }
+            None => None,
+        };
+
         // 2. Bootstrap from RPC: fetch latest validated ledger to set our starting point
         if let Some(rpc_url) = sync_rpc_url {
             match Self::bootstrap_from_rpc(rpc_url).await {
@@ -704,6 +730,9 @@ impl Node {
         }));
         if let Some(ref store) = self.node_store {
             peer_mgr.set_node_store(Arc::clone(store));
+        }
+        if let Some(manifest) = local_manifest {
+            peer_mgr.set_local_manifest(manifest);
         }
 
         // 3b. Create overlay event channel for bridging to RPC events
