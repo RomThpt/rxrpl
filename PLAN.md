@@ -1,266 +1,292 @@
-# Validator Seed File with Strict Unix Permissions (mode 0600)
+# Plan: Validator List v2 + Cascade Trust (Initiative D)
 
-## Audit: Current Validator Seed Loading Flow
+**Status**: 0% complete | **Target batches**: 5 | **Primary risk**: backward-compat with v1 | **Biggest blocker**: cascade depth/revocation coordination
 
-### Current State
-1. **No file-based validator seed loader exists** — validation keys are currently:
-   - Generated ad-hoc via RPC handlers (`validation_create`, `validation_seed`)
-   - Not loaded from disk at node startup
-   - Not persistent across restarts
+## 1. Audit Summary
 
-2. **Node identity (P2P) seed handling** (exists in `crates/node/src/node.rs:616-622`):
-   - Loaded from `config.peer.node_seed` (optional string)
-   - Accepts 32-char hex OR base58 family seed format
-   - Parsed by `parse_node_seed()` → 16-byte entropy
-   - No persistent storage; must be provided each boot via config or env
+### Current State (v1 only)
+- `crates/overlay/src/validator_list.rs` (685 LOC): parses & verifies v1 VL blobs with ephemeral-key signature verification
+- `crates/overlay/src/vl_fetcher.rs` (324 LOC): periodically fetches VL from HTTP endpoints, calls `verify_and_parse()`, publishes trusted keys to consensus
+- `crates/overlay/src/manifest.rs` (859 LOC): parses STObject manifests (sequence, master/ephemeral keys, domain), rejects revocation (seq==u32::MAX)
+- `crates/consensus/src/unl.rs`: maps validator master keys → NodeIds for quorum computation; no time-based filtering
+- **Version field**: parsed but ignored; wire format currently only supports `version: 1`
 
-3. **Config loading** (`crates/config/src/loader.rs`):
-   - Simple `fs::read_to_string()` + TOML parse
-   - No permission validation; assumes config file is operator-owned
+### What Exists
+- Publisher master key registration + signing-key rotation + revocation handling (T39, commit 28a2e6d)
+- Manifest-store with tracking of revoked publishers
+- Per-validator master-key extraction from blob
+- Tests: signature verification, stale-sequence detection, rotation attestation, revocation cascade (3 tests in validator_list.rs)
 
-4. **Crypto primitives** (`crates/crypto/src/seed.rs`):
-   - `Seed::from_passphrase()` — SHA-512(passphrase)[:16]
-   - `Seed::from_bytes()` — raw 16-byte constructor
-   - `Seed::random()` — cryptographically random seed
-   - Zeroized on drop ✓
-
-5. **Error types**:
-   - `ConfigError` — IO, Parse, Invalid
-   - `NodeError` — Config, Storage, Server, etc.
-   - Both use `thiserror`; can be extended
-
-### Dependencies Available
-- **Standard library only** — no `cap-std`, `nix`, or `rustix` in workspace
-- Will need to add: `std::fs::metadata()` + `#[cfg(unix)]` for mode checks
-- Windows: use `std::fs::File::open()` with ACL validation or graceful skip
+### What's Missing (v2 + cascade)
+1. **Blob v2 format**: multiple `blobs_v2` entries with `effective_start` + `effective_expiration` windows; each VL instance has scope
+2. **Effective time windows**: parsing & enforcing `effective_start ≤ now < effective_expiration` for each blob; stale/future blobs must be filtered
+3. **Cascade resolution**: when a VL references other publishers as "delegates", fetch & verify those publishers' VLs to build transitive trust chain
+4. **Signature chain verification**: verify each delegate publisher's signature over the delegation payload using their registered ephemeral key
+5. **Publisher key derivation from validator manifest**: each validator can specify a distinct publisher key (not global); blob-level override needed
 
 ---
 
-## Identified Target Crates & Files
+## 2. Target Crates & Files
 
-### Crate: `rxrpl-config`
-Files to modify/create:
-- `crates/config/src/types.rs` — add `ValidatorConfig::seed_file` field (Optional<PathBuf>)
-- `crates/config/src/loader.rs` — extend to load & validate seed file
-- `crates/config/src/error.rs` — add `SeedFile` variant
-- (NEW) `crates/config/src/seed_loader.rs` — dedicated seed file I/O module
-
-### Crate: `rxrpl-node`
-Files to modify:
-- `crates/node/src/node.rs` — integrate seed file load at startup (line ~601 `run_networked`)
-- `crates/node/src/error.rs` — extend with `SeedFilePermission` variant
-
-### Crate: `rxrpl-crypto`
-No changes needed — existing `Seed` API is sufficient.
-
-### RPC Server (validation_seed handler)
-- `crates/rpc-server/src/handlers/validation_seed.rs` — already works; no changes
-- (NOTE) Handlers for *generating* seeds; validator *loading* is separate concern
-
-### Tests
-- (NEW) `crates/config/tests/seed_file_permission.rs` — Unix mode 0600 validation
-- (NEW) Integration test in `crates/node/tests/` — load & validate seed at startup
+| Crate | File | Role |
+|-------|------|------|
+| `overlay` | `src/validator_list.rs` | Core v2 blob parser; effective-time filter; cascade resolver |
+| `overlay` | `src/vl_fetcher.rs` | HTTP fetch loop; error handling for stale/future blobs |
+| `overlay` | `src/manifest.rs` | *No change required* (manifests are v1-only) |
+| `consensus` | `src/unl.rs` | Consume effective-time metadata; mark VLs with scope windows |
+| `config` | `src/types.rs` | *Minimal*: cascade-depth-limit config (e.g., max 3 delegations) |
+| `tests` | `crates/overlay/tests/vl_v2_cascade.rs` | **New** integration tests; fixture generators |
 
 ---
 
-## Spec: Implementation Batches (B1–B5)
+## 3. Batch Plan (B1..B5)
 
-### **B1: Config Type & Permission Error Types**
-**Goal:** Add seed file path to ValidatorConfig; extend error enums.
+### B1: V2 Parser – Multiple Blobs + Effective Windows
+**Goal**: Parse rippled v2 blob array; extract & filter by `effective_start`/`effective_expiration`.  
+**Files**: `crates/overlay/src/validator_list.rs` (modify parse_and_parse)
 
-**Files:**
-- `crates/config/src/types.rs` — add to `ValidatorConfig`:
-  ```toml
-  [validators]
-  enabled = true
-  seed_file = "/etc/rxrpl/validator-seed"  # optional
-  ```
-- `crates/config/src/error.rs` — add variants:
-  - `SeedFileNotFound(PathBuf)`
-  - `SeedFilePermissionDenied(PathBuf, mode u32)` — Unix mode too loose
-  - `SeedFileUnreadable(PathBuf, String)` — generic I/O error
-  - `SeedFileWindowsNotSupported` — Windows doesn't store Unix mode
-- `crates/node/src/error.rs` — add: `SeedFileError(String)` variant
+**Changes**:
+- Extend `VlPayload` struct to parse optional `blobs_v2: [{ effective_start, effective_expiration, blob, signature }]` array (v2) alongside v1's single blob
+- Parse `version` field; route to appropriate parser based on version ≥ 2
+- Add `SystemTime`-aware filter: for each blob, check `effective_start ≤ now < effective_expiration`; reject if outside window
+- Return list of `(ValidatorListData, effective_window: (u64, u64))` instead of single VL
 
-**Failing test:** Config with `seed_file` set parses without error (no loader yet).
+**Types**:
+- `struct BlobV2Entry { effective_start: u64, effective_expiration: u64, blob: Vec<u8>, signature: Vec<u8> }`
+- `struct ValidatorListDataV2 { base: ValidatorListData, effective_start: u64, effective_expiration: u64, publisher_id: PublicKey }`
+- Enum `ValidatorListVersion { V1(ValidatorListData), V2(Vec<ValidatorListDataV2>) }`
 
-**Verify:**
+**First failing test**: `test_parse_vl_v2_multiple_blobs_filters_by_time()`
+```rust
+// Fixture: 3 blobs; time=100; blob1: start=50 end=150 (valid), blob2: start=0 end=50 (expired), blob3: start=150 end=200 (future)
+// Expected: only blob1 in result
+```
+
+**Verify command**:
 ```bash
-cargo test --package rxrpl-config config_types
+cd /Users/romt/Developer/rxrpl/.worktrees/vl-v2-cascade
+cargo test -p rxrpl-overlay test_parse_vl_v2_multiple_blobs_filters_by_time -- --nocapture
 ```
 
 ---
 
-### **B2: Seed File Loader Module (Unix Mode Check)**
-**Goal:** Implement `crates/config/src/seed_loader.rs` — read seed file, enforce 0600 on Unix.
+### B2: Effective-Time Filtering in Consensus UNL
+**Goal**: Filter validator set by time windows when building trusted set.  
+**Files**: `crates/consensus/src/unl.rs` (add method); `crates/overlay/src/validator_list.rs` (expose windows)
 
-**Files:**
-- (NEW) `crates/config/src/seed_loader.rs`:
-  ```rust
-  pub fn load_seed_file(path: &Path) -> Result<Seed, ConfigError>
-  ```
-  - Read file bytes (must be 16 or 32 hex chars)
-  - On Unix: call `std::fs::metadata()`, check mode == 0o600
-  - On Windows: warn in log (ACL not portable; skip check)
-  - Return `Seed` on success
+**Changes**:
+- Add `TrustedValidatorList::update_from_validator_keys_v2(vls: &[ValidatorListDataV2])` 
+- For each VL, check `now >= effective_start && now < effective_expiration`; only add validators from non-expired VLs
+- Store `(PublicKey → expiration_unix)` map so quorum-recompute can purge expired validators after `effective_expiration` elapses
+- In consensus, when computing effective_size, exclude expired validators
 
-- `crates/config/src/lib.rs` — export module
+**Types**:
+- `struct TimeBoundValidator { master_key: PublicKey, expires_at_unix: u64 }`
 
-**Failing test:**
-- File with mode 0644 → `SeedFilePermissionDenied`
-- File with mode 0600 → success
-- Missing file → `SeedFileNotFound`
+**First failing test**: `test_unl_filters_expired_validators()`
+```rust
+// Fixture: 2 validators; expiry_1 = 100, expiry_2 = 200; time=150
+// Expected: effective_size() = 1 (only validator 2 counts)
+```
 
-**Verify:**
+**Verify command**:
 ```bash
-cargo test --package rxrpl-config seed_file --lib
+cargo test -p rxrpl-consensus test_unl_filters_expired_validators -- --nocapture
 ```
 
 ---
 
-### **B3: Config Loader Integration**
-**Goal:** Wire seed file loader into config parsing at load time.
+### B3: Cascade Resolution – Delegation Chain
+**Goal**: Follow delegation references from primary VL to secondary publishers; resolve transitive trust.  
+**Files**: `crates/overlay/src/validator_list.rs` (new fn); `crates/overlay/src/vl_fetcher.rs` (fetch loop)
 
-**Files:**
-- `crates/config/src/loader.rs`:
-  ```rust
-  pub fn load_config(path: impl AsRef<Path>) -> Result<(NodeConfig, Option<Seed>), ConfigError>
-  ```
-  - Load NodeConfig as before
-  - If `config.validators.seed_file` is Some, call `load_seed_file()`
-  - Return tuple: (config, seed)
+**Changes**:
+- Add `delegates: Option<Vec<PublicKey>>` field to v2 blob structure
+- Implement `fn resolve_cascade(publisher_pk, depth_limit, manifest_store, fetcher_client) → Result<Vec<ValidatorListDataV2>>` 
+- For each delegate PK, call `fetcher_client.get(delegate_publisher_url)` (URL derived from manifest `sfDomain`), verify blob against delegate's ephemeral key, collect validators
+- Enforce `depth ≤ config.validators.cascade_depth_max` (default 3); reject cycles via `visited_publishers: HashSet<PublicKey>`
+- On revocation, mark cascaded VLs as stale (delegate revoked → all descendants dropped)
 
-**Failing test:**
-- Config without `seed_file` → returns None seed ✓
-- Config with valid seed file → returns seed bytes ✓
-- Config with loose-perm seed file → Error
+**Types**:
+- `struct CascadeBlob { primary_pk: PublicKey, delegates: Vec<PublicKey>, depth: usize }`
+- `fn resolve_cascade(...) → Result<Vec<ValidatorListDataV2>, CascadeError>`
+- `enum CascadeError { DepthExceeded, CyclicDelegate, DelegateFetchFailed, DelegateRevoked }`
 
-**Verify:**
+**First failing test**: `test_cascade_resolves_one_level()`
+```rust
+// Fixture: primary VL with delegates=[delegate_pk_1]; delegate's URL cached in manifest domain
+// Expected: cascade() returns validators from both primary and delegate
+```
+
+**Verify command**:
 ```bash
-cargo test --package rxrpl-config loader
+cargo test -p rxrpl-overlay test_cascade_resolves_one_level -- --nocapture
 ```
 
 ---
 
-### **B4: Node Startup Integration (Pass-Through)**
-**Goal:** Load validator seed at `Node::run_networked()` boot; store in `Node` struct.
+### B4: Signature & Manifest Verification Chain
+**Goal**: Verify blob signatures for cascaded blobs using delegates' ephemeral keys; link manifest rotation to cascade.  
+**Files**: `crates/overlay/src/validator_list.rs`; `crates/overlay/src/manifest.rs` (register ephemeral key for delegates)
 
-**Files:**
-- `crates/node/src/node.rs`:
-  - Add field to `struct Node`: `validation_seed: Option<Seed>`
-  - Modify `Node::new(config)` → load seed if config specifies path
-  - At startup, if enabled: initialize validator signing key (placeholder for later)
-  - Log: "validator seed loaded from X" or warning if seed_file specified but disabled
+**Changes**:
+- When verifying cascaded blob: extract delegate's current ephemeral key from `manifest_store.get_signing_pk(delegate_pk)`; verify blob signature against that key
+- On delegate manifest rotation (T39 `rotate_publisher_signing_key`), invalidate all cascaded VLs from that delegate; require re-fetch
+- Add `fn verify_cascade_signature(blob_bytes, delegate_ephemeral_pk, signature) → bool` (same logic as V1 blob sig, reusing `verify_blob_signature`)
+- Test: forge bad cascade signature; must reject with `CascadeError::SignatureInvalid`
 
-- `crates/node/src/error.rs` — ensure `SeedFileError` propagates from config
+**Types**:
+- `enum CascadeError { ... SignatureInvalid, ... }`
 
-**Failing test:**
-- Create node with validator enabled + seed file set → seed loaded ✓
-- Create node with validator disabled + seed file set → warning logged, no panic
-- Create node, seed file has wrong mode → startup fails cleanly
+**First failing test**: `test_cascade_rejects_tampered_delegate_signature()`
+```rust
+// Fixture: cascade blob with valid delegate PK but tampered signature
+// Expected: verify_cascade_signature() returns false; cascade resolver returns Err(SignatureInvalid)
+```
 
-**Verify:**
+**Verify command**:
 ```bash
-cargo test --package rxrpl-node node -- --nocapture
+cargo test -p rxrpl-overlay test_cascade_rejects_tampered_delegate_signature -- --nocapture
 ```
 
 ---
 
-### **B5: Write Path + Umask (File Creation)**
-**Goal:** Add CLI helper or utility fn to create seed file with 0600 atomically.
+### B5: Integration + Backward-Compat Tests
+**Goal**: v1 still works; v2 with/without cascade; stale-blob handling; graceful downgrade.  
+**Files**: `crates/overlay/tests/vl_v2_cascade.rs` (new file); `crates/node/src/node.rs` (integrate fetcher)
 
-**Files:**
-- (NEW) `crates/config/src/seed_writer.rs`:
-  ```rust
-  pub fn write_seed_file(path: &Path, seed: &Seed) -> Result<(), ConfigError>
-  ```
-  - Create file with O_EXCL (fail if exists)
-  - On Unix: set umask(0o077) before create, then restore
-  - Write 16 bytes (hex) or raw binary
-  - Sync to disk
-  - Verify mode == 0o600 after write
+**Changes**:
+- New test file with fixtures for: v1-only, v2 single-blob, v2 multi-blob, v2 with cascade, mixed v1+v2
+- Test backward-compat: v1 fetcher continues to work; VL version=1 blob parsed identically to current behavior
+- Test stale-blob rejection: when all v2 blobs are expired, node halts new validator additions; uses stale UNL until fresh blob arrives
+- Test cascade+rotation: when delegate's signing key rotates, old cached cascade VLs are invalidated; new fetch succeeds with new key
+- Test cascade revocation: when primary publisher revokes, all cascaded VLs drop immediately
+- Integration: `VlFetcher::run()` detects version in wire payload; routes to v1 or v2 parser
 
-- (NEW) CLI subcommand (e.g., `rxrpl init-validator-seed --path /etc/rxrpl/seed`):
-  ```bash
-  rxrpl init-validator-seed \
-    --path /etc/rxrpl/validator-seed \
-    [--generate | --from-passphrase "..."]
-  ```
-  - Generate random or from passphrase
-  - Write with 0600
-  - Print validation key (public) for UNL registration
+**Test matrix** (minimum 8 tests):
+| Test | Scenario | Expected |
+|------|----------|----------|
+| `test_v1_backward_compat` | version=1 blob | parse identically to current |
+| `test_v2_single_blob` | version=2, 1 blob, in-window | accepted |
+| `test_v2_all_blobs_expired` | version=2, all expired | stale-UNL used |
+| `test_v2_cascade_one_level` | version=2 + delegates | merged validator set |
+| `test_v2_cascade_depth_exceeded` | version=2 + 4-level cascade | rejected |
+| `test_cascade_delegate_revoked` | cascade + delegate revocation | cascaded VLs dropped |
+| `test_cascade_rotation_invalidates_cache` | v2 cascade + delegate key rotation | re-fetch required |
+| `test_mixed_v1_v2_publishers` | 2 publishers: one v1, one v2 | both work |
 
-**Failing test:**
-- Write file, check mode == 0o600 ✓
-- Write to existing file → fails (O_EXCL)
-- Write then read back → identical seed ✓
-
-**Verify:**
+**Verify command**:
 ```bash
-cargo test --package rxrpl-config seed_writer
+cargo test -p rxrpl-overlay vl_v2_cascade -- --nocapture
+cargo test -p rxrpl-node node_integration_vl_v2 -- --nocapture
 ```
 
 ---
 
-## Risk Analysis
+## 4. Risk Assessment
 
-### High
-1. **TOCTOU (Time-of-Check-Time-of-Use):**
-   - Attacker could change mode between our check and read
-   - *Mitigation:* Atomic check+read in single `open()` call; use `fcntl(F_GETFL)` after open to verify mode still 0o600
-   - *Acceptance:* Not exploitable in typical setups; Docker/container environments may need special guidance
+### High Risk
+1. **Backward-compat with v1 publishers**: existing rippled nodes may not upgrade to v2 immediately; must support both indefinitely
+   - *Mitigation*: version detection + dual parser; fallback if v2 unparseable
+2. **Cascade depth attacks**: malicious delegate could create circular references or deep chains
+   - *Mitigation*: hard limit (default 3); cycle detection via `visited_publishers: HashSet`
+3. **Time-based expiration race**: `effective_start ≤ now < effective_expiration` computed at fetch time; clock skew on node causes valid blob to be rejected
+   - *Mitigation*: add 5-minute grace window; log warnings at 95% TTL
 
-2. **Windows ACL story:**
-   - Unix mode 0600 is meaningless on Windows
-   - No portable ACL equivalent
-   - *Solution:* Log warning on Windows; require operator to manually secure via NTFS ACLs or GPO
-   - *Or:* Use `rustls` already in dependencies, embed seed in encrypted config + password prompt at startup (defer to future iteration)
+### Medium Risk
+1. **Manifest rotation during cascade fetch**: delegate's ephemeral key rotates mid-fetch; signature verification fails inconsistently
+   - *Mitigation*: atomic read of ephemeral key from store; re-try once on mismatch
+2. **Cascade URL resolution**: domain not in manifest; requires out-of-band config
+   - *Mitigation*: explicit cascade-url mapping in config; fall back to HTTPS://<domain>/ standard path
+3. **Memory amplification**: cascade resolver makes N HTTP requests; N = validator count + cascade depth
+   - *Mitigation*: serialize cascade fetches; enforce per-fetch timeout; limit total blob size across all cascades
 
-### Medium
-3. **Symlink attack:**
-   - If seed_file points to symlink, attacker could redirect to world-readable file
-   - *Mitigation:* Check that seed_file path is not a symlink; use `fs::symlink_metadata()` → `is_symlink()`
-   - *If symlink:* Error or warning (decide per ops preference)
-
-4. **Docker/container ergonomics:**
-   - 0600 file in volume mount may not be preservable across container restart
-   - Docker run: `--cap-drop=DAC_OVERRIDE` helps; volume mount may lose perms
-   - *Guidance:* Document use of tmpfs or secrets manager integration (future)
-
-5. **Backward compat for users with seed in `rxrpl.cfg`:**
-   - Some users may have stored `[validators] seed = "hex..."` in config
-   - *Approach:* Keep that field unsupported (or with a loud deprecation warning)
-   - Migration: provide one-time CLI tool to extract from cfg → write to 0600 file
-
-### Low
-6. **Parent directory mode:**
-   - If `/etc/rxrpl/` is world-writable, attacker could mv/swap file
-   - *Mitigation:* Check parent dir mode in `load_seed_file()` (warn if world-writable)
-   - *Or:* Document that parent must be 0750 or stricter (operator responsibility)
+### Low Risk
+1. **Tests only cover happy path**: edge cases like partial cascade failures, mixed-version cascades
+   - *Mitigation*: B5 test matrix covers; add chaos-injection tests later
 
 ---
 
-## Out of Scope
+## 5. Open Questions
 
-1. **Key rotation:** Only load once at startup; rotations require node restart
-2. **Hardware security modules (HSM):** Direct file I/O only; no PKCS#11 integration
-3. **Encrypted seed storage:** Seed is stored plaintext at 0600; if encryption needed, wrap at filesystem level (LUKS, dm-crypt)
-4. **Multi-signature validator keys:** Single-key support; multisig is separate protocol concern
-5. **Audit logging for seed access:** OS-level audit (`auditctl`, `seaudit`) is operator responsibility
-6. **Seed rotation on file modification:** No active monitor; requires manual restart
-7. **gRPC server integration:** Currently RPC-only; gRPC handlers can be added in parallel
+1. **Cascade URL encoding**: rippled stores delegate URLs in manifest `sfDomain`; is this reliable? Do we need explicit config?
+2. **Revocation semantics**: if primary publisher revokes, do cascaded validators become untrusted immediately, or only after TTL?
+3. **Quorum recompute frequency**: effective-time filtering is time-dependent; should consensus engine recompute quorum periodically (e.g., every 10 ledgers)?
+4. **Wire-level v2 negotiation**: do we advertise v2 support in P2P handshake, or just silently accept v2 blobs?
+5. **Ledger state for VL metadata**: should effective-start/expiration windows be stored in ledger, or ephemeral-only?
 
 ---
 
-## Progress Summary
+## 6. Out of Scope
 
-**% Done:** 5% (audit complete; ready for B1)
+- **Amendment voting for v2 support**: v2 blobs are fetched; no consensus/ledger change required
+- **Negative UNL v2**: negative-UNL remains v1-only; cascade does not create negative entries
+- **Multi-signature cascade**: each blob has single publisher; multi-sig not supported in v2
+- **Time-sync requirements**: assumes system clock is NTP-synchronized (standard assumption); no on-chain time-lock mechanism
+- **Cascade over TLS client certificate auth**: only HTTPS GET supported; no mTLS
+- **Historical VL archival**: old blobs discarded after TTL; no ledger-based VL history
 
-**# Batches:** 5 (B1 config types, B2 loader, B3 config integration, B4 node startup, B5 write path)
+---
 
-**Biggest Risk:** Windows ACL story + TOCTOU attack window. Solved by: Windows → warn + document, TOCTOU → use atomic open+verify post-open.
+## 7. Completion Estimate
 
-**Effort:** ~2–3 days (B1-B2: 4h, B3: 2h, B4: 3h, B5: 3h + testing 2h)
+| Batch | LOC Delta | Tests | Days |
+|-------|-----------|-------|------|
+| B1 | +180 | 3 | 1 |
+| B2 | +60 | 2 | 0.5 |
+| B3 | +200 | 3 | 1.5 |
+| B4 | +100 | 2 | 1 |
+| B5 | +250 | 8 | 2 |
+| **Total** | **+790** | **18** | **6** |
 
-**Next:** Start B1 — add `seed_file: Option<PathBuf>` to `ValidatorConfig`.
+**Final state**: ~1900 LOC in overlay/validator_list.rs + related; 26 new integration tests (18 + 8 existing regression suite).
+
+---
+
+## 8. Success Criteria
+
+✓ V1 blobs continue to parse & work (regression suite all green)  
+✓ V2 single-blob (no cascade) accepted & validators added to consensus UNL  
+✓ V2 multi-blob with effective-time filtering: expired blobs ignored  
+✓ Cascade chain resolves to depth limit; cycles rejected  
+✓ Delegate signature verification enforced; tampered blobs rejected  
+✓ Cascade invalidation on delegate revocation  
+✓ RPC `validator_list_sites` returns per-blob windows (added to status struct)  
+✓ All 8-test matrix (B5) green  
+✓ Backward-compat: mainnet rippled + rxrpl mixed UNL still converge  
+
+---
+
+## Appendix: rippled v2 Blob Format Reference
+
+```json
+{
+  "version": 2,
+  "public_key": "ED2677...",
+  "manifest": "<base64>",
+  "blobs_v2": [
+    {
+      "effective_start": 700000000,
+      "effective_expiration": 700100000,
+      "blob": "<base64 JSON with validators + delegates>",
+      "signature": "<hex>"
+    },
+    { ... }
+  ]
+}
+```
+
+**Blob JSON (v2)**:
+```json
+{
+  "sequence": 5,
+  "expiration": 700100000,
+  "validators": [
+    { "validation_public_key": "ED1234...", "manifest": "<base64>" }
+  ],
+  "delegates": [
+    "ED5678..."  // optional; references other publishers' PKs
+  ]
+}
+```
 
