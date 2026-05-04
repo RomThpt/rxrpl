@@ -57,6 +57,22 @@ mod tests {
     }
 
     #[test]
+    fn validator_config_seed_file_field_parses() {
+        let toml = r#"
+            [validators]
+            enabled = true
+            seed_file = "/etc/rxrpl/validator-seed"
+        "#;
+
+        let config = load_config_str(toml).unwrap();
+        assert!(config.validators.enabled);
+        assert_eq!(
+            config.validators.seed_file.as_deref(),
+            Some(std::path::Path::new("/etc/rxrpl/validator-seed"))
+        );
+    }
+
+    #[test]
     fn validator_config() {
         let toml = r#"
             [validators]

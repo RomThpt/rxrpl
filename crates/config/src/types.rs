@@ -258,6 +258,10 @@ pub struct ValidatorConfig {
     /// run with no UNL configured.
     #[serde(default = "default_require_trusted")]
     pub require_trusted_validators: bool,
+    /// Optional path to a file containing this validator's signing seed.
+    /// On Unix the file MUST have mode 0o600 or loading is refused.
+    #[serde(default)]
+    pub seed_file: Option<PathBuf>,
 }
 
 fn default_require_trusted() -> bool {
@@ -273,6 +277,7 @@ impl Default for ValidatorConfig {
             validator_list_keys: Vec::new(),
             quorum: None,
             require_trusted_validators: default_require_trusted(),
+            seed_file: None,
         }
     }
 }

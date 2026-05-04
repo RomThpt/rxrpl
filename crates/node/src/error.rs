@@ -24,4 +24,7 @@ pub enum NodeError {
 
     #[error("ledger not open")]
     LedgerNotOpen,
+
+    #[error("validator seed file error: {0}")]
+    SeedFile(String),
 }
