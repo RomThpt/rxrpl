@@ -24,6 +24,19 @@ pub struct TrustedValidatorList {
     ephemeral_to_master: HashMap<NodeId, NodeId>,
     /// Master public key bytes (hex) -> NodeId, for reverse lookups.
     master_keys: HashMap<String, NodeId>,
+    /// NodeId -> earliest expiration (unix seconds) under which it is
+    /// trusted via a v2 VL. Populated by [`update_from_validator_keys_v2`].
+    /// Validators not in this map have no time bound (legacy v1 trust).
+    expirations: HashMap<NodeId, u64>,
+}
+
+/// One trusted-validator record carrying a v2 effective expiration.
+///
+/// Used by [`TrustedValidatorList::update_from_validator_keys_v2`].
+#[derive(Clone, Debug)]
+pub struct TimeBoundValidator {
+    pub master_key: PublicKey,
+    pub expires_at_unix: u64,
 }
 
 impl TrustedValidatorList {
@@ -34,6 +47,7 @@ impl TrustedValidatorList {
             negative_unl: HashSet::new(),
             ephemeral_to_master: HashMap::new(),
             master_keys: HashMap::new(),
+            expirations: HashMap::new(),
         }
     }
 
@@ -78,6 +92,58 @@ impl TrustedValidatorList {
             .iter()
             .filter(|n| !self.negative_unl.contains(n))
             .count()
+    }
+
+    /// Effective size at a given wall-clock time. Validators whose v2
+    /// expiration is `<= now_unix` are excluded. Validators without an
+    /// expiration record (legacy v1) always count.
+    pub fn effective_size_at(&self, now_unix: u64) -> usize {
+        self.trusted
+            .iter()
+            .filter(|n| !self.negative_unl.contains(n))
+            .filter(|n| {
+                self.expirations
+                    .get(*n)
+                    .map(|exp| now_unix < *exp)
+                    .unwrap_or(true)
+            })
+            .count()
+    }
+
+    /// Replace the trusted set from a v2 list, recording each validator's
+    /// effective expiration. Only validators whose
+    /// `expires_at_unix > now_unix` are admitted; expired validators are
+    /// dropped (they would never count toward quorum anyway). The recorded
+    /// expirations are used by [`Self::effective_size_at`] to purge
+    /// validators as time advances.
+    pub fn update_from_validator_keys_v2(
+        &mut self,
+        validators: &[TimeBoundValidator],
+        now_unix: u64,
+    ) {
+        self.trusted.clear();
+        self.master_keys.clear();
+        self.expirations.clear();
+        for v in validators {
+            if v.expires_at_unix <= now_unix {
+                continue;
+            }
+            let node_id = NodeId::from_public_key(v.master_key.as_bytes());
+            self.trusted.insert(node_id);
+            self.master_keys
+                .insert(hex::encode(v.master_key.as_bytes()), node_id);
+            // If a validator appears in multiple v2 VLs, keep the latest
+            // expiration so that quorum stays large as long as any blob
+            // covers the validator.
+            self.expirations
+                .entry(node_id)
+                .and_modify(|e| {
+                    if v.expires_at_unix > *e {
+                        *e = v.expires_at_unix;
+                    }
+                })
+                .or_insert(v.expires_at_unix);
+        }
     }
 
     /// Quorum threshold: 80% of effective size, rounded up.
@@ -285,6 +351,61 @@ mod tests {
 
         unl.revoke_master_key(&kp.public_key);
         assert!(!unl.is_trusted(&id));
+    }
+
+    /// B2: validators whose v2 effective_expiration is in the past are
+    /// excluded from effective_size at the given time.
+    #[test]
+    fn unl_filters_expired_validators() {
+        let kp1 = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("b2_val_1"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let kp2 = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("b2_val_2"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+
+        let mut unl = TrustedValidatorList::empty();
+        unl.update_from_validator_keys_v2(
+            &[
+                TimeBoundValidator {
+                    master_key: kp1.public_key.clone(),
+                    expires_at_unix: 100,
+                },
+                TimeBoundValidator {
+                    master_key: kp2.public_key.clone(),
+                    expires_at_unix: 200,
+                },
+            ],
+            50,
+        );
+
+        // At t=150, kp1 has expired; kp2 still counts.
+        assert_eq!(unl.effective_size_at(150), 1);
+        // At t=50, both still valid.
+        assert_eq!(unl.effective_size_at(50), 2);
+        // At t=250, both expired.
+        assert_eq!(unl.effective_size_at(250), 0);
+    }
+
+    /// B2: validators whose expiration is already past at admission time
+    /// are skipped entirely (never inserted into the trusted set).
+    #[test]
+    fn unl_v2_skips_already_expired_at_admission() {
+        let kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("b2_val_skip"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let mut unl = TrustedValidatorList::empty();
+        unl.update_from_validator_keys_v2(
+            &[TimeBoundValidator {
+                master_key: kp.public_key.clone(),
+                expires_at_unix: 100,
+            }],
+            150,
+        );
+        assert_eq!(unl.effective_size(), 0);
     }
 
     #[test]
