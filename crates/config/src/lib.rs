@@ -10,5 +10,5 @@ pub use error::ConfigError;
 pub use loader::load_config;
 pub use types::{
     ClusterConfig, DatabaseConfig, GenesisConfig, NetworkConfig, NodeConfig, PeerConfig,
-    ServerConfig, ShardConfig, ValidatorConfig,
+    ServerConfig, ShardConfig, ValidatorConfig, ValidatorIdentityConfig,
 };

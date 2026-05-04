@@ -15,6 +15,8 @@ pub struct NodeConfig {
     #[serde(default)]
     pub validators: ValidatorConfig,
     #[serde(default)]
+    pub validator_identity: ValidatorIdentityConfig,
+    #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
     pub genesis: GenesisConfig,
@@ -31,6 +33,7 @@ impl Default for NodeConfig {
             peer: PeerConfig::default(),
             database: DatabaseConfig::default(),
             validators: ValidatorConfig::default(),
+            validator_identity: ValidatorIdentityConfig::default(),
             network: NetworkConfig::default(),
             genesis: GenesisConfig::default(),
             cluster: ClusterConfig::default(),
@@ -273,6 +276,60 @@ impl Default for ValidatorConfig {
             validator_list_keys: Vec::new(),
             quorum: None,
             require_trusted_validators: default_require_trusted(),
+        }
+    }
+}
+
+/// Validator signing-identity configuration.
+///
+/// Distinct from [`ValidatorConfig`] (which configures the trusted-set / UNL
+/// from the consumer side): this struct holds the **secrets used to sign
+/// our own validations and manifest** when this node operates as a UNL
+/// signatory.
+///
+/// Three mutually-exclusive ways to provide the identity:
+/// 1. `master_secret` + `ephemeral_seed`: explicit two-key form.
+/// 2. `validator_token`: rippled-style base64 bundle (manifest + ephemeral
+///    secret) inline in the config.
+/// 3. `validator_token_path`: filesystem path to a token file (mode 0600).
+///
+/// All fields default to `None`; an empty `ValidatorIdentityConfig` means
+/// the node will operate as a non-signing observer (still useful for
+/// follower mode and RPC-only nodes).
+#[derive(Clone, Debug, Deserialize)]
+pub struct ValidatorIdentityConfig {
+    /// Master seed (long-term key, kept offline ideally). Family seed
+    /// (`sn...`) or 32-char hex.
+    #[serde(default)]
+    pub master_secret: Option<String>,
+    /// Ephemeral signing seed (rotatable). Same encoding as `master_secret`.
+    #[serde(default)]
+    pub ephemeral_seed: Option<String>,
+    /// Inline rippled-style validator token (base64 of JSON
+    /// `{validation_secret_key, manifest}`).
+    #[serde(default)]
+    pub validator_token: Option<String>,
+    /// Path to a file containing a rippled-style validator token.
+    #[serde(default)]
+    pub validator_token_path: Option<PathBuf>,
+    /// Domain claim emitted in the manifest's `sfDomain` field.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// Manifest sequence (monotonic). When rotating signing keys, must be
+    /// strictly greater than any previously-published sequence.
+    #[serde(default)]
+    pub sequence: u32,
+}
+
+impl Default for ValidatorIdentityConfig {
+    fn default() -> Self {
+        Self {
+            master_secret: None,
+            ephemeral_seed: None,
+            validator_token: None,
+            validator_token_path: None,
+            domain: None,
+            sequence: 0,
         }
     }
 }
