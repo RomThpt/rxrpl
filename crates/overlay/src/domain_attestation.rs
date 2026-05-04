@@ -10,16 +10,22 @@
 //! Body size is capped at 64 KiB. A configurable timeout (default 10 s)
 //! prevents the background task from hanging.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rxrpl_primitives::PublicKey;
 use serde::Deserialize;
+use tokio::sync::RwLock;
 
 /// Default per-request HTTP timeout for `xrp-ledger.toml` fetches.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum bytes accepted from a single TOML response.
 pub const MAX_BODY: u64 = 64 * 1024;
+
+/// Default cache TTL for a successful attestation (24 hours).
+pub const DEFAULT_TTL: Duration = Duration::from_secs(24 * 3600);
 
 /// Errors produced while fetching or verifying a domain attestation.
 #[derive(Debug, thiserror::Error)]
@@ -183,6 +189,185 @@ fn verify_toml(text: &str, master_key: &PublicKey) -> Result<bool, AttestationEr
     Ok(false)
 }
 
+// ---------------------------------------------------------------------
+// B2: cache + TTL + retry backoff
+// ---------------------------------------------------------------------
+
+/// Status of a single validator's domain attestation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttestationStatus {
+    /// No attempt has been made yet.
+    NotAttempted,
+    /// A fetch is in flight or scheduled but no result yet.
+    Pending,
+    /// Successfully verified at the given Unix timestamp.
+    Verified { at: u64 },
+    /// Most recent attempt failed with the recorded error message.
+    Failed { last_error: String, fail_count: u32 },
+    /// Previously verified but TTL has lapsed.
+    Expired,
+}
+
+impl AttestationStatus {
+    /// Short string for RPC exposure.
+    pub fn label(&self) -> &'static str {
+        match self {
+            AttestationStatus::NotAttempted => "not_attempted",
+            AttestationStatus::Pending => "pending",
+            AttestationStatus::Verified { .. } => "verified",
+            AttestationStatus::Failed { .. } => "failed",
+            AttestationStatus::Expired => "expired",
+        }
+    }
+}
+
+/// Cache entry for a single validator.
+#[derive(Clone, Debug)]
+pub struct AttestationEntry {
+    pub domain: String,
+    pub status: AttestationStatus,
+    pub last_checked_unix: u64,
+}
+
+/// Per-validator domain attestation cache.
+#[derive(Debug, Default)]
+pub struct AttestationCache {
+    entries: HashMap<PublicKey, AttestationEntry>,
+    ttl: Duration,
+}
+
+impl AttestationCache {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl: DEFAULT_TTL,
+        }
+    }
+
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl,
+        }
+    }
+
+    /// Return the live status, applying TTL expiry to past `Verified`
+    /// entries. Returns `Pending` if no entry exists yet for this key /
+    /// domain pair (caller is expected to schedule a refresh).
+    pub fn get_or_refresh(
+        &self,
+        key: &PublicKey,
+        domain: &str,
+        now: u64,
+    ) -> AttestationStatus {
+        match self.entries.get(key) {
+            Some(entry) if entry.domain == domain => {
+                if let AttestationStatus::Verified { at } = entry.status {
+                    if now.saturating_sub(at) > self.ttl.as_secs() {
+                        return AttestationStatus::Expired;
+                    }
+                }
+                entry.status.clone()
+            }
+            _ => AttestationStatus::Pending,
+        }
+    }
+
+    /// Record a fresh verification result.
+    pub fn record_result(
+        &mut self,
+        key: &PublicKey,
+        domain: &str,
+        verified: bool,
+        now: u64,
+    ) {
+        let prior_fail_count = match self.entries.get(key).map(|e| &e.status) {
+            Some(AttestationStatus::Failed { fail_count, .. }) => *fail_count,
+            _ => 0,
+        };
+        let status = if verified {
+            AttestationStatus::Verified { at: now }
+        } else {
+            AttestationStatus::Failed {
+                last_error: "validator key not listed in xrp-ledger.toml".into(),
+                fail_count: prior_fail_count.saturating_add(1),
+            }
+        };
+        self.entries.insert(
+            key.clone(),
+            AttestationEntry {
+                domain: domain.to_string(),
+                status,
+                last_checked_unix: now,
+            },
+        );
+    }
+
+    /// Record an error result (HTTP, parse, timeout, ...).
+    pub fn record_error(&mut self, key: &PublicKey, domain: &str, err: &str, now: u64) {
+        let prior_fail_count = match self.entries.get(key).map(|e| &e.status) {
+            Some(AttestationStatus::Failed { fail_count, .. }) => *fail_count,
+            _ => 0,
+        };
+        self.entries.insert(
+            key.clone(),
+            AttestationEntry {
+                domain: domain.to_string(),
+                status: AttestationStatus::Failed {
+                    last_error: err.to_string(),
+                    fail_count: prior_fail_count.saturating_add(1),
+                },
+                last_checked_unix: now,
+            },
+        );
+    }
+
+    /// Return how many seconds the caller should wait before retrying
+    /// `key` after a failure: 60 s after the first, 300 s after the
+    /// second, 3600 s after the third+ (capped). For non-failure entries
+    /// returns 0 (caller should respect the loop refresh interval).
+    pub fn retry_backoff_secs(&self, key: &PublicKey) -> u64 {
+        match self.entries.get(key).map(|e| &e.status) {
+            Some(AttestationStatus::Failed { fail_count, .. }) => match fail_count {
+                0 | 1 => 60,
+                2 => 300,
+                _ => 3600,
+            },
+            _ => 0,
+        }
+    }
+
+    /// Last-checked timestamp recorded for this key, if any.
+    pub fn last_checked(&self, key: &PublicKey) -> Option<u64> {
+        self.entries.get(key).map(|e| e.last_checked_unix)
+    }
+
+    /// Return a snapshot of all known entries (for RPC).
+    pub fn snapshot(&self, now: u64) -> Vec<(PublicKey, AttestationEntry)> {
+        self.entries
+            .iter()
+            .map(|(k, v)| {
+                let mut entry = v.clone();
+                if let AttestationStatus::Verified { at } = entry.status {
+                    if now.saturating_sub(at) > self.ttl.as_secs() {
+                        entry.status = AttestationStatus::Expired;
+                    }
+                }
+                (k.clone(), entry)
+            })
+            .collect()
+    }
+}
+
+/// Shared handle to the attestation cache, cloned cheaply into RPC
+/// handlers and the background service.
+pub type CacheHandle = Arc<RwLock<AttestationCache>>;
+
+/// Build a fresh shared cache handle.
+pub fn new_cache() -> CacheHandle {
+    Arc::new(RwLock::new(AttestationCache::new()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +421,84 @@ mod tests {
         assert!(validate_domain("foo bar").is_err());
         assert!(validate_domain("foo/bar").is_err());
         assert!(validate_domain("example.com").is_ok());
+    }
+
+    #[test]
+    fn cache_returns_pending_for_unknown_key() {
+        let cache = AttestationCache::new();
+        let key = ed_key(0x01);
+        assert_eq!(
+            cache.get_or_refresh(&key, "example.com", 1000),
+            AttestationStatus::Pending
+        );
+    }
+
+    #[test]
+    fn cache_records_verification_then_expires() {
+        let mut cache = AttestationCache::new();
+        let key = ed_key(0x01);
+        cache.record_result(&key, "example.com", true, 1000);
+        assert!(matches!(
+            cache.get_or_refresh(&key, "example.com", 1000),
+            AttestationStatus::Verified { at: 1000 }
+        ));
+        assert!(matches!(
+            cache.get_or_refresh(&key, "example.com", 1000 + 24 * 3600),
+            AttestationStatus::Verified { .. }
+        ));
+        assert_eq!(
+            cache.get_or_refresh(&key, "example.com", 1000 + 24 * 3600 + 1),
+            AttestationStatus::Expired
+        );
+    }
+
+    #[test]
+    fn cache_failure_increments_backoff() {
+        let mut cache = AttestationCache::new();
+        let key = ed_key(0x02);
+        cache.record_error(&key, "bad.example", "404", 100);
+        assert_eq!(cache.retry_backoff_secs(&key), 60);
+        cache.record_error(&key, "bad.example", "404", 200);
+        assert_eq!(cache.retry_backoff_secs(&key), 300);
+        cache.record_error(&key, "bad.example", "404", 700);
+        assert_eq!(cache.retry_backoff_secs(&key), 3600);
+    }
+
+    #[test]
+    fn cache_domain_change_treated_as_pending() {
+        let mut cache = AttestationCache::new();
+        let key = ed_key(0x03);
+        cache.record_result(&key, "old.example", true, 100);
+        assert_eq!(
+            cache.get_or_refresh(&key, "new.example", 200),
+            AttestationStatus::Pending
+        );
+    }
+
+    #[test]
+    fn status_labels_are_stable() {
+        assert_eq!(AttestationStatus::NotAttempted.label(), "not_attempted");
+        assert_eq!(AttestationStatus::Pending.label(), "pending");
+        assert_eq!(AttestationStatus::Expired.label(), "expired");
+        assert_eq!(AttestationStatus::Verified { at: 1 }.label(), "verified");
+        assert_eq!(
+            AttestationStatus::Failed {
+                last_error: "x".into(),
+                fail_count: 1
+            }
+            .label(),
+            "failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_handle_is_shareable() {
+        let h = new_cache();
+        let h2 = h.clone();
+        {
+            let mut g = h.write().await;
+            g.record_result(&ed_key(0x05), "example.com", true, 1);
+        }
+        assert_eq!(h2.read().await.snapshot(1).len(), 1);
     }
 }
