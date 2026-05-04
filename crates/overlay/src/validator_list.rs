@@ -341,6 +341,128 @@ fn parse_blob_json(
     ))
 }
 
+/// Maximum cascade depth. Chosen as 3 because (a) deeper trust chains
+/// are operationally hard to reason about, (b) it matches the plan's
+/// default, and (c) it bounds the HTTP fetch fan-out.
+pub const CASCADE_DEPTH_DEFAULT: usize = 3;
+
+/// Trait used by [`resolve_cascade`] to fetch a delegate publisher's v2
+/// payload. Production code wires this to the HTTP VL fetcher; tests
+/// implement it in-memory.
+///
+/// Returning `Ok(None)` indicates the delegate is unknown / not
+/// reachable; the caller may treat this as
+/// [`ValidatorListError::DelegateFetchFailed`].
+pub trait DelegateResolver {
+    /// Fetch (publisher_manifest_bytes, blobs_v2) for `delegate_pk`.
+    fn resolve(
+        &mut self,
+        delegate_pk: &PublicKey,
+    ) -> Result<Option<(Vec<u8>, Vec<BlobV2Wire>)>, ValidatorListError>;
+}
+
+/// Resolve a cascade chain rooted at `primary_blobs`.
+///
+/// For every active blob in `primary_blobs`, recursively follow each
+/// `delegates` reference, fetch and verify the delegate's v2 payload,
+/// and append its active blobs to the output.
+///
+/// Constraints:
+///   - Maximum recursion depth `depth_limit` (depth 0 = primary only).
+///   - Cycles are rejected via `visited` set (publisher master keys).
+///   - Delegates flagged revoked in `manifest_store` are rejected.
+///
+/// Returns the union of primary + cascaded active blobs in DFS order.
+pub fn resolve_cascade<R: DelegateResolver>(
+    primary_blobs: Vec<ValidatorListDataV2>,
+    resolver: &mut R,
+    manifest_store: &mut ManifestStore,
+    now_unix: u64,
+    depth_limit: usize,
+) -> Result<Vec<ValidatorListDataV2>, ValidatorListError> {
+    let mut visited: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    // Seed visited with primary publishers so they cannot be re-pulled
+    // as delegates of themselves.
+    for b in &primary_blobs {
+        visited.insert(b.base.publisher_master_key.as_bytes().to_vec());
+    }
+    let mut out: Vec<ValidatorListDataV2> = Vec::new();
+    // Walk delegates from each primary blob at depth=1.
+    let primary_clone = primary_blobs.clone();
+    out.extend(primary_blobs);
+    for blob in &primary_clone {
+        for delegate_pk in &blob.delegates {
+            walk_delegate(
+                delegate_pk,
+                1,
+                depth_limit,
+                resolver,
+                manifest_store,
+                now_unix,
+                &mut visited,
+                &mut out,
+            )?;
+        }
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_delegate<R: DelegateResolver>(
+    delegate_pk: &PublicKey,
+    depth: usize,
+    depth_limit: usize,
+    resolver: &mut R,
+    manifest_store: &mut ManifestStore,
+    now_unix: u64,
+    visited: &mut std::collections::HashSet<Vec<u8>>,
+    out: &mut Vec<ValidatorListDataV2>,
+) -> Result<(), ValidatorListError> {
+    if depth > depth_limit {
+        return Err(ValidatorListError::CascadeDepthExceeded(depth_limit));
+    }
+    let key_bytes = delegate_pk.as_bytes().to_vec();
+    if !visited.insert(key_bytes) {
+        return Err(ValidatorListError::CyclicDelegate);
+    }
+    if manifest_store.is_revoked(delegate_pk) {
+        return Err(ValidatorListError::DelegateRevoked);
+    }
+
+    let (manifest_bytes, blobs_v2) = resolver
+        .resolve(delegate_pk)?
+        .ok_or_else(|| ValidatorListError::DelegateFetchFailed(hex::encode(delegate_pk.as_bytes())))?;
+
+    let bundle = verify_and_parse_v2(&manifest_bytes, &blobs_v2, manifest_store, now_unix)
+        .map_err(|e| match e {
+            ValidatorListError::BlobSignatureInvalid => {
+                ValidatorListError::CascadeSignatureInvalid
+            }
+            other => other,
+        })?;
+
+    // Snapshot delegates of each active blob before we move it into out.
+    let next_delegates: Vec<Vec<PublicKey>> =
+        bundle.active.iter().map(|b| b.delegates.clone()).collect();
+    out.extend(bundle.active);
+
+    for delegates in next_delegates {
+        for next_pk in delegates {
+            walk_delegate(
+                &next_pk,
+                depth + 1,
+                depth_limit,
+                resolver,
+                manifest_store,
+                now_unix,
+                visited,
+                out,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Verify the blob signature using the publisher's ephemeral key.
 ///
 /// The signature is over the raw blob bytes (the base64-encoded string,
@@ -908,6 +1030,167 @@ mod tests {
         assert_eq!(bundle.active[0].effective_start, 50);
         assert_eq!(bundle.active[0].effective_expiration, 150);
         assert_eq!(bundle.active[0].base.validators.len(), 1);
+    }
+
+    /// In-memory DelegateResolver for tests. Maps publisher master key
+    /// (raw bytes) -> (manifest, blobs_v2).
+    struct MockResolver {
+        entries: std::collections::HashMap<Vec<u8>, (Vec<u8>, Vec<BlobV2Wire>)>,
+    }
+
+    impl MockResolver {
+        fn new() -> Self {
+            Self {
+                entries: std::collections::HashMap::new(),
+            }
+        }
+        fn insert(&mut self, pk: &PublicKey, manifest: Vec<u8>, wire: Vec<BlobV2Wire>) {
+            self.entries.insert(pk.as_bytes().to_vec(), (manifest, wire));
+        }
+    }
+
+    impl DelegateResolver for MockResolver {
+        fn resolve(
+            &mut self,
+            delegate_pk: &PublicKey,
+        ) -> Result<Option<(Vec<u8>, Vec<BlobV2Wire>)>, ValidatorListError> {
+            Ok(self.entries.get(&delegate_pk.as_bytes().to_vec()).cloned())
+        }
+    }
+
+    /// Helper: extract a publisher's master key from a publisher seed.
+    fn pub_master_pk(seed: &str) -> PublicKey {
+        rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase(seed),
+            rxrpl_crypto::KeyType::Ed25519,
+        )
+        .public_key
+        .clone()
+    }
+
+    /// B3: cascade with one delegate level merges validators from primary
+    /// and delegate publishers.
+    #[test]
+    fn cascade_resolves_one_level() {
+        let delegate_pk = pub_master_pk("b3_delegate_pub");
+        let v_a = ["b3_val_primary"];
+        let v_b = ["b3_val_delegate"];
+        let no_delegates: Vec<PublicKey> = vec![];
+
+        // Primary references delegate.
+        let (primary_manifest, primary_wire) = make_test_vl_v2(
+            "b3_primary_pub",
+            "b3_primary_eph",
+            &[(0, 1000, 1, &v_a, &[delegate_pk.clone()][..])],
+        );
+        // Delegate's own VL (no further delegates).
+        let (delegate_manifest, delegate_wire) = make_test_vl_v2(
+            "b3_delegate_pub",
+            "b3_delegate_eph",
+            &[(0, 1000, 1, &v_b, &no_delegates)],
+        );
+
+        let mut store = ManifestStore::new();
+        let bundle = verify_and_parse_v2(&primary_manifest, &primary_wire, &mut store, 100)
+            .expect("primary parse ok");
+        assert_eq!(bundle.active.len(), 1);
+
+        let mut resolver = MockResolver::new();
+        resolver.insert(&delegate_pk, delegate_manifest, delegate_wire);
+
+        let merged = resolve_cascade(
+            bundle.active,
+            &mut resolver,
+            &mut store,
+            100,
+            CASCADE_DEPTH_DEFAULT,
+        )
+        .expect("cascade resolve ok");
+
+        // Expect 2 blobs total: primary + delegate.
+        assert_eq!(merged.len(), 2);
+        let total_validators: usize = merged.iter().map(|b| b.base.validators.len()).sum();
+        assert_eq!(total_validators, 2);
+    }
+
+    /// B3: cascade depth limit is enforced.
+    #[test]
+    fn cascade_depth_exceeded() {
+        // Build chain: primary -> d1 -> d2 -> d3 -> d4. depth_limit=2 should reject.
+        let d1_pk = pub_master_pk("b3_chain_d1");
+        let d2_pk = pub_master_pk("b3_chain_d2");
+        let d3_pk = pub_master_pk("b3_chain_d3");
+        let d4_pk = pub_master_pk("b3_chain_d4");
+        let no_v: [&str; 0] = [];
+        let no_delegates: Vec<PublicKey> = vec![];
+
+        let (m_primary, w_primary) = make_test_vl_v2(
+            "b3_chain_primary",
+            "b3_chain_primary_eph",
+            &[(0, 1000, 1, &no_v, &[d1_pk.clone()][..])],
+        );
+        let (m1, w1) = make_test_vl_v2(
+            "b3_chain_d1",
+            "b3_chain_d1_eph",
+            &[(0, 1000, 1, &no_v, &[d2_pk.clone()][..])],
+        );
+        let (m2, w2) = make_test_vl_v2(
+            "b3_chain_d2",
+            "b3_chain_d2_eph",
+            &[(0, 1000, 1, &no_v, &[d3_pk.clone()][..])],
+        );
+        let (m3, w3) = make_test_vl_v2(
+            "b3_chain_d3",
+            "b3_chain_d3_eph",
+            &[(0, 1000, 1, &no_v, &[d4_pk.clone()][..])],
+        );
+        let (m4, w4) = make_test_vl_v2(
+            "b3_chain_d4",
+            "b3_chain_d4_eph",
+            &[(0, 1000, 1, &no_v, &no_delegates)],
+        );
+
+        let mut store = ManifestStore::new();
+        let bundle = verify_and_parse_v2(&m_primary, &w_primary, &mut store, 100).unwrap();
+        let mut resolver = MockResolver::new();
+        resolver.insert(&d1_pk, m1, w1);
+        resolver.insert(&d2_pk, m2, w2);
+        resolver.insert(&d3_pk, m3, w3);
+        resolver.insert(&d4_pk, m4, w4);
+
+        let res = resolve_cascade(bundle.active, &mut resolver, &mut store, 100, 2);
+        assert!(matches!(
+            res,
+            Err(ValidatorListError::CascadeDepthExceeded(2))
+        ));
+    }
+
+    /// B3: cycle (A -> B -> A) is rejected.
+    #[test]
+    fn cascade_rejects_cycle() {
+        let primary_pk = pub_master_pk("b3_cycle_primary");
+        let d_pk = pub_master_pk("b3_cycle_d");
+        let no_v: [&str; 0] = [];
+
+        let (m_primary, w_primary) = make_test_vl_v2(
+            "b3_cycle_primary",
+            "b3_cycle_primary_eph",
+            &[(0, 1000, 1, &no_v, &[d_pk.clone()][..])],
+        );
+        // Delegate cycles back to primary.
+        let (m_d, w_d) = make_test_vl_v2(
+            "b3_cycle_d",
+            "b3_cycle_d_eph",
+            &[(0, 1000, 1, &no_v, &[primary_pk.clone()][..])],
+        );
+
+        let mut store = ManifestStore::new();
+        let bundle = verify_and_parse_v2(&m_primary, &w_primary, &mut store, 100).unwrap();
+        let mut resolver = MockResolver::new();
+        resolver.insert(&d_pk, m_d, w_d);
+
+        let res = resolve_cascade(bundle.active, &mut resolver, &mut store, 100, 3);
+        assert!(matches!(res, Err(ValidatorListError::CyclicDelegate)));
     }
 
     /// B1: tampered v2 signature is rejected.
