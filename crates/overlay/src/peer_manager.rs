@@ -1087,6 +1087,11 @@ impl PeerManager {
                             .filter_map(|m| m.stobject)
                             .collect();
                         let mut applied = 0;
+                        // B3: collect freshly-applied manifests so we can relay
+                        // them to other peers below. ManifestStore::apply()
+                        // returns false on stale/duplicate, so we never
+                        // re-broadcast the same manifest twice.
+                        let mut to_relay: Vec<Vec<u8>> = Vec::new();
                         for raw in &raw_bytes {
                             match manifest::parse_and_verify(raw) {
                                 Ok(m) => {
@@ -1102,6 +1107,7 @@ impl PeerManager {
 
                                     if self.manifest_store.apply(m) {
                                         applied += 1;
+                                        to_relay.push(raw.clone());
                                         let _ = self.consensus_tx.send(
                                             ConsensusMessage::ManifestApplied {
                                                 master_key,
@@ -1114,6 +1120,23 @@ impl PeerManager {
                                 }
                                 Err(e) => {
                                     tracing::debug!("manifest verify failed: {}", e);
+                                }
+                            }
+                        }
+
+                        // B3: gossip relay — forward freshly-applied manifests
+                        // to every other connected peer so the network
+                        // converges on validator key bindings without lag.
+                        if !to_relay.is_empty() {
+                            let relay_payload = proto_convert::encode_manifests(to_relay);
+                            for (id, handle) in &self.peer_handles {
+                                if *id != from {
+                                    let _ = handle.tx.try_send(
+                                        rxrpl_p2p_proto::codec::PeerMessage {
+                                            msg_type: MessageType::Manifests,
+                                            payload: relay_payload.clone(),
+                                        },
+                                    );
                                 }
                             }
                         }
@@ -2916,6 +2939,101 @@ mod tests {
             reparsed.master_public_key, expected_master,
             "broadcast carries our master pubkey"
         );
+    }
+
+    /// B3: when peer A delivers a Manifests message, the manager applies
+    /// the manifest AND re-broadcasts it to every other connected peer
+    /// (so the network converges on validator key bindings without
+    /// linear handshake-distance lag).
+    ///
+    /// Verifies:
+    ///   - applied to local manifest_store
+    ///   - delivered to peer B's channel
+    ///   - NOT echoed back to peer A
+    #[tokio::test]
+    async fn dispatch_manifest_relays_to_other_peers_but_not_back_to_sender() {
+        use crate::identity::ValidatorIdentity;
+        use crate::peer_handle::PeerHandle;
+        use crate::tls;
+        use std::sync::atomic::AtomicU32;
+        use tokio::sync::RwLock as TokioRwLock;
+
+        // Build a freshly-signed manifest that A will deliver.
+        let validator_id = ValidatorIdentity::two_key(
+            &rxrpl_crypto::Seed::from_passphrase("b3-foreign-master"),
+            &rxrpl_crypto::Seed::from_passphrase("b3-foreign-signing"),
+        );
+        let raw_manifest = validator_id.sign_manifest(1, None).expect("sign_manifest");
+        let payload = crate::proto_convert::encode_manifests(vec![raw_manifest]);
+
+        let p2p_id = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("b3-p2p"));
+        let cfg = PeerManagerConfig {
+            listen_port: 0,
+            max_peers: 4,
+            seeds: vec![],
+            fixed_peers: vec![],
+            network_id: 12345,
+            tls_server: tls::build_server_config(&NodeIdentity::from_seed(
+                &rxrpl_crypto::Seed::from_passphrase("b3-p2p"),
+            )),
+            tls_client: tls::build_client_config(),
+            cluster_enabled: false,
+            cluster_node_name: String::new(),
+            cluster_members: Vec::new(),
+            cluster_broadcast_interval_secs: 5,
+        };
+        let (mut mgr, _cmd_tx, _consensus_rx) = PeerManager::new(
+            Arc::new(p2p_id),
+            cfg,
+            Arc::new(AtomicU32::new(1)),
+            Arc::new(TokioRwLock::new(Hash256::new([0; 32]))),
+        );
+
+        let id_a = Hash256::new([0xAA; 32]);
+        let id_b = Hash256::new([0xBB; 32]);
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::channel(4);
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(4);
+        for (id, tx) in [(id_a, tx_a), (id_b, tx_b)] {
+            let info = Arc::new(crate::peer_set::PeerInfo {
+                node_id: id,
+                address: "127.0.0.1:0".into(),
+                inbound: true,
+                ledger_seq: AtomicU32::new(0),
+                reputation: crate::reputation::PeerReputation::new(),
+                scoring: crate::peer_score::PeerScore::new(),
+                rate_limiter: crate::rate_limiter::PeerRateLimiter::default(),
+                software: crate::peer_set::PeerSoftware::Unknown,
+            });
+            // Register in peer_set so dispatch_message recognises the sender
+            // for reputation accounting (otherwise peer_info is None and
+            // some paths short-circuit).
+            mgr.peer_set.add(Arc::clone(&info));
+            mgr.peer_handles
+                .insert(id, PeerHandle { node_id: id, info, tx });
+        }
+
+        mgr.dispatch_message(id_a, MessageType::Manifests, &payload);
+
+        // B receives the relayed payload (with a hard timeout so a RED
+        // test fails fast instead of hanging the test runner).
+        let relayed = tokio::time::timeout(std::time::Duration::from_millis(500), rx_b.recv())
+            .await
+            .expect("peer B must receive the relayed manifest within 500ms")
+            .expect("channel must not close");
+        assert_eq!(relayed.msg_type, MessageType::Manifests);
+        assert_eq!(relayed.payload, payload);
+
+        // A must NOT receive an echo.
+        match rx_a.try_recv() {
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            other => panic!(
+                "sender peer A must not receive an echo, got: {:?}",
+                other.is_ok()
+            ),
+        }
+
+        // And the manifest is applied locally.
+        assert_eq!(mgr.manifest_store.len(), 1, "manifest applied locally");
     }
 
     /// Calling `send_local_manifest_to` without a local manifest is a
