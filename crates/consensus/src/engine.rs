@@ -251,6 +251,27 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         &mut self.negative_unl_tracker
     }
 
+    /// Register the master public keys for a trusted validator set with the
+    /// negative-UNL tracker. The tracker needs the hex-encoded master key of
+    /// each validator so that emitted [`crate::negative_unl::NegativeUnlChange`]
+    /// entries carry the value used in `UNLModify` pseudo-transactions.
+    ///
+    /// Validators in `trusted_set` without an entry in `key_map` are skipped
+    /// silently — `evaluate_negative_unl` will simply not emit a change for
+    /// them (mirrors rippled, which does not demote unknown validators).
+    pub fn register_validators(
+        &mut self,
+        trusted_set: &std::collections::HashSet<NodeId>,
+        key_map: &HashMap<NodeId, String>,
+    ) {
+        for node_id in trusted_set {
+            if let Some(key) = key_map.get(node_id) {
+                self.negative_unl_tracker
+                    .register_validator(*node_id, key.clone());
+            }
+        }
+    }
+
     /// Record a validation from a trusted validator for the current ledger.
     /// Should be called when a validation message is received.
     pub fn record_validation(&mut self, node_id: NodeId) {
