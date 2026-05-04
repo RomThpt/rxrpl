@@ -608,6 +608,10 @@ impl PeerManager {
                         tx: write_tx,
                     },
                 );
+                // Proactively share our local manifest so the peer can bind
+                // our signing key to our master key before the first
+                // validation arrives (B2).
+                self.send_local_manifest_to(&node_id);
                 // Request shard availability from new peer.
                 self.send_get_shards(&node_id);
             }
@@ -1700,6 +1704,29 @@ impl PeerManager {
         // The actual async import is triggered by the ShardSyncer's tick()
         // method. Here we just log receipt. The ShardSyncer::on_shard_data()
         // method handles the actual import but requires async context.
+    }
+
+    /// Send our local manifest to a freshly-connected peer (B2).
+    ///
+    /// No-op when no local manifest is configured. Encodes the single
+    /// manifest into a `TmManifests` and delivers it via the peer's
+    /// write channel; the peer parses it through its standard
+    /// `MessageType::Manifests` handler (which calls `apply` on the
+    /// `ManifestStore`), so they learn our master->signing binding
+    /// before our first validation arrives.
+    fn send_local_manifest_to(&self, peer_id: &Hash256) {
+        let raw = match self.manifest_store.local() {
+            Some(m) => m.raw.clone(),
+            None => return,
+        };
+        let payload = crate::proto_convert::encode_manifests(vec![raw]);
+        if let Some(handle) = self.peer_handles.get(peer_id) {
+            let _ = handle.tx.try_send(rxrpl_p2p_proto::codec::PeerMessage {
+                msg_type: MessageType::Manifests,
+                payload,
+            });
+            tracing::debug!("sent local manifest to {}", peer_id);
+        }
     }
 
     /// Send a GetShards request to a newly connected peer.
@@ -2800,5 +2827,156 @@ mod tests {
         assert_eq!(b.attempt(), 1);
         b.next_delay();
         assert_eq!(b.attempt(), 2);
+    }
+
+    /// B2: when a local manifest is set, `send_local_manifest_to(peer)`
+    /// pushes a `Manifests` message containing our manifest into the
+    /// peer's write channel. Verified by inserting a fake PeerHandle
+    /// (whose `tx` we own the receiver of) and reading back the bytes.
+    #[tokio::test]
+    async fn send_local_manifest_to_pushes_our_manifest_into_peer_channel() {
+        use crate::identity::ValidatorIdentity;
+        use crate::manifest::parse_and_verify;
+        use crate::peer_handle::PeerHandle;
+        use crate::tls;
+        use std::sync::atomic::AtomicU32;
+        use tokio::sync::RwLock as TokioRwLock;
+
+        let p2p_id = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("b2-p2p"));
+        let validator_id = ValidatorIdentity::two_key(
+            &rxrpl_crypto::Seed::from_passphrase("b2-master"),
+            &rxrpl_crypto::Seed::from_passphrase("b2-signing"),
+        );
+        let manifest_bytes = validator_id
+            .sign_manifest(1, None)
+            .expect("sign_manifest");
+        let manifest = parse_and_verify(&manifest_bytes).expect("parse_and_verify");
+        let expected_master = manifest.master_public_key.clone();
+
+        let cfg = PeerManagerConfig {
+            listen_port: 0,
+            max_peers: 4,
+            seeds: vec![],
+            fixed_peers: vec![],
+            network_id: 12345,
+            tls_server: tls::build_server_config(&NodeIdentity::from_seed(
+                &rxrpl_crypto::Seed::from_passphrase("b2-p2p"),
+            )),
+            tls_client: tls::build_client_config(),
+            cluster_enabled: false,
+            cluster_node_name: String::new(),
+            cluster_members: Vec::new(),
+            cluster_broadcast_interval_secs: 5,
+        };
+        let (mut mgr, _cmd_tx, _consensus_rx) = PeerManager::new(
+            Arc::new(p2p_id),
+            cfg,
+            Arc::new(AtomicU32::new(1)),
+            Arc::new(TokioRwLock::new(Hash256::new([0; 32]))),
+        );
+        mgr.set_local_manifest(manifest);
+
+        // Inject a fake peer with an mpsc whose receiver we keep.
+        let peer_id = Hash256::new([0xCC; 32]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let info = Arc::new(crate::peer_set::PeerInfo {
+            node_id: peer_id,
+            address: "127.0.0.1:0".into(),
+            inbound: true,
+            ledger_seq: AtomicU32::new(0),
+            reputation: crate::reputation::PeerReputation::new(),
+            scoring: crate::peer_score::PeerScore::new(),
+            rate_limiter: crate::rate_limiter::PeerRateLimiter::default(),
+            software: crate::peer_set::PeerSoftware::Unknown,
+        });
+        mgr.peer_handles.insert(
+            peer_id,
+            PeerHandle {
+                node_id: peer_id,
+                info,
+                tx,
+            },
+        );
+
+        // Act
+        mgr.send_local_manifest_to(&peer_id);
+
+        // Assert
+        let msg = rx
+            .recv()
+            .await
+            .expect("send_local_manifest_to must enqueue a message");
+        assert_eq!(msg.msg_type, MessageType::Manifests);
+        let parsed = crate::proto_convert::decode_manifests(&msg.payload)
+            .expect("payload is a valid TmManifests");
+        assert_eq!(parsed.len(), 1, "exactly one manifest in the broadcast");
+        let inner = parsed[0].stobject.as_ref().expect("inner stobject");
+        let reparsed = parse_and_verify(inner).expect("inner manifest verifies");
+        assert_eq!(
+            reparsed.master_public_key, expected_master,
+            "broadcast carries our master pubkey"
+        );
+    }
+
+    /// Calling `send_local_manifest_to` without a local manifest is a
+    /// no-op; the peer's write channel stays empty.
+    #[tokio::test]
+    async fn send_local_manifest_to_is_noop_without_local_manifest() {
+        use crate::peer_handle::PeerHandle;
+        use crate::tls;
+        use std::sync::atomic::AtomicU32;
+        use tokio::sync::RwLock as TokioRwLock;
+
+        let p2p_id = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("b2-noop"));
+        let cfg = PeerManagerConfig {
+            listen_port: 0,
+            max_peers: 4,
+            seeds: vec![],
+            fixed_peers: vec![],
+            network_id: 12345,
+            tls_server: tls::build_server_config(&NodeIdentity::from_seed(
+                &rxrpl_crypto::Seed::from_passphrase("b2-noop"),
+            )),
+            tls_client: tls::build_client_config(),
+            cluster_enabled: false,
+            cluster_node_name: String::new(),
+            cluster_members: Vec::new(),
+            cluster_broadcast_interval_secs: 5,
+        };
+        let (mut mgr, _cmd_tx, _consensus_rx) = PeerManager::new(
+            Arc::new(p2p_id),
+            cfg,
+            Arc::new(AtomicU32::new(1)),
+            Arc::new(TokioRwLock::new(Hash256::new([0; 32]))),
+        );
+
+        let peer_id = Hash256::new([0xDD; 32]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let info = Arc::new(crate::peer_set::PeerInfo {
+            node_id: peer_id,
+            address: "127.0.0.1:0".into(),
+            inbound: true,
+            ledger_seq: AtomicU32::new(0),
+            reputation: crate::reputation::PeerReputation::new(),
+            scoring: crate::peer_score::PeerScore::new(),
+            rate_limiter: crate::rate_limiter::PeerRateLimiter::default(),
+            software: crate::peer_set::PeerSoftware::Unknown,
+        });
+        mgr.peer_handles.insert(
+            peer_id,
+            PeerHandle {
+                node_id: peer_id,
+                info,
+                tx,
+            },
+        );
+
+        mgr.send_local_manifest_to(&peer_id);
+
+        // Channel must stay empty.
+        match rx.try_recv() {
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            other => panic!("expected empty channel, got {:?}", other.is_ok()),
+        }
     }
 }
