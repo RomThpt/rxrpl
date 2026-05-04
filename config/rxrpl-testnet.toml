@@ -1,0 +1,31 @@
+# rxrpl testnet (altnet) node configuration template
+#
+# Connects to rippletest.net and uses the testnet UNL.
+
+[server]
+bind = "127.0.0.1:5005"
+admin_ips = ["127.0.0.1"]
+
+[peer]
+port = 51235
+max_peers = 21
+seeds = [
+    "s.altnet.rippletest.net:51235",
+]
+fixed_peers = []
+tls_enabled = true
+
+[database]
+path = "/var/lib/rxrpl/testnet"
+backend = "rocksdb"
+online_delete = 2000
+
+[validators]
+enabled = false
+trusted = []
+validator_list_sites = []
+validator_list_keys = []
+
+[network]
+# Altnet network ID.
+network_id = 1
