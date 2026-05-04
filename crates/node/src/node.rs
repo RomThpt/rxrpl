@@ -643,9 +643,29 @@ impl Node {
         // they receive our validations. Without this, rippled classifies
         // our validations as `untrusted`. The ManifestStore registration
         // happens after PeerManager construction below (`peer_mgr.set_local_manifest`).
+        //
+        // B4: read any previously-persisted manifest. If we already
+        // published sequence N on a prior run, the new sequence must be
+        // strictly greater (rotation contract); otherwise peers reject
+        // our manifest as stale and our validations remain untrusted.
         let local_manifest = match validator_id.as_deref() {
             Some(vid) => {
-                let seq = self.config.validator_identity.sequence.max(1);
+                let data_dir = &self.config.database.path;
+                let persisted = match crate::local_manifest_store::load(data_dir) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to load persisted local manifest at {}: {} — using config sequence",
+                            data_dir.display(), e,
+                        );
+                        None
+                    }
+                };
+                let cfg_seq = self.config.validator_identity.sequence;
+                let seq = match persisted.as_ref() {
+                    Some(p) => p.sequence.saturating_add(1).max(cfg_seq.max(1)),
+                    None => cfg_seq.max(1),
+                };
                 let domain = self.config.validator_identity.domain.as_deref();
                 let bytes = vid.sign_manifest(seq, domain).map_err(|e| {
                     NodeError::Config(format!("failed to build local manifest: {e:?}"))
@@ -655,9 +675,23 @@ impl Node {
                         "self-built manifest failed parse_and_verify (bug): {e:?}"
                     ))
                 })?;
+                if let Err(e) = crate::local_manifest_store::save(
+                    data_dir,
+                    &crate::local_manifest_store::PersistedManifest {
+                        sequence: seq,
+                        raw_bytes_hex: hex::encode(&bytes),
+                    },
+                ) {
+                    tracing::warn!(
+                        "failed to persist local manifest to {}: {} — node will rebuild on next boot",
+                        data_dir.display(), e,
+                    );
+                }
                 tracing::info!(
-                    "local manifest built: sequence={}, domain={:?}",
-                    parsed.sequence, domain,
+                    "local manifest built: sequence={}, domain={:?}, prior={:?}",
+                    parsed.sequence,
+                    domain,
+                    persisted.as_ref().map(|p| p.sequence),
                 );
                 Some(parsed)
             }
