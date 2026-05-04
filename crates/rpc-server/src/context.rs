@@ -1,5 +1,5 @@
 use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicU32;
 
 use rxrpl_config::ServerConfig;
@@ -70,7 +70,29 @@ pub struct ServerContext {
     /// Used by `sign` to auto-fill `NetworkID` on transactions, which modern
     /// rippled requires (`telREQUIRES_NETWORK_ID`).
     pub network_id: Option<u32>,
+    /// Local validator manifest (this node's own), set once at boot from
+    /// the loaded `ValidatorIdentity`. Populated by Node::run_networked
+    /// via `set_local_manifest`. Reads use the snapshot fields directly;
+    /// the OnceLock makes the post-Arc-construction set possible without
+    /// interior mutability for every field.
+    local_manifest: OnceLock<Arc<LocalManifestSnapshot>>,
     event_tx: broadcast::Sender<ServerEvent>,
+}
+
+/// Snapshot of the local validator manifest exposed via the `manifest` RPC.
+///
+/// Lives in `rxrpl-rpc-server` (rather than depending on
+/// `rxrpl-overlay::manifest::Manifest`) to keep this crate's dep graph
+/// lightweight — Node converts overlay's full Manifest into a snapshot at
+/// boot.
+#[derive(Clone, Debug)]
+pub struct LocalManifestSnapshot {
+    pub master_public_key: Vec<u8>,
+    pub ephemeral_public_key: Vec<u8>,
+    pub sequence: u32,
+    pub domain: Option<String>,
+    /// Raw signed-STObject bytes (what the manifest RPC returns base64-encoded).
+    pub raw_bytes: Vec<u8>,
 }
 
 impl ServerContext {
@@ -94,6 +116,7 @@ impl ServerContext {
             forward_url: None,
             validator_list_status: None,
             network_id: None,
+            local_manifest: OnceLock::new(),
             event_tx,
         })
     }
@@ -129,6 +152,7 @@ impl ServerContext {
             forward_url: None,
             validator_list_status: None,
             network_id: None,
+            local_manifest: OnceLock::new(),
             event_tx,
         })
     }
@@ -165,6 +189,7 @@ impl ServerContext {
             forward_url: None,
             validator_list_status: None,
             network_id: None,
+            local_manifest: OnceLock::new(),
             event_tx,
         })
     }
@@ -201,6 +226,7 @@ impl ServerContext {
             forward_url: None,
             validator_list_status: None,
             network_id: None,
+            local_manifest: OnceLock::new(),
             event_tx,
         })
     }
@@ -230,6 +256,7 @@ impl ServerContext {
             forward_url: Some(forward_url),
             validator_list_status: None,
             network_id: None,
+            local_manifest: OnceLock::new(),
             event_tx,
         })
     }
@@ -258,5 +285,23 @@ impl ServerContext {
     /// Get a reference to the event broadcast sender.
     pub fn event_sender(&self) -> &broadcast::Sender<ServerEvent> {
         &self.event_tx
+    }
+
+    /// Set the local validator manifest (this node's own). Idempotent
+    /// once set — subsequent calls are no-ops, since the manifest is
+    /// loaded once at boot from `ValidatorIdentity`.
+    ///
+    /// Returns `Ok(())` if the snapshot was stored, `Err(_)` if a
+    /// manifest was already set (the existing one is unchanged).
+    pub fn set_local_manifest(
+        &self,
+        snapshot: LocalManifestSnapshot,
+    ) -> Result<(), Arc<LocalManifestSnapshot>> {
+        self.local_manifest.set(Arc::new(snapshot))
+    }
+
+    /// Get the local validator manifest snapshot, if set.
+    pub fn local_manifest(&self) -> Option<&LocalManifestSnapshot> {
+        self.local_manifest.get().map(|arc| arc.as_ref())
     }
 }

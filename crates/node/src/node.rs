@@ -852,6 +852,29 @@ impl Node {
         );
         ctx.attach_validator_list_status(Arc::clone(&vl_status));
         ctx.attach_network_id(self.config.network.network_id);
+        // B5: expose the local manifest to the RPC `manifest` handler.
+        if let Some(vid) = validator_id.as_deref() {
+            let seq = self.config.validator_identity.sequence.max(1);
+            let domain = self.config.validator_identity.domain.clone();
+            // Re-build the raw bytes so the RPC server doesn't need
+            // overlay's Manifest type. Re-signing is deterministic for
+            // the same (master, signing, sequence, domain) tuple.
+            match vid.sign_manifest(seq, domain.as_deref()) {
+                Ok(raw_bytes) => {
+                    let snapshot = rxrpl_rpc_server::LocalManifestSnapshot {
+                        master_public_key: vid.master_pubkey().as_bytes().to_vec(),
+                        ephemeral_public_key: vid.signing_pubkey().as_bytes().to_vec(),
+                        sequence: seq,
+                        domain,
+                        raw_bytes,
+                    };
+                    let _ = ctx.set_local_manifest(snapshot);
+                }
+                Err(e) => {
+                    tracing::warn!("failed to build manifest snapshot for RPC: {e:?}");
+                }
+            }
+        }
         let event_tx = ctx.event_sender().clone();
 
         // Clone ctx for gRPC before moving into RPC router
