@@ -439,6 +439,19 @@ impl Node {
                     );
                 }
 
+                // Apply negative-UNL pseudo-transactions on flag ledgers
+                // (no-op otherwise). Mirrors apply_amendment_voting:
+                // pseudo-txs land before the ledger's final hash is
+                // computed by close().
+                let _nunl_results = Node::apply_negative_unl(
+                    &mut consensus,
+                    &mut l,
+                    &tx_engine_close,
+                    &fees_close,
+                    ledger_seq,
+                );
+                consensus.on_ledger_close_for_tracker();
+
                 if let Err(e) = l.close(effective_close_time, close_flags) {
                     tracing::error!("failed to close ledger: {}", e);
                     continue;
@@ -1313,7 +1326,7 @@ impl Node {
                                             phase: "accepted".into(),
                                         });
                                         Self::close_consensus_round(
-                                            &consensus, pending_close_time, &ledger,
+                                            &mut consensus, pending_close_time, &ledger,
                                             &closed_ledgers, &tx_store, &event_tx,
                                             &ledger_seq_shared, &ledger_hash_shared,
                                             &tx_queue, &identity, &cmd_tx_catchup,
@@ -1339,7 +1352,7 @@ impl Node {
                                             phase: "accepted".into(),
                                         });
                                         Self::close_consensus_round(
-                                            &consensus, pending_close_time, &ledger,
+                                            &mut consensus, pending_close_time, &ledger,
                                             &closed_ledgers, &tx_store, &event_tx,
                                             &ledger_seq_shared, &ledger_hash_shared,
                                             &tx_queue, &identity, &cmd_tx_catchup,
@@ -1894,7 +1907,7 @@ impl Node {
     /// Close a consensus round: apply the accepted set, close ledger, emit events.
     #[allow(clippy::too_many_arguments)]
     async fn close_consensus_round<A: rxrpl_consensus::ConsensusAdapter>(
-        consensus: &ConsensusEngine<A>,
+        consensus: &mut ConsensusEngine<A>,
         pending_close_time: u32,
         ledger: &Arc<RwLock<Ledger>>,
         closed_ledgers: &Arc<RwLock<VecDeque<Ledger>>>,
@@ -1959,6 +1972,17 @@ impl Node {
                 ledger_seq,
             );
         }
+
+        // Apply negative-UNL pseudo-transactions on flag ledgers.
+        let nunl_seq = l.header.sequence;
+        let _nunl_results = Node::apply_negative_unl(
+            consensus,
+            &mut l,
+            tx_engine,
+            fees,
+            nunl_seq,
+        );
+        consensus.on_ledger_close_for_tracker();
 
         if let Err(e) = l.close(effective_close_time, close_flags) {
             tracing::error!("failed to close ledger: {}", e);

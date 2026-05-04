@@ -123,6 +123,58 @@ fn apply_negative_unl_creates_unl_modify_tx_for_unreliable_validator() {
     assert_eq!(disabled[0]["PublicKey"].as_str().unwrap(), key5);
 }
 
+// ===== B5 =====
+
+#[test]
+fn apply_negative_unl_re_enable_validator_on_next_flag_ledger() {
+    // Window 1 (ledger 256): validator 5 silent -> disabled.
+    // Window 2 (ledger 512): validator 5 fully reliable -> re-enabled.
+    let mut consensus = make_engine(&[1, 2, 3, 4, 5]);
+    let trusted: HashSet<NodeId> = [1u8, 2, 3, 4, 5].iter().map(|&i| node_id(i)).collect();
+    let key_map = make_key_map(&[1, 2, 3, 4, 5]);
+    consensus.register_validators(&trusted, &key_map);
+
+    let mut ledger = Ledger::genesis();
+    let tx_engine = make_tx_engine_with_pseudo();
+    let fees = FeeSettings::default();
+
+    // Window 1
+    for _ in 0..256u32 {
+        for id in 1..=4 {
+            consensus.record_validation(node_id(id));
+        }
+        consensus.on_ledger_close_for_tracker();
+    }
+    let r1 = Node::apply_negative_unl(&mut consensus, &mut ledger, &tx_engine, &fees, 256);
+    assert_eq!(r1.len(), 1);
+    assert!(r1[0].is_success());
+
+    // Confirm validator 5 disabled.
+    let nunl_data = ledger
+        .get_state(&keylet::negative_unl())
+        .expect("nunl SLE present after window 1");
+    let obj: Value = rxrpl_ledger::sle_codec::decode_state(nunl_data).unwrap();
+    assert_eq!(obj["DisabledValidators"].as_array().unwrap().len(), 1);
+
+    // Window 2: validator 5 reliable.
+    for _ in 0..256u32 {
+        for id in 1..=5 {
+            consensus.record_validation(node_id(id));
+        }
+        consensus.on_ledger_close_for_tracker();
+    }
+    let r2 = Node::apply_negative_unl(&mut consensus, &mut ledger, &tx_engine, &fees, 512);
+    assert_eq!(r2.len(), 1);
+    assert!(r2[0].is_success());
+
+    // After re-enable, DisabledValidators is empty.
+    let nunl_data2 = ledger.get_state(&keylet::negative_unl()).unwrap();
+    let obj2: Value = rxrpl_ledger::sle_codec::decode_state(nunl_data2).unwrap();
+    assert!(obj2["DisabledValidators"].as_array().unwrap().is_empty());
+    // UNL also synced.
+    assert!(!consensus.unl().is_in_negative_unl(&node_id(5)));
+}
+
 #[test]
 fn apply_negative_unl_no_changes_when_all_reliable() {
     let mut consensus = make_engine(&[1, 2, 3, 4, 5]);
