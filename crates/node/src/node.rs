@@ -2407,6 +2407,59 @@ impl Node {
         amendment_table.build_rules()
     }
 
+    /// Apply negative-UNL pseudo-transactions on a flag ledger.
+    ///
+    /// On flag ledgers (sequence % 256 == 0), the consensus engine's
+    /// negative-UNL tracker is evaluated to produce zero or more
+    /// `UNLModify` pseudo-transactions (disable / re-enable). Each
+    /// generated pseudo-tx is applied to `ledger` via `tx_engine`, which
+    /// mutates the `NegativeUNL` ledger entry.
+    ///
+    /// Mirrors [`Self::apply_amendment_voting`] for nUNL. Returns the
+    /// result of each applied pseudo-tx (in emission order). Off a flag
+    /// ledger, returns an empty vector and does not touch state.
+    pub fn apply_negative_unl<A: rxrpl_consensus::ConsensusAdapter>(
+        consensus: &mut ConsensusEngine<A>,
+        ledger: &mut Ledger,
+        tx_engine: &TxEngine,
+        fees: &FeeSettings,
+        ledger_seq: u32,
+    ) -> Vec<TransactionResult> {
+        let changes = consensus.evaluate_negative_unl(ledger_seq);
+        if changes.is_empty() {
+            return Vec::new();
+        }
+
+        let rules = Rules::new();
+        let mut results = Vec::with_capacity(changes.len());
+        for change in changes {
+            let tx = serde_json::json!({
+                "TransactionType": "UNLModify",
+                "UNLModifyDisabling": if change.disable { 1u32 } else { 0u32 },
+                "UNLModifyValidator": change.validator_key,
+                "LedgerSequence": change.ledger_seq,
+            });
+            match tx_engine.apply(&tx, ledger, &rules, fees) {
+                Ok(result) => {
+                    if result.is_success() {
+                        tracing::info!(
+                            "nUNL pseudo-tx applied: {} validator {}",
+                            if change.disable { "disable" } else { "re-enable" },
+                            change.validator_key,
+                        );
+                    } else {
+                        tracing::warn!("nUNL pseudo-tx failed: {}", result);
+                    }
+                    results.push(result);
+                }
+                Err(e) => {
+                    tracing::error!("failed to apply nUNL pseudo-tx: {}", e);
+                }
+            }
+        }
+        results
+    }
+
     /// Close the current ledger and return a new open ledger derived from it.
     ///
     /// Returns the closed ledger's hash and the new open ledger.
