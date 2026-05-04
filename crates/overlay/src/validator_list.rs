@@ -1193,6 +1193,100 @@ mod tests {
         assert!(matches!(res, Err(ValidatorListError::CyclicDelegate)));
     }
 
+    /// B4: tampered delegate signature must surface as CascadeSignatureInvalid.
+    #[test]
+    fn cascade_rejects_tampered_delegate_signature() {
+        let delegate_pk = pub_master_pk("b4_delegate_pub");
+        let no_v: [&str; 0] = [];
+        let v_b = ["b4_val_delegate"];
+        let no_delegates: Vec<PublicKey> = vec![];
+
+        let (m_primary, w_primary) = make_test_vl_v2(
+            "b4_primary_pub",
+            "b4_primary_eph",
+            &[(0, 1000, 1, &no_v, &[delegate_pk.clone()][..])],
+        );
+        let (m_d, mut w_d) = make_test_vl_v2(
+            "b4_delegate_pub",
+            "b4_delegate_eph",
+            &[(0, 1000, 1, &v_b, &no_delegates)],
+        );
+        // Tamper the delegate's signature byte 0.
+        if let Some(b) = w_d[0].signature_hex.get_mut(0) {
+            *b = if *b == b'0' { b'1' } else { b'0' };
+        }
+
+        let mut store = ManifestStore::new();
+        let bundle = verify_and_parse_v2(&m_primary, &w_primary, &mut store, 100).unwrap();
+        let mut resolver = MockResolver::new();
+        resolver.insert(&delegate_pk, m_d, w_d);
+
+        let res = resolve_cascade(
+            bundle.active,
+            &mut resolver,
+            &mut store,
+            100,
+            CASCADE_DEPTH_DEFAULT,
+        );
+        assert!(
+            matches!(res, Err(ValidatorListError::CascadeSignatureInvalid)),
+            "expected CascadeSignatureInvalid, got {:?}",
+            res
+        );
+    }
+
+    /// B4: revoked delegate publisher is rejected before any cascade fetch.
+    #[test]
+    fn cascade_rejects_revoked_delegate() {
+        let delegate_kp = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("b4_revoke_delegate_master"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let delegate_pk = delegate_kp.public_key.clone();
+        let no_v: [&str; 0] = [];
+        let v_b = ["b4_revoke_val_delegate"];
+        let no_delegates: Vec<PublicKey> = vec![];
+
+        let (m_primary, w_primary) = make_test_vl_v2(
+            "b4_revoke_primary",
+            "b4_revoke_primary_eph",
+            &[(0, 1000, 1, &no_v, &[delegate_pk.clone()][..])],
+        );
+        // We won't actually need delegate's wire because revocation
+        // intercepts before fetch. But create them for completeness.
+        let (m_d, w_d) = make_test_vl_v2(
+            "b4_revoke_delegate_master",
+            "b4_revoke_delegate_eph",
+            &[(0, 1000, 1, &v_b, &no_delegates)],
+        );
+
+        let mut store = ManifestStore::new();
+        let bundle = verify_and_parse_v2(&m_primary, &w_primary, &mut store, 100).unwrap();
+
+        // Mark the delegate as revoked by applying a revocation manifest.
+        let revoke_manifest = manifest::Manifest {
+            sequence: MANIFEST_REVOKED_SEQ,
+            master_public_key: delegate_pk.clone(),
+            ephemeral_public_key: None,
+            domain: None,
+            raw: vec![],
+        };
+        store.apply(revoke_manifest);
+        assert!(store.is_revoked(&delegate_pk));
+
+        let mut resolver = MockResolver::new();
+        resolver.insert(&delegate_pk, m_d, w_d);
+
+        let res = resolve_cascade(
+            bundle.active,
+            &mut resolver,
+            &mut store,
+            100,
+            CASCADE_DEPTH_DEFAULT,
+        );
+        assert!(matches!(res, Err(ValidatorListError::DelegateRevoked)));
+    }
+
     /// B1: tampered v2 signature is rejected.
     #[test]
     fn v2_rejects_tampered_signature() {
