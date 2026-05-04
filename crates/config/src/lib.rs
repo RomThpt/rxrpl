@@ -14,5 +14,5 @@ pub use seed_loader::load_seed_file;
 pub use seed_writer::write_seed_file;
 pub use types::{
     ClusterConfig, DatabaseConfig, GenesisConfig, NetworkConfig, NodeConfig, PeerConfig,
-    ServerConfig, ShardConfig, ValidatorConfig,
+    ServerConfig, ShardConfig, ValidatorConfig, ValidatorIdentityConfig,
 };
