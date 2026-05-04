@@ -7,6 +7,13 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transac
 
 pub struct AMMWithdrawTransactor;
 
+/// tfWithdrawAll flag (0x00020000): withdraw all of caller's LP tokens
+/// (caller redeems their entire share). Allows zero-amount preflight.
+const TF_WITHDRAW_ALL: u32 = 0x00020000;
+/// tfOneAssetWithdrawAll flag (0x00040000): redeem all LP for a single
+/// asset (caller cashes out into one of the two pool currencies).
+const TF_ONE_ASSET_WITHDRAW_ALL: u32 = 0x00040000;
+
 impl Transactor for AMMWithdrawTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
         let asset = ctx.tx.get("Asset").ok_or(TransactionResult::TemMalformed)?;
@@ -17,6 +24,13 @@ impl Transactor for AMMWithdrawTransactor {
 
         amm_helpers::validate_asset(asset)?;
         amm_helpers::validate_asset(asset2)?;
+
+        // tfWithdrawAll / tfOneAssetWithdrawAll: zero amounts allowed —
+        // the flag itself signals "withdraw everything".
+        let flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
+        if flags & (TF_WITHDRAW_ALL | TF_ONE_ASSET_WITHDRAW_ALL) != 0 {
+            return Ok(());
+        }
 
         // Accept either LPTokenIn (full or partial proportional withdraw) or
         // Amount/Amount2 (single-asset withdraw via tfSingleAsset).
@@ -66,7 +80,15 @@ impl Transactor for AMMWithdrawTransactor {
         let pool2 = amm_helpers::get_pool_field(&amm, "PoolBalance2");
         let total_lp = amm_helpers::get_pool_field(&amm, "LPTokenBalance");
 
-        let lp_in = helpers::get_u64_str_field(ctx.tx, "LPTokenIn").unwrap_or(0);
+        let flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
+        let withdraw_all = flags & TF_WITHDRAW_ALL != 0;
+        // tfWithdrawAll: redeem all pool LP tokens (single-LP scenario for
+        // basic AMM with one liquidity provider). For now, set lp_in to total_lp.
+        let lp_in = if withdraw_all {
+            total_lp
+        } else {
+            helpers::get_u64_str_field(ctx.tx, "LPTokenIn").unwrap_or(0)
+        };
         let withdraw1 = ctx
             .tx
             .get("Amount")
@@ -103,17 +125,24 @@ impl Transactor for AMMWithdrawTransactor {
         };
 
         let lp_to_burn = lp_burned.min(total_lp);
+        let new_lp = total_lp.saturating_sub(lp_to_burn);
 
-        // Update AMM entry
-        amm["PoolBalance1"] = serde_json::Value::String(pool1.saturating_sub(payout1).to_string());
-        amm["PoolBalance2"] = serde_json::Value::String(pool2.saturating_sub(payout2).to_string());
-        amm["LPTokenBalance"] =
-            serde_json::Value::String(total_lp.saturating_sub(lp_to_burn).to_string());
+        // Auto-delete: when LPTokenBalance hits 0, remove the AMM entirely
+        // (rippled behavior — AMMs with no liquidity are garbage-collected).
+        if new_lp == 0 {
+            ctx.view
+                .erase(&amm_key)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        } else {
+            amm["PoolBalance1"] = serde_json::Value::String(pool1.saturating_sub(payout1).to_string());
+            amm["PoolBalance2"] = serde_json::Value::String(pool2.saturating_sub(payout2).to_string());
+            amm["LPTokenBalance"] = serde_json::Value::String(new_lp.to_string());
 
-        let amm_data = serde_json::to_vec(&amm).map_err(|_| TransactionResult::TefInternal)?;
-        ctx.view
-            .update(amm_key, amm_data)
-            .map_err(|_| TransactionResult::TefInternal)?;
+            let amm_data = serde_json::to_vec(&amm).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(amm_key, amm_data)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
 
         // Credit only XRP payouts to the AccountRoot balance; IOU payouts
         // require trust-line credits (out of scope).
@@ -233,12 +262,10 @@ mod tests {
         let result = AMMWithdrawTransactor.apply(&mut ctx).unwrap();
         assert_eq!(result, TransactionResult::TesSuccess);
 
+        // Full withdraw (LPTokenBalance = 0) auto-deletes the AMM SLE
+        // (rippled behavior, mirrored).
         let amm_key = amm_helpers::compute_amm_key_from_tx(&tx).unwrap();
-        let amm_bytes = sandbox.read(&amm_key).unwrap();
-        let amm: serde_json::Value = serde_json::from_slice(&amm_bytes).unwrap();
-        assert_eq!(amm["PoolBalance1"].as_str().unwrap(), "0");
-        assert_eq!(amm["PoolBalance2"].as_str().unwrap(), "0");
-        assert_eq!(amm["LPTokenBalance"].as_str().unwrap(), "0");
+        assert!(sandbox.read(&amm_key).is_none());
 
         // BOB gets credited only the XRP leg (PoolBalance1 = 10M XRP).
         // The USD leg (5M units) goes to the trust line, not AccountRoot.
