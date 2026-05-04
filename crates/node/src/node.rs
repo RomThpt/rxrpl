@@ -587,15 +587,15 @@ impl Node {
         });
 
         tracing::info!(
-            "standalone node running (close interval: {}s), press ctrl+c to stop",
+            "standalone node running (close interval: {}s), waiting for SIGINT/SIGTERM",
             close_interval_secs
         );
 
-        tokio::signal::ctrl_c()
+        let signal = crate::shutdown::wait_for_shutdown()
             .await
             .map_err(|e| NodeError::Server(format!("signal error: {e}")))?;
 
-        tracing::info!("shutting down");
+        tracing::info!(signal = %signal, "shutting down gracefully");
         Ok(())
     }
 
@@ -1879,15 +1879,15 @@ impl Node {
         });
 
         tracing::info!(
-            "networked node running (close interval: {}s), press ctrl+c to stop",
+            "networked node running (close interval: {}s), waiting for SIGINT/SIGTERM",
             close_interval_secs
         );
 
-        tokio::signal::ctrl_c()
+        let signal = crate::shutdown::wait_for_shutdown()
             .await
             .map_err(|e| NodeError::Server(format!("signal error: {e}")))?;
 
-        tracing::info!("shutting down");
+        tracing::info!(signal = %signal, "shutting down gracefully");
         Ok(())
     }
 

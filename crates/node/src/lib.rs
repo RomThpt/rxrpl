@@ -8,6 +8,7 @@ pub mod error;
 pub mod node;
 pub mod pruner;
 pub mod reporting;
+pub mod shutdown;
 
 pub use checkpoint::{AnchorConfig, CheckpointAnchor, StartingLedger};
 pub use error::NodeError;
