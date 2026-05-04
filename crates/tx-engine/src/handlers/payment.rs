@@ -189,11 +189,15 @@ impl Transactor for PaymentTransactor {
                 return Err(TransactionResult::TecNoDstInsuf);
             }
 
+            // New / resurrected accounts get Sequence = current ledger seq
+            // (rippled convention; preserves uniqueness of OfferIDs etc. across
+            // delete/recreate cycles within the same ledger history).
+            let new_seq = ctx.view.seq().max(1);
             let new_account = serde_json::json!({
                 "LedgerEntryType": "AccountRoot",
                 "Account": destination_str,
                 "Balance": amount.to_string(),
-                "Sequence": 1,
+                "Sequence": new_seq,
                 "OwnerCount": 0,
                 "Flags": 0,
             });
