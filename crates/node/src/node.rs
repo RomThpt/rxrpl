@@ -624,6 +624,20 @@ impl Node {
         tracing::info!("node identity: {}", identity.node_id);
         tracing::info!("node public key: {}", hex::encode(identity.public_key_bytes()));
 
+        // 1b. Optional validator signing identity (master + ephemeral). When
+        // configured, validations + proposals are signed by the ephemeral key
+        // (with master key publishing the manifest). When absent, the
+        // legacy single-key path uses `identity` for signing too.
+        let validator_id: Option<Arc<rxrpl_overlay::identity::ValidatorIdentity>> =
+            build_validator_identity(&self.config.validator_identity)?.map(Arc::new);
+        if let Some(ref vid) = validator_id {
+            tracing::info!(
+                "validator signing identity loaded: master={}, signing={}",
+                hex::encode(vid.master_pubkey().as_bytes()),
+                hex::encode(vid.signing_pubkey().as_bytes()),
+            );
+        }
+
         // 2. Bootstrap from RPC: fetch latest validated ledger to set our starting point
         if let Some(rpc_url) = sync_rpc_url {
             match Self::bootstrap_from_rpc(rpc_url).await {
@@ -1016,6 +1030,7 @@ impl Node {
         // `run_networked` via `validate_starting_ledger_unl` so the error
         // surfaces before any port bind or task spawn.
 
+        let validator_id_for_loop = validator_id.clone();
         tokio::spawn(async move {
             let node_id = NodeId(identity.node_id);
             let consensus_params = ConsensusParams::default();
@@ -1277,7 +1292,8 @@ impl Node {
                                             &consensus, pending_close_time, &ledger,
                                             &closed_ledgers, &tx_store, &event_tx,
                                             &ledger_seq_shared, &ledger_hash_shared,
-                                            &tx_queue, &identity, &cmd_tx_catchup,
+                                            &tx_queue, &identity, &validator_id_for_loop,
+                                            &cmd_tx_catchup,
                                             &amendment_table, &tx_engine, &fees,
                                             &amendment_votes, trusted_validator_count,
                                             &pruner, &node_store,
@@ -1303,7 +1319,8 @@ impl Node {
                                             &consensus, pending_close_time, &ledger,
                                             &closed_ledgers, &tx_store, &event_tx,
                                             &ledger_seq_shared, &ledger_hash_shared,
-                                            &tx_queue, &identity, &cmd_tx_catchup,
+                                            &tx_queue, &identity, &validator_id_for_loop,
+                                            &cmd_tx_catchup,
                                             &amendment_table, &tx_engine, &fees,
                                             &amendment_votes, trusted_validator_count,
                                             &pruner, &node_store,
@@ -1692,9 +1709,13 @@ impl Node {
                                                         .unwrap_or_default()
                                                         .as_secs()
                                                         .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
+                                                    let signing_pubkey: Vec<u8> = match validator_id_for_loop.as_ref() {
+                                                        Some(vid) => vid.signing_pubkey().as_bytes().to_vec(),
+                                                        None => identity.public_key_bytes().to_vec(),
+                                                    };
                                                     let mut validation = Validation {
                                                         node_id: rxrpl_consensus::types::NodeId(Hash256::new(identity.node_id.0)),
-                                                        public_key: identity.public_key_bytes().to_vec(),
+                                                        public_key: signing_pubkey.clone(),
                                                         ledger_hash: reconstructed.header.hash,
                                                         ledger_seq: seq,
                                                         full: true,
@@ -1705,10 +1726,14 @@ impl Node {
                                                         signing_payload: None,
                                                         ..Default::default()
                                                     };
-                                                    identity.sign_validation(&mut validation);
+                                                    if let Some(ref vid) = validator_id_for_loop {
+                                                        vid.sign_validation(&mut validation);
+                                                    } else {
+                                                        identity.sign_validation(&mut validation);
+                                                    }
                                                     let payload = rxrpl_overlay::proto_convert::encode_validation(
                                                         &validation,
-                                                        identity.public_key_bytes(),
+                                                        &signing_pubkey,
                                                     );
                                                     let _ = cmd_tx_catchup.send(OverlayCommand::Broadcast {
                                                         msg_type: rxrpl_p2p_proto::MessageType::Validation,
@@ -1865,6 +1890,7 @@ impl Node {
         ledger_hash_shared: &Arc<tokio::sync::RwLock<Hash256>>,
         tx_queue: &Arc<RwLock<TxQueue>>,
         identity: &Arc<NodeIdentity>,
+        validator_id_for_loop: &Option<Arc<rxrpl_overlay::identity::ValidatorIdentity>>,
         cmd_tx: &tokio::sync::mpsc::UnboundedSender<OverlayCommand>,
         amendment_table: &Arc<RwLock<AmendmentTable>>,
         tx_engine: &Arc<TxEngine>,
@@ -2010,9 +2036,13 @@ impl Node {
             use rxrpl_consensus::types::Validation;
             // Include our amendment votes in the validation message
             let our_amendment_votes = amendment_table.read().await.get_votes();
+            let signing_pubkey: Vec<u8> = match validator_id_for_loop.as_ref() {
+                Some(vid) => vid.signing_pubkey().as_bytes().to_vec(),
+                None => identity.public_key_bytes().to_vec(),
+            };
             let mut validation = Validation {
                 node_id: rxrpl_consensus::types::NodeId(Hash256::new(identity.node_id.0)),
-                public_key: identity.public_key_bytes().to_vec(),
+                public_key: signing_pubkey.clone(),
                 ledger_hash: hash,
                 ledger_seq: closed_seq,
                 full: true,
@@ -2023,10 +2053,14 @@ impl Node {
                 signing_payload: None,
                 ..Default::default()
             };
-            identity.sign_validation(&mut validation);
+            if let Some(vid) = validator_id_for_loop.as_ref() {
+                vid.sign_validation(&mut validation);
+            } else {
+                identity.sign_validation(&mut validation);
+            }
             let payload = rxrpl_overlay::proto_convert::encode_validation(
                 &validation,
-                identity.public_key_bytes(),
+                &signing_pubkey,
             );
             let _ = cmd_tx.send(OverlayCommand::Broadcast {
                 msg_type: rxrpl_p2p_proto::MessageType::Validation,
@@ -2678,6 +2712,55 @@ impl Node {
     }
 }
 
+/// Build a [`ValidatorIdentity`] from a [`ValidatorIdentityConfig`].
+///
+/// Returns `Ok(None)` when no signing identity is configured (the node will
+/// run as a non-signing observer). Returns `Ok(Some(_))` when an explicit
+/// two-key form (`master_secret` + `ephemeral_seed`) is provided.
+///
+/// `validator_token` and `validator_token_path` paths are not yet wired —
+/// see follow-up B-track tasks. They currently return an error to flag the
+/// gap rather than silently dropping the configuration.
+fn build_validator_identity(
+    cfg: &rxrpl_config::ValidatorIdentityConfig,
+) -> Result<Option<rxrpl_overlay::identity::ValidatorIdentity>, NodeError> {
+    let any_set = cfg.master_secret.is_some()
+        || cfg.ephemeral_seed.is_some()
+        || cfg.validator_token.is_some()
+        || cfg.validator_token_path.is_some();
+    if !any_set {
+        return Ok(None);
+    }
+
+    if cfg.validator_token.is_some() || cfg.validator_token_path.is_some() {
+        return Err(NodeError::Config(
+            "validator_token / validator_token_path loading not yet wired \
+             (use master_secret + ephemeral_seed for now)"
+                .into(),
+        ));
+    }
+
+    let master_str = cfg.master_secret.as_deref().ok_or_else(|| {
+        NodeError::Config("validator_identity.master_secret is required when ephemeral_seed is set".into())
+    })?;
+    let ephemeral_str = cfg.ephemeral_seed.as_deref().ok_or_else(|| {
+        NodeError::Config("validator_identity.ephemeral_seed is required when master_secret is set".into())
+    })?;
+
+    let master_bytes = parse_node_seed(master_str)
+        .map_err(|e| NodeError::Config(format!("invalid validator_identity.master_secret: {e}")))?;
+    let ephemeral_bytes = parse_node_seed(ephemeral_str).map_err(|e| {
+        NodeError::Config(format!("invalid validator_identity.ephemeral_seed: {e}"))
+    })?;
+
+    let master_seed = rxrpl_crypto::Seed::from_bytes(master_bytes);
+    let ephemeral_seed = rxrpl_crypto::Seed::from_bytes(ephemeral_bytes);
+    Ok(Some(rxrpl_overlay::identity::ValidatorIdentity::two_key(
+        &master_seed,
+        &ephemeral_seed,
+    )))
+}
+
 /// Decode a `node_seed` config value into raw 16-byte seed entropy.
 ///
 /// Accepts either:
@@ -2728,6 +2811,47 @@ mod tests {
     #[test]
     fn parse_node_seed_garbage_rejected() {
         assert!(parse_node_seed("not a seed").is_err());
+    }
+
+    #[test]
+    fn build_validator_identity_returns_none_for_empty_config() {
+        let cfg = rxrpl_config::ValidatorIdentityConfig::default();
+        let id = build_validator_identity(&cfg).unwrap();
+        assert!(id.is_none(), "empty validator_identity config = no signer");
+    }
+
+    #[test]
+    fn build_validator_identity_loads_two_key_from_seeds() {
+        let cfg = rxrpl_config::ValidatorIdentityConfig {
+            master_secret: Some("sneWFZcEqA8TUA5BmJ38xsqaR7dFb".into()),
+            ephemeral_seed: Some(
+                // 32 hex chars = 16 raw seed bytes (distinct from the master).
+                "FFEEDDCCBBAA99887766554433221100".into(),
+            ),
+            ..Default::default()
+        };
+        let id = build_validator_identity(&cfg).unwrap().expect("id present");
+
+        assert_ne!(
+            id.master_pubkey().as_bytes(),
+            id.signing_pubkey().as_bytes(),
+            "two-key load must produce distinct keys"
+        );
+    }
+
+    #[test]
+    fn build_validator_identity_rejects_master_without_ephemeral() {
+        let cfg = rxrpl_config::ValidatorIdentityConfig {
+            master_secret: Some("sneWFZcEqA8TUA5BmJ38xsqaR7dFb".into()),
+            ephemeral_seed: None,
+            ..Default::default()
+        };
+        let err = build_validator_identity(&cfg).expect_err("must reject");
+        let s = format!("{err}");
+        assert!(
+            s.contains("ephemeral_seed"),
+            "error must point at the missing field, got: {s}"
+        );
     }
 
     #[test]

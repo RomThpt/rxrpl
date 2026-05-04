@@ -747,6 +747,48 @@ mod tests {
         );
     }
 
+    /// In two-key mode, `sign_validation` must use the **ephemeral signing
+    /// key**, never the master. A peer rejects any validation whose
+    /// signature does not verify against the embedded `sfSigningPubKey`,
+    /// and the signing pubkey is set by the caller (Node) from
+    /// `signing_pubkey()`. So if we accidentally signed with the master,
+    /// the validation would fail signature verification on every peer.
+    #[test]
+    fn validator_identity_two_key_signs_with_signing_key_not_master() {
+        use rxrpl_consensus::types::{NodeId, Validation};
+        use rxrpl_primitives::Hash256;
+
+        let master = Seed::from_passphrase("two-key-sign-master");
+        let signing = Seed::from_passphrase("two-key-sign-signing");
+        let id = ValidatorIdentity::two_key(&master, &signing);
+
+        let mut validation = Validation {
+            node_id: NodeId(Hash256::new([0xAA; 32])),
+            public_key: id.signing_pubkey().as_bytes().to_vec(),
+            ledger_hash: Hash256::new([0xCC; 32]),
+            ledger_seq: 1,
+            full: true,
+            close_time: 100,
+            sign_time: 100,
+            signature: None,
+            amendments: vec![],
+            signing_payload: None,
+            ..Default::default()
+        };
+        id.sign_validation(&mut validation);
+        assert!(verify_validation_signature(&validation), "signing key sig must verify");
+
+        // If we put the master pubkey as the embedded `public_key`, the
+        // verifier must reject (signature was made with signing key, not
+        // master).
+        validation.public_key = id.master_pubkey().as_bytes().to_vec();
+        validation.signing_payload = None; // force re-encode for verifier
+        assert!(
+            !verify_validation_signature(&validation),
+            "verifying against master pubkey must fail — signature is from signing key"
+        );
+    }
+
     /// `ValidatorIdentity` must produce signatures byte-identical to a
     /// legacy single-key `NodeIdentity` derived from the same seed —
     /// otherwise A3's swap-over in `node.rs` would silently change every
