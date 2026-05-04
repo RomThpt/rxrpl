@@ -7,6 +7,7 @@ pub mod loader;
 pub mod seed_loader;
 pub mod seed_writer;
 pub mod types;
+pub mod validator_token;
 
 pub use error::ConfigError;
 pub use loader::{load_config, load_config_with_seed};
@@ -16,3 +17,4 @@ pub use types::{
     ClusterConfig, DatabaseConfig, GenesisConfig, NetworkConfig, NodeConfig, PeerConfig,
     ServerConfig, ShardConfig, ValidatorConfig, ValidatorIdentityConfig,
 };
+pub use validator_token::{ValidatorToken, ValidatorTokenError, parse_validator_token};
