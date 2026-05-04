@@ -6,6 +6,7 @@ pub mod cluster;
 pub mod command;
 pub mod consensus_bridge;
 pub mod discovery;
+pub mod domain_attestation;
 pub mod error;
 pub mod event;
 pub mod handshake;
