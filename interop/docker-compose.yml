@@ -1,8 +1,12 @@
 # Mixed-network interop testing: rxrpl + rippled validators
 #
-# Spins up a 5-node private network:
-#   - 3 rippled validators
-#   - 2 rxrpl validators
+# Spins up a 3-node private network:
+#   - 2 rippled validators
+#   - 1 rxrpl validator
+#
+# Quorum 2-of-3 keeps consensus rounds short and exposes the rxrpl-as-voter
+# path: any quorum without the rxrpl validation must come from 2 rippled,
+# making missing rxrpl signatures observable in the validation_count.
 #
 # All nodes share a common UNL and genesis ledger.
 # Usage:
@@ -14,6 +18,7 @@ services:
   # --- rippled validators ---
   rippled-0:
     image: ${RIPPLED_IMAGE:-rippleci/rippled:2.3.0}
+    container_name: interop-rippled-0
     volumes:
       - ./configs/rippled-0.cfg:/etc/opt/ripple/rippled.cfg:ro
       - ./configs/validators.txt:/etc/opt/ripple/validators.txt:ro
@@ -25,6 +30,7 @@ services:
 
   rippled-1:
     image: ${RIPPLED_IMAGE:-rippleci/rippled:2.3.0}
+    container_name: interop-rippled-1
     volumes:
       - ./configs/rippled-1.cfg:/etc/opt/ripple/rippled.cfg:ro
       - ./configs/validators.txt:/etc/opt/ripple/validators.txt:ro
@@ -32,20 +38,12 @@ services:
       xrpl-net:
         ipv4_address: 172.30.0.11
 
-  rippled-2:
-    image: ${RIPPLED_IMAGE:-rippleci/rippled:2.3.0}
-    volumes:
-      - ./configs/rippled-2.cfg:/etc/opt/ripple/rippled.cfg:ro
-      - ./configs/validators.txt:/etc/opt/ripple/validators.txt:ro
-    networks:
-      xrpl-net:
-        ipv4_address: 172.30.0.12
-
   # --- rxrpl validators ---
   rxrpl-0:
     build:
       context: ..
       dockerfile: Dockerfile
+    container_name: interop-rxrpl-0
     command: ["run", "--config", "/etc/rxrpl/config.toml"]
     volumes:
       - ./configs/rxrpl-0.toml:/etc/rxrpl/config.toml:ro
@@ -55,17 +53,6 @@ services:
       xrpl-net:
         ipv4_address: 172.30.0.20
 
-  rxrpl-1:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    command: ["run", "--config", "/etc/rxrpl/config.toml"]
-    volumes:
-      - ./configs/rxrpl-1.toml:/etc/rxrpl/config.toml:ro
-    networks:
-      xrpl-net:
-        ipv4_address: 172.30.0.21
-
   # --- test runner ---
   test-runner:
     build:
@@ -74,12 +61,20 @@ services:
     depends_on:
       - rippled-0
       - rippled-1
-      - rippled-2
       - rxrpl-0
-      - rxrpl-1
     environment:
-      RIPPLED_URLS: "http://172.30.0.10:5005,http://172.30.0.11:5005,http://172.30.0.12:5005"
-      RXRPL_URLS: "http://172.30.0.20:5005,http://172.30.0.21:5005"
+      RIPPLED_URLS: "http://172.30.0.10:5005,http://172.30.0.11:5005"
+      RXRPL_URLS: "http://172.30.0.20:5005"
+      # Used by B3 log-scrape and B4/B5 chaos tests. Names match the
+      # `container_name` fields above and are independent of the compose
+      # project name.
+      RIPPLED_CONTAINERS: "interop-rippled-0,interop-rippled-1"
+      RXRPL_CONTAINERS: "interop-rxrpl-0"
+    volumes:
+      # Required by B3 log-scrape and B4/B5 chaos tests so the runner can
+      # invoke `docker logs`, `docker stop`, `docker start` against sibling
+      # containers via the host docker socket.
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       xrpl-net:
         ipv4_address: 172.30.0.100

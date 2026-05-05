@@ -6,8 +6,8 @@ admin_ips = ["0.0.0.0"]
 port = 51235
 max_peers = 21
 seeds = []
-fixed_peers = ["172.30.0.10:51235", "172.30.0.11:51235", "172.30.0.12:51235", "172.30.0.21:51235"]
-node_seed = "981679ae222d51083ac51f7eb3e890aec1958ce2dafbd9b3f35ceec71713882a"
+fixed_peers = ["172.30.0.10:51235", "172.30.0.11:51235"]
+node_seed = "a00bea5ec7bda12408cb8b215171b4b209190767c0d811f51888b773ece2cf81"
 tls_enabled = false
 
 [database]
@@ -17,7 +17,7 @@ online_delete = 256
 
 [validators]
 enabled = true
-trusted = ["n9264433adf7f3e0c20240c05d3aa0074dc176ec69cfb3382f09", "n99630e6f61decf83c950f18f29c3998fb7d6e14b7fcab6d3b55", "n919fda9ee81d3e6ffc23414906be2ff26a58505ddb24fda1b0e", "n9b69af7a20649103518d9e06e5a7a779eff9f01c06dc0b60e85", "n981e230ed8486d169b8d902a75a3711b72017283845a11e4a08"]
+trusted = ["n989cb3095636ff8ddd17655763b218593740ebe5c6bd2e311e0", "n96d889b79e90e074910ce7886e72922918ade6f60534aa31d4c", "n997863d75a1bfec6fb1d6d9c6afd0719b6bc67e68a610b25970"]
 quorum = 3
 
 [network]

@@ -1,0 +1,6 @@
+# Generated per-run by scripts/generate_configs.py.
+# publisher.json contains a fresh test-only secp256k1 secret key —
+# keeping it out of version control prevents accidental key reuse.
+configs/publisher.json
+configs/manifest.json
+tests/__pycache__/

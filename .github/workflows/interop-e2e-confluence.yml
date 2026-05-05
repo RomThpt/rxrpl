@@ -1,0 +1,92 @@
+name: Interop E2E Confluence (rxrpl in UNL)
+
+# End-to-end proof that rxrpl can act as a trusted validator in a mixed
+# UNL: configs (B1), mixed-voter consensus (B3), flaky rxrpl (B4),
+# flaky rippled (B5). Runs nightly and on manual dispatch — kept
+# separate from the existing `interop.yml` so failures here do not
+# block the lighter-weight propagation/sync regression suite.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rippled_image:
+        description: 'rippled Docker image (overrides matrix entry)'
+        default: ''
+        type: string
+      suite:
+        description: 'Test selection (pytest -k expression, empty = all)'
+        default: ''
+        type: string
+  schedule:
+    # Nightly at 03:00 UTC, an hour after the lighter interop.yml run.
+    - cron: '0 3 * * *'
+
+jobs:
+  e2e-confluence:
+    name: ${{ matrix.rippled_image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        rippled_image:
+          - rippleci/rippled:2.3.0
+          - rippleci/rippled:2.4.0
+    env:
+      RIPPLED_IMAGE: ${{ inputs.rippled_image != '' && inputs.rippled_image || matrix.rippled_image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate network configs
+        run: python3 interop/scripts/generate_configs.py --rippled 2 --rxrpl 1
+
+      - name: Build rxrpl Docker image
+        run: docker build -t rxrpl:interop -f Dockerfile .
+
+      - name: Start mixed network
+        working-directory: interop
+        run: docker compose up -d --build
+
+      - name: Wait for network startup
+        run: sleep 45
+
+      - name: Run E2E confluence tests
+        working-directory: interop
+        run: |
+          SELECTOR=""
+          if [ -n "${{ inputs.suite }}" ]; then
+            SELECTOR="-k ${{ inputs.suite }}"
+          fi
+          docker compose run --rm test-runner \
+            python -m pytest -v --tb=short --maxfail=999 $SELECTOR \
+              tests/test_configs.py \
+              tests/test_consensus_mixed_voter.py \
+              tests/test_flaky_rxrpl.py \
+              tests/test_flaky_rippled.py
+
+      - name: Collect logs on failure
+        if: failure()
+        working-directory: interop
+        run: |
+          mkdir -p logs
+          for svc in interop-rippled-0 interop-rippled-1 interop-rxrpl-0; do
+            echo "=== $svc ==="
+            docker logs --tail=500 "$svc" > "logs/$svc.log" 2>&1 || true
+            cat "logs/$svc.log" || true
+          done
+
+      - name: Upload logs artifact on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-confluence-logs-${{ matrix.rippled_image }}
+          path: interop/logs/
+          if-no-files-found: ignore
+
+      - name: Teardown
+        if: always()
+        working-directory: interop
+        run: docker compose down -v --remove-orphans

@@ -93,7 +93,27 @@ def get_ledger_hash(url: str, seq: int) -> str | None:
         return None
 
 
+def pytest_collection_modifyitems(config, items):
+    """Skip network tests when INTEROP_OFFLINE=1 (unit-only mode)."""
+    if os.environ.get("INTEROP_OFFLINE") == "1":
+        skip_marker = pytest.mark.skip(reason="INTEROP_OFFLINE=1 (unit-only)")
+        for item in items:
+            if "network" in item.keywords:
+                item.add_marker(skip_marker)
+
+
 @pytest.fixture(scope="session", autouse=True)
-def network_ready():
-    """Ensure the network is live before running tests."""
-    wait_all_nodes_live(min_seq=3, timeout=TIMEOUT)
+def network_ready(request):
+    """Ensure the network is live before running tests requiring it.
+
+    Tests must opt-in via the @pytest.mark.network marker. Pure-unit
+    tests (config generation, manifest parsing) skip this gate.
+    """
+    if os.environ.get("INTEROP_OFFLINE") == "1":
+        return
+    # Only block startup if at least one collected test needs the network.
+    needs_network = any(
+        "network" in item.keywords for item in request.session.items
+    )
+    if needs_network:
+        wait_all_nodes_live(min_seq=3, timeout=TIMEOUT)
