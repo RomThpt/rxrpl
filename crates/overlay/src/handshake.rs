@@ -10,64 +10,12 @@ use crate::error::OverlayError;
 use crate::http;
 use crate::identity::NodeIdentity;
 use crate::peer_set::PeerSoftware;
-use crate::proto_convert;
 use crate::tls::{self, PeerStream};
 
 /// Our outgoing `User-Agent` advertised in the HTTP upgrade headers.
 const OUR_USER_AGENT: &str = concat!("rxrpl/", env!("CARGO_PKG_VERSION"));
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Validate a received TMHello message and return the peer's node ID.
-fn validate_hello(
-    payload: &[u8],
-    expected_network_id: u32,
-    our_identity: &NodeIdentity,
-) -> Result<Hash256, OverlayError> {
-    let hello = proto_convert::decode_hello(payload)?;
-
-    // Check network ID
-    if hello.network_id != expected_network_id {
-        return Err(OverlayError::Handshake(format!(
-            "network_id mismatch: expected {}, got {}",
-            expected_network_id, hello.network_id
-        )));
-    }
-
-    // Check protocol version compatibility
-    const OUR_PROTO_VERSION_MIN: u32 = 2;
-    if hello.proto_version < OUR_PROTO_VERSION_MIN {
-        return Err(OverlayError::Handshake(format!(
-            "peer protocol version {} too old (min {})",
-            hello.proto_version, OUR_PROTO_VERSION_MIN
-        )));
-    }
-
-    // Verify node_proof: signature of SHA-512-Half(peer_pubkey || "XRPL-HANDSHAKE")
-    let mut proof_data = Vec::new();
-    proof_data.extend_from_slice(&hello.node_public);
-    proof_data.extend_from_slice(b"XRPL-HANDSHAKE");
-    let proof_hash = rxrpl_crypto::sha512_half::sha512_half(&[&proof_data]);
-
-    let proof_valid = if hello.node_public.first() == Some(&0xED) {
-        rxrpl_crypto::ed25519::verify(proof_hash.as_bytes(), &hello.node_public, &hello.node_proof)
-    } else {
-        rxrpl_crypto::secp256k1::verify(proof_hash.as_bytes(), &hello.node_public, &hello.node_proof)
-    };
-    if !proof_valid {
-        return Err(OverlayError::Handshake("invalid node_proof".into()));
-    }
-
-    // Derive peer node ID
-    let peer_node_id = rxrpl_crypto::sha512_half::sha512_half(&[&hello.node_public]);
-
-    // Self-connection check
-    if peer_node_id == our_identity.node_id {
-        return Err(OverlayError::Handshake("self-connection detected".into()));
-    }
-
-    Ok(peer_node_id)
-}
 
 /// Maximum size of an HTTP upgrade request/response (16 KB should be more than enough).
 const MAX_HTTP_HEADER_SIZE: usize = 16 * 1024;

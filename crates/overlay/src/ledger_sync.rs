@@ -164,6 +164,9 @@ pub struct LedgerSyncer {
 }
 
 struct PendingRequest {
+    /// Expected ledger hash, captured at request time so future retry/validation
+    /// logic can correlate responses. Not yet read by the syncer.
+    #[allow(dead_code)]
     hash: Option<Hash256>,
     sent_at: Instant,
     retries: u32,
