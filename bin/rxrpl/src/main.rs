@@ -1,273 +1,12 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::Parser;
 use rxrpl::Wallet;
+use rxrpl_cli::{
+    Cli, Commands, LogLevel, MetricsExport, RunMode, default_metrics_url, prometheus_to_json,
+    resolve_run_mode,
+};
 use serde_json::Value;
-
-/// Log verbosity levels.
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum LogLevel {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
-
-impl std::fmt::Display for LogLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            LogLevel::Trace => "trace",
-            LogLevel::Debug => "debug",
-            LogLevel::Info => "info",
-            LogLevel::Warn => "warn",
-            LogLevel::Error => "error",
-        };
-        f.write_str(s)
-    }
-}
-
-#[derive(Parser)]
-#[command(
-    name = "rxrpl",
-    about = "XRPL node and client toolchain",
-    version,
-    long_about = "rxrpl -- a Rust implementation of the XRP Ledger protocol.\n\n\
-        Run a standalone or networked XRPL node, query ledger data,\n\
-        manage wallets, and submit transactions from the command line."
-)]
-struct Cli {
-    /// XRPL node URL for client commands
-    #[arg(long, default_value = "https://s1.ripple.com:51234")]
-    url: String,
-
-    /// Path to configuration file (TOML)
-    #[arg(short, long, global = true)]
-    config: Option<PathBuf>,
-
-    /// Log level
-    #[arg(short, long, global = true, default_value = "info", value_enum)]
-    log_level: LogLevel,
-
-    /// Data directory override
-    #[arg(short = 'D', long, global = true)]
-    data_dir: Option<PathBuf>,
-
-    #[command(subcommand)]
-    command: Commands,
-}
-
-/// Node run modes.
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum RunMode {
-    /// Standalone single-node mode (no P2P)
-    Standalone,
-    /// Networked mode with P2P overlay
-    Network,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Run an XRPL node (standalone or networked)
-    Run {
-        /// Node run mode
-        #[arg(short, long, default_value = "standalone", value_enum)]
-        mode: RunMode,
-
-        /// Genesis account address
-        #[arg(long, default_value = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")]
-        genesis_account: String,
-
-        /// Ledger close interval in seconds
-        #[arg(long, default_value = "10")]
-        close_interval: u64,
-
-        /// RPC server bind address (standalone mode)
-        #[arg(long, default_value = "127.0.0.1:5005")]
-        bind: String,
-
-        /// RPC URL of a trusted node to sync from (network mode)
-        #[arg(long)]
-        sync_rpc: Option<String>,
-
-        /// Path to the persistent node store (RocksDB). Implies
-        /// `backend = "rocksdb"` unless explicitly overridden in the config.
-        /// If unset, the configured backend (default: memory) is used.
-        #[arg(long)]
-        db_path: Option<PathBuf>,
-
-        /// Bootstrap from a checkpoint instead of replaying from genesis.
-        /// Accepts:
-        ///   - a sequence number (decimal, e.g. `90000000`)
-        ///   - a 64-char hex ledger hash
-        ///   - the literal `recent` to anchor at "tip - 1024"
-        /// Requires `validator_list_sites` + `validator_list_keys` to
-        /// establish a UNL-quorum trust anchor for the chosen ledger.
-        #[arg(long)]
-        starting_ledger: Option<String>,
-
-        /// Shorthand for --mode standalone
-        #[arg(long, conflicts_with = "network")]
-        standalone: bool,
-
-        /// Shorthand for --mode network
-        #[arg(long, conflicts_with = "standalone")]
-        network: bool,
-
-        /// Run in reporting mode (read-only, no consensus)
-        #[arg(long, conflicts_with_all = ["standalone", "network"])]
-        reporting: bool,
-    },
-
-    /// Print version information and exit
-    Version,
-
-    // -- Server Queries --
-    /// Get server info from an XRPL node
-    ServerInfo,
-
-    /// Get current fee info
-    Fee,
-
-    /// Get the latest validated ledger
-    LedgerClosed,
-
-    /// Get a ledger by index
-    Ledger {
-        /// Ledger index or shortcut (validated, current, closed)
-        index: String,
-    },
-
-    /// Subscribe to streams (WebSocket only)
-    Subscribe {
-        /// Streams to subscribe to (e.g., ledger, transactions)
-        #[arg(value_delimiter = ',')]
-        streams: Vec<String>,
-    },
-
-    // -- Account Queries --
-    /// Get account info
-    AccountInfo {
-        /// Account address (classic or X-address)
-        account: String,
-    },
-
-    /// Get account transaction history
-    AccountTx {
-        /// Account address
-        account: String,
-        /// Maximum number of transactions
-        #[arg(long, default_value = "10")]
-        limit: u32,
-    },
-
-    /// List NFTs for an account
-    AccountNfts {
-        /// Account address
-        account: String,
-    },
-
-    // -- Wallet --
-    /// Generate a new wallet keypair locally
-    WalletPropose {
-        /// Key type: ed25519 or secp256k1
-        #[arg(long, default_value = "ed25519")]
-        key_type: String,
-    },
-
-    // -- Transactions --
-    /// Submit a signed transaction blob
-    Submit {
-        /// Hex-encoded transaction blob
-        tx_blob: String,
-    },
-
-    /// Look up a transaction by hash
-    Tx {
-        /// Transaction hash
-        hash: String,
-    },
-
-    /// Sign a transaction from JSON (inline or @file)
-    Sign {
-        /// Secret seed (sXXX format)
-        #[arg(long)]
-        seed: String,
-        /// Transaction JSON (inline string or @path/to/file.json)
-        #[arg(long)]
-        tx: String,
-        /// Key type: ed25519 or secp256k1
-        #[arg(long, default_value = "ed25519")]
-        key_type: String,
-    },
-
-    /// Send an XRP payment (build, autofill, sign, submit)
-    Pay {
-        /// Sender secret seed (sXXX format)
-        #[arg(long)]
-        from: String,
-        /// Destination address (rXXX format)
-        #[arg(long)]
-        to: String,
-        /// Amount in drops
-        #[arg(long)]
-        amount: u64,
-        /// Fee in drops (auto-filled if omitted)
-        #[arg(long)]
-        fee: Option<String>,
-        /// Key type: ed25519 or secp256k1
-        #[arg(long, default_value = "ed25519")]
-        key_type: String,
-    },
-
-    /// Set a trust line (autofill, sign, submit)
-    TrustSet {
-        /// Sender secret seed (sXXX format)
-        #[arg(long)]
-        from: String,
-        /// Issuer address (rXXX format)
-        #[arg(long)]
-        issuer: String,
-        /// Currency code (e.g., USD)
-        #[arg(long)]
-        currency: String,
-        /// Trust line limit
-        #[arg(long)]
-        limit: String,
-        /// Fee in drops (auto-filled if omitted)
-        #[arg(long)]
-        fee: Option<String>,
-    },
-
-    /// Create an offer (autofill, sign, submit)
-    OfferCreate {
-        /// Sender secret seed (sXXX format)
-        #[arg(long)]
-        from: String,
-        /// What the taker gets: drops or value/currency/issuer
-        #[arg(long)]
-        taker_gets: String,
-        /// What the taker pays: drops or value/currency/issuer
-        #[arg(long)]
-        taker_pays: String,
-        /// Fee in drops (auto-filled if omitted)
-        #[arg(long)]
-        fee: Option<String>,
-    },
-
-    /// Delete an account (autofill, sign, submit)
-    AccountDelete {
-        /// Sender secret seed (sXXX format)
-        #[arg(long)]
-        from: String,
-        /// Destination for remaining XRP (rXXX format)
-        #[arg(long)]
-        destination: String,
-        /// Fee in drops (auto-filled if omitted)
-        #[arg(long)]
-        fee: Option<String>,
-    },
-}
 
 fn setup_logging(level: LogLevel) {
     use tracing_subscriber::EnvFilter;
@@ -316,17 +55,6 @@ fn parse_amount(s: &str) -> Result<Value, Box<dyn std::error::Error>> {
     }
 }
 
-/// Resolve the effective run mode from the `--mode`, `--standalone`, and `--network` flags.
-fn resolve_run_mode(mode: RunMode, standalone: bool, network: bool) -> RunMode {
-    if standalone {
-        RunMode::Standalone
-    } else if network {
-        RunMode::Network
-    } else {
-        mode
-    }
-}
-
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Version => {
@@ -361,7 +89,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(2)
                 })
                 .unwrap();
-            if let Some(s) = parsed_starting {
+            if let Some(s) = parsed_starting.as_ref() {
                 tracing::info!("checkpoint bootstrap requested: {:?}", s);
             }
             let mut config = if let Some(ref config_path) = cli.config {
@@ -397,10 +125,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     return cmd_node_run(config, &genesis_account, close_interval).await;
                 }
                 RunMode::Network => {
-                    // Only bootstrap from an external RPC when explicitly
-                    // requested via --sync-rpc. The default --url is for
-                    // client commands; nodes with fixed_peers can sync via
-                    // P2P alone (private/test networks like xrpl-hive).
                     return cmd_network_run(
                         config,
                         &genesis_account,
@@ -501,6 +225,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             return cmd_account_delete(&cli.url, &from, &destination, fee.as_deref()).await;
         }
 
+        // -- I-B3 operator commands --
+        Commands::Peers { json } => {
+            return cmd_peers(&cli.url, json).await;
+        }
+        Commands::Validators { json } => {
+            return cmd_validators(&cli.url, json).await;
+        }
+        Commands::Metrics { endpoint, export } => {
+            let target = endpoint.unwrap_or_else(|| default_metrics_url(&cli.url));
+            return cmd_metrics(&target, export).await;
+        }
+        Commands::ConfigValidate { path } => {
+            let resolved = path.or(cli.config.clone());
+            return cmd_config_validate(resolved.as_ref());
+        }
+
         _ => {}
     }
 
@@ -508,7 +248,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let client = rxrpl::ClientBuilder::new(&cli.url).build_http()?;
 
     let result: Value = match cli.command {
-        Commands::ServerInfo => client.server_info().await?,
+        Commands::ServerInfo { .. } => client.server_info().await?,
         Commands::AccountInfo { account } => client.account_info(&account).await?,
         Commands::AccountTx { account, limit } => client.account_tx(&account, Some(limit)).await?,
         Commands::Submit { tx_blob } => client.submit(&tx_blob).await?,
@@ -525,7 +265,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         | Commands::Pay { .. }
         | Commands::TrustSet { .. }
         | Commands::OfferCreate { .. }
-        | Commands::AccountDelete { .. } => unreachable!(),
+        | Commands::AccountDelete { .. }
+        | Commands::Peers { .. }
+        | Commands::Validators { .. }
+        | Commands::Metrics { .. }
+        | Commands::ConfigValidate { .. } => unreachable!(),
     };
 
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -653,7 +397,6 @@ async fn cmd_account_delete(
     autofill_sign_submit(url, &wallet, &mut tx_json).await
 }
 
-/// Shared autofill -> sign -> submit -> wait pipeline for transaction commands.
 async fn autofill_sign_submit(
     url: &str,
     wallet: &Wallet,
@@ -730,4 +473,85 @@ async fn cmd_reporting_run(
 
     node.run_reporting().await?;
     Ok(())
+}
+
+// -- I-B3 operator subcommand handlers --
+
+async fn cmd_peers(url: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let client = rxrpl::ClientBuilder::new(url).build_http()?;
+    let result: Value = client.request("peers", serde_json::json!({})).await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    let peers = result["peers"].as_array().cloned().unwrap_or_default();
+    let count = result["peer_count"].as_u64().unwrap_or(peers.len() as u64);
+    println!("peer_count: {count}");
+    if peers.is_empty() {
+        println!("(no peers connected)");
+        return Ok(());
+    }
+    println!("{:<40} {:<12} {:<10}", "address", "ledger", "state");
+    for p in peers {
+        let addr = p["address"].as_str().unwrap_or("-");
+        let ledger = p["ledger"].as_u64().unwrap_or(0);
+        let state = p["state"].as_str().unwrap_or("-");
+        println!("{addr:<40} {ledger:<12} {state:<10}");
+    }
+    Ok(())
+}
+
+async fn cmd_validators(url: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let client = rxrpl::ClientBuilder::new(url).build_http()?;
+    let result: Value = client.request("validators", serde_json::json!({})).await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    let quorum = result["validation_quorum"].as_u64().unwrap_or(0);
+    let trusted = result["trusted_validator_keys"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let publishers = result["publisher_lists"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    println!("validation_quorum:        {quorum}");
+    println!("trusted_validator_keys:   {trusted}");
+    println!("publisher_lists:          {publishers}");
+    Ok(())
+}
+
+async fn cmd_metrics(url: &str, export: MetricsExport) -> Result<(), Box<dyn std::error::Error>> {
+    let body = reqwest::get(url).await?.error_for_status()?.text().await?;
+    match export {
+        MetricsExport::Prometheus => {
+            print!("{body}");
+        }
+        MetricsExport::Json => {
+            let v = prometheus_to_json(&body);
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_config_validate(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let path = path.ok_or("no config path provided (use --config or pass a path)")?;
+    match rxrpl_config::load_config(path) {
+        Ok(cfg) => {
+            println!("OK: {}", path.display());
+            println!("  server.bind:       {}", cfg.server.bind);
+            println!("  peer.port:         {}", cfg.peer.port);
+            println!("  database.backend:  {}", cfg.database.backend);
+            println!("  network.id:        {}", cfg.network.network_id);
+            Ok(())
+        }
+        Err(e) => Err(format!("config invalid ({}): {e}", path.display()).into()),
+    }
 }
