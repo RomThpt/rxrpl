@@ -142,6 +142,17 @@ impl Transactor for AMMWithdrawTransactor {
         let lp_to_burn = lp_burned.min(total_lp);
         let new_lp = total_lp.saturating_sub(lp_to_burn);
 
+        // Debit the holder's LP-token RippleState. Burns LP balance; the
+        // line is left in place at zero (rippled keeps the trust line).
+        if lp_to_burn > 0 {
+            amm_helpers::adjust_lp_balance(
+                ctx.view,
+                &amm_key,
+                &account_id,
+                -(lp_to_burn as i128),
+            )?;
+        }
+
         // Auto-delete: when LPTokenBalance hits 0, remove the AMM entirely
         // (rippled behavior — AMMs with no liquidity are garbage-collected).
         if new_lp == 0 {

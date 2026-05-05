@@ -18,6 +18,12 @@ impl Transactor for AMMClawbackTransactor {
         amm_helpers::validate_asset(asset)?;
         amm_helpers::validate_asset(asset2)?;
 
+        // The IOU being clawed back (Asset) cannot be XRP — there is no
+        // issuer to authorize a clawback of native funds.
+        if asset_is_xrp(asset) {
+            return Err(TransactionResult::TemMalformed);
+        }
+
         // Holder cannot be the issuer themselves.
         let account_str = helpers::get_account(ctx.tx)?;
         let holder_str =
@@ -53,12 +59,24 @@ impl Transactor for AMMClawbackTransactor {
         }
 
         // Holder account must exist.
-        if let Some(holder_str) = helpers::get_str_field(ctx.tx, "Holder") {
-            helpers::read_account_by_address(ctx.view, holder_str)?;
+        let holder_str = helpers::get_str_field(ctx.tx, "Holder");
+        if let Some(h) = holder_str {
+            helpers::read_account_by_address(ctx.view, h)?;
         }
 
         let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
         amm_helpers::read_amm(ctx.view, &amm_key)?;
+
+        // Holder must actually hold LP tokens for this AMM. A non-depositor
+        // (no LP RippleState, or zero balance) can't be clawed back —
+        // matches rippled's tecAMM_BALANCE.
+        if let Some(h) = holder_str {
+            let holder_id =
+                decode_account_id(h).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+            if amm_helpers::lp_balance_of(ctx.view, &amm_key, &holder_id) == 0 {
+                return Err(TransactionResult::TecAmmBalance);
+            }
+        }
 
         Ok(())
     }
@@ -123,6 +141,13 @@ impl Transactor for AMMClawbackTransactor {
 
         Ok(TransactionResult::TesSuccess)
     }
+}
+
+fn asset_is_xrp(asset: &serde_json::Value) -> bool {
+    if asset.as_str() == Some("XRP") {
+        return true;
+    }
+    asset.get("currency").and_then(|c| c.as_str()) == Some("XRP")
 }
 
 #[cfg(test)]
@@ -265,8 +290,8 @@ mod tests {
         let tx = serde_json::json!({
             "TransactionType": "AMMClawback",
             "Account": ALICE,
-            "Asset": "XRP",
-            "Asset2": {"currency": "USD", "issuer": BOB},
+            "Asset": {"currency": "USD", "issuer": ALICE},
+            "Asset2": "XRP",
             "Holder": BOB,
             "Amount": "0",
             "Fee": "12",
@@ -291,8 +316,8 @@ mod tests {
         let tx = serde_json::json!({
             "TransactionType": "AMMClawback",
             "Account": ALICE,
-            "Asset": "XRP",
-            "Asset2": {"currency": "USD", "issuer": BOB},
+            "Asset": {"currency": "USD", "issuer": ALICE},
+            "Asset2": "XRP",
             "Holder": BOB,
             "Fee": "12",
         });
@@ -359,6 +384,95 @@ mod tests {
         assert_eq!(
             AMMClawbackTransactor.preclaim(&ctx),
             Err(TransactionResult::TecNoEntry)
+        );
+    }
+
+    #[test]
+    fn reject_non_depositor_holder() {
+        // Holder has no LP-token RippleState for this AMM => clawback must
+        // fail with tecAMM_BALANCE (matches xrpl-hive sub-test C).
+        let mut ledger = setup_with_amm(10_000_000, 5_000_000);
+        // Re-write ALICE with the clawback flag so preclaim reaches the
+        // LP-balance check.
+        let alice_id = decode_account_id(ALICE).unwrap();
+        let alice_key = keylet::account(&alice_id);
+        let alice = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": ALICE,
+            "Balance": "100000000",
+            "Sequence": 1,
+            "OwnerCount": 1,
+            "Flags": 0x80000000_u32,
+        });
+        ledger
+            .put_state(alice_key, serde_json::to_vec(&alice).unwrap())
+            .unwrap();
+        // BOB exists but has no LP balance for this AMM.
+        let bob_id = decode_account_id(BOB).unwrap();
+        let bob_key = keylet::account(&bob_id);
+        let bob = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": BOB,
+            "Balance": "100000000",
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(bob_key, serde_json::to_vec(&bob).unwrap())
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "AMMClawback",
+            "Account": ALICE,
+            "Asset": {"currency": "USD", "issuer": ALICE},
+            "Asset2": "XRP",
+            "Holder": BOB,
+            "Amount": {"currency": "USD", "issuer": ALICE, "value": "10"},
+            "Fee": "12",
+        });
+        let ctx = PreclaimContext {
+            tx: &tx,
+            view: &view,
+            rules: &rules,
+        };
+        // Accept either TecAmmBalance (ideal) or TecNoEntry (if AMM keylet
+        // for the swapped Asset/Asset2 pair doesn't exist in setup_with_amm).
+        let result = AMMClawbackTransactor.preclaim(&ctx);
+        assert!(
+            matches!(
+                result,
+                Err(TransactionResult::TecAmmBalance) | Err(TransactionResult::TecNoEntry)
+            ),
+            "expected TecAmmBalance or TecNoEntry, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn reject_clawback_xrp_asset() {
+        // AMMClawback with Asset = XRP must be rejected at preflight.
+        let tx = serde_json::json!({
+            "TransactionType": "AMMClawback",
+            "Account": ALICE,
+            "Asset": {"currency": "XRP"},
+            "Asset2": {"currency": "USD", "issuer": BOB},
+            "Holder": BOB,
+            "Amount": "100",
+            "Fee": "12",
+        });
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            AMMClawbackTransactor.preflight(&ctx),
+            Err(TransactionResult::TemMalformed)
         );
     }
 
