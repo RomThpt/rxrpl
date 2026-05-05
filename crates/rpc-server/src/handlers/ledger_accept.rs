@@ -3,11 +3,56 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use rxrpl_amendment::Rules;
+use rxrpl_codec::address::decode_account_id;
 use rxrpl_ledger::Ledger;
+use rxrpl_storage::TxStore;
 use rxrpl_txq::{FeeLevel, QueueEntry};
 
 use crate::context::ServerContext;
 use crate::error::RpcServerError;
+
+/// Index every transaction in a closed ledger into the tx store, plus
+/// per-account indexes (sender + destination). Mirrors the loop run by
+/// `Node::index_ledger_transactions` in the natural-close path so that
+/// `account_tx`/`tx` queries work in standalone (`ledger_accept`) mode too.
+fn index_closed_ledger(store: &dyn TxStore, ledger: &Ledger) {
+    let seq = ledger.header.sequence;
+    let mut tx_index = 0u32;
+
+    ledger.tx_map.for_each(&mut |tx_hash, data| {
+        if let Ok(record) = serde_json::from_slice::<Value>(data) {
+            let meta_blob =
+                serde_json::to_vec(record.get("meta").unwrap_or(&Value::Null)).unwrap_or_default();
+
+            if let Err(e) =
+                store.insert_transaction(tx_hash.as_bytes(), seq, tx_index, data, &meta_blob)
+            {
+                tracing::error!("failed to index tx {}: {}", tx_hash, e);
+            }
+
+            for field in ["Account", "Destination"] {
+                if let Some(addr) = record
+                    .get("tx_json")
+                    .and_then(|tj| tj.get(field))
+                    .and_then(|a| a.as_str())
+                {
+                    if let Ok(id) = decode_account_id(addr) {
+                        if let Err(e) = store.insert_account_transaction(
+                            id.as_bytes(),
+                            seq,
+                            tx_index,
+                            tx_hash.as_bytes(),
+                        ) {
+                            tracing::error!("failed to index account tx ({field}): {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        tx_index += 1;
+    });
+}
 
 /// Close the current ledger in standalone mode and open a new one.
 ///
@@ -78,6 +123,13 @@ pub async fn ledger_accept(
                 });
         }
     });
+
+    // Index transactions into the tx_store so account_tx/tx RPC queries
+    // can find them. The natural-close loop in node.rs does this; in
+    // standalone mode (ledger_accept-driven) we must do it here too.
+    if let Some(ref store) = ctx.tx_store {
+        index_closed_ledger(store.as_ref(), &closed_copy);
+    }
 
     {
         let mut closed_ledgers = closed_lock.write().await;

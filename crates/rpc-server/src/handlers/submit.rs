@@ -173,9 +173,21 @@ pub async fn submit(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
         }
     }
 
+    // Inject canonical tx hash into the returned tx_json so clients can read
+    // it without recomputing — matches rippled's submit response shape.
+    let mut tx_json_with_hash = tx_json;
+    if let Ok(tx_hash) = compute_tx_hash(&tx_json_with_hash) {
+        if let Some(obj) = tx_json_with_hash.as_object_mut() {
+            obj.insert(
+                "hash".into(),
+                serde_json::Value::String(tx_hash.to_string()),
+            );
+        }
+    }
+
     Ok(serde_json::json!({
         "engine_result": result.to_string(),
         "engine_result_code": result.code(),
-        "tx_json": tx_json,
+        "tx_json": tx_json_with_hash,
     }))
 }
