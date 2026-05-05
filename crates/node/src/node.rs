@@ -1471,6 +1471,13 @@ impl Node {
                                     "validation from {:?} for ledger #{} hash={}",
                                     validation.node_id, val_seq, val_hash
                                 );
+
+                                // Plumb the validation into the consensus
+                                // engine's negative-UNL tracker (C-B6).
+                                Node::record_validation_into_engine(
+                                    &mut consensus,
+                                    &validation,
+                                );
                                 let _ = event_tx.send(ServerEvent::ValidationReceived {
                                     validator: validation.node_id.0.to_string(),
                                     ledger_hash: val_hash.to_string(),
@@ -2429,6 +2436,22 @@ impl Node {
 
         // Return updated rules after any activations
         amendment_table.build_rules()
+    }
+
+    /// Forward a received `Validation` message into the consensus engine's
+    /// negative-UNL tracker.
+    ///
+    /// This is the single plumbing point connecting the overlay validation
+    /// stream (produced by `PeerManager` and surfaced via
+    /// `ConsensusMessage::Validation`) to the engine's
+    /// [`ConsensusEngine::record_validation`]. Only validators that have been
+    /// previously registered via `register_validators` accumulate counts; all
+    /// other ids are silently ignored by the tracker.
+    pub fn record_validation_into_engine<A: rxrpl_consensus::ConsensusAdapter>(
+        consensus: &mut ConsensusEngine<A>,
+        validation: &rxrpl_consensus::types::Validation,
+    ) {
+        consensus.record_validation(validation.node_id);
     }
 
     /// Apply negative-UNL pseudo-transactions on a flag ledger.
