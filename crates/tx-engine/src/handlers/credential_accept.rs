@@ -39,11 +39,22 @@ impl Transactor for CredentialAcceptTransactor {
         let entry: serde_json::Value =
             serde_json::from_slice(&entry_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        if entry
+        // The `Accepted` boolean is dropped on round-trip through the XRPL
+        // binary SLE codec (Credential entries persist acceptance via the
+        // lsfAccepted flag, 0x00010000). Check both so the duplicate guard
+        // fires whether the entry was just written by this handler or read
+        // back from the ledger after binary encoding.
+        const LSF_ACCEPTED: u32 = 0x00010000;
+        let accepted_field = entry
             .get("Accepted")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        let accepted_flag = entry
+            .get("Flags")
+            .and_then(|v| v.as_u64())
+            .map(|f| (f as u32) & LSF_ACCEPTED != 0)
+            .unwrap_or(false);
+        if accepted_field || accepted_flag {
             return Err(TransactionResult::TecDuplicate);
         }
 
@@ -235,6 +246,64 @@ mod tests {
     #[test]
     fn preclaim_already_accepted() {
         let ledger = setup_with_credential(true);
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let rules = Rules::new();
+
+        let tx = serde_json::json!({
+            "TransactionType": "CredentialAccept",
+            "Account": BOB,
+            "Issuer": ALICE,
+            "CredentialType": "KYC",
+            "Fee": "12",
+        });
+        let ctx = PreclaimContext {
+            tx: &tx,
+            view: &view,
+            rules: &rules,
+        };
+        assert_eq!(
+            CredentialAcceptTransactor.preclaim(&ctx),
+            Err(TransactionResult::TecDuplicate)
+        );
+    }
+
+    #[test]
+    fn preclaim_already_accepted_via_flag_only() {
+        // After binary SLE round-trip, the `Accepted` field is dropped and
+        // only the lsfAccepted flag (0x00010000) survives. The duplicate
+        // guard must fire on the flag alone.
+        let mut ledger = Ledger::genesis();
+        for (addr, balance) in [(ALICE, 100_000_000u64), (BOB, 50_000_000)] {
+            let id = decode_account_id(addr).unwrap();
+            let key = keylet::account(&id);
+            let account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot",
+                "Account": addr,
+                "Balance": balance.to_string(),
+                "Sequence": 1,
+                "OwnerCount": 0,
+                "Flags": 0,
+            });
+            ledger
+                .put_state(key, serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        let alice_id = decode_account_id(ALICE).unwrap();
+        let bob_id = decode_account_id(BOB).unwrap();
+        let cred_key = keylet::credential(&bob_id, &alice_id, b"KYC");
+        // Note: no "Accepted" key — only Flags carries the accepted state.
+        let entry = serde_json::json!({
+            "LedgerEntryType": "Credential",
+            "Subject": BOB,
+            "Issuer": ALICE,
+            "CredentialType": "KYC",
+            "Flags": 0x00010000u32,
+        });
+        ledger
+            .put_state(cred_key, serde_json::to_vec(&entry).unwrap())
+            .unwrap();
+
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let rules = Rules::new();
