@@ -1,0 +1,48 @@
+[Unit]
+Description=rxrpl XRPL validator node
+Documentation=https://github.com/xrpl-commons/rxrpl
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rxrpl
+Group=rxrpl
+ExecStart=/usr/local/bin/rxrpl run --config /etc/rxrpl/config.toml
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+# Graceful shutdown: rxrpl traps SIGTERM and drains in-flight work.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30s
+
+# Resource limits (tune for hardware).
+LimitNOFILE=65536
+MemoryMax=8G
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/rxrpl /var/log/rxrpl
+
+# Allow binding to privileged ports if you remap RPC/peer to <1024.
+# Drop this if you stay on 5005/51235.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

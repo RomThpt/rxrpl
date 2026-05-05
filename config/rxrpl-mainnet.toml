@@ -1,0 +1,54 @@
+# rxrpl mainnet node configuration template
+#
+# Copy to /etc/rxrpl/config.toml and tune for your environment.
+# All fields are optional and fall back to defaults; see docs/CONFIG.md.
+
+[server]
+# RPC / WebSocket bind address. Bind to a private interface in production
+# and front with a reverse proxy if you need TLS termination.
+bind = "127.0.0.1:5005"
+# Source IPs allowed to invoke admin RPC methods (e.g. can_delete).
+admin_ips = ["127.0.0.1"]
+
+[peer]
+# Public peer-protocol listen port (open this in your firewall).
+port = 51235
+# Soft cap on inbound + outbound peer connections.
+max_peers = 21
+# Bootstrap seeds (DNS resolved at startup).
+seeds = [
+    "r.ripple.com:51235",
+    "s1.ripple.com:51235",
+    "s2.ripple.com:51235",
+]
+# Always-connected peers (cluster, your own infra, etc.).
+fixed_peers = []
+# Optional 32-hex deterministic identity. Omit for a random identity.
+# node_seed = "0123456789abcdef0123456789abcdef"
+# TLS for the peer protocol. Required to interop with rippled mainnet.
+tls_enabled = true
+
+[database]
+# Persistent data directory. Must be writable by the rxrpl user.
+path = "/var/lib/rxrpl/data"
+# Persistent backend. Use "rocksdb" for mainnet; "memory" is dev-only.
+backend = "rocksdb"
+# Number of recent ledgers to retain. 0 disables pruning.
+online_delete = 2000
+# When true, pruning only runs after the can_delete admin RPC.
+advisory_delete = false
+
+[validators]
+# Set to true only if this node signs validations.
+enabled = false
+# Trusted validator public keys (node-pub format). Leave empty to rely on
+# validator_list_sites + validator_list_keys (recommended).
+trusted = []
+# UNL publisher endpoints (HTTPS).
+validator_list_sites = []
+# UNL publisher signing keys.
+validator_list_keys = []
+
+[network]
+# 0 = mainnet, 1 = testnet, 21337 = devnet, etc.
+network_id = 0

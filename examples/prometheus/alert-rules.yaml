@@ -1,0 +1,146 @@
+groups:
+  - name: rxrpl.health
+    interval: 30s
+    rules:
+      - alert: RxrplPeerCountLow
+        expr: p2p_peers_connected < 4
+        for: 5m
+        labels:
+          severity: warning
+          component: p2p
+        annotations:
+          summary: "rxrpl peer count low ({{ $value }} peers)"
+          description: |
+            p2p_peers_connected has been below 4 for 5 minutes on
+            {{ $labels.instance }}. Check firewall, peer_list, and network_id.
+            See docs/RUNBOOK.md section 3.1.
+
+      - alert: RxrplPeerCountCritical
+        expr: p2p_peers_connected < 1
+        for: 2m
+        labels:
+          severity: critical
+          component: p2p
+        annotations:
+          summary: "rxrpl has no connected peers"
+          description: |
+            Node is isolated for over 2 minutes. Ledger progression will halt.
+            Investigate immediately.
+
+      - alert: RxrplLedgerStalled
+        expr: increase(ledger_sequence[5m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: consensus
+        annotations:
+          summary: "rxrpl ledger sequence is not advancing"
+          description: |
+            ledger_sequence has not changed for 5 minutes. Consensus may be
+            stalled or the node is severely behind. See docs/RUNBOOK.md 3.2.
+
+      - alert: RxrplConsensusStalls
+        expr: increase(consensus_stalls_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: consensus
+        annotations:
+          summary: "rxrpl consensus stalls detected"
+          description: |
+            {{ $value }} consensus stall(s) in the last 10 minutes on
+            {{ $labels.instance }}. Investigate before this becomes critical.
+
+      - alert: RxrplLedgerCloseSlow
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, instance) (rate(ledger_close_duration_seconds_bucket[5m]))
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+          component: consensus
+        annotations:
+          summary: "rxrpl ledger close p95 > 5s"
+          description: |
+            p95 ledger close duration is {{ $value }}s on {{ $labels.instance }}.
+            Check disk IO and CPU saturation.
+
+  - name: rxrpl.txq
+    interval: 30s
+    rules:
+      - alert: RxrplTxqSaturated
+        expr: txq_size > 0 and (txq_size / on(instance) txq_size offset 5m) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          component: txq
+        annotations:
+          summary: "rxrpl transaction queue near capacity"
+          description: |
+            txq_size on {{ $labels.instance }} is sustained at high level.
+            See docs/RUNBOOK.md 3.3.
+
+      - alert: RxrplTxqRejectionsHigh
+        expr: rate(txq_rejected_full_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+          component: txq
+        annotations:
+          summary: "rxrpl rejecting transactions due to full queue"
+          description: |
+            {{ $value }} rejections/sec over the last 5 minutes.
+
+  - name: rxrpl.rpc
+    interval: 30s
+    rules:
+      - alert: RxrplRpcErrorRate
+        expr: |
+          sum by (instance) (rate(rpc_errors_total[5m]))
+            /
+          sum by (instance) (rate(rpc_requests_total[5m]))
+            > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          component: rpc
+        annotations:
+          summary: "rxrpl RPC error rate above 5%"
+          description: |
+            RPC error rate is {{ $value | humanizePercentage }} on
+            {{ $labels.instance }}.
+
+      - alert: RxrplRpcLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, instance) (rate(rpc_request_duration_seconds_bucket[5m]))
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+          component: rpc
+        annotations:
+          summary: "rxrpl RPC p95 latency above 1s"
+          description: |
+            p95 latency is {{ $value }}s on {{ $labels.instance }}.
+
+  - name: rxrpl.storage
+    interval: 1m
+    rules:
+      - alert: RxrplNodestoreCacheMissRateHigh
+        expr: |
+          sum by (instance) (rate(nodestore_cache_misses_total[10m]))
+            /
+          (sum by (instance) (rate(nodestore_cache_hits_total[10m]))
+            + sum by (instance) (rate(nodestore_cache_misses_total[10m])))
+            > 0.3
+        for: 30m
+        labels:
+          severity: info
+          component: storage
+        annotations:
+          summary: "rxrpl nodestore cache miss rate > 30%"
+          description: |
+            Sustained cache miss rate suggests cache is undersized. Consider
+            raising database.cache_mb. See docs/RUNBOOK.md section 6.

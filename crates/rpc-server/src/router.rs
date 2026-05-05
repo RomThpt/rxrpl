@@ -69,6 +69,7 @@ async fn dispatch_inner(
         "ledger_entry" => handlers::ledger_entry(params, ctx).await,
         "ledger_data" => handlers::ledger_data(params, ctx).await,
         "ledger_header" => handlers::ledger_header(params, ctx).await,
+        "ledger_info" => handlers::ledger_info(params, ctx).await,
         "ledger_range" => handlers::ledger_range(params, ctx).await,
         "ledger_request" => handlers::ledger_request(params, ctx).await,
 

@@ -1,0 +1,32 @@
+# rxrpl standalone-mode configuration template
+#
+# Single node, no P2P, in-memory backend. Intended for local development,
+# tests, and reproducible scenarios. Run with:
+#
+#     rxrpl run --config config/rxrpl-standalone.toml --standalone
+
+[server]
+bind = "127.0.0.1:5005"
+admin_ips = ["127.0.0.1"]
+
+[peer]
+# Standalone disables peer networking; the port is unused.
+port = 51235
+max_peers = 0
+seeds = []
+fixed_peers = []
+tls_enabled = false
+
+[database]
+path = "data"
+backend = "memory"
+# Keep all history (no pruning) for deterministic dev workflows.
+online_delete = 0
+
+[validators]
+enabled = false
+trusted = []
+
+[network]
+# Local-only sandbox; pick any non-zero ID to avoid colliding with mainnet.
+network_id = 63456

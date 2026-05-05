@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "rxrpl_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rxrpl"
 path = "src/main.rs"
@@ -24,3 +28,4 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 serde_json = { workspace = true }
 hex = { workspace = true }
 toml = "0.8"
+reqwest = { workspace = true }

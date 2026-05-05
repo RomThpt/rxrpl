@@ -1,0 +1,186 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 38,
+  "tags": ["rxrpl", "xrpl"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "selected": false, "text": "Prometheus", "value": "Prometheus" }
+      },
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(p2p_peers_connected, instance)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "rxrpl Node Overview",
+  "uid": "rxrpl-overview",
+  "version": 1,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Connected peers",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "p2p_peers_connected{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0 }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Ledger sequence",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 0 },
+      "targets": [
+        {
+          "expr": "ledger_sequence{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "id": 3,
+      "title": "Ledger close p50/p95",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, instance) (rate(ledger_close_duration_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p50 {{instance}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, instance) (rate(ledger_close_duration_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p95 {{instance}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 4,
+      "title": "TXQ size and escalated fee",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 7 },
+      "targets": [
+        {
+          "expr": "txq_size{instance=~\"$instance\"}",
+          "legendFormat": "size {{instance}}"
+        },
+        {
+          "expr": "txq_escalated_fee_drops{instance=~\"$instance\"}",
+          "legendFormat": "fee drops {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Transactions queued vs dequeued (rate)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 7 },
+      "targets": [
+        {
+          "expr": "rate(txq_queued_total{instance=~\"$instance\"}[5m])",
+          "legendFormat": "queued {{instance}}"
+        },
+        {
+          "expr": "rate(txq_dequeued_total{instance=~\"$instance\"}[5m])",
+          "legendFormat": "dequeued {{instance}}"
+        },
+        {
+          "expr": "rate(txq_rejected_full_total{instance=~\"$instance\"}[5m])",
+          "legendFormat": "rejected (full) {{instance}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "id": 6,
+      "title": "Consensus rounds and stalls",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        {
+          "expr": "rate(consensus_rounds_total{instance=~\"$instance\"}[5m])",
+          "legendFormat": "rounds/s {{instance}}"
+        },
+        {
+          "expr": "increase(consensus_stalls_total{instance=~\"$instance\"}[5m])",
+          "legendFormat": "stalls (5m) {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "RPC throughput and error rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 14 },
+      "targets": [
+        {
+          "expr": "sum by (instance) (rate(rpc_requests_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "req/s {{instance}}"
+        },
+        {
+          "expr": "sum by (instance) (rate(rpc_errors_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "err/s {{instance}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "id": 8,
+      "title": "RPC latency p95 by method",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 21 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, method) (rate(rpc_request_duration_seconds_bucket{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "{{method}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 9,
+      "title": "Nodestore cache hit ratio",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 21 },
+      "targets": [
+        {
+          "expr": "sum by (instance) (rate(nodestore_cache_hits_total{instance=~\"$instance\"}[5m])) / (sum by (instance) (rate(nodestore_cache_hits_total{instance=~\"$instance\"}[5m])) + sum by (instance) (rate(nodestore_cache_misses_total{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "hit ratio {{instance}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } }
+    }
+  ]
+}

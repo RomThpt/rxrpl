@@ -346,3 +346,79 @@ async fn validators_returns_empty_domains_when_unattached() {
         .unwrap();
     assert_eq!(result["validator_domains"], json!([]));
 }
+
+// -- peers handler tests --
+
+#[tokio::test]
+async fn peers_returns_shape() {
+    let ctx = test_ctx_with_ledger();
+    let params = json!({});
+
+    let result = rxrpl_rpc_server::handlers::peers(params, &ctx)
+        .await
+        .unwrap();
+
+    // Required fields per rippled `peers` response contract.
+    assert!(result["peers"].is_array(), "peers must be an array");
+    assert!(
+        result["peer_count"].is_u64() || result["peer_count"].is_number(),
+        "peer_count must be numeric"
+    );
+}
+
+// -- validators handler tests --
+
+#[tokio::test]
+async fn validators_returns_shape() {
+    let ctx = test_ctx_with_ledger();
+    let params = json!({});
+
+    let result = rxrpl_rpc_server::handlers::validators(params, &ctx)
+        .await
+        .unwrap();
+
+    // Required fields per rippled `validators` response contract.
+    assert!(result["validation_quorum"].is_number());
+    assert!(result["trusted_validator_keys"].is_array());
+    assert!(result["publisher_lists"].is_array());
+    // New: surface the configured quorum status block.
+    assert!(result["validator_list"].is_object());
+}
+
+// -- ledger_info handler tests --
+
+#[tokio::test]
+async fn ledger_info_returns_age_and_txn_count() {
+    let ctx = test_ctx_with_ledger();
+    let params = json!({});
+
+    let result = rxrpl_rpc_server::handlers::ledger_info(params, &ctx)
+        .await
+        .unwrap();
+
+    assert!(result["ledger"].is_object());
+    let l = &result["ledger"];
+    assert_eq!(l["ledger_index"], 2);
+    assert!(l["ledger_hash"].is_string());
+    assert!(l["parent_hash"].is_string());
+    assert!(l["age_seconds"].is_number(), "must report age_seconds");
+    assert!(
+        l["transaction_count"].is_number(),
+        "must report transaction_count"
+    );
+    assert!(l["closed"].is_boolean());
+}
+
+#[tokio::test]
+async fn ledger_info_validated_variant() {
+    let ctx = test_ctx_with_ledger();
+    let params = json!({ "ledger_index": "validated" });
+
+    let result = rxrpl_rpc_server::handlers::ledger_info(params, &ctx)
+        .await
+        .unwrap();
+
+    let l = &result["ledger"];
+    assert_eq!(l["ledger_index"], 1);
+    assert_eq!(l["closed"], true);
+}
