@@ -145,8 +145,8 @@ async fn tls_session_cookie_deterministic() {
 #[tokio::test]
 async fn http_handshake_with_ledger_hash() {
     use rxrpl_overlay::handshake;
-    use tokio_util::codec::Framed;
     use rxrpl_p2p_proto::codec::PeerCodec;
+    use tokio_util::codec::Framed;
 
     let network_id = 42;
     let ledger_hash = Hash256::new([0xDD; 32]);
@@ -174,9 +174,17 @@ async fn http_handshake_with_ledger_hash() {
     let client_result =
         handshake::handshake_outbound_http(stream, &id_client, network_id, 5, &ledger_hash).await;
 
-    assert!(client_result.is_ok(), "client handshake failed: {:?}", client_result.err());
+    assert!(
+        client_result.is_ok(),
+        "client handshake failed: {:?}",
+        client_result.err()
+    );
     let server_result = server_handle.await.unwrap();
-    assert!(server_result.is_ok(), "server handshake failed: {:?}", server_result.err());
+    assert!(
+        server_result.is_ok(),
+        "server handshake failed: {:?}",
+        server_result.err()
+    );
 
     let (client_peer_id, _, _) = client_result.unwrap();
     let (server_peer_id, _, _) = server_result.unwrap();

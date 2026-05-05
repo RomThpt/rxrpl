@@ -316,7 +316,9 @@ impl LedgerSyncer {
                 }
                 // Replace when the active sync is stuck (zero-add rounds).
                 // Don't replace during active progress to avoid thrashing.
-                let zero_rounds = self.incremental.get(&active_seq)
+                let zero_rounds = self
+                    .incremental
+                    .get(&active_seq)
                     .map(|e| e.zero_rounds)
                     .unwrap_or(0);
                 if zero_rounds < 8 {
@@ -324,7 +326,9 @@ impl LedgerSyncer {
                 }
                 tracing::info!(
                     "replacing stale sync #{} (round {}) with #{}",
-                    active_seq, zero_rounds, seq
+                    active_seq,
+                    zero_rounds,
+                    seq
                 );
                 self.incremental.clear();
             }
@@ -364,11 +368,7 @@ impl LedgerSyncer {
     ///   should be retried via TMGetObjectByHash with content hashes.
     /// - `Continue` if the sync is still in progress.
     /// - `Removed` if the sync was abandoned or not found.
-    pub fn feed_nodes(
-        &mut self,
-        seq: u32,
-        nodes: &[(Vec<u8>, Vec<u8>)],
-    ) -> FeedResult {
+    pub fn feed_nodes(&mut self, seq: u32, nodes: &[(Vec<u8>, Vec<u8>)]) -> FeedResult {
         let entry = match self.incremental.get_mut(&seq) {
             Some(e) => e,
             None => return FeedResult::Removed,
@@ -382,24 +382,26 @@ impl LedgerSyncer {
 
             tracing::debug!(
                 "feed_nodes #{}: computed hash={} storage_size={} wire_size={}",
-                seq, hash, storage_bytes.len(), node_data.len()
+                seq,
+                hash,
+                storage_bytes.len(),
+                node_data.len()
             );
 
             match entry.map.add_raw_node(hash, storage_bytes) {
                 Ok(true) => added += 1,
                 Ok(false) => {}
                 Err(e) => {
-                    tracing::debug!(
-                        "feed_nodes #{}: failed to add node {}: {}",
-                        seq, hash, e
-                    );
+                    tracing::debug!("feed_nodes #{}: failed to add node {}: {}", seq, hash, e);
                 }
             }
         }
 
         tracing::debug!(
             "feed_nodes #{}: added {} new nodes out of {} received",
-            seq, added, nodes.len()
+            seq,
+            added,
+            nodes.len()
         );
 
         if added > 0 {
@@ -413,7 +415,9 @@ impl LedgerSyncer {
             if let Err(e) = entry.map.reload_root(entry.hash) {
                 tracing::warn!(
                     "feed_nodes #{}: reload_root({}) failed: {}",
-                    seq, entry.hash, e
+                    seq,
+                    entry.hash,
+                    e
                 );
             }
         } else {
@@ -421,7 +425,8 @@ impl LedgerSyncer {
             if entry.zero_rounds > 20 {
                 tracing::warn!(
                     "incremental sync for ledger #{} stuck ({} consecutive zero-add rounds), removing",
-                    seq, entry.zero_rounds
+                    seq,
+                    entry.zero_rounds
                 );
                 self.incremental.remove(&seq);
                 return FeedResult::Removed;
@@ -429,16 +434,19 @@ impl LedgerSyncer {
 
             // After HASH_FALLBACK_THRESHOLD zero-add rounds, signal a fallback
             // to TMGetObjectByHash using content hashes instead of SHAMap node IDs.
-            if entry.zero_rounds >= HASH_FALLBACK_THRESHOLD && entry.zero_rounds % HASH_FALLBACK_THRESHOLD == 0 {
+            if entry.zero_rounds >= HASH_FALLBACK_THRESHOLD
+                && entry.zero_rounds % HASH_FALLBACK_THRESHOLD == 0
+            {
                 let missing = entry
                     .map
                     .missing_nodes(entry.hash, MAX_DELTA_NODES_PER_REQUEST);
                 if !missing.is_empty() {
-                    let content_hashes: Vec<Hash256> =
-                        missing.iter().map(|mn| mn.hash).collect();
+                    let content_hashes: Vec<Hash256> = missing.iter().map(|mn| mn.hash).collect();
                     tracing::info!(
                         "sync #{} stuck for {} zero-add rounds, falling back to hash-based fetch ({} hashes)",
-                        seq, entry.zero_rounds, content_hashes.len()
+                        seq,
+                        entry.zero_rounds,
+                        content_hashes.len()
                     );
                     return FeedResult::FallbackToHashFetch(content_hashes);
                 }
@@ -566,8 +574,7 @@ mod tests {
         let (hash, storage) = decode_wire_node(&wire).expect("decode");
         assert_eq!(storage.len(), 16 * 32);
         assert_eq!(storage, payload);
-        let expected_hash =
-            rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &payload]);
+        let expected_hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &payload]);
         assert_eq!(hash, expected_hash);
     }
 
@@ -596,8 +603,7 @@ mod tests {
         assert_eq!(&storage[5 * 32..6 * 32], &h5);
         // branch 6..16 zero
         assert!(storage[6 * 32..].iter().all(|&b| b == 0));
-        let expected =
-            rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &storage]);
+        let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &storage]);
         assert_eq!(hash, expected);
     }
 
@@ -614,8 +620,7 @@ mod tests {
         assert_eq!(&storage[..32], &key);
         assert_eq!(&storage[32..], &data[..]);
         // Hash uses rippled order (data || key)
-        let expected =
-            rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_LEAF, &data, &key]);
+        let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_LEAF, &data, &key]);
         assert_eq!(hash, expected);
     }
 
@@ -630,8 +635,7 @@ mod tests {
         let (hash, storage) = decode_wire_node(&wire).expect("decode");
         assert_eq!(&storage[..32], &key);
         assert_eq!(&storage[32..], &data[..]);
-        let expected =
-            rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_NODE, &data, &key]);
+        let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_NODE, &data, &key]);
         assert_eq!(hash, expected);
     }
 
@@ -642,8 +646,7 @@ mod tests {
         wire.push(WIRE_TYPE_TRANSACTION);
 
         let (hash, storage) = decode_wire_node(&wire).expect("decode");
-        let expected_key =
-            rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_ID, &data]);
+        let expected_key = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_ID, &data]);
         // Hash IS the tx hash
         assert_eq!(hash, expected_key);
         // Storage = key || data

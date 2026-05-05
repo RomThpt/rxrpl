@@ -10,9 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use rxrpl_config::NodeConfig;
 use rxrpl_consensus::types::{NodeId, Proposal, TxSet, Validation};
-use rxrpl_consensus::{
-    ConsensusAdapter, ConsensusEngine, ConsensusParams, TrustedValidatorList,
-};
+use rxrpl_consensus::{ConsensusAdapter, ConsensusEngine, ConsensusParams, TrustedValidatorList};
 use rxrpl_ledger::sle_codec;
 use rxrpl_node::Node;
 use rxrpl_primitives::Hash256;
@@ -85,10 +83,7 @@ fn e2e_negative_unl_generates_and_applies_pseudo_txs() {
     for i in 1..=256u32 {
         for j in 1..=5u8 {
             if j != 5 || i % 4 == 0 {
-                Node::record_validation_into_engine(
-                    &mut consensus,
-                    &make_validation(j, i),
-                );
+                Node::record_validation_into_engine(&mut consensus, &make_validation(j, i));
             }
         }
         consensus.on_ledger_close_for_tracker();
@@ -104,8 +99,14 @@ fn e2e_negative_unl_generates_and_applies_pseudo_txs() {
         256,
     );
 
-    assert!(!results.is_empty(), "flag ledger must produce at least one pseudo-tx");
-    assert!(results[0].is_success(), "UNLModify pseudo-tx must apply successfully");
+    assert!(
+        !results.is_empty(),
+        "flag ledger must produce at least one pseudo-tx"
+    );
+    assert!(
+        results[0].is_success(),
+        "UNLModify pseudo-tx must apply successfully"
+    );
 
     // NegativeUNL ledger entry exists and lists validator 5.
     let nunl_data = ledger
@@ -114,7 +115,11 @@ fn e2e_negative_unl_generates_and_applies_pseudo_txs() {
     let nunl: Value = sle_codec::decode_state(nunl_data).unwrap();
     assert_eq!(nunl["LedgerEntryType"], "NegativeUNL");
     let disabled = nunl["DisabledValidators"].as_array().unwrap();
-    assert_eq!(disabled.len(), 1, "validator 5 must be the sole demoted entry");
+    assert_eq!(
+        disabled.len(),
+        1,
+        "validator 5 must be the sole demoted entry"
+    );
     let key5 = keys.get(&nid(5)).unwrap();
     assert_eq!(disabled[0]["PublicKey"].as_str().unwrap(), key5);
 
@@ -128,11 +133,5 @@ fn e2e_negative_unl_generates_and_applies_pseudo_txs() {
         .get_state(&keylet::negative_unl())
         .expect("NegativeUNL must survive ledger close in the e2e flow");
     let reloaded: Value = sle_codec::decode_state(after_close).unwrap();
-    assert_eq!(
-        reloaded["DisabledValidators"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1,
-    );
+    assert_eq!(reloaded["DisabledValidators"].as_array().unwrap().len(), 1,);
 }

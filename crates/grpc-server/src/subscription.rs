@@ -32,13 +32,19 @@ impl XrplSubscription for XrplSubscriptionService {
 
         if !req.streams.is_empty() {
             params["streams"] = serde_json::Value::Array(
-                req.streams.iter().map(|s| serde_json::Value::String(s.clone())).collect(),
+                req.streams
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
             );
         }
 
         if !req.accounts.is_empty() {
             params["accounts"] = serde_json::Value::Array(
-                req.accounts.iter().map(|a| serde_json::Value::String(a.clone())).collect(),
+                req.accounts
+                    .iter()
+                    .map(|a| serde_json::Value::String(a.clone()))
+                    .collect(),
             );
         }
 
@@ -59,8 +65,7 @@ impl XrplSubscription for XrplSubscriptionService {
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         // Subscribe to the event broadcast channel
-        let mut event_rx: broadcast::Receiver<ServerEvent> =
-            self.ctx.event_sender().subscribe();
+        let mut event_rx: broadcast::Receiver<ServerEvent> = self.ctx.event_sender().subscribe();
 
         let (tx, rx) = tokio::sync::mpsc::channel(256);
 

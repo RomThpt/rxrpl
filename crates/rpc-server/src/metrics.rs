@@ -317,10 +317,7 @@ pub fn describe_metrics() {
     describe_counter!(RPC_ERRORS_TOTAL, "Total RPC errors by method and type");
 
     // Consensus
-    describe_counter!(
-        CONSENSUS_ROUNDS_TOTAL,
-        "Total consensus rounds completed"
-    );
+    describe_counter!(CONSENSUS_ROUNDS_TOTAL, "Total consensus rounds completed");
     describe_histogram!(
         CONSENSUS_ROUND_DURATION_SECONDS,
         "Consensus round duration in seconds"
@@ -337,10 +334,7 @@ pub fn describe_metrics() {
         CONSENSUS_VALIDATIONS_RECEIVED_TOTAL,
         "Total validations received"
     );
-    describe_counter!(
-        CONSENSUS_VALIDATIONS_SENT_TOTAL,
-        "Total validations sent"
-    );
+    describe_counter!(CONSENSUS_VALIDATIONS_SENT_TOTAL, "Total validations sent");
     describe_counter!(
         CONSENSUS_STALLS_TOTAL,
         "Total consensus stalls (max rounds exceeded)"
@@ -348,19 +342,13 @@ pub fn describe_metrics() {
 
     // P2P
     describe_gauge!(P2P_PEERS_CONNECTED, "Current number of connected peers");
-    describe_counter!(
-        P2P_MESSAGES_SENT_TOTAL,
-        "Total P2P messages sent by type"
-    );
+    describe_counter!(P2P_MESSAGES_SENT_TOTAL, "Total P2P messages sent by type");
     describe_counter!(
         P2P_MESSAGES_RECEIVED_TOTAL,
         "Total P2P messages received by type"
     );
     describe_counter!(P2P_BYTES_SENT_TOTAL, "Total bytes sent to peers");
-    describe_counter!(
-        P2P_BYTES_RECEIVED_TOTAL,
-        "Total bytes received from peers"
-    );
+    describe_counter!(P2P_BYTES_RECEIVED_TOTAL, "Total bytes received from peers");
     describe_counter!(P2P_DISCONNECTS_TOTAL, "Total peer disconnections");
     describe_histogram!(
         P2P_PEER_SCORE,
@@ -386,10 +374,7 @@ pub fn describe_metrics() {
         TXQ_REJECTED_DUPLICATE_TOTAL,
         "Total duplicate transaction submissions"
     );
-    describe_gauge!(
-        TXQ_ESCALATED_FEE_DROPS,
-        "Current escalated fee in drops"
-    );
+    describe_gauge!(TXQ_ESCALATED_FEE_DROPS, "Current escalated fee in drops");
 
     // Ledger
     describe_gauge!(LEDGER_SEQUENCE, "Current ledger sequence number");
@@ -420,10 +405,7 @@ pub fn describe_metrics() {
 
     // NodeStore
     describe_counter!(NODESTORE_READS_TOTAL, "Total node store read operations");
-    describe_counter!(
-        NODESTORE_WRITES_TOTAL,
-        "Total node store write operations"
-    );
+    describe_counter!(NODESTORE_WRITES_TOTAL, "Total node store write operations");
     describe_counter!(
         NODESTORE_CACHE_HITS_TOTAL,
         "Total node store positive cache hits"
@@ -509,12 +491,10 @@ mod tests {
         ];
 
         for name in all_names {
+            assert!(!name.is_empty(), "metric name must not be empty");
             assert!(
-                !name.is_empty(),
-                "metric name must not be empty"
-            );
-            assert!(
-                name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                name.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
                 "metric name must be snake_case: {name}"
             );
         }
@@ -564,10 +544,7 @@ mod tests {
 
         let mut seen = std::collections::HashSet::new();
         for name in all_names {
-            assert!(
-                seen.insert(name),
-                "duplicate metric name: {name}"
-            );
+            assert!(seen.insert(name), "duplicate metric name: {name}");
         }
     }
 

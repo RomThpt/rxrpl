@@ -13,7 +13,6 @@ impl ValidClawback {
             Some("RippleState") | Some("MPToken")
         )
     }
-
 }
 
 impl InvariantCheck for ValidClawback {

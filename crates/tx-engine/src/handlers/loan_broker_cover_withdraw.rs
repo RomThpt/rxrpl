@@ -135,8 +135,7 @@ impl Transactor for LoanBrokerCoverWithdrawTransactor {
         helpers::set_balance(&mut account, balance + amount);
         helpers::increment_sequence(&mut account);
 
-        let acct_data =
-            serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
+        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
             .map_err(|_| TransactionResult::TefInternal)?;

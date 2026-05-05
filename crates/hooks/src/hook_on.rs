@@ -31,7 +31,10 @@ mod tests {
         let hook_on = [0u8; 32];
         // 0 = Payment, 7 = OfferCreate, 20 = TrustSet, 100 = EnableAmendment
         for tx_type in [0, 7, 20, 100] {
-            assert!(should_hook_fire(&hook_on, tx_type), "should fire for type {tx_type}");
+            assert!(
+                should_hook_fire(&hook_on, tx_type),
+                "should fire for type {tx_type}"
+            );
         }
     }
 
@@ -39,7 +42,10 @@ mod tests {
     fn all_ones_fires_for_none() {
         let hook_on = [0xFF; 32];
         for tx_type in [0, 7, 20, 100] {
-            assert!(!should_hook_fire(&hook_on, tx_type), "should not fire for type {tx_type}");
+            assert!(
+                !should_hook_fire(&hook_on, tx_type),
+                "should not fire for type {tx_type}"
+            );
         }
     }
 
@@ -50,7 +56,10 @@ mod tests {
         hook_on[31] |= 1;
 
         assert!(!should_hook_fire(&hook_on, 0), "Payment should be blocked");
-        assert!(should_hook_fire(&hook_on, 7), "OfferCreate should still fire");
+        assert!(
+            should_hook_fire(&hook_on, 7),
+            "OfferCreate should still fire"
+        );
         assert!(should_hook_fire(&hook_on, 20), "TrustSet should still fire");
     }
 
@@ -61,7 +70,10 @@ mod tests {
         hook_on[31] |= 1 << 7;
 
         assert!(should_hook_fire(&hook_on, 0), "Payment should fire");
-        assert!(!should_hook_fire(&hook_on, 7), "OfferCreate should be blocked");
+        assert!(
+            !should_hook_fire(&hook_on, 7),
+            "OfferCreate should be blocked"
+        );
     }
 
     #[test]

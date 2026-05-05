@@ -68,21 +68,29 @@ pub fn register_host_functions(
     // accept(code: i32) -> i64
     // Terminates hook execution with an acceptance result.
     let ctx = context.clone();
-    linker.func_wrap("env", "accept", move |_caller: Caller<()>, code: i32| -> i64 {
-        let mut hook_ctx = ctx.lock().unwrap();
-        let _ = hook_ctx.consume_gas(HOST_CALL_GAS);
-        code as i64
-    })?;
+    linker.func_wrap(
+        "env",
+        "accept",
+        move |_caller: Caller<()>, code: i32| -> i64 {
+            let mut hook_ctx = ctx.lock().unwrap();
+            let _ = hook_ctx.consume_gas(HOST_CALL_GAS);
+            code as i64
+        },
+    )?;
 
     // rollback(code: i32) -> i64
     // Terminates hook execution with a rollback result.
     let ctx = context.clone();
-    linker.func_wrap("env", "rollback", move |_caller: Caller<()>, code: i32| -> i64 {
-        let mut hook_ctx = ctx.lock().unwrap();
-        let _ = hook_ctx.consume_gas(HOST_CALL_GAS);
-        // Negative indicates rollback
-        -(code as i64)
-    })?;
+    linker.func_wrap(
+        "env",
+        "rollback",
+        move |_caller: Caller<()>, code: i32| -> i64 {
+            let mut hook_ctx = ctx.lock().unwrap();
+            let _ = hook_ctx.consume_gas(HOST_CALL_GAS);
+            // Negative indicates rollback
+            -(code as i64)
+        },
+    )?;
 
     // state_set(key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32) -> i64
     // Writes a value into the hook's state map.
@@ -125,7 +133,12 @@ pub fn register_host_functions(
     linker.func_wrap(
         "env",
         "state_get",
-        move |mut caller: Caller<()>, key_ptr: i32, key_len: i32, val_ptr: i32, val_max: i32| -> i64 {
+        move |mut caller: Caller<()>,
+              key_ptr: i32,
+              key_len: i32,
+              val_ptr: i32,
+              val_max: i32|
+              -> i64 {
             let memory = match get_memory(&caller) {
                 Some(mem) => mem,
                 None => return OUT_OF_BOUNDS,
@@ -420,7 +433,12 @@ pub fn register_host_functions(
     linker.func_wrap(
         "env",
         "emit",
-        move |mut caller: Caller<()>, write_ptr: i32, write_len: i32, read_ptr: i32, read_len: i32| -> i64 {
+        move |mut caller: Caller<()>,
+              write_ptr: i32,
+              write_len: i32,
+              read_ptr: i32,
+              read_len: i32|
+              -> i64 {
             if read_len < 0 || write_len < 0 {
                 return INVALID_ARGUMENT;
             }
@@ -474,10 +492,7 @@ mod tests {
     use rxrpl_primitives::Hash256;
 
     fn make_context() -> Arc<Mutex<HookContext>> {
-        Arc::new(Mutex::new(HookContext::new(
-            Hash256::default(),
-            [0u8; 20],
-        )))
+        Arc::new(Mutex::new(HookContext::new(Hash256::default(), [0u8; 20])))
     }
 
     #[test]

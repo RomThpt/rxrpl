@@ -69,12 +69,7 @@ impl SqliteLedgerStore {
 }
 
 impl LedgerStore for SqliteLedgerStore {
-    fn store_ledger(
-        &self,
-        seq: u32,
-        hash: &[u8],
-        header_blob: &[u8],
-    ) -> Result<(), StorageError> {
+    fn store_ledger(&self, seq: u32, hash: &[u8], header_blob: &[u8]) -> Result<(), StorageError> {
         let conn = self
             .conn
             .lock()
@@ -178,11 +173,7 @@ impl LedgerStore for SqliteLedgerStore {
         Ok(rows)
     }
 
-    fn index_account_tx(
-        &self,
-        account: &[u8],
-        tx_hash: &[u8],
-    ) -> Result<(), StorageError> {
+    fn index_account_tx(&self, account: &[u8], tx_hash: &[u8]) -> Result<(), StorageError> {
         let conn = self
             .conn
             .lock()
@@ -201,9 +192,7 @@ impl LedgerStore for SqliteLedgerStore {
             .lock()
             .map_err(|e| StorageError::Backend(e.to_string()))?;
         let mut stmt = conn.prepare("SELECT MAX(sequence) FROM ledger_headers")?;
-        let result: Option<u32> = stmt
-            .query_row([], |row| row.get(0))
-            .unwrap_or(None);
+        let result: Option<u32> = stmt.query_row([], |row| row.get(0)).unwrap_or(None);
         Ok(result)
     }
 }

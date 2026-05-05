@@ -9,10 +9,7 @@ use crate::error::RpcServerError;
 ///
 /// Matches rippled's `shard_info` RPC. Returns information about locally
 /// stored shards of ledger history including their state and sequence ranges.
-pub async fn shard_info(
-    _params: Value,
-    ctx: &Arc<ServerContext>,
-) -> Result<Value, RpcServerError> {
+pub async fn shard_info(_params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcServerError> {
     let Some(ref manager_lock) = ctx.shard_manager else {
         return Ok(serde_json::json!({
             "shards": "none",

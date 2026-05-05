@@ -57,11 +57,7 @@ impl HookExecutionEngine {
     /// Its i64 return value determines the result:
     /// - >= 0: Accept
     /// - < 0: Rollback
-    pub fn execute(
-        &self,
-        wasm: &[u8],
-        context: HookContext,
-    ) -> Result<HookResult, EngineError> {
+    pub fn execute(&self, wasm: &[u8], context: HookContext) -> Result<HookResult, EngineError> {
         // Check HookOn filter before executing
         if let Some(ref hook_on_mask) = context.hook_on {
             if !hook_on::should_hook_fire(hook_on_mask, context.otxn_type) {

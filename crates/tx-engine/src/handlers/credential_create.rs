@@ -39,8 +39,8 @@ impl Transactor for CredentialCreateTransactor {
             helpers::get_str_field(ctx.tx, "Subject").ok_or(TransactionResult::TemMalformed)?;
         // Subject account must exist; map to tecNO_TARGET (not terNO_ACCOUNT)
         // to match rippled's CredentialCreate semantics.
-        let subject_id = decode_account_id(subject_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let subject_id =
+            decode_account_id(subject_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let subject_key = keylet::account(&subject_id);
         if !ctx.view.exists(&subject_key) {
             return Err(TransactionResult::TecNoTarget);

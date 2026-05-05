@@ -144,12 +144,7 @@ mod tests {
 
         let cfg_path = dir.path().join("rxrpl.cfg");
         let mut f = std::fs::File::create(&cfg_path).unwrap();
-        write!(
-            f,
-            "[validators]\nseed_file = \"{}\"\n",
-            seed_path.display()
-        )
-        .unwrap();
+        write!(f, "[validators]\nseed_file = \"{}\"\n", seed_path.display()).unwrap();
 
         let err = load_config_with_seed(&cfg_path).unwrap_err();
         assert!(matches!(err, ConfigError::SeedFilePermissionDenied { .. }));

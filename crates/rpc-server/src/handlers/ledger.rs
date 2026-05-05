@@ -35,7 +35,9 @@ fn parse_ledger_selector(params: &Value) -> Result<LedgerSelector, RpcServerErro
             other => other
                 .parse::<u32>()
                 .map(LedgerSelector::Sequence)
-                .map_err(|_| RpcServerError::InvalidParams(format!("invalid ledger_index: {other}"))),
+                .map_err(|_| {
+                    RpcServerError::InvalidParams(format!("invalid ledger_index: {other}"))
+                }),
         },
         Value::Number(n) => n
             .as_u64()
@@ -55,14 +57,14 @@ pub async fn ledger(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
     if ctx.reporting_mode {
         if let Some(ref store) = ctx.ledger_store {
             let seq = match selector {
-                LedgerSelector::Current
-                | LedgerSelector::Closed
-                | LedgerSelector::Validated => store
-                    .latest_sequence()
-                    .map_err(|e| RpcServerError::Internal(format!("storage error: {e}")))?
-                    .ok_or_else(|| {
-                        RpcServerError::Internal("no ledger data available yet".into())
-                    })?,
+                LedgerSelector::Current | LedgerSelector::Closed | LedgerSelector::Validated => {
+                    store
+                        .latest_sequence()
+                        .map_err(|e| RpcServerError::Internal(format!("storage error: {e}")))?
+                        .ok_or_else(|| {
+                            RpcServerError::Internal("no ledger data available yet".into())
+                        })?
+                }
                 LedgerSelector::Sequence(s) => s,
             };
 

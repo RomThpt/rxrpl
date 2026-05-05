@@ -161,7 +161,9 @@ impl LedgerPruner {
 
         // Update earliest sequence
         if new_earliest > self.state.earliest_seq.load(Ordering::Relaxed) {
-            self.state.earliest_seq.store(new_earliest, Ordering::Relaxed);
+            self.state
+                .earliest_seq
+                .store(new_earliest, Ordering::Relaxed);
         }
 
         tracing::info!(
@@ -342,9 +344,7 @@ mod tests {
         // Old ledger (seq=1)
         let mut old_state = SHAMap::account_state_with_store(Arc::clone(&store));
         old_state.insert(shared_key, shared_data.clone()).unwrap();
-        old_state
-            .insert(Hash256::new([0x11; 32]), vec![1])
-            .unwrap();
+        old_state.insert(Hash256::new([0x11; 32]), vec![1]).unwrap();
         let _ = old_state.flush().unwrap();
 
         let mut old_ledger = Ledger::genesis();
@@ -389,9 +389,7 @@ mod tests {
 
         // Build old ledger
         let mut state = SHAMap::account_state_with_store(Arc::clone(&store));
-        state
-            .insert(Hash256::new([0xBB; 32]), vec![1, 2])
-            .unwrap();
+        state.insert(Hash256::new([0xBB; 32]), vec![1, 2]).unwrap();
         let _ = state.flush().unwrap();
         let hashes = state.collect_all_node_hashes();
 

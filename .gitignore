@@ -10,3 +10,4 @@ Cargo.lock
 .nightly-lock
 .nightshift/
 .worktrees/
+PLAN.md

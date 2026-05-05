@@ -15,10 +15,9 @@
 /// Each validator entry in the blob has:
 ///   - `validation_public_key`: hex master public key
 ///   - `manifest`: base64-encoded individual validator manifest
-
 use rxrpl_primitives::PublicKey;
 
-use crate::manifest::{self, ManifestStore, MANIFEST_REVOKED_SEQ};
+use crate::manifest::{self, MANIFEST_REVOKED_SEQ, ManifestStore};
 
 /// A parsed and verified validator list.
 #[derive(Clone, Debug)]
@@ -147,15 +146,9 @@ pub fn verify_and_parse(
     let blob: serde_json::Value = serde_json::from_slice(&blob_json)
         .map_err(|e| ValidatorListError::BlobDecode(format!("json: {}", e)))?;
 
-    let sequence = blob
-        .get("sequence")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let sequence = blob.get("sequence").and_then(|v| v.as_u64()).unwrap_or(0);
 
-    let expiration = blob
-        .get("expiration")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let expiration = blob.get("expiration").and_then(|v| v.as_u64()).unwrap_or(0);
 
     let validators_arr = blob
         .get("validators")
@@ -167,10 +160,7 @@ pub fn verify_and_parse(
 
     for entry in validators_arr {
         // Extract master public key
-        if let Some(pk_hex) = entry
-            .get("validation_public_key")
-            .and_then(|v| v.as_str())
-        {
+        if let Some(pk_hex) = entry.get("validation_public_key").and_then(|v| v.as_str()) {
             if let Ok(pk_bytes) = hex::decode(pk_hex) {
                 if let Ok(pk) = PublicKey::from_slice(&pk_bytes) {
                     validators.push(pk);
@@ -180,7 +170,8 @@ pub fn verify_and_parse(
 
         // Extract individual validator manifest
         if let Some(manifest_b64) = entry.get("manifest").and_then(|v| v.as_str()) {
-            if let Ok(manifest_bytes) = base64::engine::general_purpose::STANDARD.decode(manifest_b64)
+            if let Ok(manifest_bytes) =
+                base64::engine::general_purpose::STANDARD.decode(manifest_b64)
             {
                 validator_manifests.push(manifest_bytes);
             }
@@ -429,15 +420,13 @@ fn walk_delegate<R: DelegateResolver>(
         return Err(ValidatorListError::DelegateRevoked);
     }
 
-    let (manifest_bytes, blobs_v2) = resolver
-        .resolve(delegate_pk)?
-        .ok_or_else(|| ValidatorListError::DelegateFetchFailed(hex::encode(delegate_pk.as_bytes())))?;
+    let (manifest_bytes, blobs_v2) = resolver.resolve(delegate_pk)?.ok_or_else(|| {
+        ValidatorListError::DelegateFetchFailed(hex::encode(delegate_pk.as_bytes()))
+    })?;
 
     let bundle = verify_and_parse_v2(&manifest_bytes, &blobs_v2, manifest_store, now_unix)
         .map_err(|e| match e {
-            ValidatorListError::BlobSignatureInvalid => {
-                ValidatorListError::CascadeSignatureInvalid
-            }
+            ValidatorListError::BlobSignatureInvalid => ValidatorListError::CascadeSignatureInvalid,
             other => other,
         })?;
 
@@ -551,7 +540,10 @@ impl ValidatorListTracker {
     }
 
     /// Cache a verified VL under its publisher master key.
-    pub fn cache_validator_list(&mut self, vl: ValidatorListData) -> Result<(), ValidatorListError> {
+    pub fn cache_validator_list(
+        &mut self,
+        vl: ValidatorListData,
+    ) -> Result<(), ValidatorListError> {
         let hex_key = hex::encode(vl.publisher_master_key.as_bytes());
         let state = self
             .publishers
@@ -655,7 +647,9 @@ impl ValidatorListTracker {
 /// so a stray signature cannot be replayed against unrelated payloads.
 fn rotation_signing_payload(master_pk: &PublicKey, new_signing_pk: &PublicKey) -> Vec<u8> {
     let prefix = rxrpl_crypto::hash_prefix::HashPrefix::MANIFEST.to_bytes();
-    let mut buf = Vec::with_capacity(prefix.len() + master_pk.as_bytes().len() + new_signing_pk.as_bytes().len());
+    let mut buf = Vec::with_capacity(
+        prefix.len() + master_pk.as_bytes().len() + new_signing_pk.as_bytes().len(),
+    );
     buf.extend_from_slice(&prefix);
     buf.extend_from_slice(master_pk.as_bytes());
     buf.extend_from_slice(new_signing_pk.as_bytes());
@@ -713,8 +707,7 @@ mod tests {
             None,
         );
         let eph_sig = rxrpl_crypto::ed25519::sign(&signing_data, &eph_kp.private_key).unwrap();
-        let master_sig =
-            rxrpl_crypto::ed25519::sign(&signing_data, &pub_kp.private_key).unwrap();
+        let master_sig = rxrpl_crypto::ed25519::sign(&signing_data, &pub_kp.private_key).unwrap();
 
         let publisher_manifest = manifest::build_manifest_bytes(
             1,
@@ -778,8 +771,7 @@ mod tests {
 
     #[test]
     fn reject_tampered_blob_signature() {
-        let (manifest, blob, mut sig) =
-            make_test_vl("vl_pub2", "vl_eph2", &["val1"], 1);
+        let (manifest, blob, mut sig) = make_test_vl("vl_pub2", "vl_eph2", &["val1"], 1);
 
         // Tamper signature
         if let Some(b) = sig.get_mut(0) {
@@ -793,8 +785,7 @@ mod tests {
 
     #[test]
     fn reject_tampered_blob_content() {
-        let (manifest, mut blob, sig) =
-            make_test_vl("vl_pub3", "vl_eph3", &["val1"], 1);
+        let (manifest, mut blob, sig) = make_test_vl("vl_pub3", "vl_eph3", &["val1"], 1);
 
         // Tamper blob
         if let Some(b) = blob.get_mut(5) {
@@ -813,9 +804,9 @@ mod tests {
 
         assert!(tracker.record_sequence(&pk, 1));
         assert!(tracker.record_sequence(&pk, 5));
-        assert!(!tracker.record_sequence(&pk, 5));  // same
-        assert!(!tracker.record_sequence(&pk, 3));  // older
-        assert!(tracker.record_sequence(&pk, 10));   // newer
+        assert!(!tracker.record_sequence(&pk, 5)); // same
+        assert!(!tracker.record_sequence(&pk, 3)); // older
+        assert!(tracker.record_sequence(&pk, 10)); // newer
     }
 
     #[test]
@@ -946,10 +937,8 @@ mod tests {
             eph_kp.public_key.as_bytes(),
             None,
         );
-        let eph_sig =
-            rxrpl_crypto::ed25519::sign(&signing_data, &eph_kp.private_key).unwrap();
-        let master_sig =
-            rxrpl_crypto::ed25519::sign(&signing_data, &pub_kp.private_key).unwrap();
+        let eph_sig = rxrpl_crypto::ed25519::sign(&signing_data, &eph_kp.private_key).unwrap();
+        let master_sig = rxrpl_crypto::ed25519::sign(&signing_data, &pub_kp.private_key).unwrap();
 
         let publisher_manifest = manifest::build_manifest_bytes(
             1,
@@ -1021,8 +1010,8 @@ mod tests {
         );
 
         let mut store = ManifestStore::new();
-        let bundle = verify_and_parse_v2(&manifest, &wire, &mut store, 100)
-            .expect("v2 parse must succeed");
+        let bundle =
+            verify_and_parse_v2(&manifest, &wire, &mut store, 100).expect("v2 parse must succeed");
 
         assert_eq!(bundle.active.len(), 1, "exactly one blob is in window");
         assert_eq!(bundle.inactive.len(), 2, "two blobs are out of window");
@@ -1045,7 +1034,8 @@ mod tests {
             }
         }
         fn insert(&mut self, pk: &PublicKey, manifest: Vec<u8>, wire: Vec<BlobV2Wire>) {
-            self.entries.insert(pk.as_bytes().to_vec(), (manifest, wire));
+            self.entries
+                .insert(pk.as_bytes().to_vec(), (manifest, wire));
         }
     }
 
@@ -1320,10 +1310,7 @@ mod tests {
         );
 
         let mut tracker = ValidatorListTracker::new();
-        tracker.register_publisher(
-            master_kp.public_key.clone(),
-            signing_kp.public_key.clone(),
-        );
+        tracker.register_publisher(master_kp.public_key.clone(), signing_kp.public_key.clone());
 
         let vl_a = ValidatorListData {
             sequence: 1,
@@ -1341,7 +1328,14 @@ mod tests {
         };
         tracker.cache_validator_list(vl_a).expect("cache vl_a");
         tracker.cache_validator_list(vl_b).expect("cache vl_b");
-        assert_eq!(tracker.publisher_state(&master_kp.public_key).unwrap().vls.len(), 2);
+        assert_eq!(
+            tracker
+                .publisher_state(&master_kp.public_key)
+                .unwrap()
+                .vls
+                .len(),
+            2
+        );
 
         // Build the revocation manifest the way rippled does: sequence == u32::MAX.
         let revoke_manifest = manifest::Manifest {

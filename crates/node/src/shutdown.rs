@@ -12,7 +12,7 @@ use std::io;
 pub async fn wait_for_shutdown() -> io::Result<&'static str> {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
         tokio::select! {

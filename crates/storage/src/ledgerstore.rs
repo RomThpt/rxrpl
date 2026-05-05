@@ -26,12 +26,7 @@ pub struct LedgerTxRecord {
 /// and their associated transactions. Implementations must be thread-safe.
 pub trait LedgerStore: Send + Sync + 'static {
     /// Store a validated ledger header.
-    fn store_ledger(
-        &self,
-        seq: u32,
-        hash: &[u8],
-        header_blob: &[u8],
-    ) -> Result<(), StorageError>;
+    fn store_ledger(&self, seq: u32, hash: &[u8], header_blob: &[u8]) -> Result<(), StorageError>;
 
     /// Retrieve a ledger header by sequence number.
     fn get_ledger_header(&self, seq: u32) -> Result<Option<LedgerHeaderRecord>, StorageError>;
@@ -56,11 +51,7 @@ pub trait LedgerStore: Send + Sync + 'static {
     ) -> Result<Vec<LedgerTxRecord>, StorageError>;
 
     /// Index a transaction against an account for later retrieval.
-    fn index_account_tx(
-        &self,
-        account: &[u8],
-        tx_hash: &[u8],
-    ) -> Result<(), StorageError>;
+    fn index_account_tx(&self, account: &[u8], tx_hash: &[u8]) -> Result<(), StorageError>;
 
     /// Return the latest stored ledger sequence, or None if empty.
     fn latest_sequence(&self) -> Result<Option<u32>, StorageError>;
@@ -90,12 +81,7 @@ impl Default for InMemoryLedgerStore {
 }
 
 impl LedgerStore for InMemoryLedgerStore {
-    fn store_ledger(
-        &self,
-        seq: u32,
-        hash: &[u8],
-        header_blob: &[u8],
-    ) -> Result<(), StorageError> {
+    fn store_ledger(&self, seq: u32, hash: &[u8], header_blob: &[u8]) -> Result<(), StorageError> {
         let record = LedgerHeaderRecord {
             sequence: seq,
             hash: hash.to_vec(),
@@ -174,11 +160,7 @@ impl LedgerStore for InMemoryLedgerStore {
         Ok(results)
     }
 
-    fn index_account_tx(
-        &self,
-        account: &[u8],
-        tx_hash: &[u8],
-    ) -> Result<(), StorageError> {
+    fn index_account_tx(&self, account: &[u8], tx_hash: &[u8]) -> Result<(), StorageError> {
         self.account_txs
             .write()
             .map_err(|e| StorageError::Backend(e.to_string()))?

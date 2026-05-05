@@ -30,8 +30,8 @@ impl Transactor for LoanPayTransactor {
             .ok_or(TransactionResult::TemMalformed)?;
         let _broker_seq = helpers::get_u32_field(ctx.tx, "LoanBrokerSequence")
             .ok_or(TransactionResult::TemMalformed)?;
-        let loan_seq =
-            helpers::get_u32_field(ctx.tx, "LoanSequence").ok_or(TransactionResult::TemMalformed)?;
+        let loan_seq = helpers::get_u32_field(ctx.tx, "LoanSequence")
+            .ok_or(TransactionResult::TemMalformed)?;
 
         let broker_owner_id = decode_account_id(broker_owner_str)
             .map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -80,8 +80,8 @@ impl Transactor for LoanPayTransactor {
             .to_string();
         let broker_seq = helpers::get_u32_field(ctx.tx, "LoanBrokerSequence")
             .ok_or(TransactionResult::TemMalformed)?;
-        let loan_seq =
-            helpers::get_u32_field(ctx.tx, "LoanSequence").ok_or(TransactionResult::TemMalformed)?;
+        let loan_seq = helpers::get_u32_field(ctx.tx, "LoanSequence")
+            .ok_or(TransactionResult::TemMalformed)?;
         let payment_amount = helpers::get_u64_str_field(ctx.tx, "PaymentAmount")
             .ok_or(TransactionResult::TemBadAmount)?;
 
@@ -121,7 +121,11 @@ impl Transactor for LoanPayTransactor {
             .as_str()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0) as u32;
-        let base_time = if last_payment > 0 { last_payment } else { loan_start };
+        let base_time = if last_payment > 0 {
+            last_payment
+        } else {
+            loan_start
+        };
 
         // Use parent ledger close time as "now"
         let current_time = ctx.view.parent_close_time();
@@ -162,8 +166,7 @@ impl Transactor for LoanPayTransactor {
 
         let new_principal = principal_outstanding - principal_paid;
         let new_interest_remaining = total_interest - interest_paid;
-        let new_total_value = total_value_outstanding
-            .saturating_sub(payment_amount - remaining);
+        let new_total_value = total_value_outstanding.saturating_sub(payment_amount - remaining);
 
         // Update loan
         loan["PrincipalOutstanding"] = serde_json::Value::String(new_principal.to_string());
@@ -212,7 +215,9 @@ impl Transactor for LoanPayTransactor {
         }
         let vault_owner_id =
             decode_account_id(parts[0]).map_err(|_| TransactionResult::TefInternal)?;
-        let vault_seq: u32 = parts[1].parse().map_err(|_| TransactionResult::TefInternal)?;
+        let vault_seq: u32 = parts[1]
+            .parse()
+            .map_err(|_| TransactionResult::TefInternal)?;
         let vault_key = keylet::vault(&vault_owner_id, vault_seq);
 
         let vault_bytes = ctx
@@ -252,8 +257,7 @@ impl Transactor for LoanPayTransactor {
         );
         helpers::increment_sequence(&mut account);
 
-        let acct_data =
-            serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
+        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
             .map_err(|_| TransactionResult::TefInternal)?;

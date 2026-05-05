@@ -19,8 +19,8 @@ pub struct SetHookTransactor;
 
 impl Transactor for SetHookTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
-        let hooks = helpers::get_array_field(ctx.tx, "Hooks")
-            .ok_or(TransactionResult::TemMalformed)?;
+        let hooks =
+            helpers::get_array_field(ctx.tx, "Hooks").ok_or(TransactionResult::TemMalformed)?;
 
         if hooks.is_empty() || hooks.len() > MAX_HOOKS {
             return Err(TransactionResult::TemMalformed);
@@ -40,8 +40,8 @@ impl Transactor for SetHookTransactor {
                     }
 
                     // Validate hex encoding
-                    let wasm_bytes = hex::decode(code_hex)
-                        .map_err(|_| TransactionResult::TemMalformed)?;
+                    let wasm_bytes =
+                        hex::decode(code_hex).map_err(|_| TransactionResult::TemMalformed)?;
 
                     // Validate WASM magic number (0x00 0x61 0x73 0x6D)
                     if wasm_bytes.len() < 4
@@ -88,8 +88,8 @@ impl Transactor for SetHookTransactor {
 
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
         // Read and update source account
         let src_key = keylet::account(&account_id);
@@ -132,8 +132,8 @@ impl Transactor for SetHookTransactor {
                 entry["CreateCode"] = serde_json::Value::String(create_code.to_string());
 
                 // Compute HookHash as SHA-256 of the WASM bytes
-                let wasm_bytes = hex::decode(create_code)
-                    .map_err(|_| TransactionResult::TefInternal)?;
+                let wasm_bytes =
+                    hex::decode(create_code).map_err(|_| TransactionResult::TefInternal)?;
                 let hash = rxrpl_crypto::sha512_half::sha512_half(&[&wasm_bytes]);
                 entry["HookHash"] = serde_json::Value::String(hex::encode(hash.as_bytes()));
             } else if let Some(hh) = hook.get("HookHash") {

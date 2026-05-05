@@ -2,7 +2,7 @@
 //! survives ledger close and can be reconstructed from the SHAMap state
 //! leaves (mirroring the catchup / restart code path).
 
-use rxrpl_ledger::{sle_codec, Ledger};
+use rxrpl_ledger::{Ledger, sle_codec};
 use rxrpl_protocol::keylet;
 use rxrpl_shamap::SHAMap;
 use serde_json::json;

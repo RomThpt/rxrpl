@@ -25,8 +25,8 @@
 //!   both calls leave the same preferred result, no double-counting in the
 //!   tip support.
 
-use rxrpl_consensus::types::{NodeId, Validation};
 use rxrpl_consensus::ValidationsTrie;
+use rxrpl_consensus::types::{NodeId, Validation};
 use rxrpl_primitives::Hash256;
 
 /// Build a deterministic `NodeId` from a single byte (every byte of the

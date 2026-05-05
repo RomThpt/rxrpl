@@ -274,7 +274,9 @@ impl ValidationAggregator {
         if self.by_ledger.len() >= MAX_BUCKETS && !self.by_ledger.contains_key(&(seq, hash)) {
             tracing::debug!(
                 "validation aggregator: by_ledger at cap {} entries; dropping new (seq={}, hash={})",
-                MAX_BUCKETS, seq, hash
+                MAX_BUCKETS,
+                seq,
+                hash
             );
             return None;
         }
@@ -371,12 +373,14 @@ mod tests {
         let mut agg = ValidationAggregator::new(3);
         let hash = Hash256::new([0xAA; 32]);
 
-        assert!(agg
-            .add_validation_at(make_validation(1, 10, hash), TEST_NOW)
-            .is_none());
-        assert!(agg
-            .add_validation_at(make_validation(2, 10, hash), TEST_NOW)
-            .is_none());
+        assert!(
+            agg.add_validation_at(make_validation(1, 10, hash), TEST_NOW)
+                .is_none()
+        );
+        assert!(
+            agg.add_validation_at(make_validation(2, 10, hash), TEST_NOW)
+                .is_none()
+        );
         let result = agg.add_validation_at(make_validation(3, 10, hash), TEST_NOW);
         assert!(result.is_some());
 
@@ -393,13 +397,15 @@ mod tests {
 
         agg.add_validation_at(make_validation(1, 5, hash), TEST_NOW);
         // Same node again
-        assert!(agg
-            .add_validation_at(make_validation(1, 5, hash), TEST_NOW)
-            .is_none());
+        assert!(
+            agg.add_validation_at(make_validation(1, 5, hash), TEST_NOW)
+                .is_none()
+        );
         // Different node reaches quorum
-        assert!(agg
-            .add_validation_at(make_validation(2, 5, hash), TEST_NOW)
-            .is_some());
+        assert!(
+            agg.add_validation_at(make_validation(2, 5, hash), TEST_NOW)
+                .is_some()
+        );
     }
 
     #[test]
@@ -420,13 +426,15 @@ mod tests {
         let mut agg = ValidationAggregator::new(1);
         let hash = Hash256::new([0xCC; 32]);
 
-        assert!(agg
-            .add_validation_at(make_validation(1, 5, hash), TEST_NOW)
-            .is_some());
+        assert!(
+            agg.add_validation_at(make_validation(1, 5, hash), TEST_NOW)
+                .is_some()
+        );
         // Already validated, skip
-        assert!(agg
-            .add_validation_at(make_validation(2, 5, hash), TEST_NOW)
-            .is_none());
+        assert!(
+            agg.add_validation_at(make_validation(2, 5, hash), TEST_NOW)
+                .is_none()
+        );
     }
 
     #[test]
@@ -449,23 +457,27 @@ mod tests {
         let hash = Hash256::new([0xEE; 32]);
 
         // With quorum=1, a single validation reaches quorum
-        assert!(agg
-            .add_validation_at(make_validation(1, 10, hash), TEST_NOW)
-            .is_some());
+        assert!(
+            agg.add_validation_at(make_validation(1, 10, hash), TEST_NOW)
+                .is_some()
+        );
 
         // Raise quorum to 3
         agg.update_quorum(3);
 
         // Now need 3 validations for next sequence
-        assert!(agg
-            .add_validation_at(make_validation(1, 20, hash), TEST_NOW)
-            .is_none());
-        assert!(agg
-            .add_validation_at(make_validation(2, 20, hash), TEST_NOW)
-            .is_none());
-        assert!(agg
-            .add_validation_at(make_validation(3, 20, hash), TEST_NOW)
-            .is_some());
+        assert!(
+            agg.add_validation_at(make_validation(1, 20, hash), TEST_NOW)
+                .is_none()
+        );
+        assert!(
+            agg.add_validation_at(make_validation(2, 20, hash), TEST_NOW)
+                .is_none()
+        );
+        assert!(
+            agg.add_validation_at(make_validation(3, 20, hash), TEST_NOW)
+                .is_some()
+        );
     }
 
     #[test]
@@ -474,9 +486,10 @@ mod tests {
         agg.update_quorum(0); // should clamp to 1
         let hash = Hash256::new([0xFF; 32]);
         // Single validation should still reach quorum (floor=1)
-        assert!(agg
-            .add_validation_at(make_validation(1, 10, hash), TEST_NOW)
-            .is_some());
+        assert!(
+            agg.add_validation_at(make_validation(1, 10, hash), TEST_NOW)
+                .is_some()
+        );
     }
 
     #[test]
@@ -574,9 +587,7 @@ mod tests {
         let mut agg = ValidationAggregator::new(1);
         // The explicit verify-and-add path drops the validation and bumps
         // the dedicated counter.
-        assert!(agg
-            .verify_and_add_validation_at(val, TEST_NOW)
-            .is_none());
+        assert!(agg.verify_and_add_validation_at(val, TEST_NOW).is_none());
         assert_eq!(agg.dropped_invalid_signature_total(), 1);
         // Nothing was recorded in the aggregator.
         assert_eq!(agg.validation_count(99, &hash), 0);
@@ -630,9 +641,10 @@ mod tests {
 
         // A fresh validation is accepted; counters stay at 0.
         let hash_ok = Hash256::new([0x01; 32]);
-        assert!(agg
-            .add_validation_at(make_validation(1, 100, hash_ok), TEST_NOW)
-            .is_some());
+        assert!(
+            agg.add_validation_at(make_validation(1, 100, hash_ok), TEST_NOW)
+                .is_some()
+        );
         assert_eq!(agg.validations_dropped_freshness_total(), 0);
         assert_eq!(agg.validations_dropped_stale_total(), 0);
 

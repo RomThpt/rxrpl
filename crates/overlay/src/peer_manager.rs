@@ -25,7 +25,6 @@ use crate::handshake;
 use crate::identity::NodeIdentity;
 use crate::ledger_provider::LedgerProvider;
 use crate::ledger_sync::LedgerSyncer;
-use crate::shard_sync::ShardSyncer;
 use crate::manifest::{self, ManifestStore};
 use crate::peer_handle::PeerHandle;
 use crate::peer_loop;
@@ -34,10 +33,11 @@ use crate::peer_set::{PeerInfo, PeerSet};
 use crate::proto_convert;
 use crate::relay::RelayFilter;
 use crate::reputation::PeerReputation;
+use crate::shard_sync::ShardSyncer;
 use crate::squelch::SquelchManager;
+use crate::tls::{self, PeerStream};
 use crate::tx_batch_relay::TxBatchRelay;
 use crate::validator_list::{self, ValidatorListTracker};
-use crate::tls::{self, PeerStream};
 
 /// TMLedgerInfoType values from rippled.
 const LI_BASE: i32 = 0;
@@ -431,7 +431,9 @@ impl PeerManager {
                 let delay = backoff.next_delay();
                 tracing::debug!(
                     "reconnecting to fixed peer {} in {:?} (attempt {})",
-                    addr, delay, backoff.attempt(),
+                    addr,
+                    delay,
+                    backoff.attempt(),
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
@@ -507,7 +509,9 @@ impl PeerManager {
                 if full > 0 {
                     tracing::warn!(
                         "broadcast {:?}: {} sent, {} dropped (peer channel full)",
-                        msg_type, sent, full
+                        msg_type,
+                        sent,
+                        full
                     );
                 }
             }
@@ -638,7 +642,9 @@ impl PeerManager {
                 crate::rate_limiter::RateLimitResult::Dropped => {
                     tracing::warn!(
                         "rate-limited {:?} from peer {} (consecutive drops: {})",
-                        msg_type, from, info.rate_limiter.consecutive_drops()
+                        msg_type,
+                        from,
+                        info.rate_limiter.consecutive_drops()
                     );
                     info.reputation
                         .apply_penalty(-crate::rate_limiter::PeerRateLimiter::penalty());
@@ -665,29 +671,27 @@ impl PeerManager {
                 // Hello is already handled during handshake; ignore late arrivals.
                 tracing::debug!("ignoring late Hello from {}", from);
             }
-            MessageType::Ping => {
-                match proto_convert::decode_ping(payload) {
-                    Ok(ping) => {
-                        if let Some(ref info) = peer_info {
-                            info.reputation.record_valid_message(payload_len);
-                        }
-                        if ping.r#type.unwrap_or(0) == 0 {
-                            let pong = proto_convert::encode_ping(ping.seq.unwrap_or(0), true);
-                            if let Some(handle) = self.peer_handles.get(&from) {
-                                let _ = handle.tx.try_send(PeerMessage {
-                                    msg_type: MessageType::Ping,
-                                    payload: pong,
-                                });
-                            }
-                        }
+            MessageType::Ping => match proto_convert::decode_ping(payload) {
+                Ok(ping) => {
+                    if let Some(ref info) = peer_info {
+                        info.reputation.record_valid_message(payload_len);
                     }
-                    Err(_) => {
-                        if let Some(ref info) = peer_info {
-                            info.reputation.record_invalid_message();
+                    if ping.r#type.unwrap_or(0) == 0 {
+                        let pong = proto_convert::encode_ping(ping.seq.unwrap_or(0), true);
+                        if let Some(handle) = self.peer_handles.get(&from) {
+                            let _ = handle.tx.try_send(PeerMessage {
+                                msg_type: MessageType::Ping,
+                                payload: pong,
+                            });
                         }
                     }
                 }
-            }
+                Err(_) => {
+                    if let Some(ref info) = peer_info {
+                        info.reputation.record_invalid_message();
+                    }
+                }
+            },
             MessageType::Transaction => {
                 match proto_convert::decode_transaction(payload) {
                     Ok((tx_hash, tx_data)) => {
@@ -720,21 +724,19 @@ impl PeerManager {
                     }
                 }
             }
-            MessageType::ProposeSet => {
-                match proto_convert::decode_propose_set(payload) {
-                    Ok(proposal) => {
-                        if let Some(ref info) = peer_info {
-                            info.reputation.record_valid_message(payload_len);
-                        }
-                        let _ = self.consensus_tx.send(ConsensusMessage::Proposal(proposal));
+            MessageType::ProposeSet => match proto_convert::decode_propose_set(payload) {
+                Ok(proposal) => {
+                    if let Some(ref info) = peer_info {
+                        info.reputation.record_valid_message(payload_len);
                     }
-                    Err(_) => {
-                        if let Some(ref info) = peer_info {
-                            info.reputation.record_invalid_message();
-                        }
+                    let _ = self.consensus_tx.send(ConsensusMessage::Proposal(proposal));
+                }
+                Err(_) => {
+                    if let Some(ref info) = peer_info {
+                        info.reputation.record_invalid_message();
                     }
                 }
-            }
+            },
             MessageType::Validation => {
                 match proto_convert::decode_validation(payload) {
                     Ok(validation) => {
@@ -754,10 +756,10 @@ impl PeerManager {
 
                             // Track which peer is relaying this validator's messages
                             // and send squelch to redundant sources.
-                            if let Some(action) = self.squelch_manager.record_validation_source(
-                                from,
-                                &validation.public_key,
-                            ) {
+                            if let Some(action) = self
+                                .squelch_manager
+                                .record_validation_source(from, &validation.public_key)
+                            {
                                 self.send_squelch_to_peers(&action);
                             }
 
@@ -774,10 +776,9 @@ impl PeerManager {
                             // Relay validation to peers, respecting inbound squelch.
                             for (id, handle) in &self.peer_handles {
                                 if *id != from
-                                    && !self.squelch_manager.is_relay_squelched(
-                                        id,
-                                        &validation.public_key,
-                                    )
+                                    && !self
+                                        .squelch_manager
+                                        .is_relay_squelched(id, &validation.public_key)
                                 {
                                     let _ = handle.tx.try_send(PeerMessage {
                                         msg_type: MessageType::Validation,
@@ -852,7 +853,9 @@ impl PeerManager {
                         }
                         tracing::debug!(
                             "Cluster message from {}: {}/{} nodes accepted",
-                            from, accepted, nodes.len()
+                            from,
+                            accepted,
+                            nodes.len()
                         );
                         if let Some(avg_fee) = self.cluster_manager.average_load_fee() {
                             tracing::trace!("cluster average load fee: {}", avg_fee);
@@ -873,10 +876,7 @@ impl PeerManager {
                 self.handle_get_ledger(from, payload);
             }
             MessageType::LedgerData => {
-                tracing::info!(
-                    "received LedgerData from {}: {} bytes",
-                    from, payload.len()
-                );
+                tracing::info!("received LedgerData from {}: {} bytes", from, payload.len());
                 match proto_convert::decode_ledger_data(payload) {
                     Ok(msg) => {
                         if let Some(ref info) = peer_info {
@@ -897,7 +897,10 @@ impl PeerManager {
                         let info_type = msg.ledger_info_type;
                         tracing::info!(
                             "decoded LedgerData seq={} hash={} itype={} nodes={}",
-                            ledger_seq, hash, info_type, nodes.len()
+                            ledger_seq,
+                            hash,
+                            info_type,
+                            nodes.len()
                         );
 
                         // Handle tx-set candidate responses (liTS_CANDIDATE = 3).
@@ -908,7 +911,10 @@ impl PeerManager {
 
                         // Skip already-synced ledgers.
                         if self.ledger_syncer.is_synced(ledger_seq) {
-                            tracing::debug!("ignoring LedgerData for already-synced #{}", ledger_seq);
+                            tracing::debug!(
+                                "ignoring LedgerData for already-synced #{}",
+                                ledger_seq
+                            );
                         } else if self.ledger_syncer.has_incremental_sync(ledger_seq) {
                             // Active incremental sync: feed nodes into SHAMap.
                             use crate::ledger_sync::FeedResult;
@@ -916,7 +922,8 @@ impl PeerManager {
                                 FeedResult::Complete(leaves) => {
                                     tracing::info!(
                                         "incremental sync complete for ledger #{} ({} leaf nodes)",
-                                        ledger_seq, leaves.len()
+                                        ledger_seq,
+                                        leaves.len()
                                     );
                                     self.ledger_syncer.mark_synced(ledger_seq);
                                     let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
@@ -943,21 +950,24 @@ impl PeerManager {
                             // No active sync: try to parse as liBASE header.
                             let header_data = &nodes[0].1;
                             let latest = self.ledger_syncer.latest_known_seq();
-                            if let Some(header) = rxrpl_ledger::LedgerHeader::from_raw_bytes(header_data)
-                                .filter(|h| {
-                                    latest.map_or(true, |known| {
-                                        (h.sequence as i64 - known as i64).unsigned_abs() <= 1000
-                                    })
+                            if let Some(header) = rxrpl_ledger::LedgerHeader::from_raw_bytes(
+                                header_data,
+                            )
+                            .filter(|h| {
+                                latest.map_or(true, |known| {
+                                    (h.sequence as i64 - known as i64).unsigned_abs() <= 1000
                                 })
-                            {
+                            }) {
                                 let is_newer = latest.map_or(true, |known| header.sequence > known);
                                 if is_newer {
                                     tracing::info!(
                                         "received liBASE header for ledger #{} hash={}",
-                                        header.sequence, header.hash
+                                        header.sequence,
+                                        header.hash
                                     );
                                 }
-                                self.ledger_syncer.set_ledger_hash(header.sequence, header.hash);
+                                self.ledger_syncer
+                                    .set_ledger_hash(header.sequence, header.hash);
 
                                 if let Some(store) = self.get_node_store() {
                                     let missing = self.ledger_syncer.start_incremental_sync(
@@ -975,7 +985,8 @@ impl PeerManager {
                                         // matches genesis). Dispatch leaves to consensus.
                                         tracing::info!(
                                             "incremental sync immediate-complete for ledger #{} ({} leaves)",
-                                            header.sequence, leaves.len()
+                                            header.sequence,
+                                            leaves.len()
                                         );
                                         self.ledger_syncer.mark_synced(header.sequence);
                                         let _ =
@@ -995,7 +1006,8 @@ impl PeerManager {
                                 // Not a header -- raw node data, not useful for reconstruction.
                                 tracing::debug!(
                                     "ignoring non-header LedgerData for #{} ({} nodes)",
-                                    ledger_seq, nodes.len()
+                                    ledger_seq,
+                                    nodes.len()
                                 );
                             }
                         }
@@ -1028,11 +1040,7 @@ impl PeerManager {
                         if let Some(ref info) = peer_info {
                             info.reputation.record_valid_message(payload_len);
                         }
-                        tracing::debug!(
-                            "received {} peer addresses from {}",
-                            peers.len(),
-                            from
-                        );
+                        tracing::debug!("received {} peer addresses from {}", peers.len(), from);
                         if let Some(ref discovery) = self.discovery {
                             let disc = Arc::clone(discovery);
                             let peers = peers.clone();
@@ -1054,11 +1062,7 @@ impl PeerManager {
                         if let Some(ref info) = peer_info {
                             info.reputation.record_valid_message(payload_len);
                         }
-                        tracing::debug!(
-                            "received {} manifests from {}",
-                            manifest_list.len(),
-                            from
-                        );
+                        tracing::debug!("received {} manifests from {}", manifest_list.len(), from);
 
                         // Parse, verify, and apply each manifest
                         let raw_bytes: Vec<Vec<u8>> = manifest_list
@@ -1128,7 +1132,9 @@ impl PeerManager {
                         }
                         tracing::debug!(
                             "HaveTransactionSet from {} hash={} status={}",
-                            from, have_set.hash, have_set.status
+                            from,
+                            have_set.hash,
+                            have_set.status
                         );
 
                         // If we do not have this tx-set locally, fetch it from the peer.
@@ -1142,7 +1148,8 @@ impl PeerManager {
                         {
                             tracing::info!(
                                 "requesting unknown tx-set {} from peer {}",
-                                have_set.hash, from
+                                have_set.hash,
+                                from
                             );
                             self.pending_tx_set_fetches.insert(have_set.hash);
                             self.send_get_tx_set(from, have_set.hash);
@@ -1181,7 +1188,9 @@ impl PeerManager {
                                 .collect();
                             tracing::info!(
                                 "received GetObjectByHash response from {} ({} objects for #{})",
-                                from, nodes.len(), ledger_seq
+                                from,
+                                nodes.len(),
+                                ledger_seq
                             );
                             if self.ledger_syncer.has_incremental_sync(ledger_seq) {
                                 use crate::ledger_sync::FeedResult;
@@ -1191,14 +1200,16 @@ impl PeerManager {
                                     FeedResult::Complete(leaves) => {
                                         tracing::info!(
                                             "incremental sync complete (via hash fallback) for #{} ({} leaves)",
-                                            ledger_seq, leaves.len()
+                                            ledger_seq,
+                                            leaves.len()
                                         );
                                         self.ledger_syncer.mark_synced(ledger_seq);
-                                        let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
-                                            hash,
-                                            seq: ledger_seq,
-                                            nodes: leaves,
-                                        });
+                                        let _ =
+                                            self.consensus_tx.send(ConsensusMessage::LedgerData {
+                                                hash,
+                                                seq: ledger_seq,
+                                                nodes: leaves,
+                                            });
                                     }
                                     FeedResult::FallbackToHashFetch(content_hashes) => {
                                         self.send_get_objects_by_hash(ledger_seq, &content_hashes);
@@ -1229,7 +1240,8 @@ impl PeerManager {
                         }
                         tracing::debug!(
                             "ValidatorList v{} from {} ({} bytes manifest, {} bytes blob)",
-                            vl.version.unwrap_or(0), from,
+                            vl.version.unwrap_or(0),
+                            from,
                             vl.manifest.as_ref().map(|v| v.len()).unwrap_or(0),
                             vl.blob.as_ref().map(|v| v.len()).unwrap_or(0)
                         );
@@ -1253,18 +1265,21 @@ impl PeerManager {
                                     let seq = vl_data.sequence;
 
                                     // Track sequence to reject stale lists
-                                    if self.vl_tracker.record_sequence(
-                                        &vl_data.publisher_master_key,
-                                        seq,
-                                    ) {
+                                    if self
+                                        .vl_tracker
+                                        .record_sequence(&vl_data.publisher_master_key, seq)
+                                    {
                                         tracing::info!(
                                             "verified validator list seq={} with {} validators from {}",
-                                            seq, count, from
+                                            seq,
+                                            count,
+                                            from
                                         );
 
                                         // Process individual validator manifests
                                         for raw_manifest in &vl_data.validator_manifests {
-                                            if let Ok(m) = manifest::parse_and_verify(raw_manifest) {
+                                            if let Ok(m) = manifest::parse_and_verify(raw_manifest)
+                                            {
                                                 let master_key = m.master_public_key.clone();
                                                 let eph_key = m.ephemeral_public_key.clone();
                                                 let revoked = m.is_revoked();
@@ -1295,7 +1310,8 @@ impl PeerManager {
                                     } else {
                                         tracing::debug!(
                                             "stale validator list seq={} from {}",
-                                            seq, from
+                                            seq,
+                                            from
                                         );
                                     }
 
@@ -1309,7 +1325,8 @@ impl PeerManager {
                                 Err(e) => {
                                     tracing::debug!(
                                         "validator list verification failed from {}: {}",
-                                        from, e
+                                        from,
+                                        e
                                     );
                                     // Fall back to unverified count extraction
                                     if let Some(blob_b) = vl.blob.as_ref() {
@@ -1351,7 +1368,9 @@ impl PeerManager {
                         }
                         tracing::debug!(
                             "ValidatorListCollection v{} from {} ({} blobs)",
-                            vlc.version.unwrap_or(0), from, vlc.blobs.len()
+                            vlc.version.unwrap_or(0),
+                            from,
+                            vlc.blobs.len()
                         );
                     }
                     Err(_) => {
@@ -1361,35 +1380,35 @@ impl PeerManager {
                     }
                 }
             }
-            MessageType::Squelch => {
-                match proto_convert::decode_squelch(payload) {
-                    Ok(msg) => {
-                        if let Some(ref info) = peer_info {
-                            info.reputation.record_valid_message(payload_len);
-                        }
-                        let squelch_flag = msg.squelch.unwrap_or(true);
-                        let validator_key = msg.validator_pub_key.unwrap_or_default();
-                        let duration = msg.squelch_duration.unwrap_or(300);
-                        if !validator_key.is_empty() {
-                            self.squelch_manager.handle_inbound_squelch(
-                                from,
-                                &validator_key,
-                                squelch_flag,
-                                duration,
-                            );
-                        }
-                        tracing::debug!(
-                            "Squelch from {}: squelch={}, duration={}s",
-                            from, squelch_flag, duration,
+            MessageType::Squelch => match proto_convert::decode_squelch(payload) {
+                Ok(msg) => {
+                    if let Some(ref info) = peer_info {
+                        info.reputation.record_valid_message(payload_len);
+                    }
+                    let squelch_flag = msg.squelch.unwrap_or(true);
+                    let validator_key = msg.validator_pub_key.unwrap_or_default();
+                    let duration = msg.squelch_duration.unwrap_or(300);
+                    if !validator_key.is_empty() {
+                        self.squelch_manager.handle_inbound_squelch(
+                            from,
+                            &validator_key,
+                            squelch_flag,
+                            duration,
                         );
                     }
-                    Err(_) => {
-                        if let Some(ref info) = peer_info {
-                            info.reputation.record_invalid_message();
-                        }
+                    tracing::debug!(
+                        "Squelch from {}: squelch={}, duration={}s",
+                        from,
+                        squelch_flag,
+                        duration,
+                    );
+                }
+                Err(_) => {
+                    if let Some(ref info) = peer_info {
+                        info.reputation.record_invalid_message();
                     }
                 }
-            }
+            },
             MessageType::HaveTransactions => {
                 match proto_convert::decode_have_transactions(payload) {
                     Ok(hash_list) => {
@@ -1438,8 +1457,7 @@ impl PeerManager {
                         }
 
                         // Request the ones we are missing.
-                        let missing =
-                            self.tx_batch_relay.process_have_transactions(&need_hashes);
+                        let missing = self.tx_batch_relay.process_have_transactions(&need_hashes);
                         if !missing.is_empty() {
                             let request_payload =
                                 crate::tx_batch_relay::encode_have_transactions(&missing);
@@ -1464,8 +1482,9 @@ impl PeerManager {
                         if let Some(ref info) = peer_info {
                             info.reputation.record_valid_message(payload_len);
                         }
-                        let new_txs =
-                            self.tx_batch_relay.process_transactions_batch(&batch.transactions);
+                        let new_txs = self
+                            .tx_batch_relay
+                            .process_transactions_batch(&batch.transactions);
                         tracing::debug!(
                             "Transactions batch from {} with {} txs ({} new)",
                             from,
@@ -1475,11 +1494,10 @@ impl PeerManager {
                         // Forward each new transaction to the consensus layer
                         for (tx_hash, tx_data) in &new_txs {
                             if self.relay_filter.should_relay(tx_hash) {
-                                let _ =
-                                    self.consensus_tx.send(ConsensusMessage::Transaction {
-                                        hash: *tx_hash,
-                                        data: tx_data.clone(),
-                                    });
+                                let _ = self.consensus_tx.send(ConsensusMessage::Transaction {
+                                    hash: *tx_hash,
+                                    data: tx_data.clone(),
+                                });
                             }
                         }
                     }
@@ -1496,24 +1514,22 @@ impl PeerManager {
                 }
                 self.handle_get_shards(from);
             }
-            MessageType::Shards => {
-                match rxrpl_p2p_proto::shard_msg::decode_shards(payload) {
-                    Ok(msg) => {
-                        if let Some(ref info) = peer_info {
-                            info.reputation.record_valid_message(payload_len);
-                        }
-                        if let Some(ref mut syncer) = self.shard_syncer {
-                            syncer.on_shards_message(from, msg);
-                        }
+            MessageType::Shards => match rxrpl_p2p_proto::shard_msg::decode_shards(payload) {
+                Ok(msg) => {
+                    if let Some(ref info) = peer_info {
+                        info.reputation.record_valid_message(payload_len);
                     }
-                    Err(e) => {
-                        tracing::warn!("failed to decode Shards from {}: {}", from, e);
-                        if let Some(ref info) = peer_info {
-                            info.reputation.record_invalid_message();
-                        }
+                    if let Some(ref mut syncer) = self.shard_syncer {
+                        syncer.on_shards_message(from, msg);
                     }
                 }
-            }
+                Err(e) => {
+                    tracing::warn!("failed to decode Shards from {}: {}", from, e);
+                    if let Some(ref info) = peer_info {
+                        info.reputation.record_invalid_message();
+                    }
+                }
+            },
             MessageType::GetShardData => {
                 match rxrpl_p2p_proto::shard_msg::decode_get_shard_data(payload) {
                     Ok(msg) => {
@@ -1576,11 +1592,8 @@ impl PeerManager {
 
     /// Send squelch messages to the specified peers for a given validator.
     fn send_squelch_to_peers(&self, action: &crate::squelch::SquelchAction) {
-        let payload = proto_convert::encode_squelch(
-            &action.validator_key,
-            true,
-            action.duration_secs,
-        );
+        let payload =
+            proto_convert::encode_squelch(&action.validator_key, true, action.duration_secs);
         for peer_id in &action.squelch_peers {
             if let Some(handle) = self.peer_handles.get(peer_id) {
                 let _ = handle.tx.try_send(PeerMessage {
@@ -1639,7 +1652,9 @@ impl PeerManager {
         let seqs = msg.ledger_seqs;
         tracing::debug!(
             "GetShardData from {} for shard {} ({} sequences)",
-            from, shard_index, seqs.len()
+            from,
+            shard_index,
+            seqs.len()
         );
 
         // For now, respond with empty data since we cannot hold async locks
@@ -1677,7 +1692,9 @@ impl PeerManager {
 
         tracing::debug!(
             "importing {} ledger entries for shard {} from {}",
-            entry_count, shard_index, from
+            entry_count,
+            shard_index,
+            from
         );
 
         // The actual async import is triggered by the ShardSyncer's tick()
@@ -1858,8 +1875,16 @@ impl PeerManager {
             .collect();
 
         let num_ids = node_ids.len();
-        let min_depth = missing.iter().map(|mn| mn.node_id.depth()).min().unwrap_or(0);
-        let max_depth = missing.iter().map(|mn| mn.node_id.depth()).max().unwrap_or(0);
+        let min_depth = missing
+            .iter()
+            .map(|mn| mn.node_id.depth())
+            .min()
+            .unwrap_or(0);
+        let max_depth = missing
+            .iter()
+            .map(|mn| mn.node_id.depth())
+            .max()
+            .unwrap_or(0);
 
         // Split requests across multiple peers so each gets a different subset.
         let best = self.peer_set.best_peers_for_ledger(seq, 3);
@@ -1896,7 +1921,11 @@ impl PeerManager {
         }
         tracing::debug!(
             "sent GetLedger seq={} delta ({} node_ids across {} peers, depth={}-{})",
-            seq, num_ids, peers_used, min_depth, max_depth
+            seq,
+            num_ids,
+            peers_used,
+            min_depth,
+            max_depth
         );
     }
 
@@ -1924,16 +1953,14 @@ impl PeerManager {
         let requested = msg.objects.len();
         tracing::debug!(
             "GetObjectByHash query from {} ({} objects requested)",
-            from, requested
+            from,
+            requested
         );
 
         let store = match &self.node_store {
             Some(s) => s,
             None => {
-                tracing::debug!(
-                    "GetObjectByHash from {} but no node store configured",
-                    from
-                );
+                tracing::debug!("GetObjectByHash from {} but no node store configured", from);
                 return;
             }
         };
@@ -1974,10 +2001,7 @@ impl PeerManager {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::trace!(
-                        "GetObjectByHash: store fetch error for {}: {}",
-                        hash, e
-                    );
+                    tracing::trace!("GetObjectByHash: store fetch error for {}: {}", hash, e);
                 }
             }
         }
@@ -1985,7 +2009,8 @@ impl PeerManager {
         if found.is_empty() {
             tracing::debug!(
                 "GetObjectByHash from {}: none of {} requested objects found",
-                from, requested
+                from,
+                requested
             );
             return;
         }
@@ -1999,7 +2024,10 @@ impl PeerManager {
 
         tracing::debug!(
             "GetObjectByHash response to {}: {} of {} objects ({} bytes)",
-            from, found.len(), requested, response.len()
+            from,
+            found.len(),
+            requested,
+            response.len()
         );
 
         if let Some(handle) = self.peer_handles.get(&from) {
@@ -2037,17 +2065,13 @@ impl PeerManager {
         let chunk_size = (content_hashes.len() + num_peers - 1) / num_peers;
         let mut peers_used = 0;
         for (i, node_id) in best.iter().enumerate() {
-            let chunk: &[Hash256] = &content_hashes
-                [i * chunk_size..content_hashes.len().min((i + 1) * chunk_size)];
+            let chunk: &[Hash256] =
+                &content_hashes[i * chunk_size..content_hashes.len().min((i + 1) * chunk_size)];
             if chunk.is_empty() {
                 break;
             }
-            let payload = proto_convert::encode_get_objects_by_hash(
-                &ledger_hash,
-                seq,
-                chunk,
-                false,
-            );
+            let payload =
+                proto_convert::encode_get_objects_by_hash(&ledger_hash, seq, chunk, false);
             if let Some(handle) = self.peer_handles.get(node_id) {
                 let _ = handle.tx.try_send(PeerMessage {
                     msg_type: MessageType::GetObjects,
@@ -2058,7 +2082,9 @@ impl PeerManager {
         }
         tracing::info!(
             "sent GetObjectByHash seq={} ({} hashes across {} peers, fallback for stuck sync)",
-            seq, content_hashes.len(), peers_used
+            seq,
+            content_hashes.len(),
+            peers_used
         );
     }
 
@@ -2166,14 +2192,17 @@ impl PeerManager {
                 None if req_ledger_seq > 0 => {
                     tracing::debug!(
                         "GetLedger from {} hash={} not found, falling back to seq={}",
-                        from, hash, req_ledger_seq
+                        from,
+                        hash,
+                        req_ledger_seq
                     );
                     provider.get_by_seq(req_ledger_seq)
                 }
                 None => {
                     tracing::debug!(
                         "GetLedger from {} hash={} not found, no seq fallback",
-                        from, hash
+                        from,
+                        hash
                     );
                     None
                 }
@@ -2300,7 +2329,9 @@ impl PeerManager {
             if truncated {
                 tracing::warn!(
                     "GetLedger delta response truncated at 256KB: sent {} of {} requested nodes for seq={}",
-                    nodes.len(), request_node_ids.len(), ledger.header.sequence
+                    nodes.len(),
+                    request_node_ids.len(),
+                    ledger.header.sequence
                 );
             }
         } else {
@@ -2323,7 +2354,8 @@ impl PeerManager {
             if truncated {
                 tracing::warn!(
                     "GetLedger response truncated at 256KB: sent {} state nodes for seq={}",
-                    nodes.len(), ledger.header.sequence
+                    nodes.len(),
+                    ledger.header.sequence
                 );
             }
         }
@@ -2353,33 +2385,29 @@ impl PeerManager {
             return;
         };
 
-        let tx_set = self.tx_sets.as_ref().and_then(|cache| {
-            cache.read().unwrap().get(&set_hash).cloned()
-        });
+        let tx_set = self
+            .tx_sets
+            .as_ref()
+            .and_then(|cache| cache.read().unwrap().get(&set_hash).cloned());
 
         let nodes = match tx_set {
-            Some(set) => {
-                set.txs
-                    .iter()
-                    .map(|tx_hash| (tx_hash.as_bytes().to_vec(), Vec::new()))
-                    .collect()
-            }
+            Some(set) => set
+                .txs
+                .iter()
+                .map(|tx_hash| (tx_hash.as_bytes().to_vec(), Vec::new()))
+                .collect(),
             None => {
                 tracing::debug!(
                     "GetLedger liTS_CANDIDATE from {}: tx-set {} not found",
-                    from, set_hash
+                    from,
+                    set_hash
                 );
                 Vec::new()
             }
         };
 
-        let response = proto_convert::encode_ledger_data(
-            &set_hash,
-            0,
-            LI_TS_CANDIDATE,
-            nodes,
-            cookie,
-        );
+        let response =
+            proto_convert::encode_ledger_data(&set_hash, 0, LI_TS_CANDIDATE, nodes, cookie);
 
         if let Some(handle) = self.peer_handles.get(&from) {
             let _ = handle.tx.try_send(PeerMessage {
@@ -2392,12 +2420,8 @@ impl PeerManager {
     /// Send a TMGetLedger request with itype=liTS_CANDIDATE to fetch a tx-set.
     fn send_get_tx_set(&self, peer: Hash256, tx_set_hash: Hash256) {
         let cookie = self.next_cookie.fetch_add(1, Ordering::Relaxed);
-        let payload = proto_convert::encode_get_ledger(
-            LI_TS_CANDIDATE,
-            Some(&tx_set_hash),
-            0,
-            cookie,
-        );
+        let payload =
+            proto_convert::encode_get_ledger(LI_TS_CANDIDATE, Some(&tx_set_hash), 0, cookie);
         if let Some(handle) = self.peer_handles.get(&peer) {
             match handle.tx.try_send(PeerMessage {
                 msg_type: MessageType::GetLedger,
@@ -2406,13 +2430,16 @@ impl PeerManager {
                 Ok(_) => {
                     tracing::debug!(
                         "sent GetLedger liTS_CANDIDATE for tx-set {} to {}",
-                        tx_set_hash, peer
+                        tx_set_hash,
+                        peer
                     );
                 }
                 Err(e) => {
                     tracing::warn!(
                         "failed to send GetLedger for tx-set {} to {}: {}",
-                        tx_set_hash, peer, e
+                        tx_set_hash,
+                        peer,
+                        e
                     );
                 }
             }
@@ -2451,14 +2478,17 @@ impl PeerManager {
         if tx_set.hash != set_hash {
             tracing::warn!(
                 "tx-set hash mismatch: expected {} got {} ({} txs)",
-                set_hash, tx_set.hash, tx_set.len()
+                set_hash,
+                tx_set.hash,
+                tx_set.len()
             );
             // Store under the computed hash anyway so consensus can still find it.
         }
 
         tracing::info!(
             "acquired tx-set {} with {} transactions",
-            tx_set.hash, tx_set.len()
+            tx_set.hash,
+            tx_set.len()
         );
 
         // Store in shared cache.
@@ -2471,7 +2501,9 @@ impl PeerManager {
         }
 
         // Notify the consensus engine.
-        let _ = self.consensus_tx.send(ConsensusMessage::TxSetAcquired(tx_set));
+        let _ = self
+            .consensus_tx
+            .send(ConsensusMessage::TxSetAcquired(tx_set));
     }
 }
 
@@ -2645,7 +2677,10 @@ fn base64_decode_validator_blob(blob_bytes: &[u8]) -> Result<usize, ()> {
         .decode(blob_bytes)
         .map_err(|_| ())?;
     let json: serde_json::Value = serde_json::from_slice(&decoded).map_err(|_| ())?;
-    let validators = json.get("validators").and_then(|v| v.as_array()).ok_or(())?;
+    let validators = json
+        .get("validators")
+        .and_then(|v| v.as_array())
+        .ok_or(())?;
     Ok(validators.len())
 }
 
@@ -2705,8 +2740,8 @@ mod tests {
                 {"validation_public_key": "ED0003", "manifest": "CC=="},
             ]
         });
-        let blob = base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_vec(&json).unwrap());
+        let blob =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&json).unwrap());
         assert_eq!(base64_decode_validator_blob(blob.as_bytes()), Ok(3));
     }
 
@@ -2719,8 +2754,8 @@ mod tests {
     fn decode_validator_blob_no_validators_key() {
         use base64::Engine;
         let json = serde_json::json!({"sequence": 1});
-        let blob = base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_vec(&json).unwrap());
+        let blob =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&json).unwrap());
         assert_eq!(base64_decode_validator_blob(blob.as_bytes()), Err(()));
     }
 

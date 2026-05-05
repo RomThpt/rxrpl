@@ -135,9 +135,7 @@ impl InnerNode {
         }
         let hash = self.hashes[branch as usize];
         let store = store.ok_or(SHAMapError::MissingStore)?;
-        let bytes = store
-            .fetch(&hash)?
-            .ok_or(SHAMapError::NodeNotFound(hash))?;
+        let bytes = store.fetch(&hash)?.ok_or(SHAMapError::NodeNotFound(hash))?;
         let node = crate::node_store::deserialize_node(&bytes, &hash, leaf_ctor)?;
         let _ = self.children[branch as usize].cell.set(Arc::new(node));
         Ok(self.children[branch as usize].cell.get())
@@ -235,9 +233,7 @@ impl InnerNode {
         }
         let hash = self.hashes[branch as usize];
         let store = store.ok_or(SHAMapError::MissingStore)?;
-        let bytes = store
-            .fetch(&hash)?
-            .ok_or(SHAMapError::NodeNotFound(hash))?;
+        let bytes = store.fetch(&hash)?.ok_or(SHAMapError::NodeNotFound(hash))?;
         let node = crate::node_store::deserialize_node(&bytes, &hash, leaf_ctor)?;
         let _ = self.children[branch as usize].cell.set(Arc::new(node));
         Ok(())

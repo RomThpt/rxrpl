@@ -19,8 +19,8 @@ pub fn read_ledger_object(
     let Some(bytes) = map.get(key) else {
         return Ok(None);
     };
-    let value = crate::sle_codec::decode_state(bytes)
-        .map_err(|e| LedgerError::Codec(e.to_string()))?;
+    let value =
+        crate::sle_codec::decode_state(bytes).map_err(|e| LedgerError::Codec(e.to_string()))?;
     let obj: LedgerObjectKind =
         serde_json::from_value(value).map_err(|e| LedgerError::Codec(e.to_string()))?;
     Ok(Some(obj))
@@ -49,8 +49,8 @@ pub fn write_ledger_object(
     obj: &LedgerObjectKind,
 ) -> Result<(), LedgerError> {
     let json_bytes = serde_json::to_vec(obj).map_err(|e| LedgerError::Codec(e.to_string()))?;
-    let binary = crate::sle_codec::encode_sle(&json_bytes)
-        .map_err(|e| LedgerError::Codec(e.to_string()))?;
+    let binary =
+        crate::sle_codec::encode_sle(&json_bytes).map_err(|e| LedgerError::Codec(e.to_string()))?;
     map.put(key, binary)?;
     Ok(())
 }

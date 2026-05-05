@@ -82,14 +82,17 @@ impl ShardSyncer {
             if req.peer_id != peer_id {
                 tracing::warn!(
                     "received shard data for index {} from unexpected peer {} (expected {})",
-                    shard_index, peer_id, req.peer_id
+                    shard_index,
+                    peer_id,
+                    req.peer_id
                 );
                 return 0;
             }
         } else {
             tracing::debug!(
                 "received unsolicited shard data for index {} from {}",
-                shard_index, peer_id
+                shard_index,
+                peer_id
             );
             return 0;
         }
@@ -108,7 +111,10 @@ impl ShardSyncer {
 
         tracing::info!(
             "imported {}/{} ledger entries for shard {} from peer {}",
-            imported, entry_count, shard_index, peer_id
+            imported,
+            entry_count,
+            shard_index,
+            peer_id
         );
 
         // Check if shard is now complete.
@@ -128,10 +134,7 @@ impl ShardSyncer {
     /// Select the best peer for a shard and build a request.
     ///
     /// Returns `None` if no peer has the requested shard or we are at capacity.
-    pub async fn request_shard(
-        &mut self,
-        shard_index: u32,
-    ) -> Option<(Hash256, TMGetShardData)> {
+    pub async fn request_shard(&mut self, shard_index: u32) -> Option<(Hash256, TMGetShardData)> {
         if self.active_requests.len() >= self.max_concurrent {
             return None;
         }
@@ -207,7 +210,8 @@ impl ShardSyncer {
                 if req.retries > MAX_RETRIES {
                     tracing::warn!(
                         "giving up on shard {} after {} retries",
-                        shard_index, req.retries
+                        shard_index,
+                        req.retries
                     );
                     // Re-queue for later if desired.
                     if !self.download_queue.contains(&shard_index) {
@@ -216,7 +220,8 @@ impl ShardSyncer {
                 } else {
                     tracing::debug!(
                         "shard {} request timed out (retry {}), re-requesting",
-                        shard_index, req.retries
+                        shard_index,
+                        req.retries
                     );
                     // Try re-requesting, possibly from a different peer.
                     if let Some((peer_id, request)) = self.request_shard(shard_index).await {
@@ -263,7 +268,8 @@ impl ShardSyncer {
             }
             tracing::debug!(
                 "re-queued shard {} download after peer {} disconnected",
-                shard_index, peer_id
+                shard_index,
+                peer_id
             );
         }
     }

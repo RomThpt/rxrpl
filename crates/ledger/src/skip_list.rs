@@ -91,7 +91,8 @@ impl SkipListEntry {
     pub fn first_seq(&self) -> u32 {
         // hashes[0] corresponds to (last_ledger_sequence - hashes.len() + 1)
         let len = self.hashes.len() as u32;
-        self.last_ledger_sequence.saturating_sub(len.saturating_sub(1))
+        self.last_ledger_sequence
+            .saturating_sub(len.saturating_sub(1))
     }
 
     /// Returns the recorded hash for `seq`, if it falls inside this SLE.

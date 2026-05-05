@@ -27,10 +27,7 @@ pub fn is_grant_authorized(
         return false;
     }
     grants.iter().any(|g| {
-        let account_ok = g
-            .authorize
-            .as_ref()
-            .is_none_or(|a| a == requesting_account);
+        let account_ok = g.authorize.as_ref().is_none_or(|a| a == requesting_account);
         let hash_ok = g
             .hook_hash
             .as_ref()
@@ -68,7 +65,11 @@ mod tests {
             hook_hash: None,
         };
 
-        assert!(is_grant_authorized(&[grant.clone()], &authorized_account, None));
+        assert!(is_grant_authorized(
+            &[grant.clone()],
+            &authorized_account,
+            None
+        ));
         assert!(!is_grant_authorized(&[grant], &other_account, None));
     }
 
@@ -82,8 +83,16 @@ mod tests {
             hook_hash: Some(hook_hash),
         };
 
-        assert!(is_grant_authorized(&[grant.clone()], &account, Some(&hook_hash)));
-        assert!(!is_grant_authorized(&[grant.clone()], &account, Some(&other_hash)));
+        assert!(is_grant_authorized(
+            &[grant.clone()],
+            &account,
+            Some(&hook_hash)
+        ));
+        assert!(!is_grant_authorized(
+            &[grant.clone()],
+            &account,
+            Some(&other_hash)
+        ));
         // No hook hash provided -> does not match a hash-specific grant
         assert!(!is_grant_authorized(&[grant], &account, None));
     }
@@ -98,7 +107,11 @@ mod tests {
         };
 
         assert!(is_grant_authorized(&[grant.clone()], &account, Some(&hash)));
-        assert!(!is_grant_authorized(&[grant.clone()], &[2u8; 20], Some(&hash)));
+        assert!(!is_grant_authorized(
+            &[grant.clone()],
+            &[2u8; 20],
+            Some(&hash)
+        ));
         assert!(!is_grant_authorized(&[grant], &account, Some(&[0xDD; 32])));
     }
 

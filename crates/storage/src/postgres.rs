@@ -128,10 +128,7 @@ impl TxStore for PostgresStore {
         })
     }
 
-    fn get_transaction(
-        &self,
-        tx_hash: &[u8],
-    ) -> Result<Option<TransactionRecord>, StorageError> {
+    fn get_transaction(&self, tx_hash: &[u8]) -> Result<Option<TransactionRecord>, StorageError> {
         let tx_hash = tx_hash.to_vec();
         self.rt.block_on(async {
             let row = sqlx::query(

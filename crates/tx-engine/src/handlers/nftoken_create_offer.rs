@@ -57,13 +57,13 @@ impl Transactor for NFTokenCreateOfferTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         helpers::read_account_by_address(ctx.view, account_str)?;
 
-        let nftoken_id = helpers::get_str_field(ctx.tx, "NFTokenID")
-            .ok_or(TransactionResult::TemMalformed)?;
+        let nftoken_id =
+            helpers::get_str_field(ctx.tx, "NFTokenID").ok_or(TransactionResult::TemMalformed)?;
         let flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
         let is_sell = flags & TF_SELL_NFTOKEN != 0;
 
-        let account_id = decode_account_id(account_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let account_id =
+            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let page_key = keylet::nftoken_page_min(&account_id);
         let owns = ctx
             .view

@@ -121,12 +121,10 @@ impl Proposal {
         let data = self.signing_data();
         let sig = match key_type {
             rxrpl_crypto::KeyType::Secp256k1 => {
-                rxrpl_crypto::secp256k1::sign(&data, private_key)
-                    .map(|s| s.as_bytes().to_vec())
+                rxrpl_crypto::secp256k1::sign(&data, private_key).map(|s| s.as_bytes().to_vec())
             }
             rxrpl_crypto::KeyType::Ed25519 => {
-                rxrpl_crypto::ed25519::sign(&data, private_key)
-                    .map(|s| s.as_bytes().to_vec())
+                rxrpl_crypto::ed25519::sign(&data, private_key).map(|s| s.as_bytes().to_vec())
             }
         };
         if let Ok(sig) = sig {
@@ -168,12 +166,10 @@ impl Validation {
         let data = self.signing_data();
         let sig = match key_type {
             rxrpl_crypto::KeyType::Secp256k1 => {
-                rxrpl_crypto::secp256k1::sign(&data, private_key)
-                    .map(|s| s.as_bytes().to_vec())
+                rxrpl_crypto::secp256k1::sign(&data, private_key).map(|s| s.as_bytes().to_vec())
             }
             rxrpl_crypto::KeyType::Ed25519 => {
-                rxrpl_crypto::ed25519::sign(&data, private_key)
-                    .map(|s| s.as_bytes().to_vec())
+                rxrpl_crypto::ed25519::sign(&data, private_key).map(|s| s.as_bytes().to_vec())
             }
         };
         if let Ok(sig) = sig {
@@ -449,10 +445,7 @@ mod tests {
             tx.update_vote(NodeId(Hash256::new([i as u8 + 1; 32])), true);
         }
         for i in 0..no_peers {
-            tx.update_vote(
-                NodeId(Hash256::new([0x80 | (i as u8); 32])),
-                false,
-            );
+            tx.update_vote(NodeId(Hash256::new([0x80 | (i as u8); 32])), false);
         }
         tx
     }
@@ -475,10 +468,7 @@ mod tests {
     fn dispute_avalanche_round2_excludes_at_70pct_when_66pct() {
         // 1 peer yes, 1 peer no, plus our yes => 2/3 = 66% (<70%, round 2)
         let tx = build_dispute(1, 1);
-        assert!(
-            !tx.our_vote(70),
-            "66% must not clear avalanche round-2 70%"
-        );
+        assert!(!tx.our_vote(70), "66% must not clear avalanche round-2 70%");
     }
 
     #[test]
@@ -518,11 +508,7 @@ mod tests {
         assert_eq!(tx.yay_count(), 1);
         assert_eq!(tx.nay_count(), 0);
         tx.update_vote(peer, false);
-        assert_eq!(
-            tx.yay_count(),
-            0,
-            "flipped peer must not be counted as yes"
-        );
+        assert_eq!(tx.yay_count(), 0, "flipped peer must not be counted as yes");
         assert_eq!(tx.nay_count(), 1, "flipped peer must be counted as no");
     }
 }

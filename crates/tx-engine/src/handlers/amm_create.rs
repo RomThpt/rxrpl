@@ -12,7 +12,10 @@ impl Transactor for AMMCreateTransactor {
         // rippled's AMMCreate derives Asset/Asset2 from Amount/Amount2 when
         // they're absent. Mirror that so xrpl-hive's two-arg payload is
         // accepted.
-        let amount_field = ctx.tx.get("Amount").ok_or(TransactionResult::TemBadAmount)?;
+        let amount_field = ctx
+            .tx
+            .get("Amount")
+            .ok_or(TransactionResult::TemBadAmount)?;
         let amount2_field = ctx
             .tx
             .get("Amount2")
@@ -73,8 +76,14 @@ impl Transactor for AMMCreateTransactor {
         // For IOU legs, trust-line balance enforcement is out of scope here
         // (covered by a future trust-line debit pass).
         let balance = helpers::get_balance(&account);
-        let amount_field = ctx.tx.get("Amount").ok_or(TransactionResult::TemBadAmount)?;
-        let amount2_field = ctx.tx.get("Amount2").ok_or(TransactionResult::TemBadAmount)?;
+        let amount_field = ctx
+            .tx
+            .get("Amount")
+            .ok_or(TransactionResult::TemBadAmount)?;
+        let amount2_field = ctx
+            .tx
+            .get("Amount2")
+            .ok_or(TransactionResult::TemBadAmount)?;
         let xrp_needed = xrp_drops_from_amount(amount_field)
             .checked_add(xrp_drops_from_amount(amount2_field))
             .ok_or(TransactionResult::TemBadAmount)?;
@@ -90,8 +99,14 @@ impl Transactor for AMMCreateTransactor {
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        let amount_field = ctx.tx.get("Amount").ok_or(TransactionResult::TemBadAmount)?;
-        let amount2_field = ctx.tx.get("Amount2").ok_or(TransactionResult::TemBadAmount)?;
+        let amount_field = ctx
+            .tx
+            .get("Amount")
+            .ok_or(TransactionResult::TemBadAmount)?;
+        let amount2_field = ctx
+            .tx
+            .get("Amount2")
+            .ok_or(TransactionResult::TemBadAmount)?;
 
         let amount = amm_helpers::amount_value_drops_or_iou(amount_field)
             .ok_or(TransactionResult::TemBadAmount)?;
@@ -173,12 +188,18 @@ fn amm_key_from_tx_with_derivation(
     let asset = tx
         .get("Asset")
         .cloned()
-        .or_else(|| tx.get("Amount").and_then(amm_helpers::asset_spec_from_amount))
+        .or_else(|| {
+            tx.get("Amount")
+                .and_then(amm_helpers::asset_spec_from_amount)
+        })
         .ok_or(TransactionResult::TemMalformed)?;
     let asset2 = tx
         .get("Asset2")
         .cloned()
-        .or_else(|| tx.get("Amount2").and_then(amm_helpers::asset_spec_from_amount))
+        .or_else(|| {
+            tx.get("Amount2")
+                .and_then(amm_helpers::asset_spec_from_amount)
+        })
         .ok_or(TransactionResult::TemMalformed)?;
     amm_helpers::compute_amm_key(&asset, &asset2)
 }

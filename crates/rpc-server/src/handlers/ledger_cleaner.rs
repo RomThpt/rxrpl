@@ -22,11 +22,17 @@ pub async fn ledger_cleaner(
     let ledger = params.get("ledger").and_then(|v| v.as_u64());
     let max_ledger = params.get("max_ledger").and_then(|v| v.as_u64());
     let min_ledger = params.get("min_ledger").and_then(|v| v.as_u64());
-    let full = params.get("full").and_then(|v| v.as_bool()).unwrap_or(false);
+    let full = params
+        .get("full")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     tracing::info!(
         "ledger_cleaner: ledger={:?} min={:?} max={:?} full={}",
-        ledger, min_ledger, max_ledger, full
+        ledger,
+        min_ledger,
+        max_ledger,
+        full
     );
 
     let mut response = serde_json::Map::new();
@@ -54,14 +60,8 @@ pub async fn ledger_cleaner(
             "earliest_available".into(),
             Value::from(ps.earliest_seq.load(Ordering::Relaxed)),
         );
-        response.insert(
-            "online_delete".into(),
-            Value::from(ps.retention_window),
-        );
-        response.insert(
-            "advisory_delete".into(),
-            Value::from(ps.advisory_delete),
-        );
+        response.insert("online_delete".into(), Value::from(ps.retention_window));
+        response.insert("advisory_delete".into(), Value::from(ps.advisory_delete));
     }
 
     Ok(Value::Object(response))

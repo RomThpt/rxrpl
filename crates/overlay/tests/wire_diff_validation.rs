@@ -87,7 +87,9 @@ fn encoded_fields_are_in_canonical_ascending_order() {
     assert!(
         keys.windows(2).all(|w| w[0] < w[1]),
         "fields not in canonical ascending order: {:?}",
-        keys.iter().map(|k| format!("0x{k:06X}")).collect::<Vec<_>>()
+        keys.iter()
+            .map(|k| format!("0x{k:06X}"))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -130,8 +132,8 @@ fn amendments_field_header_is_type19_field3() {
     let wire = encode_validation(&v, id.public_key_bytes());
     let stobj = stobject_bytes(&wire);
 
-    let amendments_start = find_field_offset(&stobj, 19, 3)
-        .expect("sfAmendments must appear in the encoded blob");
+    let amendments_start =
+        find_field_offset(&stobj, 19, 3).expect("sfAmendments must appear in the encoded blob");
     assert_eq!(
         &stobj[amendments_start..amendments_start + 2],
         &[0x03, 0x13],
@@ -164,7 +166,10 @@ fn signature_is_der_encoded_not_raw_r_s() {
         "DER signature length out of bounds: {} bytes",
         der.len()
     );
-    assert_eq!(der[0], 0x30, "DER signature must start with SEQUENCE (0x30)");
+    assert_eq!(
+        der[0], 0x30,
+        "DER signature must start with SEQUENCE (0x30)"
+    );
     assert_eq!(
         der[1] as usize,
         der.len() - 2,
@@ -187,8 +192,8 @@ fn signing_pubkey_is_vl_prefixed_33_bytes() {
 
     let pk_start = find_field_offset(&stobj, 7, 3).expect("sfSigningPubKey present");
     assert_eq!(stobj[pk_start], 0x73, "sfSigningPubKey header byte");
-    let (pk_len, vl_hdr_len) = decode_vl_length_inline(&stobj[pk_start + 1..])
-        .expect("VL length must decode");
+    let (pk_len, vl_hdr_len) =
+        decode_vl_length_inline(&stobj[pk_start + 1..]).expect("VL length must decode");
     assert_eq!(pk_len, 33, "secp256k1 compressed pubkey is 33 bytes");
     let body_start = pk_start + 1 + vl_hdr_len;
     assert_eq!(

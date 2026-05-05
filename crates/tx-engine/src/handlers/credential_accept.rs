@@ -82,10 +82,7 @@ impl Transactor for CredentialAcceptTransactor {
         // Also set lsfAccepted flag (0x00010000) so account_objects responses
         // expose the accepted status via the Flags field, matching rippled.
         const LSF_ACCEPTED: u32 = 0x00010000;
-        let prev_flags = entry
-            .get("Flags")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
+        let prev_flags = entry.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         entry["Flags"] = serde_json::Value::from(prev_flags | LSF_ACCEPTED);
 
         let entry_data = serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?;

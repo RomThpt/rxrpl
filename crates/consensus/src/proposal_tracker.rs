@@ -243,10 +243,7 @@ mod tests {
         assert!(tracker.track(make_proposal(node(0x01), ledger(0x10), 1)));
         assert!(tracker.track(make_proposal(node(0x01), ledger(0x10), 5)));
         assert_eq!(tracker.len(), 1);
-        assert_eq!(
-            tracker.get(&node(0x01), &ledger(0x10)).unwrap().prop_seq,
-            5
-        );
+        assert_eq!(tracker.get(&node(0x01), &ledger(0x10)).unwrap().prop_seq, 5);
     }
 
     #[test]
@@ -258,10 +255,7 @@ mod tests {
         // Strictly lower: rejected as stale.
         assert!(!tracker.track(make_proposal(node(0x01), ledger(0x10), 3)));
         // Stored proposal must still be the original.
-        assert_eq!(
-            tracker.get(&node(0x01), &ledger(0x10)).unwrap().prop_seq,
-            5
-        );
+        assert_eq!(tracker.get(&node(0x01), &ledger(0x10)).unwrap().prop_seq, 5);
     }
 
     #[test]
@@ -272,14 +266,8 @@ mod tests {
         // Lower prop_seq but DIFFERENT prev_ledger: accepted as a new track.
         assert!(tracker.track(make_proposal(node(0x01), ledger(0x20), 0)));
         assert_eq!(tracker.len(), 2);
-        assert_eq!(
-            tracker.get(&node(0x01), &ledger(0x10)).unwrap().prop_seq,
-            9
-        );
-        assert_eq!(
-            tracker.get(&node(0x01), &ledger(0x20)).unwrap().prop_seq,
-            0
-        );
+        assert_eq!(tracker.get(&node(0x01), &ledger(0x10)).unwrap().prop_seq, 9);
+        assert_eq!(tracker.get(&node(0x01), &ledger(0x20)).unwrap().prop_seq, 0);
     }
 
     #[test]
@@ -290,7 +278,10 @@ mod tests {
         assert!(tracker.track(make_proposal(node(0x03), ledger(0x10), 2)));
         assert_eq!(tracker.count_for(&ledger(0x10)), 3);
         let seqs: Vec<u32> = {
-            let mut v: Vec<u32> = tracker.iter_for(&ledger(0x10)).map(|p| p.prop_seq).collect();
+            let mut v: Vec<u32> = tracker
+                .iter_for(&ledger(0x10))
+                .map(|p| p.prop_seq)
+                .collect();
             v.sort_unstable();
             v
         };

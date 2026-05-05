@@ -9,10 +9,7 @@ use crate::error::RpcServerError;
 ///
 /// Returns the configured validator list. Full UNL integration
 /// will provide dynamic validator information once available.
-pub async fn validators(
-    _params: Value,
-    ctx: &Arc<ServerContext>,
-) -> Result<Value, RpcServerError> {
+pub async fn validators(_params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcServerError> {
     let validator_domains = match ctx.domain_attestation_status.as_ref() {
         Some(handle) => handle
             .read()

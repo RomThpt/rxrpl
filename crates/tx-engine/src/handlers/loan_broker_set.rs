@@ -40,8 +40,8 @@ impl Transactor for LoanBrokerSetTransactor {
         }
 
         // DebtMaximum required, must be > 0
-        let debt_max =
-            helpers::get_u64_str_field(ctx.tx, "DebtMaximum").ok_or(TransactionResult::TemBadAmount)?;
+        let debt_max = helpers::get_u64_str_field(ctx.tx, "DebtMaximum")
+            .ok_or(TransactionResult::TemBadAmount)?;
         if debt_max == 0 {
             return Err(TransactionResult::TemBadAmount);
         }
@@ -109,8 +109,8 @@ impl Transactor for LoanBrokerSetTransactor {
             .to_string();
         let vault_seq = helpers::get_u32_field(ctx.tx, "VaultSequence")
             .ok_or(TransactionResult::TemMalformed)?;
-        let debt_maximum =
-            helpers::get_u64_str_field(ctx.tx, "DebtMaximum").ok_or(TransactionResult::TemBadAmount)?;
+        let debt_maximum = helpers::get_u64_str_field(ctx.tx, "DebtMaximum")
+            .ok_or(TransactionResult::TemBadAmount)?;
         let cover_rate_min = helpers::get_u32_field(ctx.tx, "CoverRateMinimum")
             .ok_or(TransactionResult::TemMalformed)?;
         let cover_rate_liq = helpers::get_u32_field(ctx.tx, "CoverRateLiquidation")
@@ -155,8 +155,7 @@ impl Transactor for LoanBrokerSetTransactor {
         helpers::increment_sequence(&mut account);
         helpers::adjust_owner_count(&mut account, 2);
 
-        let acct_data =
-            serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
+        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
             .map_err(|_| TransactionResult::TefInternal)?;

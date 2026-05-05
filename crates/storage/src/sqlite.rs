@@ -67,7 +67,6 @@ impl SqliteStore {
         )?;
         Ok(())
     }
-
 }
 
 impl TxStore for SqliteStore {
@@ -110,10 +109,7 @@ impl TxStore for SqliteStore {
         Ok(())
     }
 
-    fn get_transaction(
-        &self,
-        tx_hash: &[u8],
-    ) -> Result<Option<TransactionRecord>, StorageError> {
+    fn get_transaction(&self, tx_hash: &[u8]) -> Result<Option<TransactionRecord>, StorageError> {
         let conn = self
             .conn
             .lock()

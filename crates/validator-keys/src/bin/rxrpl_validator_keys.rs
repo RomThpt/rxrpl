@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use rxrpl_validator_keys::{
-    encode_node_public_key, generate_manifest, generate_master, KeyType, ValidatorKeysFile,
+    KeyType, ValidatorKeysFile, encode_node_public_key, generate_manifest, generate_master,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

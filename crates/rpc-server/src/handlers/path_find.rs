@@ -21,21 +21,18 @@ pub fn parse_path_find_params(params: &Value) -> Result<PathFindSubscription, Rp
     let dest_str = params
         .get("destination_account")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            RpcServerError::InvalidParams("missing 'destination_account'".into())
-        })?;
+        .ok_or_else(|| RpcServerError::InvalidParams("missing 'destination_account'".into()))?;
 
-    let dest_amount = params.get("destination_amount").cloned().ok_or_else(|| {
-        RpcServerError::InvalidParams("missing 'destination_amount'".into())
-    })?;
+    let dest_amount = params
+        .get("destination_amount")
+        .cloned()
+        .ok_or_else(|| RpcServerError::InvalidParams("missing 'destination_amount'".into()))?;
 
-    let source = decode_account_id(source_str).map_err(|e| {
-        RpcServerError::InvalidParams(format!("invalid source_account: {e}"))
-    })?;
+    let source = decode_account_id(source_str)
+        .map_err(|e| RpcServerError::InvalidParams(format!("invalid source_account: {e}")))?;
 
-    let destination = decode_account_id(dest_str).map_err(|e| {
-        RpcServerError::InvalidParams(format!("invalid destination_account: {e}"))
-    })?;
+    let destination = decode_account_id(dest_str)
+        .map_err(|e| RpcServerError::InvalidParams(format!("invalid destination_account: {e}")))?;
 
     let source_currencies =
         if let Some(arr) = params.get("source_currencies").and_then(|v| v.as_array()) {
@@ -101,10 +98,7 @@ fn alternatives_to_json(alternatives: &[PathAlternative]) -> Vec<Value> {
 }
 
 /// Build the full response JSON for a path_find create result.
-pub fn build_path_find_response(
-    sub: &PathFindSubscription,
-    alts_json: &[Value],
-) -> Value {
+pub fn build_path_find_response(sub: &PathFindSubscription, alts_json: &[Value]) -> Value {
     serde_json::json!({
         "alternatives": alts_json,
         "destination_account": sub.destination_account_str,

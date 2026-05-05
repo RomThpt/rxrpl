@@ -36,8 +36,8 @@
 //! also invoke [`Self::prune_below`] to evict stale entries from
 //! `self.latest` and the persistent trie so the fast path applies.
 
-use std::sync::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use rxrpl_primitives::Hash256;
 
@@ -150,11 +150,7 @@ impl ValidationsTrie {
     /// `LedgerTrie<Ledger>` semantics.
     ///
     /// Same return contract as [`Self::add`].
-    pub fn add_with_parents(
-        &mut self,
-        validation: Validation,
-        parent_branch: &[Hash256],
-    ) -> bool {
+    pub fn add_with_parents(&mut self, validation: Validation, parent_branch: &[Hash256]) -> bool {
         let node_id = validation.node_id;
         if !self.trusted.contains(&node_id) {
             return false;
@@ -187,13 +183,7 @@ impl ValidationsTrie {
             self.trie.remove(&prev.branch, 1);
         }
         self.trie.insert(&branch, 1);
-        self.latest.insert(
-            node_id,
-            Entry {
-                validation,
-                branch,
-            },
-        );
+        self.latest.insert(node_id, Entry { validation, branch });
         self.invalidate_cache();
         true
     }
@@ -368,7 +358,11 @@ mod tests {
 
         assert!(agg.add(validation(1, 0xBB, 6, 110)));
 
-        assert_eq!(agg.count_for(&hash(0xAA)), 1, "node 1's old vote not removed");
+        assert_eq!(
+            agg.count_for(&hash(0xAA)),
+            1,
+            "node 1's old vote not removed"
+        );
         assert_eq!(agg.count_for(&hash(0xBB)), 1, "node 1's new vote not added");
     }
 
@@ -615,16 +609,10 @@ mod tests {
         let mut agg = ValidationsTrie::new();
         agg.add_trusted(node(1));
 
-        assert!(agg.add_with_parents(
-            validation(1, 0xCC, 5, 100),
-            &[hash(0xAA), hash(0xBB)],
-        ));
+        assert!(agg.add_with_parents(validation(1, 0xCC, 5, 100), &[hash(0xAA), hash(0xBB)],));
         assert_eq!(agg.count_for(&hash(0xCC)), 1);
 
-        assert!(agg.add_with_parents(
-            validation(1, 0xEE, 6, 110),
-            &[hash(0xAA), hash(0xDD)],
-        ));
+        assert!(agg.add_with_parents(validation(1, 0xEE, 6, 110), &[hash(0xAA), hash(0xDD)],));
         assert_eq!(agg.count_for(&hash(0xCC)), 0, "old tip not removed");
         assert_eq!(agg.count_for(&hash(0xBB)), 0, "old parent not removed");
         assert_eq!(agg.count_for(&hash(0xEE)), 1, "new tip credited");
@@ -635,10 +623,7 @@ mod tests {
     fn add_with_parents_remove_trusted_drops_full_branch() {
         let mut agg = ValidationsTrie::new();
         agg.add_trusted(node(1));
-        assert!(agg.add_with_parents(
-            validation(1, 0xCC, 5, 100),
-            &[hash(0xAA), hash(0xBB)],
-        ));
+        assert!(agg.add_with_parents(validation(1, 0xCC, 5, 100), &[hash(0xAA), hash(0xBB)],));
         assert_eq!(agg.count_for(&hash(0xCC)), 1);
 
         agg.remove_trusted(&node(1));

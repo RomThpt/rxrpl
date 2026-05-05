@@ -146,8 +146,7 @@ fn check_permissioned_asset(
         None => return Ok(()),
     };
 
-    let issuer_id =
-        decode_account_id(issuer_str).map_err(|_| TransactionResult::TemMalformed)?;
+    let issuer_id = decode_account_id(issuer_str).map_err(|_| TransactionResult::TemMalformed)?;
     let issuer_key = keylet::account(&issuer_id);
 
     let issuer_bytes = match ctx.view.read(&issuer_key) {
@@ -176,10 +175,7 @@ fn check_permissioned_asset(
         let domain: Value =
             serde_json::from_slice(&domain_bytes).map_err(|_| TransactionResult::TemMalformed)?;
 
-        if let Some(accepted) = domain
-            .get("AcceptedCredentials")
-            .and_then(|v| v.as_array())
-        {
+        if let Some(accepted) = domain.get("AcceptedCredentials").and_then(|v| v.as_array()) {
             for entry in accepted {
                 let cred_issuer_str = entry
                     .get("AcceptedCredential")
@@ -192,8 +188,7 @@ fn check_permissioned_asset(
 
                 if let (Some(ci_str), Some(ct)) = (cred_issuer_str, cred_type) {
                     if let Ok(ci_id) = decode_account_id(ci_str) {
-                        let cred_key =
-                            keylet::credential(trader_id, &ci_id, ct.as_bytes());
+                        let cred_key = keylet::credential(trader_id, &ci_id, ct.as_bytes());
                         if ctx.view.exists(&cred_key) {
                             return Ok(()); // Trader holds an accepted credential
                         }

@@ -309,9 +309,7 @@ pub fn derive_seed_from_params(
     // valid family seed (preserves the legacy behavior for callers that
     // really meant a passphrase).
     if let Some(secret_str) = params.get("secret").and_then(|v| v.as_str()) {
-        if let Ok((entropy, _kt)) =
-            rxrpl_codec::address::seed::decode_seed(secret_str)
-        {
+        if let Ok((entropy, _kt)) = rxrpl_codec::address::seed::decode_seed(secret_str) {
             return Ok((rxrpl_crypto::Seed::from_bytes(entropy), key_type));
         }
         // Fall back to passphrase hashing for non-base58 strings.

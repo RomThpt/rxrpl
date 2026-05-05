@@ -16,7 +16,6 @@
 ///   The manifest body (everything except sfMasterSignature) prefixed with
 ///   `HashPrefix::MANIFEST` is signed by both the ephemeral key (sfSignature)
 ///   and the master key (sfMasterSignature).
-
 use std::collections::HashMap;
 
 use rxrpl_primitives::PublicKey;
@@ -81,8 +80,8 @@ struct RawManifest {
     sequence: u32,
     master_public_key: Vec<u8>,
     ephemeral_public_key: Vec<u8>,
-    signature: Vec<u8>,         // ephemeral sig
-    master_signature: Vec<u8>,  // master sig
+    signature: Vec<u8>,        // ephemeral sig
+    master_signature: Vec<u8>, // master sig
     domain: Option<String>,
     /// The data covered by both signatures: everything except sfMasterSignature.
     signing_data: Vec<u8>,
@@ -247,7 +246,11 @@ pub fn parse_and_verify(data: &[u8]) -> Result<Manifest, ManifestError> {
     let raw = parse_raw(data)?;
 
     // Verify master signature over signing_data
-    if !verify_signature(&raw.signing_data, &raw.master_public_key, &raw.master_signature) {
+    if !verify_signature(
+        &raw.signing_data,
+        &raw.master_public_key,
+        &raw.master_signature,
+    ) {
         return Err(ManifestError::MasterSigInvalid);
     }
 
@@ -771,8 +774,8 @@ mod tests {
             rxrpl_crypto::KeyType::Ed25519,
         );
 
-        let raw = create_signed(&master, &ephemeral, 42, Some("example.com"))
-            .expect("create_signed");
+        let raw =
+            create_signed(&master, &ephemeral, 42, Some("example.com")).expect("create_signed");
         let parsed = parse_and_verify(&raw).expect("parse_and_verify");
 
         assert_eq!(parsed.sequence, 42);
@@ -811,8 +814,7 @@ mod tests {
         stobject::put_vl(&mut signing_data, 3, eph_kp.public_key.as_bytes());
         stobject::put_vl(&mut signing_data, 7, invalid_domain);
 
-        let eph_sig =
-            rxrpl_crypto::ed25519::sign(&signing_data, &eph_kp.private_key).unwrap();
+        let eph_sig = rxrpl_crypto::ed25519::sign(&signing_data, &eph_kp.private_key).unwrap();
         let master_sig =
             rxrpl_crypto::ed25519::sign(&signing_data, &master_kp.private_key).unwrap();
 

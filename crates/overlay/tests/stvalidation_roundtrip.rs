@@ -41,25 +41,25 @@ fn arb_validation() -> impl Strategy<Value = Validation> {
     (
         // 12-tuple limit forces grouping
         (
-            any::<u32>(),                        // ledger_seq
-            any::<u32>(),                        // close_time (will be overwritten on decode)
-            any::<u32>(),                        // sign_time
-            arb_hash(),                          // ledger_hash
-            any::<bool>(),                       // full
-            arb_amendments(),                    // amendments
+            any::<u32>(),     // ledger_seq
+            any::<u32>(),     // close_time (will be overwritten on decode)
+            any::<u32>(),     // sign_time
+            arb_hash(),       // ledger_hash
+            any::<bool>(),    // full
+            arb_amendments(), // amendments
         ),
         (
-            proptest::option::of(any::<u32>()),  // load_fee
-            proptest::option::of(any::<u64>()),  // base_fee
-            proptest::option::of(any::<u32>()),  // reserve_base
-            proptest::option::of(any::<u32>()),  // reserve_increment
-            proptest::option::of(any::<u64>()),  // cookie
-            proptest::option::of(arb_hash()),    // consensus_hash
-            proptest::option::of(arb_hash()),    // validated_hash
-            proptest::option::of(any::<u64>()),  // server_version
-            proptest::option::of(any::<u64>()),  // base_fee_drops (XRP amount, top bit cleared by encoder)
-            proptest::option::of(any::<u64>()),  // reserve_base_drops
-            proptest::option::of(any::<u64>()),  // reserve_increment_drops
+            proptest::option::of(any::<u32>()), // load_fee
+            proptest::option::of(any::<u64>()), // base_fee
+            proptest::option::of(any::<u32>()), // reserve_base
+            proptest::option::of(any::<u32>()), // reserve_increment
+            proptest::option::of(any::<u64>()), // cookie
+            proptest::option::of(arb_hash()),   // consensus_hash
+            proptest::option::of(arb_hash()),   // validated_hash
+            proptest::option::of(any::<u64>()), // server_version
+            proptest::option::of(any::<u64>()), // base_fee_drops (XRP amount, top bit cleared by encoder)
+            proptest::option::of(any::<u64>()), // reserve_base_drops
+            proptest::option::of(any::<u64>()), // reserve_increment_drops
         ),
     )
         .prop_map(|((seq, ct, st, lh, full, amends), opts)| {

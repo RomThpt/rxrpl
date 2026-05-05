@@ -24,10 +24,8 @@ pub async fn account_tx(params: Value, ctx: &Arc<ServerContext>) -> Result<Value
 
             let mut transactions = Vec::new();
             for record in &records {
-                let tx_json: Value =
-                    serde_json::from_slice(&record.tx_blob).unwrap_or(Value::Null);
-                let meta: Value =
-                    serde_json::from_slice(&record.meta_blob).unwrap_or(Value::Null);
+                let tx_json: Value = serde_json::from_slice(&record.tx_blob).unwrap_or(Value::Null);
+                let meta: Value = serde_json::from_slice(&record.meta_blob).unwrap_or(Value::Null);
                 transactions.push(serde_json::json!({
                     "tx": tx_json,
                     "meta": meta,

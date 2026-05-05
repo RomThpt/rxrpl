@@ -40,10 +40,7 @@ async fn call_dispatch(
 
 #[tonic::async_trait]
 impl XrplNode for XrplNodeService {
-    async fn ping(
-        &self,
-        _request: Request<PingRequest>,
-    ) -> Result<Response<PingResponse>, Status> {
+    async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         let _ = call_dispatch(&self.ctx, "ping", serde_json::json!({})).await?;
         Ok(Response::new(PingResponse {}))
     }
@@ -56,10 +53,7 @@ impl XrplNode for XrplNodeService {
         Ok(Response::new(ServerInfoResponse { json_result }))
     }
 
-    async fn fee(
-        &self,
-        _request: Request<FeeRequest>,
-    ) -> Result<Response<FeeResponse>, Status> {
+    async fn fee(&self, _request: Request<FeeRequest>) -> Result<Response<FeeResponse>, Status> {
         let json_result = call_dispatch(&self.ctx, "fee", serde_json::json!({})).await?;
         Ok(Response::new(FeeResponse { json_result }))
     }
@@ -94,10 +88,7 @@ impl XrplNode for XrplNodeService {
         Ok(Response::new(SubmitResponse { json_result }))
     }
 
-    async fn tx(
-        &self,
-        request: Request<TxRequest>,
-    ) -> Result<Response<TxResponse>, Status> {
+    async fn tx(&self, request: Request<TxRequest>) -> Result<Response<TxResponse>, Status> {
         let req = request.into_inner();
         let params = convert::tx_params(&req.transaction);
         let json_result = call_dispatch(&self.ctx, "tx", params).await?;
@@ -108,8 +99,7 @@ impl XrplNode for XrplNodeService {
         &self,
         _request: Request<LedgerClosedRequest>,
     ) -> Result<Response<LedgerClosedResponse>, Status> {
-        let json_result =
-            call_dispatch(&self.ctx, "ledger_closed", serde_json::json!({})).await?;
+        let json_result = call_dispatch(&self.ctx, "ledger_closed", serde_json::json!({})).await?;
         Ok(Response::new(LedgerClosedResponse { json_result }))
     }
 }

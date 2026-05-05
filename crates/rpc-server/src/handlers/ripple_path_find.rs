@@ -34,8 +34,8 @@ pub async fn ripple_path_find(
     let source = decode_account_id(source_str)
         .map_err(|e| RpcServerError::InvalidParams(format!("invalid source_account: {e}")))?;
 
-    let destination = decode_account_id(destination_str)
-        .map_err(|_| RpcServerError::AccountMalformed)?;
+    let destination =
+        decode_account_id(destination_str).map_err(|_| RpcServerError::AccountMalformed)?;
 
     // rippled requires the destination account to exist when sending an
     // issued currency (non-XRP destination_amount).

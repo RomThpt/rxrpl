@@ -362,7 +362,11 @@ mod tests {
         let rep = make_reputation();
         rep.record_ping_latency(100);
         let ls = score.score_latency(&rep);
-        assert!(ls >= 75 && ls <= 100, "good latency score should be 75-100, got {}", ls);
+        assert!(
+            ls >= 75 && ls <= 100,
+            "good latency score should be 75-100, got {}",
+            ls
+        );
     }
 
     #[test]

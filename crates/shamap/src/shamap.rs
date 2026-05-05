@@ -218,9 +218,7 @@ impl SHAMap {
     /// Visit all leaf nodes.
     pub fn for_each(&self, f: &mut impl FnMut(&Hash256, &[u8])) {
         match self.root.as_ref() {
-            SHAMapNode::Inner(inner) => {
-                Self::visit(inner, f, self.store.as_ref(), self.leaf_ctor)
-            }
+            SHAMapNode::Inner(inner) => Self::visit(inner, f, self.store.as_ref(), self.leaf_ctor),
             SHAMapNode::Leaf(leaf) => f(leaf.key(), leaf.data()),
         }
     }
@@ -571,11 +569,9 @@ impl SHAMap {
             Some(arc) => {
                 // Try to unwrap, otherwise clone
                 match Arc::try_unwrap(arc) {
-                    Ok(owned) => {
-                        Self::insert_into_existing(
-                            node, branch, owned, key, leaf, depth, store, leaf_ctor,
-                        )
-                    }
+                    Ok(owned) => Self::insert_into_existing(
+                        node, branch, owned, key, leaf, depth, store, leaf_ctor,
+                    ),
                     Err(shared) => {
                         let owned = (*shared).clone();
                         Self::insert_into_existing(
@@ -705,8 +701,7 @@ impl SHAMap {
                         }
                     }
                     SHAMapNode::Inner(mut inner) => {
-                        let data =
-                            Self::delete_from(&mut inner, key, depth + 1, store, leaf_ctor)?;
+                        let data = Self::delete_from(&mut inner, key, depth + 1, store, leaf_ctor)?;
                         if inner.branch_count() == 0 {
                             // Empty inner, don't re-insert
                         } else if let Some(single) = inner.single_branch() {
@@ -827,7 +822,9 @@ impl SHAMap {
                 let mut mask = inner.branch_mask();
                 while mask != 0 {
                     let branch = mask.trailing_zeros() as u8;
-                    if let Ok(Some(child)) = inner.child_with_store(branch, store.as_ref(), leaf_ctor) {
+                    if let Ok(Some(child)) =
+                        inner.child_with_store(branch, store.as_ref(), leaf_ctor)
+                    {
                         Self::walk_node_hashes(child, store, leaf_ctor, out);
                     } else {
                         // Unresolvable branch: record the hash if known
@@ -891,11 +888,7 @@ impl SHAMap {
     /// so the caller can request the root node first.
     ///
     /// Returns up to `max_count` hashes of missing nodes.
-    pub fn missing_nodes(
-        &self,
-        target_root_hash: Hash256,
-        max_count: usize,
-    ) -> Vec<MissingNode> {
+    pub fn missing_nodes(&self, target_root_hash: Hash256, max_count: usize) -> Vec<MissingNode> {
         if max_count == 0 {
             return Vec::new();
         }
@@ -957,8 +950,13 @@ impl SHAMap {
                 if let Some(child) = inner.child(branch) {
                     if let SHAMapNode::Inner(child_inner) = child.as_ref() {
                         Self::collect_missing(
-                            child_inner, store, leaf_ctor, max_count,
-                            depth + 1, child_key, out,
+                            child_inner,
+                            store,
+                            leaf_ctor,
+                            max_count,
+                            depth + 1,
+                            child_key,
+                            out,
                         );
                     }
                 }
@@ -982,8 +980,13 @@ impl SHAMap {
                             {
                                 if let SHAMapNode::Inner(child_inner) = &node {
                                     Self::collect_missing(
-                                        child_inner, store, leaf_ctor, max_count,
-                                        depth + 1, child_key, out,
+                                        child_inner,
+                                        store,
+                                        leaf_ctor,
+                                        max_count,
+                                        depth + 1,
+                                        child_key,
+                                        out,
                                     );
                                 }
                             }
@@ -1001,11 +1004,7 @@ impl SHAMap {
     /// The node data is stored via `store.store_batch()`. Lazy loading will pick
     /// it up when the tree is traversed. Returns `Ok(true)` if the node was new
     /// (not already present), `Ok(false)` if it was already in the store.
-    pub fn add_raw_node(
-        &mut self,
-        hash: Hash256,
-        data: Vec<u8>,
-    ) -> Result<bool, SHAMapError> {
+    pub fn add_raw_node(&mut self, hash: Hash256, data: Vec<u8>) -> Result<bool, SHAMapError> {
         let store = self.store.as_ref().ok_or(SHAMapError::MissingStore)?;
 
         // Check if already present.
@@ -1024,9 +1023,7 @@ impl SHAMap {
     /// if any branch cannot be resolved (missing store or missing node).
     pub fn is_complete(&self) -> bool {
         match self.root.as_ref() {
-            SHAMapNode::Inner(inner) => {
-                Self::check_complete(inner, &self.store, self.leaf_ctor)
-            }
+            SHAMapNode::Inner(inner) => Self::check_complete(inner, &self.store, self.leaf_ctor),
             SHAMapNode::Leaf(_) => true,
         }
     }
@@ -1666,7 +1663,8 @@ mod tests {
         assert!(diffs.contains(&DiffEntry::Added { key: k4 }));
         // k3 should NOT appear in diffs
         assert!(!diffs.iter().any(|d| match d {
-            DiffEntry::Added { key } | DiffEntry::Removed { key } | DiffEntry::Modified { key } => *key == k3,
+            DiffEntry::Added { key } | DiffEntry::Removed { key } | DiffEntry::Modified { key } =>
+                *key == k3,
         }));
     }
 
@@ -1754,8 +1752,7 @@ mod tests {
         let root_hash = map.flush().unwrap();
 
         // Reconstruct from root hash
-        let loaded =
-            SHAMap::from_root_hash(root_hash, LeafNode::account_state, store).unwrap();
+        let loaded = SHAMap::from_root_hash(root_hash, LeafNode::account_state, store).unwrap();
         assert_eq!(loaded.get(&k1), Some(&[1][..]));
         assert_eq!(loaded.get(&k2), Some(&[2][..]));
         assert_eq!(loaded.get(&k3), Some(&[3][..]));
@@ -1773,8 +1770,7 @@ mod tests {
 
         let root_hash = map.flush().unwrap();
 
-        let loaded =
-            SHAMap::from_root_hash(root_hash, LeafNode::account_state, store).unwrap();
+        let loaded = SHAMap::from_root_hash(root_hash, LeafNode::account_state, store).unwrap();
         let items: Vec<_> = loaded.iter().collect();
         assert_eq!(items.len(), 2);
     }
@@ -1789,8 +1785,7 @@ mod tests {
 
         let root_hash = map.flush().unwrap();
 
-        let loaded =
-            SHAMap::from_root_hash(root_hash, LeafNode::account_state, store).unwrap();
+        let loaded = SHAMap::from_root_hash(root_hash, LeafNode::account_state, store).unwrap();
         let mut visited = Vec::new();
         loaded.for_each(&mut |key, data| {
             visited.push((*key, data.to_vec()));
@@ -1813,16 +1808,14 @@ mod tests {
 
         // Load from store, modify one leaf
         let mut loaded =
-            SHAMap::from_root_hash(root_hash_1, LeafNode::account_state, store.clone())
-                .unwrap();
+            SHAMap::from_root_hash(root_hash_1, LeafNode::account_state, store.clone()).unwrap();
         loaded.put(k1, vec![99]).unwrap();
         let root_hash_2 = loaded.flush().unwrap();
 
         assert_ne!(root_hash_1, root_hash_2);
 
         // Verify the modified tree
-        let reloaded =
-            SHAMap::from_root_hash(root_hash_2, LeafNode::account_state, store).unwrap();
+        let reloaded = SHAMap::from_root_hash(root_hash_2, LeafNode::account_state, store).unwrap();
         assert_eq!(reloaded.get(&k1), Some(&[99][..]));
         assert_eq!(reloaded.get(&k2), Some(&[2][..]));
     }

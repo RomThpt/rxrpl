@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rxrpl_primitives::Hash256;
 
 use crate::adapter::ConsensusAdapter;
-use crate::close_resolution::{next_resolution, AdaptiveCloseTime};
+use crate::close_resolution::{AdaptiveCloseTime, next_resolution};
 use crate::error::ConsensusError;
 use crate::negative_unl::{NegativeUnlChange, NegativeUnlTracker};
 use crate::params::ConsensusParams;
@@ -176,7 +176,13 @@ const FUTURE_PROPOSALS_STALE_LEDGERS: u32 = 5;
 
 impl<A: ConsensusAdapter> ConsensusEngine<A> {
     pub fn new(adapter: A, node_id: NodeId, params: ConsensusParams) -> Self {
-        Self::new_with_unl(adapter, node_id, Vec::new(), params, TrustedValidatorList::empty())
+        Self::new_with_unl(
+            adapter,
+            node_id,
+            Vec::new(),
+            params,
+            TrustedValidatorList::empty(),
+        )
     }
 
     pub fn new_with_unl(
@@ -305,8 +311,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             }
         }
         // Remove any re-enabled validators.
-        let current_nunl: Vec<NodeId> =
-            self.unl.negative_unl_set().iter().copied().collect();
+        let current_nunl: Vec<NodeId> = self.unl.negative_unl_set().iter().copied().collect();
         for n in current_nunl {
             if !self.negative_unl_tracker.disabled_set().contains(&n) {
                 self.unl.remove_from_negative_unl(&n);
@@ -453,10 +458,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         }
 
         // Find the most popular alternative prev_ledger.
-        let (preferred, &count) = ledger_counts
-            .iter()
-            .max_by_key(|&(_, &c)| c)
-            .unwrap();
+        let (preferred, &count) = ledger_counts.iter().max_by_key(|&(_, &c)| c).unwrap();
 
         // Total trusted proposals = those agreeing with us + those disagreeing.
         let agreeing_trusted = self
@@ -539,9 +541,9 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         // C3: bind node_id to public_key — prevents a caller from
         // submitting a validation whose node_id is unrelated to the key
         // that (allegedly) signed it.
-        let derived_node_id = NodeId(rxrpl_crypto::sha512_half::sha512_half(&[
-            validation.public_key.as_slice(),
-        ]));
+        let derived_node_id = NodeId(rxrpl_crypto::sha512_half::sha512_half(&[validation
+            .public_key
+            .as_slice()]));
         if validation.node_id != derived_node_id {
             tracing::warn!(
                 target: "consensus",
@@ -850,7 +852,8 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         if proposal.prev_ledger != self.prev_ledger {
             tracing::debug!(
                 "holding proposal for future prev_ledger (ours={}, theirs={})",
-                self.prev_ledger, proposal.prev_ledger
+                self.prev_ledger,
+                proposal.prev_ledger
             );
             self.wrong_prev_ledger_votes
                 .insert(proposal.node_id, proposal.prev_ledger);
@@ -870,7 +873,8 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             if proposal.ledger_seq != 0 && proposal.ledger_seq != our.ledger_seq {
                 tracing::debug!(
                     "rejected proposal: seq mismatch (ours={}, theirs={})",
-                    our.ledger_seq, proposal.ledger_seq
+                    our.ledger_seq,
+                    proposal.ledger_seq
                 );
                 return;
             }
@@ -884,12 +888,18 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         if !self.proposal_tracker.track(proposal.clone()) {
             tracing::debug!(
                 "dropped duplicate/older proposal from {:?} seq={} prop_seq={}",
-                proposal.node_id, proposal.ledger_seq, proposal.prop_seq
+                proposal.node_id,
+                proposal.ledger_seq,
+                proposal.prop_seq
             );
             return;
         }
 
-        tracing::debug!("accepted proposal from {:?} seq={}", proposal.node_id, proposal.ledger_seq);
+        tracing::debug!(
+            "accepted proposal from {:?} seq={}",
+            proposal.node_id,
+            proposal.ledger_seq
+        );
         let node_id = proposal.node_id;
         self.peer_positions.insert(node_id, proposal);
         self.create_disputes();
@@ -1046,7 +1056,11 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         }
         let resolution = self.adaptive_close_time.resolution();
         let prior = self.prior_close_time;
-        let our_time = self.our_position.as_ref().map(|p| p.close_time).unwrap_or(0);
+        let our_time = self
+            .our_position
+            .as_ref()
+            .map(|p| p.close_time)
+            .unwrap_or(0);
         let min_allowed = prior.saturating_add(1);
 
         // Same filter-don't-clamp policy as `effective_close_time` (H11):
@@ -1869,8 +1883,13 @@ mod tests {
     fn untrusted_proposal_ignored_with_unl() {
         let unl = make_unl(&[1, 2, 3]);
         let adapter = SimpleAdapter;
-        let mut engine =
-            ConsensusEngine::new_with_unl(adapter, node(1), Vec::new(), ConsensusParams::default(), unl);
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
         engine.start_round(Hash256::ZERO, 1);
 
         let set = TxSet::new(vec![]);
@@ -1885,8 +1904,13 @@ mod tests {
     fn trusted_proposal_accepted_with_unl() {
         let unl = make_unl(&[1, 2, 3]);
         let adapter = SimpleAdapter;
-        let mut engine =
-            ConsensusEngine::new_with_unl(adapter, node(1), Vec::new(), ConsensusParams::default(), unl);
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
         engine.start_round(Hash256::ZERO, 1);
 
         let set = TxSet::new(vec![]);
@@ -1901,8 +1925,13 @@ mod tests {
     fn mismatched_prev_ledger_ignored() {
         let unl = make_unl(&[1, 2]);
         let adapter = SimpleAdapter;
-        let mut engine =
-            ConsensusEngine::new_with_unl(adapter, node(1), Vec::new(), ConsensusParams::default(), unl);
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
         engine.start_round(Hash256::ZERO, 1);
 
         let set = TxSet::new(vec![]);
@@ -1919,8 +1948,13 @@ mod tests {
         // 5-node UNL, quorum = ceil(5*0.8) = 4
         let unl = make_unl(&[1, 2, 3, 4, 5]);
         let adapter = SimpleAdapter;
-        let mut engine =
-            ConsensusEngine::new_with_unl(adapter, node(1), Vec::new(), ConsensusParams::default(), unl);
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
         engine.start_round(Hash256::ZERO, 1);
 
         let set = TxSet::new(vec![]);
@@ -1939,8 +1973,13 @@ mod tests {
         // 5-node UNL, quorum = 4. Us (node 1) + nodes 2, 3, 4 = 4.
         let unl = make_unl(&[1, 2, 3, 4, 5]);
         let adapter = SimpleAdapter;
-        let mut engine =
-            ConsensusEngine::new_with_unl(adapter, node(1), Vec::new(), ConsensusParams::default(), unl);
+        let mut engine = ConsensusEngine::new_with_unl(
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
+        );
         engine.start_round(Hash256::ZERO, 1);
 
         let set = TxSet::new(vec![]);
@@ -1975,7 +2014,11 @@ mod tests {
         let unl = make_unl(&[1, 2]);
         let adapter = SimpleAdapter;
         let mut engine = ConsensusEngine::new_with_unl(
-            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
         );
         engine.start_round(Hash256::ZERO, 1);
 
@@ -1987,7 +2030,10 @@ mod tests {
 
         // Held, not accepted.
         assert!(engine.peer_positions.is_empty());
-        assert_eq!(engine.future_proposals.get(&future_prev).map(|v| v.len()), Some(1));
+        assert_eq!(
+            engine.future_proposals.get(&future_prev).map(|v| v.len()),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1998,7 +2044,11 @@ mod tests {
         let unl = make_unl(&[1, 2, 3]);
         let adapter = SimpleAdapter;
         let mut engine = ConsensusEngine::new_with_unl(
-            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
         );
         engine.start_round(Hash256::ZERO, 1);
 
@@ -2031,7 +2081,11 @@ mod tests {
         let unl = make_unl(&[1, 2]);
         let adapter = SimpleAdapter;
         let mut engine = ConsensusEngine::new_with_unl(
-            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
         );
         engine.start_round(Hash256::ZERO, 1);
 
@@ -2060,7 +2114,11 @@ mod tests {
         let unl = make_unl(&[1, 2]);
         let adapter = SimpleAdapter;
         let mut engine = ConsensusEngine::new_with_unl(
-            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
         );
         engine.start_round(Hash256::ZERO, 1);
         let set = TxSet::new(vec![]);
@@ -2072,7 +2130,10 @@ mod tests {
         assert!(engine.future_proposals.contains_key(&stale_prev));
 
         // Jump forward many rounds. Stale proposals get evicted.
-        engine.start_round(Hash256::new([0xDD; 32]), 2 + FUTURE_PROPOSALS_STALE_LEDGERS + 1);
+        engine.start_round(
+            Hash256::new([0xDD; 32]),
+            2 + FUTURE_PROPOSALS_STALE_LEDGERS + 1,
+        );
         assert!(engine.future_proposals.is_empty());
     }
 
@@ -2081,7 +2142,11 @@ mod tests {
         let unl = make_unl(&[1, 2]);
         let adapter = SimpleAdapter;
         let mut engine = ConsensusEngine::new_with_unl(
-            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
         );
         engine.start_round(Hash256::ZERO, 1);
         let set = TxSet::new(vec![]);
@@ -2100,7 +2165,11 @@ mod tests {
         let unl = make_unl(&[1, 2]);
         let adapter = SimpleAdapter;
         let mut engine = ConsensusEngine::new_with_unl(
-            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
         );
         engine.start_round(Hash256::ZERO, 1);
         let set = TxSet::new(vec![]);
@@ -2143,7 +2212,11 @@ mod tests {
         let unl = make_unl(&[1, 2, 3, 4, 5]);
         let adapter = SimpleAdapter;
         let mut engine = ConsensusEngine::new_with_unl(
-            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
         );
         let our_prev = Hash256::ZERO;
         engine.start_round(our_prev, 1);
@@ -2172,7 +2245,11 @@ mod tests {
         let unl = make_unl(&[1, 2, 3, 4, 5]);
         let adapter = SimpleAdapter;
         let mut engine = ConsensusEngine::new_with_unl(
-            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
         );
         engine.start_round(Hash256::ZERO, 1);
 
@@ -2197,7 +2274,11 @@ mod tests {
         let unl = make_unl(&[1, 2, 3, 4, 5]);
         let adapter = SimpleAdapter;
         let mut engine = ConsensusEngine::new_with_unl(
-            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
         );
         engine.start_round(Hash256::ZERO, 1);
 
@@ -2228,7 +2309,11 @@ mod tests {
         let unl = make_unl(&[1, 2, 3]);
         let adapter = SimpleAdapter;
         let mut engine = ConsensusEngine::new_with_unl(
-            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
         );
         engine.start_round(Hash256::ZERO, 1);
 
@@ -2249,7 +2334,11 @@ mod tests {
         let unl = make_unl(&[1, 2, 3]);
         let adapter = SimpleAdapter;
         let mut engine = ConsensusEngine::new_with_unl(
-            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
         );
         engine.start_round(Hash256::ZERO, 1);
 
@@ -2275,7 +2364,11 @@ mod tests {
         let unl = make_unl(&[1, 2, 3, 4, 5]);
         let adapter = SimpleAdapter;
         let mut engine = ConsensusEngine::new_with_unl(
-            adapter, node(1), Vec::new(), ConsensusParams::default(), unl,
+            adapter,
+            node(1),
+            Vec::new(),
+            ConsensusParams::default(),
+            unl,
         );
         engine.start_round(Hash256::ZERO, 1);
 
@@ -2697,9 +2790,7 @@ mod tests {
         // round to 60 at the default 30s resolution, but the clamp pushes
         // it to 101.
         engine.start_round_with_prior(Hash256::ZERO, 1, 100);
-        engine
-            .close_ledger(TxSet::new(vec![]), 50, 1)
-            .unwrap();
+        engine.close_ledger(TxSet::new(vec![]), 50, 1).unwrap();
         assert!(engine.converge());
         let ct1 = engine.accepted_close_time().expect("round 1 close time");
         assert!(
@@ -2712,9 +2803,7 @@ mod tests {
         // 50, must clamp to >= ct1 + 1 (>= 102), demonstrating monotonicity
         // across rounds.
         engine.start_round_with_prior(Hash256::ZERO, 2, ct1);
-        engine
-            .close_ledger(TxSet::new(vec![]), 50, 2)
-            .unwrap();
+        engine.close_ledger(TxSet::new(vec![]), 50, 2).unwrap();
         assert!(engine.converge());
         let ct2 = engine.accepted_close_time().expect("round 2 close time");
         assert!(
@@ -3045,10 +3134,7 @@ mod tests {
     /// Build a 3-node engine driven into Establish phase, with us=node(1)
     /// and a single-tx local set so peer proposals against a *different*
     /// tx_set materialise dispute votes we can assert on.
-    fn dedup_engine(
-        local_set: TxSet,
-        peer_set: TxSet,
-    ) -> ConsensusEngine<MockAdapter> {
+    fn dedup_engine(local_set: TxSet, peer_set: TxSet) -> ConsensusEngine<MockAdapter> {
         let unl = make_unl(&[1, 2, 3]);
         let adapter = MockAdapter::with_tx_sets(vec![local_set.clone(), peer_set]);
         let mut engine = ConsensusEngine::new_with_unl(
@@ -3155,11 +3241,7 @@ mod tests {
         };
         engine.peer_proposal_at(high, 100);
         assert_eq!(
-            engine
-                .peer_positions
-                .get(&node(2))
-                .unwrap()
-                .tx_set_hash,
+            engine.peer_positions.get(&node(2)).unwrap().tx_set_hash,
             peer_set_a.hash
         );
 
@@ -3228,14 +3310,7 @@ mod tests {
             signature: None,
         };
         engine.peer_proposal_at(first, 100);
-        assert_eq!(
-            engine
-                .peer_positions
-                .get(&node(2))
-                .unwrap()
-                .prop_seq,
-            0
-        );
+        assert_eq!(engine.peer_positions.get(&node(2)).unwrap().prop_seq, 0);
 
         let updated = Proposal {
             node_id: node(2),

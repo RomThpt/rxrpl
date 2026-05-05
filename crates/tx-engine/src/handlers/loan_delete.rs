@@ -23,8 +23,8 @@ impl Transactor for LoanDeleteTransactor {
             .ok_or(TransactionResult::TemMalformed)?;
         let _broker_seq = helpers::get_u32_field(ctx.tx, "LoanBrokerSequence")
             .ok_or(TransactionResult::TemMalformed)?;
-        let loan_seq =
-            helpers::get_u32_field(ctx.tx, "LoanSequence").ok_or(TransactionResult::TemMalformed)?;
+        let loan_seq = helpers::get_u32_field(ctx.tx, "LoanSequence")
+            .ok_or(TransactionResult::TemMalformed)?;
 
         let broker_owner_id = decode_account_id(broker_owner_str)
             .map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -79,8 +79,8 @@ impl Transactor for LoanDeleteTransactor {
             .to_string();
         let broker_seq = helpers::get_u32_field(ctx.tx, "LoanBrokerSequence")
             .ok_or(TransactionResult::TemMalformed)?;
-        let loan_seq =
-            helpers::get_u32_field(ctx.tx, "LoanSequence").ok_or(TransactionResult::TemMalformed)?;
+        let loan_seq = helpers::get_u32_field(ctx.tx, "LoanSequence")
+            .ok_or(TransactionResult::TemMalformed)?;
 
         let broker_owner_id = decode_account_id(&broker_owner_str)
             .map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -150,8 +150,7 @@ impl Transactor for LoanDeleteTransactor {
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
         helpers::increment_sequence(&mut account);
 
-        let acct_data =
-            serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
+        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
             .map_err(|_| TransactionResult::TefInternal)?;

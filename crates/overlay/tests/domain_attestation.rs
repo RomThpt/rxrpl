@@ -45,8 +45,7 @@ async fn e2e_valid_attestation_round_trip() {
         })
         .await;
 
-    let fetcher =
-        DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
+    let fetcher = DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
     let result = fetcher.fetch_and_verify("example.com", &key).await;
     assert_eq!(result.unwrap(), true);
     mock.assert_async().await;
@@ -64,8 +63,7 @@ async fn e2e_validator_key_absent_returns_false() {
         })
         .await;
 
-    let fetcher =
-        DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
+    let fetcher = DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
     let result = fetcher.fetch_and_verify("example.com", &key).await;
     assert_eq!(result.unwrap(), false);
 }
@@ -81,8 +79,7 @@ async fn e2e_http_404_is_error() {
         })
         .await;
 
-    let fetcher =
-        DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
+    let fetcher = DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
     let result = fetcher.fetch_and_verify("example.com", &key).await;
     assert!(result.is_err());
 }
@@ -100,8 +97,7 @@ async fn e2e_service_populates_cache_and_json_snapshot() {
         .await;
 
     let cache = new_cache();
-    let fetcher =
-        DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
+    let fetcher = DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
     let svc = DomainAttestationService::new(
         vec![
             AttestationTarget {
@@ -142,13 +138,9 @@ async fn e2e_cache_hit_skips_http_when_within_ttl() {
         })
         .await;
 
-    let fetcher =
-        DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
+    let fetcher = DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
     let mut cache = AttestationCache::new();
-    let verified = fetcher
-        .fetch_and_verify("example.com", &key)
-        .await
-        .unwrap();
+    let verified = fetcher.fetch_and_verify("example.com", &key).await.unwrap();
     cache.record_result(&key, "example.com", verified, 1000);
     mock.assert_hits_async(1).await;
 
@@ -171,8 +163,7 @@ async fn e2e_invalid_toml_propagates_parse_error() {
         })
         .await;
 
-    let fetcher =
-        DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
+    let fetcher = DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
     let err = fetcher
         .fetch_and_verify("example.com", &key)
         .await

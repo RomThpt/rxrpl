@@ -105,10 +105,7 @@ fn parse_destination_amount(amount: &serde_json::Value) -> IOUAmount {
         return IOUAmount::ZERO;
     }
 
-    let value_str = amount
-        .get("value")
-        .and_then(|v| v.as_str())
-        .unwrap_or("0");
+    let value_str = amount.get("value").and_then(|v| v.as_str()).unwrap_or("0");
 
     let value: f64 = value_str.parse().unwrap_or(0.0);
     if value == 0.0 || !value.is_finite() {

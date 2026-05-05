@@ -147,7 +147,10 @@ mod tests {
     fn starting_ledger_parses() {
         assert_eq!(StartingLedger::parse("recent"), Ok(StartingLedger::Recent));
         assert_eq!(StartingLedger::parse("RECENT"), Ok(StartingLedger::Recent));
-        assert_eq!(StartingLedger::parse("12345"), Ok(StartingLedger::Seq(12345)));
+        assert_eq!(
+            StartingLedger::parse("12345"),
+            Ok(StartingLedger::Seq(12345))
+        );
         let h = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
         match StartingLedger::parse(h).unwrap() {
             StartingLedger::Hash(_) => {}
@@ -265,9 +268,12 @@ mod tests {
         for i in 0u8..28 {
             let _ = anchor.add(&val(i, 100, h, i));
         }
-        assert_eq!(anchor.resolved_hash(), Some(h),
+        assert_eq!(
+            anchor.resolved_hash(),
+            Some(h),
             "anchor on its own treats all distinct keys as quorum — \
-             callers (run_networked) MUST pre-filter via UNL trust");
+             callers (run_networked) MUST pre-filter via UNL trust"
+        );
     }
 
     #[test]
