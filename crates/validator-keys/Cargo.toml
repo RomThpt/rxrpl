@@ -1,0 +1,22 @@
+[package]
+name = "rxrpl-validator-keys"
+description = "XRPL validator keypair generation, manifest signing, and rippled-compatible keychain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rxrpl-validator-keys"
+path = "src/bin/rxrpl_validator_keys.rs"
+
+[dependencies]
+rxrpl-primitives = { workspace = true }
+rxrpl-crypto = { workspace = true }
+rxrpl-codec = { workspace = true }
+rxrpl-overlay = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
