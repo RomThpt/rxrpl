@@ -328,3 +328,67 @@ async fn standalone_submit_queues_and_close_clears() {
         assert_eq!(q.len(), 0, "expected empty queue after ledger close");
     }
 }
+
+// Regression: DelegateSet with string PermissionValue must round-trip through
+// sign+submit without producing an empty engine_result.
+#[tokio::test]
+async fn standalone_delegate_set_string_permission() {
+    let port = available_port();
+    let mut config = NodeConfig::default();
+    config.server.bind = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let owner_seed = Seed::from_passphrase("delegate_owner");
+    let owner_kp = KeyPair::from_seed(&owner_seed, KeyType::Secp256k1);
+    let owner_addr = encode_classic_address_from_pubkey(owner_kp.public_key.as_bytes());
+
+    let target_seed = Seed::from_passphrase("delegate_target");
+    let target_kp = KeyPair::from_seed(&target_seed, KeyType::Ed25519);
+    let target_addr = encode_classic_address_from_pubkey(target_kp.public_key.as_bytes());
+
+    let node = Node::new_standalone(config, &owner_addr).unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    tokio::spawn(async move {
+        node.run_standalone(3600).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Fund target
+    let pay = json!({
+        "TransactionType": "Payment",
+        "Account": owner_addr,
+        "Destination": target_addr,
+        "Amount": "20000000",
+        "Fee": "12",
+        "Sequence": 1,
+    });
+    let signed = rxrpl_protocol::tx::sign(&pay, &owner_kp).unwrap();
+    let blob = rxrpl_protocol::tx::serialize_signed(&signed).unwrap();
+    let _ = rpc_call(&addr, "submit", json!({ "tx_blob": blob })).await;
+
+    let resp = rpc_call(
+        &addr,
+        "submit",
+        json!({
+            "secret": "delegate_owner",
+            "tx_json": {
+                "TransactionType": "DelegateSet",
+                "Account": owner_addr,
+                "Authorize": target_addr,
+                "Permissions": [{"Permission": {"PermissionValue": "Payment"}}],
+                "Fee": "12",
+                "Sequence": 2,
+            }
+        }),
+    )
+    .await;
+
+    let result = &resp["result"];
+    println!("DELEGATE response: {result}");
+    let er = result["engine_result"].as_str().unwrap_or("");
+    assert!(
+        !er.is_empty(),
+        "expected non-empty engine_result, got: {result:?}"
+    );
+}
