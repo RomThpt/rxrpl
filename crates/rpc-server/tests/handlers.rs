@@ -422,3 +422,166 @@ async fn ledger_info_validated_variant() {
     assert_eq!(l["ledger_index"], 1);
     assert_eq!(l["closed"], true);
 }
+
+// -- account_lines balance sign tests --
+
+/// Build a ledger with a RippleState trust line for `(holder, issuer)` of the
+/// given currency, using rxrpl's internal Balance.value convention:
+///   - issuer is low  → stored value = +amount  (high holds the IOU)
+///   - issuer is high → stored value = -amount  (low holds the IOU)
+fn ledger_with_trust_line(
+    holder_addr: &str,
+    issuer_addr: &str,
+    currency: &str,
+    holder_amount: f64,
+) -> Ledger {
+    let mut ledger = Ledger::genesis();
+
+    let holder_id = decode_account_id(holder_addr).unwrap();
+    let issuer_id = decode_account_id(issuer_addr).unwrap();
+
+    // Create AccountRoot for both.
+    for (addr, id) in [(holder_addr, &holder_id), (issuer_addr, &issuer_id)] {
+        let key = keylet::account(id);
+        let acct = json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": addr,
+            "Balance": "10000000000",
+            "Sequence": 1,
+            "OwnerCount": 1,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&acct).unwrap())
+            .unwrap();
+    }
+
+    // Determine low/high.
+    let issuer_is_low = issuer_id.as_bytes() < holder_id.as_bytes();
+    let (low_addr, high_addr) = if issuer_is_low {
+        (issuer_addr, holder_addr)
+    } else {
+        (holder_addr, issuer_addr)
+    };
+
+    // Internal convention: stored = +amount when issuer_is_low else -amount.
+    let stored = if issuer_is_low {
+        holder_amount
+    } else {
+        -holder_amount
+    };
+    let stored_str = if stored == stored.trunc() {
+        format!("{}", stored as i64)
+    } else {
+        format!("{stored}")
+    };
+
+    let cur_bytes = {
+        let mut b = [0u8; 20];
+        let cb = currency.as_bytes();
+        b[12..12 + cb.len()].copy_from_slice(cb);
+        b
+    };
+    let trust_key = keylet::trust_line(&issuer_id, &holder_id, &cur_bytes);
+
+    let trust = json!({
+        "LedgerEntryType": "RippleState",
+        "Balance": { "currency": currency, "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": stored_str },
+        "LowLimit": { "currency": currency, "issuer": low_addr, "value": "1000" },
+        "HighLimit": { "currency": currency, "issuer": high_addr, "value": "1000" },
+        "Flags": 0,
+    });
+    ledger
+        .put_state(trust_key, serde_json::to_vec(&trust).unwrap())
+        .unwrap();
+
+    // Build minimal owner directory page for the holder pointing at the trust line.
+    let owner_root = keylet::owner_dir(&holder_id);
+    let trust_key_hex = trust_key.to_string();
+    let dir = json!({
+        "LedgerEntryType": "DirectoryNode",
+        "RootIndex": owner_root.to_string(),
+        "Indexes": [trust_key_hex],
+    });
+    ledger
+        .put_state(owner_root, serde_json::to_vec(&dir).unwrap())
+        .unwrap();
+
+    ledger.close(0, 0).unwrap();
+    Ledger::new_open(&ledger)
+}
+
+fn ctx_with_ledger(ledger: Ledger) -> Arc<ServerContext> {
+    let engine = make_engine();
+    let fees = FeeSettings::default();
+    let mut closed = VecDeque::new();
+    closed.push_back(ledger.clone());
+    ServerContext::with_node_state(
+        ServerConfig::default(),
+        Arc::new(RwLock::new(ledger)),
+        Arc::new(RwLock::new(closed)),
+        Arc::new(engine),
+        Arc::new(fees),
+        None,
+        None,
+        None,
+    )
+}
+
+/// Holder is the HIGH account (issuer is low). Holder holds 200 USD.
+/// account_lines for the holder must report a POSITIVE balance "200".
+#[tokio::test]
+async fn account_lines_positive_holder_balance_when_holder_is_high() {
+    // Picked so that issuer < holder lex (issuer is low).
+    let issuer = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    let holder = "rPMh7Pi9ct699iZUTWaytJUoHcJ7cgyziK";
+    let issuer_id = decode_account_id(issuer).unwrap();
+    let holder_id = decode_account_id(holder).unwrap();
+    assert!(
+        issuer_id.as_bytes() < holder_id.as_bytes(),
+        "test setup expects issuer to be the LOW account"
+    );
+
+    let ledger = ledger_with_trust_line(holder, issuer, "USD", 200.0);
+    let ctx = ctx_with_ledger(ledger);
+
+    let result = rxrpl_rpc_server::handlers::account_lines(json!({ "account": holder }), &ctx)
+        .await
+        .unwrap();
+    let lines = result["lines"].as_array().expect("lines array");
+    assert_eq!(lines.len(), 1, "expected one trust line");
+    assert_eq!(lines[0]["account"], issuer);
+    assert_eq!(
+        lines[0]["balance"], "200",
+        "holder should see positive balance"
+    );
+}
+
+/// Holder is the LOW account (issuer is high). Holder holds 200 USD.
+/// account_lines for the holder must still report a POSITIVE balance "200".
+#[tokio::test]
+async fn account_lines_positive_holder_balance_when_holder_is_low() {
+    // Picked so that holder < issuer lex (holder is low).
+    let holder = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    let issuer = "rPMh7Pi9ct699iZUTWaytJUoHcJ7cgyziK";
+    let issuer_id = decode_account_id(issuer).unwrap();
+    let holder_id = decode_account_id(holder).unwrap();
+    assert!(
+        holder_id.as_bytes() < issuer_id.as_bytes(),
+        "test setup expects holder to be the LOW account"
+    );
+
+    let ledger = ledger_with_trust_line(holder, issuer, "USD", 200.0);
+    let ctx = ctx_with_ledger(ledger);
+
+    let result = rxrpl_rpc_server::handlers::account_lines(json!({ "account": holder }), &ctx)
+        .await
+        .unwrap();
+    let lines = result["lines"].as_array().expect("lines array");
+    assert_eq!(lines.len(), 1, "expected one trust line");
+    assert_eq!(lines[0]["account"], issuer);
+    assert_eq!(
+        lines[0]["balance"], "200",
+        "holder should see positive balance"
+    );
+}
