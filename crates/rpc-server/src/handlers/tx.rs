@@ -25,10 +25,8 @@ pub async fn tx(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcSer
                 .map_err(|e| RpcServerError::Internal(format!("storage error: {e}")))?
                 .ok_or(RpcServerError::TxNotFound)?;
 
-            let tx_json: Value =
-                serde_json::from_slice(&record.tx_blob).unwrap_or(Value::Null);
-            let meta: Value =
-                serde_json::from_slice(&record.meta_blob).unwrap_or(Value::Null);
+            let tx_json: Value = serde_json::from_slice(&record.tx_blob).unwrap_or(Value::Null);
+            let meta: Value = serde_json::from_slice(&record.meta_blob).unwrap_or(Value::Null);
 
             return Ok(serde_json::json!({
                 "hash": hash_str,

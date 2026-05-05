@@ -283,7 +283,11 @@ mod tests {
     #[test]
     fn configured_member_keys_returns_all() {
         let mgr = make_manager(vec!["x", "y", "z"]);
-        let mut keys: Vec<&str> = mgr.configured_member_keys().iter().map(|k| k.as_str()).collect();
+        let mut keys: Vec<&str> = mgr
+            .configured_member_keys()
+            .iter()
+            .map(|k| k.as_str())
+            .collect();
         keys.sort();
         assert_eq!(keys, vec!["x", "y", "z"]);
     }

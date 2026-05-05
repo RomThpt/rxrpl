@@ -98,10 +98,7 @@ impl Transactor for CheckCashTransactor {
         let account_key = keylet::account(&account_id);
 
         // Branch on SendMax shape — XRP (string drops) vs IOU (object).
-        let is_iou_check = check
-            .get("SendMax")
-            .map(|v| v.is_object())
-            .unwrap_or(false);
+        let is_iou_check = check.get("SendMax").map(|v| v.is_object()).unwrap_or(false);
 
         if !is_iou_check {
             let send_max: u64 = check["SendMax"]
@@ -127,16 +124,16 @@ impl Transactor for CheckCashTransactor {
                 .view
                 .read(&check_src_key)
                 .ok_or(TransactionResult::TerNoAccount)?;
-            let mut check_src_account: serde_json::Value =
-                serde_json::from_slice(&check_src_bytes).map_err(|_| TransactionResult::TefInternal)?;
+            let mut check_src_account: serde_json::Value = serde_json::from_slice(&check_src_bytes)
+                .map_err(|_| TransactionResult::TefInternal)?;
             let src_balance = helpers::get_balance(&check_src_account);
             if src_balance < cash_amount {
                 return Err(TransactionResult::TecUnfundedPayment);
             }
             helpers::set_balance(&mut check_src_account, src_balance - cash_amount);
             helpers::adjust_owner_count(&mut check_src_account, -1);
-            let check_src_data =
-                serde_json::to_vec(&check_src_account).map_err(|_| TransactionResult::TefInternal)?;
+            let check_src_data = serde_json::to_vec(&check_src_account)
+                .map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
                 .update(check_src_key, check_src_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
@@ -145,8 +142,8 @@ impl Transactor for CheckCashTransactor {
                 .view
                 .read(&account_key)
                 .ok_or(TransactionResult::TerNoAccount)?;
-            let mut account: serde_json::Value =
-                serde_json::from_slice(&account_bytes).map_err(|_| TransactionResult::TefInternal)?;
+            let mut account: serde_json::Value = serde_json::from_slice(&account_bytes)
+                .map_err(|_| TransactionResult::TefInternal)?;
             let dst_balance = helpers::get_balance(&account);
             helpers::set_balance(&mut account, dst_balance + cash_amount);
             helpers::increment_sequence(&mut account);
@@ -159,7 +156,8 @@ impl Transactor for CheckCashTransactor {
             // IOU CheckCash: SendMax is {currency, issuer, value}. Amount/DeliverMin
             // must match the same currency+issuer. Move IOU from check.Account
             // to tx.Account via their respective trust lines.
-            let send_max_obj = check["SendMax"].as_object()
+            let send_max_obj = check["SendMax"]
+                .as_object()
                 .ok_or(TransactionResult::TefInternal)?;
             let currency = send_max_obj
                 .get("currency")
@@ -203,8 +201,8 @@ impl Transactor for CheckCashTransactor {
                 return Err(TransactionResult::TecInsufficientPayment);
             }
 
-            let issuer_id = decode_account_id(issuer)
-                .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+            let issuer_id =
+                decode_account_id(issuer).map_err(|_| TransactionResult::TemInvalidAccountId)?;
             let cur_bytes = helpers::currency_to_bytes(currency);
 
             // Debit check.Account's trust line.
@@ -258,8 +256,8 @@ impl Transactor for CheckCashTransactor {
                 .view
                 .read(&check_src_key)
                 .ok_or(TransactionResult::TerNoAccount)?;
-            let mut src_acct: serde_json::Value =
-                serde_json::from_slice(&src_acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
+            let mut src_acct: serde_json::Value = serde_json::from_slice(&src_acct_bytes)
+                .map_err(|_| TransactionResult::TefInternal)?;
             helpers::adjust_owner_count(&mut src_acct, -1);
             let src_acct_data =
                 serde_json::to_vec(&src_acct).map_err(|_| TransactionResult::TefInternal)?;
@@ -271,8 +269,8 @@ impl Transactor for CheckCashTransactor {
                 .view
                 .read(&account_key)
                 .ok_or(TransactionResult::TerNoAccount)?;
-            let mut dst_acct: serde_json::Value =
-                serde_json::from_slice(&dst_acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
+            let mut dst_acct: serde_json::Value = serde_json::from_slice(&dst_acct_bytes)
+                .map_err(|_| TransactionResult::TefInternal)?;
             helpers::increment_sequence(&mut dst_acct);
             let dst_acct_data =
                 serde_json::to_vec(&dst_acct).map_err(|_| TransactionResult::TefInternal)?;
@@ -327,11 +325,18 @@ fn adjust_iou_balance(
         .parse()
         .map_err(|_| TransactionResult::TemBadAmount)?;
     let issuer_is_low = issuer_id.as_bytes() < holder_id.as_bytes();
-    let new = if issuer_is_low { current + delta } else { current - delta };
+    let new = if issuer_is_low {
+        current + delta
+    } else {
+        current - delta
+    };
     Ok(if new == new.trunc() {
         format!("{}", new as i64)
     } else {
-        format!("{:.15}", new).trim_end_matches('0').trim_end_matches('.').to_string()
+        format!("{:.15}", new)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
     })
 }
 

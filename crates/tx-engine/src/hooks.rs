@@ -99,20 +99,17 @@ pub fn execute_hooks_for_tx(
                     .get("Authorize")
                     .and_then(|v| v.as_str())
                     .and_then(|s| decode_account_id(s).ok().map(|a| a.0));
-                let hook_hash = g
-                    .get("HookHash")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| {
-                        hex::decode(s).ok().and_then(|b| {
-                            if b.len() == 32 {
-                                let mut a = [0u8; 32];
-                                a.copy_from_slice(&b);
-                                Some(a)
-                            } else {
-                                None
-                            }
-                        })
-                    });
+                let hook_hash = g.get("HookHash").and_then(|v| v.as_str()).and_then(|s| {
+                    hex::decode(s).ok().and_then(|b| {
+                        if b.len() == 32 {
+                            let mut a = [0u8; 32];
+                            a.copy_from_slice(&b);
+                            Some(a)
+                        } else {
+                            None
+                        }
+                    })
+                });
                 ctx.grants.push(rxrpl_hooks::HookGrant {
                     authorize,
                     hook_hash,

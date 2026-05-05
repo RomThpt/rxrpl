@@ -200,10 +200,7 @@ mod tests {
         let (_dir, path) = write_temp(b"00112233445566778899aabbccddeeff");
         chmod(&path, 0o640);
         let err = load_seed_file(&path).unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::SeedFilePermissionDenied { .. }
-        ));
+        assert!(matches!(err, ConfigError::SeedFilePermissionDenied { .. }));
     }
 
     #[cfg(unix)]
@@ -215,8 +212,8 @@ mod tests {
         assert_eq!(
             seed.as_bytes(),
             &[
-                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
-                0xdd, 0xee, 0xff
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff
             ]
         );
     }

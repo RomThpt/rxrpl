@@ -188,12 +188,7 @@ fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32, String> {
     if *pos + 4 > data.len() {
         return Err("truncated message: expected u32".into());
     }
-    let val = u32::from_be_bytes([
-        data[*pos],
-        data[*pos + 1],
-        data[*pos + 2],
-        data[*pos + 3],
-    ]);
+    let val = u32::from_be_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
     *pos += 4;
     Ok(val)
 }

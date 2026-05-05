@@ -10,10 +10,10 @@
 ///   - mixed v1+v2 publishers
 use base64::Engine;
 
-use rxrpl_overlay::manifest::{self as manifest_mod, ManifestStore, MANIFEST_REVOKED_SEQ};
+use rxrpl_overlay::manifest::{self as manifest_mod, MANIFEST_REVOKED_SEQ, ManifestStore};
 use rxrpl_overlay::validator_list::{
-    resolve_cascade, verify_and_parse, verify_and_parse_v2, BlobV2Wire, DelegateResolver,
-    ValidatorListError, CASCADE_DEPTH_DEFAULT,
+    BlobV2Wire, CASCADE_DEPTH_DEFAULT, DelegateResolver, ValidatorListError, resolve_cascade,
+    verify_and_parse, verify_and_parse_v2,
 };
 use rxrpl_primitives::PublicKey;
 
@@ -37,8 +37,7 @@ fn build_publisher_manifest(
         None,
     );
     let eph_sig = rxrpl_crypto::ed25519::sign(&signing_data, &eph_kp.private_key).unwrap();
-    let master_sig =
-        rxrpl_crypto::ed25519::sign(&signing_data, &pub_kp.private_key).unwrap();
+    let master_sig = rxrpl_crypto::ed25519::sign(&signing_data, &pub_kp.private_key).unwrap();
     let bytes = manifest_mod::build_manifest_bytes(
         1,
         pub_kp.public_key.as_bytes(),
@@ -75,10 +74,13 @@ fn sign_v1_blob(
         "expiration": expiration,
         "validators": validator_entries,
     });
-    let blob_b64 = base64::engine::general_purpose::STANDARD
-        .encode(serde_json::to_vec(&blob_json).unwrap());
+    let blob_b64 =
+        base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&blob_json).unwrap());
     let sig = rxrpl_crypto::ed25519::sign(blob_b64.as_bytes(), &eph_kp.private_key).unwrap();
-    (blob_b64.into_bytes(), hex::encode(sig.as_bytes()).into_bytes())
+    (
+        blob_b64.into_bytes(),
+        hex::encode(sig.as_bytes()).into_bytes(),
+    )
 }
 
 /// Build one BlobV2Wire signed with `eph_kp`.
@@ -113,8 +115,8 @@ fn sign_v2_blob(
         "validators": validator_entries,
         "delegates": delegate_entries,
     });
-    let blob_b64 = base64::engine::general_purpose::STANDARD
-        .encode(serde_json::to_vec(&blob_json).unwrap());
+    let blob_b64 =
+        base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&blob_json).unwrap());
     let sig = rxrpl_crypto::ed25519::sign(blob_b64.as_bytes(), &eph_kp.private_key).unwrap();
     BlobV2Wire {
         effective_start,
@@ -132,7 +134,8 @@ struct MapResolver {
 
 impl MapResolver {
     fn insert(&mut self, pk: &PublicKey, manifest: Vec<u8>, wire: Vec<BlobV2Wire>) {
-        self.entries.insert(pk.as_bytes().to_vec(), (manifest, wire));
+        self.entries
+            .insert(pk.as_bytes().to_vec(), (manifest, wire));
     }
 }
 
@@ -147,8 +150,7 @@ impl DelegateResolver for MapResolver {
 
 #[test]
 fn b5_v1_backward_compat() {
-    let (_pub_kp, eph_kp, manifest_bytes) =
-        build_publisher_manifest("b5_v1_master", "b5_v1_eph");
+    let (_pub_kp, eph_kp, manifest_bytes) = build_publisher_manifest("b5_v1_master", "b5_v1_eph");
     let (blob, sig) = sign_v1_blob(&eph_kp, 1, 999_999_999, &["b5_v1_val_a", "b5_v1_val_b"]);
 
     let mut store = ManifestStore::new();
@@ -162,7 +164,14 @@ fn b5_v1_backward_compat() {
 fn b5_v2_single_blob_in_window() {
     let (_pub_kp, eph_kp, manifest_bytes) =
         build_publisher_manifest("b5_v2_single_master", "b5_v2_single_eph");
-    let wire = vec![sign_v2_blob(&eph_kp, 0, 1000, 1, &["b5_v2_single_val"], &[])];
+    let wire = vec![sign_v2_blob(
+        &eph_kp,
+        0,
+        1000,
+        1,
+        &["b5_v2_single_val"],
+        &[],
+    )];
 
     let mut store = ManifestStore::new();
     let bundle = verify_and_parse_v2(&manifest_bytes, &wire, &mut store, 100)
@@ -241,10 +250,38 @@ fn b5_v2_cascade_depth_exceeded() {
     let (d3p, d3e, d3_manifest) = build_publisher_manifest("b5_depth_d3", "b5_depth_d3_eph");
     let (_d4p, d4e, d4_manifest) = build_publisher_manifest("b5_depth_d4", "b5_depth_d4_eph");
 
-    let primary_wire = vec![sign_v2_blob(&primary_eph, 0, 1000, 1, &[], &[d1p.public_key.clone()])];
-    let d1_wire = vec![sign_v2_blob(&d1e, 0, 1000, 1, &[], &[d2p.public_key.clone()])];
-    let d2_wire = vec![sign_v2_blob(&d2e, 0, 1000, 1, &[], &[d3p.public_key.clone()])];
-    let d3_wire = vec![sign_v2_blob(&d3e, 0, 1000, 1, &[], &[_d4p.public_key.clone()])];
+    let primary_wire = vec![sign_v2_blob(
+        &primary_eph,
+        0,
+        1000,
+        1,
+        &[],
+        &[d1p.public_key.clone()],
+    )];
+    let d1_wire = vec![sign_v2_blob(
+        &d1e,
+        0,
+        1000,
+        1,
+        &[],
+        &[d2p.public_key.clone()],
+    )];
+    let d2_wire = vec![sign_v2_blob(
+        &d2e,
+        0,
+        1000,
+        1,
+        &[],
+        &[d3p.public_key.clone()],
+    )];
+    let d3_wire = vec![sign_v2_blob(
+        &d3e,
+        0,
+        1000,
+        1,
+        &[],
+        &[_d4p.public_key.clone()],
+    )];
     let d4_wire = vec![sign_v2_blob(&d4e, 0, 1000, 1, &[], &[])];
 
     let mut store = ManifestStore::new();
@@ -257,7 +294,10 @@ fn b5_v2_cascade_depth_exceeded() {
 
     // depth_limit=2 should reject a 4-deep chain.
     let res = resolve_cascade(bundle.active, &mut resolver, &mut store, 100, 2);
-    assert!(matches!(res, Err(ValidatorListError::CascadeDepthExceeded(2))));
+    assert!(matches!(
+        res,
+        Err(ValidatorListError::CascadeDepthExceeded(2))
+    ));
 }
 
 #[test]
@@ -336,8 +376,7 @@ fn b5_cascade_resolver_unknown_delegate() {
         &[dp.public_key.clone()],
     )];
     let mut store = ManifestStore::new();
-    let bundle =
-        verify_and_parse_v2(&primary_manifest, &primary_wire, &mut store, 100).unwrap();
+    let bundle = verify_and_parse_v2(&primary_manifest, &primary_wire, &mut store, 100).unwrap();
     let mut resolver = MapResolver::default();
     let res = resolve_cascade(
         bundle.active,
@@ -346,5 +385,8 @@ fn b5_cascade_resolver_unknown_delegate() {
         100,
         CASCADE_DEPTH_DEFAULT,
     );
-    assert!(matches!(res, Err(ValidatorListError::DelegateFetchFailed(_))));
+    assert!(matches!(
+        res,
+        Err(ValidatorListError::DelegateFetchFailed(_))
+    ));
 }

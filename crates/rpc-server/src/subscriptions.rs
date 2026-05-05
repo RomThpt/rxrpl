@@ -181,7 +181,8 @@ impl ConnectionSubscriptions {
                         "books entry requires taker_pays and taker_gets".into(),
                     ));
                 }
-                self.order_books.insert(OrderBookKey::new(taker_pays, taker_gets));
+                self.order_books
+                    .insert(OrderBookKey::new(taker_pays, taker_gets));
             }
         }
 
@@ -224,7 +225,8 @@ impl ConnectionSubscriptions {
             for book in books {
                 let taker_pays = book.get("taker_pays").cloned().unwrap_or(Value::Null);
                 let taker_gets = book.get("taker_gets").cloned().unwrap_or(Value::Null);
-                self.order_books.remove(&OrderBookKey::new(taker_pays, taker_gets));
+                self.order_books
+                    .remove(&OrderBookKey::new(taker_pays, taker_gets));
             }
         }
 
@@ -234,10 +236,7 @@ impl ConnectionSubscriptions {
     /// Register a persistent path_find subscription.
     ///
     /// Returns an error if a subscription is already active (rippled limit: 1).
-    pub fn create_path_find(
-        &mut self,
-        sub: PathFindSubscription,
-    ) -> Result<(), RpcServerError> {
+    pub fn create_path_find(&mut self, sub: PathFindSubscription) -> Result<(), RpcServerError> {
         if self.path_find.is_some() {
             return Err(RpcServerError::InvalidParams(
                 "only one path_find subscription allowed per connection".into(),
@@ -450,7 +449,8 @@ mod tests {
     #[test]
     fn order_book_missing_fields_rejected() {
         let mut subs = ConnectionSubscriptions::new();
-        let result = subs.apply_subscribe(&serde_json::json!({"books": [{"taker_pays": {"currency": "XRP"}}]}));
+        let result = subs
+            .apply_subscribe(&serde_json::json!({"books": [{"taker_pays": {"currency": "XRP"}}]}));
         assert!(result.is_err());
     }
 
@@ -553,7 +553,10 @@ mod tests {
         sub.last_result = Some("test".into());
 
         assert_eq!(
-            subs.path_find_subscription().unwrap().last_result.as_deref(),
+            subs.path_find_subscription()
+                .unwrap()
+                .last_result
+                .as_deref(),
             Some("test")
         );
     }

@@ -7,9 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use rxrpl_consensus::types::{NodeId, Proposal, TxSet, Validation};
-use rxrpl_consensus::{
-    ConsensusAdapter, ConsensusEngine, ConsensusParams, TrustedValidatorList,
-};
+use rxrpl_consensus::{ConsensusAdapter, ConsensusEngine, ConsensusParams, TrustedValidatorList};
 use rxrpl_ledger::Ledger;
 use rxrpl_node::Node;
 use rxrpl_primitives::Hash256;
@@ -23,7 +21,9 @@ struct NoopAdapter {
 
 impl NoopAdapter {
     fn new() -> Self {
-        Self { accepted_ledger_hash: Hash256::new([0xAA; 32]) }
+        Self {
+            accepted_ledger_hash: Hash256::new([0xAA; 32]),
+        }
     }
 }
 
@@ -86,7 +86,10 @@ fn apply_negative_unl_off_flag_ledger_is_noop() {
     let fees = FeeSettings::default();
 
     let results = Node::apply_negative_unl(&mut consensus, &mut ledger, &tx_engine, &fees, 100);
-    assert!(results.is_empty(), "non-flag ledger must yield zero pseudo-txs");
+    assert!(
+        results.is_empty(),
+        "non-flag ledger must yield zero pseudo-txs"
+    );
     assert!(ledger.get_state(&keylet::negative_unl()).is_none());
 }
 
@@ -115,7 +118,9 @@ fn apply_negative_unl_creates_unl_modify_tx_for_unreliable_validator() {
 
     // NegativeUNL ledger entry must exist with validator 5's key in DisabledValidators.
     let nunl_key = keylet::negative_unl();
-    let data = ledger.get_state(&nunl_key).expect("NegativeUNL SLE present after pseudo-tx");
+    let data = ledger
+        .get_state(&nunl_key)
+        .expect("NegativeUNL SLE present after pseudo-tx");
     let obj: Value = rxrpl_ledger::sle_codec::decode_state(data).expect("decodes");
     let disabled = obj["DisabledValidators"].as_array().expect("array");
     assert_eq!(disabled.len(), 1);

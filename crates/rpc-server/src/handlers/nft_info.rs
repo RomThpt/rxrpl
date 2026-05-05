@@ -38,7 +38,8 @@ pub async fn nft_info(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, 
     // Parse flags (bytes 0..2) and taxon (bytes 24..28) and serial (bytes 28..32) from the NFT ID.
     let flags = u16::from_be_bytes([nft_bytes[0], nft_bytes[1]]);
     let transfer_fee = u16::from_be_bytes([nft_bytes[2], nft_bytes[3]]);
-    let taxon_raw = u32::from_be_bytes([nft_bytes[24], nft_bytes[25], nft_bytes[26], nft_bytes[27]]);
+    let taxon_raw =
+        u32::from_be_bytes([nft_bytes[24], nft_bytes[25], nft_bytes[26], nft_bytes[27]]);
     let serial = u32::from_be_bytes([nft_bytes[28], nft_bytes[29], nft_bytes[30], nft_bytes[31]]);
 
     // Walk all state entries looking for NFTokenPage objects that contain this NFT.

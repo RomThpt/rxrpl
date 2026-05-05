@@ -19,8 +19,8 @@
 //! from a churn of one-shot client IPs.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::extract::ConnectInfo;
@@ -59,11 +59,7 @@ pub async fn rate_limit_by_ip(
     }
 
     if !try_consume(ip, 1000) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate limit exceeded\n",
-        )
-            .into_response();
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded\n").into_response();
     }
 
     maybe_evict_idle();

@@ -134,8 +134,10 @@ impl Transactor for AMMWithdrawTransactor {
                 .erase(&amm_key)
                 .map_err(|_| TransactionResult::TefInternal)?;
         } else {
-            amm["PoolBalance1"] = serde_json::Value::String(pool1.saturating_sub(payout1).to_string());
-            amm["PoolBalance2"] = serde_json::Value::String(pool2.saturating_sub(payout2).to_string());
+            amm["PoolBalance1"] =
+                serde_json::Value::String(pool1.saturating_sub(payout1).to_string());
+            amm["PoolBalance2"] =
+                serde_json::Value::String(pool2.saturating_sub(payout2).to_string());
             amm["LPTokenBalance"] = serde_json::Value::String(new_lp.to_string());
 
             let amm_data = serde_json::to_vec(&amm).map_err(|_| TransactionResult::TefInternal)?;
@@ -156,8 +158,15 @@ impl Transactor for AMMWithdrawTransactor {
 
         let asset_field = ctx.tx.get("Asset");
         let asset2_field = ctx.tx.get("Asset2");
-        let xrp_payout = if asset_is_xrp(asset_field) { payout1 } else { 0 }
-            + if asset_is_xrp(asset2_field) { payout2 } else { 0 };
+        let xrp_payout = if asset_is_xrp(asset_field) {
+            payout1
+        } else {
+            0
+        } + if asset_is_xrp(asset2_field) {
+            payout2
+        } else {
+            0
+        };
         let balance = helpers::get_balance(&account);
         helpers::set_balance(&mut account, balance.saturating_add(xrp_payout));
         helpers::increment_sequence(&mut account);

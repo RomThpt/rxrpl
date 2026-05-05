@@ -43,8 +43,7 @@ pub fn add_to_owner_dir(
                 "Indexes": [entry_hex],
                 "Flags": 0,
             });
-            let bytes =
-                serde_json::to_vec(&dir).map_err(|_| TransactionResult::TefInternal)?;
+            let bytes = serde_json::to_vec(&dir).map_err(|_| TransactionResult::TefInternal)?;
             view.insert(root_key, bytes)
                 .map_err(|_| TransactionResult::TefInternal)?;
         }
@@ -56,7 +55,10 @@ pub fn add_to_owner_dir(
                 .and_then(|v| v.as_array_mut())
                 .ok_or(TransactionResult::TefInternal)?;
 
-            if indexes.iter().any(|v| v.as_str() == Some(entry_hex.as_str())) {
+            if indexes
+                .iter()
+                .any(|v| v.as_str() == Some(entry_hex.as_str()))
+            {
                 return Ok(());
             }
             if indexes.len() >= MAX_ENTRIES_PER_PAGE {
@@ -64,8 +66,7 @@ pub fn add_to_owner_dir(
             }
             indexes.push(Value::String(entry_hex));
 
-            let new_bytes =
-                serde_json::to_vec(&dir).map_err(|_| TransactionResult::TefInternal)?;
+            let new_bytes = serde_json::to_vec(&dir).map_err(|_| TransactionResult::TefInternal)?;
             view.update(root_key, new_bytes)
                 .map_err(|_| TransactionResult::TefInternal)?;
         }
@@ -108,8 +109,7 @@ pub fn remove_from_owner_dir(
         view.erase(&root_key)
             .map_err(|_| TransactionResult::TefInternal)?;
     } else {
-        let new_bytes =
-            serde_json::to_vec(&dir).map_err(|_| TransactionResult::TefInternal)?;
+        let new_bytes = serde_json::to_vec(&dir).map_err(|_| TransactionResult::TefInternal)?;
         view.update(root_key, new_bytes)
             .map_err(|_| TransactionResult::TefInternal)?;
     }

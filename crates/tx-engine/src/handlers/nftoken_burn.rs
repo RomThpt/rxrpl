@@ -61,8 +61,8 @@ impl Transactor for NFTokenBurnTransactor {
             // Only the original issuer (encoded in NFTokenID bytes 16..56)
             // may invoke the burnable-by-issuer path.
             let issuer_hex_in_id = &nftoken_id[16..56];
-            let account_id_bytes =
-                decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+            let account_id_bytes = decode_account_id(account_str)
+                .map_err(|_| TransactionResult::TemInvalidAccountId)?;
             let account_hex = hex::encode_upper(account_id_bytes.as_bytes());
             if !issuer_hex_in_id.eq_ignore_ascii_case(&account_hex) {
                 return Err(TransactionResult::TecNoPermission);

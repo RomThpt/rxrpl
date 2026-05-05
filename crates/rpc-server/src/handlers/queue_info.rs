@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use rxrpl_txq::{FeeMetrics, BASE_FEE_LEVEL};
+use rxrpl_txq::{BASE_FEE_LEVEL, FeeMetrics};
 
 use crate::context::ServerContext;
 use crate::error::RpcServerError;
@@ -11,10 +11,7 @@ use crate::error::RpcServerError;
 ///
 /// Optional params:
 ///   - `account`: restrict output to a single account.
-pub async fn queue_info(
-    params: Value,
-    ctx: &Arc<ServerContext>,
-) -> Result<Value, RpcServerError> {
+pub async fn queue_info(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcServerError> {
     let tq = ctx
         .tx_queue
         .as_ref()

@@ -145,13 +145,17 @@ pub enum Commands {
     },
 
     // -- Account Queries --
-    AccountInfo { account: String },
+    AccountInfo {
+        account: String,
+    },
     AccountTx {
         account: String,
         #[arg(long, default_value = "10")]
         limit: u32,
     },
-    AccountNfts { account: String },
+    AccountNfts {
+        account: String,
+    },
 
     /// Generate a new wallet keypair locally
     WalletPropose {
@@ -159,8 +163,12 @@ pub enum Commands {
         key_type: String,
     },
 
-    Submit { tx_blob: String },
-    Tx { hash: String },
+    Submit {
+        tx_blob: String,
+    },
+    Tx {
+        hash: String,
+    },
     Sign {
         #[arg(long)]
         seed: String,
@@ -276,17 +284,14 @@ pub fn prometheus_to_json(body: &str) -> serde_json::Value {
         };
         let (name, labels) = if let Some(idx) = left.find('{') {
             let name = &left[..idx];
-            let label_blob = left[idx..]
-                .trim_start_matches('{')
-                .trim_end_matches('}');
+            let label_blob = left[idx..].trim_start_matches('{').trim_end_matches('}');
             let mut labels = serde_json::Map::new();
             for kv in label_blob.split(',') {
                 if let Some((k, v)) = kv.split_once('=') {
                     let k = k.trim();
                     let v = v.trim().trim_matches('"');
                     if !k.is_empty() {
-                        labels
-                            .insert(k.to_string(), serde_json::Value::String(v.to_string()));
+                        labels.insert(k.to_string(), serde_json::Value::String(v.to_string()));
                     }
                 }
             }

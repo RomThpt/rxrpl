@@ -118,10 +118,7 @@ impl DomainAttestationFetcher {
     ) -> Result<bool, AttestationError> {
         validate_domain(domain)?;
         let url = match &self.base_url_override {
-            Some(base) => format!(
-                "{}/.well-known/xrp-ledger.toml",
-                base.trim_end_matches('/')
-            ),
+            Some(base) => format!("{}/.well-known/xrp-ledger.toml", base.trim_end_matches('/')),
             None => format!("https://{domain}/.well-known/xrp-ledger.toml"),
         };
 
@@ -257,12 +254,7 @@ impl AttestationCache {
     /// Return the live status, applying TTL expiry to past `Verified`
     /// entries. Returns `Pending` if no entry exists yet for this key /
     /// domain pair (caller is expected to schedule a refresh).
-    pub fn get_or_refresh(
-        &self,
-        key: &PublicKey,
-        domain: &str,
-        now: u64,
-    ) -> AttestationStatus {
+    pub fn get_or_refresh(&self, key: &PublicKey, domain: &str, now: u64) -> AttestationStatus {
         match self.entries.get(key) {
             Some(entry) if entry.domain == domain => {
                 if let AttestationStatus::Verified { at } = entry.status {
@@ -277,13 +269,7 @@ impl AttestationCache {
     }
 
     /// Record a fresh verification result.
-    pub fn record_result(
-        &mut self,
-        key: &PublicKey,
-        domain: &str,
-        verified: bool,
-        now: u64,
-    ) {
+    pub fn record_result(&mut self, key: &PublicKey, domain: &str, verified: bool, now: u64) {
         let prior_fail_count = match self.entries.get(key).map(|e| &e.status) {
             Some(AttestationStatus::Failed { fail_count, .. }) => *fail_count,
             _ => 0,
@@ -434,10 +420,7 @@ impl DomainAttestationService {
                     let mut guard = self.cache.write().await;
                     guard.record_result(&target.master_key, &target.domain, verified, now);
                     if verified {
-                        tracing::info!(
-                            "Domain attestation verified for {}",
-                            target.domain
-                        );
+                        tracing::info!("Domain attestation verified for {}", target.domain);
                     } else {
                         tracing::warn!(
                             "Domain attestation failed for {}: key not listed",
@@ -446,17 +429,9 @@ impl DomainAttestationService {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Domain attestation failed for {}: {e}",
-                        target.domain
-                    );
+                    tracing::warn!("Domain attestation failed for {}: {e}", target.domain);
                     let mut guard = self.cache.write().await;
-                    guard.record_error(
-                        &target.master_key,
-                        &target.domain,
-                        &e.to_string(),
-                        now,
-                    );
+                    guard.record_error(&target.master_key, &target.domain, &e.to_string(), now);
                 }
             }
         }
@@ -537,9 +512,7 @@ mod tests {
     fn verify_toml_finds_matching_key() {
         let key = ed_key(0x01);
         let hex = hex::encode_upper(key.as_bytes());
-        let toml = format!(
-            "[[VALIDATORS]]\npublic_key = \"{hex}\"\nnetwork = \"main\"\n"
-        );
+        let toml = format!("[[VALIDATORS]]\npublic_key = \"{hex}\"\nnetwork = \"main\"\n");
         assert_eq!(verify_toml(&toml, &key).unwrap(), true);
     }
 
@@ -689,15 +662,13 @@ mod tests {
             .mock_async(|when, then| {
                 when.method(httpmock::Method::GET)
                     .path("/.well-known/xrp-ledger.toml");
-                then.status(200).body(format!(
-                    "[[VALIDATORS]]\npublic_key = \"{hex}\"\n"
-                ));
+                then.status(200)
+                    .body(format!("[[VALIDATORS]]\npublic_key = \"{hex}\"\n"));
             })
             .await;
 
         let cache = new_cache();
-        let fetcher =
-            DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
+        let fetcher = DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
         let svc = DomainAttestationService::new(
             vec![AttestationTarget {
                 master_key: key.clone(),
@@ -709,6 +680,9 @@ mod tests {
         svc.refresh_once().await;
         let snap = cache.read().await.snapshot(now_unix());
         assert_eq!(snap.len(), 1);
-        assert!(matches!(snap[0].1.status, AttestationStatus::Verified { .. }));
+        assert!(matches!(
+            snap[0].1.status,
+            AttestationStatus::Verified { .. }
+        ));
     }
 }

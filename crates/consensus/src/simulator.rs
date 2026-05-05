@@ -288,7 +288,8 @@ impl ConsensusSimulator {
         for (i, proposal) in initial_proposals.into_iter().enumerate() {
             for j in 0..node_count {
                 if j != i {
-                    self.network.send(i, j, SimMessage::Proposal(proposal.clone()));
+                    self.network
+                        .send(i, j, SimMessage::Proposal(proposal.clone()));
                 }
             }
         }
@@ -387,7 +388,10 @@ impl ConsensusSimulator {
 
     /// Apply a network partition.
     pub fn partition(&mut self, groups: Vec<Vec<usize>>) {
-        let groups: Vec<HashSet<usize>> = groups.into_iter().map(|g| g.into_iter().collect()).collect();
+        let groups: Vec<HashSet<usize>> = groups
+            .into_iter()
+            .map(|g| g.into_iter().collect())
+            .collect();
         self.network.partition(groups);
     }
 

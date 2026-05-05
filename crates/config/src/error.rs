@@ -15,9 +15,7 @@ pub enum ConfigError {
     #[error("validator seed file not found: {0}")]
     SeedFileNotFound(PathBuf),
 
-    #[error(
-        "validator seed file {path} has insecure permissions: mode {mode:#o} (expected 0o600)"
-    )]
+    #[error("validator seed file {path} has insecure permissions: mode {mode:#o} (expected 0o600)")]
     SeedFilePermissionDenied { path: PathBuf, mode: u32 },
 
     #[error("validator seed file {path} is unreadable: {reason}")]
@@ -26,8 +24,6 @@ pub enum ConfigError {
     #[error("validator seed file {0} has invalid contents: {1}")]
     SeedFileInvalidContents(PathBuf, String),
 
-    #[error(
-        "validator seed file permission enforcement is not supported on this platform: {0}"
-    )]
+    #[error("validator seed file permission enforcement is not supported on this platform: {0}")]
     SeedFilePlatformUnsupported(PathBuf),
 }

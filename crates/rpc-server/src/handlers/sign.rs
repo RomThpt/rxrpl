@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use rxrpl_codec::address::classic::{account_id_from_public_key, decode_account_id, encode_account_id};
+use rxrpl_codec::address::classic::{
+    account_id_from_public_key, decode_account_id, encode_account_id,
+};
 use rxrpl_crypto::KeyPair;
 use rxrpl_protocol::keylet;
 

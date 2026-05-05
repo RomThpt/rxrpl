@@ -3,7 +3,7 @@ use rxrpl_ledger::Ledger;
 use rxrpl_primitives::AccountId;
 
 use crate::line_cache::RippleLineCache;
-use crate::types::{Issue, PathStep, PATH_STEP_ACCOUNT, PATH_STEP_CURRENCY, PATH_STEP_ISSUER};
+use crate::types::{Issue, PATH_STEP_ACCOUNT, PATH_STEP_CURRENCY, PATH_STEP_ISSUER, PathStep};
 
 /// Result of simulating a payment along a single strand (path).
 #[derive(Debug, Clone)]
@@ -85,14 +85,7 @@ pub fn simulate_strand(
         let in_issue = &step_issues[i];
         let out_issue = &step_issues[i + 1];
 
-        flow = simulate_step(
-            ledger,
-            line_cache,
-            step,
-            in_issue,
-            out_issue,
-            &flow,
-        );
+        flow = simulate_step(ledger, line_cache, step, in_issue, out_issue, &flow);
 
         if flow.is_zero() {
             return StrandResult {
@@ -112,14 +105,7 @@ pub fn simulate_strand(
         let in_issue = &step_issues[i];
         let out_issue = &step_issues[i + 1];
 
-        needed = compute_input_for_output(
-            ledger,
-            line_cache,
-            step,
-            in_issue,
-            out_issue,
-            &needed,
-        );
+        needed = compute_input_for_output(ledger, line_cache, step, in_issue, out_issue, &needed);
 
         if needed.is_zero() {
             return StrandResult {
@@ -169,13 +155,8 @@ fn simulate_direct_path(
 
     if src_issue.currency == dst_issue.currency {
         // Same currency: check trust line balance
-        let available = trust_line_available(
-            ledger,
-            line_cache,
-            source,
-            destination,
-            &src_issue.currency,
-        );
+        let available =
+            trust_line_available(ledger, line_cache, source, destination, &src_issue.currency);
 
         let delivered = min_amount(requested_amount, &available);
         let quality = if delivered.is_zero() {
@@ -238,12 +219,8 @@ fn simulate_step(
     if (step.step_type & PATH_STEP_ACCOUNT) != 0 {
         // Account step: trust line transfer through an intermediary
         if let Some(account) = &step.account {
-            let available = trust_line_available_from(
-                ledger,
-                line_cache,
-                account,
-                &out_issue.currency,
-            );
+            let available =
+                trust_line_available_from(ledger, line_cache, account, &out_issue.currency);
             return min_amount(input_flow, &available);
         }
         return *input_flow;

@@ -390,8 +390,8 @@ impl NFTokenAcceptOfferTransactor {
 
         // Caller (seller) must own the NFT to accept a buy offer.
         // Verify by checking the seller's NFTokenPage contains the token.
-        let seller_id = decode_account_id(seller_addr)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let seller_id =
+            decode_account_id(seller_addr).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let page_key = keylet::nftoken_page_min(&seller_id);
         let owns = ctx
             .view

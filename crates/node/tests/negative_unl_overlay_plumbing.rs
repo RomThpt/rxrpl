@@ -5,9 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use rxrpl_consensus::types::{NodeId, Proposal, TxSet, Validation};
-use rxrpl_consensus::{
-    ConsensusAdapter, ConsensusEngine, ConsensusParams, TrustedValidatorList,
-};
+use rxrpl_consensus::{ConsensusAdapter, ConsensusEngine, ConsensusParams, TrustedValidatorList};
 use rxrpl_node::Node;
 use rxrpl_primitives::Hash256;
 
@@ -84,7 +82,11 @@ fn record_validation_into_engine_demotes_silent_validator() {
     }
 
     let changes = consensus.evaluate_negative_unl(256);
-    assert_eq!(changes.len(), 1, "validator 5 must be demoted via overlay plumbing");
+    assert_eq!(
+        changes.len(),
+        1,
+        "validator 5 must be demoted via overlay plumbing"
+    );
     assert!(changes[0].disable);
     let key5 = key_map.get(&node_id(5)).unwrap();
     assert_eq!(&changes[0].validator_key, key5);

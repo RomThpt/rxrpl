@@ -58,11 +58,7 @@ fn parse_amount(s: &str) -> Result<Value, Box<dyn std::error::Error>> {
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Version => {
-            println!(
-                "{} {}",
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION")
-            );
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
 

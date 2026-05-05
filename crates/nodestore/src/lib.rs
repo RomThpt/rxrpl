@@ -17,6 +17,6 @@ pub use cache::{CacheConfig, CachedNodeStore};
 pub use database::NodeDatabase;
 pub use error::NodeStoreError;
 pub use shard::{
-    PersistentShardStore, ShardInfo, ShardManager, ShardState, ShardStore,
-    shard_index_for, shard_range, LEDGERS_PER_SHARD,
+    LEDGERS_PER_SHARD, PersistentShardStore, ShardInfo, ShardManager, ShardState, ShardStore,
+    shard_index_for, shard_range,
 };

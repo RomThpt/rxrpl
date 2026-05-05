@@ -233,10 +233,7 @@ mod tests {
     fn setup_tracker(validator_ids: &[u8]) -> NegativeUnlTracker {
         let mut tracker = NegativeUnlTracker::new();
         for &id in validator_ids {
-            tracker.register_validator(
-                node(id),
-                format!("ED{:0>64}", hex::encode([id; 32])),
-            );
+            tracker.register_validator(node(id), format!("ED{:0>64}", hex::encode([id; 32])));
         }
         tracker
     }
@@ -460,10 +457,7 @@ mod tests {
         let mut tracker = NegativeUnlTracker::new();
         // Only register validators 1-4, not 5
         for id in 1..=4 {
-            tracker.register_validator(
-                node(id),
-                format!("ED{:0>64}", hex::encode([id; 32])),
-            );
+            tracker.register_validator(node(id), format!("ED{:0>64}", hex::encode([id; 32])));
         }
 
         let trusted = make_trusted_set(&[1, 2, 3, 4, 5]);
@@ -526,7 +520,11 @@ mod tests {
         let disables: Vec<_> = changes.iter().filter(|c| c.disable).collect();
 
         assert_eq!(re_enables.len(), 1);
-        assert!(re_enables[0].validator_key.contains(&hex::encode([6u8; 32])));
+        assert!(
+            re_enables[0]
+                .validator_key
+                .contains(&hex::encode([6u8; 32]))
+        );
         // Cap is floor(8*0.25) = 2, was 1 disabled (node 6), re-enabled -> 0,
         // so up to 2 new disables
         assert!(disables.len() <= 2);

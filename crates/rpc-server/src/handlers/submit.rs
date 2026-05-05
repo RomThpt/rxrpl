@@ -30,10 +30,9 @@ pub async fn submit(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
             .await
             .map_err(|e| RpcServerError::Internal(format!("forward request failed: {e}")))?;
 
-        let result: Value = response
-            .json()
-            .await
-            .map_err(|e| RpcServerError::Internal(format!("failed to parse forward response: {e}")))?;
+        let result: Value = response.json().await.map_err(|e| {
+            RpcServerError::Internal(format!("failed to parse forward response: {e}"))
+        })?;
 
         // The upstream response wraps the result under "result"
         return Ok(result.get("result").cloned().unwrap_or(result));

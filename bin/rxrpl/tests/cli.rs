@@ -101,7 +101,10 @@ fn default_metrics_url_strips_path_and_appends_metrics() {
         "https://s1.ripple.com:51234/metrics"
     );
     // No scheme -> just append.
-    assert_eq!(default_metrics_url("localhost:5005"), "localhost:5005/metrics");
+    assert_eq!(
+        default_metrics_url("localhost:5005"),
+        "localhost:5005/metrics"
+    );
 }
 
 #[test]

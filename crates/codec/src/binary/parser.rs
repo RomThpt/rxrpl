@@ -98,69 +98,126 @@ impl<'a> BinaryParser<'a> {
     /// is missing from definitions.json (e.g. newer amendment fields).
     fn skip_field(&mut self, type_code: i32) -> Result<(), CodecError> {
         match type_code {
-            1 => { self.read_bytes(2)?; }    // UInt16
-            2 => { self.read_bytes(4)?; }    // UInt32
-            3 => { self.read_bytes(8)?; }    // UInt64
-            10 => { self.read_bytes(4)?; }   // Int32
-            4 => { self.read_bytes(16)?; }   // Hash128
-            5 | 29 => { self.read_bytes(32)?; } // Hash256, UInt256
-            6 => {                            // Amount
+            1 => {
+                self.read_bytes(2)?;
+            } // UInt16
+            2 => {
+                self.read_bytes(4)?;
+            } // UInt32
+            3 => {
+                self.read_bytes(8)?;
+            } // UInt64
+            10 => {
+                self.read_bytes(4)?;
+            } // Int32
+            4 => {
+                self.read_bytes(16)?;
+            } // Hash128
+            5 | 29 => {
+                self.read_bytes(32)?;
+            } // Hash256, UInt256
+            6 => {
+                // Amount
                 let raw = self.read_u64()?;
                 // IOU amounts have bit 63 set and include currency + issuer
                 if raw & 0x8000_0000_0000_0000 != 0 {
                     self.read_bytes(40)?; // 20-byte currency + 20-byte issuer
                 }
             }
-            7 | 8 | 19 => {                  // Blob, AccountID, Vector256
+            7 | 8 | 19 => {
+                // Blob, AccountID, Vector256
                 let len = self.read_vl_length()?;
                 self.read_bytes(len)?;
             }
-            9 => { self.read_bytes(8)?; }    // Number (IOU value encoding)
-            14 => {                           // STObject: skip until ObjectEndMarker
+            9 => {
+                self.read_bytes(8)?;
+            } // Number (IOU value encoding)
+            14 => {
+                // STObject: skip until ObjectEndMarker
                 loop {
-                    if self.remaining() == 0 { break; }
+                    if self.remaining() == 0 {
+                        break;
+                    }
                     let (tc, fc, consumed) = field_id::decode_field_id(&self.data[self.pos..])?;
                     self.pos += consumed;
-                    if tc == 14 && fc == 1 { break; } // ObjectEndMarker
+                    if tc == 14 && fc == 1 {
+                        break;
+                    } // ObjectEndMarker
                     self.skip_field(tc)?;
                 }
             }
-            15 => {                           // STArray: skip until ArrayEndMarker
+            15 => {
+                // STArray: skip until ArrayEndMarker
                 loop {
-                    if self.remaining() == 0 { break; }
+                    if self.remaining() == 0 {
+                        break;
+                    }
                     let (tc, fc, consumed) = field_id::decode_field_id(&self.data[self.pos..])?;
                     self.pos += consumed;
-                    if tc == 15 && fc == 1 { break; } // ArrayEndMarker
+                    if tc == 15 && fc == 1 {
+                        break;
+                    } // ArrayEndMarker
                     // Each array element is an STObject wrapper
                     self.skip_field(14)?;
                 }
             }
-            16 => { self.read_bytes(1)?; }   // UInt8
-            17 | 20 => { self.read_bytes(20)?; } // Hash160, UInt160
-            18 => {                           // PathSet: skip until end marker 0x00
+            16 => {
+                self.read_bytes(1)?;
+            } // UInt8
+            17 | 20 => {
+                self.read_bytes(20)?;
+            } // Hash160, UInt160
+            18 => {
+                // PathSet: skip until end marker 0x00
                 loop {
-                    if self.remaining() == 0 { break; }
+                    if self.remaining() == 0 {
+                        break;
+                    }
                     let type_byte = self.read_u8()?;
-                    if type_byte == 0x00 { break; }
-                    if type_byte == 0xFF { continue; } // path separator
-                    if type_byte & 0x01 != 0 { self.read_bytes(20)?; } // account
-                    if type_byte & 0x10 != 0 { self.read_bytes(20)?; } // currency
-                    if type_byte & 0x20 != 0 { self.read_bytes(20)?; } // issuer
+                    if type_byte == 0x00 {
+                        break;
+                    }
+                    if type_byte == 0xFF {
+                        continue;
+                    } // path separator
+                    if type_byte & 0x01 != 0 {
+                        self.read_bytes(20)?;
+                    } // account
+                    if type_byte & 0x10 != 0 {
+                        self.read_bytes(20)?;
+                    } // currency
+                    if type_byte & 0x20 != 0 {
+                        self.read_bytes(20)?;
+                    } // issuer
                 }
             }
-            21 | 22 => { self.read_bytes(24)?; } // Hash192, UInt192
-            23 => { self.read_bytes(28)?; }  // UInt224
-            24 | 26 => {                     // Issue, Currency: 20-byte code + optional issuer
+            21 | 22 => {
+                self.read_bytes(24)?;
+            } // Hash192, UInt192
+            23 => {
+                self.read_bytes(28)?;
+            } // UInt224
+            24 | 26 => {
+                // Issue, Currency: 20-byte code + optional issuer
                 let currency_bytes = self.read_bytes(20)?;
                 let is_xrp = currency_bytes.iter().all(|&b| b == 0);
-                if !is_xrp && type_code == 24 { self.read_bytes(20)?; }
+                if !is_xrp && type_code == 24 {
+                    self.read_bytes(20)?;
+                }
             }
-            25 => {                           // XChainBridge: nested STObject
+            25 => {
+                // XChainBridge: nested STObject
                 self.skip_field(14)?;
             }
-            27 => { self.read_bytes(48)?; }  // UInt384
-            28 => { self.read_bytes(64)?; }  // UInt512
-            30 => { self.read_bytes(12)?; }  // UInt96
+            27 => {
+                self.read_bytes(48)?;
+            } // UInt384
+            28 => {
+                self.read_bytes(64)?;
+            } // UInt512
+            30 => {
+                self.read_bytes(12)?;
+            } // UInt96
             _ => {
                 return Err(CodecError::UnsupportedType(format!(
                     "cannot skip unknown type_code={type_code}"

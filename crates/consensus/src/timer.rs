@@ -153,9 +153,7 @@ impl ConsensusTimer {
         let elapsed = now.duration_since(self.phase_start);
 
         match self.phase {
-            ConsensusPhase::Open => {
-                Some(self.open_duration.saturating_sub(elapsed))
-            }
+            ConsensusPhase::Open => Some(self.open_duration.saturating_sub(elapsed)),
             ConsensusPhase::Establish => {
                 let since_last = now.duration_since(self.last_converge);
                 Some(self.converge_interval.saturating_sub(since_last))
@@ -370,7 +368,12 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         let t2 = timer.time_until_next_action().unwrap();
 
-        assert!(t2 < t1, "time_until_next should decrease: {:?} vs {:?}", t2, t1);
+        assert!(
+            t2 < t1,
+            "time_until_next should decrease: {:?} vs {:?}",
+            t2,
+            t1
+        );
     }
 
     #[test]

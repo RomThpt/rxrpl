@@ -14,10 +14,7 @@ use crate::error::RpcServerError;
 ///   - `"never"` prevents any automatic deletion (same as 0).
 /// Without parameters: returns the current earliest available ledger
 /// and the advisory delete cursor.
-pub async fn can_delete(
-    params: Value,
-    ctx: &Arc<ServerContext>,
-) -> Result<Value, RpcServerError> {
+pub async fn can_delete(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcServerError> {
     // Handle set operations
     if let Some(val) = params.get("can_delete") {
         if let Some(seq) = val.as_u64() {

@@ -11,9 +11,7 @@
 use std::collections::{HashMap, HashSet};
 
 use rxrpl_consensus::types::{NodeId, Proposal, TxSet, Validation};
-use rxrpl_consensus::{
-    ConsensusAdapter, ConsensusEngine, ConsensusParams, TrustedValidatorList,
-};
+use rxrpl_consensus::{ConsensusAdapter, ConsensusEngine, ConsensusParams, TrustedValidatorList};
 use rxrpl_primitives::Hash256;
 
 struct NoopAdapter {
@@ -22,7 +20,9 @@ struct NoopAdapter {
 
 impl NoopAdapter {
     fn new() -> Self {
-        Self { accepted_ledger_hash: Hash256::new([0xAA; 32]) }
+        Self {
+            accepted_ledger_hash: Hash256::new([0xAA; 32]),
+        }
     }
 }
 
@@ -87,7 +87,11 @@ fn engine_register_validators_populates_tracker_keys() {
 
     let changes = engine.evaluate_negative_unl(256);
     let key5 = key_map.get(&node(5)).unwrap();
-    assert_eq!(changes.len(), 1, "expected one disable for absent validator 5");
+    assert_eq!(
+        changes.len(),
+        1,
+        "expected one disable for absent validator 5"
+    );
     assert!(changes[0].disable);
     assert_eq!(&changes[0].validator_key, key5);
 }
@@ -110,7 +114,10 @@ fn engine_records_validations_from_multiple_validators() {
     }
 
     let changes = engine.evaluate_negative_unl(256);
-    assert!(changes.is_empty(), "no demotion when all validators are reliable");
+    assert!(
+        changes.is_empty(),
+        "no demotion when all validators are reliable"
+    );
 }
 
 // ===== B3 =====
@@ -135,7 +142,10 @@ fn engine_emits_unl_modify_changes_at_flag_ledger() {
 
     // Non-flag ledger: no changes.
     let none = engine.evaluate_negative_unl(255);
-    assert!(none.is_empty(), "evaluation off a flag ledger must yield no changes");
+    assert!(
+        none.is_empty(),
+        "evaluation off a flag ledger must yield no changes"
+    );
 
     let changes = engine.evaluate_negative_unl(256);
     assert_eq!(changes.len(), 1);

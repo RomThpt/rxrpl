@@ -198,8 +198,8 @@ mod tests {
     fn rippled_master_passphrase_seed_round_trip() {
         const RIPPLED_MASTER_SEED: &str = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb";
 
-        let (entropy, key_type) =
-            rxrpl_codec::address::seed::decode_seed(RIPPLED_MASTER_SEED).expect("decode rippled seed");
+        let (entropy, key_type) = rxrpl_codec::address::seed::decode_seed(RIPPLED_MASTER_SEED)
+            .expect("decode rippled seed");
         assert_eq!(key_type, KeyType::Secp256k1);
 
         // Re-encoding produces byte-identical output.
@@ -261,7 +261,8 @@ mod tests {
         let master_seed = Seed::from_passphrase("validator-keys-master");
         let master_kp = KeyPair::from_seed(&master_seed, KeyType::Ed25519);
 
-        let manifest = generate_manifest(&master_kp, 1, KeyType::Ed25519, Some("example.com")).unwrap();
+        let manifest =
+            generate_manifest(&master_kp, 1, KeyType::Ed25519, Some("example.com")).unwrap();
         assert_eq!(manifest.sequence, 1);
         assert_eq!(manifest.domain.as_deref(), Some("example.com"));
 
@@ -272,7 +273,8 @@ mod tests {
         assert_eq!(parsed.master_public_key, master_kp.public_key);
         assert_eq!(parsed.domain.as_deref(), Some("example.com"));
         // Ephemeral public key in the parsed manifest matches our generated one.
-        let eph_str = encode_node_public_key(parsed.ephemeral_public_key.as_ref().unwrap().as_bytes());
+        let eph_str =
+            encode_node_public_key(parsed.ephemeral_public_key.as_ref().unwrap().as_bytes());
         assert_eq!(eph_str, manifest.ephemeral_public_key);
     }
 

@@ -13,7 +13,9 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, TransactionResult> {
     }
     (0..hex.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| TransactionResult::TemMalformed))
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| TransactionResult::TemMalformed)
+        })
         .collect()
 }
 
@@ -132,7 +134,9 @@ impl Transactor for LoanSetTransactor {
 
         // Build the signing payload: canonical hash of the loan terms
         // The borrower signs: BrokerOwner + BrokerSeq + Principal + Rate + MaturityDate
-        let principal_str = ctx.tx.get("LoanPrincipal")
+        let principal_str = ctx
+            .tx
+            .get("LoanPrincipal")
             .map(|v| v.to_string())
             .unwrap_or_else(|| "0".to_string());
         let loan_rate = helpers::get_u32_field(ctx.tx, "LoanRate").unwrap_or(0);
@@ -148,17 +152,20 @@ impl Transactor for LoanSetTransactor {
         let payload_hash = rxrpl_crypto::sha512_half::sha512_half(&[&signing_data]);
 
         // Read the borrower's public key from their AccountRoot
-        let borrower_id = decode_account_id(borrower_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let borrower_id =
+            decode_account_id(borrower_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let borrower_key = keylet::account(&borrower_id);
-        let borrower_bytes = ctx.view.read(&borrower_key)
+        let borrower_bytes = ctx
+            .view
+            .read(&borrower_key)
             .ok_or(TransactionResult::TerNoAccount)?;
         let borrower_obj: serde_json::Value =
             serde_json::from_slice(&borrower_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
         if let Some(pub_key_hex) = borrower_obj.get("PublicKey").and_then(|v| v.as_str()) {
             let pub_key_bytes = decode_hex(pub_key_hex)?;
-            if !rxrpl_crypto::verify_signature(&pub_key_bytes, payload_hash.as_bytes(), &sig_bytes) {
+            if !rxrpl_crypto::verify_signature(&pub_key_bytes, payload_hash.as_bytes(), &sig_bytes)
+            {
                 return Err(TransactionResult::TemBadSignature);
             }
         } else {
@@ -224,8 +231,7 @@ impl Transactor for LoanSetTransactor {
         let origination_fee_rate =
             helpers::get_u32_field(ctx.tx, "OriginationFeeRate").unwrap_or(0);
         let grace_period_days = helpers::get_u32_field(ctx.tx, "GracePeriodDays").unwrap_or(0);
-        let mgmt_fee_rate =
-            helpers::get_u32_field(ctx.tx, "ManagementFeeRate").unwrap_or(0);
+        let mgmt_fee_rate = helpers::get_u32_field(ctx.tx, "ManagementFeeRate").unwrap_or(0);
 
         let broker_owner_id = decode_account_id(&broker_owner_str)
             .map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -309,8 +315,7 @@ impl Transactor for LoanSetTransactor {
         // Update broker: increment LoanSequence, OwnerCount, DebtTotal
         broker["LoanSequence"] = serde_json::Value::from(loan_sequence + 1);
         broker["OwnerCount"] = serde_json::Value::from(broker_owner_count + 1);
-        broker["DebtTotal"] =
-            serde_json::Value::String((debt_total + principal).to_string());
+        broker["DebtTotal"] = serde_json::Value::String((debt_total + principal).to_string());
 
         let broker_data =
             serde_json::to_vec(&broker).map_err(|_| TransactionResult::TefInternal)?;
@@ -330,7 +335,9 @@ impl Transactor for LoanSetTransactor {
         }
         let vault_owner_id =
             decode_account_id(parts[0]).map_err(|_| TransactionResult::TefInternal)?;
-        let vault_seq: u32 = parts[1].parse().map_err(|_| TransactionResult::TefInternal)?;
+        let vault_seq: u32 = parts[1]
+            .parse()
+            .map_err(|_| TransactionResult::TefInternal)?;
         let vault_key = keylet::vault(&vault_owner_id, vault_seq);
 
         let vault_bytes = ctx
@@ -386,8 +393,7 @@ impl Transactor for LoanSetTransactor {
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
         helpers::increment_sequence(&mut account);
 
-        let acct_data =
-            serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
+        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -415,8 +421,8 @@ mod tests {
     /// Fixed seed for deterministic borrower key pair in tests.
     fn borrower_keypair() -> (Vec<u8>, Vec<u8>) {
         let seed = Seed::from_bytes([
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
         ]);
         let kp = rxrpl_crypto::KeyPair::from_seed(&seed, KeyType::Ed25519);
         (kp.public_key.0.clone(), kp.private_key.clone())

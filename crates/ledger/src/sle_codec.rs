@@ -4,8 +4,8 @@
 //! JSON bytes (used internally by handlers) and XRPL binary format
 //! (used in SHAMaps for hash compatibility with rippled).
 
-use rxrpl_codec::binary;
 use rxrpl_codec::CodecError;
+use rxrpl_codec::binary;
 use serde_json::Value;
 
 /// Encode a JSON ledger entry to XRPL binary format.

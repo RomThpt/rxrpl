@@ -184,8 +184,7 @@ mod tests {
         bytes.extend_from_slice(key.as_bytes());
         bytes.extend_from_slice(&leaf_data);
 
-        let node =
-            super::deserialize_node(&bytes, &leaf_hash, LeafNode::account_state).unwrap();
+        let node = super::deserialize_node(&bytes, &leaf_hash, LeafNode::account_state).unwrap();
         match &node {
             SHAMapNode::Leaf(deserialized) => {
                 assert_eq!(*deserialized.key(), key);

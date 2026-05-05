@@ -50,7 +50,8 @@ async fn refuses_when_require_trusted_disabled() {
     // so the anchor would happily accept Sybil keys.
     let mut config = NodeConfig::default();
     config.validators.validator_list_sites = vec!["https://vl.ripple.com/".into()];
-    config.validators.validator_list_keys = vec!["ED2677ABFFD1B33AC6FBC3062B71F1E8397A1505E1C42C64D11AD1B28FF73F4734".into()];
+    config.validators.validator_list_keys =
+        vec!["ED2677ABFFD1B33AC6FBC3062B71F1E8397A1505E1C42C64D11AD1B28FF73F4734".into()];
     config.validators.require_trusted_validators = false;
     let node = Node::new_standalone(config, GENESIS_ADDR).unwrap();
 

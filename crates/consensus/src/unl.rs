@@ -164,8 +164,7 @@ impl TrustedValidatorList {
         for pk in master_keys {
             let node_id = NodeId::from_public_key(pk.as_bytes());
             self.trusted.insert(node_id);
-            self.master_keys
-                .insert(hex::encode(pk.as_bytes()), node_id);
+            self.master_keys.insert(hex::encode(pk.as_bytes()), node_id);
         }
     }
 

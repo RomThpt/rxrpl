@@ -73,7 +73,8 @@ pub async fn nft_buy_offers(
     if truncated {
         tracing::warn!(
             "nft_buy_offers scan truncated at {} entries for nft_id={}",
-            MAX_SCANNED_ENTRIES, nft_id_str
+            MAX_SCANNED_ENTRIES,
+            nft_id_str
         );
     }
 

@@ -22,7 +22,9 @@ pub async fn run_peer_read_loop(
             Some(Ok(msg)) => {
                 tracing::debug!(
                     "peer {} msg {:?} ({} bytes)",
-                    node_id, msg.msg_type, msg.payload.len()
+                    node_id,
+                    msg.msg_type,
+                    msg.payload.len()
                 );
                 let event = PeerEvent::Message {
                     from: node_id,

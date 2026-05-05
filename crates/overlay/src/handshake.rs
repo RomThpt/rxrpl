@@ -78,9 +78,7 @@ async fn read_until_header_end(stream: &mut PeerStream) -> Result<Vec<u8>, Overl
 
     loop {
         if buf.len() >= MAX_HTTP_HEADER_SIZE {
-            return Err(OverlayError::Handshake(
-                "HTTP header too large".into(),
-            ));
+            return Err(OverlayError::Handshake("HTTP header too large".into()));
         }
 
         let n = stream
@@ -143,9 +141,7 @@ fn verify_peer_http_headers(
         rxrpl_crypto::secp256k1::verify_digest(cookie.as_bytes(), &peer_pubkey, &peer_sig)
     };
     if !sig_valid {
-        return Err(OverlayError::Handshake(
-            "invalid Session-Signature".into(),
-        ));
+        return Err(OverlayError::Handshake("invalid Session-Signature".into()));
     }
 
     // Derive peer node ID
@@ -193,8 +189,7 @@ pub async fn handshake_outbound_http(
     // Read HTTP response
     let response_buf = timeout(HANDSHAKE_TIMEOUT, read_until_header_end(&mut stream))
         .await
-        .map_err(|_| OverlayError::Handshake("receive HTTP response timeout".into()))?
-        ?;
+        .map_err(|_| OverlayError::Handshake("receive HTTP response timeout".into()))??;
 
     let (status, resp_headers) = http::parse_http_response(&response_buf)
         .map_err(|e| OverlayError::Handshake(format!("parse HTTP response: {e}")))?;
@@ -202,7 +197,9 @@ pub async fn handshake_outbound_http(
     if status != 101 {
         let req_text = String::from_utf8_lossy(&request);
         let resp_text = String::from_utf8_lossy(&response_buf);
-        tracing::error!("HTTP upgrade rejected by peer.\n--- REQUEST ---\n{req_text}--- RESPONSE ---\n{resp_text}");
+        tracing::error!(
+            "HTTP upgrade rejected by peer.\n--- REQUEST ---\n{req_text}--- RESPONSE ---\n{resp_text}"
+        );
         return Err(OverlayError::Handshake(format!(
             "expected HTTP 101, got {status}"
         )));
@@ -233,8 +230,7 @@ pub async fn handshake_inbound_http(
     // Read HTTP upgrade request
     let request_buf = timeout(HANDSHAKE_TIMEOUT, read_until_header_end(&mut stream))
         .await
-        .map_err(|_| OverlayError::Handshake("receive HTTP request timeout".into()))?
-        ?;
+        .map_err(|_| OverlayError::Handshake("receive HTTP request timeout".into()))??;
 
     let req_headers = http::parse_http_request(&request_buf)
         .map_err(|e| OverlayError::Handshake(format!("parse HTTP request: {e}")))?;
@@ -292,8 +288,7 @@ mod tests {
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let stream = tls::connect_tls(tcp, &client_config).await.unwrap();
 
-        let result =
-            handshake_outbound_http(stream, &id_a, network_id, 1, &ledger_hash).await;
+        let result = handshake_outbound_http(stream, &id_a, network_id, 1, &ledger_hash).await;
         assert!(result.is_ok(), "outbound failed: {:?}", result.err());
 
         let (peer_id_from_client, client_seen_software, _framed_client) = result.unwrap();
@@ -329,15 +324,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let handle = tokio::spawn(async move {
-            let id =
-                NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("http-server"));
+            let id = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("http-server"));
             let (tcp, _) = listener.accept().await.unwrap();
             let stream = tls::accept_tls(tcp, &server_tls).await.unwrap();
             handshake_inbound_http(stream, &id, 99, 1, &ledger_hash).await
         });
 
-        let id =
-            NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("http-client"));
+        let id = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("http-client"));
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let stream = tls::connect_tls(tcp, &client_tls).await.unwrap();
         // Client uses network_id=1, server expects 99
@@ -355,8 +348,7 @@ mod tests {
         let ledger_hash = Hash256::new([0xCC; 32]);
 
         let id = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("self-node"));
-        let id_clone =
-            NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("self-node"));
+        let id_clone = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("self-node"));
         let server_config = tls::build_server_config(&id);
         let client_config = tls::build_client_config();
 
@@ -371,8 +363,7 @@ mod tests {
 
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let stream = tls::connect_tls(tcp, &client_config).await.unwrap();
-        let result =
-            handshake_outbound_http(stream, &id_clone, network_id, 1, &ledger_hash).await;
+        let result = handshake_outbound_http(stream, &id_clone, network_id, 1, &ledger_hash).await;
 
         // Either side should detect self-connection
         let client_is_err = result.is_err();

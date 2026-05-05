@@ -89,18 +89,17 @@ pub const DECREASE_LEDGER_TIME_RESOLUTION_EVERY: u32 = 1;
 // guard.  Keeping the two `if`s separate preserves the one-to-one
 // mapping with LedgerTiming.h:83-95.
 #[allow(clippy::modulo_one, clippy::collapsible_if)]
-pub fn next_resolution(
-    parent_resolution: u32,
-    previous_agree: bool,
-    new_ledger_seq: u32,
-) -> u32 {
+pub fn next_resolution(parent_resolution: u32, previous_agree: bool, new_ledger_seq: u32) -> u32 {
     if new_ledger_seq == 0 {
         return parent_resolution;
     }
 
     // Locate parent_resolution in the bin array.  Mirrors the
     // `std::find` lookup in LedgerTiming.h:69-72.
-    let idx = match TIME_RESOLUTIONS.iter().position(|&r| r == parent_resolution) {
+    let idx = match TIME_RESOLUTIONS
+        .iter()
+        .position(|&r| r == parent_resolution)
+    {
         Some(i) => i,
         // Precaution branch (LedgerTiming.h:78-79): unknown bin → no-op.
         None => return parent_resolution,
@@ -531,7 +530,14 @@ mod tests {
     fn next_resolution_disagree_walks_all_bins_up_to_120() {
         // From idx 0 (10s), repeated disagreements step one coarser
         // each call (seq % 1 == 0 always), saturating at 120s.
-        let walk = [(10, 20), (20, 30), (30, 60), (60, 90), (90, 120), (120, 120)];
+        let walk = [
+            (10, 20),
+            (20, 30),
+            (30, 60),
+            (60, 90),
+            (90, 120),
+            (120, 120),
+        ];
         for (parent, want) in walk {
             assert_eq!(
                 next_resolution(parent, false, 1),

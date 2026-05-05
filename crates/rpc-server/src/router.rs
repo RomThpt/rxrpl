@@ -6,7 +6,7 @@ use crate::context::ServerContext;
 use crate::error::RpcServerError;
 use crate::handlers;
 use crate::metrics;
-use crate::role::{is_admin_method, RequestContext};
+use crate::role::{RequestContext, is_admin_method};
 
 /// Dispatch an RPC method call to the appropriate handler.
 pub async fn dispatch(
@@ -191,21 +191,39 @@ mod tests {
     #[tokio::test]
     async fn public_cannot_call_admin_method() {
         let ctx = test_ctx();
-        let result = dispatch("stop", Value::Object(Default::default()), &ctx, &public_req_ctx()).await;
+        let result = dispatch(
+            "stop",
+            Value::Object(Default::default()),
+            &ctx,
+            &public_req_ctx(),
+        )
+        .await;
         assert!(matches!(result, Err(RpcServerError::NoPermission(_))));
     }
 
     #[tokio::test]
     async fn admin_can_call_admin_method() {
         let ctx = test_ctx();
-        let result = dispatch("stop", Value::Object(Default::default()), &ctx, &admin_req_ctx()).await;
+        let result = dispatch(
+            "stop",
+            Value::Object(Default::default()),
+            &ctx,
+            &admin_req_ctx(),
+        )
+        .await;
         assert!(!matches!(result, Err(RpcServerError::NoPermission(_))));
     }
 
     #[tokio::test]
     async fn public_can_call_public_method() {
         let ctx = test_ctx();
-        let result = dispatch("ping", Value::Object(Default::default()), &ctx, &public_req_ctx()).await;
+        let result = dispatch(
+            "ping",
+            Value::Object(Default::default()),
+            &ctx,
+            &public_req_ctx(),
+        )
+        .await;
         assert!(result.is_ok());
     }
 }

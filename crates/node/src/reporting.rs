@@ -167,7 +167,10 @@ impl EtlPipeline {
 
             // Check if this is a ledger_closed event (subscription notification)
             if value.get("type").and_then(|v| v.as_str()) == Some("ledgerClosed") {
-                if let Err(e) = self.handle_ledger_closed(&value, &mut ws_write, &mut ws_read).await {
+                if let Err(e) = self
+                    .handle_ledger_closed(&value, &mut ws_write, &mut ws_read)
+                    .await
+                {
                     tracing::warn!(error = %e, "failed to process ledger event");
                 }
             }
@@ -203,7 +206,11 @@ impl EtlPipeline {
             }
         }
 
-        tracing::debug!(seq = ledger_index, hash = ledger_hash, "fetching full ledger");
+        tracing::debug!(
+            seq = ledger_index,
+            hash = ledger_hash,
+            "fetching full ledger"
+        );
 
         // Request full ledger with expanded transactions
         let ledger_req = serde_json::json!({
@@ -225,9 +232,7 @@ impl EtlPipeline {
             .or_else(|| response.get("ledger"))
             .unwrap_or(&response);
 
-        let ledger_obj = result
-            .get("ledger")
-            .unwrap_or(result);
+        let ledger_obj = result.get("ledger").unwrap_or(result);
 
         // Extract ledger header blob
         let header_blob = ledger_obj
@@ -251,19 +256,22 @@ impl EtlPipeline {
                     .and_then(|s| hex::decode(s).ok())
                     .unwrap_or_default();
 
-                let tx_blob = if let Some(blob_hex) = tx_entry.get("tx_blob").and_then(|v| v.as_str()) {
-                    hex::decode(blob_hex).unwrap_or_default()
-                } else if let Some(tx_obj) = tx_entry.get("tx") {
-                    serde_json::to_vec(tx_obj).unwrap_or_default()
-                } else {
-                    // The entry itself might be the tx object
-                    serde_json::to_vec(tx_entry).unwrap_or_default()
-                };
+                let tx_blob =
+                    if let Some(blob_hex) = tx_entry.get("tx_blob").and_then(|v| v.as_str()) {
+                        hex::decode(blob_hex).unwrap_or_default()
+                    } else if let Some(tx_obj) = tx_entry.get("tx") {
+                        serde_json::to_vec(tx_obj).unwrap_or_default()
+                    } else {
+                        // The entry itself might be the tx object
+                        serde_json::to_vec(tx_entry).unwrap_or_default()
+                    };
 
                 let meta_blob =
                     if let Some(meta_hex) = tx_entry.get("meta_blob").and_then(|v| v.as_str()) {
                         hex::decode(meta_hex).unwrap_or_default()
-                    } else if let Some(meta_obj) = tx_entry.get("meta").or_else(|| tx_entry.get("metaData")) {
+                    } else if let Some(meta_obj) =
+                        tx_entry.get("meta").or_else(|| tx_entry.get("metaData"))
+                    {
                         serde_json::to_vec(meta_obj).unwrap_or_default()
                     } else {
                         Vec::new()
@@ -283,10 +291,7 @@ impl EtlPipeline {
 
     /// Read the next JSON response from the WebSocket stream, skipping
     /// subscription notifications.
-    async fn read_response(
-        &self,
-        ws_read: &mut WsReader,
-    ) -> Result<Value, NodeError> {
+    async fn read_response(&self, ws_read: &mut WsReader) -> Result<Value, NodeError> {
         let timeout = Duration::from_secs(30);
         let deadline = tokio::time::Instant::now() + timeout;
 
@@ -359,9 +364,8 @@ fn extract_affected_accounts(tx_blob: &[u8], meta_blob: &[u8]) -> Vec<Vec<u8>> {
                 // Each node is wrapped in CreatedNode, ModifiedNode, or DeletedNode
                 for wrapper_key in &["CreatedNode", "ModifiedNode", "DeletedNode"] {
                     if let Some(inner) = node.get(*wrapper_key) {
-                        if let Some(fields) = inner
-                            .get("FinalFields")
-                            .or_else(|| inner.get("NewFields"))
+                        if let Some(fields) =
+                            inner.get("FinalFields").or_else(|| inner.get("NewFields"))
                         {
                             if let Some(account) = fields.get("Account").and_then(|v| v.as_str()) {
                                 add_account(account);
@@ -399,8 +403,7 @@ impl super::Node {
             let db_path = self.config.database.path.join("reporting.db");
             Arc::new(
                 rxrpl_storage::SqliteLedgerStore::open(&db_path).unwrap_or_else(|_| {
-                    rxrpl_storage::SqliteLedgerStore::in_memory()
-                        .expect("in-memory fallback")
+                    rxrpl_storage::SqliteLedgerStore::in_memory().expect("in-memory fallback")
                 }),
             )
         };

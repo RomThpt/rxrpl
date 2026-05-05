@@ -7,23 +7,23 @@ use std::time::Duration;
 use rxrpl_amendment::{AmendmentTable, FeatureRegistry, Rules};
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_config::{NodeConfig, load_seed_file};
-use rxrpl_crypto::Seed;
 use rxrpl_consensus::{
     ConsensusEngine, ConsensusParams, ConsensusTimer, NodeId, TimerAction, TrustedValidatorList,
     TxSet,
 };
+use rxrpl_crypto::Seed;
 use rxrpl_ledger::Ledger;
+#[cfg(feature = "rocksdb")]
+use rxrpl_nodestore::PersistentNodeDatabase;
+use rxrpl_nodestore::{CachedNodeStore, MemoryNodeDatabase};
 use rxrpl_overlay::{
     ConsensusMessage, LedgerProvider, NetworkConsensusAdapter, NodeIdentity, OverlayCommand,
     PeerManager, PeerManagerConfig, VlFetcher, new_trusted_keys,
 };
 use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
-use rxrpl_nodestore::{CachedNodeStore, MemoryNodeDatabase};
-#[cfg(feature = "rocksdb")]
-use rxrpl_nodestore::PersistentNodeDatabase;
-use rxrpl_shamap::{NodeStore, SHAMap};
 use rxrpl_rpc_server::{ServerContext, ServerEvent};
+use rxrpl_shamap::{NodeStore, SHAMap};
 use rxrpl_storage::{SqliteStore, TxStore};
 use rxrpl_tx_engine::{FeeSettings, TransactorRegistry, TxEngine};
 use rxrpl_txq::TxQueue;
@@ -281,7 +281,12 @@ impl Node {
         self.running = true;
 
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
+            if let Err(e) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
                 tracing::error!("RPC server error: {}", e);
             }
         });
@@ -323,7 +328,12 @@ impl Node {
 
         // Spawn RPC server
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
+            if let Err(e) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
                 tracing::error!("RPC server error: {}", e);
             }
         });
@@ -380,7 +390,8 @@ impl Node {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs()
-                    .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
+                    .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET)
+                    as u32;
 
                 // Round to the current close_time_resolution so that two nodes
                 // closing within the same window produce the same close_time
@@ -480,7 +491,9 @@ impl Node {
                         let tx_json = record.get("tx_json").cloned().unwrap_or_default();
 
                         // Check for order book changes
-                        if let Some(tx_type) = tx_json.get("TransactionType").and_then(|v| v.as_str()) {
+                        if let Some(tx_type) =
+                            tx_json.get("TransactionType").and_then(|v| v.as_str())
+                        {
                             if matches!(tx_type, "OfferCreate" | "OfferCancel") {
                                 has_offer_changes = true;
                             }
@@ -584,14 +597,14 @@ impl Node {
                         let cutoff_seq = seq.saturating_sub(retention);
 
                         // Collect old ledgers eligible for pruning
-                        let old: Vec<_> = history.iter()
+                        let old: Vec<_> = history
+                            .iter()
                             .filter(|l| l.header.sequence <= cutoff_seq)
                             .cloned()
                             .collect();
 
                         // The retained ledger is the first one after the cutoff
-                        let retained = history.iter()
-                            .find(|l| l.header.sequence > cutoff_seq);
+                        let retained = history.iter().find(|l| l.header.sequence > cutoff_seq);
 
                         let _deleted = pruner.prune(seq, &old, retained, store);
                     }
@@ -674,7 +687,10 @@ impl Node {
         };
         let identity = Arc::new(identity);
         tracing::info!("node identity: {}", identity.node_id);
-        tracing::info!("node public key: {}", hex::encode(identity.public_key_bytes()));
+        tracing::info!(
+            "node public key: {}",
+            hex::encode(identity.public_key_bytes())
+        );
 
         // 2. Bootstrap from RPC: fetch latest validated ledger to set our starting point
         if let Some(rpc_url) = sync_rpc_url {
@@ -686,18 +702,28 @@ impl Node {
                     drop(l);
                     tracing::info!(
                         "bootstrapped from RPC: validated ledger #{} hash={}, open ledger #{}",
-                        seq, hash, seq + 1
+                        seq,
+                        hash,
+                        seq + 1
                     );
 
                     // Download the full state tree via RPC to pre-populate the store.
                     if let Some(ref store) = self.node_store {
                         let hash_hex = hex::encode(hash.as_bytes());
-                        match Self::download_state_via_rpc(rpc_url, &hash_hex, Arc::clone(store)).await {
+                        match Self::download_state_via_rpc(rpc_url, &hash_hex, Arc::clone(store))
+                            .await
+                        {
                             Ok(count) => {
-                                tracing::info!("pre-populated store with {} state entries via RPC", count);
+                                tracing::info!(
+                                    "pre-populated store with {} state entries via RPC",
+                                    count
+                                );
                             }
                             Err(e) => {
-                                tracing::warn!("RPC state download failed (P2P sync will be used): {}", e);
+                                tracing::warn!(
+                                    "RPC state download failed (P2P sync will be used): {}",
+                                    e
+                                );
                             }
                         }
                     }
@@ -766,7 +792,8 @@ impl Node {
             while let Some((tx_hash, tx_bytes)) = relay_rx.recv().await {
                 tracing::debug!(
                     "relay bridge: forwarding tx {} ({} bytes) to broadcast",
-                    tx_hash, tx_bytes.len()
+                    tx_hash,
+                    tx_bytes.len()
                 );
                 let payload = rxrpl_overlay::proto_convert::encode_transaction(&tx_hash, &tx_bytes);
                 let _ = cmd_tx_relay.send(OverlayCommand::Broadcast {
@@ -876,7 +903,12 @@ impl Node {
             .map_err(|e| NodeError::Server(e.to_string()))?;
 
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
+            if let Err(e) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
                 tracing::error!("RPC server error: {}", e);
             }
         });
@@ -957,10 +989,7 @@ impl Node {
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("")
                                             .to_string(),
-                                        seq: json
-                                            .get("seq")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0)
+                                        seq: json.get("seq").and_then(|v| v.as_u64()).unwrap_or(0)
                                             as u32,
                                     });
                                 }
@@ -1072,8 +1101,13 @@ impl Node {
             let node_id = NodeId(identity.node_id);
             let consensus_params = ConsensusParams::default();
             let mut timer = ConsensusTimer::new(&consensus_params);
-            let mut consensus =
-                ConsensusEngine::new_with_unl(adapter, node_id, identity.public_key_bytes().to_vec(), consensus_params, unl);
+            let mut consensus = ConsensusEngine::new_with_unl(
+                adapter,
+                node_id,
+                identity.public_key_bytes().to_vec(),
+                consensus_params,
+                unl,
+            );
 
             let mut syncing = false;
             let mut max_peer_seq: u32 = 0;
@@ -1138,7 +1172,8 @@ impl Node {
                     Some(crate::checkpoint::StartingLedger::Seq(s)) => {
                         tracing::info!(
                             "checkpoint bootstrap: tracking anchor for ledger #{} (quorum {})",
-                            s, initial_quorum
+                            s,
+                            initial_quorum
                         );
                         Some(crate::checkpoint::CheckpointAnchor::new(
                             crate::checkpoint::AnchorConfig {
@@ -1151,8 +1186,10 @@ impl Node {
                     Some(crate::checkpoint::StartingLedger::Hash(_)) | None => None,
                 };
             // True until --starting-ledger=recent has computed its target seq.
-            let mut recent_anchor_pending =
-                matches!(starting_ledger_for_loop, Some(crate::checkpoint::StartingLedger::Recent));
+            let mut recent_anchor_pending = matches!(
+                starting_ledger_for_loop,
+                Some(crate::checkpoint::StartingLedger::Recent)
+            );
 
             // Collect amendment votes from received validations for the current round.
             // Reset after each ledger close.
@@ -1958,7 +1995,9 @@ impl Node {
             });
         tracing::debug!(
             "closing with effective_close_time={} close_flags={} pending_close_time={}",
-            effective_close_time, close_flags, pending_close_time
+            effective_close_time,
+            close_flags,
+            pending_close_time
         );
 
         let mut l = ledger.write().await;
@@ -1982,13 +2021,7 @@ impl Node {
 
         // Apply negative-UNL pseudo-transactions on flag ledgers.
         let nunl_seq = l.header.sequence;
-        let _nunl_results = Node::apply_negative_unl(
-            consensus,
-            &mut l,
-            tx_engine,
-            fees,
-            nunl_seq,
-        );
+        let _nunl_results = Node::apply_negative_unl(consensus, &mut l, tx_engine, fees, nunl_seq);
         consensus.on_ledger_close_for_tracker();
 
         if let Err(e) = l.close(effective_close_time, close_flags) {
@@ -2106,8 +2139,7 @@ impl Node {
 
         // Broadcast StatusChange so peers know our current ledger
         {
-            let payload =
-                rxrpl_overlay::proto_convert::encode_status_change(&hash, closed_seq);
+            let payload = rxrpl_overlay::proto_convert::encode_status_change(&hash, closed_seq);
             let _ = cmd_tx.send(OverlayCommand::Broadcast {
                 msg_type: rxrpl_p2p_proto::MessageType::StatusChange,
                 payload,
@@ -2158,13 +2190,13 @@ impl Node {
                 let retention = pruner.shared_state().retention_window;
                 let cutoff_seq = closed_seq.saturating_sub(retention);
 
-                let old: Vec<_> = history.iter()
+                let old: Vec<_> = history
+                    .iter()
                     .filter(|l| l.header.sequence <= cutoff_seq)
                     .cloned()
                     .collect();
 
-                let retained = history.iter()
-                    .find(|l| l.header.sequence > cutoff_seq);
+                let retained = history.iter().find(|l| l.header.sequence > cutoff_seq);
 
                 let _deleted = pruner.prune(closed_seq, &old, retained, store);
             }
@@ -2382,10 +2414,7 @@ impl Node {
         let rules = amendment_table.build_rules();
 
         if actions.is_empty() {
-            tracing::debug!(
-                "flag ledger #{}: no amendment voting changes",
-                ledger_seq
-            );
+            tracing::debug!("flag ledger #{}: no amendment voting changes", ledger_seq);
             return rules;
         }
 
@@ -2396,25 +2425,20 @@ impl Node {
                     if result.is_success() {
                         match action {
                             rxrpl_amendment::AmendmentAction::GotMajority {
-                                amendment_id,
-                                ..
+                                amendment_id, ..
                             } => {
                                 tracing::info!(
                                     "amendment {} gained majority",
                                     hex::encode(amendment_id.as_bytes())
                                 );
                             }
-                            rxrpl_amendment::AmendmentAction::LostMajority {
-                                amendment_id,
-                            } => {
+                            rxrpl_amendment::AmendmentAction::LostMajority { amendment_id } => {
                                 tracing::info!(
                                     "amendment {} lost majority",
                                     hex::encode(amendment_id.as_bytes())
                                 );
                             }
-                            rxrpl_amendment::AmendmentAction::Activate {
-                                amendment_id,
-                            } => {
+                            rxrpl_amendment::AmendmentAction::Activate { amendment_id } => {
                                 tracing::info!(
                                     "amendment {} activated",
                                     hex::encode(amendment_id.as_bytes())
@@ -2422,10 +2446,7 @@ impl Node {
                             }
                         }
                     } else {
-                        tracing::warn!(
-                            "amendment pseudo-tx failed: {}",
-                            result
-                        );
+                        tracing::warn!("amendment pseudo-tx failed: {}", result);
                     }
                 }
                 Err(e) => {
@@ -2491,7 +2512,11 @@ impl Node {
                     if result.is_success() {
                         tracing::info!(
                             "nUNL pseudo-tx applied: {} validator {}",
-                            if change.disable { "disable" } else { "re-enable" },
+                            if change.disable {
+                                "disable"
+                            } else {
+                                "re-enable"
+                            },
                             change.validator_key,
                         );
                     } else {
@@ -2661,8 +2686,8 @@ impl Node {
             .and_then(|v| v.as_str())
             .ok_or("missing hash in ledger info")?;
 
-        let hash_bytes = hex::decode(hash_str)
-            .map_err(|e| format!("invalid ledger hash hex: {e}"))?;
+        let hash_bytes =
+            hex::decode(hash_str).map_err(|e| format!("invalid ledger hash hex: {e}"))?;
         if hash_bytes.len() != 32 {
             return Err(format!("ledger hash must be 32 bytes, got {}", hash_bytes.len()).into());
         }
@@ -2736,14 +2761,16 @@ impl Node {
             };
             retries = 0;
 
-            let result = body.get("result")
+            let result = body
+                .get("result")
                 .ok_or("missing result in ledger_data response")?;
 
             if let Some(err) = result.get("error") {
                 return Err(format!("ledger_data error: {}", err).into());
             }
 
-            let state = result.get("state")
+            let state = result
+                .get("state")
                 .and_then(|s| s.as_array())
                 .ok_or("missing state array in ledger_data response")?;
 
@@ -2782,9 +2809,8 @@ impl Node {
 
             let count = batch.len();
             if count > 0 {
-                let refs: Vec<(&Hash256, &[u8])> = batch.iter()
-                    .map(|(h, d)| (h, d.as_slice()))
-                    .collect();
+                let refs: Vec<(&Hash256, &[u8])> =
+                    batch.iter().map(|(h, d)| (h, d.as_slice())).collect();
                 store.store_batch(&refs)?;
             }
             total += count as u32;
@@ -2792,14 +2818,21 @@ impl Node {
 
             if page % 100 == 0 {
                 let elapsed = start.elapsed().as_secs();
-                let rate = if elapsed > 0 { total as u64 / elapsed } else { 0 };
+                let rate = if elapsed > 0 {
+                    total as u64 / elapsed
+                } else {
+                    0
+                };
                 tracing::info!(
                     "RPC state download: {} entries ({} pages, {} entries/s)",
-                    total, page, rate
+                    total,
+                    page,
+                    rate
                 );
             }
 
-            marker = result.get("marker")
+            marker = result
+                .get("marker")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
@@ -2811,7 +2844,9 @@ impl Node {
         let elapsed = start.elapsed().as_secs();
         tracing::info!(
             "RPC state download complete: {} entries in {} pages ({}s)",
-            total, page, elapsed
+            total,
+            page,
+            elapsed
         );
         Ok(total)
     }
@@ -2918,7 +2953,9 @@ mod tests {
         let genesis = Node::genesis_with_funded_account(address).unwrap();
 
         let fee_key = keylet::fee_settings();
-        let data = genesis.get_state(&fee_key).expect("FeeSettings missing from genesis");
+        let data = genesis
+            .get_state(&fee_key)
+            .expect("FeeSettings missing from genesis");
         let fee: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
         assert_eq!(fee["LedgerEntryType"].as_str().unwrap(), "FeeSettings");
         assert_eq!(fee["ReserveBase"], 10_000_000);
@@ -2966,8 +3003,8 @@ mod tests {
     fn quorum_auto_set_integration() {
         // Simulate the full flow: ValidatorListReceived → compute_quorum → update_quorum
         // This tests the exact code path from the select! handler.
-        use rxrpl_overlay::validation_aggregator::ValidationAggregator;
         use rxrpl_consensus::types::{NodeId as CNodeId, Validation};
+        use rxrpl_overlay::validation_aggregator::ValidationAggregator;
 
         let configured_quorum: Option<usize> = None; // auto mode
         let mut val_aggregator = ValidationAggregator::new(1);

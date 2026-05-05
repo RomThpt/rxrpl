@@ -124,7 +124,10 @@ impl TxQueue {
         let sequence = entry.sequence;
 
         self.by_fee.insert(std::cmp::Reverse(fee_level), hash);
-        self.by_account.entry(account.clone()).or_default().push(hash);
+        self.by_account
+            .entry(account.clone())
+            .or_default()
+            .push(hash);
         self.by_account_seq.insert((account, sequence), hash);
         self.by_hash.insert(hash, entry);
         self.metrics.total_queued += 1;
@@ -142,7 +145,8 @@ impl TxQueue {
                 self.by_account.remove(&entry.account);
             }
         }
-        self.by_account_seq.remove(&(entry.account.clone(), entry.sequence));
+        self.by_account_seq
+            .remove(&(entry.account.clone(), entry.sequence));
         Some(entry)
     }
 
@@ -270,8 +274,16 @@ impl TxQueue {
         // Sort groups by max fee level descending
         let mut groups: Vec<(String, Vec<QueueEntry>)> = by_account.into_iter().collect();
         groups.sort_by(|a, b| {
-            let max_a = a.1.iter().map(|e| e.fee_level).max().unwrap_or(FeeLevel::new(0, 1));
-            let max_b = b.1.iter().map(|e| e.fee_level).max().unwrap_or(FeeLevel::new(0, 1));
+            let max_a =
+                a.1.iter()
+                    .map(|e| e.fee_level)
+                    .max()
+                    .unwrap_or(FeeLevel::new(0, 1));
+            let max_b =
+                b.1.iter()
+                    .map(|e| e.fee_level)
+                    .max()
+                    .unwrap_or(FeeLevel::new(0, 1));
             max_b.cmp(&max_a)
         });
 
@@ -385,8 +397,13 @@ mod tests {
         use crate::fee::MAX_ACCOUNT_QUEUE_DEPTH;
         let mut q = TxQueue::new(100);
         for i in 0..MAX_ACCOUNT_QUEUE_DEPTH {
-            q.submit(make_entry_with_seq(i as u8, 10 + i as u64, "alice", i as u32))
-                .unwrap();
+            q.submit(make_entry_with_seq(
+                i as u8,
+                10 + i as u64,
+                "alice",
+                i as u32,
+            ))
+            .unwrap();
         }
         // The next one from the same account must fail.
         let result = q.submit(make_entry_with_seq(0xFF, 10, "alice", 99));

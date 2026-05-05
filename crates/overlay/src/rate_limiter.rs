@@ -180,9 +180,9 @@ impl PeerRateLimiter {
 
         // Check type-specific bucket first.
         let type_allowed = match msg_type {
-            MessageType::Transaction | MessageType::HaveTransactions | MessageType::Transactions => {
-                inner.transaction.try_consume()
-            }
+            MessageType::Transaction
+            | MessageType::HaveTransactions
+            | MessageType::Transactions => inner.transaction.try_consume(),
             MessageType::ProposeSet => inner.proposal.try_consume(),
             MessageType::Validation => inner.validation.try_consume(),
             // Other message types only check the global bucket.
@@ -431,8 +431,7 @@ mod tests {
         // Simulate time passing to refill.
         {
             let mut inner = limiter.inner.lock().unwrap();
-            inner.global.last_refill =
-                Instant::now() - std::time::Duration::from_millis(500);
+            inner.global.last_refill = Instant::now() - std::time::Duration::from_millis(500);
         }
 
         // Should be allowed again and reset consecutive drops.

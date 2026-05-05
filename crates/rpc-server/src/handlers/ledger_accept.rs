@@ -99,9 +99,7 @@ pub async fn ledger_accept(
     let new_seq = ledger.header.sequence;
 
     // --- Queue retry: re-apply queued txs against the new open ledger ---
-    if let (Some(tq), Some(engine), Some(fees)) =
-        (&ctx.tx_queue, &ctx.tx_engine, &ctx.fees)
-    {
+    if let (Some(tq), Some(engine), Some(fees)) = (&ctx.tx_queue, &ctx.tx_engine, &ctx.fees) {
         let pending = {
             let mut q = tq.write().await;
             // Drop transactions that are already confirmed in the just-closed

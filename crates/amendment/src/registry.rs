@@ -246,7 +246,9 @@ mod tests {
             "fixNFTokenPageLinks",
             "ExpandedSignerList",
         ] {
-            let f = reg.get_by_name(name).unwrap_or_else(|| panic!("{name} not found"));
+            let f = reg
+                .get_by_name(name)
+                .unwrap_or_else(|| panic!("{name} not found"));
             assert!(f.retired, "{name} should be retired");
         }
     }
@@ -262,9 +264,14 @@ mod tests {
             ("fixPriceOracleOrder", true),
             ("fixTokenEscrowV1", true),
         ] {
-            let f = reg.get_by_name(name).unwrap_or_else(|| panic!("{name} not found"));
+            let f = reg
+                .get_by_name(name)
+                .unwrap_or_else(|| panic!("{name} not found"));
             assert!(!f.retired, "{name} should not be retired");
-            assert_eq!(f.default_vote, expected_vote, "{name} default_vote mismatch");
+            assert_eq!(
+                f.default_vote, expected_vote,
+                "{name} default_vote mismatch"
+            );
         }
     }
 

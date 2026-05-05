@@ -1,6 +1,6 @@
-use rxrpl_amendment::{AmendmentTable, FeatureRegistry, Rules, is_flag_ledger};
 use rxrpl_amendment::feature::{Feature, feature_id};
 use rxrpl_amendment::voting::{self, AmendmentAction, FLAG_LEDGER_INTERVAL};
+use rxrpl_amendment::{AmendmentTable, FeatureRegistry, Rules, is_flag_ledger};
 use rxrpl_ledger::Ledger;
 use rxrpl_node::Node;
 use rxrpl_primitives::Hash256;
@@ -69,9 +69,7 @@ fn flag_ledger_amendments_gain_majority() {
     let id_b = reg.id_for_name("TestAmendmentB").unwrap();
 
     // Simulate 10 validators all voting for TestAmendmentA and TestAmendmentB
-    let validator_votes: Vec<Vec<Hash256>> = (0..10)
-        .map(|_| vec![id_a, id_b])
-        .collect();
+    let validator_votes: Vec<Vec<Hash256>> = (0..10).map(|_| vec![id_a, id_b]).collect();
 
     let _rules = Node::apply_amendment_voting(
         &mut ledger,
@@ -109,9 +107,7 @@ fn amendment_activation_lifecycle() {
 
     // Step 1: Gain majority on first flag ledger
     let mut ledger1 = Ledger::genesis();
-    let validator_votes: Vec<Vec<Hash256>> = (0..10)
-        .map(|_| vec![id_a])
-        .collect();
+    let validator_votes: Vec<Vec<Hash256>> = (0..10).map(|_| vec![id_a]).collect();
 
     Node::apply_amendment_voting(
         &mut ledger1,
@@ -152,7 +148,8 @@ fn amendment_activation_lifecycle() {
     assert!(
         amendments.iter().any(|v| v.as_str() == Some(&id_hex)),
         "Amendment {} not found in Amendments list: {:?}",
-        id_hex, amendments
+        id_hex,
+        amendments
     );
 
     // Rules snapshot should reflect the activation
@@ -172,9 +169,7 @@ fn amendment_loses_majority() {
 
     // Step 1: Gain majority
     let mut ledger1 = Ledger::genesis();
-    let votes_strong: Vec<Vec<Hash256>> = (0..10)
-        .map(|_| vec![id_a])
-        .collect();
+    let votes_strong: Vec<Vec<Hash256>> = (0..10).map(|_| vec![id_a]).collect();
 
     Node::apply_amendment_voting(
         &mut ledger1,
@@ -190,9 +185,7 @@ fn amendment_loses_majority() {
 
     // Step 2: Lose majority (only 5 of 10 vote)
     let mut ledger2 = Ledger::genesis();
-    let votes_weak: Vec<Vec<Hash256>> = (0..5)
-        .map(|_| vec![id_a])
-        .collect();
+    let votes_weak: Vec<Vec<Hash256>> = (0..5).map(|_| vec![id_a]).collect();
 
     Node::apply_amendment_voting(
         &mut ledger2,
@@ -260,7 +253,12 @@ fn pseudo_tx_format_compatible_with_transactor() {
         // Verify the engine can apply it to a genesis ledger
         let mut ledger = Ledger::genesis();
         let result = engine.apply(&tx, &mut ledger, &rules, &fees);
-        assert!(result.is_ok(), "engine.apply failed for {:?}: {:?}", action, result);
+        assert!(
+            result.is_ok(),
+            "engine.apply failed for {:?}: {:?}",
+            action,
+            result
+        );
     }
 }
 

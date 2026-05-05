@@ -29,10 +29,7 @@ pub async fn server_subscribe(
                 if let Some(ref closed) = ctx.closed_ledgers {
                     let closed = closed.read().await;
                     if let Some(last) = closed.back() {
-                        result.insert(
-                            "ledger_index".into(),
-                            Value::from(last.header.sequence),
-                        );
+                        result.insert("ledger_index".into(), Value::from(last.header.sequence));
                         result.insert(
                             "ledger_hash".into(),
                             Value::from(last.header.hash.to_string()),
@@ -41,23 +38,14 @@ pub async fn server_subscribe(
                 }
             }
             "server" => {
-                result.insert(
-                    "server_status".into(),
-                    Value::from("full"),
-                );
+                result.insert("server_status".into(), Value::from("full"));
             }
             "transactions" | "transactions_proposed" => {
                 // Acknowledged; events would be delivered via polling
-                result.insert(
-                    format!("{stream_name}_subscribed"),
-                    Value::Bool(true),
-                );
+                result.insert(format!("{stream_name}_subscribed"), Value::Bool(true));
             }
             "validations" => {
-                result.insert(
-                    "validations_subscribed".into(),
-                    Value::Bool(true),
-                );
+                result.insert("validations_subscribed".into(), Value::Bool(true));
             }
             "consensus" => {
                 result.insert("consensus_subscribed".into(), Value::Bool(true));

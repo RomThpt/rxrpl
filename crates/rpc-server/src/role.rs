@@ -98,13 +98,19 @@ mod tests {
     #[test]
     fn loopback_ipv4_is_admin() {
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        assert_eq!(ConnectionRole::from_ip(ip, &default_config()), ConnectionRole::Admin);
+        assert_eq!(
+            ConnectionRole::from_ip(ip, &default_config()),
+            ConnectionRole::Admin
+        );
     }
 
     #[test]
     fn loopback_ipv6_is_admin() {
         let ip: IpAddr = "::1".parse().unwrap();
-        assert_eq!(ConnectionRole::from_ip(ip, &default_config()), ConnectionRole::Admin);
+        assert_eq!(
+            ConnectionRole::from_ip(ip, &default_config()),
+            ConnectionRole::Admin
+        );
     }
 
     #[test]
@@ -118,7 +124,10 @@ mod tests {
     #[test]
     fn random_ip_is_public() {
         let ip: IpAddr = "203.0.113.42".parse().unwrap();
-        assert_eq!(ConnectionRole::from_ip(ip, &default_config()), ConnectionRole::Public);
+        assert_eq!(
+            ConnectionRole::from_ip(ip, &default_config()),
+            ConnectionRole::Public
+        );
     }
 
     #[test]

@@ -14,10 +14,7 @@ use crate::handlers::common::resolve_ledger;
 /// Returns enriched ledger data with age in seconds (relative to the host
 /// clock), transaction count, and parent hash diff. Mirrors the operator
 /// summary fields from rippled's expanded `ledger`/`server_info` blocks.
-pub async fn ledger_info(
-    params: Value,
-    ctx: &Arc<ServerContext>,
-) -> Result<Value, RpcServerError> {
+pub async fn ledger_info(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcServerError> {
     let ledger = resolve_ledger(&params, ctx).await?;
 
     // Age = host_now (UNIX epoch) - close_time (Ripple epoch -> UNIX epoch).
@@ -30,9 +27,8 @@ pub async fn ledger_info(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-            let close_unix =
-                ledger.header.close_time as i64 + RIPPLE_EPOCH_OFFSET as i64;
-            (now_unix - close_unix).max(0)
+        let close_unix = ledger.header.close_time as i64 + RIPPLE_EPOCH_OFFSET as i64;
+        (now_unix - close_unix).max(0)
     };
 
     let transaction_count = ledger.tx_map.iter().count() as u64;

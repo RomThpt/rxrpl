@@ -64,8 +64,7 @@ pub struct ServerContext {
     /// Live status snapshot of the UNL fetcher, populated by the overlay
     /// layer when `validator_list_sites` are configured. Read by the
     /// `validator_list_sites` RPC method.
-    pub validator_list_status:
-        Option<Arc<RwLock<serde_json::Value>>>,
+    pub validator_list_status: Option<Arc<RwLock<serde_json::Value>>>,
     /// Live snapshot of validator domain attestation status, populated by
     /// the overlay layer's `DomainAttestationService`. Read by the
     /// `server_info` and `validators` RPC methods. Shape:
@@ -78,8 +77,7 @@ pub struct ServerContext {
     ///                   "last_verified": u64}]
     /// }
     /// ```
-    pub domain_attestation_status:
-        Option<Arc<RwLock<serde_json::Value>>>,
+    pub domain_attestation_status: Option<Arc<RwLock<serde_json::Value>>>,
     /// Configured network id (e.g. 0 = mainnet, 21337 = devnet, 10000 = test).
     /// Used by `sign` to auto-fill `NetworkID` on transactions, which modern
     /// rippled requires (`telREQUIRES_NETWORK_ID`).

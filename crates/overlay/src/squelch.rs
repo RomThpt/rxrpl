@@ -128,8 +128,7 @@ impl SquelchManager {
         // No selected source yet. If we have enough sources, pick this one
         // as primary and squelch the rest.
         if sources.len() >= MIN_PEERS_BEFORE_SQUELCH {
-            self.selected_source
-                .insert(validator_key.to_vec(), peer_id);
+            self.selected_source.insert(validator_key.to_vec(), peer_id);
 
             let peers_to_squelch: Vec<Hash256> = sources
                 .iter()
@@ -202,11 +201,7 @@ impl SquelchManager {
 
     /// Check whether we should skip relaying a validation to a specific peer
     /// because that peer has sent us a squelch for this validator.
-    pub fn is_relay_squelched(
-        &mut self,
-        peer_id: &Hash256,
-        validator_key: &[u8],
-    ) -> bool {
+    pub fn is_relay_squelched(&mut self, peer_id: &Hash256, validator_key: &[u8]) -> bool {
         let key = (*peer_id, validator_key.to_vec());
         if let Some(expiry) = self.inbound_squelches.get(&key) {
             if Instant::now() < *expiry {
@@ -246,12 +241,10 @@ impl SquelchManager {
         }
 
         // Remove outbound squelches involving this peer.
-        self.outbound_squelches
-            .retain(|(pid, _), _| pid != peer_id);
+        self.outbound_squelches.retain(|(pid, _), _| pid != peer_id);
 
         // Remove inbound squelches from this peer.
-        self.inbound_squelches
-            .retain(|(pid, _), _| pid != peer_id);
+        self.inbound_squelches.retain(|(pid, _), _| pid != peer_id);
     }
 
     /// Expire old squelch entries and stale validator sources.

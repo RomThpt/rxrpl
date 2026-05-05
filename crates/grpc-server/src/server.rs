@@ -5,9 +5,9 @@ use tonic::transport::Server;
 
 use rxrpl_rpc_server::ServerContext;
 
+use crate::service::XrplNodeService;
 use crate::service::proto::xrpl_node_server::XrplNodeServer;
 use crate::service::proto::xrpl_subscription_server::XrplSubscriptionServer;
-use crate::service::XrplNodeService;
 use crate::subscription::XrplSubscriptionService;
 
 /// Start the gRPC server on the given address.

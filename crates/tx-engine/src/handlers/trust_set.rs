@@ -45,8 +45,11 @@ impl Transactor for TrustSetTransactor {
 
         // Zero limit with non-zero QualityIn/QualityOut is malformed (rippled
         // doesn't allow setting quality on a zero trust line).
-        let limit_zero =
-            limit_value == "0" || limit_value.parse::<f64>().map(|f| f == 0.0).unwrap_or(false);
+        let limit_zero = limit_value == "0"
+            || limit_value
+                .parse::<f64>()
+                .map(|f| f == 0.0)
+                .unwrap_or(false);
         if limit_zero {
             let qi = helpers::get_u32_field(ctx.tx, "QualityIn").unwrap_or(0);
             let qo = helpers::get_u32_field(ctx.tx, "QualityOut").unwrap_or(0);
@@ -85,8 +88,8 @@ impl Transactor for TrustSetTransactor {
         // (lsfDisallowIncomingTrustline = 0x40000000), reject TrustSet from a
         // different account. Holder must already trust BEFORE issuer turns the
         // flag on; new incoming trust lines are blocked.
-        let issuer_account: serde_json::Value = serde_json::from_slice(&issuer_bytes)
-            .map_err(|_| TransactionResult::TefInternal)?;
+        let issuer_account: serde_json::Value =
+            serde_json::from_slice(&issuer_bytes).map_err(|_| TransactionResult::TefInternal)?;
         let issuer_flags = issuer_account
             .get("Flags")
             .and_then(|v| v.as_u64())

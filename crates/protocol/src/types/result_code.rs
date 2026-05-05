@@ -28,90 +28,90 @@ pub enum TransactionResult {
     TesSuccess,
 
     // tec: Claimed cost (100+)
-    TecClaimCost,                         // 100 tecCLAIM
-    TecPathPartial,                       // 101 tecPATH_PARTIAL
-    TecUnfundedAdd,                       // 102 tecUNFUNDED_ADD
-    TecUnfundedOffer,                     // 103 tecUNFUNDED_OFFER
-    TecUnfundedPayment,                   // 104 tecUNFUNDED_PAYMENT
-    TecFailedProcessing,                  // 105 tecFAILED_PROCESSING
-    TecDirFull,                           // 121 tecDIR_FULL
-    TecInsufReserveLine,                  // 122 tecINSUF_RESERVE_LINE
-    TecInsufReserveOffer,                 // 123 tecINSUF_RESERVE_OFFER
-    TecNoDst,                             // 124 tecNO_DST
-    TecNoDstInsuf,                        // 125 tecNO_DST_INSUF_XRP
-    TecNoLineInsuf,                       // 126 tecNO_LINE_INSUF_RESERVE
-    TecNoLineRedundant,                   // 127 tecNO_LINE_REDUNDANT
-    TecPathDry,                           // 128 tecPATH_DRY
-    TecUnfunded,                          // 129 tecUNFUNDED
-    TecNoAlternativeKey,                  // 130 tecNO_ALTERNATIVE_KEY
-    TecNoRegularKey,                      // 131 tecNO_REGULAR_KEY
-    TecOwners,                            // 132 tecOWNERS
-    TecNoIssuer,                          // 133 tecNO_ISSUER
-    TecNoAuth,                            // 134 tecNO_AUTH
-    TecNoLine,                            // 135 tecNO_LINE
-    TecInsufFee,                          // 136 tecINSUFF_FEE
-    TecFrozen,                            // 137 tecFROZEN
-    TecNoTarget,                          // 138 tecNO_TARGET
-    TecNoPermission,                      // 139 tecNO_PERMISSION
-    TecNoEntry,                           // 140 tecNO_ENTRY
-    TecInsufficientReserve,               // 141 tecINSUFFICIENT_RESERVE
-    TecNeedMasterKey,                     // 142 tecNEED_MASTER_KEY
-    TecDstTagNeeded,                      // 143 tecDST_TAG_NEEDED
-    TecInternalError,                     // 144 tecINTERNAL
-    TecOversize,                          // 145 tecOVERSIZE
-    TecCryptoconditionError,              // 146 tecCRYPTOCONDITION_ERROR
-    TecInvariantFailed,                   // 147 tecINVARIANT_FAILED
-    TecExpired,                           // 148 tecEXPIRED
-    TecDuplicate,                         // 149 tecDUPLICATE
-    TecKilled,                            // 150 tecKILLED
-    TecHasObligations,                    // 151 tecHAS_OBLIGATIONS
-    TecTooSoon,                           // 152 tecTOO_SOON
-    TecHookRejected,                      // 153 tecHOOK_REJECTED
-    TecMaxSequenceReached,                // 154 tecMAX_SEQUENCE_REACHED
-    TecNoSuitableNFTokenPage,             // 155 tecNO_SUITABLE_NFTOKEN_PAGE
-    TecNFTokenBuySellMismatch,            // 156 tecNFTOKEN_BUY_SELL_MISMATCH
-    TecNFTokenOfferTypeMismatch,          // 157 tecNFTOKEN_OFFER_TYPE_MISMATCH
-    TecCantAcceptOwnNFTokenOffer,         // 158 tecCANT_ACCEPT_OWN_NFTOKEN_OFFER
-    TecInsufficientFunds,                 // 159 tecINSUFFICIENT_FUNDS
-    TecObjectNotFound,                    // 160 tecOBJECT_NOT_FOUND
-    TecInsufficientPayment,               // 161 tecINSUFFICIENT_PAYMENT
-    TecUnfundedAmm,                       // 162 tecUNFUNDED_AMM
-    TecAmmBalance,                        // 163 tecAMM_BALANCE
-    TecAmmFailed,                         // 164 tecAMM_FAILED
-    TecAmmInvalidTokens,                  // 165 tecAMM_INVALID_TOKENS
-    TecAmmEmpty,                          // 166 tecAMM_EMPTY
-    TecAmmNotEmpty,                       // 167 tecAMM_NOT_EMPTY
-    TecAmmAccount,                        // 168 tecAMM_ACCOUNT
-    TecIncomplete,                        // 169 tecINCOMPLETE
-    TecXChainBadTransferIssue,            // 170 tecXCHAIN_BAD_TRANSFER_ISSUE
-    TecXChainNoClaimId,                   // 171 tecXCHAIN_NO_CLAIM_ID
-    TecXChainBadClaimId,                  // 172 tecXCHAIN_BAD_CLAIM_ID
-    TecXChainClaimNoQuorum,               // 173 tecXCHAIN_CLAIM_NO_QUORUM
-    TecXChainProofUnknownKey,             // 174 tecXCHAIN_PROOF_UNKNOWN_KEY
-    TecXChainCreateAccountNonXrpIssue,    // 175 tecXCHAIN_CREATE_ACCOUNT_NONXRP_ISSUE
-    TecXChainWrongChain,                  // 176 tecXCHAIN_WRONG_CHAIN
-    TecXChainRewardMismatch,              // 177 tecXCHAIN_REWARD_MISMATCH
-    TecXChainNoSignersList,               // 178 tecXCHAIN_NO_SIGNERS_LIST
-    TecXChainSendingAccountMismatch,      // 179 tecXCHAIN_SENDING_ACCOUNT_MISMATCH
-    TecXChainInsufCreateAmount,           // 180 tecXCHAIN_INSUFF_CREATE_AMOUNT
-    TecXChainAccountCreatePastSeq,        // 181 tecXCHAIN_ACCOUNT_CREATE_PAST
-    TecXChainAccountCreateTooMany,        // 182 tecXCHAIN_ACCOUNT_CREATE_TOO_MANY
-    TecXChainPaymentFailed,               // 183 tecXCHAIN_PAYMENT_FAILED
-    TecXChainSelfCommit,                  // 184 tecXCHAIN_SELF_COMMIT
-    TecXChainBadPublicKeyAccountPair,     // 185 tecXCHAIN_BAD_PUBLIC_KEY_ACCOUNT_PAIR
-    TecXChainCreateAccountDisabled,       // 186 tecXCHAIN_CREATE_ACCOUNT_DISABLED
-    TecEmptyDID,                          // 187 tecEMPTY_DID
-    TecInvalidUpdateTime,                 // 188 tecINVALID_UPDATE_TIME
-    TecTokenPairNotFound,                 // 189 tecTOKEN_PAIR_NOT_FOUND
-    TecArrayEmpty,                        // 190 tecARRAY_EMPTY
-    TecArrayTooLarge,                     // 191 tecARRAY_TOO_LARGE
-    TecLocked,                            // 192 tecLOCKED
-    TecBadCredential,                     // 193 tecBAD_CREDENTIALS
-    TecWrongAsset,                        // 194 tecWRONG_ASSET
-    TecLimitExceeded,                     // 195 tecLIMIT_EXCEEDED
-    TecPseudoAccount,                     // 196 tecPSEUDO_ACCOUNT
-    TecPrecisionLoss,                     // 197 tecPRECISION_LOSS
-    TecNoDelegatePermission,              // 198 tecNO_DELEGATE_PERMISSION
+    TecClaimCost,                      // 100 tecCLAIM
+    TecPathPartial,                    // 101 tecPATH_PARTIAL
+    TecUnfundedAdd,                    // 102 tecUNFUNDED_ADD
+    TecUnfundedOffer,                  // 103 tecUNFUNDED_OFFER
+    TecUnfundedPayment,                // 104 tecUNFUNDED_PAYMENT
+    TecFailedProcessing,               // 105 tecFAILED_PROCESSING
+    TecDirFull,                        // 121 tecDIR_FULL
+    TecInsufReserveLine,               // 122 tecINSUF_RESERVE_LINE
+    TecInsufReserveOffer,              // 123 tecINSUF_RESERVE_OFFER
+    TecNoDst,                          // 124 tecNO_DST
+    TecNoDstInsuf,                     // 125 tecNO_DST_INSUF_XRP
+    TecNoLineInsuf,                    // 126 tecNO_LINE_INSUF_RESERVE
+    TecNoLineRedundant,                // 127 tecNO_LINE_REDUNDANT
+    TecPathDry,                        // 128 tecPATH_DRY
+    TecUnfunded,                       // 129 tecUNFUNDED
+    TecNoAlternativeKey,               // 130 tecNO_ALTERNATIVE_KEY
+    TecNoRegularKey,                   // 131 tecNO_REGULAR_KEY
+    TecOwners,                         // 132 tecOWNERS
+    TecNoIssuer,                       // 133 tecNO_ISSUER
+    TecNoAuth,                         // 134 tecNO_AUTH
+    TecNoLine,                         // 135 tecNO_LINE
+    TecInsufFee,                       // 136 tecINSUFF_FEE
+    TecFrozen,                         // 137 tecFROZEN
+    TecNoTarget,                       // 138 tecNO_TARGET
+    TecNoPermission,                   // 139 tecNO_PERMISSION
+    TecNoEntry,                        // 140 tecNO_ENTRY
+    TecInsufficientReserve,            // 141 tecINSUFFICIENT_RESERVE
+    TecNeedMasterKey,                  // 142 tecNEED_MASTER_KEY
+    TecDstTagNeeded,                   // 143 tecDST_TAG_NEEDED
+    TecInternalError,                  // 144 tecINTERNAL
+    TecOversize,                       // 145 tecOVERSIZE
+    TecCryptoconditionError,           // 146 tecCRYPTOCONDITION_ERROR
+    TecInvariantFailed,                // 147 tecINVARIANT_FAILED
+    TecExpired,                        // 148 tecEXPIRED
+    TecDuplicate,                      // 149 tecDUPLICATE
+    TecKilled,                         // 150 tecKILLED
+    TecHasObligations,                 // 151 tecHAS_OBLIGATIONS
+    TecTooSoon,                        // 152 tecTOO_SOON
+    TecHookRejected,                   // 153 tecHOOK_REJECTED
+    TecMaxSequenceReached,             // 154 tecMAX_SEQUENCE_REACHED
+    TecNoSuitableNFTokenPage,          // 155 tecNO_SUITABLE_NFTOKEN_PAGE
+    TecNFTokenBuySellMismatch,         // 156 tecNFTOKEN_BUY_SELL_MISMATCH
+    TecNFTokenOfferTypeMismatch,       // 157 tecNFTOKEN_OFFER_TYPE_MISMATCH
+    TecCantAcceptOwnNFTokenOffer,      // 158 tecCANT_ACCEPT_OWN_NFTOKEN_OFFER
+    TecInsufficientFunds,              // 159 tecINSUFFICIENT_FUNDS
+    TecObjectNotFound,                 // 160 tecOBJECT_NOT_FOUND
+    TecInsufficientPayment,            // 161 tecINSUFFICIENT_PAYMENT
+    TecUnfundedAmm,                    // 162 tecUNFUNDED_AMM
+    TecAmmBalance,                     // 163 tecAMM_BALANCE
+    TecAmmFailed,                      // 164 tecAMM_FAILED
+    TecAmmInvalidTokens,               // 165 tecAMM_INVALID_TOKENS
+    TecAmmEmpty,                       // 166 tecAMM_EMPTY
+    TecAmmNotEmpty,                    // 167 tecAMM_NOT_EMPTY
+    TecAmmAccount,                     // 168 tecAMM_ACCOUNT
+    TecIncomplete,                     // 169 tecINCOMPLETE
+    TecXChainBadTransferIssue,         // 170 tecXCHAIN_BAD_TRANSFER_ISSUE
+    TecXChainNoClaimId,                // 171 tecXCHAIN_NO_CLAIM_ID
+    TecXChainBadClaimId,               // 172 tecXCHAIN_BAD_CLAIM_ID
+    TecXChainClaimNoQuorum,            // 173 tecXCHAIN_CLAIM_NO_QUORUM
+    TecXChainProofUnknownKey,          // 174 tecXCHAIN_PROOF_UNKNOWN_KEY
+    TecXChainCreateAccountNonXrpIssue, // 175 tecXCHAIN_CREATE_ACCOUNT_NONXRP_ISSUE
+    TecXChainWrongChain,               // 176 tecXCHAIN_WRONG_CHAIN
+    TecXChainRewardMismatch,           // 177 tecXCHAIN_REWARD_MISMATCH
+    TecXChainNoSignersList,            // 178 tecXCHAIN_NO_SIGNERS_LIST
+    TecXChainSendingAccountMismatch,   // 179 tecXCHAIN_SENDING_ACCOUNT_MISMATCH
+    TecXChainInsufCreateAmount,        // 180 tecXCHAIN_INSUFF_CREATE_AMOUNT
+    TecXChainAccountCreatePastSeq,     // 181 tecXCHAIN_ACCOUNT_CREATE_PAST
+    TecXChainAccountCreateTooMany,     // 182 tecXCHAIN_ACCOUNT_CREATE_TOO_MANY
+    TecXChainPaymentFailed,            // 183 tecXCHAIN_PAYMENT_FAILED
+    TecXChainSelfCommit,               // 184 tecXCHAIN_SELF_COMMIT
+    TecXChainBadPublicKeyAccountPair,  // 185 tecXCHAIN_BAD_PUBLIC_KEY_ACCOUNT_PAIR
+    TecXChainCreateAccountDisabled,    // 186 tecXCHAIN_CREATE_ACCOUNT_DISABLED
+    TecEmptyDID,                       // 187 tecEMPTY_DID
+    TecInvalidUpdateTime,              // 188 tecINVALID_UPDATE_TIME
+    TecTokenPairNotFound,              // 189 tecTOKEN_PAIR_NOT_FOUND
+    TecArrayEmpty,                     // 190 tecARRAY_EMPTY
+    TecArrayTooLarge,                  // 191 tecARRAY_TOO_LARGE
+    TecLocked,                         // 192 tecLOCKED
+    TecBadCredential,                  // 193 tecBAD_CREDENTIALS
+    TecWrongAsset,                     // 194 tecWRONG_ASSET
+    TecLimitExceeded,                  // 195 tecLIMIT_EXCEEDED
+    TecPseudoAccount,                  // 196 tecPSEUDO_ACCOUNT
+    TecPrecisionLoss,                  // 197 tecPRECISION_LOSS
+    TecNoDelegatePermission,           // 198 tecNO_DELEGATE_PERMISSION
 
     // -- Legacy aliases kept for backward compatibility with existing codebase --
     // These map to the same codes as their canonical counterparts above but
@@ -426,8 +426,8 @@ impl TransactionResult {
             Self::TefNFTokenIsNotTransferable => -179,
             Self::TefInvalidLedgerFixType => -178,
             // Legacy tef aliases
-            Self::TefSeqNumPast => -190, // alias for TefPastSeq
-            Self::TefTooOld => -189,     // alias for TefWrongPrior
+            Self::TefSeqNumPast => -190,   // alias for TefPastSeq
+            Self::TefTooOld => -189,       // alias for TefWrongPrior
             Self::TefNotTrustLine => -181, // alias for TefTooBig
 
             // ter (-99..-1)
@@ -530,9 +530,9 @@ impl TransactionResult {
             Self::TelNetworkIdMakesTxNonCanonical => -384,
             Self::TelEnvRpcFailed => -383,
             // Legacy tel aliases
-            Self::TelNoAuthPeer => -393,       // alias for TelNoDstPartial
+            Self::TelNoAuthPeer => -393, // alias for TelNoDstPartial
             Self::TelCanNotQueueDrops => -390, // alias for TelCanNotQueueBlocks
-            Self::TelCanNotQueueBusy => -385,  // alias for TelRequiresNetworkId
+            Self::TelCanNotQueueBusy => -385, // alias for TelRequiresNetworkId
         }
     }
 

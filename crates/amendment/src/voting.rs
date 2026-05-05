@@ -30,13 +30,9 @@ pub enum AmendmentAction {
         close_time: u32,
     },
     /// The amendment lost its previously held majority.
-    LostMajority {
-        amendment_id: Hash256,
-    },
+    LostMajority { amendment_id: Hash256 },
     /// The amendment has held majority long enough and should be activated.
-    Activate {
-        amendment_id: Hash256,
-    },
+    Activate { amendment_id: Hash256 },
 }
 
 /// Tally amendment votes from received validations and determine
@@ -295,11 +291,7 @@ mod tests {
         let id2 = Hash256::new([0x02; 32]);
         let id3 = Hash256::new([0x03; 32]);
 
-        let validator_votes = vec![
-            vec![id1, id2],
-            vec![id1, id3],
-            vec![id1, id2, id3],
-        ];
+        let validator_votes = vec![vec![id1, id2], vec![id1, id3], vec![id1, id2, id3]];
 
         let counts = count_votes(&validator_votes);
         assert_eq!(counts[&id1], 3);

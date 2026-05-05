@@ -27,8 +27,7 @@ impl NodeIdentity {
     /// public key — without this distinction rxrpl's validations are
     /// signed by a key that no rippled UNL trusts.
     pub fn from_seed(seed: &Seed) -> Self {
-        let (public_key, private_key) =
-            rxrpl_crypto::secp256k1::derive_keypair(seed, true);
+        let (public_key, private_key) = rxrpl_crypto::secp256k1::derive_keypair(seed, true);
         let node_id = rxrpl_crypto::sha512_half::sha512_half(&[public_key.as_bytes()]);
         let key_pair = KeyPair {
             public_key,
@@ -122,7 +121,11 @@ impl NodeIdentity {
         let mut stripped = Vec::with_capacity(192);
 
         // (2,2) sfFlags — always
-        let flags: u32 = if validation.full { 0x80000001 } else { 0x00000000 };
+        let flags: u32 = if validation.full {
+            0x80000001
+        } else {
+            0x00000000
+        };
         stobject::put_uint32(&mut stripped, 2, flags);
 
         // (2,6) sfLedgerSequence — always
@@ -341,11 +344,9 @@ mod tests {
         // verified empirically via the `n9LXMXFTeVL6o9fxdFHfeVZWf6YzWCBzt7YyeK1HV7wZ4ZFRNgUV`
         // base58 form once we wire the encoder.
 
-        let entropy = rxrpl_codec::address::seed::decode_seed(
-            "sneWFZcEqA8TUA5BmJ38xsqaR7dFb",
-        )
-        .expect("known-good family seed must decode")
-        .0;
+        let entropy = rxrpl_codec::address::seed::decode_seed("sneWFZcEqA8TUA5BmJ38xsqaR7dFb")
+            .expect("known-good family seed must decode")
+            .0;
         let seed = Seed::from_bytes(entropy);
         let id = NodeIdentity::from_seed(&seed);
         // Encode as nXXX base58 ('n' + 0x1C prefix per rippled):

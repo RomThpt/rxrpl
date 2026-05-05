@@ -1,10 +1,10 @@
 use prost::Message;
 use rxrpl_consensus::types::{NodeId, Proposal, Validation};
 use rxrpl_p2p_proto::proto::{
-    TmCluster, TmClusterNode, TmEndpoints, TmGetLedger, TmGetObjectByHash,
-    TmHaveTransactionSet, TmHaveTransactions, TmHello, TmLedgerData, TmLedgerNode, TmManifest,
-    TmManifests, TmPing, TmProposeSet, TmSquelch, TmStatusChange, TmTransaction, TmTransactions,
-    TmValidation, TmValidatorList, TmValidatorListCollection,
+    TmCluster, TmClusterNode, TmEndpoints, TmGetLedger, TmGetObjectByHash, TmHaveTransactionSet,
+    TmHaveTransactions, TmHello, TmLedgerData, TmLedgerNode, TmManifest, TmManifests, TmPing,
+    TmProposeSet, TmSquelch, TmStatusChange, TmTransaction, TmTransactions, TmValidation,
+    TmValidatorList, TmValidatorListCollection,
 };
 use rxrpl_primitives::Hash256;
 
@@ -65,11 +65,7 @@ pub fn decode_propose_set(data: &[u8]) -> Result<Proposal, OverlayError> {
         prev_ledger,
         signature: {
             let sig = msg.signature.unwrap_or_default();
-            if sig.is_empty() {
-                None
-            } else {
-                Some(sig)
-            }
+            if sig.is_empty() { None } else { Some(sig) }
         },
     })
 }
@@ -120,7 +116,11 @@ pub fn encode_validation(validation: &Validation, public_key: &[u8]) -> Vec<u8> 
         stobj.extend_from_slice(&stripped[split..]);
     } else {
         // Legacy 5-field fallback. Matches the pre-T09 byte image.
-        let flags: u32 = if validation.full { 0x80000001 } else { 0x00000000 };
+        let flags: u32 = if validation.full {
+            0x80000001
+        } else {
+            0x00000000
+        };
         stobject::put_uint32(&mut stobj, 2, flags);
         stobject::put_uint32(&mut stobj, 6, validation.ledger_seq);
         stobject::put_uint32(&mut stobj, 9, validation.sign_time);
@@ -156,9 +156,7 @@ fn canonical_signature_insert_offset(stripped: &[u8]) -> usize {
     let mut pos = 0usize;
     while pos < stripped.len() {
         let field_start = pos;
-        let Some((type_id, field_id, hdr_len)) =
-            stobject::decode_field_id(&stripped[pos..])
-        else {
+        let Some((type_id, field_id, hdr_len)) = stobject::decode_field_id(&stripped[pos..]) else {
             return field_start;
         };
         let key = ((type_id as u32) << 16) | field_id as u32;
@@ -336,8 +334,10 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
             }
             // AMOUNT — only XRP-native amounts are valid in STValidation.
             6 => {
-                let (drops, consumed) = stobject::decode_amount_xrp(&payload[pos..])
-                    .ok_or_else(|| OverlayError::Codec("invalid Amount (non-XRP in STValidation)".into()))?;
+                let (drops, consumed) =
+                    stobject::decode_amount_xrp(&payload[pos..]).ok_or_else(|| {
+                        OverlayError::Codec("invalid Amount (non-XRP in STValidation)".into())
+                    })?;
                 match field_id {
                     22 => validation.base_fee_drops = Some(drops),
                     23 => validation.reserve_base_drops = Some(drops),
@@ -365,8 +365,7 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
                 let (entries, consumed) = stobject::decode_vector256(&payload[pos..])
                     .ok_or_else(|| OverlayError::Codec("invalid Vector256".into()))?;
                 if field_id == 3 {
-                    validation.amendments =
-                        entries.into_iter().map(Hash256::new).collect();
+                    validation.amendments = entries.into_iter().map(Hash256::new).collect();
                 }
                 pos + consumed
             }
@@ -569,7 +568,11 @@ pub fn encode_get_ledger_with_nodes(
         ledger_hash: hash.map(|h| h.as_bytes().to_vec()),
         ledger_seq: if seq > 0 { Some(seq) } else { None },
         node_ids,
-        request_cookie: if request_cookie > 0 { Some(request_cookie) } else { None },
+        request_cookie: if request_cookie > 0 {
+            Some(request_cookie)
+        } else {
+            None
+        },
         query_type: None,
         query_depth: if has_nodes { Some(2) } else { None },
     };
@@ -865,8 +868,8 @@ pub fn encode_cluster(nodes: &[ClusterNodeData]) -> Vec<u8> {
 }
 
 pub fn decode_cluster(data: &[u8]) -> Result<Vec<ClusterNodeData>, OverlayError> {
-    let msg = TmCluster::decode(data)
-        .map_err(|e| OverlayError::Codec(format!("decode Cluster: {e}")))?;
+    let msg =
+        TmCluster::decode(data).map_err(|e| OverlayError::Codec(format!("decode Cluster: {e}")))?;
     Ok(msg
         .cluster_nodes
         .into_iter()
@@ -1043,10 +1046,19 @@ mod tests {
         assert_eq!(decoded.ledger_info_type, 2);
         assert_eq!(decoded.request_cookie.unwrap_or(0), 99);
         assert_eq!(decoded.nodes.len(), 2);
-        assert_eq!(decoded.nodes[0].nodeid.as_deref().unwrap_or(&[]), &[1, 2, 3]);
-        assert_eq!(decoded.nodes[0].nodedata.as_deref().unwrap_or(&[]), &[4, 5, 6]);
+        assert_eq!(
+            decoded.nodes[0].nodeid.as_deref().unwrap_or(&[]),
+            &[1, 2, 3]
+        );
+        assert_eq!(
+            decoded.nodes[0].nodedata.as_deref().unwrap_or(&[]),
+            &[4, 5, 6]
+        );
         assert_eq!(decoded.nodes[1].nodeid.as_deref().unwrap_or(&[]), &[7, 8]);
-        assert_eq!(decoded.nodes[1].nodedata.as_deref().unwrap_or(&[]), &[9, 10, 11, 12]);
+        assert_eq!(
+            decoded.nodes[1].nodedata.as_deref().unwrap_or(&[]),
+            &[9, 10, 11, 12]
+        );
     }
 
     #[test]
@@ -1097,18 +1109,12 @@ mod tests {
             decoded.objects[0].hash.as_deref().unwrap_or(&[]),
             h1.as_bytes()
         );
-        assert_eq!(
-            decoded.objects[0].data.as_deref().unwrap_or(&[]),
-            &d1[..]
-        );
+        assert_eq!(decoded.objects[0].data.as_deref().unwrap_or(&[]), &d1[..]);
         assert_eq!(
             decoded.objects[1].hash.as_deref().unwrap_or(&[]),
             h2.as_bytes()
         );
-        assert_eq!(
-            decoded.objects[1].data.as_deref().unwrap_or(&[]),
-            &d2[..]
-        );
+        assert_eq!(decoded.objects[1].data.as_deref().unwrap_or(&[]), &d2[..]);
     }
 
     #[test]
@@ -1223,7 +1229,10 @@ mod tests {
 
         // Sign: stashes the canonical strip-result into `signing_payload`.
         id.sign_validation(&mut original);
-        assert!(original.signature.is_some(), "signing must produce a signature");
+        assert!(
+            original.signature.is_some(),
+            "signing must produce a signature"
+        );
         assert!(
             original.signing_payload.is_some(),
             "signing must stash the strip-result"
@@ -1256,7 +1265,10 @@ mod tests {
         assert_eq!(decoded.server_version, original.server_version);
         assert_eq!(decoded.base_fee_drops, original.base_fee_drops);
         assert_eq!(decoded.reserve_base_drops, original.reserve_base_drops);
-        assert_eq!(decoded.reserve_increment_drops, original.reserve_increment_drops);
+        assert_eq!(
+            decoded.reserve_increment_drops,
+            original.reserve_increment_drops
+        );
         // The strip-result must be byte-identical: any divergence here
         // would break signature verification on the receiving side.
         assert_eq!(
@@ -1415,5 +1427,4 @@ mod tests {
             "error must identify the cap violation, got: {err_msg}"
         );
     }
-
 }

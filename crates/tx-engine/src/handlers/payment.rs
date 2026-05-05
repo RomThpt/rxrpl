@@ -81,7 +81,10 @@ impl Transactor for PaymentTransactor {
         // must include a DestinationTag.
         if let Some(bytes) = &dst_bytes {
             if let Ok(dst_account) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                let dst_flags = dst_account.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let dst_flags = dst_account
+                    .get("Flags")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
                 const LSF_DEPOSIT_AUTH: u32 = 0x01000000;
                 const LSF_REQUIRE_DEST_TAG: u32 = 0x00020000;
                 if dst_flags & LSF_DEPOSIT_AUTH != 0 && account_str != destination_str {
@@ -238,7 +241,10 @@ fn apply_iou(
     if account_str == issuer {
         // Issuer mints IOUs into holder's trust line.
         let trust_key = keylet::trust_line(&issuer_id, &dest_id, &cur_bytes);
-        let trust_bytes = ctx.view.read(&trust_key).ok_or(TransactionResult::TecPathDry)?;
+        let trust_bytes = ctx
+            .view
+            .read(&trust_key)
+            .ok_or(TransactionResult::TecPathDry)?;
         let mut trust: serde_json::Value =
             serde_json::from_slice(&trust_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
@@ -269,9 +275,7 @@ fn apply_iou(
 
     // Non-issuer (holder-to-holder) IOU send: debit source's RippleState
     // and credit destination's RippleState. Both must exist.
-    let send_value: f64 = value
-        .parse()
-        .map_err(|_| TransactionResult::TemBadAmount)?;
+    let send_value: f64 = value.parse().map_err(|_| TransactionResult::TemBadAmount)?;
     if send_value <= 0.0 {
         return Err(TransactionResult::TemBadAmount);
     }
@@ -282,15 +286,11 @@ fn apply_iou(
         .view
         .read(&src_trust_key)
         .ok_or(TransactionResult::TecPathDry)?;
-    let mut src_trust: serde_json::Value = serde_json::from_slice(&src_trust_bytes)
-        .map_err(|_| TransactionResult::TefInternal)?;
+    let mut src_trust: serde_json::Value =
+        serde_json::from_slice(&src_trust_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-    let new_src_value = adjust_iou_balance(
-        &src_trust,
-        &format!("-{}", value),
-        &issuer_id,
-        &src_id,
-    )?;
+    let new_src_value =
+        adjust_iou_balance(&src_trust, &format!("-{}", value), &issuer_id, &src_id)?;
     // Source must have sufficient balance (cannot go below 0 from holder's perspective).
     let src_holder_balance = compute_holder_balance(&src_trust, &issuer_id, &src_id);
     if src_holder_balance < send_value {
@@ -309,8 +309,8 @@ fn apply_iou(
         .view
         .read(&dst_trust_key)
         .ok_or(TransactionResult::TecPathDry)?;
-    let mut dst_trust: serde_json::Value = serde_json::from_slice(&dst_trust_bytes)
-        .map_err(|_| TransactionResult::TefInternal)?;
+    let mut dst_trust: serde_json::Value =
+        serde_json::from_slice(&dst_trust_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
     let new_dst_value = adjust_iou_balance(&dst_trust, value, &issuer_id, &dest_id)?;
     dst_trust["Balance"]["value"] = serde_json::Value::String(new_dst_value);

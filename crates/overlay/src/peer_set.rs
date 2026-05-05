@@ -37,9 +37,15 @@ impl PeerSoftware {
             return PeerSoftware::Unknown;
         }
         let lower = trimmed.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("rxrpl/").or_else(|| lower.strip_prefix("rxrpl-")) {
+        if let Some(rest) = lower
+            .strip_prefix("rxrpl/")
+            .or_else(|| lower.strip_prefix("rxrpl-"))
+        {
             PeerSoftware::Rxrpl(rest.to_string())
-        } else if let Some(rest) = lower.strip_prefix("rippled-").or_else(|| lower.strip_prefix("rippled/")) {
+        } else if let Some(rest) = lower
+            .strip_prefix("rippled-")
+            .or_else(|| lower.strip_prefix("rippled/"))
+        {
             PeerSoftware::Rippled(rest.to_string())
         } else {
             PeerSoftware::Other(trimmed.to_string())
@@ -132,7 +138,11 @@ impl PeerSet {
 
         // Sort by score descending, then latency ascending for ties
         candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
-        candidates.into_iter().take(count).map(|(id, _, _)| id).collect()
+        candidates
+            .into_iter()
+            .take(count)
+            .map(|(id, _, _)| id)
+            .collect()
     }
 
     /// Select up to `count` peers sorted by normalized score (0-100, highest first).
@@ -180,7 +190,9 @@ impl PeerSet {
 
         fn rank<'a, I>(it: I, target_seq: u32) -> Vec<(Hash256, i32, u64)>
         where
-            I: Iterator<Item = dashmap::mapref::multiple::RefMulti<'a, Hash256, std::sync::Arc<PeerInfo>>>,
+            I: Iterator<
+                Item = dashmap::mapref::multiple::RefMulti<'a, Hash256, std::sync::Arc<PeerInfo>>,
+            >,
         {
             let mut candidates: Vec<_> = it
                 .map(|r| {
@@ -207,7 +219,11 @@ impl PeerSet {
             target_seq,
         );
         if !strict.is_empty() {
-            return strict.into_iter().take(count).map(|(id, _, _)| id).collect();
+            return strict
+                .into_iter()
+                .take(count)
+                .map(|(id, _, _)| id)
+                .collect();
         }
         // Fallback: include negative-rep peers rather than return nothing.
         rank(self.peers.iter(), target_seq)

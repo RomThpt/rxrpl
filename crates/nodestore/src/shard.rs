@@ -172,10 +172,7 @@ impl<S: KvStore> PersistentShardStore<S> {
             ShardState::Incomplete { stored_count } => format!("incomplete:{stored_count}"),
             ShardState::Downloading => "downloading".to_string(),
         };
-        let hash_str = info
-            .last_hash
-            .map(|h| h.to_string())
-            .unwrap_or_default();
+        let hash_str = info.last_hash.map(|h| h.to_string()).unwrap_or_default();
         let meta = format!(
             "{}:{}:{}:{}:{}",
             info.index, state_str, info.first_seq, info.last_seq, hash_str
@@ -205,25 +202,35 @@ fn parse_shard_meta(s: &str) -> Result<ShardInfo, String> {
         return Err("invalid shard meta format".into());
     }
 
-    let index: u32 = parts[0].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+    let index: u32 = parts[0]
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
 
     let state = if parts[1] == "complete" {
         ShardState::Complete
     } else if parts[1] == "downloading" {
         ShardState::Downloading
     } else if let Some(count_str) = parts[1].strip_prefix("incomplete:") {
-        let stored_count: u32 = count_str.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+        let stored_count: u32 = count_str
+            .parse()
+            .map_err(|e: std::num::ParseIntError| e.to_string())?;
         ShardState::Incomplete { stored_count }
     } else {
         // Handle the case where the state field itself contains a colon
         // and the count is in the next part
         if parts[1] == "incomplete" && parts.len() >= 5 {
-            let stored_count: u32 = parts[2].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+            let stored_count: u32 = parts[2]
+                .parse()
+                .map_err(|e: std::num::ParseIntError| e.to_string())?;
             // Re-parse with adjusted positions
-            let first_seq: u32 = parts[3].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+            let first_seq: u32 = parts[3]
+                .parse()
+                .map_err(|e: std::num::ParseIntError| e.to_string())?;
             let rest = if parts.len() > 4 { parts[4] } else { "" };
             let rest_parts: Vec<&str> = rest.splitn(2, ':').collect();
-            let last_seq: u32 = rest_parts[0].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+            let last_seq: u32 = rest_parts[0]
+                .parse()
+                .map_err(|e: std::num::ParseIntError| e.to_string())?;
             let last_hash = if rest_parts.len() > 1 && !rest_parts[1].is_empty() {
                 rest_parts[1].parse::<Hash256>().ok()
             } else {
@@ -240,8 +247,12 @@ fn parse_shard_meta(s: &str) -> Result<ShardInfo, String> {
         return Err(format!("unknown shard state: {}", parts[1]));
     };
 
-    let first_seq: u32 = parts[2].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
-    let last_seq: u32 = parts[3].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+    let first_seq: u32 = parts[2]
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
+    let last_seq: u32 = parts[3]
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
     let last_hash = if parts.len() > 4 && !parts[4].is_empty() {
         parts[4].parse::<Hash256>().ok()
     } else {
@@ -422,8 +433,8 @@ impl ShardManager {
             .store
             .get(index, first_seq)
             .ok_or(ShardVerifyError::MissingData(first_seq, index))?;
-        let mut prev_header =
-            LedgerHeader::from_raw_bytes(first_data).ok_or(ShardVerifyError::ParseError(first_seq))?;
+        let mut prev_header = LedgerHeader::from_raw_bytes(first_data)
+            .ok_or(ShardVerifyError::ParseError(first_seq))?;
 
         // Walk the chain
         for seq in (first_seq + 1)..=last_seq {
@@ -461,7 +472,7 @@ impl Default for ShardManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rxrpl_ledger::header::{RAW_HEADER_SIZE, INITIAL_XRP_DROPS};
+    use rxrpl_ledger::header::{INITIAL_XRP_DROPS, RAW_HEADER_SIZE};
 
     /// Serialize a LedgerHeader into the raw binary format (118 bytes).
     fn header_to_raw(h: &LedgerHeader) -> Vec<u8> {

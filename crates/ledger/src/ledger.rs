@@ -116,13 +116,17 @@ impl Ledger {
     /// Used when the ledger header is received via liBASE response.
     /// The state and tx maps are lazy-loaded from the store using the
     /// root hashes in the header.
-    pub fn from_header(header: LedgerHeader, store: Arc<dyn NodeStore>) -> Result<Ledger, LedgerError> {
+    pub fn from_header(
+        header: LedgerHeader,
+        store: Arc<dyn NodeStore>,
+    ) -> Result<Ledger, LedgerError> {
         let state_map = if !header.account_hash.is_zero() {
             let mut m = SHAMap::from_root_hash(
                 header.account_hash,
                 rxrpl_shamap::LeafNode::account_state,
                 Arc::clone(&store),
-            ).map_err(|e| LedgerError::SHAMap(e))?;
+            )
+            .map_err(|e| LedgerError::SHAMap(e))?;
             m.set_immutable();
             m
         } else {
@@ -136,7 +140,8 @@ impl Ledger {
                 header.tx_hash,
                 rxrpl_shamap::LeafNode::transaction_with_meta,
                 Arc::clone(&store),
-            ).map_err(|e| LedgerError::SHAMap(e))?;
+            )
+            .map_err(|e| LedgerError::SHAMap(e))?;
             m.set_immutable();
             m
         } else {
@@ -399,11 +404,9 @@ impl Ledger {
         if let Some(store) = self.state_map.store().cloned() {
             let hash = self.header.account_hash;
             if !hash.is_zero() {
-                if let Ok(lazy) = SHAMap::from_root_hash(
-                    hash,
-                    rxrpl_shamap::LeafNode::account_state,
-                    store,
-                ) {
+                if let Ok(lazy) =
+                    SHAMap::from_root_hash(hash, rxrpl_shamap::LeafNode::account_state, store)
+                {
                     self.state_map = lazy;
                     self.state_map.set_immutable();
                 }
@@ -595,13 +598,13 @@ mod tests {
         });
         let state = rxrpl_shamap::SHAMap::from_leaf_nodes(&leaves).unwrap();
 
-        let reconstructed = Ledger::from_catchup(
-            original.header.sequence,
-            original.header.hash,
-            state,
-        );
+        let reconstructed =
+            Ledger::from_catchup(original.header.sequence, original.header.hash, state);
         assert!(reconstructed.is_closed());
         assert_eq!(reconstructed.get_state(&key), Some(&[1, 2, 3][..]));
-        assert_eq!(reconstructed.header.account_hash, original.header.account_hash);
+        assert_eq!(
+            reconstructed.header.account_hash,
+            original.header.account_hash
+        );
     }
 }

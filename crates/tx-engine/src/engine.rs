@@ -126,14 +126,14 @@ impl TxEngine {
             if !has_signers {
                 if let Ok(account_str) = helpers::get_account(tx) {
                     if let Ok(account_id) = decode_account_id(account_str) {
-                        if let Some(pubkey_hex) =
-                            tx.get("SigningPubKey").and_then(|v| v.as_str())
-                        {
+                        if let Some(pubkey_hex) = tx.get("SigningPubKey").and_then(|v| v.as_str()) {
                             if !pubkey_hex.is_empty() {
                                 if let Ok(pubkey_bytes) = hex::decode(pubkey_hex) {
-                                    let signer_id = rxrpl_codec::address::classic::account_id_from_public_key(&pubkey_bytes);
-                                    let acct_key =
-                                        rxrpl_protocol::keylet::account(&account_id);
+                                    let signer_id =
+                                        rxrpl_codec::address::classic::account_id_from_public_key(
+                                            &pubkey_bytes,
+                                        );
+                                    let acct_key = rxrpl_protocol::keylet::account(&account_id);
                                     if let Some(acct_bytes) = view.read(&acct_key) {
                                         if let Ok(acct_obj) =
                                             serde_json::from_slice::<serde_json::Value>(&acct_bytes)
@@ -147,7 +147,9 @@ impl TxEngine {
                                                     as u32;
                                                 const LSF_DISABLE_MASTER: u32 = 0x00100000;
                                                 if flags & LSF_DISABLE_MASTER != 0 {
-                                                    return Ok(TransactionResult::TefMasterDisabled);
+                                                    return Ok(
+                                                        TransactionResult::TefMasterDisabled,
+                                                    );
                                                 }
                                             } else {
                                                 // Regular key sign — must match RegularKey.
@@ -183,8 +185,7 @@ impl TxEngine {
                 if !signers_arr.is_empty() {
                     if let Ok(account_str) = helpers::get_account(tx) {
                         if let Ok(account_id) = decode_account_id(account_str) {
-                            let signer_list_key =
-                                rxrpl_protocol::keylet::signer_list(&account_id);
+                            let signer_list_key = rxrpl_protocol::keylet::signer_list(&account_id);
                             match view.read(&signer_list_key) {
                                 None => return Ok(TransactionResult::TefNotMultiSigning),
                                 Some(bytes) => {
@@ -216,7 +217,9 @@ impl TxEngine {
                                                 if entry.get("Account").and_then(|v| v.as_str())
                                                     == Some(signer_acct)
                                                 {
-                                                    entry.get("SignerWeight").and_then(|v| v.as_u64())
+                                                    entry
+                                                        .get("SignerWeight")
+                                                        .and_then(|v| v.as_u64())
                                                 } else {
                                                     None
                                                 }
@@ -313,8 +316,7 @@ impl TxEngine {
 
                 // Execute hooks on the destination account (if any)
                 if result == TransactionResult::TesSuccess {
-                    let tx_hash = rxrpl_protocol::tx::compute_tx_hash(tx)
-                        .unwrap_or_default();
+                    let tx_hash = rxrpl_protocol::tx::compute_tx_hash(tx).unwrap_or_default();
                     if let Some(hook_result) =
                         crate::hooks::execute_hooks_for_tx(tx, &tx_hash, &sandbox)
                     {
