@@ -1,5 +1,13 @@
 target/
 .git/
-fuzz/
-*.md
 .github/
+.worktrees/
+fuzz/
+local/
+docs/
+examples/
+*.md
+NIGHT_SHIFT_*
+PLAN.md
+gaps.md
+.DS_Store

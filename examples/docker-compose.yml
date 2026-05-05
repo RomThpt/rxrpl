@@ -1,0 +1,45 @@
+version: "3.9"
+
+# Single-node rxrpl deployment (mainnet config baseline).
+# Adapt environment + volume to your operational policy before production use.
+
+services:
+  rxrpl:
+    image: rxrpl:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: rxrpl
+    restart: unless-stopped
+    stop_grace_period: 60s
+    user: "10001:10001"
+    ports:
+      - "5005:5005"     # JSON-RPC
+      - "51235:51235"   # P2P / peer protocol
+    environment:
+      RUST_LOG: "info"
+      RXRPL_RPC_URL: "http://127.0.0.1:5005"
+    volumes:
+      - rxrpl-data:/var/lib/rxrpl
+      - ./rxrpl.toml:/etc/rxrpl/rxrpl.toml:ro
+    command:
+      - "run"
+      - "--config"
+      - "/etc/rxrpl/rxrpl.toml"
+      - "--data-dir"
+      - "/var/lib/rxrpl"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          curl -fsS -H 'content-type: application/json'
+          --data '{"method":"server_info","params":[{}]}'
+          http://127.0.0.1:5005 >/dev/null
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  rxrpl-data:
+    driver: local
