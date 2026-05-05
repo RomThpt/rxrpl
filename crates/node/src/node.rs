@@ -439,6 +439,19 @@ impl Node {
                     );
                 }
 
+                // Apply negative-UNL pseudo-transactions on flag ledgers
+                // (no-op otherwise). Mirrors apply_amendment_voting:
+                // pseudo-txs land before the ledger's final hash is
+                // computed by close().
+                let _nunl_results = Node::apply_negative_unl(
+                    &mut consensus,
+                    &mut l,
+                    &tx_engine_close,
+                    &fees_close,
+                    ledger_seq,
+                );
+                consensus.on_ledger_close_for_tracker();
+
                 if let Err(e) = l.close(effective_close_time, close_flags) {
                     tracing::error!("failed to close ledger: {}", e);
                     continue;
@@ -1313,7 +1326,7 @@ impl Node {
                                             phase: "accepted".into(),
                                         });
                                         Self::close_consensus_round(
-                                            &consensus, pending_close_time, &ledger,
+                                            &mut consensus, pending_close_time, &ledger,
                                             &closed_ledgers, &tx_store, &event_tx,
                                             &ledger_seq_shared, &ledger_hash_shared,
                                             &tx_queue, &identity, &cmd_tx_catchup,
@@ -1339,7 +1352,7 @@ impl Node {
                                             phase: "accepted".into(),
                                         });
                                         Self::close_consensus_round(
-                                            &consensus, pending_close_time, &ledger,
+                                            &mut consensus, pending_close_time, &ledger,
                                             &closed_ledgers, &tx_store, &event_tx,
                                             &ledger_seq_shared, &ledger_hash_shared,
                                             &tx_queue, &identity, &cmd_tx_catchup,
@@ -1457,6 +1470,13 @@ impl Node {
                                 tracing::debug!(
                                     "validation from {:?} for ledger #{} hash={}",
                                     validation.node_id, val_seq, val_hash
+                                );
+
+                                // Plumb the validation into the consensus
+                                // engine's negative-UNL tracker (C-B6).
+                                Node::record_validation_into_engine(
+                                    &mut consensus,
+                                    &validation,
                                 );
                                 let _ = event_tx.send(ServerEvent::ValidationReceived {
                                     validator: validation.node_id.0.to_string(),
@@ -1894,7 +1914,7 @@ impl Node {
     /// Close a consensus round: apply the accepted set, close ledger, emit events.
     #[allow(clippy::too_many_arguments)]
     async fn close_consensus_round<A: rxrpl_consensus::ConsensusAdapter>(
-        consensus: &ConsensusEngine<A>,
+        consensus: &mut ConsensusEngine<A>,
         pending_close_time: u32,
         ledger: &Arc<RwLock<Ledger>>,
         closed_ledgers: &Arc<RwLock<VecDeque<Ledger>>>,
@@ -1959,6 +1979,17 @@ impl Node {
                 ledger_seq,
             );
         }
+
+        // Apply negative-UNL pseudo-transactions on flag ledgers.
+        let nunl_seq = l.header.sequence;
+        let _nunl_results = Node::apply_negative_unl(
+            consensus,
+            &mut l,
+            tx_engine,
+            fees,
+            nunl_seq,
+        );
+        consensus.on_ledger_close_for_tracker();
 
         if let Err(e) = l.close(effective_close_time, close_flags) {
             tracing::error!("failed to close ledger: {}", e);
@@ -2405,6 +2436,75 @@ impl Node {
 
         // Return updated rules after any activations
         amendment_table.build_rules()
+    }
+
+    /// Forward a received `Validation` message into the consensus engine's
+    /// negative-UNL tracker.
+    ///
+    /// This is the single plumbing point connecting the overlay validation
+    /// stream (produced by `PeerManager` and surfaced via
+    /// `ConsensusMessage::Validation`) to the engine's
+    /// [`ConsensusEngine::record_validation`]. Only validators that have been
+    /// previously registered via `register_validators` accumulate counts; all
+    /// other ids are silently ignored by the tracker.
+    pub fn record_validation_into_engine<A: rxrpl_consensus::ConsensusAdapter>(
+        consensus: &mut ConsensusEngine<A>,
+        validation: &rxrpl_consensus::types::Validation,
+    ) {
+        consensus.record_validation(validation.node_id);
+    }
+
+    /// Apply negative-UNL pseudo-transactions on a flag ledger.
+    ///
+    /// On flag ledgers (sequence % 256 == 0), the consensus engine's
+    /// negative-UNL tracker is evaluated to produce zero or more
+    /// `UNLModify` pseudo-transactions (disable / re-enable). Each
+    /// generated pseudo-tx is applied to `ledger` via `tx_engine`, which
+    /// mutates the `NegativeUNL` ledger entry.
+    ///
+    /// Mirrors [`Self::apply_amendment_voting`] for nUNL. Returns the
+    /// result of each applied pseudo-tx (in emission order). Off a flag
+    /// ledger, returns an empty vector and does not touch state.
+    pub fn apply_negative_unl<A: rxrpl_consensus::ConsensusAdapter>(
+        consensus: &mut ConsensusEngine<A>,
+        ledger: &mut Ledger,
+        tx_engine: &TxEngine,
+        fees: &FeeSettings,
+        ledger_seq: u32,
+    ) -> Vec<TransactionResult> {
+        let changes = consensus.evaluate_negative_unl(ledger_seq);
+        if changes.is_empty() {
+            return Vec::new();
+        }
+
+        let rules = Rules::new();
+        let mut results = Vec::with_capacity(changes.len());
+        for change in changes {
+            let tx = serde_json::json!({
+                "TransactionType": "UNLModify",
+                "UNLModifyDisabling": if change.disable { 1u32 } else { 0u32 },
+                "UNLModifyValidator": change.validator_key,
+                "LedgerSequence": change.ledger_seq,
+            });
+            match tx_engine.apply(&tx, ledger, &rules, fees) {
+                Ok(result) => {
+                    if result.is_success() {
+                        tracing::info!(
+                            "nUNL pseudo-tx applied: {} validator {}",
+                            if change.disable { "disable" } else { "re-enable" },
+                            change.validator_key,
+                        );
+                    } else {
+                        tracing::warn!("nUNL pseudo-tx failed: {}", result);
+                    }
+                    results.push(result);
+                }
+                Err(e) => {
+                    tracing::error!("failed to apply nUNL pseudo-tx: {}", e);
+                }
+            }
+        }
+        results
     }
 
     /// Close the current ledger and return a new open ledger derived from it.
