@@ -1103,7 +1103,7 @@ impl Node {
             // Counter for how many close ticks we've deferred waiting for a
             // peer position. Caps the wait at ~10s extra so an offline peer
             // doesn't block our progress forever.
-            let mut close_deferrals: u32 = 0;
+            let close_deferrals: u32 = 0;
             // Cache of LedgerHeader objects parsed from peer liBASE responses.
             // We need the full header (parent_hash, parent_close_time,
             // close_time, drops, close_time_resolution, close_flags) when

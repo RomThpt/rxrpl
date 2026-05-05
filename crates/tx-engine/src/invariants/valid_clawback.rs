@@ -14,27 +14,6 @@ impl ValidClawback {
         )
     }
 
-    fn has_negative_balance(obj: &Value) -> bool {
-        if let Some(balance) = obj.get("Balance") {
-            // IOU balance (RippleState)
-            if let Some(val_str) = balance
-                .as_object()
-                .and_then(|o| o.get("value"))
-                .and_then(|v| v.as_str())
-            {
-                return val_str.starts_with('-');
-            }
-            // MPToken balance (integer)
-            if let Some(s) = balance.as_str() {
-                return s.starts_with('-');
-            }
-        }
-        // MPToken uses MPTAmount field
-        if let Some(amt) = obj.get("MPTAmount").and_then(|v| v.as_str()) {
-            return amt.starts_with('-');
-        }
-        false
-    }
 }
 
 impl InvariantCheck for ValidClawback {
