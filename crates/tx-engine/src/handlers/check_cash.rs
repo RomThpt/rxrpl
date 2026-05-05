@@ -197,13 +197,32 @@ impl Transactor for CheckCashTransactor {
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
                 .ok_or(TransactionResult::TemBadAmount)?;
-            if cash_amount > send_max_value {
-                return Err(TransactionResult::TecInsufficientPayment);
-            }
 
             let issuer_id =
                 decode_account_id(issuer).map_err(|_| TransactionResult::TemInvalidAccountId)?;
             let cur_bytes = helpers::currency_to_bytes(currency);
+
+            // If the issuer has a TransferRate set and is not party to this
+            // transfer, source debits cash_amount * rate to cover the fee
+            // while destination receives cash_amount. SendMax must cover the
+            // grossed-up source debit.
+            let issuer_key = keylet::account(&issuer_id);
+            let transfer_rate_raw = ctx
+                .view
+                .read(&issuer_key)
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|acct| acct.get("TransferRate").and_then(|v| v.as_u64()));
+            let issuer_is_party = issuer_id == check_src_id || issuer_id == account_id;
+            let rate_multiplier = match transfer_rate_raw {
+                Some(r) if r > 1_000_000_000 && !issuer_is_party => {
+                    r as f64 / 1_000_000_000.0
+                }
+                _ => 1.0,
+            };
+            let src_debit_amount = cash_amount * rate_multiplier;
+            if src_debit_amount > send_max_value {
+                return Err(TransactionResult::TecInsufficientPayment);
+            }
 
             // Debit check.Account's trust line.
             let src_trust_key = keylet::trust_line(&check_src_id, &issuer_id, &cur_bytes);
@@ -214,12 +233,12 @@ impl Transactor for CheckCashTransactor {
             let mut src_trust: serde_json::Value = serde_json::from_slice(&src_trust_bytes)
                 .map_err(|_| TransactionResult::TefInternal)?;
             let src_holder_balance = compute_holder_balance(&src_trust, &issuer_id, &check_src_id);
-            if src_holder_balance < cash_amount {
+            if src_holder_balance < src_debit_amount {
                 return Err(TransactionResult::TecPathPartial);
             }
             let new_src_value = adjust_iou_balance(
                 &src_trust,
-                &format!("-{}", cash_amount),
+                &format!("-{}", src_debit_amount),
                 &issuer_id,
                 &check_src_id,
             )?;
