@@ -27,6 +27,9 @@ pub const MAX_BODY: u64 = 64 * 1024;
 /// Default cache TTL for a successful attestation (24 hours).
 pub const DEFAULT_TTL: Duration = Duration::from_secs(24 * 3600);
 
+/// Default refresh interval for the background loop (5 minutes).
+pub const DEFAULT_REFRESH: Duration = Duration::from_secs(300);
+
 /// Errors produced while fetching or verifying a domain attestation.
 #[derive(Debug, thiserror::Error)]
 pub enum AttestationError {
@@ -368,6 +371,116 @@ pub fn new_cache() -> CacheHandle {
     Arc::new(RwLock::new(AttestationCache::new()))
 }
 
+// ---------------------------------------------------------------------
+// B3: background attestation service
+// ---------------------------------------------------------------------
+
+/// One validator the background service should attest periodically.
+#[derive(Clone, Debug)]
+pub struct AttestationTarget {
+    pub master_key: PublicKey,
+    pub domain: String,
+}
+
+/// Periodic attestation service. Designed to run in its own
+/// `tokio::spawn` task so HTTP latency cannot stall consensus.
+pub struct DomainAttestationService {
+    targets: Vec<AttestationTarget>,
+    cache: CacheHandle,
+    fetcher: Arc<DomainAttestationFetcher>,
+    refresh: Duration,
+}
+
+impl DomainAttestationService {
+    pub fn new(
+        targets: Vec<AttestationTarget>,
+        cache: CacheHandle,
+        fetcher: DomainAttestationFetcher,
+    ) -> Self {
+        Self {
+            targets,
+            cache,
+            fetcher: Arc::new(fetcher),
+            refresh: DEFAULT_REFRESH,
+        }
+    }
+
+    pub fn with_refresh(mut self, refresh: Duration) -> Self {
+        self.refresh = refresh;
+        self
+    }
+
+    /// Drive a single refresh cycle. Honors per-target retry backoff.
+    pub async fn refresh_once(&self) {
+        let now = now_unix();
+        for target in &self.targets {
+            let (last_checked, backoff) = {
+                let guard = self.cache.read().await;
+                (
+                    guard.last_checked(&target.master_key).unwrap_or(0),
+                    guard.retry_backoff_secs(&target.master_key),
+                )
+            };
+            if backoff > 0 && now.saturating_sub(last_checked) < backoff {
+                continue;
+            }
+
+            match self
+                .fetcher
+                .fetch_and_verify(&target.domain, &target.master_key)
+                .await
+            {
+                Ok(verified) => {
+                    let mut guard = self.cache.write().await;
+                    guard.record_result(&target.master_key, &target.domain, verified, now);
+                    if verified {
+                        tracing::info!(
+                            "Domain attestation verified for {}",
+                            target.domain
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Domain attestation failed for {}: key not listed",
+                            target.domain
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Domain attestation failed for {}: {e}",
+                        target.domain
+                    );
+                    let mut guard = self.cache.write().await;
+                    guard.record_error(
+                        &target.master_key,
+                        &target.domain,
+                        &e.to_string(),
+                        now,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Spawn the periodic loop. Call this once at boot.
+    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(self.refresh);
+            loop {
+                interval.tick().await;
+                self.refresh_once().await;
+            }
+        })
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +613,37 @@ mod tests {
             g.record_result(&ed_key(0x05), "example.com", true, 1);
         }
         assert_eq!(h2.read().await.snapshot(1).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn service_refresh_once_writes_cache() {
+        let key = ed_key(0x10);
+        let server = httpmock::MockServer::start_async().await;
+        let hex = hex::encode_upper(key.as_bytes());
+        let _m = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path("/.well-known/xrp-ledger.toml");
+                then.status(200).body(format!(
+                    "[[VALIDATORS]]\npublic_key = \"{hex}\"\n"
+                ));
+            })
+            .await;
+
+        let cache = new_cache();
+        let fetcher =
+            DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
+        let svc = DomainAttestationService::new(
+            vec![AttestationTarget {
+                master_key: key.clone(),
+                domain: "example.com".to_string(),
+            }],
+            cache.clone(),
+            fetcher,
+        );
+        svc.refresh_once().await;
+        let snap = cache.read().await.snapshot(now_unix());
+        assert_eq!(snap.len(), 1);
+        assert!(matches!(snap[0].1.status, AttestationStatus::Verified { .. }));
     }
 }
