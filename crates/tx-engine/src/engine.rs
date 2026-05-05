@@ -114,10 +114,12 @@ impl TxEngine {
         //     account has lsfDisableMaster (0x00100000) set → tefMASTER_DISABLED.
         //  2. Pubkey derives to AccountRoot.RegularKey → regular key sign. OK.
         //  3. Otherwise → tefBAD_AUTH.
-        // Gated on !skip_signature_verification because some local tests
-        // intentionally sign with mismatched keys (relying on the skip flag
-        // to bypass crypto verify); the auth check would reject those.
-        if !is_pseudo && !self.skip_signature_verification {
+        // This is stateful authorization (independent of cryptographic
+        // signature verification) and must run even when crypto verify is
+        // skipped — otherwise the production node (which skips verify because
+        // signatures are checked at ingress / consensus) would never enforce
+        // lsfDisableMaster or RegularKey rotation.
+        if !is_pseudo {
             let has_signers = tx
                 .get("Signers")
                 .and_then(|v| v.as_array())
@@ -152,11 +154,12 @@ impl TxEngine {
                                                     );
                                                 }
                                             } else {
-                                                // Regular key sign — must match RegularKey.
-                                                let reg_key_str = acct_obj
+                                                // Pubkey doesn't derive to Account → must match
+                                                // the configured RegularKey. If no RegularKey is
+                                                // configured, this signer is unauthorized.
+                                                let reg_id = acct_obj
                                                     .get("RegularKey")
-                                                    .and_then(|v| v.as_str());
-                                                let reg_id = reg_key_str
+                                                    .and_then(|v| v.as_str())
                                                     .and_then(|s| decode_account_id(s).ok());
                                                 if Some(signer_id) != reg_id {
                                                     return Ok(TransactionResult::TefBadAuth);

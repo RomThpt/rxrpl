@@ -173,7 +173,14 @@ async fn standalone_sign_submit_verify() {
     let mut config = NodeConfig::default();
     config.server.bind = format!("127.0.0.1:{port}").parse().unwrap();
 
-    let node = Node::new_standalone(config, GENESIS_ADDR).unwrap();
+    // Fund a genesis whose master key matches the signer keypair so the
+    // engine's master-key auth check (which always runs, even with crypto
+    // verify disabled) accepts this transaction.
+    let dummy_seed = Seed::from_passphrase("dummy_signer");
+    let dummy_kp = KeyPair::from_seed(&dummy_seed, KeyType::Ed25519);
+    let signer_addr = encode_classic_address_from_pubkey(dummy_kp.public_key.as_bytes());
+
+    let node = Node::new_standalone(config, &signer_addr).unwrap();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
     tokio::spawn(async move {
@@ -187,12 +194,8 @@ async fn standalone_sign_submit_verify() {
     let dest_kp = KeyPair::from_seed(&dest_seed, KeyType::Ed25519);
     let dest_addr = encode_classic_address_from_pubkey(dest_kp.public_key.as_bytes());
 
-    // Use a dummy keypair for signing (sig verification is disabled in standalone)
-    let dummy_seed = Seed::from_passphrase("dummy_signer");
-    let dummy_kp = KeyPair::from_seed(&dummy_seed, KeyType::Ed25519);
-
     // Get genesis balance before
-    let resp = rpc_call(&addr, "account_info", json!({ "account": GENESIS_ADDR })).await;
+    let resp = rpc_call(&addr, "account_info", json!({ "account": &signer_addr })).await;
     let genesis_balance_before: u64 = resp["result"]["account_data"]["Balance"]
         .as_str()
         .unwrap()
@@ -204,7 +207,7 @@ async fn standalone_sign_submit_verify() {
     let fee: u64 = 12;
     let tx = json!({
         "TransactionType": "Payment",
-        "Account": GENESIS_ADDR,
+        "Account": signer_addr,
         "Destination": dest_addr,
         "Amount": payment_amount.to_string(),
         "Fee": fee.to_string(),
@@ -221,7 +224,7 @@ async fn standalone_sign_submit_verify() {
     assert_eq!(result["engine_result"], "tesSUCCESS");
 
     // Verify genesis balance decreased
-    let resp = rpc_call(&addr, "account_info", json!({ "account": GENESIS_ADDR })).await;
+    let resp = rpc_call(&addr, "account_info", json!({ "account": &signer_addr })).await;
     let genesis_balance_after: u64 = resp["result"]["account_data"]["Balance"]
         .as_str()
         .unwrap()
@@ -250,7 +253,11 @@ async fn standalone_submit_queues_and_close_clears() {
     let mut config = NodeConfig::default();
     config.server.bind = format!("127.0.0.1:{port}").parse().unwrap();
 
-    let node = Node::new_standalone(config, GENESIS_ADDR).unwrap();
+    let dummy_seed = Seed::from_passphrase("dummy_signer");
+    let dummy_kp = KeyPair::from_seed(&dummy_seed, KeyType::Ed25519);
+    let signer_addr = encode_classic_address_from_pubkey(dummy_kp.public_key.as_bytes());
+
+    let node = Node::new_standalone(config, &signer_addr).unwrap();
     let tx_queue = Arc::clone(node.tx_queue());
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
@@ -266,13 +273,10 @@ async fn standalone_submit_queues_and_close_clears() {
     let dest_kp = KeyPair::from_seed(&dest_seed, KeyType::Ed25519);
     let dest_addr = encode_classic_address_from_pubkey(dest_kp.public_key.as_bytes());
 
-    let dummy_seed = Seed::from_passphrase("dummy_signer");
-    let dummy_kp = KeyPair::from_seed(&dummy_seed, KeyType::Ed25519);
-
     // Submit first Payment
     let tx1 = json!({
         "TransactionType": "Payment",
-        "Account": GENESIS_ADDR,
+        "Account": signer_addr,
         "Destination": dest_addr,
         "Amount": "50000000",
         "Fee": "12",
@@ -297,7 +301,7 @@ async fn standalone_submit_queues_and_close_clears() {
 
     let tx2 = json!({
         "TransactionType": "Payment",
-        "Account": GENESIS_ADDR,
+        "Account": signer_addr,
         "Destination": dest_addr2,
         "Amount": "30000000",
         "Fee": "12",
