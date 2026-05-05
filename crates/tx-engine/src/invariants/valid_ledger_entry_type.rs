@@ -11,6 +11,7 @@ const KNOWN_ENTRY_TYPES: &[&str] = &[
     "Check",
     "Credential",
     "DID",
+    "Delegate",
     "DepositPreauth",
     "DirectoryNode",
     "Escrow",

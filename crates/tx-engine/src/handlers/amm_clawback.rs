@@ -18,6 +18,14 @@ impl Transactor for AMMClawbackTransactor {
         amm_helpers::validate_asset(asset)?;
         amm_helpers::validate_asset(asset2)?;
 
+        // Holder cannot be the issuer themselves.
+        let account_str = helpers::get_account(ctx.tx)?;
+        let holder_str = helpers::get_str_field(ctx.tx, "Holder")
+            .ok_or(TransactionResult::TemMalformed)?;
+        if account_str == holder_str {
+            return Err(TransactionResult::TemMalformed);
+        }
+
         // Amount is OPTIONAL: when absent the issuer claws back the holder's
         // entire AMM position. When present it must be a well-formed amount
         // (XRP drops string or IOU object), strictly positive, and its
@@ -35,7 +43,14 @@ impl Transactor for AMMClawbackTransactor {
 
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        helpers::read_account_by_address(ctx.view, account_str)?;
+        let (_, account) = helpers::read_account_by_address(ctx.view, account_str)?;
+
+        // Issuer must have lsfAllowTrustLineClawback set.
+        const LSF_ALLOW_TRUST_LINE_CLAWBACK: u32 = 0x8000_0000;
+        let flags = helpers::get_flags(&account);
+        if flags & LSF_ALLOW_TRUST_LINE_CLAWBACK == 0 {
+            return Err(TransactionResult::TecNoPermission);
+        }
 
         let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
         amm_helpers::read_amm(ctx.view, &amm_key)?;
@@ -248,6 +263,7 @@ mod tests {
             "Account": ALICE,
             "Asset": "XRP",
             "Asset2": {"currency": "USD", "issuer": BOB},
+            "Holder": BOB,
             "Amount": "0",
             "Fee": "12",
         });
@@ -273,6 +289,7 @@ mod tests {
             "Account": ALICE,
             "Asset": "XRP",
             "Asset2": {"currency": "USD", "issuer": BOB},
+            "Holder": BOB,
             "Fee": "12",
         });
         let rules = Rules::new();
@@ -290,13 +307,15 @@ mod tests {
         let mut ledger = Ledger::genesis();
         let id = decode_account_id(ALICE).unwrap();
         let key = keylet::account(&id);
+        // 0x80000000 = lsfAllowTrustLineClawback so preclaim passes the
+        // permission check and reaches the AMM-existence check.
         let account = serde_json::json!({
             "LedgerEntryType": "AccountRoot",
             "Account": ALICE,
             "Balance": "100000000",
             "Sequence": 1,
             "OwnerCount": 0,
-            "Flags": 0,
+            "Flags": 0x80000000_u32,
         });
         ledger
             .put_state(key, serde_json::to_vec(&account).unwrap())
@@ -310,6 +329,7 @@ mod tests {
             "Account": ALICE,
             "Asset": "XRP",
             "Asset2": {"currency": "USD", "issuer": BOB},
+            "Holder": BOB,
             "Amount": "1000000",
             "Fee": "12",
         });

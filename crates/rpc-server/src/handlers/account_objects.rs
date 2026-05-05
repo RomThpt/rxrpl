@@ -30,6 +30,11 @@ fn map_type_alias(t: &str) -> &str {
         "mptoken" => "MPToken",
         "vault" => "Vault",
         "credential" => "Credential",
+        "bridge" => "Bridge",
+        "xchain_owned_claim_id" => "XChainOwnedClaimID",
+        "xchain_owned_create_account_claim_id" => "XChainOwnedCreateAccountClaimID",
+        "delegate" => "Delegate",
+        "permissioned_domain" => "PermissionedDomain",
         other => other,
     }
 }
