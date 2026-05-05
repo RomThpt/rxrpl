@@ -474,6 +474,48 @@ impl DomainAttestationService {
     }
 }
 
+/// Render the cache + optional local-validator entry into the JSON shape
+/// consumed by `rpc-server` (`server_info` / `validators`).
+///
+/// `local` is the public key of the running validator (when in
+/// validator mode), so the corresponding cache entry is duplicated under
+/// `"local"` for `server_info`. All other entries land under
+/// `"validators"`.
+pub fn render_status_json(
+    cache: &AttestationCache,
+    local: Option<&PublicKey>,
+    now: u64,
+) -> serde_json::Value {
+    let mut local_obj = serde_json::json!({});
+    let mut validators = Vec::new();
+    for (key, entry) in cache.snapshot(now) {
+        let pk_hex = hex::encode_upper(key.as_bytes());
+        let status_label = entry.status.label();
+        let verified = matches!(entry.status, AttestationStatus::Verified { .. });
+        let last_verified = match entry.status {
+            AttestationStatus::Verified { at } => at,
+            _ => entry.last_checked_unix,
+        };
+        let v = serde_json::json!({
+            "public_key": pk_hex,
+            "domain": entry.domain,
+            "verification_status": status_label,
+            "last_verified": last_verified,
+        });
+        if local == Some(&key) {
+            local_obj = serde_json::json!({
+                "verified": verified,
+                "domain": entry.domain,
+                "status": status_label,
+                "last_check": entry.last_checked_unix,
+            });
+        } else {
+            validators.push(v);
+        }
+    }
+    serde_json::json!({ "local": local_obj, "validators": validators })
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -613,6 +655,29 @@ mod tests {
             g.record_result(&ed_key(0x05), "example.com", true, 1);
         }
         assert_eq!(h2.read().await.snapshot(1).len(), 1);
+    }
+
+    #[test]
+    fn render_status_json_splits_local_and_others() {
+        let mut cache = AttestationCache::new();
+        let local = ed_key(0x01);
+        let other = ed_key(0x02);
+        cache.record_result(&local, "self.example", true, 1000);
+        cache.record_result(&other, "peer.example", false, 1000);
+        let v = render_status_json(&cache, Some(&local), 1500);
+        assert_eq!(v["local"]["status"], "verified");
+        assert_eq!(v["local"]["domain"], "self.example");
+        let arr = v["validators"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["domain"], "peer.example");
+        assert_eq!(arr[0]["verification_status"], "failed");
+    }
+
+    #[test]
+    fn render_status_json_no_local() {
+        let cache = AttestationCache::new();
+        let v = render_status_json(&cache, None, 0);
+        assert_eq!(v["validators"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
