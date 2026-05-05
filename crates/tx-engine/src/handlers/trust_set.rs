@@ -202,9 +202,12 @@ impl Transactor for TrustSetTransactor {
                 .insert(tl_key, bytes)
                 .map_err(|_| TransactionResult::TemMalformed)?;
 
-            // Link the new RippleState into the calling account's owner
-            // directory so account_lines / account_objects can find it.
+            // Link the new RippleState into BOTH parties' owner directories
+            // so account_lines / account_objects / gateway_balances find it
+            // from either side. Matches rippled's `trustCreate` which inserts
+            // into both lowDir and highDir.
             add_to_owner_dir(ctx.view, &account_id, &tl_key)?;
+            add_to_owner_dir(ctx.view, &issuer_id, &tl_key)?;
 
             // Increment owner count for the account
             let acct_key = keylet::account(&account_id);
