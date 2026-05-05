@@ -4,6 +4,8 @@ Verify that a mixed validator set (rippled + rxrpl) reaches consensus
 and all nodes agree on the same validated ledger hashes.
 """
 
+import pytest
+
 from conftest import (
     ALL_URLS,
     RIPPLED_URLS,
@@ -14,6 +16,7 @@ from conftest import (
 )
 
 
+@pytest.mark.network
 class TestConsensus:
     """Test consensus across mixed rippled/rxrpl validator sets."""
 

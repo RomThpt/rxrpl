@@ -6,6 +6,8 @@ existing rippled validators and reach the same ledger state.
 
 import time
 
+import pytest
+
 from conftest import (
     ALL_URLS,
     RIPPLED_URLS,
@@ -20,6 +22,7 @@ from conftest import (
 DEST_PRESYNC = "rfkE1aSy9G8Upk4JssnwBxhEv5p4mn2KTy"
 
 
+@pytest.mark.network
 class TestSync:
     """Test ledger synchronization for late-joining nodes."""
 

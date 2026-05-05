@@ -6,6 +6,8 @@ on nodes of the other implementation after validation.
 
 import time
 
+import pytest
+
 from conftest import (
     RIPPLED_URLS,
     RXRPL_URLS,
@@ -19,6 +21,7 @@ DEST_RIPPLED_TO_RXRPL = "rPMh7Pi9ct699iZUTWzJaUPfRhPgenRpBk"
 DEST_RXRPL_TO_RIPPLED = "r3kmLJN5D28dHuH8vZNUZpMC43pEHpaocV"
 
 
+@pytest.mark.network
 class TestPropagation:
     """Test transaction propagation between rippled and rxrpl nodes."""
 

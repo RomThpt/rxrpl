@@ -10,11 +10,107 @@ Usage:
 """
 
 import argparse
+import base64
 import hashlib
+import json
 import os
 import secrets
 
 CONFIGS_DIR = os.path.join(os.path.dirname(__file__), "..", "configs")
+
+
+def _try_import_secp256k1_signer():
+    """Return a callable (priv_hex, msg_bytes) -> (sig_hex, pub_hex) or None.
+
+    Prefers the `ecdsa` library which is broadly available; falls back to None
+    if no secp256k1 implementation is reachable.
+    """
+    try:
+        from ecdsa import SigningKey, SECP256k1
+        from ecdsa.util import sigencode_der_canonize
+
+        def sign(priv_hex: str, msg: bytes) -> tuple[str, str]:
+            sk = SigningKey.from_string(bytes.fromhex(priv_hex), curve=SECP256k1)
+            vk = sk.get_verifying_key()
+            # Compressed pubkey (33 bytes) per SEC1.
+            pub_pt = vk.pubkey.point
+            x = pub_pt.x().to_bytes(32, "big")
+            prefix = b"\x02" if pub_pt.y() % 2 == 0 else b"\x03"
+            compressed = prefix + x
+            sig = sk.sign_deterministic(
+                msg,
+                hashfunc=hashlib.sha256,
+                sigencode=sigencode_der_canonize,
+            )
+            return sig.hex().upper(), compressed.hex().upper()
+
+        return sign
+    except Exception:
+        return None
+
+
+def generate_publisher_key() -> dict:
+    """Create a fresh test publisher secp256k1 keypair.
+
+    Returns dict with hex-encoded `secret_key` (32 bytes) and `public_key`
+    (33-byte compressed). If no secp256k1 library is available, falls back
+    to a deterministic stub (still 33 bytes, but not a real curve point).
+    """
+    secret = secrets.token_hex(32)
+    signer = _try_import_secp256k1_signer()
+    if signer is None:
+        # Deterministic stub pubkey for environments without ecdsa.
+        h = hashlib.sha256(secret.encode()).hexdigest()
+        return {
+            "secret_key": secret,
+            "public_key": ("02" + h)[:66].upper(),
+            "_stub": True,
+        }
+    _, pub_hex = signer(secret, b"probe")
+    return {"secret_key": secret, "public_key": pub_hex}
+
+
+def write_publisher(path: str, key: dict):
+    with open(path, "w") as f:
+        json.dump(key, f, indent=2)
+
+
+def write_manifest(path: str, publisher: dict, validators: list[dict],
+                   sequence: int = 1):
+    """Sign and write the shared validator-list manifest.
+
+    The signed payload is the canonical JSON of `validators + sequence`.
+    Format mirrors rippled's UTE envelope at a JSON layer (B1 scope: parse
+    + presence; full STValidatorList byte-encoding deferred to B3).
+    """
+    blob = {
+        "sequence": sequence,
+        "validators": validators,
+    }
+    blob_bytes = json.dumps(blob, sort_keys=True, separators=(",", ":")).encode()
+    blob_b64 = base64.b64encode(blob_bytes).decode()
+
+    signer = _try_import_secp256k1_signer()
+    if signer is None:
+        # Stub signature: SHA-256 of (priv || blob).  Deterministic, parse-able.
+        h = hashlib.sha256(
+            (publisher["secret_key"] + blob_b64).encode()
+        ).hexdigest()
+        sig_hex = h.upper()
+        signing_pubkey = publisher["public_key"]
+    else:
+        sig_hex, signing_pubkey = signer(publisher["secret_key"], blob_bytes)
+
+    manifest = {
+        "version": 2,
+        "sequence": sequence,
+        "validators": validators,
+        "blob": blob_b64,
+        "signature": sig_hex,
+        "signing_pubkey": signing_pubkey,
+    }
+    with open(path, "w") as f:
+        json.dump(manifest, f, indent=2)
 
 
 def generate_node_seed():
@@ -201,9 +297,24 @@ def main():
         public_keys,
     )
 
+    # Generate test publisher key + signed manifest binding all validators.
+    publisher = generate_publisher_key()
+    write_publisher(os.path.join(CONFIGS_DIR, "publisher.json"), publisher)
+
+    validator_entries = []
+    for i, key in enumerate(public_keys):
+        role = "rippled" if i < args.rippled else "rxrpl"
+        validator_entries.append({"public_key": key, "role": role})
+    write_manifest(
+        os.path.join(CONFIGS_DIR, "manifest.json"),
+        publisher,
+        validator_entries,
+    )
+
     print(f"Generated configs for {args.rippled} rippled + {args.rxrpl} rxrpl nodes")
     print(f"  Configs: {CONFIGS_DIR}/")
     print(f"  Validators: {len(public_keys)} total")
+    print(f"  Publisher: {publisher['public_key'][:16]}...")
 
 
 if __name__ == "__main__":
