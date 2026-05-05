@@ -332,7 +332,9 @@ fn collect_offers(ledger: &Ledger, pays_issue: &Issue, gets_issue: &Issue) -> Ve
     let mut offers = Vec::new();
 
     for (_key, data) in ledger.state_map.iter() {
-        let entry: serde_json::Value = match serde_json::from_slice(&data) {
+        // State entries are stored as XRPL binary; decode_state handles
+        // both binary and the legacy JSON form used in some tests.
+        let entry: serde_json::Value = match rxrpl_ledger::sle_codec::decode_state(&data) {
             Ok(v) => v,
             Err(_) => continue,
         };

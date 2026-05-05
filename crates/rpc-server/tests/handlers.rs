@@ -422,3 +422,206 @@ async fn ledger_info_validated_variant() {
     assert_eq!(l["ledger_index"], 1);
     assert_eq!(l["closed"], true);
 }
+
+// -- ripple_path_find handler end-to-end tests --
+
+mod ripple_path_find_e2e {
+    //! End-to-end reproduction of the txcompat path scenarios that previously
+    //! returned empty `alternatives`. Builds ledger state via TxEngine
+    //! (AccountSet/TrustSet/Payment), then runs `PathRequest::find_paths`
+    //! against the resulting binary-encoded SHAMap.
+
+    use super::*;
+    use rxrpl_amendment::Rules;
+    use rxrpl_codec::address::classic::encode_account_id;
+    use rxrpl_primitives::AccountId;
+
+    fn add_account(ledger: &mut Ledger, account: &AccountId, balance: u64) {
+        let key = keylet::account(account);
+        let acct = json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": encode_account_id(account),
+            "Balance": balance.to_string(),
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&acct).unwrap())
+            .unwrap();
+    }
+
+    fn submit(
+        engine: &TxEngine,
+        ledger: &mut Ledger,
+        tx: Value,
+    ) -> rxrpl_protocol::TransactionResult {
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+        engine.apply(&tx, ledger, &rules, &fees).unwrap()
+    }
+
+    /// Reproduce `path_find_basic`: alice has USD from gateway, query path
+    /// alice → bob (both trust gateway for USD). At least one alternative
+    /// is expected.
+    #[tokio::test]
+    async fn path_find_basic_returns_alternatives() {
+        let engine = make_engine();
+        let mut ledger = Ledger::genesis();
+
+        let gateway = AccountId([1u8; 20]);
+        let alice = AccountId([2u8; 20]);
+        let bob = AccountId([3u8; 20]);
+        add_account(&mut ledger, &gateway, 10_000_000_000);
+        add_account(&mut ledger, &alice, 10_000_000_000);
+        add_account(&mut ledger, &bob, 10_000_000_000);
+
+        let gw = encode_account_id(&gateway);
+        let a = encode_account_id(&alice);
+        let b = encode_account_id(&bob);
+
+        // DefaultRipple on the gateway so it acts like a normal issuer.
+        submit(
+            &engine,
+            &mut ledger,
+            json!({
+                "TransactionType": "AccountSet",
+                "Account": gw,
+                "SetFlag": 8u32,
+                "Sequence": 1u32,
+                "Fee": "10",
+            }),
+        );
+        submit(
+            &engine,
+            &mut ledger,
+            json!({
+                "TransactionType": "TrustSet",
+                "Account": a,
+                "LimitAmount": {"currency": "USD", "issuer": gw, "value": "1000"},
+                "Sequence": 1u32,
+                "Fee": "10",
+            }),
+        );
+        submit(
+            &engine,
+            &mut ledger,
+            json!({
+                "TransactionType": "TrustSet",
+                "Account": b,
+                "LimitAmount": {"currency": "USD", "issuer": gw, "value": "1000"},
+                "Sequence": 1u32,
+                "Fee": "10",
+            }),
+        );
+        submit(
+            &engine,
+            &mut ledger,
+            json!({
+                "TransactionType": "Payment",
+                "Account": gw,
+                "Destination": a,
+                "Amount": {"currency": "USD", "issuer": gw, "value": "50"},
+                "Sequence": 2u32,
+                "Fee": "10",
+            }),
+        );
+
+        let req = rxrpl_pathfind::PathRequest {
+            source: alice,
+            destination: bob,
+            destination_amount: json!({"currency": "USD", "issuer": gw, "value": "10"}),
+            source_currencies: None,
+        };
+        let alts = req.find_paths(&ledger);
+        assert!(
+            !alts.is_empty(),
+            "expected at least one path alternative for direct USD transfer"
+        );
+    }
+
+    /// Reproduce `path_source_currency_limits` second call: same setup,
+    /// query with `source_currencies=[USD wildcard]` — should yield a USD
+    /// direct alternative.
+    #[tokio::test]
+    async fn path_source_currency_usd_wildcard_returns_alternatives() {
+        let engine = make_engine();
+        let mut ledger = Ledger::genesis();
+
+        let gateway = AccountId([1u8; 20]);
+        let alice = AccountId([2u8; 20]);
+        let bob = AccountId([3u8; 20]);
+        add_account(&mut ledger, &gateway, 10_000_000_000);
+        add_account(&mut ledger, &alice, 10_000_000_000);
+        add_account(&mut ledger, &bob, 10_000_000_000);
+
+        let gw = encode_account_id(&gateway);
+        let a = encode_account_id(&alice);
+        let b = encode_account_id(&bob);
+
+        submit(
+            &engine,
+            &mut ledger,
+            json!({
+                "TransactionType": "AccountSet",
+                "Account": gw,
+                "SetFlag": 8u32,
+                "Sequence": 1u32,
+                "Fee": "10",
+            }),
+        );
+        submit(
+            &engine,
+            &mut ledger,
+            json!({
+                "TransactionType": "TrustSet",
+                "Account": a,
+                "LimitAmount": {"currency": "USD", "issuer": gw, "value": "1000"},
+                "Sequence": 1u32,
+                "Fee": "10",
+            }),
+        );
+        submit(
+            &engine,
+            &mut ledger,
+            json!({
+                "TransactionType": "TrustSet",
+                "Account": b,
+                "LimitAmount": {"currency": "USD", "issuer": gw, "value": "1000"},
+                "Sequence": 1u32,
+                "Fee": "10",
+            }),
+        );
+        submit(
+            &engine,
+            &mut ledger,
+            json!({
+                "TransactionType": "Payment",
+                "Account": gw,
+                "Destination": a,
+                "Amount": {"currency": "USD", "issuer": gw, "value": "100"},
+                "Sequence": 2u32,
+                "Fee": "10",
+            }),
+        );
+
+        // USD wildcard (no issuer): expand should pick up alice's USD line.
+        let mut usd = [0u8; 20];
+        usd[12..15].copy_from_slice(b"USD");
+        let usd_wildcard = rxrpl_pathfind::Issue {
+            currency: usd,
+            issuer: AccountId([0u8; 20]),
+        };
+        let req = rxrpl_pathfind::PathRequest {
+            source: alice,
+            destination: bob,
+            destination_amount: json!({"currency": "USD", "issuer": gw, "value": "10"}),
+            source_currencies: Some(vec![usd_wildcard]),
+        };
+        let alts = req.find_paths(&ledger);
+        assert!(
+            !alts.is_empty(),
+            "expected at least one USD direct path alternative when source_currencies=[USD]"
+        );
+    }
+}
