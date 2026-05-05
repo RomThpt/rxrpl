@@ -88,7 +88,7 @@ impl BinarySerializer {
         match def.field_type.as_str() {
             "UInt8" => self.serialize_uint8(value)?,
             "UInt16" => self.serialize_uint16(value, def)?,
-            "UInt32" => self.serialize_uint32(value)?,
+            "UInt32" => self.serialize_uint32(value, def)?,
             "Int32" => self.serialize_int32(value)?,
             "UInt64" => self.serialize_uint64(value)?,
             "Hash128" => self.serialize_hash(value, 16)?,
@@ -160,7 +160,23 @@ impl BinarySerializer {
         Ok(())
     }
 
-    fn serialize_uint32(&mut self, value: &Value) -> Result<(), CodecError> {
+    fn serialize_uint32(&mut self, value: &Value, def: &FieldDef) -> Result<(), CodecError> {
+        // PermissionValue accepts a string transaction-type or granular permission name,
+        // mirroring rippled's STParsedJSON handling.
+        if let Some(s) = value.as_str() {
+            if def.name == "PermissionValue" {
+                let v = definitions::resolve_permission_value(s)
+                    .ok_or_else(|| CodecError::UnknownField(s.to_string()))?;
+                self.write_u32(v);
+                return Ok(());
+            }
+            // Allow numeric strings as a convenience for other UInt32 fields.
+            let v: u32 = s
+                .parse()
+                .map_err(|_| CodecError::UnsupportedType("expected u32 integer".to_string()))?;
+            self.write_u32(v);
+            return Ok(());
+        }
         let v = value
             .as_u64()
             .ok_or_else(|| CodecError::UnsupportedType("expected u32 integer".to_string()))?;
@@ -597,6 +613,22 @@ mod tests {
                 "Number round-trip failed for {value_str}: got {parsed_str}"
             );
         }
+    }
+
+    #[test]
+    fn delegate_set_permission_string() {
+        let tx = serde_json::json!({
+            "TransactionType": "DelegateSet",
+            "Account": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+            "Authorize": "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN",
+            "Fee": "10",
+            "Sequence": 1,
+            "Permissions": [{"Permission": {"PermissionValue": "Payment"}}],
+        });
+        let mut s = BinarySerializer::new();
+        s.serialize_object(&tx, false)
+            .expect("DelegateSet with string PermissionValue must encode");
+        assert!(!s.into_bytes().is_empty());
     }
 
     #[test]
