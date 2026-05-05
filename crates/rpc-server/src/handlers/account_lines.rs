@@ -73,17 +73,19 @@ pub async fn account_lines(
             })
             .unwrap_or("0");
 
-        // Negate balance if we're the high account
+        // RippleState Balance.value is stored from the holder-when-issuer-is-low
+        // perspective in rxrpl: positive when issuer is low and the high account
+        // holds the IOU; negative when issuer is high and the low account holds
+        // the IOU. So to render holder's view, negate when the queried account
+        // is the LOW account (peer is high, i.e. peer is the issuer/owed party).
         let balance = if is_high {
-            if let Some(stripped) = balance_str.strip_prefix('-') {
-                stripped.to_string()
-            } else if balance_str == "0" {
-                "0".to_string()
-            } else {
-                format!("-{balance_str}")
-            }
-        } else {
             balance_str.to_string()
+        } else if let Some(stripped) = balance_str.strip_prefix('-') {
+            stripped.to_string()
+        } else if balance_str == "0" {
+            "0".to_string()
+        } else {
+            format!("-{balance_str}")
         };
 
         let currency = entry
