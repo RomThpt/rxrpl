@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use rxrpl_amendment::{AmendmentTable, FeatureRegistry, Rules};
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_config::NodeConfig;
+use rxrpl_config::{NodeConfig, load_seed_file};
+use rxrpl_crypto::Seed;
 use rxrpl_consensus::{
     ConsensusEngine, ConsensusParams, ConsensusTimer, NodeId, TimerAction, TrustedValidatorList,
     TxSet,
@@ -71,6 +72,10 @@ pub struct Node {
     tx_store: Option<Arc<dyn TxStore>>,
     node_store: Option<Arc<dyn NodeStore>>,
     pruner: Arc<LedgerPruner>,
+    /// Optional validator signing seed loaded from `validators.seed_file`.
+    /// Held only when `validators.enabled` is true; otherwise dropped after
+    /// emitting a warning so unused secret material is zeroized promptly.
+    validation_seed: Option<Seed>,
     running: bool,
 }
 
@@ -101,8 +106,39 @@ impl Node {
         }
     }
 
+    /// Reference to the loaded validator signing seed, if any.
+    #[allow(dead_code)]
+    pub(crate) fn validation_seed(&self) -> Option<&Seed> {
+        self.validation_seed.as_ref()
+    }
+
+    /// Load the validator signing seed if configured, enforcing strict
+    /// permissions. Returns `Ok(None)` when no `seed_file` is set; emits a
+    /// warning (and drops the seed) when a seed file is provided but
+    /// validation is not enabled.
+    fn load_validation_seed(config: &NodeConfig) -> Result<Option<Seed>, NodeError> {
+        let Some(path) = config.validators.seed_file.as_deref() else {
+            return Ok(None);
+        };
+        let seed = load_seed_file(path).map_err(|e| NodeError::SeedFile(e.to_string()))?;
+        if !config.validators.enabled {
+            tracing::warn!(
+                path = %path.display(),
+                "validator seed file configured but [validators].enabled is false; \
+                 seed will not be used"
+            );
+            // Drop seed to zeroize unused secret material.
+            drop(seed);
+            return Ok(None);
+        }
+        tracing::info!(path = %path.display(), "validator signing seed loaded");
+        Ok(Some(seed))
+    }
+
     /// Create a new node from configuration.
     pub fn new(config: NodeConfig) -> Result<Self, NodeError> {
+        let validation_seed = Self::load_validation_seed(&config)?;
+
         // Initialize node store
         let node_store = Self::create_node_store(&config)?;
 
@@ -152,6 +188,7 @@ impl Node {
             tx_store: None,
             node_store,
             pruner,
+            validation_seed,
             running: false,
         })
     }
@@ -161,6 +198,7 @@ impl Node {
     /// Creates genesis ledger, funds the account, closes genesis,
     /// and opens ledger #2 ready for transactions.
     pub fn new_standalone(config: NodeConfig, genesis_address: &str) -> Result<Self, NodeError> {
+        let validation_seed = Self::load_validation_seed(&config)?;
         let node_store = Self::create_node_store(&config)?;
 
         let registry = FeatureRegistry::with_known_amendments();
@@ -219,6 +257,7 @@ impl Node {
             tx_store: Some(tx_store),
             node_store,
             pruner,
+            validation_seed,
             running: false,
         })
     }
@@ -2939,5 +2978,60 @@ mod tests {
         let data1 = genesis1.get_state(&key).unwrap();
         let data2 = genesis2.get_state(&key).unwrap();
         assert_eq!(data1, data2, "binary encoding must be deterministic");
+    }
+
+    #[cfg(unix)]
+    fn write_seed_file_with_mode(dir: &std::path::Path, mode: u32) -> std::path::PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("seed");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"00112233445566778899aabbccddeeff").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validator_enabled_with_seed_file_loads_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed_path = write_seed_file_with_mode(dir.path(), 0o600);
+        let mut config = NodeConfig::default();
+        config.validators.enabled = true;
+        config.validators.seed_file = Some(seed_path);
+
+        let node = Node::new(config).expect("node creation should succeed");
+        let seed = node.validation_seed().expect("seed should be loaded");
+        assert_eq!(seed.as_bytes()[0], 0x00);
+        assert_eq!(seed.as_bytes()[15], 0xff);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validator_disabled_with_seed_file_logs_warning_and_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed_path = write_seed_file_with_mode(dir.path(), 0o600);
+        let mut config = NodeConfig::default();
+        config.validators.enabled = false;
+        config.validators.seed_file = Some(seed_path);
+
+        let node = Node::new(config).expect("node creation should succeed");
+        assert!(node.validation_seed().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loose_seed_file_mode_fails_node_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed_path = write_seed_file_with_mode(dir.path(), 0o644);
+        let mut config = NodeConfig::default();
+        config.validators.enabled = true;
+        config.validators.seed_file = Some(seed_path);
+
+        let err = match Node::new(config) {
+            Ok(_) => panic!("expected node creation to fail with loose seed mode"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, NodeError::SeedFile(_)), "got {err:?}");
     }
 }
