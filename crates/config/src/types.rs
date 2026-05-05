@@ -135,12 +135,7 @@ fn default_max_peers() -> usize {
 }
 
 fn default_seeds() -> Vec<String> {
-    vec![
-        "r.ripple.com:51235".into(),
-        "s1.ripple.com:51235".into(),
-        "s2.ripple.com:51235".into(),
-        "s.altnet.rippletest.net:51235".into(),
-    ]
+    Vec::new()
 }
 
 impl Default for PeerConfig {
