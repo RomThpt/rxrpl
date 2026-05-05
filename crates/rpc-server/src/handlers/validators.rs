@@ -11,8 +11,17 @@ use crate::error::RpcServerError;
 /// will provide dynamic validator information once available.
 pub async fn validators(
     _params: Value,
-    _ctx: &Arc<ServerContext>,
+    ctx: &Arc<ServerContext>,
 ) -> Result<Value, RpcServerError> {
+    let validator_domains = match ctx.domain_attestation_status.as_ref() {
+        Some(handle) => handle
+            .read()
+            .await
+            .get("validators")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+        None => Value::Array(Vec::new()),
+    };
     Ok(serde_json::json!({
         "validation_quorum": 0,
         "validator_list": {
@@ -21,5 +30,6 @@ pub async fn validators(
         },
         "trusted_validator_keys": [],
         "publisher_lists": [],
+        "validator_domains": validator_domains,
     }))
 }

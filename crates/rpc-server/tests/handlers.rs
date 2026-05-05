@@ -279,3 +279,70 @@ async fn tx_invalid_hash() {
     assert!(matches!(err, RpcServerError::NotImplemented));
     assert_eq!(err.token(), "notImpl");
 }
+
+// -- domain attestation RPC tests (F-B4) --
+
+#[tokio::test]
+async fn server_info_includes_domain_verification_when_attached() {
+    let mut ctx = test_ctx_with_ledger();
+    let snap = Arc::new(RwLock::new(json!({
+        "local": {
+            "verified": true,
+            "domain": "xrpl.example.com",
+            "status": "verified",
+            "last_check": 1700000000u64
+        },
+        "validators": []
+    })));
+    ctx.attach_domain_attestation_status(snap);
+    let result = rxrpl_rpc_server::handlers::server_info(json!({}), &ctx)
+        .await
+        .unwrap();
+    assert_eq!(result["info"]["domain_verification"]["status"], "verified");
+    assert_eq!(
+        result["info"]["domain_verification"]["domain"],
+        "xrpl.example.com"
+    );
+}
+
+#[tokio::test]
+async fn server_info_omits_domain_verification_when_unattached() {
+    let ctx = test_ctx_with_ledger();
+    let result = rxrpl_rpc_server::handlers::server_info(json!({}), &ctx)
+        .await
+        .unwrap();
+    assert!(result["info"].get("domain_verification").is_none());
+}
+
+#[tokio::test]
+async fn validators_exposes_validator_domains_array() {
+    let mut ctx = test_ctx_with_ledger();
+    let snap = Arc::new(RwLock::new(json!({
+        "local": {},
+        "validators": [
+            {
+                "public_key": "ED1234",
+                "domain": "v1.example.com",
+                "verification_status": "verified",
+                "last_verified": 1700000000u64
+            }
+        ]
+    })));
+    ctx.attach_domain_attestation_status(snap);
+    let result = rxrpl_rpc_server::handlers::validators(json!({}), &ctx)
+        .await
+        .unwrap();
+    let arr = result["validator_domains"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["public_key"], "ED1234");
+    assert_eq!(arr[0]["verification_status"], "verified");
+}
+
+#[tokio::test]
+async fn validators_returns_empty_domains_when_unattached() {
+    let ctx = test_ctx_with_ledger();
+    let result = rxrpl_rpc_server::handlers::validators(json!({}), &ctx)
+        .await
+        .unwrap();
+    assert_eq!(result["validator_domains"], json!([]));
+}

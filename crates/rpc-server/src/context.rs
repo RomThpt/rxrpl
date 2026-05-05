@@ -66,6 +66,20 @@ pub struct ServerContext {
     /// `validator_list_sites` RPC method.
     pub validator_list_status:
         Option<Arc<RwLock<serde_json::Value>>>,
+    /// Live snapshot of validator domain attestation status, populated by
+    /// the overlay layer's `DomainAttestationService`. Read by the
+    /// `server_info` and `validators` RPC methods. Shape:
+    /// ```json
+    /// {
+    ///   "local": {"verified": bool, "domain": str, "status": "verified"|...,
+    ///             "last_check": u64},
+    ///   "validators": [{"public_key": "ED..", "domain": "...",
+    ///                   "verification_status": "verified"|..,
+    ///                   "last_verified": u64}]
+    /// }
+    /// ```
+    pub domain_attestation_status:
+        Option<Arc<RwLock<serde_json::Value>>>,
     /// Configured network id (e.g. 0 = mainnet, 21337 = devnet, 10000 = test).
     /// Used by `sign` to auto-fill `NetworkID` on transactions, which modern
     /// rippled requires (`telREQUIRES_NETWORK_ID`).
@@ -93,6 +107,7 @@ impl ServerContext {
             reporting_mode: false,
             forward_url: None,
             validator_list_status: None,
+            domain_attestation_status: None,
             network_id: None,
             event_tx,
         })
@@ -128,6 +143,7 @@ impl ServerContext {
             reporting_mode: false,
             forward_url: None,
             validator_list_status: None,
+            domain_attestation_status: None,
             network_id: None,
             event_tx,
         })
@@ -164,6 +180,7 @@ impl ServerContext {
             reporting_mode: false,
             forward_url: None,
             validator_list_status: None,
+            domain_attestation_status: None,
             network_id: None,
             event_tx,
         })
@@ -200,6 +217,7 @@ impl ServerContext {
             reporting_mode: false,
             forward_url: None,
             validator_list_status: None,
+            domain_attestation_status: None,
             network_id: None,
             event_tx,
         })
@@ -229,6 +247,7 @@ impl ServerContext {
             reporting_mode: true,
             forward_url: Some(forward_url),
             validator_list_status: None,
+            domain_attestation_status: None,
             network_id: None,
             event_tx,
         })
@@ -249,6 +268,17 @@ impl ServerContext {
     /// Attach the configured network id so `sign` can auto-fill
     /// `NetworkID` on outbound transactions. Same get_mut constraint as
     /// `attach_validator_list_status`.
+    /// Attach the shared domain attestation status snapshot. Same get_mut
+    /// constraint as `attach_validator_list_status`.
+    pub fn attach_domain_attestation_status(
+        self: &mut Arc<Self>,
+        handle: Arc<RwLock<serde_json::Value>>,
+    ) {
+        if let Some(ctx) = Arc::get_mut(self) {
+            ctx.domain_attestation_status = Some(handle);
+        }
+    }
+
     pub fn attach_network_id(self: &mut Arc<Self>, network_id: u32) {
         if let Some(ctx) = Arc::get_mut(self) {
             ctx.network_id = Some(network_id);

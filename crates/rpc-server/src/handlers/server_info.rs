@@ -69,6 +69,12 @@ pub async fn server_info(
     if let Some(v) = summary.validated_ledger {
         info["validated_ledger"] = v;
     }
+    if let Some(handle) = ctx.domain_attestation_status.as_ref() {
+        let snap = handle.read().await;
+        if let Some(local) = snap.get("local") {
+            info["domain_verification"] = local.clone();
+        }
+    }
 
     Ok(serde_json::json!({ "info": info }))
 }
