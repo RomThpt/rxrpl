@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_pathfind::{PathRequest, parse_amount_issue, path_step_to_json};
+use rxrpl_pathfind::{PathRequest, parse_source_currency, path_step_to_json};
 use rxrpl_protocol::keylet;
 
 use crate::context::ServerContext;
@@ -50,7 +50,7 @@ pub async fn ripple_path_find(
         if let Some(arr) = params.get("source_currencies").and_then(|v| v.as_array()) {
             let mut issues = Vec::new();
             for item in arr {
-                if let Some(issue) = parse_amount_issue(item) {
+                if let Some(issue) = parse_source_currency(item) {
                     issues.push(issue);
                 }
             }

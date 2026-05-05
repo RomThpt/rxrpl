@@ -273,8 +273,9 @@ fn apply_iou(
         return Ok(TransactionResult::TesSuccess);
     }
 
-    // Non-issuer (holder-to-holder) IOU send: debit source's RippleState
-    // and credit destination's RippleState. Both must exist.
+    // Non-issuer IOU send: debit source's RippleState. If the destination is
+    // the issuer itself, this is a burn (only debit). Otherwise also credit
+    // destination's RippleState with the issuer.
     let send_value: f64 = value.parse().map_err(|_| TransactionResult::TemBadAmount)?;
     if send_value <= 0.0 {
         return Err(TransactionResult::TemBadAmount);
@@ -303,22 +304,25 @@ fn apply_iou(
         .update(src_trust_key, src_trust_data)
         .map_err(|_| TransactionResult::TefInternal)?;
 
-    // Destination credits ITS trust line balance from issuer.
-    let dst_trust_key = keylet::trust_line(&dest_id, &issuer_id, &cur_bytes);
-    let dst_trust_bytes = ctx
-        .view
-        .read(&dst_trust_key)
-        .ok_or(TransactionResult::TecPathDry)?;
-    let mut dst_trust: serde_json::Value =
-        serde_json::from_slice(&dst_trust_bytes).map_err(|_| TransactionResult::TefInternal)?;
+    // If destination is the issuer, we just burned IOU -- no trust line on
+    // the issuer's side to credit. Otherwise credit destination's RippleState.
+    if dest_id != issuer_id {
+        let dst_trust_key = keylet::trust_line(&dest_id, &issuer_id, &cur_bytes);
+        let dst_trust_bytes = ctx
+            .view
+            .read(&dst_trust_key)
+            .ok_or(TransactionResult::TecPathDry)?;
+        let mut dst_trust: serde_json::Value = serde_json::from_slice(&dst_trust_bytes)
+            .map_err(|_| TransactionResult::TefInternal)?;
 
-    let new_dst_value = adjust_iou_balance(&dst_trust, value, &issuer_id, &dest_id)?;
-    dst_trust["Balance"]["value"] = serde_json::Value::String(new_dst_value);
-    let dst_trust_data =
-        serde_json::to_vec(&dst_trust).map_err(|_| TransactionResult::TefInternal)?;
-    ctx.view
-        .update(dst_trust_key, dst_trust_data)
-        .map_err(|_| TransactionResult::TefInternal)?;
+        let new_dst_value = adjust_iou_balance(&dst_trust, value, &issuer_id, &dest_id)?;
+        dst_trust["Balance"]["value"] = serde_json::Value::String(new_dst_value);
+        let dst_trust_data =
+            serde_json::to_vec(&dst_trust).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(dst_trust_key, dst_trust_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+    }
 
     // Bump source Sequence.
     let src_key = keylet::account(&src_id);
