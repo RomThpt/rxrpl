@@ -1097,6 +1097,17 @@ impl Node {
         // `run_networked` via `validate_starting_ledger_unl` so the error
         // surfaces before any port bind or task spawn.
 
+        // Compute first-close grace before the move closure so we don't
+        // capture &self. Grace is 0 when no peers are configured (true solo /
+        // single-node sim) so close-time progresses immediately. Otherwise
+        // 60s, tuned for cross-impl rippled handshake latency.
+        let first_close_grace =
+            if self.config.peer.seeds.is_empty() && self.config.peer.fixed_peers.is_empty() {
+                Duration::from_secs(0)
+            } else {
+                Duration::from_secs(60)
+            };
+
         tokio::spawn(async move {
             let node_id = NodeId(identity.node_id);
             let consensus_params = ConsensusParams::default();
@@ -1113,13 +1124,12 @@ impl Node {
             let mut max_peer_seq: u32 = 0;
             let mut pending_close_time = 0u32;
             // Cross-impl bootstrap gate: defer first close until at least one
-            // peer has announced its sequence (max_peer_seq > 0). Without this,
-            // a fast 5s open closes #2 before peer connects (~17s for rippled
-            // StatusChange) and the bootstrap-yield can't fire. After grace
-            // period (60s) we proceed even without peer — that's solo mode.
+            // peer has announced its sequence (max_peer_seq > 0). Grace
+            // computed at the call site (above the spawn) and captured here
+            // because it depends on `self.config` which doesn't escape the
+            // closure.
             let mut first_close_completed: bool = false;
             let startup_instant = tokio::time::Instant::now();
-            const FIRST_CLOSE_GRACE: Duration = Duration::from_secs(60);
             // Cross-impl close-race guard: track last time we observed a peer
             // StatusChange. If peer is alive but BEHIND our open seq, defer
             // close to give peer time to advance — that way peer announces
@@ -1227,11 +1237,12 @@ impl Node {
                                     // takes ~17s. With 5s open, we'd fire CloseLedger before
                                     // peer is observable (max_peer_seq still 0) and the
                                     // bootstrap-yield wouldn't trigger. Defer until peer has
-                                    // announced a sequence, capped by FIRST_CLOSE_GRACE for
-                                    // solo mode (no peer at all).
+                                    // announced a sequence, capped by first_close_grace for
+                                    // solo mode (no peer at all). Grace is 0 when no peers
+                                    // are configured at all, so single-node sims close fast.
                                     if !first_close_completed
                                         && max_peer_seq == 0
-                                        && startup_instant.elapsed() < FIRST_CLOSE_GRACE
+                                        && startup_instant.elapsed() < first_close_grace
                                     {
                                         tracing::debug!(
                                             "deferring first close: no peer status yet (elapsed {:?})",
