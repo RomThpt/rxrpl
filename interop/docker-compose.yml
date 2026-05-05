@@ -1,8 +1,12 @@
 # Mixed-network interop testing: rxrpl + rippled validators
 #
-# Spins up a 5-node private network:
-#   - 3 rippled validators
-#   - 2 rxrpl validators
+# Spins up a 3-node private network:
+#   - 2 rippled validators
+#   - 1 rxrpl validator
+#
+# Quorum 2-of-3 keeps consensus rounds short and exposes the rxrpl-as-voter
+# path: any quorum without the rxrpl validation must come from 2 rippled,
+# making missing rxrpl signatures observable in the validation_count.
 #
 # All nodes share a common UNL and genesis ledger.
 # Usage:
@@ -32,15 +36,6 @@ services:
       xrpl-net:
         ipv4_address: 172.30.0.11
 
-  rippled-2:
-    image: ${RIPPLED_IMAGE:-rippleci/rippled:2.3.0}
-    volumes:
-      - ./configs/rippled-2.cfg:/etc/opt/ripple/rippled.cfg:ro
-      - ./configs/validators.txt:/etc/opt/ripple/validators.txt:ro
-    networks:
-      xrpl-net:
-        ipv4_address: 172.30.0.12
-
   # --- rxrpl validators ---
   rxrpl-0:
     build:
@@ -55,17 +50,6 @@ services:
       xrpl-net:
         ipv4_address: 172.30.0.20
 
-  rxrpl-1:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    command: ["run", "--config", "/etc/rxrpl/config.toml"]
-    volumes:
-      - ./configs/rxrpl-1.toml:/etc/rxrpl/config.toml:ro
-    networks:
-      xrpl-net:
-        ipv4_address: 172.30.0.21
-
   # --- test runner ---
   test-runner:
     build:
@@ -74,12 +58,10 @@ services:
     depends_on:
       - rippled-0
       - rippled-1
-      - rippled-2
       - rxrpl-0
-      - rxrpl-1
     environment:
-      RIPPLED_URLS: "http://172.30.0.10:5005,http://172.30.0.11:5005,http://172.30.0.12:5005"
-      RXRPL_URLS: "http://172.30.0.20:5005,http://172.30.0.21:5005"
+      RIPPLED_URLS: "http://172.30.0.10:5005,http://172.30.0.11:5005"
+      RXRPL_URLS: "http://172.30.0.20:5005"
     networks:
       xrpl-net:
         ipv4_address: 172.30.0.100
