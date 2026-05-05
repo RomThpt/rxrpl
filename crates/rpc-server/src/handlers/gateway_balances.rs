@@ -83,14 +83,8 @@ pub async fn gateway_balances(
             .unwrap_or("0");
 
         let balance: f64 = balance_str.parse().unwrap_or(0.0);
-        // RippleState Balance.value in rxrpl: positive when issuer is low and
-        // high holds, negative when issuer is high and low holds. From the
-        // gateway's perspective (gateway is the issuer), gateway_balance
-        // < 0 means the gateway owes. Map storage to that view:
-        //   gateway is high  → balance is negative when low holds → flip sign
-        //                      so that obligations appear negative.
-        // Equivalently: gateway_balance = balance if is_high else -balance.
-        let gateway_balance = if is_high { balance } else { -balance };
+        // From the gateway's perspective, negate if gateway is high account
+        let gateway_balance = if is_high { -balance } else { balance };
 
         // Check if peer is a hotwallet
         let is_hotwallet = hotwallet_ids.iter().any(|hw_id| {
