@@ -312,8 +312,8 @@ fn apply_iou(
             .view
             .read(&dst_trust_key)
             .ok_or(TransactionResult::TecPathDry)?;
-        let mut dst_trust: serde_json::Value = serde_json::from_slice(&dst_trust_bytes)
-            .map_err(|_| TransactionResult::TefInternal)?;
+        let mut dst_trust: serde_json::Value =
+            serde_json::from_slice(&dst_trust_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
         let new_dst_value = adjust_iou_balance(&dst_trust, value, &issuer_id, &dest_id)?;
         dst_trust["Balance"]["value"] = serde_json::Value::String(new_dst_value);

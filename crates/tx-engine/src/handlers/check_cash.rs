@@ -214,9 +214,7 @@ impl Transactor for CheckCashTransactor {
                 .and_then(|acct| acct.get("TransferRate").and_then(|v| v.as_u64()));
             let issuer_is_party = issuer_id == check_src_id || issuer_id == account_id;
             let rate_multiplier = match transfer_rate_raw {
-                Some(r) if r > 1_000_000_000 && !issuer_is_party => {
-                    r as f64 / 1_000_000_000.0
-                }
+                Some(r) if r > 1_000_000_000 && !issuer_is_party => r as f64 / 1_000_000_000.0,
                 _ => 1.0,
             };
             let src_debit_amount = cash_amount * rate_multiplier;

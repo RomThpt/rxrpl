@@ -20,8 +20,8 @@ impl Transactor for AMMClawbackTransactor {
 
         // Holder cannot be the issuer themselves.
         let account_str = helpers::get_account(ctx.tx)?;
-        let holder_str = helpers::get_str_field(ctx.tx, "Holder")
-            .ok_or(TransactionResult::TemMalformed)?;
+        let holder_str =
+            helpers::get_str_field(ctx.tx, "Holder").ok_or(TransactionResult::TemMalformed)?;
         if account_str == holder_str {
             return Err(TransactionResult::TemMalformed);
         }
@@ -98,8 +98,7 @@ impl Transactor for AMMClawbackTransactor {
                 .map_err(|_| TransactionResult::TefInternal)?;
         } else {
             amm["PoolBalance1"] = serde_json::Value::String(new_pool1.to_string());
-            let amm_data =
-                serde_json::to_vec(&amm).map_err(|_| TransactionResult::TefInternal)?;
+            let amm_data = serde_json::to_vec(&amm).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
                 .update(amm_key, amm_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
