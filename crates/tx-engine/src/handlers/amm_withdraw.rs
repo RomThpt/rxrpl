@@ -65,6 +65,21 @@ impl Transactor for AMMWithdrawTransactor {
             return Err(TransactionResult::TecUnfunded);
         }
 
+        // Withdraw-all flags drain the caller's entire LP position. Without
+        // a per-account LP ledger entry we only know about the AMM's
+        // Creator; reject any other caller so an account with no LP tokens
+        // can't drain the pool via tfWithdrawAll / tfOneAssetWithdrawAll.
+        let flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
+        if flags & (TF_WITHDRAW_ALL | TF_ONE_ASSET_WITHDRAW_ALL) != 0 {
+            let creator = amm
+                .get("Creator")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if creator != account_str {
+                return Err(TransactionResult::TecUnfunded);
+            }
+        }
+
         Ok(())
     }
 
