@@ -61,7 +61,7 @@ jobs:
             SELECTOR="-k ${{ inputs.suite }}"
           fi
           docker compose run --rm test-runner \
-            python -m pytest tests/ -v --tb=short --maxfail=999 $SELECTOR \
+            python -m pytest -v --tb=short --maxfail=999 $SELECTOR \
               tests/test_configs.py \
               tests/test_consensus_mixed_voter.py \
               tests/test_flaky_rxrpl.py \
