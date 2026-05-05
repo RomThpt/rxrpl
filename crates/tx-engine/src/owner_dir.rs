@@ -74,6 +74,55 @@ pub fn add_to_owner_dir(
     Ok(())
 }
 
+/// Add an entry's hash to a directory rooted at `root_key`.
+///
+/// Generic over directory kind (book directory, deposit-preauth, etc.).
+/// The created `DirectoryNode` carries the supplied root hash and a fresh
+/// `Indexes` list; subsequent calls append to the existing page.
+pub fn add_to_dir(
+    view: &mut dyn ApplyView,
+    root_key: &Hash256,
+    entry_key: &Hash256,
+) -> Result<(), TransactionResult> {
+    let entry_hex = entry_key.to_string();
+
+    match view.read(root_key) {
+        None => {
+            let dir = serde_json::json!({
+                "LedgerEntryType": "DirectoryNode",
+                "RootIndex": root_key.to_string(),
+                "Indexes": [entry_hex],
+                "Flags": 0,
+            });
+            let bytes = serde_json::to_vec(&dir).map_err(|_| TransactionResult::TefInternal)?;
+            view.insert(*root_key, bytes)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
+        Some(bytes) => {
+            let mut dir: Value =
+                serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+            let indexes = dir
+                .get_mut("Indexes")
+                .and_then(|v| v.as_array_mut())
+                .ok_or(TransactionResult::TefInternal)?;
+            if indexes
+                .iter()
+                .any(|v| v.as_str() == Some(entry_hex.as_str()))
+            {
+                return Ok(());
+            }
+            if indexes.len() >= MAX_ENTRIES_PER_PAGE {
+                return Err(TransactionResult::TecDirFull);
+            }
+            indexes.push(Value::String(entry_hex));
+            let new_bytes = serde_json::to_vec(&dir).map_err(|_| TransactionResult::TefInternal)?;
+            view.update(*root_key, new_bytes)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
+    }
+    Ok(())
+}
+
 /// Remove an entry's hash from the account's owner directory.
 ///
 /// Erases the root page if it becomes empty. Removing a non-existent

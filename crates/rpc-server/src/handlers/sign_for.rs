@@ -76,7 +76,14 @@ pub async fn sign_for(params: Value, _ctx: &Arc<ServerContext>) -> Result<Value,
         }
     }
 
+    // Re-serialize the (now multi-signed) tx_json to a hex blob so the
+    // caller can submit it directly via `submit_multisigned`. Matches
+    // rippled's sign_for response shape.
+    let tx_blob = rxrpl_codec::binary::encode(&tx_json)
+        .map_err(|e| RpcServerError::Internal(format!("encoding error: {e}")))?;
+
     Ok(serde_json::json!({
+        "tx_blob": hex::encode_upper(&tx_blob),
         "tx_json": tx_json,
     }))
 }

@@ -73,12 +73,21 @@ pub async fn account_currencies(
                 .unwrap_or("0")
         };
 
-        // Can receive if peer's limit > 0
-        if peer_limit != "0" {
+        // Per rippled: account can receive a currency when it trusts the
+        // issuer for at least 1 unit (its own limit on the line is non-zero).
+        // It can send a currency when it currently holds a positive balance
+        // or has a non-zero peer limit allowing it to go negative.
+        if my_limit != "0" {
             receive_currencies.insert(currency.to_string());
         }
-        // Can send if our limit > 0
-        if my_limit != "0" {
+
+        let balance_str = entry
+            .get("Balance")
+            .and_then(|v| v.get("value").and_then(|v| v.as_str()))
+            .unwrap_or("0");
+        let balance: f64 = balance_str.parse().unwrap_or(0.0);
+        let signed_balance = if is_high { -balance } else { balance };
+        if signed_balance > 0.0 || peer_limit != "0" {
             send_currencies.insert(currency.to_string());
         }
     }

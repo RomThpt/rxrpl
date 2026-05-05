@@ -70,13 +70,25 @@ impl<'a> Pathfinder<'a> {
     fn find_xrp_to_iou(&mut self) -> Vec<Vec<PathStep>> {
         let mut paths = Vec::new();
 
-        // Direct path: source -> dst_issuer (if they accept the IOU)
-        paths.push(vec![PathStep {
-            account: Some(self.dst_issue.issuer),
-            currency: Some(self.dst_issue.currency),
-            issuer: Some(self.dst_issue.issuer),
-            step_type: PATH_STEP_ACCOUNT | PATH_STEP_CURRENCY | PATH_STEP_ISSUER,
-        }]);
+        // Direct path through the issuer is only viable if the destination
+        // already has a trust line to that issuer for the requested currency
+        // (otherwise the issued IOU has nowhere to land — XRPL doesn't auto-
+        // create trustlines on a path payment).
+        let dest_has_line = self
+            .line_cache
+            .get_lines(self.ledger, &self.destination)
+            .iter()
+            .any(|line| {
+                line.peer == self.dst_issue.issuer && line.currency == self.dst_issue.currency
+            });
+        if dest_has_line {
+            paths.push(vec![PathStep {
+                account: Some(self.dst_issue.issuer),
+                currency: Some(self.dst_issue.currency),
+                issuer: Some(self.dst_issue.issuer),
+                step_type: PATH_STEP_ACCOUNT | PATH_STEP_CURRENCY | PATH_STEP_ISSUER,
+            }]);
+        }
 
         // Via order books
         let book_targets = self.book_index.get_books_for(&Issue::xrp());

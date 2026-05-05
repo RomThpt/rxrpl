@@ -6,7 +6,7 @@ use rxrpl_protocol::keylet;
 use serde_json::Value;
 
 use crate::helpers;
-use crate::owner_dir::add_to_owner_dir;
+use crate::owner_dir::{add_to_dir, add_to_owner_dir};
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 /// OfferCreate transaction handler.
@@ -109,6 +109,16 @@ impl Transactor for OfferCreateTransactor {
 
         add_to_owner_dir(ctx.view, &account_id, &offer_key)?;
 
+        // Link the offer into the order book directory so book_offers can
+        // find it. The book is keyed by (taker_pays, taker_gets) currency
+        // and issuer pairs. XRP is encoded with a zero issuer + zero
+        // currency (20 bytes of 0).
+        let (pays_currency, pays_issuer) = currency_and_issuer(&ctx.tx["TakerPays"]);
+        let (gets_currency, gets_issuer) = currency_and_issuer(&ctx.tx["TakerGets"]);
+        let book_root =
+            keylet::book_dir(&pays_currency, &pays_issuer, &gets_currency, &gets_issuer);
+        add_to_dir(ctx.view, &book_root, &offer_key)?;
+
         // Update account: increment sequence and owner count
         helpers::increment_sequence(&mut acct);
         helpers::adjust_owner_count(&mut acct, 1);
@@ -120,6 +130,38 @@ impl Transactor for OfferCreateTransactor {
 
         Ok(TransactionResult::TesSuccess)
     }
+}
+
+/// Extract a 20-byte currency code and issuer AccountId from a TakerPays /
+/// TakerGets value. XRP — represented as a bare drops string — maps to
+/// all-zero currency and issuer.
+fn currency_and_issuer(amount: &Value) -> ([u8; 20], AccountId) {
+    if amount.is_string() {
+        return ([0u8; 20], AccountId::from([0u8; 20]));
+    }
+    let currency_str = amount
+        .get("currency")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let mut currency = [0u8; 20];
+    if currency_str.len() == 3 {
+        let b = currency_str.as_bytes();
+        currency[12] = b[0];
+        currency[13] = b[1];
+        currency[14] = b[2];
+    } else if currency_str.len() == 40 {
+        if let Ok(decoded) = hex::decode(currency_str) {
+            if decoded.len() == 20 {
+                currency.copy_from_slice(&decoded);
+            }
+        }
+    }
+    let issuer = amount
+        .get("issuer")
+        .and_then(|v| v.as_str())
+        .and_then(|s| decode_account_id(s).ok())
+        .unwrap_or_else(|| AccountId::from([0u8; 20]));
+    (currency, issuer)
 }
 
 /// Permissioned DEX flag on an issuer's AccountRoot.
