@@ -54,10 +54,13 @@ impl Transactor for TicketCreateTransactor {
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
 
         let start_seq = helpers::get_sequence(&acct);
+        // The TicketCreate tx itself consumes `start_seq`; tickets are
+        // reserved starting at `start_seq + 1`, matching rippled.
+        let first_ticket_seq = start_seq + 1;
 
         // Create tickets
         for i in 0..count {
-            let ticket_seq = start_seq + i;
+            let ticket_seq = first_ticket_seq + i;
             let ticket_key = keylet::ticket(&account_id, ticket_seq);
 
             let ticket_obj = serde_json::json!({
@@ -76,8 +79,9 @@ impl Transactor for TicketCreateTransactor {
                 .map_err(|_| TransactionResult::TemMalformed)?;
         }
 
-        // Update account: advance sequence past all tickets, increase owner count
-        let new_seq = start_seq + count;
+        // Update account: advance sequence past the tx itself + all tickets,
+        // increase owner count.
+        let new_seq = first_ticket_seq + count;
         acct["Sequence"] = Value::from(new_seq);
         helpers::adjust_owner_count(&mut acct, count as i32);
 
