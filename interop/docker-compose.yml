@@ -18,6 +18,7 @@ services:
   # --- rippled validators ---
   rippled-0:
     image: ${RIPPLED_IMAGE:-rippleci/rippled:2.3.0}
+    container_name: interop-rippled-0
     volumes:
       - ./configs/rippled-0.cfg:/etc/opt/ripple/rippled.cfg:ro
       - ./configs/validators.txt:/etc/opt/ripple/validators.txt:ro
@@ -29,6 +30,7 @@ services:
 
   rippled-1:
     image: ${RIPPLED_IMAGE:-rippleci/rippled:2.3.0}
+    container_name: interop-rippled-1
     volumes:
       - ./configs/rippled-1.cfg:/etc/opt/ripple/rippled.cfg:ro
       - ./configs/validators.txt:/etc/opt/ripple/validators.txt:ro
@@ -41,6 +43,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+    container_name: interop-rxrpl-0
     command: ["run", "--config", "/etc/rxrpl/config.toml"]
     volumes:
       - ./configs/rxrpl-0.toml:/etc/rxrpl/config.toml:ro
@@ -62,6 +65,16 @@ services:
     environment:
       RIPPLED_URLS: "http://172.30.0.10:5005,http://172.30.0.11:5005"
       RXRPL_URLS: "http://172.30.0.20:5005"
+      # Used by B3 log-scrape and B4/B5 chaos tests. Names match the
+      # `container_name` fields above and are independent of the compose
+      # project name.
+      RIPPLED_CONTAINERS: "interop-rippled-0,interop-rippled-1"
+      RXRPL_CONTAINERS: "interop-rxrpl-0"
+    volumes:
+      # Required by B3 log-scrape and B4/B5 chaos tests so the runner can
+      # invoke `docker logs`, `docker stop`, `docker start` against sibling
+      # containers via the host docker socket.
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       xrpl-net:
         ipv4_address: 172.30.0.100
