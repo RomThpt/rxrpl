@@ -147,6 +147,37 @@ pub fn get_ledger_entry_type_name(code: i32) -> Option<&'static str> {
         .map(|s| s.as_str())
 }
 
+/// Look up a granular permission code by name (PermissionDelegation amendment).
+/// Granular permission values live in 65537..u32::MAX so they cannot collide with
+/// `txType + 1` permission encodings.
+pub fn get_granular_permission_code(name: &str) -> Option<u32> {
+    match name {
+        "TrustlineAuthorize" => Some(65537),
+        "TrustlineFreeze" => Some(65538),
+        "TrustlineUnfreeze" => Some(65539),
+        "AccountDomainSet" => Some(65540),
+        "AccountEmailHashSet" => Some(65541),
+        "AccountMessageKeySet" => Some(65542),
+        "AccountTransferRateSet" => Some(65543),
+        "AccountTickSizeSet" => Some(65544),
+        "PaymentMint" => Some(65545),
+        "PaymentBurn" => Some(65546),
+        "MPTokenIssuanceLock" => Some(65547),
+        "MPTokenIssuanceUnlock" => Some(65548),
+        _ => None,
+    }
+}
+
+/// Resolve a `PermissionValue` JSON string to its UInt32 wire encoding.
+/// Either a granular permission name or a transaction type name (encoded as
+/// `txType + 1`), matching rippled's STParsedJSON behavior.
+pub fn resolve_permission_value(name: &str) -> Option<u32> {
+    if let Some(v) = get_granular_permission_code(name) {
+        return Some(v);
+    }
+    get_transaction_type_code(name).map(|c| (c as u32) + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

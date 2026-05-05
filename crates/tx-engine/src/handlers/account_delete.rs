@@ -51,8 +51,16 @@ impl Transactor for AccountDeleteTransactor {
         let src_obj: Value =
             serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        // Source must have no owned objects
-        let owner_count = helpers::get_owner_count(&src_obj);
+        // Source must have no owned objects. A TicketSequence the tx is using
+        // is consumed by the AccountDelete itself, so its Ticket SLE doesn't
+        // count toward outstanding obligations.
+        let mut owner_count = helpers::get_owner_count(&src_obj);
+        if let Some(ticket_seq) = helpers::get_u32_field(ctx.tx, "TicketSequence") {
+            let ticket_key = keylet::ticket(&src_id, ticket_seq);
+            if ctx.view.exists(&ticket_key) {
+                owner_count = owner_count.saturating_sub(1);
+            }
+        }
         if owner_count > 0 {
             return Err(TransactionResult::TecHasObligations);
         }
@@ -95,6 +103,19 @@ impl Transactor for AccountDeleteTransactor {
 
         let src_key = keylet::account(&src_id);
         let dst_key = keylet::account(&dst_id);
+
+        // If the tx uses a TicketSequence, consume the matching Ticket SLE.
+        // Mirrors rippled's generic ticket consumption path.
+        if let Some(ticket_seq) = helpers::get_u32_field(ctx.tx, "TicketSequence") {
+            let ticket_key = keylet::ticket(&src_id, ticket_seq);
+            if ctx.view.exists(&ticket_key) {
+                crate::owner_dir::remove_from_owner_dir(ctx.view, &src_id, &ticket_key)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+                ctx.view
+                    .erase(&ticket_key)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+            }
+        }
 
         // Read source account
         let src_bytes = ctx

@@ -33,9 +33,30 @@ impl PathRequest {
         let book_index = BookIndex::build(ledger);
         let mut line_cache = RippleLineCache::new();
 
-        // Determine source currencies
+        // Determine source currencies. When a caller supplies entries with no
+        // issuer (a wildcard over issuers, signalled by an all-zero AccountId
+        // on a non-XRP issue), expand each wildcard against the source's
+        // actual trust lines for that currency.
         let src_issues = match &self.source_currencies {
-            Some(currencies) => currencies.clone(),
+            Some(currencies) => {
+                let mut expanded = Vec::new();
+                let mut account_lines: Option<Vec<Issue>> = None;
+                for issue in currencies {
+                    if issue.is_xrp() || issue.issuer != rxrpl_primitives::AccountId([0u8; 20]) {
+                        expanded.push(issue.clone());
+                        continue;
+                    }
+                    let lines = account_lines.get_or_insert_with(|| {
+                        account_currencies(ledger, &self.source, &mut line_cache)
+                    });
+                    for line in lines.iter() {
+                        if line.currency == issue.currency {
+                            expanded.push(line.clone());
+                        }
+                    }
+                }
+                expanded
+            }
             None => {
                 let mut issues = account_currencies(ledger, &self.source, &mut line_cache);
                 // Always include XRP
@@ -151,6 +172,40 @@ pub fn parse_amount_issue(amount: &serde_json::Value) -> Option<Issue> {
     }
 
     let issuer = rxrpl_codec::address::classic::decode_account_id(issuer_str).ok()?;
+    Some(Issue { currency, issuer })
+}
+
+/// Parse a `source_currencies` entry. Unlike `destination_amount`, the issuer
+/// is optional; a currency-only entry is a wildcard over any issuer.
+/// When the issuer is omitted the returned Issue has an empty AccountId
+/// (`[0u8; 20]`), which the request layer treats as "match any issuer for this
+/// currency".
+pub fn parse_source_currency(amount: &serde_json::Value) -> Option<Issue> {
+    if amount.is_string() {
+        return Some(Issue::xrp());
+    }
+
+    let currency_str = amount.get("currency").and_then(|v| v.as_str())?;
+
+    if currency_str == "XRP" {
+        return Some(Issue::xrp());
+    }
+
+    let mut currency = [0u8; 20];
+    if currency_str.len() == 3 {
+        currency[12] = currency_str.as_bytes()[0];
+        currency[13] = currency_str.as_bytes()[1];
+        currency[14] = currency_str.as_bytes()[2];
+    } else if currency_str.len() == 40 {
+        let decoded = hex::decode(currency_str).ok()?;
+        currency.copy_from_slice(&decoded);
+    }
+
+    let issuer = match amount.get("issuer").and_then(|v| v.as_str()) {
+        Some(s) => rxrpl_codec::address::classic::decode_account_id(s).ok()?,
+        None => rxrpl_primitives::AccountId([0u8; 20]),
+    };
+
     Some(Issue { currency, issuer })
 }
 

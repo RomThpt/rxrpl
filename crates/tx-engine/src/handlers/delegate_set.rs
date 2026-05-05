@@ -27,6 +27,18 @@ impl Transactor for DelegateSetTransactor {
             return Err(TransactionResult::TemMalformed);
         }
 
+        // Authorize requires a non-empty Permissions array.
+        if has_authorize {
+            let perms = ctx
+                .tx
+                .get("Permissions")
+                .and_then(|v| v.as_array())
+                .ok_or(TransactionResult::TemMalformed)?;
+            if perms.is_empty() {
+                return Err(TransactionResult::TemMalformed);
+            }
+        }
+
         Ok(())
     }
 

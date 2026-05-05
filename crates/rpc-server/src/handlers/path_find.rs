@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_ledger::Ledger;
-use rxrpl_pathfind::{PathAlternative, PathRequest, parse_amount_issue, path_step_to_json};
+use rxrpl_pathfind::{PathAlternative, PathRequest, parse_source_currency, path_step_to_json};
 
 use crate::context::ServerContext;
 use crate::error::RpcServerError;
@@ -38,7 +38,7 @@ pub fn parse_path_find_params(params: &Value) -> Result<PathFindSubscription, Rp
         if let Some(arr) = params.get("source_currencies").and_then(|v| v.as_array()) {
             let mut issues = Vec::new();
             for item in arr {
-                if let Some(issue) = parse_amount_issue(item) {
+                if let Some(issue) = parse_source_currency(item) {
                     issues.push(issue);
                 }
             }

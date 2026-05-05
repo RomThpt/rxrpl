@@ -7,6 +7,6 @@ pub mod request;
 pub mod strand;
 pub mod types;
 
-pub use request::{PathRequest, parse_amount_issue, path_step_to_json};
+pub use request::{PathRequest, parse_amount_issue, parse_source_currency, path_step_to_json};
 pub use strand::StrandResult;
 pub use types::{Issue, PathAlternative, PathStep};

@@ -49,6 +49,15 @@ fn serialize_issue(data: &mut Vec<u8>, issue: &Value) -> Result<(), TransactionR
             .get("currency")
             .and_then(|v| v.as_str())
             .ok_or(TransactionResult::TemXChainBridge)?;
+        // XRP is represented as {"currency": "XRP"} with no issuer.
+        if cur == "XRP" {
+            if issue.get("issuer").is_some() {
+                return Err(TransactionResult::TemXChainBridge);
+            }
+            data.extend_from_slice(&[0u8; 20]); // currency
+            data.extend_from_slice(&[0u8; 20]); // issuer
+            return Ok(());
+        }
         let iss = issue
             .get("issuer")
             .and_then(|v| v.as_str())

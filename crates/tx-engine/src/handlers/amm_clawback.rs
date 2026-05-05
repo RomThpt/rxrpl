@@ -18,10 +18,24 @@ impl Transactor for AMMClawbackTransactor {
         amm_helpers::validate_asset(asset)?;
         amm_helpers::validate_asset(asset2)?;
 
-        let amount =
-            helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
-        if amount == 0 {
-            return Err(TransactionResult::TemBadAmount);
+        // Holder cannot be the issuer themselves.
+        let account_str = helpers::get_account(ctx.tx)?;
+        let holder_str =
+            helpers::get_str_field(ctx.tx, "Holder").ok_or(TransactionResult::TemMalformed)?;
+        if account_str == holder_str {
+            return Err(TransactionResult::TemMalformed);
+        }
+
+        // Amount is OPTIONAL: when absent the issuer claws back the holder's
+        // entire AMM position. When present it must be a well-formed amount
+        // (XRP drops string or IOU object), strictly positive, and its
+        // currency/issuer must match the `Asset` field.
+        if let Some(amount_field) = ctx.tx.get("Amount") {
+            let amount = amm_helpers::amount_value_drops_or_iou(amount_field)
+                .ok_or(TransactionResult::TemBadAmount)?;
+            if amount == 0 {
+                return Err(TransactionResult::TemBadAmount);
+            }
         }
 
         Ok(())
@@ -29,7 +43,19 @@ impl Transactor for AMMClawbackTransactor {
 
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        helpers::read_account_by_address(ctx.view, account_str)?;
+        let (_, account) = helpers::read_account_by_address(ctx.view, account_str)?;
+
+        // Issuer must have lsfAllowTrustLineClawback set.
+        const LSF_ALLOW_TRUST_LINE_CLAWBACK: u32 = 0x8000_0000;
+        let flags = helpers::get_flags(&account);
+        if flags & LSF_ALLOW_TRUST_LINE_CLAWBACK == 0 {
+            return Err(TransactionResult::TecNoPermission);
+        }
+
+        // Holder account must exist.
+        if let Some(holder_str) = helpers::get_str_field(ctx.tx, "Holder") {
+            helpers::read_account_by_address(ctx.view, holder_str)?;
+        }
 
         let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
         amm_helpers::read_amm(ctx.view, &amm_key)?;
@@ -42,27 +68,44 @@ impl Transactor for AMMClawbackTransactor {
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        let clawback_amount =
-            helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
+        // Amount may be an IOU object (currency/issuer/value), an XRP drops
+        // string, or absent (clawback-all sentinel = u64::MAX).
+        let clawback_amount = match ctx.tx.get("Amount") {
+            Some(amount_field) => amm_helpers::amount_value_drops_or_iou(amount_field)
+                .ok_or(TransactionResult::TemBadAmount)?,
+            None => u64::MAX,
+        };
 
         let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
         let mut amm = amm_helpers::read_amm(ctx.view, &amm_key)?;
 
-        // Determine which pool to claw back from.
-        // The clawback targets PoolBalance1 by default; the issuer specifies
-        // which asset they issued. For simplicity in this MVP, we always claw
-        // back from PoolBalance1, capped at the pool balance.
+        // The clawback drains the issuer's side from the AMM pool. By
+        // convention `PoolBalance1` corresponds to `Asset` (the issuer's
+        // token).
         let pool1 = amm_helpers::get_pool_field(&amm, "PoolBalance1");
+        let pool2 = amm_helpers::get_pool_field(&amm, "PoolBalance2");
         let actual_clawback = clawback_amount.min(pool1);
 
-        amm["PoolBalance1"] = serde_json::Value::String((pool1 - actual_clawback).to_string());
+        let new_pool1 = pool1 - actual_clawback;
 
-        let amm_data = serde_json::to_vec(&amm).map_err(|_| TransactionResult::TefInternal)?;
-        ctx.view
-            .update(amm_key, amm_data)
-            .map_err(|_| TransactionResult::TefInternal)?;
+        // When the issuer's side is fully drained the AMM has no remaining
+        // LP value backing — delete the entry so amm_info reports it gone,
+        // matching rippled's deletion-on-zero-LP behaviour.
+        if new_pool1 == 0 {
+            let _ = pool2;
+            ctx.view
+                .erase(&amm_key)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        } else {
+            amm["PoolBalance1"] = serde_json::Value::String(new_pool1.to_string());
+            let amm_data = serde_json::to_vec(&amm).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(amm_key, amm_data)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
 
-        // Credit clawback amount to issuer's balance and increment sequence
+        // Increment the issuer's sequence. Clawed-back IOU tokens are
+        // redeemed/destroyed, not credited as XRP to the issuer.
         let acct_key = keylet::account(&account_id);
         let acct_bytes = ctx
             .view
@@ -71,8 +114,6 @@ impl Transactor for AMMClawbackTransactor {
         let mut account: serde_json::Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        let balance = helpers::get_balance(&account);
-        helpers::set_balance(&mut account, balance + actual_clawback);
         helpers::increment_sequence(&mut account);
 
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
@@ -171,12 +212,13 @@ mod tests {
         assert_eq!(amm["PoolBalance1"].as_str().unwrap(), "7000000");
         assert_eq!(amm["PoolBalance2"].as_str().unwrap(), "5000000");
 
-        // Verify issuer credited
+        // Issuer's XRP balance is unchanged (clawed IOU tokens are not
+        // credited as drops); only the sequence is bumped.
         let alice_id = decode_account_id(ALICE).unwrap();
         let acct_key = keylet::account(&alice_id);
         let acct_bytes = sandbox.read(&acct_key).unwrap();
         let acct: serde_json::Value = serde_json::from_slice(&acct_bytes).unwrap();
-        assert_eq!(acct["Balance"].as_str().unwrap(), "103000000");
+        assert_eq!(acct["Balance"].as_str().unwrap(), "100000000");
         assert_eq!(acct["Sequence"].as_u64().unwrap(), 2);
     }
 
@@ -207,16 +249,15 @@ mod tests {
         let result = AMMClawbackTransactor.apply(&mut ctx).unwrap();
         assert_eq!(result, TransactionResult::TesSuccess);
 
+        // Pool fully drained on the issuer's side -> AMM entry deleted.
         let amm_key = amm_helpers::compute_amm_key_from_tx(&tx).unwrap();
-        let amm_bytes = sandbox.read(&amm_key).unwrap();
-        let amm: serde_json::Value = serde_json::from_slice(&amm_bytes).unwrap();
-        assert_eq!(amm["PoolBalance1"].as_str().unwrap(), "0");
+        assert!(sandbox.read(&amm_key).is_none());
 
         let alice_id = decode_account_id(ALICE).unwrap();
         let acct_key = keylet::account(&alice_id);
         let acct_bytes = sandbox.read(&acct_key).unwrap();
         let acct: serde_json::Value = serde_json::from_slice(&acct_bytes).unwrap();
-        assert_eq!(acct["Balance"].as_str().unwrap(), "102000000");
+        assert_eq!(acct["Balance"].as_str().unwrap(), "100000000");
     }
 
     #[test]
@@ -226,6 +267,7 @@ mod tests {
             "Account": ALICE,
             "Asset": "XRP",
             "Asset2": {"currency": "USD", "issuer": BOB},
+            "Holder": BOB,
             "Amount": "0",
             "Fee": "12",
         });
@@ -243,12 +285,15 @@ mod tests {
     }
 
     #[test]
-    fn reject_missing_amount() {
+    fn accept_missing_amount_means_clawback_all() {
+        // Per AMMClawback spec, Amount is optional: omitting it claws back
+        // the holder's entire AMM position.
         let tx = serde_json::json!({
             "TransactionType": "AMMClawback",
             "Account": ALICE,
             "Asset": "XRP",
             "Asset2": {"currency": "USD", "issuer": BOB},
+            "Holder": BOB,
             "Fee": "12",
         });
         let rules = Rules::new();
@@ -258,10 +303,7 @@ mod tests {
             rules: &rules,
             fees: &fees,
         };
-        assert_eq!(
-            AMMClawbackTransactor.preflight(&ctx),
-            Err(TransactionResult::TemBadAmount)
-        );
+        assert_eq!(AMMClawbackTransactor.preflight(&ctx), Ok(()));
     }
 
     #[test]
@@ -269,16 +311,32 @@ mod tests {
         let mut ledger = Ledger::genesis();
         let id = decode_account_id(ALICE).unwrap();
         let key = keylet::account(&id);
+        // 0x80000000 = lsfAllowTrustLineClawback so preclaim passes the
+        // permission check and reaches the AMM-existence check.
         let account = serde_json::json!({
             "LedgerEntryType": "AccountRoot",
             "Account": ALICE,
             "Balance": "100000000",
             "Sequence": 1,
             "OwnerCount": 0,
-            "Flags": 0,
+            "Flags": 0x80000000_u32,
         });
         ledger
             .put_state(key, serde_json::to_vec(&account).unwrap())
+            .unwrap();
+
+        let bob_id = decode_account_id(BOB).unwrap();
+        let bob_key = keylet::account(&bob_id);
+        let bob_acct = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": BOB,
+            "Balance": "100000000",
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(bob_key, serde_json::to_vec(&bob_acct).unwrap())
             .unwrap();
 
         let fees = FeeSettings::default();
@@ -289,6 +347,7 @@ mod tests {
             "Account": ALICE,
             "Asset": "XRP",
             "Asset2": {"currency": "USD", "issuer": BOB},
+            "Holder": BOB,
             "Amount": "1000000",
             "Fee": "12",
         });
