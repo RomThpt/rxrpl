@@ -52,6 +52,11 @@ impl Transactor for AMMClawbackTransactor {
             return Err(TransactionResult::TecNoPermission);
         }
 
+        // Holder account must exist.
+        if let Some(holder_str) = helpers::get_str_field(ctx.tx, "Holder") {
+            helpers::read_account_by_address(ctx.view, holder_str)?;
+        }
+
         let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
         amm_helpers::read_amm(ctx.view, &amm_key)?;
 
@@ -319,6 +324,20 @@ mod tests {
         });
         ledger
             .put_state(key, serde_json::to_vec(&account).unwrap())
+            .unwrap();
+
+        let bob_id = decode_account_id(BOB).unwrap();
+        let bob_key = keylet::account(&bob_id);
+        let bob_acct = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": BOB,
+            "Balance": "100000000",
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(bob_key, serde_json::to_vec(&bob_acct).unwrap())
             .unwrap();
 
         let fees = FeeSettings::default();
