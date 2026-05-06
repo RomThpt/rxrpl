@@ -749,6 +749,7 @@ impl Node {
                     &crate::local_manifest_store::PersistedManifest {
                         sequence: seq,
                         raw_bytes_hex: hex::encode(&bytes),
+                        last_rotated_unix: 0,
                     },
                 ) {
                     tracing::warn!(
