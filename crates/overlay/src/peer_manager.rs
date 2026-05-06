@@ -2220,20 +2220,17 @@ impl PeerManager {
         let ledger = match ledger {
             Some(l) => l,
             None => {
-                tracing::debug!("GetLedger from {}: ledger not found", from);
-                let empty_response = proto_convert::encode_ledger_data(
-                    &Hash256::ZERO,
+                // Match rippled behavior: silently drop the request when the
+                // ledger is unknown. Sending an empty TMLedgerData triggers
+                // rippled's `nodes_size() <= 0` rejection (Protocol:WRN
+                // "TMLedgerData: Invalid Ledger/TXset nodes 0") and incurs
+                // peer charges for malformed traffic.
+                tracing::debug!(
+                    "GetLedger from {}: ledger not found (seq={}, hash_len={}); dropping",
+                    from,
                     req_ledger_seq,
-                    req_ledger_type,
-                    vec![],
-                    req_cookie,
+                    req_ledger_hash.len()
                 );
-                if let Some(handle) = self.peer_handles.get(&from) {
-                    let _ = handle.tx.try_send(PeerMessage {
-                        msg_type: MessageType::LedgerData,
-                        payload: empty_response,
-                    });
-                }
                 return;
             }
         };
@@ -2390,19 +2387,22 @@ impl PeerManager {
             .as_ref()
             .and_then(|cache| cache.read().unwrap().get(&set_hash).cloned());
 
-        let nodes = match tx_set {
+        let nodes: Vec<(Vec<u8>, Vec<u8>)> = match tx_set {
             Some(set) => set
                 .txs
                 .iter()
                 .map(|tx_hash| (tx_hash.as_bytes().to_vec(), Vec::new()))
                 .collect(),
             None => {
+                // Match rippled behavior: silently drop the request when the
+                // tx-set is unknown. An empty TMLedgerData would be rejected
+                // by rippled's `nodes_size() <= 0` check.
                 tracing::debug!(
-                    "GetLedger liTS_CANDIDATE from {}: tx-set {} not found",
+                    "GetLedger liTS_CANDIDATE from {}: tx-set {} not found; dropping",
                     from,
                     set_hash
                 );
-                Vec::new()
+                return;
             }
         };
 
@@ -2818,5 +2818,135 @@ mod tests {
         assert_eq!(b.attempt(), 1);
         b.next_delay();
         assert_eq!(b.attempt(), 2);
+    }
+
+    /// LedgerProvider that always returns None — simulates an unknown ledger.
+    struct EmptyLedgerProvider;
+    impl crate::ledger_provider::LedgerProvider for EmptyLedgerProvider {
+        fn get_by_hash(&self, _hash: &Hash256) -> Option<rxrpl_ledger::Ledger> {
+            None
+        }
+        fn get_by_seq(&self, _seq: u32) -> Option<rxrpl_ledger::Ledger> {
+            None
+        }
+        fn latest_closed(&self) -> Option<rxrpl_ledger::Ledger> {
+            None
+        }
+    }
+
+    fn make_test_peer_manager() -> (PeerManager, Hash256, mpsc::Receiver<PeerMessage>) {
+        use crate::identity::NodeIdentity;
+        use crate::peer_set::{PeerInfo, PeerSoftware};
+        use crate::tls;
+        use std::sync::atomic::AtomicU32;
+        use tokio::sync::RwLock;
+
+        let id = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("test-peer-mgr"));
+        let id_arc = Arc::new(id);
+        let config = PeerManagerConfig {
+            listen_port: 0,
+            max_peers: 4,
+            seeds: vec![],
+            fixed_peers: vec![],
+            network_id: 1,
+            tls_server: tls::build_server_config(&id_arc),
+            tls_client: tls::build_client_config(),
+            cluster_enabled: false,
+            cluster_node_name: String::new(),
+            cluster_members: vec![],
+            cluster_broadcast_interval_secs: 5,
+        };
+        let (mut mgr, _cmd_tx, _consensus_rx) = PeerManager::new(
+            id_arc,
+            config,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(RwLock::new(Hash256::ZERO)),
+        );
+
+        let peer_id = Hash256::new([0xAB; 32]);
+        let (tx, rx) = mpsc::channel::<PeerMessage>(8);
+        let info = Arc::new(PeerInfo {
+            node_id: peer_id,
+            address: "127.0.0.1:0".into(),
+            inbound: false,
+            ledger_seq: AtomicU32::new(0),
+            reputation: crate::reputation::PeerReputation::new(),
+            scoring: crate::peer_score::PeerScore::new(),
+            rate_limiter: crate::rate_limiter::PeerRateLimiter::default(),
+            software: PeerSoftware::Unknown,
+        });
+        mgr.peer_handles.insert(
+            peer_id,
+            crate::peer_handle::PeerHandle {
+                node_id: peer_id,
+                info,
+                tx,
+            },
+        );
+        (mgr, peer_id, rx)
+    }
+
+    #[tokio::test]
+    async fn peer_manager_get_ledger_unknown_returns_no_response() {
+        let (mut mgr, peer_id, mut rx) = make_test_peer_manager();
+        mgr.set_ledger_provider(Arc::new(EmptyLedgerProvider));
+
+        // Build a TMGetLedger request for an unknown ledger by seq.
+        let payload = proto_convert::encode_get_ledger(
+            1, // liBASE
+            None, 999_999, // unknown seq
+            42,      // cookie
+        );
+
+        mgr.handle_get_ledger(peer_id, &payload);
+
+        // Allow any spawned task time (none expected); then assert nothing queued.
+        match rx.try_recv() {
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Ok(msg) => panic!(
+                "expected no TMLedgerData on not-found, got msg_type={:?}",
+                msg.msg_type
+            ),
+            Err(e) => panic!("unexpected channel state: {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_manager_get_tx_set_unknown_returns_no_response() {
+        let (mgr, peer_id, mut rx) = make_test_peer_manager();
+        // No tx_sets cache configured -> always miss.
+        let unknown_tx_set = Hash256::new([0xCD; 32]);
+
+        mgr.handle_get_tx_set(peer_id, unknown_tx_set.as_bytes(), 7);
+
+        match rx.try_recv() {
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Ok(msg) => panic!(
+                "expected no TMLedgerData on tx-set not-found, got msg_type={:?}",
+                msg.msg_type
+            ),
+            Err(e) => panic!("unexpected channel state: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn ledger_data_round_trip_preserves_node_payload() {
+        let hash = Hash256::new([0x11; 32]);
+        let payload = vec![0x42u8; 118];
+        let nodes = vec![(vec![0x01u8; 33], payload.clone())];
+
+        let bytes = proto_convert::encode_ledger_data(&hash, 12345, 1, nodes, 99);
+        let decoded = proto_convert::decode_ledger_data(&bytes).expect("decode");
+
+        assert_eq!(decoded.nodes.len(), 1, "nodes_size must be 1, not 0");
+        assert_eq!(
+            decoded.nodes[0].nodedata.as_ref().map(|d| d.len()),
+            Some(118),
+            "nodedata length must round-trip"
+        );
+        assert_eq!(decoded.nodes[0].nodedata.as_deref(), Some(&payload[..]));
+        assert_eq!(decoded.ledger_seq, 12345);
+        assert_eq!(decoded.ledger_info_type, 1);
+        assert_eq!(decoded.request_cookie, Some(99));
     }
 }
