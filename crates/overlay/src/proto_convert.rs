@@ -590,7 +590,7 @@ pub fn encode_ledger_data(
     seq: u32,
     ltype: i32,
     nodes: Vec<(Vec<u8>, Vec<u8>)>,
-    cookie: u64,
+    request_cookie: Option<u32>,
 ) -> Vec<u8> {
     let msg = TmLedgerData {
         ledger_hash: hash.as_bytes().to_vec(),
@@ -603,7 +603,7 @@ pub fn encode_ledger_data(
                 nodedata: Some(data),
             })
             .collect(),
-        request_cookie: Some(cookie as u32),
+        request_cookie,
         error: None,
     };
     msg.encode_to_vec()
@@ -1038,13 +1038,13 @@ mod tests {
             (vec![7, 8], vec![9, 10, 11, 12]),
         ];
 
-        let encoded = encode_ledger_data(&hash, 50, 2, nodes.clone(), 99);
+        let encoded = encode_ledger_data(&hash, 50, 2, nodes.clone(), Some(99));
         let decoded = decode_ledger_data(&encoded).unwrap();
 
         assert_eq!(decoded.ledger_hash, hash.as_bytes());
         assert_eq!(decoded.ledger_seq, 50);
         assert_eq!(decoded.ledger_info_type, 2);
-        assert_eq!(decoded.request_cookie.unwrap_or(0), 99);
+        assert_eq!(decoded.request_cookie, Some(99));
         assert_eq!(decoded.nodes.len(), 2);
         assert_eq!(
             decoded.nodes[0].nodeid.as_deref().unwrap_or(&[]),
@@ -1059,6 +1059,25 @@ mod tests {
             decoded.nodes[1].nodedata.as_deref().unwrap_or(&[]),
             &[9, 10, 11, 12]
         );
+    }
+
+    #[test]
+    fn encode_ledger_data_omits_cookie_when_none() {
+        let hash = Hash256::new([0x0D; 32]);
+        let bytes = encode_ledger_data(&hash, 1, 0, vec![], None);
+        let decoded = decode_ledger_data(&bytes).unwrap();
+        assert!(
+            decoded.request_cookie.is_none(),
+            "request_cookie must be absent on the wire when source request had no cookie"
+        );
+    }
+
+    #[test]
+    fn encode_ledger_data_preserves_explicit_cookie() {
+        let hash = Hash256::new([0x0D; 32]);
+        let bytes = encode_ledger_data(&hash, 1, 0, vec![], Some(42));
+        let decoded = decode_ledger_data(&bytes).unwrap();
+        assert_eq!(decoded.request_cookie, Some(42));
     }
 
     #[test]
