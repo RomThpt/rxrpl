@@ -307,7 +307,8 @@ pub fn adjust_lp_balance(
     let (existing_balance_signed, mut line, exists): (i128, Value, bool) = match view.read(&tl_key)
     {
         Some(b) => {
-            let v: Value = serde_json::from_slice(&b).map_err(|_| TransactionResult::TefInternal)?;
+            let v: Value =
+                serde_json::from_slice(&b).map_err(|_| TransactionResult::TefInternal)?;
             let raw = v
                 .get("Balance")
                 .and_then(|b| b.get("value"))
@@ -382,8 +383,8 @@ pub fn adjust_lp_balance(
         // matching TrustSet's bookkeeping.
         let acct_key = keylet::account(holder);
         if let Some(acct_bytes) = view.read(&acct_key) {
-            let mut acct: Value = serde_json::from_slice(&acct_bytes)
-                .map_err(|_| TransactionResult::TefInternal)?;
+            let mut acct: Value =
+                serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
             crate::helpers::adjust_owner_count(&mut acct, 1);
             let new_bytes =
                 serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
