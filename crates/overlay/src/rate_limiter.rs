@@ -111,6 +111,7 @@ impl TokenBucket {
 
     /// Reset the bucket to full capacity (used in tests).
     #[cfg(test)]
+    #[allow(dead_code)]
     fn reset(&mut self) {
         self.tokens = self.max_tokens;
         self.last_refill = Instant::now();

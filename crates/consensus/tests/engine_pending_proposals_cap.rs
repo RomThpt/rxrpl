@@ -159,15 +159,8 @@ fn pending_proposals_bounded_during_non_establish() {
     // Flood: FLOOD_NODES distinct trusted peers, each pushing one fresh
     // proposal. Without the cap, `pending_proposals` would grow to
     // FLOOD_NODES; with the cap it stops at PENDING_PROPOSALS_MAX = 1024.
-    for i in 1..=FLOOD_NODES {
-        let p = fresh_proposal(
-            all_nodes[i],
-            empty_set.hash,
-            prev,
-            close_time,
-            0,
-            ledger_seq,
-        );
+    for &node in all_nodes.iter().skip(1).take(FLOOD_NODES) {
+        let p = fresh_proposal(node, empty_set.hash, prev, close_time, 0, ledger_seq);
         engine.peer_proposal_at(p, close_time);
     }
 

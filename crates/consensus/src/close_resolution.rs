@@ -21,7 +21,7 @@
 /// longer wired into [`crate::ConsensusEngine`].
 ///
 /// Reference: rippled `src/xrpld/consensus/LedgerTiming.h:30-122`.
-
+//
 /// Valid close-time-resolution bin widths in seconds, finest to coarsest.
 /// Matches rippled `ledgerPossibleTimeResolutions` (LedgerTiming.h:35-41).
 pub const TIME_RESOLUTIONS: [u32; 6] = [10, 20, 30, 60, 90, 120];
@@ -251,11 +251,7 @@ fn nearest_index(resolution: u32) -> usize {
     let mut best_idx = 0;
     let mut best_diff = u32::MAX;
     for (i, &r) in TIME_RESOLUTIONS.iter().enumerate() {
-        let diff = if r >= resolution {
-            r - resolution
-        } else {
-            resolution - r
-        };
+        let diff = r.abs_diff(resolution);
         if diff < best_diff {
             best_diff = diff;
             best_idx = i;

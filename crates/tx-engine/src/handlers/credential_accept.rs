@@ -358,6 +358,6 @@ mod tests {
         let cred_key = keylet::credential(&bob_id, &alice_id, b"KYC");
         let entry_bytes = sandbox.read(&cred_key).unwrap();
         let entry: serde_json::Value = serde_json::from_slice(&entry_bytes).unwrap();
-        assert_eq!(entry["Accepted"].as_bool().unwrap(), true);
+        assert!(entry["Accepted"].as_bool().unwrap());
     }
 }

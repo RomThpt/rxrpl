@@ -189,16 +189,11 @@ impl LedgerSyncer {
     /// Called by `PeerManager::send_get_ledger` to ensure the response handler
     /// can match incoming `LedgerData` to a pending request.
     pub fn register_request(&mut self, seq: u32, hash: Option<Hash256>) {
-        if !self.pending.contains_key(&seq) {
-            self.pending.insert(
-                seq,
-                PendingRequest {
-                    hash,
-                    sent_at: Instant::now(),
-                    retries: 0,
-                },
-            );
-        }
+        self.pending.entry(seq).or_insert_with(|| PendingRequest {
+            hash,
+            sent_at: Instant::now(),
+            retries: 0,
+        });
     }
 
     /// Check if we need to sync based on our sequence vs a peer's sequence.
@@ -218,15 +213,12 @@ impl LedgerSyncer {
         let mut seq = our_seq + 1;
 
         while seq < target_seq && self.pending.len() < self.max_concurrent {
-            if !self.pending.contains_key(&seq) {
-                self.pending.insert(
-                    seq,
-                    PendingRequest {
-                        hash: None,
-                        sent_at: Instant::now(),
-                        retries: 0,
-                    },
-                );
+            if let std::collections::hash_map::Entry::Vacant(e) = self.pending.entry(seq) {
+                e.insert(PendingRequest {
+                    hash: None,
+                    sent_at: Instant::now(),
+                    retries: 0,
+                });
                 requests.push((seq, None));
             }
             seq += 1;

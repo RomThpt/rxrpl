@@ -12,6 +12,7 @@ use crate::error::RpcServerError;
 ///   - A numeric value sets the maximum sequence eligible for deletion.
 ///   - `"always"` removes the advisory limit (same as u32::MAX).
 ///   - `"never"` prevents any automatic deletion (same as 0).
+///
 /// Without parameters: returns the current earliest available ledger
 /// and the advisory delete cursor.
 pub async fn can_delete(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcServerError> {

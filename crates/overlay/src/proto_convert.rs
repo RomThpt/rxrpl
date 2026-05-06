@@ -1005,7 +1005,7 @@ mod tests {
         assert_eq!(decoded.itype, 1);
         assert_eq!(decoded.ledger_seq.unwrap_or(0), 10);
         assert_eq!(decoded.request_cookie.unwrap_or(0), 0);
-        assert!(decoded.ledger_hash.as_ref().map_or(true, |v| v.is_empty()));
+        assert!(decoded.ledger_hash.as_ref().is_none_or(|v| v.is_empty()));
     }
 
     #[test]

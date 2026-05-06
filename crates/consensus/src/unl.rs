@@ -321,7 +321,7 @@ mod tests {
         );
 
         // Add master to trusted
-        unl.update_from_validator_keys(&[master_kp.public_key.clone()]);
+        unl.update_from_validator_keys(std::slice::from_ref(&master_kp.public_key));
 
         // Register ephemeral mapping
         unl.register_ephemeral_key(&master_kp.public_key, &eph_kp.public_key, None);
@@ -344,7 +344,7 @@ mod tests {
             rxrpl_crypto::KeyType::Ed25519,
         );
 
-        unl.update_from_validator_keys(&[kp.public_key.clone()]);
+        unl.update_from_validator_keys(std::slice::from_ref(&kp.public_key));
         let id = NodeId::from_public_key(kp.public_key.as_bytes());
         assert!(unl.is_trusted(&id));
 
@@ -424,7 +424,7 @@ mod tests {
             rxrpl_crypto::KeyType::Ed25519,
         );
 
-        unl.update_from_validator_keys(&[master_kp.public_key.clone()]);
+        unl.update_from_validator_keys(std::slice::from_ref(&master_kp.public_key));
 
         // Register first ephemeral
         unl.register_ephemeral_key(&master_kp.public_key, &eph1.public_key, None);

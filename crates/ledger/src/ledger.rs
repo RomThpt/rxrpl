@@ -126,7 +126,7 @@ impl Ledger {
                 rxrpl_shamap::LeafNode::account_state,
                 Arc::clone(&store),
             )
-            .map_err(|e| LedgerError::SHAMap(e))?;
+            .map_err(LedgerError::SHAMap)?;
             m.set_immutable();
             m
         } else {
@@ -141,7 +141,7 @@ impl Ledger {
                 rxrpl_shamap::LeafNode::transaction_with_meta,
                 Arc::clone(&store),
             )
-            .map_err(|e| LedgerError::SHAMap(e))?;
+            .map_err(LedgerError::SHAMap)?;
             m.set_immutable();
             m
         } else {

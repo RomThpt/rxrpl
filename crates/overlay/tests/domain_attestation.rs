@@ -47,7 +47,7 @@ async fn e2e_valid_attestation_round_trip() {
 
     let fetcher = DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
     let result = fetcher.fetch_and_verify("example.com", &key).await;
-    assert_eq!(result.unwrap(), true);
+    assert!(result.unwrap());
     mock.assert_async().await;
 }
 
@@ -65,7 +65,7 @@ async fn e2e_validator_key_absent_returns_false() {
 
     let fetcher = DomainAttestationFetcher::with_base_url_for_tests(server.base_url()).unwrap();
     let result = fetcher.fetch_and_verify("example.com", &key).await;
-    assert_eq!(result.unwrap(), false);
+    assert!(!result.unwrap());
 }
 
 #[tokio::test]

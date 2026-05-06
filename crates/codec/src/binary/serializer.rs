@@ -10,6 +10,12 @@ pub struct BinarySerializer {
     buf: Vec<u8>,
 }
 
+impl Default for BinarySerializer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BinarySerializer {
     pub fn new() -> Self {
         Self { buf: Vec::new() }

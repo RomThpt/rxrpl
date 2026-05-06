@@ -13,6 +13,7 @@ use crate::types::{Issue, PathRank, PathStep};
 /// the path converts input to output (lower is better, matching the
 /// taker-pays/taker-gets convention). Liquidity reflects the fraction
 /// of the requested amount that can actually be delivered.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_path_ranks(
     paths: &[Vec<PathStep>],
     ledger: &Ledger,
@@ -164,7 +165,7 @@ mod tests {
 
         let paths = vec![vec![]]; // Direct XRP path
 
-        let mut ranks = compute_path_ranks(
+        let ranks = compute_path_ranks(
             &paths,
             &ledger,
             &mut line_cache,

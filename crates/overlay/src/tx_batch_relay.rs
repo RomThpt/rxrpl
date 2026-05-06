@@ -39,6 +39,12 @@ pub struct TxBatchRelay {
     outbound_queue: Mutex<Vec<Hash256>>,
 }
 
+impl Default for TxBatchRelay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TxBatchRelay {
     pub fn new() -> Self {
         let known_cap = NonZeroUsize::new(8192).unwrap();

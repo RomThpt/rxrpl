@@ -66,7 +66,7 @@ mod tests {
         };
 
         assert!(is_grant_authorized(
-            &[grant.clone()],
+            std::slice::from_ref(&grant),
             &authorized_account,
             None
         ));
@@ -84,12 +84,12 @@ mod tests {
         };
 
         assert!(is_grant_authorized(
-            &[grant.clone()],
+            std::slice::from_ref(&grant),
             &account,
             Some(&hook_hash)
         ));
         assert!(!is_grant_authorized(
-            &[grant.clone()],
+            std::slice::from_ref(&grant),
             &account,
             Some(&other_hash)
         ));
@@ -106,9 +106,13 @@ mod tests {
             hook_hash: Some(hash),
         };
 
-        assert!(is_grant_authorized(&[grant.clone()], &account, Some(&hash)));
+        assert!(is_grant_authorized(
+            std::slice::from_ref(&grant),
+            &account,
+            Some(&hash)
+        ));
         assert!(!is_grant_authorized(
-            &[grant.clone()],
+            std::slice::from_ref(&grant),
             &[2u8; 20],
             Some(&hash)
         ));

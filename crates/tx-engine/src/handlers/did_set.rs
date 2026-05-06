@@ -114,7 +114,7 @@ impl Transactor for DIDSetTransactor {
 mod tests {
     use super::*;
     use crate::fees::FeeSettings;
-    use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext};
+    use crate::transactor::{ApplyContext, PreflightContext};
     use crate::view::ledger_view::LedgerView;
     use crate::view::read_view::ReadView;
     use crate::view::sandbox::Sandbox;

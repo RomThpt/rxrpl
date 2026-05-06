@@ -40,17 +40,14 @@ impl InvariantCheck for NoZeroBalanceEntries {
                     continue;
                 }
 
-                let balance_zero = obj
-                    .get("Balance")
-                    .map(|b| Self::is_zero_value(b))
-                    .unwrap_or(false);
+                let balance_zero = obj.get("Balance").map(Self::is_zero_value).unwrap_or(false);
                 let low_zero = obj
                     .get("LowLimit")
-                    .map(|l| Self::is_zero_value(l))
+                    .map(Self::is_zero_value)
                     .unwrap_or(false);
                 let high_zero = obj
                     .get("HighLimit")
-                    .map(|h| Self::is_zero_value(h))
+                    .map(Self::is_zero_value)
                     .unwrap_or(false);
 
                 if balance_zero && low_zero && high_zero {

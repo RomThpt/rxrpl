@@ -954,11 +954,11 @@ impl PeerManager {
                                 header_data,
                             )
                             .filter(|h| {
-                                latest.map_or(true, |known| {
+                                latest.is_none_or(|known| {
                                     (h.sequence as i64 - known as i64).unsigned_abs() <= 1000
                                 })
                             }) {
-                                let is_newer = latest.map_or(true, |known| header.sequence > known);
+                                let is_newer = latest.is_none_or(|known| header.sequence > known);
                                 if is_newer {
                                     tracing::info!(
                                         "received liBASE header for ledger #{} hash={}",
@@ -1247,9 +1247,9 @@ impl PeerManager {
                         );
 
                         // Attempt full signature verification
-                        let manifest_bytes = vl.manifest.as_ref().map(|v| v.as_slice());
-                        let blob_bytes = vl.blob.as_ref().map(|v| v.as_slice());
-                        let sig_bytes = vl.signature.as_ref().map(|v| v.as_slice());
+                        let manifest_bytes = vl.manifest.as_deref();
+                        let blob_bytes = vl.blob.as_deref();
+                        let sig_bytes = vl.signature.as_deref();
 
                         if let (Some(manifest_b), Some(blob_b), Some(sig_b)) =
                             (manifest_bytes, blob_bytes, sig_bytes)
@@ -1892,7 +1892,7 @@ impl PeerManager {
         if num_peers == 0 {
             return;
         }
-        let chunk_size = (node_ids.len() + num_peers - 1) / num_peers;
+        let chunk_size = node_ids.len().div_ceil(num_peers);
         let mut peers_used = 0;
         for (i, node_id) in best.iter().enumerate() {
             let chunk: Vec<Vec<u8>> = node_ids
@@ -2062,7 +2062,7 @@ impl PeerManager {
             return;
         }
 
-        let chunk_size = (content_hashes.len() + num_peers - 1) / num_peers;
+        let chunk_size = content_hashes.len().div_ceil(num_peers);
         let mut peers_used = 0;
         for (i, node_id) in best.iter().enumerate() {
             let chunk: &[Hash256] =

@@ -2807,7 +2807,7 @@ mod tests {
         assert!(engine.converge());
         let ct2 = engine.accepted_close_time().expect("round 2 close time");
         assert!(
-            ct2 >= ct1 + 1,
+            ct2 > ct1,
             "round 2 close_time {} should be strictly greater than round 1 ({})",
             ct2,
             ct1

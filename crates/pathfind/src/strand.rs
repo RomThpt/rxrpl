@@ -31,6 +31,7 @@ struct BookOffer {
 /// Walks each step of the path, computing how much can flow through
 /// offer books and trust lines. Returns the quality and deliverable
 /// amount for the strand.
+#[allow(clippy::too_many_arguments)]
 pub fn simulate_strand(
     ledger: &Ledger,
     line_cache: &mut RippleLineCache,

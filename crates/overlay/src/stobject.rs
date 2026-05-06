@@ -1,11 +1,11 @@
-/// Minimal STObject serializer for rippled wire-compatible validation encoding.
-///
-/// Implements the XRPL binary serialization format for the subset of fields
-/// needed by STValidation objects.
-///
-/// Field IDs and type codes verified against rippled
-/// `include/xrpl/protocol/detail/sfields.macro` and
-/// `include/xrpl/protocol/SField.h`.
+//! Minimal STObject serializer for rippled wire-compatible validation encoding.
+//!
+//! Implements the XRPL binary serialization format for the subset of fields
+//! needed by STValidation objects.
+//!
+//! Field IDs and type codes verified against rippled
+//! `include/xrpl/protocol/detail/sfields.macro` and
+//! `include/xrpl/protocol/SField.h`.
 
 // SField type IDs (STYPE codes from rippled SField.h)
 const STI_UINT32: u8 = 2;

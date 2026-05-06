@@ -346,6 +346,7 @@ pub const CASCADE_DEPTH_DEFAULT: usize = 3;
 /// [`ValidatorListError::DelegateFetchFailed`].
 pub trait DelegateResolver {
     /// Fetch (publisher_manifest_bytes, blobs_v2) for `delegate_pk`.
+    #[allow(clippy::type_complexity)]
     fn resolve(
         &mut self,
         delegate_pk: &PublicKey,
@@ -1044,7 +1045,7 @@ mod tests {
             &mut self,
             delegate_pk: &PublicKey,
         ) -> Result<Option<(Vec<u8>, Vec<BlobV2Wire>)>, ValidatorListError> {
-            Ok(self.entries.get(&delegate_pk.as_bytes().to_vec()).cloned())
+            Ok(self.entries.get(delegate_pk.as_bytes()).cloned())
         }
     }
 

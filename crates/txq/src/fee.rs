@@ -73,7 +73,7 @@ impl FeeMetrics {
     pub fn escalated_fee_drops(&self, base_fee: u64) -> u64 {
         let level = self.escalated_fee_level(BASE_FEE_LEVEL);
         // Round up so the user always pays enough
-        (level * base_fee + 255) / 256
+        (level * base_fee).div_ceil(256)
     }
 }
 

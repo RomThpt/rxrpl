@@ -1030,10 +1030,8 @@ impl Node {
                     } else {
                         None
                     }
-                } else if let Ok(decoded) = hex::decode(trimmed) {
-                    Some(decoded)
                 } else {
-                    None
+                    hex::decode(trimmed).ok()
                 };
                 if let Some(b) = bytes {
                     trusted.insert(NodeId::from_public_key(&b));
@@ -2399,6 +2397,7 @@ impl Node {
     /// updated so subsequent transactions see the new amendment state.
     ///
     /// Returns the updated Rules snapshot.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_amendment_voting(
         ledger: &mut Ledger,
         tx_engine: &TxEngine,

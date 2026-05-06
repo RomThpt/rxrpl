@@ -293,6 +293,7 @@ mod tests {
         assert!(set.is_empty());
     }
 
+    #[allow(dead_code)]
     fn make_peer_with_score(id_byte: u8, score_delta: i32) -> Arc<PeerInfo> {
         let peer = make_peer(id_byte, false);
         if score_delta > 0 {

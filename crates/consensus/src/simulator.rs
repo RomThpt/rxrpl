@@ -231,11 +231,11 @@ impl ConsensusSimulator {
         let unl = TrustedValidatorList::new(trusted);
         let mut engines = Vec::with_capacity(node_count);
 
-        for i in 0..node_count {
+        for &node_id in node_ids.iter().take(node_count) {
             let adapter = SimAdapter::new();
             let engine = ConsensusEngine::new_with_unl(
                 adapter,
-                node_ids[i],
+                node_id,
                 Vec::new(),
                 ConsensusParams::default(),
                 unl.clone(),

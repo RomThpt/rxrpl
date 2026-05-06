@@ -1,7 +1,7 @@
-/// Minimal HTTP/1.1 parser for the XRPL peer protocol upgrade handshake.
-///
-/// Handles formatting and parsing of HTTP upgrade requests/responses
-/// used during the rippled-compatible peer handshake.
+//! Minimal HTTP/1.1 parser for the XRPL peer protocol upgrade handshake.
+//!
+//! Handles formatting and parsing of HTTP upgrade requests/responses
+//! used during the rippled-compatible peer handshake.
 
 /// Format an HTTP/1.1 upgrade request with the given headers.
 pub fn format_http_request(headers: &[(String, String)]) -> Vec<u8> {

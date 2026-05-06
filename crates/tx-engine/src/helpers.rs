@@ -3,7 +3,7 @@ use serde_json::Value;
 
 /// Extract an IOU Amount object from a transaction.
 /// Returns (currency, issuer, value) if the Amount field is an object.
-pub fn get_iou_amount<'a>(tx: &'a Value) -> Option<(&'a str, &'a str, &'a str)> {
+pub fn get_iou_amount(tx: &Value) -> Option<(&str, &str, &str)> {
     let amount = tx.get("Amount")?;
     if !amount.is_object() {
         return None;
