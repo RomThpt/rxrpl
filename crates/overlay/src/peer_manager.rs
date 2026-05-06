@@ -2238,7 +2238,7 @@ impl PeerManager {
         let req_ledger_type = req.itype;
         let req_ledger_hash = req.ledger_hash.unwrap_or_default();
         let req_ledger_seq = req.ledger_seq.unwrap_or(0);
-        let req_cookie = req.request_cookie.unwrap_or(0);
+        let req_cookie: Option<u32> = req.request_cookie.map(|c| c as u32);
 
         // Handle tx-set requests (liTS_CANDIDATE) separately.
         if req_ledger_type == LI_TS_CANDIDATE {
@@ -2440,7 +2440,7 @@ impl PeerManager {
     }
 
     /// Serve a tx-set request from a peer (GetLedger with itype=liTS_CANDIDATE).
-    fn handle_get_tx_set(&self, from: Hash256, hash_bytes: &[u8], cookie: u64) {
+    fn handle_get_tx_set(&self, from: Hash256, hash_bytes: &[u8], cookie: Option<u32>) {
         let set_hash = if hash_bytes.len() >= 32 {
             Hash256::new(hash_bytes[..32].try_into().unwrap_or([0u8; 32]))
         } else {
@@ -2983,7 +2983,7 @@ mod tests {
         // No tx_sets cache configured -> always miss.
         let unknown_tx_set = Hash256::new([0xCD; 32]);
 
-        mgr.handle_get_tx_set(peer_id, unknown_tx_set.as_bytes(), 7);
+        mgr.handle_get_tx_set(peer_id, unknown_tx_set.as_bytes(), Some(7));
 
         match rx.try_recv() {
             Err(mpsc::error::TryRecvError::Empty) => {}
@@ -2995,13 +2995,62 @@ mod tests {
         }
     }
 
+    /// LedgerProvider that always returns the genesis ledger — lets us drive
+    /// the liBASE response path of `handle_get_ledger`.
+    struct GenesisLedgerProvider;
+    impl crate::ledger_provider::LedgerProvider for GenesisLedgerProvider {
+        fn get_by_hash(&self, _hash: &Hash256) -> Option<rxrpl_ledger::Ledger> {
+            Some(rxrpl_ledger::Ledger::genesis())
+        }
+        fn get_by_seq(&self, _seq: u32) -> Option<rxrpl_ledger::Ledger> {
+            Some(rxrpl_ledger::Ledger::genesis())
+        }
+        fn latest_closed(&self) -> Option<rxrpl_ledger::Ledger> {
+            Some(rxrpl_ledger::Ledger::genesis())
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_get_ledger_propagates_cookie_when_present() {
+        let (mut mgr, peer_id, mut rx) = make_test_peer_manager();
+        mgr.set_ledger_provider(Arc::new(GenesisLedgerProvider));
+
+        // liBASE request (itype=0) with explicit cookie 123.
+        let payload = proto_convert::encode_get_ledger(0, None, 0, 123);
+        mgr.handle_get_ledger(peer_id, &payload);
+
+        let msg = rx.try_recv().expect("expected TMLedgerData response");
+        assert_eq!(msg.msg_type, MessageType::LedgerData);
+        let decoded = proto_convert::decode_ledger_data(&msg.payload).expect("decode");
+        assert_eq!(decoded.request_cookie, Some(123));
+    }
+
+    #[tokio::test]
+    async fn handle_get_ledger_omits_cookie_when_absent_in_request() {
+        let (mut mgr, peer_id, mut rx) = make_test_peer_manager();
+        mgr.set_ledger_provider(Arc::new(GenesisLedgerProvider));
+
+        // liBASE request with no cookie (encode_get_ledger drops cookie==0).
+        let payload = proto_convert::encode_get_ledger(0, None, 0, 0);
+        mgr.handle_get_ledger(peer_id, &payload);
+
+        let msg = rx.try_recv().expect("expected TMLedgerData response");
+        assert_eq!(msg.msg_type, MessageType::LedgerData);
+        let decoded = proto_convert::decode_ledger_data(&msg.payload).expect("decode");
+        assert!(
+            decoded.request_cookie.is_none(),
+            "cookie must be absent on wire when source request had no cookie; \
+             rippled drops payload with set-but-unknown cookie via 'Unable to route'"
+        );
+    }
+
     #[test]
     fn ledger_data_round_trip_preserves_node_payload() {
         let hash = Hash256::new([0x11; 32]);
         let payload = vec![0x42u8; 118];
         let nodes = vec![(vec![0x01u8; 33], payload.clone())];
 
-        let bytes = proto_convert::encode_ledger_data(&hash, 12345, 1, nodes, 99);
+        let bytes = proto_convert::encode_ledger_data(&hash, 12345, 1, nodes, Some(99));
         let decoded = proto_convert::decode_ledger_data(&bytes).expect("decode");
 
         assert_eq!(decoded.nodes.len(), 1, "nodes_size must be 1, not 0");
