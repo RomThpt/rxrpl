@@ -105,6 +105,9 @@ pub struct LocalManifestSnapshot {
     pub domain: Option<String>,
     /// Raw signed-STObject bytes (what the manifest RPC returns base64-encoded).
     pub raw_bytes: Vec<u8>,
+    /// UNIX seconds when the persisted manifest was last written. 0 when
+    /// unknown (no on-disk record yet, or freshly built without persistence).
+    pub last_rotated_unix: u64,
 }
 
 impl ServerContext {
