@@ -433,6 +433,7 @@ fn make_ctx_with_local_manifest_snapshot()
         sequence: 7,
         domain: Some("b5.example.com".into()),
         raw_bytes: vec![0xCA, 0xFE, 0xBA, 0xBE],
+        last_rotated_unix: 1_700_000_000,
     };
     let ctx = test_ctx_with_ledger();
     ctx.set_local_manifest(snapshot.clone()).expect("set once");
@@ -496,4 +497,106 @@ async fn manifest_returns_null_when_no_local_manifest_configured() {
         .await
         .unwrap();
     assert!(result["manifest"].is_null());
+}
+
+// -- validator_info tests (B7a) --
+
+#[tokio::test]
+async fn validator_info_returns_not_configured_without_identity() {
+    let ctx = test_ctx_with_ledger();
+    let result = rxrpl_rpc_server::handlers::validator_info(json!({}), &ctx)
+        .await
+        .unwrap();
+    assert_eq!(result["validator"]["status"], "not_configured");
+}
+
+#[tokio::test]
+async fn validator_info_returns_full_snapshot_when_configured() {
+    let (ctx, snapshot) = make_ctx_with_local_manifest_snapshot();
+    let result = rxrpl_rpc_server::handlers::validator_info(json!({}), &ctx)
+        .await
+        .unwrap();
+    let v = &result["validator"];
+    assert_eq!(v["status"], "active");
+    assert_eq!(v["seq"], 7);
+    assert_eq!(v["domain"], "b5.example.com");
+    assert_eq!(v["master_key"], hex::encode(&snapshot.master_public_key));
+    assert_eq!(
+        v["signing_key"],
+        hex::encode(&snapshot.ephemeral_public_key)
+    );
+    assert_ne!(v["master_key"], v["signing_key"]);
+    assert!(v["master_key_n"].as_str().unwrap().starts_with('n'));
+    assert!(v["signing_key_n"].as_str().unwrap().starts_with('n'));
+    assert!(!v["manifest"].as_str().unwrap().is_empty());
+    assert_eq!(v["last_rotated_unix"], 1_700_000_000u64);
+}
+
+#[tokio::test]
+async fn validator_info_does_not_leak_seeds_or_private_keys() {
+    let (ctx, _) = make_ctx_with_local_manifest_snapshot();
+    let result = rxrpl_rpc_server::handlers::validator_info(json!({}), &ctx)
+        .await
+        .unwrap();
+    let serialized = serde_json::to_string(&result).unwrap();
+    for forbidden in [
+        "master_secret",
+        "ephemeral_seed",
+        "private_key",
+        "secret_key",
+        "seed",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "validator_info response leaked '{forbidden}': {serialized}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn validator_info_master_key_n_matches_rippled_base58() {
+    let entropy = rxrpl_codec::address::seed::decode_seed("sneWFZcEqA8TUA5BmJ38xsqaR7dFb")
+        .expect("known-good family seed must decode")
+        .0;
+    let seed = rxrpl_crypto::Seed::from_bytes(entropy);
+    let id = rxrpl_overlay::identity::NodeIdentity::from_seed(&seed);
+    let master_pub = id.public_key_bytes().to_vec();
+
+    let snapshot = rxrpl_rpc_server::LocalManifestSnapshot {
+        master_public_key: master_pub,
+        ephemeral_public_key: vec![0x02; 33],
+        sequence: 1,
+        domain: None,
+        raw_bytes: vec![0xAA],
+        last_rotated_unix: 0,
+    };
+    let ctx = test_ctx_with_ledger();
+    ctx.set_local_manifest(snapshot).unwrap();
+
+    let result = rxrpl_rpc_server::handlers::validator_info(json!({}), &ctx)
+        .await
+        .unwrap();
+    assert_eq!(
+        result["validator"]["master_key_n"],
+        "n9LXMXFTeVL6o9fxdFHfeVZWf6YzWCBzt7YyeK1HV7wZ4ZFRNgUV",
+    );
+}
+
+#[tokio::test]
+async fn validator_info_returns_revoked_when_seq_is_u32_max() {
+    let snapshot = rxrpl_rpc_server::LocalManifestSnapshot {
+        master_public_key: vec![0xED; 33],
+        ephemeral_public_key: vec![0x02; 33],
+        sequence: u32::MAX,
+        domain: None,
+        raw_bytes: vec![0xBB],
+        last_rotated_unix: 0,
+    };
+    let ctx = test_ctx_with_ledger();
+    ctx.set_local_manifest(snapshot).unwrap();
+
+    let result = rxrpl_rpc_server::handlers::validator_info(json!({}), &ctx)
+        .await
+        .unwrap();
+    assert_eq!(result["validator"]["status"], "revoked");
 }

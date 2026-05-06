@@ -12,6 +12,7 @@
 //! a missing/corrupt file degrades to "use config sequence, default 1".
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,11 @@ use serde::{Deserialize, Serialize};
 pub struct PersistedManifest {
     pub sequence: u32,
     pub raw_bytes_hex: String,
+    /// Wall-clock seconds since the UNIX epoch when this manifest was last
+    /// persisted. Used by `validator_info` RPC to surface the rotation age
+    /// to operators. Legacy files without this field load as 0.
+    #[serde(default)]
+    pub last_rotated_unix: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -50,7 +56,14 @@ pub fn save(data_dir: &Path, manifest: &PersistedManifest) -> Result<(), Persist
     std::fs::create_dir_all(data_dir)?;
     let final_path = path_for(data_dir);
     let tmp_path = final_path.with_extension("tmp");
-    let json = serde_json::to_vec_pretty(manifest)?;
+    let stamped = PersistedManifest {
+        last_rotated_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        ..manifest.clone()
+    };
+    let json = serde_json::to_vec_pretty(&stamped)?;
     std::fs::write(&tmp_path, &json)?;
     std::fs::rename(&tmp_path, &final_path)?;
     Ok(())
@@ -72,12 +85,56 @@ mod tests {
         let m = PersistedManifest {
             sequence: 7,
             raw_bytes_hex: "deadbeef".into(),
+            last_rotated_unix: 0,
         };
 
         save(dir.path(), &m).unwrap();
         let loaded = load(dir.path()).unwrap().expect("present after save");
 
-        assert_eq!(loaded, m);
+        assert_eq!(loaded.sequence, m.sequence);
+        assert_eq!(loaded.raw_bytes_hex, m.raw_bytes_hex);
+    }
+
+    #[test]
+    fn persisted_manifest_round_trips_last_rotated() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        save(
+            dir.path(),
+            &PersistedManifest {
+                sequence: 3,
+                raw_bytes_hex: "ab".into(),
+                last_rotated_unix: 0,
+            },
+        )
+        .unwrap();
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let loaded = load(dir.path()).unwrap().unwrap();
+        assert!(
+            loaded.last_rotated_unix >= before && loaded.last_rotated_unix <= after,
+            "last_rotated_unix {} not in [{before}, {after}]",
+            loaded.last_rotated_unix,
+        );
+    }
+
+    #[test]
+    fn persisted_manifest_reads_legacy_file_without_field() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("local_manifest.json"),
+            br#"{"sequence":4,"raw_bytes_hex":"cd"}"#,
+        )
+        .unwrap();
+        let loaded = load(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.sequence, 4);
+        assert_eq!(loaded.raw_bytes_hex, "cd");
+        assert_eq!(loaded.last_rotated_unix, 0);
     }
 
     /// Saving twice replaces atomically (no `.tmp` left behind, no corrupt
@@ -88,15 +145,18 @@ mod tests {
         let m1 = PersistedManifest {
             sequence: 1,
             raw_bytes_hex: "11".into(),
+            last_rotated_unix: 0,
         };
         let m2 = PersistedManifest {
             sequence: 2,
             raw_bytes_hex: "22".into(),
+            last_rotated_unix: 0,
         };
         save(dir.path(), &m1).unwrap();
         save(dir.path(), &m2).unwrap();
         let loaded = load(dir.path()).unwrap().unwrap();
-        assert_eq!(loaded, m2);
+        assert_eq!(loaded.sequence, m2.sequence);
+        assert_eq!(loaded.raw_bytes_hex, m2.raw_bytes_hex);
         assert!(
             !dir.path().join("local_manifest.tmp").exists(),
             "no leftover .tmp"

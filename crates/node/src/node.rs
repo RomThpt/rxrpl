@@ -749,6 +749,7 @@ impl Node {
                     &crate::local_manifest_store::PersistedManifest {
                         sequence: seq,
                         raw_bytes_hex: hex::encode(&bytes),
+                        last_rotated_unix: 0,
                     },
                 ) {
                     tracing::warn!(
@@ -976,12 +977,18 @@ impl Node {
             // the same (master, signing, sequence, domain) tuple.
             match vid.sign_manifest(seq, domain.as_deref()) {
                 Ok(raw_bytes) => {
+                    let last_rotated_unix =
+                        match crate::local_manifest_store::load(&self.config.database.path) {
+                            Ok(Some(p)) => p.last_rotated_unix,
+                            _ => 0,
+                        };
                     let snapshot = rxrpl_rpc_server::LocalManifestSnapshot {
                         master_public_key: vid.master_pubkey().as_bytes().to_vec(),
                         ephemeral_public_key: vid.signing_pubkey().as_bytes().to_vec(),
                         sequence: seq,
                         domain,
                         raw_bytes,
+                        last_rotated_unix,
                     };
                     let _ = ctx.set_local_manifest(snapshot);
                 }
