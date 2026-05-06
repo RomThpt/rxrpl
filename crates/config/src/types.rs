@@ -15,6 +15,8 @@ pub struct NodeConfig {
     #[serde(default)]
     pub validators: ValidatorConfig,
     #[serde(default)]
+    pub validator_identity: ValidatorIdentityConfig,
+    #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
     pub genesis: GenesisConfig,
@@ -260,6 +262,47 @@ impl Default for ValidatorConfig {
             seed_file: None,
         }
     }
+}
+
+/// Validator signing-identity configuration.
+///
+/// Distinct from [`ValidatorConfig`] (which configures the trusted-set / UNL
+/// from the consumer side): this struct holds the **secrets used to sign
+/// our own validations and manifest** when this node operates as a UNL
+/// signatory.
+///
+/// Three mutually-exclusive ways to provide the identity:
+/// 1. `master_secret` + `ephemeral_seed`: explicit two-key form.
+/// 2. `validator_token`: rippled-style base64 bundle (manifest + ephemeral
+///    secret) inline in the config.
+/// 3. `validator_token_path`: filesystem path to a token file (mode 0600).
+///
+/// All fields default to `None`; an empty `ValidatorIdentityConfig` means
+/// the node will operate as a non-signing observer (still useful for
+/// follower mode and RPC-only nodes).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ValidatorIdentityConfig {
+    /// Master seed (long-term key, kept offline ideally). Family seed
+    /// (`sn...`) or 32-char hex.
+    #[serde(default)]
+    pub master_secret: Option<String>,
+    /// Ephemeral signing seed (rotatable). Same encoding as `master_secret`.
+    #[serde(default)]
+    pub ephemeral_seed: Option<String>,
+    /// Inline rippled-style validator token (base64 of JSON
+    /// `{validation_secret_key, manifest}`).
+    #[serde(default)]
+    pub validator_token: Option<String>,
+    /// Path to a file containing a rippled-style validator token.
+    #[serde(default)]
+    pub validator_token_path: Option<PathBuf>,
+    /// Domain claim emitted in the manifest's `sfDomain` field.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// Manifest sequence (monotonic). When rotating signing keys, must be
+    /// strictly greater than any previously-published sequence.
+    #[serde(default)]
+    pub sequence: u32,
 }
 
 /// Network configuration.
