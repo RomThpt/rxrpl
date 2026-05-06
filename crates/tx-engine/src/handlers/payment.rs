@@ -238,6 +238,26 @@ fn apply_iou(
         decode_account_id(issuer).map_err(|_| TransactionResult::TemInvalidAccountId)?;
     let cur_bytes = helpers::currency_to_bytes(currency);
 
+    // GlobalFreeze: when the issuer has lsfGlobalFreeze set, only the issuer
+    // can move its IOU. Non-issuer transfers must fail.
+    // Per rippled's RippleCalc/PathTransfer logic, a strand encountering a
+    // frozen issuer fails with tecPATH_DRY.
+    const LSF_GLOBAL_FREEZE: u32 = 0x00400000;
+    if account_str != issuer {
+        let issuer_key = keylet::account(&issuer_id);
+        if let Some(bytes) = ctx.view.read(&issuer_key) {
+            if let Ok(issuer_acct) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                let issuer_flags = issuer_acct
+                    .get("Flags")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                if issuer_flags & LSF_GLOBAL_FREEZE != 0 {
+                    return Err(TransactionResult::TecPathDry);
+                }
+            }
+        }
+    }
+
     if account_str == issuer {
         // Issuer mints IOUs into holder's trust line.
         let trust_key = keylet::trust_line(&issuer_id, &dest_id, &cur_bytes);

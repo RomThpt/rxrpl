@@ -153,6 +153,11 @@ impl Transactor for AMMCreateTransactor {
             .insert(amm_key, amm_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
+        // Mint the creator's LP-token RippleState. account_lines /
+        // amm_info both expect to find this line on the creator after
+        // AMMCreate.
+        amm_helpers::adjust_lp_balance(ctx.view, &amm_key, &account_id, lp_tokens as i128)?;
+
         // Deduct only XRP legs from the creator's AccountRoot. IOU legs would
         // need a trust-line debit (out of scope until non-issuer IOU sends
         // are implemented in payment.rs).
@@ -288,8 +293,27 @@ mod tests {
         let acct_bytes = sandbox.read(&acct_key).unwrap();
         let acct: serde_json::Value = serde_json::from_slice(&acct_bytes).unwrap();
         assert_eq!(acct["Balance"].as_str().unwrap(), "85000000");
-        assert_eq!(acct["OwnerCount"].as_u64().unwrap(), 1);
+        // OwnerCount: +1 for the AMM SLE, +1 for the creator's LP-token
+        // RippleState that backs `account_lines`.
+        assert_eq!(acct["OwnerCount"].as_u64().unwrap(), 2);
         assert_eq!(acct["Sequence"].as_u64().unwrap(), 2);
+
+        // The creator's LP-token RippleState must exist and carry the
+        // expected balance + LP currency hex (matches amm_info output).
+        let lp_balance = amm_helpers::lp_balance_of(&sandbox, &amm_key, &id);
+        assert_eq!(lp_balance, 5_000_000);
+        let lp_cur_hex = amm_helpers::lp_currency_hex(&amm_key);
+        let pseudo = amm_helpers::amm_pseudo_account(&amm_key);
+        let mut cur_bytes = [0u8; 20];
+        hex::decode_to_slice(&lp_cur_hex, &mut cur_bytes).unwrap();
+        let tl_key = rxrpl_protocol::keylet::trust_line(&id, &pseudo, &cur_bytes);
+        let line_bytes = sandbox.read(&tl_key).unwrap();
+        let line: serde_json::Value = serde_json::from_slice(&line_bytes).unwrap();
+        assert_eq!(line["LedgerEntryType"].as_str().unwrap(), "RippleState");
+        assert_eq!(
+            line["Balance"]["currency"].as_str().unwrap(),
+            lp_cur_hex.as_str()
+        );
     }
 
     #[test]

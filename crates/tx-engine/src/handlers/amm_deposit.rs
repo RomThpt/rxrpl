@@ -92,6 +92,11 @@ impl Transactor for AMMDepositTransactor {
             .update(amm_key, amm_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
+        // Credit the depositor's LP-token RippleState (creates one if missing).
+        if new_lp > 0 {
+            amm_helpers::adjust_lp_balance(ctx.view, &amm_key, &account_id, new_lp as i128)?;
+        }
+
         // Deduct deposits from account
         let acct_key = keylet::account(&account_id);
         let acct_bytes = ctx
@@ -339,6 +344,41 @@ mod tests {
         let bob: serde_json::Value = serde_json::from_slice(&bob_bytes).unwrap();
         assert_eq!(bob["Balance"].as_str().unwrap(), "47000000");
         assert_eq!(bob["Sequence"].as_u64().unwrap(), 2);
+    }
+
+    #[test]
+    fn deposit_mints_lp_ripple_state() {
+        let ledger = setup_with_amm(10_000_000, 5_000_000, 5_000_000);
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "AMMDeposit",
+            "Account": BOB,
+            "Asset": "XRP",
+            "Asset2": {"currency": "USD", "issuer": BOB},
+            "Amount": "2000000",
+            "Amount2": "1000000",
+            "Fee": "12",
+            "Sequence": 1,
+        });
+
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        AMMDepositTransactor.apply(&mut ctx).unwrap();
+
+        let amm_key = amm_helpers::compute_amm_key_from_tx(&tx).unwrap();
+        let bob_id = decode_account_id(BOB).unwrap();
+        // 2_000_000 * 5_000_000 / 10_000_000 = 1_000_000 LP minted.
+        assert_eq!(
+            amm_helpers::lp_balance_of(&sandbox, &amm_key, &bob_id),
+            1_000_000
+        );
     }
 
     #[test]

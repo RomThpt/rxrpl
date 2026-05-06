@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use rxrpl_ledger::Ledger;
+use rxrpl_ledger::sle_codec::decode_state;
 use rxrpl_primitives::{AccountId, Hash256};
 use rxrpl_protocol::keylet;
 
@@ -47,8 +48,10 @@ fn load_trust_lines(ledger: &Ledger, account: &AccountId) -> Vec<PathFindTrustLi
             ledger.get_state(&page_key)
         };
 
+        // Pages are stored as XRPL binary in production but as JSON in
+        // some unit-test fixtures; decode_state handles both.
         let page_json: serde_json::Value = match page_data {
-            Some(data) => match serde_json::from_slice(data) {
+            Some(data) => match decode_state(data) {
                 Ok(v) => v,
                 Err(_) => break,
             },
@@ -64,7 +67,7 @@ fn load_trust_lines(ledger: &Ledger, account: &AccountId) -> Vec<PathFindTrustLi
                 };
 
                 if let Some(entry_data) = ledger.get_state(&idx_hash) {
-                    if let Ok(entry) = serde_json::from_slice::<serde_json::Value>(entry_data) {
+                    if let Ok(entry) = decode_state(entry_data) {
                         if entry.get("LedgerEntryType").and_then(|v| v.as_str())
                             == Some("RippleState")
                         {
