@@ -48,6 +48,12 @@ fn validators_subcommand_default() {
 }
 
 #[test]
+fn validator_info_subcommand_parses() {
+    let cli = parse(&["validator-info"]);
+    assert!(matches!(cli.command, Commands::ValidatorInfo));
+}
+
+#[test]
 fn metrics_subcommand_default_export() {
     let cli = parse(&["metrics"]);
     match cli.command {

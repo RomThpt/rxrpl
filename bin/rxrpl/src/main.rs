@@ -228,6 +228,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Validators { json } => {
             return cmd_validators(&cli.url, json).await;
         }
+        Commands::ValidatorInfo => {
+            return cmd_validator_info(&cli.url).await;
+        }
         Commands::Metrics { endpoint, export } => {
             let target = endpoint.unwrap_or_else(|| default_metrics_url(&cli.url));
             return cmd_metrics(&target, export).await;
@@ -264,6 +267,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         | Commands::AccountDelete { .. }
         | Commands::Peers { .. }
         | Commands::Validators { .. }
+        | Commands::ValidatorInfo
         | Commands::Metrics { .. }
         | Commands::ConfigValidate { .. } => unreachable!(),
     };
@@ -520,6 +524,15 @@ async fn cmd_validators(url: &str, json: bool) -> Result<(), Box<dyn std::error:
     println!("validation_quorum:        {quorum}");
     println!("trusted_validator_keys:   {trusted}");
     println!("publisher_lists:          {publishers}");
+    Ok(())
+}
+
+async fn cmd_validator_info(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let client = rxrpl::ClientBuilder::new(url).build_http()?;
+    let result: Value = client
+        .request("validator_info", serde_json::json!({}))
+        .await?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
 

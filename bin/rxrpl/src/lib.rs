@@ -235,6 +235,9 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Show this node's validator identity (calls `validator_info` RPC).
+    ValidatorInfo,
+
     /// Fetch the Prometheus metrics endpoint.
     Metrics {
         /// Override the metrics URL (defaults to `<--url host>/metrics`).
