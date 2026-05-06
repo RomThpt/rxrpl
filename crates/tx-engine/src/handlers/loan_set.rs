@@ -271,8 +271,7 @@ impl Transactor for LoanSetTransactor {
             periodic_payment
                 .checked_mul(periods as u64)
                 .ok_or(TransactionResult::TefInternal)?
-                .checked_sub(principal)
-                .unwrap_or(0)
+                .saturating_sub(principal)
         } else {
             0
         };

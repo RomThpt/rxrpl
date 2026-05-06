@@ -655,7 +655,7 @@ mod tests {
         }
 
         assert!(manager.is_complete(TEST_SHARD_INDEX));
-        assert_eq!(manager.verify_shard(TEST_SHARD_INDEX).unwrap(), true);
+        assert!(manager.verify_shard(TEST_SHARD_INDEX).unwrap());
     }
 
     #[test]

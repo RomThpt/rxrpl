@@ -584,6 +584,7 @@ impl SHAMap {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_into_existing(
         node: &mut InnerNode,
         branch: u8,
@@ -972,26 +973,20 @@ impl SHAMap {
                         hash: child_hash,
                         node_id: child_node_id,
                     });
-                } else {
-                    if let Some(s) = store.as_ref() {
-                        if let Ok(Some(data)) = s.fetch(&child_hash) {
-                            if let Ok(node) =
-                                crate::node_store::deserialize_node(&data, &child_hash, leaf_ctor)
-                            {
-                                if let SHAMapNode::Inner(child_inner) = &node {
-                                    Self::collect_missing(
-                                        child_inner,
-                                        store,
-                                        leaf_ctor,
-                                        max_count,
-                                        depth + 1,
-                                        child_key,
-                                        out,
-                                    );
-                                }
-                            }
-                        }
-                    }
+                } else if let Some(s) = store.as_ref()
+                    && let Ok(Some(data)) = s.fetch(&child_hash)
+                    && let Ok(SHAMapNode::Inner(child_inner)) =
+                        crate::node_store::deserialize_node(&data, &child_hash, leaf_ctor)
+                {
+                    Self::collect_missing(
+                        &child_inner,
+                        store,
+                        leaf_ctor,
+                        max_count,
+                        depth + 1,
+                        child_key,
+                        out,
+                    );
                 }
             }
 
@@ -1071,7 +1066,7 @@ impl SHAMap {
             .and_then(|bytes| {
                 crate::node_store::deserialize_node(&bytes, &root_hash, leaf_ctor).ok()
             })
-            .map(|node| Arc::new(node))
+            .map(Arc::new)
             .unwrap_or_else(|| Arc::new(SHAMapNode::inner(InnerNode::new())));
 
         Self {
@@ -1696,7 +1691,7 @@ mod tests {
     #[test]
     fn from_leaf_nodes_invalid_key_length_skipped() {
         let nodes = vec![(vec![1, 2, 3], vec![4, 5, 6])]; // key is 3 bytes, not 32
-        let mut result = SHAMap::from_leaf_nodes(&nodes).unwrap();
+        let result = SHAMap::from_leaf_nodes(&nodes).unwrap();
         assert!(result.is_empty()); // Invalid entries are skipped.
     }
 

@@ -64,7 +64,7 @@ impl InvariantCheck for ValidAmm {
                 continue;
             }
 
-            let asset1 = match obj.get("Asset1Amount").and_then(|v| Self::parse_amount(v)) {
+            let asset1 = match obj.get("Asset1Amount").and_then(Self::parse_amount) {
                 Some(v) if v >= 0.0 => v,
                 Some(v) => {
                     return Err(format!("AMM at {key} has negative Asset1Amount: {v}"));
@@ -72,7 +72,7 @@ impl InvariantCheck for ValidAmm {
                 None => continue,
             };
 
-            let asset2 = match obj.get("Asset2Amount").and_then(|v| Self::parse_amount(v)) {
+            let asset2 = match obj.get("Asset2Amount").and_then(Self::parse_amount) {
                 Some(v) if v >= 0.0 => v,
                 Some(v) => {
                     return Err(format!("AMM at {key} has negative Asset2Amount: {v}"));
@@ -80,10 +80,7 @@ impl InvariantCheck for ValidAmm {
                 None => continue,
             };
 
-            let lp_tokens = match obj
-                .get("LPTokenBalance")
-                .and_then(|v| Self::parse_amount(v))
-            {
+            let lp_tokens = match obj.get("LPTokenBalance").and_then(Self::parse_amount) {
                 Some(v) if v >= 0.0 => v,
                 Some(v) => {
                     return Err(format!("AMM at {key} has negative LPTokenBalance: {v}"));

@@ -144,7 +144,7 @@ impl DelegateResolver for MapResolver {
         &mut self,
         delegate_pk: &PublicKey,
     ) -> Result<Option<(Vec<u8>, Vec<BlobV2Wire>)>, ValidatorListError> {
-        Ok(self.entries.get(&delegate_pk.as_bytes().to_vec()).cloned())
+        Ok(self.entries.get(delegate_pk.as_bytes()).cloned())
     }
 }
 
@@ -212,7 +212,7 @@ fn b5_v2_cascade_one_level() {
         1000,
         1,
         &["b5_casc_val_primary"],
-        &[delegate_pk.clone()],
+        std::slice::from_ref(&delegate_pk),
     )];
     let delegate_wire = vec![sign_v2_blob(
         &de,
@@ -256,7 +256,7 @@ fn b5_v2_cascade_depth_exceeded() {
         1000,
         1,
         &[],
-        &[d1p.public_key.clone()],
+        std::slice::from_ref(&d1p.public_key),
     )];
     let d1_wire = vec![sign_v2_blob(
         &d1e,
@@ -264,7 +264,7 @@ fn b5_v2_cascade_depth_exceeded() {
         1000,
         1,
         &[],
-        &[d2p.public_key.clone()],
+        std::slice::from_ref(&d2p.public_key),
     )];
     let d2_wire = vec![sign_v2_blob(
         &d2e,
@@ -272,7 +272,7 @@ fn b5_v2_cascade_depth_exceeded() {
         1000,
         1,
         &[],
-        &[d3p.public_key.clone()],
+        std::slice::from_ref(&d3p.public_key),
     )];
     let d3_wire = vec![sign_v2_blob(
         &d3e,
@@ -280,7 +280,7 @@ fn b5_v2_cascade_depth_exceeded() {
         1000,
         1,
         &[],
-        &[_d4p.public_key.clone()],
+        std::slice::from_ref(&_d4p.public_key),
     )];
     let d4_wire = vec![sign_v2_blob(&d4e, 0, 1000, 1, &[], &[])];
 
@@ -314,7 +314,7 @@ fn b5_cascade_delegate_revoked() {
         1000,
         1,
         &[],
-        &[delegate_pk.clone()],
+        std::slice::from_ref(&delegate_pk),
     )];
 
     let mut store = ManifestStore::new();
@@ -373,7 +373,7 @@ fn b5_cascade_resolver_unknown_delegate() {
         1000,
         1,
         &[],
-        &[dp.public_key.clone()],
+        std::slice::from_ref(&dp.public_key),
     )];
     let mut store = ManifestStore::new();
     let bundle = verify_and_parse_v2(&primary_manifest, &primary_wire, &mut store, 100).unwrap();

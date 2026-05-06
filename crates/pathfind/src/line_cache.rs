@@ -12,6 +12,12 @@ pub struct RippleLineCache {
     cache: HashMap<AccountId, Vec<PathFindTrustLine>>,
 }
 
+impl Default for RippleLineCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RippleLineCache {
     pub fn new() -> Self {
         Self {

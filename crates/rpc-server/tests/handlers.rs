@@ -7,7 +7,7 @@ use rxrpl_ledger::Ledger;
 use rxrpl_protocol::keylet;
 use rxrpl_rpc_server::ServerContext;
 use rxrpl_tx_engine::{FeeSettings, TransactorRegistry, TxEngine};
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::sync::RwLock;
 
 const GENESIS_ADDR: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 /// Top-level node configuration.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct NodeConfig {
     #[serde(default)]
     pub server: ServerConfig,
@@ -22,21 +22,6 @@ pub struct NodeConfig {
     pub cluster: ClusterConfig,
     #[serde(default)]
     pub reporting: ReportingConfig,
-}
-
-impl Default for NodeConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            peer: PeerConfig::default(),
-            database: DatabaseConfig::default(),
-            validators: ValidatorConfig::default(),
-            network: NetworkConfig::default(),
-            genesis: GenesisConfig::default(),
-            cluster: ClusterConfig::default(),
-            reporting: ReportingConfig::default(),
-        }
-    }
 }
 
 /// Reporting mode configuration.
@@ -278,17 +263,11 @@ impl Default for ValidatorConfig {
 }
 
 /// Network configuration.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct NetworkConfig {
     /// Network ID (0 = mainnet, 1 = testnet, etc.).
     #[serde(default)]
     pub network_id: u32,
-}
-
-impl Default for NetworkConfig {
-    fn default() -> Self {
-        Self { network_id: 0 }
-    }
 }
 
 /// Cluster configuration.
@@ -327,15 +306,9 @@ impl Default for ClusterConfig {
 }
 
 /// Genesis ledger configuration.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct GenesisConfig {
     /// Genesis ledger hash (for network identification).
     #[serde(default)]
     pub ledger_hash: Option<String>,
-}
-
-impl Default for GenesisConfig {
-    fn default() -> Self {
-        Self { ledger_hash: None }
-    }
 }

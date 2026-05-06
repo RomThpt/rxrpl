@@ -513,7 +513,7 @@ mod tests {
         let key = ed_key(0x01);
         let hex = hex::encode_upper(key.as_bytes());
         let toml = format!("[[VALIDATORS]]\npublic_key = \"{hex}\"\nnetwork = \"main\"\n");
-        assert_eq!(verify_toml(&toml, &key).unwrap(), true);
+        assert!(verify_toml(&toml, &key).unwrap());
     }
 
     #[test]
@@ -522,7 +522,7 @@ mod tests {
         let other = ed_key(0x02);
         let hex = hex::encode_upper(other.as_bytes());
         let toml = format!("[[VALIDATORS]]\npublic_key = \"{hex}\"\n");
-        assert_eq!(verify_toml(&toml, &key).unwrap(), false);
+        assert!(!verify_toml(&toml, &key).unwrap());
     }
 
     #[test]
@@ -540,7 +540,7 @@ mod tests {
         let key = ed_key(0x01);
         let hex = hex::encode(key.as_bytes());
         let toml = format!("[[VALIDATORS]]\npublic_key = \"{hex}\"\n");
-        assert_eq!(verify_toml(&toml, &key).unwrap(), true);
+        assert!(verify_toml(&toml, &key).unwrap());
     }
 
     #[test]

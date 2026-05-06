@@ -287,7 +287,7 @@ mod tests {
         let entry: serde_json::Value = serde_json::from_slice(&entry_bytes).unwrap();
         assert_eq!(entry["Issuer"].as_str().unwrap(), ALICE);
         assert_eq!(entry["Subject"].as_str().unwrap(), BOB);
-        assert_eq!(entry["Accepted"].as_bool().unwrap(), false);
+        assert!(!entry["Accepted"].as_bool().unwrap());
 
         let account_key = keylet::account(&alice_id);
         let account_bytes = sandbox.read(&account_key).unwrap();

@@ -123,7 +123,9 @@ bar{a=\"x\",b=\"y\"} 3.14
     assert_eq!(arr[1]["name"], "bar");
     assert_eq!(arr[1]["labels"]["a"], "x");
     assert_eq!(arr[1]["labels"]["b"], "y");
-    assert_eq!(arr[1]["value"], 3.14);
+    #[allow(clippy::approx_constant)]
+    let expected = 3.14;
+    assert_eq!(arr[1]["value"], expected);
 }
 
 #[test]

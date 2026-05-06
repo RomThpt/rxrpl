@@ -450,7 +450,7 @@ impl ManifestStore {
         // Handle revocation
         if manifest.is_revoked() {
             // Remove any ephemeral mapping
-            if let Some(ref existing) = self.manifests.get(&master_hex) {
+            if let Some(existing) = self.manifests.get(&master_hex) {
                 if let Some(ref old_eph) = existing.ephemeral_public_key {
                     let old_eph_hex = Self::key_hex(old_eph);
                     self.ephemeral_to_master.remove(&old_eph_hex);

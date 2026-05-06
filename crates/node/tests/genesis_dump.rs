@@ -24,7 +24,7 @@ fn dump_full_genesis() {
 #[test]
 fn dump_ledger_2_with_skip_list() {
     use rxrpl_ledger::Ledger;
-    let mut genesis =
+    let genesis =
         rxrpl_node::Node::genesis_with_funded_account("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")
             .unwrap();
     eprintln!("GENESIS hash={}", genesis.header.hash);

@@ -1,7 +1,7 @@
 use super::definitions::{self, FieldDef};
 
 /// Sort fields by canonical order (type_code, then field_code/nth).
-pub fn sort_fields_canonical(field_names: &mut Vec<String>) {
+pub fn sort_fields_canonical(field_names: &mut [String]) {
     field_names.sort_by(|a, b| {
         let a_def = definitions::get_field(a);
         let b_def = definitions::get_field(b);

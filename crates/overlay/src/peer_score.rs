@@ -363,7 +363,7 @@ mod tests {
         rep.record_ping_latency(100);
         let ls = score.score_latency(&rep);
         assert!(
-            ls >= 75 && ls <= 100,
+            (75..=100).contains(&ls),
             "good latency score should be 75-100, got {}",
             ls
         );

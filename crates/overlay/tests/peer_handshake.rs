@@ -3,12 +3,12 @@
 /// Tests the full flow: TLS connection -> HTTP upgrade -> session cookie ->
 /// protobuf message exchange between two rxrpl nodes.
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use rxrpl_overlay::identity::NodeIdentity;
 use rxrpl_overlay::tls;
-use rxrpl_overlay::{PeerManager, PeerManagerConfig, PeerSet};
+use rxrpl_overlay::{PeerManager, PeerManagerConfig};
 use rxrpl_primitives::Hash256;
 use tokio::sync::RwLock;
 
@@ -45,10 +45,10 @@ async fn two_nodes_handshake_and_exchange() {
     let hash_b = Arc::new(RwLock::new(Hash256::new([0xBB; 32])));
 
     let config_a = make_peer_config(&id_a, 0, vec![]); // port 0 = random
-    let config_b = make_peer_config(&id_b, 0, vec![]);
+    let _config_b = make_peer_config(&id_b, 0, vec![]);
 
     // Start node A
-    let (mgr_a, cmd_tx_a, mut consensus_rx_a) = PeerManager::new(
+    let (_mgr_a0, _cmd_tx_a0, _consensus_rx_a0) = PeerManager::new(
         Arc::new(id_a),
         config_a,
         Arc::clone(&seq_a),
@@ -117,7 +117,7 @@ async fn two_nodes_handshake_and_exchange() {
 async fn tls_session_cookie_deterministic() {
     // Verify that both sides of a TLS connection derive the same session cookie
     let id_server = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("cookie-server"));
-    let id_client = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("cookie-client"));
+    let _id_client = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("cookie-client"));
 
     let server_config = tls::build_server_config(&id_server);
     let client_config = tls::build_client_config();
@@ -145,8 +145,6 @@ async fn tls_session_cookie_deterministic() {
 #[tokio::test]
 async fn http_handshake_with_ledger_hash() {
     use rxrpl_overlay::handshake;
-    use rxrpl_p2p_proto::codec::PeerCodec;
-    use tokio_util::codec::Framed;
 
     let network_id = 42;
     let ledger_hash = Hash256::new([0xDD; 32]);

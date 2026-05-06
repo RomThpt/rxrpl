@@ -62,6 +62,12 @@ pub struct SquelchAction {
     pub duration_secs: u32,
 }
 
+impl Default for SquelchManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SquelchManager {
     pub fn new() -> Self {
         Self {

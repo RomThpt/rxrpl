@@ -225,10 +225,8 @@ mod tests {
     #[test]
     fn preclaim_account_not_door() {
         let ledger = setup_ledger();
-        let view = LedgerView::with_fees(&ledger, FeeSettings::default());
         let rules = Rules::new();
 
-        // Use a third account that is not a door
         let other = "r3kmLJN5D28dHuH8vZNUZpMC43pEHpaocV";
         let other_id = decode_account_id(other).unwrap();
         let mut ledger2 = ledger;
