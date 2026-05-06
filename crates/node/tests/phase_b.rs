@@ -240,7 +240,7 @@ fn check_create_cash_lifecycle() {
         "CheckID": check_id,
         "Amount": "3000000",
         "Fee": "12",
-        "Sequence": 1,
+        "Sequence": 2,
     });
 
     let result2 = Node::apply_transaction(&mut ledger, &engine, &tx2, &fees).unwrap();
@@ -356,7 +356,7 @@ fn payment_channel_create_fund_claim_lifecycle() {
         "Channel": channel_id,
         "Balance": "3000000",
         "Fee": "12",
-        "Sequence": 1,
+        "Sequence": 2,
     });
 
     let result3 = Node::apply_transaction(&mut ledger, &engine, &tx3, &fees).unwrap();

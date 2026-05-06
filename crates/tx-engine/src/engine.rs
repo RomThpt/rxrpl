@@ -14,6 +14,35 @@ use crate::view::ledger_view::LedgerView;
 use crate::view::read_view::ReadView;
 use crate::view::sandbox::Sandbox;
 
+/// Check that the transaction's Sequence matches the AccountRoot's Sequence.
+///
+/// Mirrors rippled's `Transactor::checkSeqProxy`. Returns:
+/// - `tefPAST_SEQ` if the tx Sequence is below the account's (already used)
+/// - `terPRE_SEQ` if the tx Sequence is above the account's (gap, retry later)
+/// - `terNO_ACCOUNT` if the source account does not exist
+fn check_seq_proxy(tx: &Value, view: &dyn ReadView) -> Result<(), TransactionResult> {
+    let account_str = helpers::get_account(tx)?;
+    let account_id =
+        decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let account_key = keylet::account(&account_id);
+    let account_bytes = view
+        .read(&account_key)
+        .ok_or(TransactionResult::TerNoAccount)?;
+    let account_obj: Value =
+        serde_json::from_slice(&account_bytes).map_err(|_| TransactionResult::TefInternal)?;
+
+    let a_seq = helpers::get_sequence(&account_obj);
+    let t_seq = tx.get("Sequence").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+
+    if t_seq == a_seq {
+        Ok(())
+    } else if t_seq > a_seq {
+        Err(TransactionResult::TerPreSeq)
+    } else {
+        Err(TransactionResult::TefPastSeq)
+    }
+}
+
 /// The transaction execution engine.
 ///
 /// Orchestrates the full transaction processing pipeline:
@@ -236,6 +265,16 @@ impl TxEngine {
                         }
                     }
                 }
+            }
+        }
+
+        // Sequence check: rippled Transactor::checkSeqProxy. Tx Sequence must
+        // exactly match the AccountRoot Sequence; otherwise tefPAST_SEQ (used)
+        // or terPRE_SEQ (gap, retry). Skipped for pseudo-transactions and when
+        // a TicketSequence is used (ticket path not yet wired through engine).
+        if !is_pseudo && tx.get("TicketSequence").is_none() {
+            if let Err(result) = check_seq_proxy(tx, &view) {
+                return Ok(result);
             }
         }
 
@@ -550,7 +589,8 @@ mod tests {
         serde_json::json!({
             "TransactionType": tx_type,
             "Account": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
-            "Fee": "10"
+            "Fee": "10",
+            "Sequence": 1,
         })
     }
 
@@ -763,6 +803,7 @@ mod tests {
             "TransactionType": "BatchSubmit",
             "Account": GENESIS,
             "Fee": "10",
+            "Sequence": 1,
             "RawTransactions": [{
                 "RawTransaction": {
                     "InnerTx": {
@@ -806,6 +847,7 @@ mod tests {
             "TransactionType": "BatchSubmit",
             "Account": GENESIS,
             "Fee": "20",
+            "Sequence": 1,
             "RawTransactions": [
                 {
                     "RawTransaction": {
@@ -867,6 +909,7 @@ mod tests {
             "TransactionType": "BatchSubmit",
             "Account": GENESIS,
             "Fee": "20",
+            "Sequence": 1,
             "RawTransactions": [
                 {
                     "RawTransaction": {
@@ -923,5 +966,105 @@ mod tests {
 
         let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
         assert_eq!(result, TransactionResult::TemMalformed);
+    }
+
+    // ---- Sequence check tests (rippled checkSeqProxy parity) ----
+
+    fn payment_engine() -> TxEngine {
+        let mut registry = TransactorRegistry::new();
+        crate::handlers::register_phase_a(&mut registry);
+        TxEngine::new_without_sig_check(registry)
+    }
+
+    fn make_payment(account: &str, dest: &str, amount: &str, sequence: u32) -> Value {
+        serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": account,
+            "Destination": dest,
+            "Amount": amount,
+            "Fee": "10",
+            "Sequence": sequence,
+        })
+    }
+
+    #[test]
+    fn payment_with_past_sequence_returns_tef_past_seq() {
+        let engine = payment_engine();
+        let mut ledger = setup_two_accounts(GENESIS, 1_000_000_000, DEST, 10_000_000);
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+
+        let tx = make_payment(GENESIS, DEST, "5000000", 0);
+
+        let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
+        assert_eq!(result, TransactionResult::TefPastSeq);
+    }
+
+    #[test]
+    fn payment_with_future_sequence_returns_ter_pre_seq() {
+        let engine = payment_engine();
+        let mut ledger = setup_two_accounts(GENESIS, 1_000_000_000, DEST, 10_000_000);
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+
+        let tx = make_payment(GENESIS, DEST, "5000000", 5);
+
+        let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
+        assert_eq!(result, TransactionResult::TerPreSeq);
+    }
+
+    #[test]
+    fn payment_with_correct_sequence_increments_account_seq() {
+        let engine = payment_engine();
+        let mut ledger = setup_two_accounts(GENESIS, 1_000_000_000, DEST, 10_000_000);
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+
+        let tx = make_payment(GENESIS, DEST, "5000000", 1);
+
+        let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        let gid = decode_account_id(GENESIS).unwrap();
+        let gdata = ledger.get_state(&keylet::account(&gid)).unwrap();
+        let gobj: Value = rxrpl_ledger::sle_codec::decode_state(gdata).unwrap();
+        assert_eq!(gobj["Sequence"].as_u64().unwrap(), 2);
+    }
+
+    #[test]
+    fn payment_replay_after_apply_is_rejected_as_past_seq() {
+        let engine = payment_engine();
+        let mut ledger = setup_two_accounts(GENESIS, 1_000_000_000, DEST, 10_000_000);
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+
+        let tx = make_payment(GENESIS, DEST, "50_000_000".replace('_', "").as_str(), 1);
+
+        let first = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
+        assert_eq!(first, TransactionResult::TesSuccess);
+
+        let second = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
+        assert_eq!(second, TransactionResult::TefPastSeq);
+
+        // Destination balance must reflect a single application only.
+        let did = decode_account_id(DEST).unwrap();
+        let ddata = ledger.get_state(&keylet::account(&did)).unwrap();
+        let dobj: Value = rxrpl_ledger::sle_codec::decode_state(ddata).unwrap();
+        let dest_balance: u64 = dobj["Balance"].as_str().unwrap().parse().unwrap();
+        assert_eq!(dest_balance, 10_000_000 + 50_000_000);
+    }
+
+    #[test]
+    fn account_set_sequence_check_applies_to_non_payment_tx() {
+        let engine = test_engine_with(TransactionType::AccountSet, NoopTransactor);
+        let mut ledger = setup_ledger_with_account("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh", 1_000_000);
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+
+        let mut tx = make_tx("AccountSet");
+        tx["Sequence"] = Value::from(99u64);
+
+        let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
+        assert_eq!(result, TransactionResult::TerPreSeq);
     }
 }

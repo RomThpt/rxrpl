@@ -96,7 +96,7 @@ fn full_ledger_lifecycle() {
         "Destination": genesis_addr,
         "Amount": "10000000",
         "Fee": "12",
-        "Sequence": 1,
+        "Sequence": 2,
     });
 
     let result2 = Node::apply_transaction(&mut ledger_3, &engine, &tx2, &fees).unwrap();

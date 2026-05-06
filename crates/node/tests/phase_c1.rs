@@ -123,7 +123,7 @@ fn nftoken_full_lifecycle() {
         "Account": dest_addr,
         "NFTokenSellOffer": offer_id,
         "Fee": "12",
-        "Sequence": 1,
+        "Sequence": 2,
     });
     let result = Node::apply_transaction(&mut ledger, &engine, &accept_tx, &fees).unwrap();
     assert_eq!(result, TransactionResult::TesSuccess);
@@ -150,7 +150,7 @@ fn nftoken_full_lifecycle() {
         "Account": dest_addr,
         "NFTokenID": nftoken_id,
         "Fee": "12",
-        "Sequence": 2,
+        "Sequence": 3,
     });
     let result = Node::apply_transaction(&mut ledger, &engine, &burn_tx, &fees).unwrap();
     assert_eq!(result, TransactionResult::TesSuccess);
@@ -235,7 +235,7 @@ fn clawback_lifecycle() {
         "Account": genesis_addr,
         "SetFlag": 16,
         "Fee": "12",
-        "Sequence": 1,
+        "Sequence": 2,
     });
     let result = Node::apply_transaction(&mut ledger, &engine, &allow_clawback_tx, &fees).unwrap();
     assert_eq!(result, TransactionResult::TesSuccess);
@@ -250,7 +250,7 @@ fn clawback_lifecycle() {
             "value": "1000"
         },
         "Fee": "12",
-        "Sequence": 1,
+        "Sequence": 2,
     });
     let result = Node::apply_transaction(&mut ledger, &engine, &trust_tx, &fees).unwrap();
     assert_eq!(result, TransactionResult::TesSuccess);
@@ -285,7 +285,7 @@ fn clawback_lifecycle() {
             "value": "30"
         },
         "Fee": "12",
-        "Sequence": 2,
+        "Sequence": 3,
     });
     let result = Node::apply_transaction(&mut ledger, &engine, &clawback_tx, &fees).unwrap();
     assert_eq!(result, TransactionResult::TesSuccess);
