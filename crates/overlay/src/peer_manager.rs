@@ -2969,8 +2969,7 @@ mod tests {
         l2.close(l1.header.close_time + 4, 0).unwrap();
 
         struct ChainProvider {
-            by_hash:
-                std::collections::HashMap<Hash256, rxrpl_ledger::Ledger>,
+            by_hash: std::collections::HashMap<Hash256, rxrpl_ledger::Ledger>,
         }
         impl crate::ledger_provider::LedgerProvider for ChainProvider {
             fn get_by_hash(&self, h: &Hash256) -> Option<rxrpl_ledger::Ledger> {
@@ -3007,9 +3006,16 @@ mod tests {
         assert_eq!(reply.objects.len(), 2);
         let first = &reply.objects[0];
         assert_eq!(first.ledger_seq, Some(l1.header.sequence));
-        assert_eq!(first.hash.as_deref(), Some(l1.header.hash.as_bytes().as_slice()));
+        assert_eq!(
+            first.hash.as_deref(),
+            Some(l1.header.hash.as_bytes().as_slice())
+        );
         let data = first.data.as_deref().unwrap();
-        assert_eq!(&data[..4], b"LWR\0", "must lead with HashPrefix::ledgerMaster");
+        assert_eq!(
+            &data[..4],
+            b"LWR\0",
+            "must lead with HashPrefix::ledgerMaster"
+        );
         assert_eq!(data.len(), 4 + 118);
     }
 
