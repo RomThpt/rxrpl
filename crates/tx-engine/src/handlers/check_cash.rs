@@ -2,6 +2,7 @@ use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
 
+use crate::amount_helpers::{compute_holder_balance, compute_new_iou_balance};
 use crate::helpers;
 use crate::owner_dir::remove_from_owner_dir;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -306,47 +307,13 @@ impl Transactor for CheckCashTransactor {
     }
 }
 
-/// Re-use Payment's IOU balance helpers via direct re-implementation.
-/// (Keeps check_cash decoupled from Payment internals.)
-fn compute_holder_balance(
-    trust: &serde_json::Value,
-    issuer_id: &rxrpl_primitives::AccountId,
-    holder_id: &rxrpl_primitives::AccountId,
-) -> f64 {
-    let raw: f64 = trust
-        .get("Balance")
-        .and_then(|b| b.get("value"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("0")
-        .parse()
-        .unwrap_or(0.0);
-    let issuer_is_low = issuer_id.as_bytes() < holder_id.as_bytes();
-    let holder_view = if issuer_is_low { raw } else { -raw };
-    holder_view.max(0.0)
-}
-
 fn adjust_iou_balance(
     trust: &serde_json::Value,
     delta_str: &str,
     issuer_id: &rxrpl_primitives::AccountId,
     holder_id: &rxrpl_primitives::AccountId,
 ) -> Result<String, TransactionResult> {
-    let current: f64 = trust
-        .get("Balance")
-        .and_then(|b| b.get("value"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("0")
-        .parse()
-        .map_err(|_| TransactionResult::TefInternal)?;
-    let delta: f64 = delta_str
-        .parse()
-        .map_err(|_| TransactionResult::TemBadAmount)?;
-    let issuer_is_low = issuer_id.as_bytes() < holder_id.as_bytes();
-    let new = if issuer_is_low {
-        current + delta
-    } else {
-        current - delta
-    };
+    let new = compute_new_iou_balance(trust, delta_str, issuer_id, holder_id)?;
     Ok(if new == new.trunc() {
         format!("{}", new as i64)
     } else {

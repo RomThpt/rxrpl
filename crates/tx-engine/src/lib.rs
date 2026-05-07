@@ -7,6 +7,7 @@
 /// - `ReadView`/`ApplyView`/`Sandbox` for COW state management
 /// - Invariant checks for post-transaction validation
 pub mod amm_helpers;
+pub mod amount_helpers;
 pub mod bridge_helpers;
 pub mod engine;
 pub mod error;

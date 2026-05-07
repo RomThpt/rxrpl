@@ -1,6 +1,7 @@
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::{TransactionResult, keylet};
 
+use crate::amount_helpers::{compute_holder_balance, compute_new_iou_balance};
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 use crate::view::read_view::ReadView;
@@ -374,25 +375,6 @@ fn apply_iou(
     Ok(TransactionResult::TesSuccess)
 }
 
-/// Compute holder's IOU balance against the issuer (always non-negative
-/// from holder's perspective). Returns 0 if holder owes issuer.
-fn compute_holder_balance(
-    trust: &serde_json::Value,
-    issuer_id: &rxrpl_primitives::AccountId,
-    holder_id: &rxrpl_primitives::AccountId,
-) -> f64 {
-    let raw: f64 = trust
-        .get("Balance")
-        .and_then(|b| b.get("value"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("0")
-        .parse()
-        .unwrap_or(0.0);
-    let issuer_is_low = issuer_id.as_bytes() < holder_id.as_bytes();
-    let holder_view = if issuer_is_low { raw } else { -raw };
-    holder_view.max(0.0)
-}
-
 /// Compute the new RippleState Balance.value after an issuer mint.
 ///
 /// RippleState Balance is stored from the low-account perspective.
@@ -407,22 +389,7 @@ fn adjust_iou_balance(
     issuer_id: &rxrpl_primitives::AccountId,
     holder_id: &rxrpl_primitives::AccountId,
 ) -> Result<String, TransactionResult> {
-    let current: f64 = trust
-        .get("Balance")
-        .and_then(|b| b.get("value"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("0")
-        .parse()
-        .map_err(|_| TransactionResult::TefInternal)?;
-    let delta: f64 = delta_str
-        .parse()
-        .map_err(|_| TransactionResult::TemBadAmount)?;
-    let issuer_is_low = issuer_id.as_bytes() < holder_id.as_bytes();
-    let new = if issuer_is_low {
-        current + delta
-    } else {
-        current - delta
-    };
+    let new = compute_new_iou_balance(trust, delta_str, issuer_id, holder_id)?;
     Ok(format_iou_value(new))
 }
 
