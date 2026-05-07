@@ -79,8 +79,12 @@ impl ConsensusAdapter for NetworkConsensusAdapter {
             .unwrap()
             .insert(tx_set.hash, tx_set.clone());
 
-        // Broadcast status change
-        let payload = proto_convert::encode_status_change(ledger_hash, ledger_seq);
+        // Broadcast status change. We advertise the genesis ledger as the
+        // start of our complete range — current rxrpl nodes never prune
+        // history, so any closed ledger from 1..=ledger_seq is locally
+        // available. Without this range, late-joining rippled never asks
+        // rxrpl for ancestors and its `complete_ledgers` stays empty.
+        let payload = proto_convert::encode_status_change(ledger_hash, ledger_seq, 1, ledger_seq);
         self.broadcast(MessageType::StatusChange, payload);
     }
 
