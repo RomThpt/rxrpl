@@ -196,6 +196,16 @@ impl Transactor for PaymentTransactor {
             // (rippled convention; preserves uniqueness of OfferIDs etc. across
             // delete/recreate cycles within the same ledger history).
             let new_seq = ctx.view.seq().max(1);
+            // PreviousTxnID + PreviousTxnLgrSeq are SOE_REQUIRED on rippled's
+            // AccountRoot SOTemplate. Omitting them produced parse-time
+            // throws ("Field 'PreviousTxnID' is required but missing.") on
+            // any rippled peer that received the SLE — most visibly when a
+            // late-joining rippled tried `account_info` against the rxrpl
+            // network and got rpcINTERNAL. We don't yet plumb the apply
+            // tx-hash into ApplyContext, so PreviousTxnID is set to zero;
+            // PreviousTxnLgrSeq is the ledger this tx is being applied in.
+            // Follow-up: thread real tx-hash through `ApplyContext` for full
+            // ancestry traceability.
             let new_account = serde_json::json!({
                 "LedgerEntryType": "AccountRoot",
                 "Account": destination_str,
@@ -203,6 +213,8 @@ impl Transactor for PaymentTransactor {
                 "Sequence": new_seq,
                 "OwnerCount": 0,
                 "Flags": 0,
+                "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+                "PreviousTxnLgrSeq": new_seq,
             });
 
             let dst_data =
