@@ -1291,6 +1291,9 @@ impl Node {
             }
             tracing::info!("validation quorum initialized to {}", initial_quorum);
 
+            let mut pending_validations =
+                crate::pending_validations::PendingValidations::new();
+
             // Checkpoint bootstrap state (consumed once the anchor resolves).
             let mut checkpoint_anchor: Option<crate::checkpoint::CheckpointAnchor> =
                 match starting_ledger_for_loop {
@@ -1698,6 +1701,19 @@ impl Node {
                                     }
                                 }
 
+                                if !anchor_trustable {
+                                    pending_validations.buffer(
+                                        validation,
+                                        std::time::Instant::now(),
+                                    );
+                                    tracing::debug!(
+                                        target: "consensus",
+                                        buffered = pending_validations.len(),
+                                        "validation buffered (signing key not yet trusted)"
+                                    );
+                                    continue;
+                                }
+
                                 // Aggregate validation and check for quorum
                                 if let Some(validated) = val_aggregator.add_validation(validation) {
                                     tracing::info!(
@@ -2059,13 +2075,32 @@ impl Node {
                                             guard.remove(old);
                                         }
                                         if !revoked {
-                                            if let Some(eph) = ephemeral_key {
-                                                guard.insert(eph);
+                                            if let Some(ref eph) = ephemeral_key {
+                                                guard.insert(eph.clone());
                                             }
                                         }
                                     } else if revoked {
                                         if let Some(ref old) = old_ephemeral_key {
                                             guard.remove(old);
+                                        }
+                                    }
+                                }
+
+                                if !revoked {
+                                    if let Some(ref eph) = ephemeral_key {
+                                        let drained = pending_validations
+                                            .drain(eph.as_bytes(), std::time::Instant::now());
+                                        if !drained.is_empty() {
+                                            tracing::debug!(
+                                                target: "consensus",
+                                                ephemeral = %eph,
+                                                replayed = drained.len(),
+                                                replayed_total = pending_validations.replayed_total(),
+                                                "replaying buffered validations after manifest"
+                                            );
+                                            for v in drained {
+                                                let _ = val_aggregator.add_validation(v);
+                                            }
                                         }
                                     }
                                 }
