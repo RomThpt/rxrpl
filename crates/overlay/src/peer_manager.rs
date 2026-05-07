@@ -41,7 +41,7 @@ use crate::validator_list::{self, ValidatorListTracker};
 
 /// TMLedgerInfoType values from rippled.
 const LI_BASE: i32 = 0;
-const _LI_TX_NODE: i32 = 1;
+const LI_TX_NODE: i32 = 1;
 const LI_AS_NODE: i32 = 2;
 const LI_TS_CANDIDATE: i32 = 3;
 
@@ -2032,6 +2032,18 @@ impl PeerManager {
         };
 
         let object_type = msg.r#type.unwrap_or(0);
+        // rippled `TMGetObjectByHash::ObjectType` -> SHAMap leaf wireType:
+        //   otTRANSACTION_NODE (3) -> tx-with-meta leaf, wireType 0x04
+        //   otSTATE_NODE       (4) -> account-state leaf, wireType 0x01
+        //   anything else (otUNKNOWN, otLEDGER, otTRANSACTION) defaults to
+        //   account-state, which is what rxrpl historically returned.
+        // Inner nodes (16*32 bytes) always serialize with wireType 0x02.
+        const OT_TRANSACTION_NODE: i32 = 3;
+        let leaf_wire_type = if object_type == OT_TRANSACTION_NODE {
+            WIRE_TYPE_TX_WITH_META
+        } else {
+            WIRE_TYPE_ACCOUNT_STATE
+        };
         let ledger_seq = msg.seq.unwrap_or(0);
         let ledger_hash_bytes = msg.ledger_hash.as_deref().unwrap_or(&[]);
         let ledger_hash = if ledger_hash_bytes.len() >= 32 {
@@ -2057,12 +2069,16 @@ impl PeerManager {
             let hash = Hash256::new(arr);
 
             match store.fetch(&hash) {
-                Ok(Some(data)) => {
-                    let entry_size = 32 + data.len();
+                Ok(Some(raw)) => {
+                    // Storage holds rxrpl's internal node form (no wireType
+                    // byte); rippled expects TMLedgerNode-style wire form.
+                    // Wrap before sending so peers can decode the response.
+                    let wire = encode_shamap_wire_node(&raw, leaf_wire_type);
+                    let entry_size = 32 + wire.len();
                     if total_size + entry_size > MAX_RESPONSE_SIZE {
                         break;
                     }
-                    found.push((hash, data));
+                    found.push((hash, wire));
                     total_size += entry_size;
                 }
                 Ok(None) => {}
@@ -2230,11 +2246,9 @@ impl PeerManager {
             }
         };
 
-        // TMLedgerInfoType: liBASE=0, liTX_NODE=1, liAS_NODE=2, liTS_CANDIDATE=3
-        const LT_CLOSED: i32 = 1;
-        const LT_VALIDATED: i32 = 2;
-        const LT_HASH: i32 = 3;
-
+        // TMLedgerInfoType (req_ledger_type): liBASE=0, liTX_NODE=1,
+        // liAS_NODE=2, liTS_CANDIDATE=3 (handled via the module-level
+        // LI_* constants).
         let req_ledger_type = req.itype;
         let req_ledger_hash = req.ledger_hash.unwrap_or_default();
         let req_ledger_seq = req.ledger_seq.unwrap_or(0);
@@ -2278,10 +2292,8 @@ impl PeerManager {
         } else {
             provider.latest_closed()
         };
-        // (req_ledger_type tells us *which* SHAMap to serve from — base /
-        // tx_node / as_node — handled below when we serialise the response.)
-        let _ = req_ledger_type;
-        let _ = (LT_CLOSED, LT_VALIDATED, LT_HASH);
+        // req_ledger_type tells us *which* SHAMap to serve from — base /
+        // tx_node / as_node — handled below when we serialise the response.
 
         let ledger = match ledger {
             Some(l) => l,
@@ -2343,7 +2355,6 @@ impl PeerManager {
         // ledger header — that's what the late joiner parses to set up
         // its incremental sync. Returning state-map leaves here makes the
         // late joiner discard the response (header parse fails).
-        const LI_BASE: i32 = 0;
         if request_node_ids.is_empty() && req_ledger_type == LI_BASE {
             let header_bytes = ledger.header.to_raw_bytes();
             nodes.push((vec![], header_bytes));
@@ -2364,20 +2375,31 @@ impl PeerManager {
             return;
         }
 
+        // Pick which SHAMap to serve from based on the requested itype, and
+        // the corresponding leaf wireType byte rippled expects on the wire:
+        //   liAS_NODE   -> account-state map, leaf wireType 0x01
+        //   liTX_NODE   -> transaction map (with metadata), leaf wireType 0x04
+        // Inner nodes always serialize with wireType 0x02 in either tree.
+        // Any unknown itype (after liBASE / liTS_CANDIDATE handled above)
+        // falls back to the state map so legacy peers keep working.
+        let (map, leaf_wire_type) = match req_ledger_type {
+            LI_TX_NODE => (&ledger.tx_map, WIRE_TYPE_TX_WITH_META),
+            _ => (&ledger.state_map, WIRE_TYPE_ACCOUNT_STATE),
+        };
+
         if !request_node_ids.is_empty() {
             // Delta sync: serve specific nodes by walking the SHAMap to the
             // requested (path, depth). Outgoing nodedata is in rippled
             // TMLedgerNode wire format: payload || wireType byte.
             //
             // - Inner (16*32 bytes in storage): payload as-is + wireType 2.
-            // - Leaf account state (key || data in storage): reorder to
-            //   data || key + wireType 1. State map leaves are always
-            //   account-state for liAS_NODE responses.
+            // - Leaf (key || data in storage): reorder to data || key + the
+            //   tree-specific leaf wireType byte selected above.
             for node_id in &request_node_ids {
-                let Some((_content_hash, raw)) = ledger.state_map.node_at(*node_id) else {
+                let Some((_content_hash, raw)) = map.node_at(*node_id) else {
                     continue;
                 };
-                let wire = encode_state_wire_node(&raw);
+                let wire = encode_shamap_wire_node(&raw, leaf_wire_type);
                 let id_bytes = node_id.to_wire_bytes();
                 let entry_size = id_bytes.len() + wire.len();
                 if total_size + entry_size <= MAX_RESPONSE_SIZE {
@@ -2399,12 +2421,12 @@ impl PeerManager {
             }
         } else {
             // Full sync fallback: serve all leaf nodes in rippled wire format
-            // (data || key || wireType=1 for account state).
-            ledger.state_map.for_each(&mut |key, data| {
+            // (data || key || leaf_wire_type) for the selected tree.
+            map.for_each(&mut |key, data| {
                 let mut wire = Vec::with_capacity(data.len() + 33);
                 wire.extend_from_slice(data);
                 wire.extend_from_slice(key.as_bytes());
-                wire.push(1u8); // WIRE_TYPE_ACCOUNT_STATE
+                wire.push(leaf_wire_type);
                 let entry_size = key.as_bytes().len() + wire.len();
                 if total_size + entry_size <= MAX_RESPONSE_SIZE {
                     nodes.push((key.as_bytes().to_vec(), wire));
@@ -2416,9 +2438,10 @@ impl PeerManager {
 
             if truncated {
                 tracing::warn!(
-                    "GetLedger response truncated at 256KB: sent {} state nodes for seq={}",
+                    "GetLedger response truncated at 256KB: sent {} leaf nodes for seq={} itype={}",
                     nodes.len(),
-                    ledger.header.sequence
+                    ledger.header.sequence,
+                    req_ledger_type
                 );
             }
         }
@@ -2687,30 +2710,38 @@ async fn try_accept_inbound(
 /// Convert a SHAMap storage-format node into the rippled `TMLedgerNode.nodedata`
 /// wire format for state-map (account-state) responses.
 ///
+/// rippled SHAMap node wire-type bytes (trailing tag in TMLedgerNode payloads).
+const WIRE_TYPE_INNER: u8 = 2;
+const WIRE_TYPE_ACCOUNT_STATE: u8 = 1;
+const WIRE_TYPE_TX_WITH_META: u8 = 4;
+
+/// Encode a SHAMap node from rxrpl storage form to rippled TMLedgerNode wire form.
+///
 /// Storage layout (rxrpl `node_store::deserialize_node`):
 /// - Inner: `16 * 32 bytes` of child hashes
-/// - Leaf account state: `key[32] || data`
+/// - Leaf:  `key[32] || data` (state-map leaf body is the SLE blob, tx-map
+///   leaf body is the tx blob followed by the metadata blob)
 ///
-/// Wire layout (rippled `SHAMap{Inner,AccountStateLeaf}Node::serializeForWire`):
-/// - Inner: `16 * 32 bytes || 0x02` (wireTypeInner)
-/// - Leaf account state: `data || key[32] || 0x01` (wireTypeAccountState)
+/// Wire layout (rippled `SHAMap*Node::serializeForWire`):
+/// - Inner:        `16 * 32 bytes || 0x02` (wireTypeInner)
+/// - State leaf:   `data || key[32] || 0x01` (wireTypeAccountState)
+/// - Tx-w/meta:    `data || key[32] || 0x04` (wireTypeTransactionWithMeta)
 ///
-/// State maps only contain account-state leaves and inner nodes, so we don't
-/// need to dispatch on tx-leaf wire types here.
-fn encode_state_wire_node(storage: &[u8]) -> Vec<u8> {
+/// `leaf_wire_type` selects the trailing byte for leaves; inner nodes are
+/// always tagged with `WIRE_TYPE_INNER` regardless of the tree.
+fn encode_shamap_wire_node(storage: &[u8], leaf_wire_type: u8) -> Vec<u8> {
     if storage.len() == 16 * 32 {
         let mut wire = Vec::with_capacity(storage.len() + 1);
         wire.extend_from_slice(storage);
-        wire.push(2u8); // wireTypeInner
+        wire.push(WIRE_TYPE_INNER);
         wire
     } else if storage.len() >= 32 {
-        // Leaf: storage = key[32] || data; wire = data || key || 0x01
         let key = &storage[..32];
         let data = &storage[32..];
         let mut wire = Vec::with_capacity(storage.len() + 1);
         wire.extend_from_slice(data);
         wire.extend_from_slice(key);
-        wire.push(1u8); // wireTypeAccountState
+        wire.push(leaf_wire_type);
         wire
     } else {
         // Malformed; emit untyped passthrough so the receiver discards.
@@ -2793,6 +2824,50 @@ impl ReconnectBackoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_shamap_wire_node_inner_appends_inner_tag() {
+        // Inner node storage = 16*32 child hashes; wire = same || 0x02.
+        // Tagged byte must NOT depend on the leaf wireType argument since
+        // inner nodes are tree-agnostic.
+        let storage = vec![0xAB; 16 * 32];
+        let wire = encode_shamap_wire_node(&storage, WIRE_TYPE_ACCOUNT_STATE);
+        assert_eq!(wire.len(), 16 * 32 + 1);
+        assert_eq!(&wire[..16 * 32], &storage[..]);
+        assert_eq!(*wire.last().unwrap(), WIRE_TYPE_INNER);
+
+        let wire_tx = encode_shamap_wire_node(&storage, WIRE_TYPE_TX_WITH_META);
+        assert_eq!(*wire_tx.last().unwrap(), WIRE_TYPE_INNER);
+    }
+
+    #[test]
+    fn encode_shamap_wire_node_account_state_leaf_reorders_and_tags() {
+        // State leaf storage = key[32] || data; wire = data || key || 0x01.
+        let key = vec![0x11u8; 32];
+        let data = vec![0x22u8; 50];
+        let mut storage = Vec::new();
+        storage.extend_from_slice(&key);
+        storage.extend_from_slice(&data);
+        let wire = encode_shamap_wire_node(&storage, WIRE_TYPE_ACCOUNT_STATE);
+        assert_eq!(wire.len(), 32 + 50 + 1);
+        assert_eq!(&wire[..50], &data[..]);
+        assert_eq!(&wire[50..82], &key[..]);
+        assert_eq!(*wire.last().unwrap(), WIRE_TYPE_ACCOUNT_STATE);
+    }
+
+    #[test]
+    fn encode_shamap_wire_node_tx_leaf_uses_with_meta_tag() {
+        // Tx leaf storage = key[32] || data; wire = data || key || 0x04.
+        let key = vec![0x33u8; 32];
+        let data = vec![0x44u8; 80];
+        let mut storage = Vec::new();
+        storage.extend_from_slice(&key);
+        storage.extend_from_slice(&data);
+        let wire = encode_shamap_wire_node(&storage, WIRE_TYPE_TX_WITH_META);
+        assert_eq!(&wire[..80], &data[..]);
+        assert_eq!(&wire[80..112], &key[..]);
+        assert_eq!(*wire.last().unwrap(), WIRE_TYPE_TX_WITH_META);
+    }
 
     #[test]
     fn decode_validator_blob_extracts_count() {

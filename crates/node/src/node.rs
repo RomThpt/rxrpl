@@ -1391,10 +1391,9 @@ impl Node {
                                     let close_time = match consensus.latest_peer_close_time() {
                                         Some(peer_ct) if peer_ct > parent_close_time => peer_ct,
                                         _ => {
-                                            if resolution > 0 {
-                                                (raw_close_time / resolution) * resolution
-                                            } else {
-                                                raw_close_time
+                                            match raw_close_time.checked_div(resolution) {
+                                                Some(q) => q * resolution,
+                                                None => raw_close_time,
                                             }
                                         }
                                     }
@@ -2955,11 +2954,7 @@ impl Node {
 
             if page % 100 == 0 {
                 let elapsed = start.elapsed().as_secs();
-                let rate = if elapsed > 0 {
-                    total as u64 / elapsed
-                } else {
-                    0
-                };
+                let rate = (total as u64).checked_div(elapsed).unwrap_or(0);
                 tracing::info!(
                     "RPC state download: {} entries ({} pages, {} entries/s)",
                     total,
