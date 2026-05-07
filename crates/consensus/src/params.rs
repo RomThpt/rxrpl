@@ -27,7 +27,7 @@ impl Default for ConsensusParams {
             // and #2 would diverge. With both fixes: bootstrap waits for peer,
             // then steady-state runs at rippled's pace so rxrpl can produce
             // validations fast enough for rippled to advance under quorum=2.
-            ledger_idle_interval_ms: 5_000,
+            ledger_idle_interval_ms: 2_000,
             propose_interval_ms: 1_250,
             initial_threshold: 50,
             threshold_increase: 10,

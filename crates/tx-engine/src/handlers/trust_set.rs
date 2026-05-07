@@ -140,12 +140,21 @@ impl Transactor for TrustSetTransactor {
             let mut obj: Value =
                 serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
 
-            // Determine which side we are (low or high)
+            // Determine which side we are (low or high). The `*Limit.issuer`
+            // field is THIS side's address (rippled convention), so rebuild
+            // the limit object with the sender's address rather than copying
+            // the tx's `LimitAmount` (whose `issuer` is the counterparty).
             let is_low = account_id.as_bytes() < issuer_id.as_bytes();
+            let limit_value = limit.get("value").cloned().unwrap_or_else(|| "0".into());
+            let side_limit = serde_json::json!({
+                "currency": limit["currency"],
+                "issuer": account_str,
+                "value": limit_value,
+            });
             if is_low {
-                obj["LowLimit"] = limit.clone();
+                obj["LowLimit"] = side_limit;
             } else {
-                obj["HighLimit"] = limit.clone();
+                obj["HighLimit"] = side_limit;
             }
 
             // Apply quality settings if present
@@ -170,26 +179,80 @@ impl Transactor for TrustSetTransactor {
             ctx.view
                 .update(tl_key, new_bytes)
                 .map_err(|_| TransactionResult::TemMalformed)?;
-        } else {
-            // Create new trust line
-            let is_low = account_id.as_bytes() < issuer_id.as_bytes();
-            let zero_amount = serde_json::json!({
-                "currency": limit["currency"],
-                "issuer": issuer_str,
-                "value": "0"
-            });
 
+            // Auto-clear: if both limits and the balance are zero after this
+            // update, delete the trust line — matches rippled's
+            // `removeEmptyTrustLine` and is required by the
+            // `NoZeroBalanceEntries` invariant.
+            let lo: f64 = obj
+                .get("LowLimit")
+                .and_then(|o| o.get("value"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0.0);
+            let hi: f64 = obj
+                .get("HighLimit")
+                .and_then(|o| o.get("value"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0.0);
+            let bal: f64 = obj
+                .get("Balance")
+                .and_then(|b| b.get("value"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0.0);
+            if lo == 0.0 && hi == 0.0 && bal == 0.0 {
+                crate::owner_dir::remove_from_owner_dir(ctx.view, &account_id, &tl_key)?;
+                crate::owner_dir::remove_from_owner_dir(ctx.view, &issuer_id, &tl_key)?;
+                let _ = ctx.view.erase(&tl_key);
+                for endpoint in [&account_id, &issuer_id].iter() {
+                    let acct_key = keylet::account(endpoint);
+                    if let Some(b) = ctx.view.read(&acct_key) {
+                        if let Ok(mut acct) = serde_json::from_slice::<Value>(&b) {
+                            helpers::adjust_owner_count(&mut acct, -1);
+                            if let Ok(nb) = serde_json::to_vec(&acct) {
+                                let _ = ctx.view.update(acct_key, nb);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Create new trust line.
+            //
+            // RippleState convention (matches rippled): each side's `*Limit`
+            // object carries that side's address as `issuer`, not the
+            // counterparty's. `Balance.issuer` is the low account by
+            // convention; sign of the balance encodes which side owes whom.
+            let is_low = account_id.as_bytes() < issuer_id.as_bytes();
+            let low_str = if is_low { account_str } else { issuer_str };
+            let acct_value = limit.get("value").cloned().unwrap_or_else(|| "0".into());
+            let currency = limit["currency"].clone();
+            let acct_limit = serde_json::json!({
+                "currency": currency,
+                "issuer": account_str,
+                "value": acct_value,
+            });
+            let peer_limit = serde_json::json!({
+                "currency": currency,
+                "issuer": issuer_str,
+                "value": "0",
+            });
             let (low_limit, high_limit) = if is_low {
-                (limit.clone(), zero_amount)
+                (acct_limit, peer_limit)
             } else {
-                (zero_amount, limit.clone())
+                (peer_limit, acct_limit)
             };
 
             let tl_obj = serde_json::json!({
                 "LedgerEntryType": "RippleState",
                 "Balance": {
-                    "currency": limit["currency"],
-                    "issuer": issuer_str,
+                    "currency": currency,
+                    "issuer": low_str,
                     "value": "0"
                 },
                 "LowLimit": low_limit,

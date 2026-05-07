@@ -90,6 +90,19 @@ impl Transactor for OfferCreateTransactor {
 
         let sequence = helpers::get_sequence(&acct);
 
+        let (pays_currency, pays_issuer) = currency_and_issuer(&ctx.tx["TakerPays"]);
+        let (gets_currency, gets_issuer) = currency_and_issuer(&ctx.tx["TakerGets"]);
+
+        // Sweep unfunded crossing offers from the inverse book. Matching the
+        // taker side of this new offer means existing offers where someone
+        // pays our `TakerGets` to receive our `TakerPays` — i.e. the book
+        // keyed by `(gets, pays)`. Any such offer whose owner can no longer
+        // deliver its TakerGets is removed before we place the new offer
+        // (rippled's `dirAdvance` skips and deletes funded-failed offers).
+        let inverse_book =
+            keylet::book_dir(&gets_currency, &gets_issuer, &pays_currency, &pays_issuer);
+        sweep_unfunded_offers(ctx, &inverse_book)?;
+
         // Create the offer ledger entry
         let offer_key = keylet::offer(&account_id, sequence);
         let offer_obj = serde_json::json!({
@@ -113,8 +126,6 @@ impl Transactor for OfferCreateTransactor {
         // find it. The book is keyed by (taker_pays, taker_gets) currency
         // and issuer pairs. XRP is encoded with a zero issuer + zero
         // currency (20 bytes of 0).
-        let (pays_currency, pays_issuer) = currency_and_issuer(&ctx.tx["TakerPays"]);
-        let (gets_currency, gets_issuer) = currency_and_issuer(&ctx.tx["TakerGets"]);
         let book_root =
             keylet::book_dir(&pays_currency, &pays_issuer, &gets_currency, &gets_issuer);
         add_to_dir(ctx.view, &book_root, &offer_key)?;
@@ -242,4 +253,212 @@ fn check_permissioned_asset(
 
     // No valid credential found in any domain
     Err(TransactionResult::TecNoPermission)
+}
+
+/// Walk the order-book directory and remove offers whose owner can no longer
+/// deliver `TakerGets`. Matches rippled's behavior in `BookOfferCrossing` /
+/// `dirAdvance` where exhausted/unfunded offers are reaped before crossing
+/// proceeds. Cleanup includes: removing the offer index from the book dir
+/// AND from the owner's owner_dir, decrementing the owner's `OwnerCount`,
+/// and erasing the SLE.
+fn sweep_unfunded_offers(
+    ctx: &mut ApplyContext<'_>,
+    book_root: &rxrpl_primitives::Hash256,
+) -> Result<(), TransactionResult> {
+    // Collect candidates first (avoid mutating while iterating dir pages).
+    let mut candidates: Vec<rxrpl_primitives::Hash256> = Vec::new();
+    let mut page = 0u64;
+    loop {
+        let page_key = if page == 0 {
+            *book_root
+        } else {
+            keylet::dir_node(book_root, page)
+        };
+        let page_bytes = match ctx.view.read(&page_key) {
+            Some(b) => b,
+            None => break,
+        };
+        let page_json: Value = match serde_json::from_slice(&page_bytes) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        if let Some(indexes) = page_json.get("Indexes").and_then(|v| v.as_array()) {
+            for idx_val in indexes {
+                if let Some(s) = idx_val.as_str() {
+                    if let Ok(h) = s.parse::<rxrpl_primitives::Hash256>() {
+                        candidates.push(h);
+                    }
+                }
+            }
+        }
+        match page_json.get("IndexNext").and_then(|v| v.as_u64()) {
+            Some(next) if next != 0 => page = next,
+            _ => break,
+        }
+    }
+
+    for offer_key in candidates {
+        let entry_bytes = match ctx.view.read(&offer_key) {
+            Some(b) => b,
+            None => continue,
+        };
+        let entry: Value = match serde_json::from_slice(&entry_bytes) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if entry.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+            continue;
+        }
+        let owner_str = match entry.get("Account").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let owner_id = match decode_account_id(owner_str) {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        let gets = entry.get("TakerGets").unwrap_or(&Value::Null);
+
+        let funded = is_offer_funded(ctx, &owner_id, gets);
+        if funded {
+            continue;
+        }
+
+        // Unfunded: reap from book dir, owner dir, decrement owner count,
+        // erase the SLE.
+        crate::owner_dir::remove_from_owner_dir(ctx.view, &owner_id, &offer_key)?;
+
+        // Remove from the book directory page.
+        remove_from_book_dir(ctx.view, book_root, &offer_key)?;
+
+        let _ = ctx.view.erase(&offer_key);
+        let owner_acct_key = keylet::account(&owner_id);
+        if let Some(b) = ctx.view.read(&owner_acct_key) {
+            if let Ok(mut acct) = serde_json::from_slice::<Value>(&b) {
+                helpers::adjust_owner_count(&mut acct, -1);
+                if let Ok(nb) = serde_json::to_vec(&acct) {
+                    let _ = ctx.view.update(owner_acct_key, nb);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Test whether `owner` currently holds the `TakerGets` amount in full.
+/// XRP: AccountRoot.Balance ≥ amount. IOU: holder-side trust line balance ≥ value.
+fn is_offer_funded(
+    ctx: &mut ApplyContext<'_>,
+    owner: &AccountId,
+    gets: &Value,
+) -> bool {
+    if let Some(drops_str) = gets.as_str() {
+        let needed: u64 = drops_str.parse().unwrap_or(0);
+        if needed == 0 {
+            return false;
+        }
+        let key = keylet::account(owner);
+        let Some(b) = ctx.view.read(&key) else {
+            return false;
+        };
+        let Ok(acct) = serde_json::from_slice::<Value>(&b) else {
+            return false;
+        };
+        let bal: u64 = acct
+            .get("Balance")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        return bal >= needed;
+    }
+    let cur_str = gets.get("currency").and_then(|v| v.as_str()).unwrap_or("");
+    let issuer_str = gets.get("issuer").and_then(|v| v.as_str()).unwrap_or("");
+    let value: f64 = gets
+        .get("value")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    if value <= 0.0 {
+        return false;
+    }
+    let issuer_id = match decode_account_id(issuer_str) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    if &issuer_id == owner {
+        // Issuer can always issue its own currency.
+        return true;
+    }
+    let cur_bytes = helpers::currency_to_bytes(cur_str);
+    let tl_key = keylet::trust_line(owner, &issuer_id, &cur_bytes);
+    let Some(tl_bytes) = ctx.view.read(&tl_key) else {
+        return false;
+    };
+    let Ok(tl) = serde_json::from_slice::<Value>(&tl_bytes) else {
+        return false;
+    };
+    let raw: f64 = tl
+        .get("Balance")
+        .and_then(|b| b.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0.0);
+    let issuer_is_low = issuer_id.as_bytes() < owner.as_bytes();
+    let holder_view = if issuer_is_low { raw } else { -raw };
+    holder_view >= value
+}
+
+/// Remove an offer hash from a book directory (inverse of `add_to_dir`).
+fn remove_from_book_dir(
+    view: &mut dyn crate::view::apply_view::ApplyView,
+    book_root: &rxrpl_primitives::Hash256,
+    offer_key: &rxrpl_primitives::Hash256,
+) -> Result<(), TransactionResult> {
+    let entry_hex = offer_key.to_string();
+    let mut page = 0u64;
+    loop {
+        let page_key = if page == 0 {
+            *book_root
+        } else {
+            keylet::dir_node(book_root, page)
+        };
+        let bytes = match view.read(&page_key) {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        let mut dir: Value =
+            serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let next_page = dir
+            .get("IndexNext")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let removed = if let Some(indexes) = dir.get_mut("Indexes").and_then(|v| v.as_array_mut())
+        {
+            let original = indexes.len();
+            indexes.retain(|v| v.as_str() != Some(entry_hex.as_str()));
+            indexes.len() != original
+        } else {
+            false
+        };
+        if removed {
+            let empty = dir
+                .get("Indexes")
+                .and_then(|v| v.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(true);
+            if empty && page == 0 {
+                let _ = view.erase(&page_key);
+            } else {
+                let new_bytes =
+                    serde_json::to_vec(&dir).map_err(|_| TransactionResult::TefInternal)?;
+                let _ = view.update(page_key, new_bytes);
+            }
+            return Ok(());
+        }
+        if next_page == 0 {
+            return Ok(());
+        }
+        page = next_page;
+    }
 }

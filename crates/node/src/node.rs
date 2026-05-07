@@ -1205,15 +1205,22 @@ impl Node {
         // surfaces before any port bind or task spawn.
 
         // Compute first-close grace before the move closure so we don't
-        // capture &self. Grace is 0 when no peers are configured (true solo /
-        // single-node sim) so close-time progresses immediately. Otherwise
-        // 60s, tuned for cross-impl rippled handshake latency.
-        let first_close_grace =
-            if self.config.peer.seeds.is_empty() && self.config.peer.fixed_peers.is_empty() {
-                Duration::from_secs(0)
-            } else {
-                Duration::from_secs(60)
-            };
+        // capture &self. Grace is 0 when no peers are configured AND no
+        // validators are trusted (true solo / single-node sim) so close-time
+        // progresses immediately. Otherwise 60s, tuned for cross-impl rippled
+        // handshake latency. Without this, in a 2-validator topology where
+        // rippled connects ~16s after rxrpl boots, rxrpl closes the genesis
+        // ledger solo and stays 1 seq ahead of rippled forever — quorum
+        // never reaches because hashes always disagree.
+        let has_peer_seed =
+            !self.config.peer.seeds.is_empty() || !self.config.peer.fixed_peers.is_empty();
+        let has_trusted_validators = self.config.validators.enabled
+            && !self.config.validators.trusted.is_empty();
+        let first_close_grace = if has_peer_seed || has_trusted_validators {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(0)
+        };
 
         let validator_id_for_loop = validator_id.clone();
         tokio::spawn(async move {
@@ -1488,7 +1495,7 @@ impl Node {
                                             &cmd_tx_catchup,
                                             &amendment_table, &tx_engine, &fees,
                                             &amendment_votes, trusted_validator_count,
-                                            &pruner, &node_store,
+                                            &pruner, &node_store, &mut val_aggregator,
                                         ).await;
                                         stall_metrics.reset_consecutive();
                                         amendment_votes.clear();
@@ -1515,7 +1522,7 @@ impl Node {
                                             &cmd_tx_catchup,
                                             &amendment_table, &tx_engine, &fees,
                                             &amendment_votes, trusted_validator_count,
-                                            &pruner, &node_store,
+                                            &pruner, &node_store, &mut val_aggregator,
                                         ).await;
                                         stall_metrics.reset_consecutive();
                                         amendment_votes.clear();
@@ -2019,7 +2026,7 @@ impl Node {
                             ConsensusMessage::ManifestApplied {
                                 master_key,
                                 ephemeral_key,
-                                old_ephemeral_key: _,
+                                old_ephemeral_key,
                                 revoked,
                             } => {
                                 if revoked {
@@ -2032,6 +2039,35 @@ impl Node {
                                         "manifest applied: master={} ephemeral={}",
                                         master_key, eph
                                     );
+                                }
+
+                                // Cross-impl interop: validations on the wire are
+                                // signed with a validator's *ephemeral* (signing)
+                                // key, but the UNL/TrustedKeys set lists *master*
+                                // keys. Without resolving the binding, validations
+                                // from rippled peers fail the trust filter and
+                                // quorum is never reached in mixed topologies.
+                                // Mirror the manifest's master->ephemeral binding
+                                // into TrustedKeys so the aggregator accepts the
+                                // current signing key for any trusted master.
+                                if let Some(ref trusted) =
+                                    trusted_validators_for_aggregator
+                                {
+                                    let mut guard = trusted.write().await;
+                                    if guard.contains(&master_key) {
+                                        if let Some(ref old) = old_ephemeral_key {
+                                            guard.remove(old);
+                                        }
+                                        if !revoked {
+                                            if let Some(eph) = ephemeral_key {
+                                                guard.insert(eph);
+                                            }
+                                        }
+                                    } else if revoked {
+                                        if let Some(ref old) = old_ephemeral_key {
+                                            guard.remove(old);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2098,6 +2134,7 @@ impl Node {
         trusted_validator_count: usize,
         pruner: &Arc<LedgerPruner>,
         node_store: &Option<Arc<dyn NodeStore>>,
+        val_aggregator: &mut rxrpl_overlay::validation_aggregator::ValidationAggregator,
     ) {
         // Resolve close_time in priority order:
         //  1. Quorum-accepted close_time from converge() — strongest signal,
@@ -2270,6 +2307,19 @@ impl Node {
                 msg_type: rxrpl_p2p_proto::MessageType::Validation,
                 payload,
             });
+
+            // Self-count: also add our own validation to the local aggregator.
+            // Without this, in a 2-validator topology (e.g. rxrpl + rippled)
+            // we would only ever see the peer's validation and never reach
+            // quorum=2 — our own broadcast is not echoed back through the
+            // peer-receive path. Matches rippled's behavior of feeding the
+            // local validation into its own RCLValidations table.
+            if let Some(validated) = val_aggregator.add_validation(validation) {
+                tracing::info!(
+                    "self-validated ledger #{} hash={} ({} validations)",
+                    validated.seq, validated.hash, validated.validation_count
+                );
+            }
         }
 
         // Broadcast StatusChange so peers know our current ledger and our

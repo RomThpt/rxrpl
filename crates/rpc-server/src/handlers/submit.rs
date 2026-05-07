@@ -121,9 +121,17 @@ pub async fn submit(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
     let mut ledger = ledger.write().await;
     let rules = Rules::new();
 
-    let result = engine
-        .apply(&tx_json, &mut ledger, &rules, fees)
-        .map_err(|e| RpcServerError::Internal(format!("tx engine error: {e}")))?;
+    let result = match engine.apply(&tx_json, &mut ledger, &rules, fees) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                "submit: tx engine error: {e} for tx_type={:?} account={:?}",
+                tx_json.get("TransactionType").and_then(|v| v.as_str()),
+                tx_json.get("Account").and_then(|v| v.as_str()),
+            );
+            return Err(RpcServerError::Internal(format!("tx engine error: {e}")));
+        }
+    };
 
     // Emit proposed transaction event for WebSocket subscribers
     let _ = ctx

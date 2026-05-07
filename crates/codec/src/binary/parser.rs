@@ -533,8 +533,10 @@ fn decode_iou_value(raw: u64) -> String {
 
     let sign = if positive { "" } else { "-" };
 
-    // Convert mantissa and exponent to decimal string
-    if exponent == 0 {
+    // Convert mantissa and exponent to decimal string. Strip trailing zeros
+    // after the decimal point and a dangling `.` so the canonical form
+    // matches rippled's STAmount text output (e.g. "50" not "50.000000000000000").
+    let raw_str = if exponent == 0 {
         format!("{sign}{mantissa}")
     } else if exponent > 0 {
         let mut s = mantissa.to_string();
@@ -557,5 +559,12 @@ fn decode_iou_value(raw: u64) -> String {
                 format!("{sign}{integer}.{decimal}")
             }
         }
+    };
+    if raw_str.contains('.') {
+        let trimmed = raw_str.trim_end_matches('0');
+        let trimmed = trimmed.trim_end_matches('.');
+        trimmed.to_string()
+    } else {
+        raw_str
     }
 }
