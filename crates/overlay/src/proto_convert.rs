@@ -455,10 +455,26 @@ pub fn decode_transaction(data: &[u8]) -> Result<(Hash256, Vec<u8>), OverlayErro
 
 // --- StatusChange ---
 
-pub fn encode_status_change(ledger_hash: &Hash256, ledger_seq: u32) -> Vec<u8> {
+/// rippled `NodeStatus` (TMStatusChange.newStatus) values. Defined inline so
+/// callers don't need to import the prost-generated enum.
+pub const NS_VALIDATING: i32 = 4;
+/// rippled `NodeEvent::neACCEPTED_LEDGER` (TMStatusChange.newEvent).
+pub const NE_ACCEPTED_LEDGER: i32 = 2;
+
+/// Encode a `TMStatusChange` advertising our current ledger and complete-ledger
+/// range. rippled uses `firstSeq`/`lastSeq` to decide which peer can serve a
+/// given historical ledger during catchup; without them, a late-joining
+/// rippled never asks rxrpl seeds for ancestors and `complete_ledgers` stays
+/// `"empty"` even after the validated ledger has been reconstructed.
+pub fn encode_status_change(
+    ledger_hash: &Hash256,
+    ledger_seq: u32,
+    first_seq: u32,
+    last_seq: u32,
+) -> Vec<u8> {
     let msg = TmStatusChange {
-        new_status: Some(0),
-        new_event: Some(0),
+        new_status: Some(NS_VALIDATING),
+        new_event: Some(NE_ACCEPTED_LEDGER),
         ledger_seq: Some(ledger_seq),
         ledger_hash: Some(ledger_hash.as_bytes().to_vec()),
         ledger_hash_previous: None,
@@ -468,8 +484,8 @@ pub fn encode_status_change(ledger_hash: &Hash256, ledger_seq: u32) -> Vec<u8> {
                 .unwrap_or_default()
                 .as_secs(),
         ),
-        first_seq: None,
-        last_seq: None,
+        first_seq: Some(first_seq),
+        last_seq: Some(last_seq),
     };
     msg.encode_to_vec()
 }
@@ -794,6 +810,76 @@ pub fn decode_get_objects(data: &[u8]) -> Result<TmGetObjectByHash, OverlayError
         .map_err(|e| OverlayError::Codec(format!("decode GetObjects: {e}")))
 }
 
+/// Encode a `TMGetObjectByHash` query (typically test-only). Production
+/// callers send specific helpers; rippled itself sends bare queries with
+/// `query=true`.
+pub fn encode_get_objects_query(
+    object_type: i32,
+    query: bool,
+    ledger_hash: Option<&Hash256>,
+    object_hashes: Vec<Hash256>,
+) -> Vec<u8> {
+    use rxrpl_p2p_proto::proto::TmIndexedObject;
+
+    let indexed: Vec<TmIndexedObject> = object_hashes
+        .into_iter()
+        .map(|h| TmIndexedObject {
+            hash: Some(h.as_bytes().to_vec()),
+            node_id: None,
+            index: None,
+            data: None,
+            ledger_seq: None,
+        })
+        .collect();
+
+    let msg = TmGetObjectByHash {
+        r#type: Some(object_type),
+        query: Some(query),
+        seq: None,
+        ledger_hash: ledger_hash.map(|h| h.as_bytes().to_vec()),
+        fat: Some(false),
+        objects: indexed,
+    };
+    msg.encode_to_vec()
+}
+
+/// Encode a `TMGetObjectByHash` reply with `type=otFETCH_PACK` (6).
+///
+/// Each entry is `(object_hash, ledger_seq, payload_bytes)`. Used to ship
+/// the chain of ancestor headers (and any companion SHAMap nodes) so a
+/// late-joining rippled can call `addFetchPack(hash, blob)` and then
+/// `gotFetchPack(progress, ledger_seq)` to resume catchup.
+pub fn encode_fetch_pack_response(
+    requested_ledger_hash: &Hash256,
+    objects: Vec<(Hash256, u32, Vec<u8>)>,
+) -> Vec<u8> {
+    use rxrpl_p2p_proto::proto::TmIndexedObject;
+
+    /// rippled `TMGetObjectByHash::ObjectType::otFETCH_PACK`.
+    const OT_FETCH_PACK: i32 = 6;
+
+    let indexed: Vec<TmIndexedObject> = objects
+        .into_iter()
+        .map(|(hash, seq, data)| TmIndexedObject {
+            hash: Some(hash.as_bytes().to_vec()),
+            node_id: None,
+            index: None,
+            data: Some(data),
+            ledger_seq: Some(seq),
+        })
+        .collect();
+
+    let msg = TmGetObjectByHash {
+        r#type: Some(OT_FETCH_PACK),
+        query: Some(false),
+        seq: None,
+        ledger_hash: Some(requested_ledger_hash.as_bytes().to_vec()),
+        fat: Some(false),
+        objects: indexed,
+    };
+    msg.encode_to_vec()
+}
+
 // --- Squelch (type 55) ---
 
 pub fn decode_squelch(data: &[u8]) -> Result<TmSquelch, OverlayError> {
@@ -953,11 +1039,27 @@ mod tests {
         let hash = Hash256::new([0x0A; 32]);
         let seq = 42;
 
-        let encoded = encode_status_change(&hash, seq);
+        let encoded = encode_status_change(&hash, seq, 1, seq);
         let (dec_hash, dec_seq) = decode_status_change(&encoded).unwrap();
 
         assert_eq!(dec_hash, hash);
         assert_eq!(dec_seq, seq);
+    }
+
+    #[test]
+    fn status_change_advertises_complete_range_and_status() {
+        let hash = Hash256::new([0x0A; 32]);
+        let encoded = encode_status_change(&hash, 100, 1, 100);
+        let raw = TmStatusChange::decode(encoded.as_slice()).unwrap();
+
+        // rippled uses (firstSeq, lastSeq) to pick a peer for historical
+        // catchup. Without them, late-joining rippled never asks rxrpl for
+        // ancestors and `complete_ledgers` stays "empty".
+        assert_eq!(raw.first_seq, Some(1));
+        assert_eq!(raw.last_seq, Some(100));
+        // Status/event must mark this as a usable seed peer.
+        assert_eq!(raw.new_status, Some(NS_VALIDATING));
+        assert_eq!(raw.new_event, Some(NE_ACCEPTED_LEDGER));
     }
 
     #[test]

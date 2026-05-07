@@ -2023,6 +2023,25 @@ impl PeerManager {
             requested
         );
 
+        let object_type = msg.r#type.unwrap_or(0);
+        // rippled `TMGetObjectByHash::ObjectType` -> SHAMap leaf wireType:
+        //   otTRANSACTION_NODE (3) -> tx-with-meta leaf, wireType 0x04
+        //   otSTATE_NODE       (4) -> account-state leaf, wireType 0x01
+        //   otFETCH_PACK       (6) -> handled separately; rippled uses fetch
+        //                              packs to backfill ledger ancestors
+        //                              after acquiring a validated head.
+        //   anything else (otUNKNOWN, otLEDGER, otTRANSACTION) defaults to
+        //   account-state, which is what rxrpl historically returned.
+        // Inner nodes (16*32 bytes) always serialize with wireType 0x02.
+        const OT_TRANSACTION_NODE: i32 = 3;
+        const OT_FETCH_PACK: i32 = 6;
+        if object_type == OT_FETCH_PACK {
+            // Fetch packs are served from the ledger provider (header chain),
+            // not the raw node store, so dispatch before the node-store check.
+            self.handle_fetch_pack_query(from, msg);
+            return;
+        }
+
         let store = match &self.node_store {
             Some(s) => s,
             None => {
@@ -2031,14 +2050,6 @@ impl PeerManager {
             }
         };
 
-        let object_type = msg.r#type.unwrap_or(0);
-        // rippled `TMGetObjectByHash::ObjectType` -> SHAMap leaf wireType:
-        //   otTRANSACTION_NODE (3) -> tx-with-meta leaf, wireType 0x04
-        //   otSTATE_NODE       (4) -> account-state leaf, wireType 0x01
-        //   anything else (otUNKNOWN, otLEDGER, otTRANSACTION) defaults to
-        //   account-state, which is what rxrpl historically returned.
-        // Inner nodes (16*32 bytes) always serialize with wireType 0x02.
-        const OT_TRANSACTION_NODE: i32 = 3;
         let leaf_wire_type = if object_type == OT_TRANSACTION_NODE {
             WIRE_TYPE_TX_WITH_META
         } else {
@@ -2110,6 +2121,118 @@ impl PeerManager {
             found.len(),
             requested,
             response.len()
+        );
+
+        if let Some(handle) = self.peer_handles.get(&from) {
+            let _ = handle.tx.try_send(PeerMessage {
+                msg_type: MessageType::GetObjects,
+                payload: response,
+            });
+        }
+    }
+
+    /// Serve a `TMGetObjectByHash` query with `type=otFETCH_PACK`.
+    ///
+    /// rippled fires fetch-pack requests after acquiring a validated head
+    /// ledger from us — they're how it backfills the ancestor chain before
+    /// inserting the range into `complete_ledgers`. Each reply object
+    /// contains `(parent_hash, parent_seq, HashPrefix::ledgerMaster ||
+    /// raw_header_118b)`; rippled stores them via `addFetchPack` and then
+    /// calls `gotFetchPack(progress, lastSeq)` to resume catchup.
+    ///
+    /// We walk back from the requested ledger via `parent_hash` until we run
+    /// out of locally-known ledgers, hit `MAX_FETCH_PACK_LEDGERS`, or fill
+    /// the 256 KB response budget. Each entry costs ~150 bytes so the cap
+    /// effectively bounds total work to a few KB per request.
+    fn handle_fetch_pack_query(
+        &self,
+        from: Hash256,
+        msg: rxrpl_p2p_proto::proto::TmGetObjectByHash,
+    ) {
+        const MAX_FETCH_PACK_LEDGERS: usize = 32;
+        const MAX_RESPONSE_SIZE: usize = 256 * 1024;
+        // rippled `HashPrefix::ledgerMaster` ('L','W','R',0).
+        const HASH_PREFIX_LEDGER_MASTER: [u8; 4] = [b'L', b'W', b'R', 0];
+
+        let provider = match &self.ledger_provider {
+            Some(p) => p,
+            None => {
+                tracing::debug!("FetchPack from {} but no ledger provider configured", from);
+                return;
+            }
+        };
+
+        let ledger_hash_bytes = msg.ledger_hash.as_deref().unwrap_or(&[]);
+        if ledger_hash_bytes.len() < 32 {
+            tracing::debug!("FetchPack from {}: missing or short ledger_hash", from);
+            return;
+        }
+        let arr: [u8; 32] = match ledger_hash_bytes[..32].try_into() {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let requested_ledger_hash = Hash256::new(arr);
+
+        // Walk parent chain. The starting ledger is the one rippled requested
+        // (the validated head it just acquired); per rippled's makeFetchPack,
+        // we send the *parents* — the requestor already has the head.
+        let head = match provider.get_by_hash(&requested_ledger_hash) {
+            Some(l) => l,
+            None => {
+                tracing::debug!(
+                    "FetchPack from {}: requested ledger {} not found",
+                    from,
+                    requested_ledger_hash
+                );
+                return;
+            }
+        };
+
+        let mut objects: Vec<(Hash256, u32, Vec<u8>)> = Vec::new();
+        let mut total_size = 0usize;
+        let mut current_parent_hash = head.header.parent_hash;
+        for _ in 0..MAX_FETCH_PACK_LEDGERS {
+            if current_parent_hash == Hash256::ZERO {
+                break;
+            }
+            let parent = match provider.get_by_hash(&current_parent_hash) {
+                Some(p) => p,
+                None => break,
+            };
+            let raw = parent.header.to_raw_bytes();
+            let mut data = Vec::with_capacity(4 + raw.len());
+            data.extend_from_slice(&HASH_PREFIX_LEDGER_MASTER);
+            data.extend_from_slice(&raw);
+
+            let entry_size = 32 + data.len();
+            if total_size + entry_size > MAX_RESPONSE_SIZE {
+                break;
+            }
+            total_size += entry_size;
+            let parent_hash = parent.header.hash;
+            let parent_seq = parent.header.sequence;
+            current_parent_hash = parent.header.parent_hash;
+            objects.push((parent_hash, parent_seq, data));
+        }
+
+        if objects.is_empty() {
+            tracing::debug!(
+                "FetchPack from {}: no ancestors available for {}",
+                from,
+                requested_ledger_hash
+            );
+            return;
+        }
+
+        let response =
+            proto_convert::encode_fetch_pack_response(&requested_ledger_hash, objects.clone());
+
+        tracing::debug!(
+            "FetchPack response to {}: {} ancestor headers ({} bytes) for {}",
+            from,
+            objects.len(),
+            response.len(),
+            requested_ledger_hash
         );
 
         if let Some(handle) = self.peer_handles.get(&from) {
@@ -2824,6 +2947,77 @@ impl ReconnectBackoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_pack_query_replies_with_ancestor_headers() {
+        // Late-joining rippled fires `TMGetObjectByHash{type=otFETCH_PACK,
+        // query=true, ledger_hash=H}` after acquiring a validated head;
+        // without a reply it never backfills history and complete_ledgers
+        // stays "empty". Verify rxrpl emits a reply containing
+        // (parent_hash, parent_seq, "LWR\0"||raw_header) for each ancestor.
+        let mut mgr = make_test_peer_manager();
+        let peer_id = mgr.1;
+        let mut rx = mgr.2;
+        let m = &mut mgr.0;
+
+        // Build a 3-ledger chain: g (genesis) -> l1 -> l2.
+        let mut g = rxrpl_ledger::Ledger::genesis();
+        g.close(0, 0).unwrap();
+        let mut l1 = rxrpl_ledger::Ledger::new_open(&g);
+        l1.close(g.header.close_time + 4, 0).unwrap();
+        let mut l2 = rxrpl_ledger::Ledger::new_open(&l1);
+        l2.close(l1.header.close_time + 4, 0).unwrap();
+
+        struct ChainProvider {
+            by_hash: std::collections::HashMap<Hash256, rxrpl_ledger::Ledger>,
+        }
+        impl crate::ledger_provider::LedgerProvider for ChainProvider {
+            fn get_by_hash(&self, h: &Hash256) -> Option<rxrpl_ledger::Ledger> {
+                self.by_hash.get(h).cloned()
+            }
+            fn get_by_seq(&self, _: u32) -> Option<rxrpl_ledger::Ledger> {
+                None
+            }
+            fn latest_closed(&self) -> Option<rxrpl_ledger::Ledger> {
+                None
+            }
+        }
+        let mut by_hash = std::collections::HashMap::new();
+        by_hash.insert(g.header.hash, g.clone());
+        by_hash.insert(l1.header.hash, l1.clone());
+        by_hash.insert(l2.header.hash, l2.clone());
+        m.set_ledger_provider(Arc::new(ChainProvider { by_hash }));
+
+        let payload = proto_convert::encode_get_objects_query(
+            6, // otFETCH_PACK
+            true,
+            Some(&l2.header.hash),
+            vec![],
+        );
+        let decoded = proto_convert::decode_get_objects(&payload).expect("decode query");
+        m.handle_get_objects_query(peer_id, decoded);
+
+        let msg = rx.try_recv().expect("expected fetch pack reply");
+        assert_eq!(msg.msg_type, MessageType::GetObjects);
+        let reply = proto_convert::decode_get_objects(&msg.payload).expect("decode reply");
+        assert_eq!(reply.r#type, Some(6));
+        assert_eq!(reply.query, Some(false));
+        // Two ancestors: l1 then g.
+        assert_eq!(reply.objects.len(), 2);
+        let first = &reply.objects[0];
+        assert_eq!(first.ledger_seq, Some(l1.header.sequence));
+        assert_eq!(
+            first.hash.as_deref(),
+            Some(l1.header.hash.as_bytes().as_slice())
+        );
+        let data = first.data.as_deref().unwrap();
+        assert_eq!(
+            &data[..4],
+            b"LWR\0",
+            "must lead with HashPrefix::ledgerMaster"
+        );
+        assert_eq!(data.len(), 4 + 118);
+    }
 
     #[test]
     fn encode_shamap_wire_node_inner_appends_inner_tag() {
