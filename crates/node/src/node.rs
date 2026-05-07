@@ -2272,9 +2272,15 @@ impl Node {
             });
         }
 
-        // Broadcast StatusChange so peers know our current ledger
+        // Broadcast StatusChange so peers know our current ledger and our
+        // complete-ledger range. Advertising (1, closed_seq) lets late-joining
+        // rippled peers know rxrpl can serve all ancestors during catchup;
+        // without that range, rippled never asks for them and its
+        // `complete_ledgers` stays empty.
         {
-            let payload = rxrpl_overlay::proto_convert::encode_status_change(&hash, closed_seq);
+            let payload = rxrpl_overlay::proto_convert::encode_status_change(
+                &hash, closed_seq, 1, closed_seq,
+            );
             let _ = cmd_tx.send(OverlayCommand::Broadcast {
                 msg_type: rxrpl_p2p_proto::MessageType::StatusChange,
                 payload,
