@@ -20,8 +20,8 @@ pub fn compute_holder_balance(
         .unwrap_or("0")
         .parse()
         .unwrap_or(0.0);
-    let issuer_is_low = issuer_id.as_bytes() < holder_id.as_bytes();
-    let holder_view = if issuer_is_low { raw } else { -raw };
+    let holder_is_low = holder_id.as_bytes() < issuer_id.as_bytes();
+    let holder_view = if holder_is_low { raw } else { -raw };
     holder_view.max(0.0)
 }
 
@@ -47,8 +47,8 @@ pub fn compute_new_iou_balance(
     let delta: f64 = delta_str
         .parse()
         .map_err(|_| TransactionResult::TemBadAmount)?;
-    let issuer_is_low = issuer_id.as_bytes() < holder_id.as_bytes();
-    Ok(if issuer_is_low {
+    let holder_is_low = holder_id.as_bytes() < issuer_id.as_bytes();
+    Ok(if holder_is_low {
         current + delta
     } else {
         current - delta
