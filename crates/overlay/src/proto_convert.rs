@@ -794,6 +794,76 @@ pub fn decode_get_objects(data: &[u8]) -> Result<TmGetObjectByHash, OverlayError
         .map_err(|e| OverlayError::Codec(format!("decode GetObjects: {e}")))
 }
 
+/// Encode a `TMGetObjectByHash` query (typically test-only). Production
+/// callers send specific helpers; rippled itself sends bare queries with
+/// `query=true`.
+pub fn encode_get_objects_query(
+    object_type: i32,
+    query: bool,
+    ledger_hash: Option<&Hash256>,
+    object_hashes: Vec<Hash256>,
+) -> Vec<u8> {
+    use rxrpl_p2p_proto::proto::TmIndexedObject;
+
+    let indexed: Vec<TmIndexedObject> = object_hashes
+        .into_iter()
+        .map(|h| TmIndexedObject {
+            hash: Some(h.as_bytes().to_vec()),
+            node_id: None,
+            index: None,
+            data: None,
+            ledger_seq: None,
+        })
+        .collect();
+
+    let msg = TmGetObjectByHash {
+        r#type: Some(object_type),
+        query: Some(query),
+        seq: None,
+        ledger_hash: ledger_hash.map(|h| h.as_bytes().to_vec()),
+        fat: Some(false),
+        objects: indexed,
+    };
+    msg.encode_to_vec()
+}
+
+/// Encode a `TMGetObjectByHash` reply with `type=otFETCH_PACK` (6).
+///
+/// Each entry is `(object_hash, ledger_seq, payload_bytes)`. Used to ship
+/// the chain of ancestor headers (and any companion SHAMap nodes) so a
+/// late-joining rippled can call `addFetchPack(hash, blob)` and then
+/// `gotFetchPack(progress, ledger_seq)` to resume catchup.
+pub fn encode_fetch_pack_response(
+    requested_ledger_hash: &Hash256,
+    objects: Vec<(Hash256, u32, Vec<u8>)>,
+) -> Vec<u8> {
+    use rxrpl_p2p_proto::proto::TmIndexedObject;
+
+    /// rippled `TMGetObjectByHash::ObjectType::otFETCH_PACK`.
+    const OT_FETCH_PACK: i32 = 6;
+
+    let indexed: Vec<TmIndexedObject> = objects
+        .into_iter()
+        .map(|(hash, seq, data)| TmIndexedObject {
+            hash: Some(hash.as_bytes().to_vec()),
+            node_id: None,
+            index: None,
+            data: Some(data),
+            ledger_seq: Some(seq),
+        })
+        .collect();
+
+    let msg = TmGetObjectByHash {
+        r#type: Some(OT_FETCH_PACK),
+        query: Some(false),
+        seq: None,
+        ledger_hash: Some(requested_ledger_hash.as_bytes().to_vec()),
+        fat: Some(false),
+        objects: indexed,
+    };
+    msg.encode_to_vec()
+}
+
 // --- Squelch (type 55) ---
 
 pub fn decode_squelch(data: &[u8]) -> Result<TmSquelch, OverlayError> {
