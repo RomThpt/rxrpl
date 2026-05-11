@@ -1108,7 +1108,14 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         }
         // Strict majority (>50%) before realigning. Below that, leave
         // our_position alone so the disagreement signal survives.
-        if best_count * 2 <= total {
+        // Exception: explicit 2-voter UNL (us + 1 peer) where 1-1 ties
+        // would block realignment forever and force max_consensus_rounds
+        // force-accept every round (~12s/ledger). In that case adopt the
+        // latest bucket on ties so both positions converge in one round.
+        // Gated on a non-empty UNL so unit tests with implicit voters
+        // (empty UNL) keep rippled-compat disagreement-preserve semantics.
+        let allow_tie_realign = total == 2 && !self.unl.is_empty();
+        if best_count * 2 < total || (!allow_tie_realign && best_count * 2 == total) {
             return;
         }
         if let Some(ref mut pos) = self.our_position {
@@ -1228,8 +1235,17 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
 
         self.round += 1;
 
-        // If we've exceeded max rounds, accept anyway
+        // If we've exceeded max rounds, accept anyway — but ONLY if we have
+        // at least one peer position. Otherwise we'd validate a ledger alone
+        // with our own close_time, fork from peers, and force a recovery cycle
+        // every round (~14s/ledger). With no peers known yet (e.g. first round
+        // before peer's first proposal arrives), keep waiting; share_position
+        // to nudge peers, and let the timer's stall_timeout abort if needed.
         if self.round >= self.params.max_consensus_rounds {
+            if self.peer_positions.is_empty() && !self.unl.is_empty() {
+                self.round = self.params.max_consensus_rounds;
+                return false;
+            }
             self.accept();
             return true;
         }
