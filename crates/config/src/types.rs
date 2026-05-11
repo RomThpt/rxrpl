@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use rxrpl_amendment::AmendmentConfig;
 use serde::Deserialize;
 
 /// Top-level node configuration.
@@ -24,6 +25,8 @@ pub struct NodeConfig {
     pub cluster: ClusterConfig,
     #[serde(default)]
     pub reporting: ReportingConfig,
+    #[serde(default)]
+    pub amendments: AmendmentConfig,
 }
 
 /// Reporting mode configuration.

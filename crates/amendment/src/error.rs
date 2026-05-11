@@ -6,4 +6,13 @@ pub enum AmendmentError {
 
     #[error("amendment already registered: {0}")]
     AlreadyRegistered(String),
+
+    #[error("unknown amendment preset: {0}")]
+    UnknownPreset(String),
+
+    #[error("amendment listed in both vote and veto: {0}")]
+    DuplicateAmendment(String),
+
+    #[error("amendments.compatibility cannot be combined with amendments.vote or amendments.veto")]
+    ConfigConflict,
 }
