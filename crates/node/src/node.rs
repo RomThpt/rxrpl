@@ -144,7 +144,11 @@ impl Node {
 
         // Initialize amendment registry
         let registry = FeatureRegistry::with_known_amendments();
-        let amendment_table = AmendmentTable::new(&registry, 14 * 24 * 60 * 4); // ~14 days at 4s/ledger
+        let mut amendment_table = AmendmentTable::new(&registry, 14 * 24 * 60 * 4); // ~14 days at 4s/ledger
+        config
+            .amendments
+            .apply(&registry, &mut amendment_table)
+            .map_err(|e| NodeError::Config(format!("amendments: {e}")))?;
 
         // Initialize transaction engine with all handlers
         let mut tx_registry = TransactorRegistry::new();
@@ -202,7 +206,11 @@ impl Node {
         let node_store = Self::create_node_store(&config)?;
 
         let registry = FeatureRegistry::with_known_amendments();
-        let amendment_table = AmendmentTable::new(&registry, 14 * 24 * 60 * 4);
+        let mut amendment_table = AmendmentTable::new(&registry, 14 * 24 * 60 * 4);
+        config
+            .amendments
+            .apply(&registry, &mut amendment_table)
+            .map_err(|e| NodeError::Config(format!("amendments: {e}")))?;
 
         let mut tx_registry = TransactorRegistry::new();
         rxrpl_tx_engine::handlers::register_phase_a(&mut tx_registry);
@@ -1238,24 +1246,11 @@ impl Node {
             // closure.
             let mut first_close_completed: bool = false;
             let startup_instant = tokio::time::Instant::now();
-            // Cross-impl close-race guard: track last time we observed a peer
-            // StatusChange. If peer is alive but BEHIND our open seq, defer
-            // close to give peer time to advance — that way peer announces
-            // first and rxrpl yields/adopts (deterministic convergence) instead
-            // of racing peer with own close (which risks close_time bucket
-            // mismatch and divergent hashes). Capped at PEER_WAIT_GRACE so a
-            // truly offline peer doesn't block us forever.
+            // Tracks last observed peer StatusChange. Still updated for
+            // diagnostics but no longer gates close (PR2: always-active
+            // proposer for mixed-validator support).
             let mut last_peer_status_at: Option<tokio::time::Instant> = None;
-            // round_open_at: timestamp when the current open seq was opened.
-            // Used to bound how long we'll defer close waiting for peer.
-            let mut round_open_at: Option<tokio::time::Instant> = None;
             let mut last_round_seq: u32 = 0;
-            const PEER_WAIT_GRACE: Duration = Duration::from_secs(30);
-            const PEER_ALIVE_WINDOW: Duration = Duration::from_secs(30);
-            // Counter for how many close ticks we've deferred waiting for a
-            // peer position. Caps the wait at ~10s extra so an offline peer
-            // doesn't block our progress forever.
-            let close_deferrals: u32 = 0;
             // Cache of LedgerHeader objects parsed from peer liBASE responses.
             // We need the full header (parent_hash, parent_close_time,
             // close_time, drops, close_time_resolution, close_flags) when
@@ -1375,9 +1370,7 @@ impl Node {
                                     let parent_close_time = l.header.parent_close_time;
                                     drop(l);
 
-                                    // Reset round timer when seq advances (new open ledger).
                                     if last_round_seq != seq {
-                                        round_open_at = Some(tokio::time::Instant::now());
                                         last_round_seq = seq;
                                     }
 
@@ -1402,57 +1395,19 @@ impl Node {
                                     }
                                     .max(parent_close_time.saturating_add(1));
 
-                                    // Cross-impl close strategy:
-                                    //  1) peer ahead/equal (max_peer_seq >= seq) → yield + adopt
-                                    //     peer's chain. Broadcast our validation for adopted hash
-                                    //     so peer reaches quorum.
-                                    //  2) peer behind (max_peer_seq < seq) AND peer alive (recent
-                                    //     StatusChange) AND we haven't waited too long → defer
-                                    //     to let peer advance to our seq. Avoids the close_time
-                                    //     race where we close before peer announces and produce
-                                    //     a divergent bucket → divergent hash.
-                                    //  3) peer behind AND (peer dead OR waited too long) →
-                                    //     close own.
-                                    let peer_alive = last_peer_status_at
-                                        .map(|t| t.elapsed() < PEER_ALIVE_WINDOW)
-                                        .unwrap_or(false);
-                                    let peer_at_or_past = max_peer_seq > 0 && max_peer_seq >= seq;
-                                    let waited = round_open_at
-                                        .map(|t| t.elapsed())
-                                        .unwrap_or(Duration::ZERO);
-                                    let peer_behind_alive = max_peer_seq > 0
-                                        && max_peer_seq < seq
-                                        && peer_alive
-                                        && waited < PEER_WAIT_GRACE;
-                                    if peer_behind_alive {
-                                        tracing::debug!(
-                                            "deferring close: peer at seq {} < our seq {}, waited {:?}",
-                                            max_peer_seq, seq, waited
-                                        );
-                                        timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
-                                        continue;
-                                    }
-                                    if peer_at_or_past {
-                                        tracing::debug!(
-                                            "yielding close: peer at seq {} >= our open seq {}",
-                                            max_peer_seq, seq
-                                        );
-                                        timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
-                                        let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
-                                            seq,
-                                            hash: None,
-                                        });
-                                        continue;
-                                    }
-
-                                    // Wait-for-peer-position removed: empirically, rippled never
-                                    // sends a proposal during the open phase (only after closing
-                                    // alone). So waiting for peer_positions deadlocks rxrpl into
-                                    // the deferral cap (100 ticks ≈ 10s) every round, which makes
-                                    // rxrpl close LATER than rippled — exact opposite of what we
-                                    // want. Better to close at the wall-clock-ceiling boundary and
-                                    // let proposals/validations sort it out via wrong-prev-ledger.
-                                    let _ = close_deferrals;
+                                    // Always-active proposer: close on schedule like rippled.
+                                    // Previous deferrals (peer_at_or_past, peer_behind_alive) kept
+                                    // rxrpl in passive validator mode whenever any peer was
+                                    // observable, so consensus.close_ledger() never fired and no
+                                    // ProposeSet was broadcast (issue #76). Removing them lets
+                                    // rxrpl participate as an active proposer in mixed-validator
+                                    // topologies. Convergence on divergent peer chains is handled
+                                    // by the existing wrong_prev_ledger / catchup recovery path.
+                                    let _ = last_peer_status_at;
+                                    tracing::info!(
+                                        "closing seq={} prev={} peer_seq={}",
+                                        seq, prev_hash, max_peer_seq
+                                    );
 
                                     let l = ledger.read().await;
                                     let mut tx_hashes = Vec::new();
