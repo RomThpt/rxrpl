@@ -2419,8 +2419,15 @@ impl Node {
 
         // FeeSettings IS in rippled's genesis (verified by querying rippled
         // standalone via ledger_data: master AccountRoot + FeeSettings +
-        // LedgerHashes). Without FeeSettings, rxrpl's genesis hash diverges.
+        // Amendments). Without FeeSettings, rxrpl's genesis hash diverges.
         Self::insert_genesis_fee_settings(&mut genesis)?;
+
+        // Amendments SLE: rippled-2.6.2 pre-activates 28 amendments in
+        // genesis. Without this SLE rxrpl's account_hash at seq=1 diverges
+        // from rippled and mixed-validator consensus can't converge on any
+        // round (every ProposeSet carries a different prev_ledger). Captured
+        // empirically from a standalone rippled-2.6.2 (issue #76).
+        Self::insert_genesis_amendments(&mut genesis)?;
 
         genesis.close(0, 0)?;
         Ok(genesis)
@@ -2460,6 +2467,9 @@ impl Node {
         // Add FeeSettings with default values
         Self::insert_genesis_fee_settings(&mut genesis)?;
 
+        // Pre-activated amendments (rippled-2.6.2 compat)
+        Self::insert_genesis_amendments(&mut genesis)?;
+
         // Close genesis ledger
         genesis.close(0, 0)?;
 
@@ -2482,6 +2492,21 @@ impl Node {
         let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes)
             .map_err(|e| NodeError::Config(format!("failed to encode fee settings: {e}")))?;
         genesis.put_state(fee_key, data)?;
+        Ok(())
+    }
+
+    fn insert_genesis_amendments(genesis: &mut Ledger) -> Result<(), NodeError> {
+        let amendments_value = serde_json::json!({
+            "LedgerEntryType": "Amendments",
+            "Amendments": rxrpl_amendment::presets::rippled_2_6_2::GENESIS_AMENDMENTS_HEX,
+            "Flags": 0,
+        });
+        let amendments_key = keylet::amendments();
+        let json_bytes = serde_json::to_vec(&amendments_value)
+            .map_err(|e| NodeError::Config(e.to_string()))?;
+        let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes)
+            .map_err(|e| NodeError::Config(format!("failed to encode amendments: {e}")))?;
+        genesis.put_state(amendments_key, data)?;
         Ok(())
     }
 
@@ -3193,6 +3218,30 @@ mod tests {
         assert_eq!(genesis1.header.hash, genesis2.header.hash);
         assert_eq!(genesis1.header.account_hash, genesis2.header.account_hash);
         assert!(!genesis1.header.hash.is_zero());
+    }
+
+    /// Genesis hash must match rippled-2.6.2 for the same standard master
+    /// account. Captured empirically from `rippled --standalone --start
+    /// --quorum=1` with network_id=10000 and the well-known genesis account
+    /// `rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh`. See issue #76.
+    #[test]
+    fn genesis_hash_matches_rippled_2_6_2() {
+        let address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let genesis = Node::genesis_with_funded_account(address).unwrap();
+
+        let actual_hash = hex::encode_upper(genesis.header.hash.as_bytes());
+        let actual_account_hash = hex::encode_upper(genesis.header.account_hash.as_bytes());
+
+        assert_eq!(
+            actual_account_hash,
+            "3791BF543E5B77A17BC454F7A0720E4615760F457135F399DE67C54D7929546D",
+            "genesis account_hash diverges from rippled-2.6.2"
+        );
+        assert_eq!(
+            actual_hash,
+            "E158C218A9AF027957A54ECD7D25F4AD35C90B2AAF8DE4956723A17D80F5B3F4",
+            "genesis ledger hash diverges from rippled-2.6.2"
+        );
     }
 
     #[test]
