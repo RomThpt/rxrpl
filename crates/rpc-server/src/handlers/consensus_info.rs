@@ -28,13 +28,20 @@ pub async fn consensus_info(
         0
     };
 
+    // Active proposer when a validator_identity is configured (then the
+    // consensus engine signs and broadcasts ProposeSets every establish
+    // round). Otherwise we observe the network as a passive validator.
+    let proposing = ctx.local_manifest().is_some();
+    let consensus_state = if proposing { "proposing" } else { "observing" };
+
     Ok(serde_json::json!({
         "info": {
-            "consensus": "n/a",
+            "consensus": consensus_state,
             "ledger_seq": ledger_seq,
             "our_position": {
                 "proposers": 0,
             },
+            "proposing": proposing,
             "validated_ledger": validated_seq,
         }
     }))

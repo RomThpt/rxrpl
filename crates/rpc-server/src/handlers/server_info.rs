@@ -60,11 +60,19 @@ pub async fn server_info(
         summary.last_seq
     };
 
+    // `proposing` / `am_validator` flag — true when a validator_identity is
+    // configured. Mirrors rippled's `info.proposing` so dashboards and ops
+    // tooling can tell whether this node emits ProposeSets in the consensus
+    // round rather than just validating peer ledgers.
+    let proposing = ctx.local_manifest().is_some();
+
     let mut info = serde_json::json!({
         "build_version": env!("CARGO_PKG_VERSION"),
         "server_state": "full",
         "complete_ledgers": summary.complete_ledgers,
         "ledger_current_index": current_index,
+        "proposing": proposing,
+        "am_validator": proposing,
     });
     if let Some(v) = summary.validated_ledger {
         info["validated_ledger"] = v;
