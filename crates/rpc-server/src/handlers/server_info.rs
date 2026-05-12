@@ -1,9 +1,30 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
 use crate::context::ServerContext;
 use crate::error::RpcServerError;
+
+/// XRPL NetClock epoch (2000-01-01 UTC) in Unix seconds. Mirrors
+/// `rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET` but kept inline so this
+/// crate doesn't need a `rxrpl-ledger` dependency just for the constant.
+const RIPPLE_EPOCH_OFFSET: u64 = 946_684_800;
+
+/// Seconds elapsed since `close_time` (NetClock seconds since 2000-01-01).
+/// Returns 0 when `close_time` is unset (catchup-only validation snapshot
+/// before the matching ledger lands locally) or ahead of wall clock.
+fn ledger_age(close_time: u32) -> u64 {
+    if close_time == 0 {
+        return 0;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        .saturating_sub(RIPPLE_EPOCH_OFFSET);
+    now.saturating_sub(close_time as u64)
+}
 
 /// Snapshot of "what's in the closed ledger window" used by both
 /// `server_info` and `server_state`.
@@ -48,6 +69,7 @@ async fn closed_ledgers_summary(ctx: &Arc<ServerContext>) -> ClosedLedgersSummar
                     "seq": snap.seq,
                     "hash": snap.hash.to_string(),
                     "close_time": snap.close_time,
+                    "age": ledger_age(snap.close_time),
                     "base_fee_xrp": 0.00001,
                     "reserve_base_xrp": 10,
                     "reserve_inc_xrp": 2,
@@ -65,6 +87,7 @@ async fn closed_ledgers_summary(ctx: &Arc<ServerContext>) -> ClosedLedgersSummar
                     "seq": last,
                     "hash": last_ledger.header.hash.to_string(),
                     "close_time": last_ledger.header.close_time,
+                    "age": ledger_age(last_ledger.header.close_time),
                     "base_fee_xrp": 0.00001,
                     "reserve_base_xrp": 10,
                     "reserve_inc_xrp": 2,
