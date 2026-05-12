@@ -64,11 +64,16 @@ pub async fn server_info(
     // configured. Mirrors rippled's `info.proposing` so dashboards and ops
     // tooling can tell whether this node emits ProposeSets in the consensus
     // round rather than just validating peer ledgers.
+    // `server_state` follows rippled's convention: a fully-synced validator
+    // that emits proposals reports "proposing"; a fully-synced read-only
+    // node reports "full". The xrpl-confluence dashboard and other ops
+    // tooling key off this string to display a node's role.
     let proposing = ctx.local_manifest().is_some();
+    let server_state = if proposing { "proposing" } else { "full" };
 
     let mut info = serde_json::json!({
         "build_version": env!("CARGO_PKG_VERSION"),
-        "server_state": "full",
+        "server_state": server_state,
         "complete_ledgers": summary.complete_ledgers,
         "ledger_current_index": current_index,
         "proposing": proposing,
@@ -92,11 +97,16 @@ pub async fn server_state(
     ctx: &Arc<ServerContext>,
 ) -> Result<Value, RpcServerError> {
     let summary = closed_ledgers_summary(ctx).await;
+    let server_state = if ctx.local_manifest().is_some() {
+        "proposing"
+    } else {
+        "full"
+    };
 
     Ok(serde_json::json!({
         "state": {
             "build_version": env!("CARGO_PKG_VERSION"),
-            "server_state": "full",
+            "server_state": server_state,
             "complete_ledgers": summary.complete_ledgers,
         }
     }))
