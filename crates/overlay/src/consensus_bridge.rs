@@ -8,7 +8,7 @@ use rxrpl_primitives::Hash256;
 use tokio::sync::mpsc;
 
 use crate::command::OverlayCommand;
-use crate::identity::NodeIdentity;
+use crate::identity::{NodeIdentity, ValidatorIdentity};
 use crate::proto_convert;
 
 /// Consensus adapter that bridges sync ConsensusAdapter calls to the async PeerManager.
@@ -19,6 +19,13 @@ use crate::proto_convert;
 pub struct NetworkConsensusAdapter {
     cmd_tx: mpsc::UnboundedSender<OverlayCommand>,
     identity: Arc<NodeIdentity>,
+    /// When set, proposals are signed with the validator's **ephemeral signing
+    /// key** instead of the node's peer-to-peer key. rippled's UNL contains
+    /// validator master keys (with the signing key bound via manifest), not
+    /// node peer keys — proposals signed with the node key arrive at rippled
+    /// with a `node_pub_key` that is not in any trusted set and get dropped
+    /// (issue #76 root cause for `laggards: N`).
+    validator_identity: Option<Arc<ValidatorIdentity>>,
     tx_sets: Arc<std::sync::RwLock<HashMap<Hash256, TxSet>>>,
 }
 
@@ -27,8 +34,18 @@ impl NetworkConsensusAdapter {
         Self {
             cmd_tx,
             identity,
+            validator_identity: None,
             tx_sets: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Attach a `ValidatorIdentity` so that proposals are signed with the
+    /// ephemeral signing key (bound to the master key by the manifest).
+    /// Without this, rxrpl signs proposals with the node peer key and rippled
+    /// silently drops them as untrusted (see field doc above).
+    pub fn with_validator_identity(mut self, vid: Arc<ValidatorIdentity>) -> Self {
+        self.validator_identity = Some(vid);
+        self
     }
 
     /// Get a reference to the tx_sets cache for external insertion
@@ -47,7 +64,20 @@ impl NetworkConsensusAdapter {
 impl ConsensusAdapter for NetworkConsensusAdapter {
     fn propose(&self, proposal: &Proposal) {
         let mut signed = proposal.clone();
-        self.identity.sign_proposal(&mut signed);
+        // When operating as a UNL validator, the proposal MUST be signed by
+        // the manifest-bound signing key and MUST carry the matching
+        // public key in `node_pub_key`; otherwise rippled treats the proposal
+        // as coming from an unknown node and drops it. Fall back to the node
+        // identity for nodes without a validator config (peers, observers).
+        match self.validator_identity.as_ref() {
+            Some(vid) => {
+                signed.public_key = vid.signing_pubkey().as_bytes().to_vec();
+                vid.sign_proposal(&mut signed);
+            }
+            None => {
+                self.identity.sign_proposal(&mut signed);
+            }
+        }
         let payload = proto_convert::encode_propose_set(&signed);
         self.broadcast(MessageType::ProposeSet, payload);
     }

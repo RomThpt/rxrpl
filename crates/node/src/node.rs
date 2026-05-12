@@ -868,8 +868,18 @@ impl Node {
         let cmd_tx_relay = cmd_tx.clone();
         let cmd_tx_catchup = cmd_tx.clone();
 
-        // 5. Create NetworkConsensusAdapter (consumes cmd_tx)
-        let adapter = NetworkConsensusAdapter::new(cmd_tx, Arc::clone(&identity));
+        // 5. Create NetworkConsensusAdapter (consumes cmd_tx). When a
+        // validator identity is configured, attach it so that proposals are
+        // signed with the manifest-bound ephemeral signing key (issue #76 —
+        // rippled drops proposals signed with the node peer key as
+        // untrusted).
+        let adapter = {
+            let base = NetworkConsensusAdapter::new(cmd_tx, Arc::clone(&identity));
+            match validator_id.as_ref() {
+                Some(vid) => base.with_validator_identity(Arc::clone(vid)),
+                None => base,
+            }
+        };
 
         // 5b. Share the adapter's tx-set cache with the peer manager so it can
         // check for locally known sets and store newly acquired ones.
@@ -1228,10 +1238,22 @@ impl Node {
             let node_id = NodeId(identity.node_id);
             let consensus_params = ConsensusParams::default();
             let mut timer = ConsensusTimer::new(&consensus_params);
+            // The engine's `public_key` is echoed verbatim into every emitted
+            // ProposeSet `node_pub_key`. For UNL-trusted proposals to be
+            // counted by rippled, it MUST be the manifest-bound signing key
+            // (rippled looks the key up in its trusted-validator set). Use
+            // the validator ephemeral signing pubkey when available; fall
+            // back to the node pubkey for non-validator operation. Pair with
+            // `NetworkConsensusAdapter::with_validator_identity` which
+            // signs with the matching private key.
+            let consensus_pubkey = match validator_id_for_loop.as_ref() {
+                Some(vid) => vid.signing_pubkey().as_bytes().to_vec(),
+                None => identity.public_key_bytes().to_vec(),
+            };
             let mut consensus = ConsensusEngine::new_with_unl(
                 adapter,
                 node_id,
-                identity.public_key_bytes().to_vec(),
+                consensus_pubkey,
                 consensus_params,
                 unl,
             );
