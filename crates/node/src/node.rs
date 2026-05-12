@@ -2265,11 +2265,12 @@ impl Node {
             });
         }
 
-        // Note: the `ServerEvent::LedgerClosed` emit is deferred to AFTER the
-        // `closed_ledgers.push_back` below. WS subscribers (e.g. the kurtosis
-        // dashboard) react to `ledgerClosed` by re-reading server_info; if we
-        // emit before the push, the dashboard sees a stale `complete_ledgers`
-        // and the `validated_ledger.seq` (WS) jumps ahead of the HTTP poll.
+        let _ = event_tx.send(ServerEvent::LedgerClosed {
+            ledger_index: closed_seq,
+            ledger_hash: hash,
+            ledger_time: effective_close_time,
+            txn_count: tx_count,
+        });
 
         // Emit path_find update after ledger close
         let _ = event_tx.send(ServerEvent::PathFindUpdate {
@@ -2375,45 +2376,31 @@ impl Node {
             }
         }
 
-        {
-            let mut history = closed_ledgers.write().await;
-            let mut compacted = closed;
-            compacted.compact();
-            history.push_back(compacted);
-            while history.len() > crate::consensus_adapter::MAX_CLOSED_LEDGERS {
-                history.pop_front();
-            }
-
-            // Ledger history pruning
-            if pruner.should_prune(closed_seq) {
-                if let Some(store) = node_store {
-                    let retention = pruner.shared_state().retention_window;
-                    let cutoff_seq = closed_seq.saturating_sub(retention);
-
-                    let old: Vec<_> = history
-                        .iter()
-                        .filter(|l| l.header.sequence <= cutoff_seq)
-                        .cloned()
-                        .collect();
-
-                    let retained = history.iter().find(|l| l.header.sequence > cutoff_seq);
-
-                    let _deleted = pruner.prune(closed_seq, &old, retained, store);
-                }
-            }
+        let mut history = closed_ledgers.write().await;
+        let mut compacted = closed;
+        compacted.compact();
+        history.push_back(compacted);
+        while history.len() > crate::consensus_adapter::MAX_CLOSED_LEDGERS {
+            history.pop_front();
         }
 
-        // Surface the new validated tip on the WS event stream AFTER the
-        // ledger is in `closed_ledgers`, so subscribers (kurtosis dashboard,
-        // ops tooling) that re-poll `server_info` upon receiving
-        // `ledgerClosed` always see a `complete_ledgers` range that contains
-        // `ledger_index`. See the deferred-emit note above.
-        let _ = event_tx.send(ServerEvent::LedgerClosed {
-            ledger_index: closed_seq,
-            ledger_hash: hash,
-            ledger_time: effective_close_time,
-            txn_count: tx_count,
-        });
+        // Ledger history pruning
+        if pruner.should_prune(closed_seq) {
+            if let Some(store) = node_store {
+                let retention = pruner.shared_state().retention_window;
+                let cutoff_seq = closed_seq.saturating_sub(retention);
+
+                let old: Vec<_> = history
+                    .iter()
+                    .filter(|l| l.header.sequence <= cutoff_seq)
+                    .cloned()
+                    .collect();
+
+                let retained = history.iter().find(|l| l.header.sequence > cutoff_seq);
+
+                let _deleted = pruner.prune(closed_seq, &old, retained, store);
+            }
+        }
     }
 
     /// Attempt to reconstruct a closed ledger from downloaded leaf nodes.
