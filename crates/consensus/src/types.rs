@@ -205,9 +205,22 @@ pub struct TxSet {
 
 impl TxSet {
     pub fn new(txs: Vec<Hash256>) -> Self {
-        // Compute hash from sorted tx hashes
+        // Compute hash from sorted tx hashes.
+        //
+        // Empty tx set: rippled uses the canonical empty-SHAMap root hash
+        // `Hash256::ZERO` (32 zero bytes) for `transaction_hash` in
+        // ProposeSet messages with no transactions. Using `sha512_half(&[])`
+        // here would produce `CF83E135…` (SHA-512-half of the empty input),
+        // which makes our empty-round proposals never agree with rippled's
+        // and stalls mixed-validator consensus (issue #76 follow-up).
         let mut sorted = txs.clone();
         sorted.sort();
+        if sorted.is_empty() {
+            return Self {
+                hash: Hash256::ZERO,
+                txs: sorted,
+            };
+        }
         let mut data = Vec::with_capacity(sorted.len() * 32);
         for tx in &sorted {
             data.extend_from_slice(tx.as_bytes());
