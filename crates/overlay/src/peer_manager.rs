@@ -226,6 +226,15 @@ impl PeerManager {
         (mgr, cmd_tx, consensus_rx)
     }
 
+    /// Clone the internal consensus-message sender so callers (typically the
+    /// node's close path) can inject synthetic `ConsensusMessage` values into
+    /// the consensus loop's input queue. This lets the local close handler
+    /// feed its own freshly-signed validation back into the same path used
+    /// for peer-received validations, so it counts toward UNL quorum.
+    pub fn consensus_sender(&self) -> mpsc::UnboundedSender<ConsensusMessage> {
+        self.consensus_tx.clone()
+    }
+
     /// Set a ledger provider for serving GetLedger requests.
     pub fn set_ledger_provider(&mut self, provider: Arc<dyn LedgerProvider>) {
         self.ledger_provider = Some(provider);

@@ -996,6 +996,16 @@ impl Node {
             rxrpl_rpc_server::context::LastCloseSnapshot::default(),
         ));
         ctx.attach_last_close(Arc::clone(&last_close_arc));
+        // Network-validated tip: refreshed in the consensus loop when
+        // ValidationAggregator reaches UNL quorum for a new seq. Reading
+        // this in `server_info` keeps `validated_ledger` honest — it
+        // reports what the UNL has agreed on, not what this node has
+        // merely closed locally. Stays at default (seq=0) until the first
+        // quorum lands.
+        let network_validated_arc = Arc::new(std::sync::RwLock::new(
+            rxrpl_rpc_server::NetworkValidatedSnapshot::default(),
+        ));
+        ctx.attach_network_validated(Arc::clone(&network_validated_arc));
         // B5: expose the local manifest to the RPC `manifest` handler.
         if let Some(vid) = validator_id.as_deref() {
             let seq = self.config.validator_identity.sequence.max(1);
@@ -1142,6 +1152,11 @@ impl Node {
             });
         }
 
+        // Capture the consensus-message sender before peer_mgr moves into
+        // the spawned task; the close path uses it to self-inject our own
+        // freshly-signed validations so they count toward UNL quorum.
+        let self_validation_tx = peer_mgr.consensus_sender();
+
         // 6. Spawn PeerManager
         tokio::spawn(async move {
             if let Err(e) = peer_mgr.run().await {
@@ -1204,6 +1219,7 @@ impl Node {
         let pruner = Arc::clone(&self.pruner);
         let ledger_seq_shared = Arc::clone(&ledger_seq);
         let ledger_hash_shared = Arc::clone(&ledger_hash);
+        let network_validated_for_loop = Arc::clone(&network_validated_arc);
         let configured_quorum = self.config.validators.quorum;
         let trusted_validators_for_aggregator = if self.config.validators.require_trusted_validators
             && !self.config.validators.validator_list_sites.is_empty()
@@ -1487,6 +1503,7 @@ impl Node {
                                             &amendment_table, &tx_engine, &fees,
                                             &amendment_votes, trusted_validator_count,
                                             &pruner, &node_store,
+                                            &self_validation_tx,
                                         ).await;
                                         if let Ok(mut lc) = last_close_arc.write() {
                                             lc.proposers = proposers_this_round;
@@ -1523,6 +1540,7 @@ impl Node {
                                             &amendment_table, &tx_engine, &fees,
                                             &amendment_votes, trusted_validator_count,
                                             &pruner, &node_store,
+                                            &self_validation_tx,
                                         ).await;
                                         if let Ok(mut lc) = last_close_arc.write() {
                                             lc.proposers = proposers_this_round;
@@ -1725,6 +1743,58 @@ impl Node {
                                         validated.seq, validated.hash, validated.validation_count
                                     );
                                     let our_seq = ledger_seq_shared.load(Ordering::Relaxed);
+
+                                    // Look up the matching closed ledger so the
+                                    // network-validated snapshot and the
+                                    // `LedgerClosed` event carry the actual
+                                    // close_time + tx count. Peers may validate
+                                    // a hash we haven't reconstructed yet — in
+                                    // that case we still publish the seq/hash
+                                    // (close_time=0) so dashboards see the
+                                    // network is ahead; the proper fields fill
+                                    // in once catchup adopts the matching ledger.
+                                    let (close_time, txn_count) = {
+                                        let history = closed_ledgers.read().await;
+                                        history
+                                            .iter()
+                                            .find(|l| {
+                                                l.header.sequence == validated.seq
+                                                    && l.header.hash == validated.hash
+                                            })
+                                            .map(|l| {
+                                                let mut c = 0u32;
+                                                l.tx_map.for_each(&mut |_, _| c += 1);
+                                                (l.header.close_time, c)
+                                            })
+                                            .unwrap_or((0u32, 0u32))
+                                    };
+
+                                    // Publish the validated tip so `server_info`
+                                    // can report it as `validated_ledger` and
+                                    // cap `complete_ledgers`. Monotone advance
+                                    // only — `add_validation` already returns
+                                    // Some at most once per (seq,hash), but a
+                                    // future cleanup could relax that, and the
+                                    // monotone guard makes this future-proof.
+                                    if let Ok(mut guard) = network_validated_for_loop.write() {
+                                        if validated.seq > guard.seq {
+                                            guard.seq = validated.seq;
+                                            guard.hash = validated.hash;
+                                            guard.close_time = close_time;
+                                            // Emit the network-validated
+                                            // `LedgerClosed` event. This is the
+                                            // single source of truth for the
+                                            // `ledger` subscribe stream in
+                                            // networked mode; the local-close
+                                            // path no longer emits.
+                                            let _ = event_tx.send(ServerEvent::LedgerClosed {
+                                                ledger_index: validated.seq,
+                                                ledger_hash: validated.hash,
+                                                ledger_time: close_time,
+                                                txn_count,
+                                            });
+                                        }
+                                    }
 
                                     // If the network is ahead, enter sync mode
                                     if validated.seq >= our_seq && !syncing {
@@ -2157,6 +2227,9 @@ impl Node {
         trusted_validator_count: usize,
         pruner: &Arc<LedgerPruner>,
         node_store: &Option<Arc<dyn NodeStore>>,
+        self_validation_tx: &tokio::sync::mpsc::UnboundedSender<
+            rxrpl_overlay::ConsensusMessage,
+        >,
     ) {
         // Resolve close_time in priority order:
         //  1. Quorum-accepted close_time from converge() — strongest signal,
@@ -2265,12 +2338,15 @@ impl Node {
             });
         }
 
-        let _ = event_tx.send(ServerEvent::LedgerClosed {
-            ledger_index: closed_seq,
-            ledger_hash: hash,
-            ledger_time: effective_close_time,
-            txn_count: tx_count,
-        });
+        // NOTE: ServerEvent::LedgerClosed is intentionally NOT emitted here.
+        // In networked mode, local close is just the first vote — the round
+        // is only "closed" from the network's perspective once UNL quorum
+        // is reached. The emit happens in the `ConsensusMessage::Validation`
+        // handler when `ValidationAggregator` returns the first
+        // quorum-reaching validation for this seq. That keeps the
+        // `validated_ledger` field and the `ledger` subscribe stream honest
+        // about what the network has actually agreed on (rather than what
+        // this node has merely closed locally).
 
         // Emit path_find update after ledger close
         let _ = event_tx.send(ServerEvent::PathFindUpdate {
@@ -2329,6 +2405,16 @@ impl Node {
                 msg_type: rxrpl_p2p_proto::MessageType::Validation,
                 payload,
             });
+
+            // Self-inject the same validation into our own consensus loop so
+            // it counts toward UNL quorum locally. Peer broadcast does not
+            // loop back through `consensus_tx`, so without this our
+            // aggregator would max out at (UNL_size - 1) votes per ledger
+            // and never reach quorum=ceil(N*0.8) when N=4 (mixed kurtosis:
+            // 2 rxrpl + 2 rippled). Rippled does the equivalent in
+            // `Validations::add` from its own onAccept path.
+            let _ = self_validation_tx
+                .send(rxrpl_overlay::ConsensusMessage::Validation(validation));
         }
 
         // Broadcast StatusChange so peers know our current ledger and our

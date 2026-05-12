@@ -14,6 +14,13 @@ struct ClosedLedgersSummary {
 }
 
 async fn closed_ledgers_summary(ctx: &Arc<ServerContext>) -> ClosedLedgersSummary {
+    // When a network-validated tip is published (networked mode after the
+    // first quorum), it is authoritative: `validated_ledger.seq` must reflect
+    // what the UNL has agreed on, and `complete_ledgers` is capped to that
+    // tip so peers don't ask us for locally-closed-but-unvalidated ancestors.
+    // In standalone (no slot attached) or before the first quorum is reached,
+    // fall back to the locally-closed window — that's all the truth we have.
+    let net = ctx.network_validated();
     if let Some(ref closed) = ctx.closed_ledgers {
         let closed = closed.read().await;
         if closed.is_empty() {
@@ -24,26 +31,57 @@ async fn closed_ledgers_summary(ctx: &Arc<ServerContext>) -> ClosedLedgersSummar
             };
         }
         let first = closed.front().unwrap().header.sequence;
-        let last_ledger = closed.back().unwrap();
-        let last = last_ledger.header.sequence;
-        let validated = serde_json::json!({
-            "seq": last,
-            "hash": last_ledger.header.hash.to_string(),
-            "close_time": last_ledger.header.close_time,
-            "base_fee_xrp": 0.00001,
-            "reserve_base_xrp": 10,
-            "reserve_inc_xrp": 2,
-        });
-        return ClosedLedgersSummary {
-            complete_ledgers: format!("{first}-{last}"),
-            last_seq: last,
-            validated_ledger: Some(validated),
-        };
-    }
-    ClosedLedgersSummary {
-        complete_ledgers: "empty".to_string(),
-        last_seq: 1,
-        validated_ledger: None,
+        match net {
+            Some(snap) => {
+                let cap = snap.seq;
+                if cap < first {
+                    // Validated tip is older than what we hold (shouldn't
+                    // normally happen). Report empty rather than lie about
+                    // a range we cannot serve as validated.
+                    return ClosedLedgersSummary {
+                        complete_ledgers: "empty".to_string(),
+                        last_seq: 1,
+                        validated_ledger: None,
+                    };
+                }
+                let validated = serde_json::json!({
+                    "seq": snap.seq,
+                    "hash": snap.hash.to_string(),
+                    "close_time": snap.close_time,
+                    "base_fee_xrp": 0.00001,
+                    "reserve_base_xrp": 10,
+                    "reserve_inc_xrp": 2,
+                });
+                ClosedLedgersSummary {
+                    complete_ledgers: format!("{first}-{cap}"),
+                    last_seq: cap,
+                    validated_ledger: Some(validated),
+                }
+            }
+            None => {
+                let last_ledger = closed.back().unwrap();
+                let last = last_ledger.header.sequence;
+                let validated = serde_json::json!({
+                    "seq": last,
+                    "hash": last_ledger.header.hash.to_string(),
+                    "close_time": last_ledger.header.close_time,
+                    "base_fee_xrp": 0.00001,
+                    "reserve_base_xrp": 10,
+                    "reserve_inc_xrp": 2,
+                });
+                ClosedLedgersSummary {
+                    complete_ledgers: format!("{first}-{last}"),
+                    last_seq: last,
+                    validated_ledger: Some(validated),
+                }
+            }
+        }
+    } else {
+        ClosedLedgersSummary {
+            complete_ledgers: "empty".to_string(),
+            last_seq: 1,
+            validated_ledger: None,
+        }
     }
 }
 
