@@ -78,7 +78,15 @@ pub async fn server_info(
         "ledger_current_index": current_index,
         "proposing": proposing,
         "am_validator": proposing,
+        "peers": ctx.peer_count(),
+        "uptime": ctx.uptime_seconds(),
     });
+    if let Some(lc) = ctx.last_close() {
+        info["last_close"] = serde_json::json!({
+            "proposers": lc.proposers,
+            "converge_time_s": lc.converge_time_s,
+        });
+    }
     if let Some(v) = summary.validated_ledger {
         info["validated_ledger"] = v;
     }

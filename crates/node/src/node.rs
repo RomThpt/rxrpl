@@ -986,6 +986,16 @@ impl Node {
         );
         ctx.attach_validator_list_status(Arc::clone(&vl_status));
         ctx.attach_network_id(self.config.network.network_id);
+        // Peer set: shared with the overlay so `server_info.peers` reads the
+        // live connection count.
+        ctx.attach_peer_set(peer_mgr.peer_set());
+        // Last-close snapshot: populated below by close_consensus_round on
+        // each accepted round (proposer count + converge duration). Surfaced
+        // as `server_info.last_close`.
+        let last_close_arc = Arc::new(std::sync::RwLock::new(
+            rxrpl_rpc_server::context::LastCloseSnapshot::default(),
+        ));
+        ctx.attach_last_close(Arc::clone(&last_close_arc));
         // B5: expose the local manifest to the RPC `manifest` handler.
         if let Some(vid) = validator_id.as_deref() {
             let seq = self.config.validator_identity.sequence.max(1);
@@ -1267,6 +1277,11 @@ impl Node {
             // because it depends on `self.config` which doesn't escape the
             // closure.
             let mut first_close_completed: bool = false;
+            // Marks the wall-clock instant the current open phase started.
+            // Set when the round timer enters CloseLedger for a new seq;
+            // read on close_consensus_round to populate
+            // `server_info.last_close.converge_time_s`.
+            let mut round_started_at: Option<tokio::time::Instant> = None;
             let startup_instant = tokio::time::Instant::now();
             // Tracks last observed peer StatusChange. Still updated for
             // diagnostics but no longer gates close (PR2: always-active
@@ -1394,6 +1409,7 @@ impl Node {
 
                                     if last_round_seq != seq {
                                         last_round_seq = seq;
+                                        round_started_at = Some(tokio::time::Instant::now());
                                     }
 
                                     // Cross-impl close_time selection priority:
@@ -1460,6 +1476,8 @@ impl Node {
                                         let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
                                             phase: "accepted".into(),
                                         });
+                                        let proposers_this_round =
+                                            consensus.peer_position_count() as u32;
                                         Self::close_consensus_round(
                                             &mut consensus, pending_close_time, &ledger,
                                             &closed_ledgers, &tx_store, &event_tx,
@@ -1470,6 +1488,13 @@ impl Node {
                                             &amendment_votes, trusted_validator_count,
                                             &pruner, &node_store,
                                         ).await;
+                                        if let Ok(mut lc) = last_close_arc.write() {
+                                            lc.proposers = proposers_this_round;
+                                            lc.converge_time_s = round_started_at
+                                                .map(|t| t.elapsed().as_secs_f64())
+                                                .unwrap_or(0.0);
+                                        }
+                                        round_started_at = None;
                                         stall_metrics.reset_consecutive();
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
@@ -1487,6 +1512,8 @@ impl Node {
                                         let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
                                             phase: "accepted".into(),
                                         });
+                                        let proposers_this_round =
+                                            consensus.peer_position_count() as u32;
                                         Self::close_consensus_round(
                                             &mut consensus, pending_close_time, &ledger,
                                             &closed_ledgers, &tx_store, &event_tx,
@@ -1497,6 +1524,13 @@ impl Node {
                                             &amendment_votes, trusted_validator_count,
                                             &pruner, &node_store,
                                         ).await;
+                                        if let Ok(mut lc) = last_close_arc.write() {
+                                            lc.proposers = proposers_this_round;
+                                            lc.converge_time_s = round_started_at
+                                                .map(|t| t.elapsed().as_secs_f64())
+                                                .unwrap_or(0.0);
+                                        }
+                                        round_started_at = None;
                                         stall_metrics.reset_consecutive();
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;

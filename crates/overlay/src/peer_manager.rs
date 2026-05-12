@@ -267,6 +267,12 @@ impl PeerManager {
 
     /// The local validator manifest, if [`set_local_manifest`] has been
     /// called.
+    /// Shared handle to the live peer set. RPC handlers can call `.len()` on
+    /// this to surface `server_info.peers` without polling internal state.
+    pub fn peer_set(&self) -> Arc<crate::peer_set::PeerSet> {
+        Arc::clone(&self.peer_set)
+    }
+
     pub fn local_manifest(&self) -> Option<&crate::manifest::Manifest> {
         self.manifest_store.local()
     }

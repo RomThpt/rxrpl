@@ -88,7 +88,28 @@ pub struct ServerContext {
     /// the OnceLock makes the post-Arc-construction set possible without
     /// interior mutability for every field.
     local_manifest: OnceLock<Arc<LocalManifestSnapshot>>,
+    /// Shared peer set, populated by the overlay layer. `None` in standalone
+    /// mode (no P2P). The `server_info.peers` field reads `.len()` at query
+    /// time so dashboards see the current count without polling overhead.
+    peer_set: Option<Arc<rxrpl_overlay::peer_set::PeerSet>>,
+    /// Snapshot of the last completed consensus round (proposer count and
+    /// convergence duration), refreshed by Node on each `close_consensus_round`.
+    /// `None` until the first close completes. Used by the kurtosis dashboard
+    /// to surface live consensus stats via `server_info.last_close`.
+    last_close: Option<Arc<std::sync::RwLock<LastCloseSnapshot>>>,
+    /// Wall-clock instant the server was constructed; used to compute
+    /// `server_info.uptime` in seconds.
+    startup_instant: std::time::Instant,
     event_tx: broadcast::Sender<ServerEvent>,
+}
+
+/// Last consensus-round summary exposed via `server_info.last_close`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LastCloseSnapshot {
+    /// Number of UNL peers that proposed in the round (excluding self).
+    pub proposers: u32,
+    /// Time from round open to acceptance, in seconds.
+    pub converge_time_s: f64,
 }
 
 /// Snapshot of the local validator manifest exposed via the `manifest` RPC.
@@ -133,6 +154,9 @@ impl ServerContext {
             domain_attestation_status: None,
             network_id: None,
             local_manifest: OnceLock::new(),
+            peer_set: None,
+            last_close: None,
+            startup_instant: std::time::Instant::now(),
             event_tx,
         })
     }
@@ -170,6 +194,9 @@ impl ServerContext {
             domain_attestation_status: None,
             network_id: None,
             local_manifest: OnceLock::new(),
+            peer_set: None,
+            last_close: None,
+            startup_instant: std::time::Instant::now(),
             event_tx,
         })
     }
@@ -208,6 +235,9 @@ impl ServerContext {
             domain_attestation_status: None,
             network_id: None,
             local_manifest: OnceLock::new(),
+            peer_set: None,
+            last_close: None,
+            startup_instant: std::time::Instant::now(),
             event_tx,
         })
     }
@@ -246,6 +276,9 @@ impl ServerContext {
             domain_attestation_status: None,
             network_id: None,
             local_manifest: OnceLock::new(),
+            peer_set: None,
+            last_close: None,
+            startup_instant: std::time::Instant::now(),
             event_tx,
         })
     }
@@ -277,6 +310,9 @@ impl ServerContext {
             domain_attestation_status: None,
             network_id: None,
             local_manifest: OnceLock::new(),
+            peer_set: None,
+            last_close: None,
+            startup_instant: std::time::Instant::now(),
             event_tx,
         })
     }
@@ -334,5 +370,54 @@ impl ServerContext {
     /// Get the local validator manifest snapshot, if set.
     pub fn local_manifest(&self) -> Option<&LocalManifestSnapshot> {
         self.local_manifest.get().map(|arc| arc.as_ref())
+    }
+
+    /// Attach the overlay's PeerSet so `server_info.peers` reflects live
+    /// connection count. Standalone mode leaves this `None` → peers=0.
+    /// Same Arc::get_mut constraint as `attach_validator_list_status`.
+    pub fn attach_peer_set(
+        self: &mut Arc<Self>,
+        set: Arc<rxrpl_overlay::peer_set::PeerSet>,
+    ) {
+        if let Some(ctx) = Arc::get_mut(self) {
+            ctx.peer_set = Some(set);
+        }
+    }
+
+    /// Current peer count, or 0 when no PeerSet is attached.
+    pub fn peer_count(&self) -> usize {
+        self.peer_set.as_ref().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Attach a shared last-close snapshot (populated by Node on each
+    /// `close_consensus_round`). Same Arc::get_mut constraint as
+    /// `attach_validator_list_status`.
+    pub fn attach_last_close(
+        self: &mut Arc<Self>,
+        slot: Arc<std::sync::RwLock<LastCloseSnapshot>>,
+    ) {
+        if let Some(ctx) = Arc::get_mut(self) {
+            ctx.last_close = Some(slot);
+        }
+    }
+
+    /// Read the current last-close snapshot if a slot is attached and has been
+    /// populated at least once.
+    pub fn last_close(&self) -> Option<LastCloseSnapshot> {
+        self.last_close.as_ref().and_then(|slot| {
+            slot.read().ok().and_then(|guard| {
+                if guard.converge_time_s > 0.0 || guard.proposers > 0 {
+                    Some(*guard)
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
+    /// Seconds elapsed since the context was constructed (used as
+    /// `server_info.uptime`).
+    pub fn uptime_seconds(&self) -> u64 {
+        self.startup_instant.elapsed().as_secs()
     }
 }

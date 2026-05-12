@@ -20,6 +20,7 @@ rxrpl-txq = { workspace = true }
 rxrpl-crypto = { workspace = true }
 rxrpl-pathfind = { workspace = true }
 rxrpl-nodestore = { workspace = true }
+rxrpl-overlay = { workspace = true }
 rand = "0.8"
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
@@ -40,4 +41,3 @@ once_cell = "1"
 
 [dev-dependencies]
 tokio = { workspace = true }
-rxrpl-overlay = { workspace = true }
