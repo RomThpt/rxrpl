@@ -32,7 +32,14 @@ impl Default for ConsensusParams {
             initial_threshold: 50,
             threshold_increase: 10,
             max_threshold: 80,
-            max_consensus_rounds: 10,
+            // Establish window = propose_interval_ms * max_consensus_rounds
+            // = 1.25s * 25 = ~31s. Must exceed rippled-2.6.2's `idle_interval`
+            // of 20s so rxrpl waits long enough to observe rippled's first
+            // ProposeSet of the round before falling through to force-accept.
+            // The engine's `peer_positions.is_empty()` guard prevents fork-on-
+            // timeout in the UNL case; this raises the natural window so the
+            // guard is rarely needed in practice.
+            max_consensus_rounds: 25,
             close_time_resolution: 30,
         }
     }

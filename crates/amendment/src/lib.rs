@@ -5,13 +5,16 @@
 /// - `FeatureRegistry`: Static registry of all known amendments
 /// - `AmendmentTable`: Runtime voting and activation tracking
 /// - `Rules`: Immutable snapshot of enabled amendments for a ledger
+pub mod config;
 pub mod error;
 pub mod feature;
+pub mod presets;
 pub mod registry;
 pub mod rules;
 pub mod table;
 pub mod voting;
 
+pub use config::AmendmentConfig;
 pub use error::AmendmentError;
 pub use feature::{Feature, feature_id};
 pub use registry::FeatureRegistry;

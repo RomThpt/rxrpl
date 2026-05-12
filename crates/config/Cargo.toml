@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+rxrpl-amendment = { workspace = true }
 rxrpl-crypto = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

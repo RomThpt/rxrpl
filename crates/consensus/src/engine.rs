@@ -100,6 +100,14 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     negative_unl_tracker: NegativeUnlTracker,
     /// Proposals received while not in Establish phase, replayed on close.
     pending_proposals: Vec<Proposal>,
+    /// Number of `converge()` calls since we last re-broadcast our position.
+    /// Periodic re-broadcast (every N converge ticks) keeps our proposal
+    /// fresh in peers' buffers so peers with a longer idle interval (e.g.
+    /// rippled's 20s) see our position within their own Establish window,
+    /// not the stale proposal we emitted ~18s before they opened the round
+    /// (issue #76 — `prev_proposers` jumps from 1 to 3 when a fresh proposal
+    /// reaches rippled mid-Establish).
+    ticks_since_share: u32,
     /// Tracks proposals from trusted peers that reference a different
     /// `prev_ledger` than ours. Keyed by (node_id -> their prev_ledger).
     /// Used to detect when we are on the wrong chain.
@@ -220,6 +228,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             unl,
             negative_unl_tracker: NegativeUnlTracker::new(),
             pending_proposals: Vec::new(),
+            ticks_since_share: 0,
             wrong_prev_ledger_votes: HashMap::new(),
             validations_trie,
             prev_ledger_seq: 0,
@@ -630,6 +639,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.proposal_tracker.clear_for(&self.prev_ledger);
         self.disputes.clear();
         self.round = 0;
+        self.ticks_since_share = 0;
         self.prev_ledger = prev_ledger;
         // The new round produces ledger `ledger_seq`; its parent
         // (prev_ledger) therefore lives at `ledger_seq - 1`. Anchor the
@@ -1050,9 +1060,13 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
     /// widening: when nodes are split across buckets (e.g. 1-1 in a
     /// 2-validator setup) no realignment fires and the spread/flag
     /// detection in `accept()` still sees the disagreement.
-    fn align_close_time_with_peers(&mut self) {
+    /// Returns `true` if our position's close_time was changed to match the
+    /// peer-popular bucket. The caller can use this signal to re-broadcast
+    /// the updated position so peers see our new bucket within their own
+    /// Establish window.
+    fn align_close_time_with_peers(&mut self) -> bool {
         if self.our_position.is_none() || self.peer_positions.is_empty() {
-            return;
+            return false;
         }
         let resolution = self.adaptive_close_time.resolution();
         let prior = self.prior_close_time;
@@ -1088,7 +1102,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         }
 
         if votes.is_empty() {
-            return;
+            return false;
         }
 
         // Denominator includes filtered voters too: a peer that sent a
@@ -1108,8 +1122,15 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         }
         // Strict majority (>50%) before realigning. Below that, leave
         // our_position alone so the disagreement signal survives.
-        if best_count * 2 <= total {
-            return;
+        // Exception: explicit 2-voter UNL (us + 1 peer) where 1-1 ties
+        // would block realignment forever and force max_consensus_rounds
+        // force-accept every round (~12s/ledger). In that case adopt the
+        // latest bucket on ties so both positions converge in one round.
+        // Gated on a non-empty UNL so unit tests with implicit voters
+        // (empty UNL) keep rippled-compat disagreement-preserve semantics.
+        let allow_tie_realign = total == 2 && !self.unl.is_empty();
+        if best_count * 2 < total || (!allow_tie_realign && best_count * 2 == total) {
+            return false;
         }
         if let Some(ref mut pos) = self.our_position {
             if pos.close_time != best_bucket {
@@ -1119,8 +1140,10 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
                     best_bucket
                 );
                 pos.close_time = best_bucket;
+                return true;
             }
         }
+        false
     }
 
     /// Run one round of convergence.
@@ -1137,7 +1160,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         // rippled's RCL — without it, two independently-clocked
         // validators each propose their own close_time forever and the
         // closed-ledger hash never matches the peer's.
-        self.align_close_time_with_peers();
+        let close_realigned = self.align_close_time_with_peers();
 
         let threshold = self.params.threshold_for_round(self.round);
         // Per-tx dispute resolution uses rippled's avalanche cascade
@@ -1173,12 +1196,32 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
                     pos.tx_set_hash = our_set.hash;
                     pos.prop_seq += 1;
                     self.adapter.share_position(pos);
+                    self.ticks_since_share = 0;
                 }
                 // Update dispute our_vote to match new reality
                 for dispute in self.disputes.values_mut() {
                     let in_set = our_set.txs.contains(&dispute.tx_hash);
                     dispute.our_vote = in_set;
                 }
+            }
+        }
+
+        // Periodic re-broadcast: if our close_time was realigned this tick OR
+        // we haven't shared in PROPOSAL_REFRESH_TICKS converge calls, push our
+        // current position so peers in a slower idle phase (rippled's 20s
+        // vs our 2s) see a fresh proposal within their Establish window.
+        // Without this, peers count us only when our single initial proposal
+        // happens to land mid-Establish (issue #76 — `prev_proposers`
+        // oscillating 1↔3).
+        const PROPOSAL_REFRESH_TICKS: u32 = 3;
+        self.ticks_since_share = self.ticks_since_share.saturating_add(1);
+        let needs_refresh =
+            close_realigned || self.ticks_since_share >= PROPOSAL_REFRESH_TICKS;
+        if needs_refresh && !set_changed {
+            if let Some(ref mut pos) = self.our_position {
+                pos.prop_seq = pos.prop_seq.saturating_add(1);
+                self.adapter.share_position(pos);
+                self.ticks_since_share = 0;
             }
         }
 
@@ -1228,8 +1271,17 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
 
         self.round += 1;
 
-        // If we've exceeded max rounds, accept anyway
+        // If we've exceeded max rounds, accept anyway — but ONLY if we have
+        // at least one peer position. Otherwise we'd validate a ledger alone
+        // with our own close_time, fork from peers, and force a recovery cycle
+        // every round (~14s/ledger). With no peers known yet (e.g. first round
+        // before peer's first proposal arrives), keep waiting; share_position
+        // to nudge peers, and let the timer's stall_timeout abort if needed.
         if self.round >= self.params.max_consensus_rounds {
+            if self.peer_positions.is_empty() && !self.unl.is_empty() {
+                self.round = self.params.max_consensus_rounds;
+                return false;
+            }
             self.accept();
             return true;
         }

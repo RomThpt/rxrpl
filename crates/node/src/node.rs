@@ -144,7 +144,11 @@ impl Node {
 
         // Initialize amendment registry
         let registry = FeatureRegistry::with_known_amendments();
-        let amendment_table = AmendmentTable::new(&registry, 14 * 24 * 60 * 4); // ~14 days at 4s/ledger
+        let mut amendment_table = AmendmentTable::new(&registry, 14 * 24 * 60 * 4); // ~14 days at 4s/ledger
+        config
+            .amendments
+            .apply(&registry, &mut amendment_table)
+            .map_err(|e| NodeError::Config(format!("amendments: {e}")))?;
 
         // Initialize transaction engine with all handlers
         let mut tx_registry = TransactorRegistry::new();
@@ -202,7 +206,11 @@ impl Node {
         let node_store = Self::create_node_store(&config)?;
 
         let registry = FeatureRegistry::with_known_amendments();
-        let amendment_table = AmendmentTable::new(&registry, 14 * 24 * 60 * 4);
+        let mut amendment_table = AmendmentTable::new(&registry, 14 * 24 * 60 * 4);
+        config
+            .amendments
+            .apply(&registry, &mut amendment_table)
+            .map_err(|e| NodeError::Config(format!("amendments: {e}")))?;
 
         let mut tx_registry = TransactorRegistry::new();
         rxrpl_tx_engine::handlers::register_phase_a(&mut tx_registry);
@@ -860,8 +868,18 @@ impl Node {
         let cmd_tx_relay = cmd_tx.clone();
         let cmd_tx_catchup = cmd_tx.clone();
 
-        // 5. Create NetworkConsensusAdapter (consumes cmd_tx)
-        let adapter = NetworkConsensusAdapter::new(cmd_tx, Arc::clone(&identity));
+        // 5. Create NetworkConsensusAdapter (consumes cmd_tx). When a
+        // validator identity is configured, attach it so that proposals are
+        // signed with the manifest-bound ephemeral signing key (issue #76 —
+        // rippled drops proposals signed with the node peer key as
+        // untrusted).
+        let adapter = {
+            let base = NetworkConsensusAdapter::new(cmd_tx, Arc::clone(&identity));
+            match validator_id.as_ref() {
+                Some(vid) => base.with_validator_identity(Arc::clone(vid)),
+                None => base,
+            }
+        };
 
         // 5b. Share the adapter's tx-set cache with the peer manager so it can
         // check for locally known sets and store newly acquired ones.
@@ -1220,10 +1238,22 @@ impl Node {
             let node_id = NodeId(identity.node_id);
             let consensus_params = ConsensusParams::default();
             let mut timer = ConsensusTimer::new(&consensus_params);
+            // The engine's `public_key` is echoed verbatim into every emitted
+            // ProposeSet `node_pub_key`. For UNL-trusted proposals to be
+            // counted by rippled, it MUST be the manifest-bound signing key
+            // (rippled looks the key up in its trusted-validator set). Use
+            // the validator ephemeral signing pubkey when available; fall
+            // back to the node pubkey for non-validator operation. Pair with
+            // `NetworkConsensusAdapter::with_validator_identity` which
+            // signs with the matching private key.
+            let consensus_pubkey = match validator_id_for_loop.as_ref() {
+                Some(vid) => vid.signing_pubkey().as_bytes().to_vec(),
+                None => identity.public_key_bytes().to_vec(),
+            };
             let mut consensus = ConsensusEngine::new_with_unl(
                 adapter,
                 node_id,
-                identity.public_key_bytes().to_vec(),
+                consensus_pubkey,
                 consensus_params,
                 unl,
             );
@@ -1238,24 +1268,11 @@ impl Node {
             // closure.
             let mut first_close_completed: bool = false;
             let startup_instant = tokio::time::Instant::now();
-            // Cross-impl close-race guard: track last time we observed a peer
-            // StatusChange. If peer is alive but BEHIND our open seq, defer
-            // close to give peer time to advance — that way peer announces
-            // first and rxrpl yields/adopts (deterministic convergence) instead
-            // of racing peer with own close (which risks close_time bucket
-            // mismatch and divergent hashes). Capped at PEER_WAIT_GRACE so a
-            // truly offline peer doesn't block us forever.
+            // Tracks last observed peer StatusChange. Still updated for
+            // diagnostics but no longer gates close (PR2: always-active
+            // proposer for mixed-validator support).
             let mut last_peer_status_at: Option<tokio::time::Instant> = None;
-            // round_open_at: timestamp when the current open seq was opened.
-            // Used to bound how long we'll defer close waiting for peer.
-            let mut round_open_at: Option<tokio::time::Instant> = None;
             let mut last_round_seq: u32 = 0;
-            const PEER_WAIT_GRACE: Duration = Duration::from_secs(30);
-            const PEER_ALIVE_WINDOW: Duration = Duration::from_secs(30);
-            // Counter for how many close ticks we've deferred waiting for a
-            // peer position. Caps the wait at ~10s extra so an offline peer
-            // doesn't block our progress forever.
-            let close_deferrals: u32 = 0;
             // Cache of LedgerHeader objects parsed from peer liBASE responses.
             // We need the full header (parent_hash, parent_close_time,
             // close_time, drops, close_time_resolution, close_flags) when
@@ -1375,9 +1392,7 @@ impl Node {
                                     let parent_close_time = l.header.parent_close_time;
                                     drop(l);
 
-                                    // Reset round timer when seq advances (new open ledger).
                                     if last_round_seq != seq {
-                                        round_open_at = Some(tokio::time::Instant::now());
                                         last_round_seq = seq;
                                     }
 
@@ -1402,57 +1417,19 @@ impl Node {
                                     }
                                     .max(parent_close_time.saturating_add(1));
 
-                                    // Cross-impl close strategy:
-                                    //  1) peer ahead/equal (max_peer_seq >= seq) → yield + adopt
-                                    //     peer's chain. Broadcast our validation for adopted hash
-                                    //     so peer reaches quorum.
-                                    //  2) peer behind (max_peer_seq < seq) AND peer alive (recent
-                                    //     StatusChange) AND we haven't waited too long → defer
-                                    //     to let peer advance to our seq. Avoids the close_time
-                                    //     race where we close before peer announces and produce
-                                    //     a divergent bucket → divergent hash.
-                                    //  3) peer behind AND (peer dead OR waited too long) →
-                                    //     close own.
-                                    let peer_alive = last_peer_status_at
-                                        .map(|t| t.elapsed() < PEER_ALIVE_WINDOW)
-                                        .unwrap_or(false);
-                                    let peer_at_or_past = max_peer_seq > 0 && max_peer_seq >= seq;
-                                    let waited = round_open_at
-                                        .map(|t| t.elapsed())
-                                        .unwrap_or(Duration::ZERO);
-                                    let peer_behind_alive = max_peer_seq > 0
-                                        && max_peer_seq < seq
-                                        && peer_alive
-                                        && waited < PEER_WAIT_GRACE;
-                                    if peer_behind_alive {
-                                        tracing::debug!(
-                                            "deferring close: peer at seq {} < our seq {}, waited {:?}",
-                                            max_peer_seq, seq, waited
-                                        );
-                                        timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
-                                        continue;
-                                    }
-                                    if peer_at_or_past {
-                                        tracing::debug!(
-                                            "yielding close: peer at seq {} >= our open seq {}",
-                                            max_peer_seq, seq
-                                        );
-                                        timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
-                                        let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
-                                            seq,
-                                            hash: None,
-                                        });
-                                        continue;
-                                    }
-
-                                    // Wait-for-peer-position removed: empirically, rippled never
-                                    // sends a proposal during the open phase (only after closing
-                                    // alone). So waiting for peer_positions deadlocks rxrpl into
-                                    // the deferral cap (100 ticks ≈ 10s) every round, which makes
-                                    // rxrpl close LATER than rippled — exact opposite of what we
-                                    // want. Better to close at the wall-clock-ceiling boundary and
-                                    // let proposals/validations sort it out via wrong-prev-ledger.
-                                    let _ = close_deferrals;
+                                    // Always-active proposer: close on schedule like rippled.
+                                    // Previous deferrals (peer_at_or_past, peer_behind_alive) kept
+                                    // rxrpl in passive validator mode whenever any peer was
+                                    // observable, so consensus.close_ledger() never fired and no
+                                    // ProposeSet was broadcast (issue #76). Removing them lets
+                                    // rxrpl participate as an active proposer in mixed-validator
+                                    // topologies. Convergence on divergent peer chains is handled
+                                    // by the existing wrong_prev_ledger / catchup recovery path.
+                                    let _ = last_peer_status_at;
+                                    tracing::info!(
+                                        "closing seq={} prev={} peer_seq={}",
+                                        seq, prev_hash, max_peer_seq
+                                    );
 
                                     let l = ledger.read().await;
                                     let mut tx_hashes = Vec::new();
@@ -2464,8 +2441,15 @@ impl Node {
 
         // FeeSettings IS in rippled's genesis (verified by querying rippled
         // standalone via ledger_data: master AccountRoot + FeeSettings +
-        // LedgerHashes). Without FeeSettings, rxrpl's genesis hash diverges.
+        // Amendments). Without FeeSettings, rxrpl's genesis hash diverges.
         Self::insert_genesis_fee_settings(&mut genesis)?;
+
+        // Amendments SLE: rippled-2.6.2 pre-activates 28 amendments in
+        // genesis. Without this SLE rxrpl's account_hash at seq=1 diverges
+        // from rippled and mixed-validator consensus can't converge on any
+        // round (every ProposeSet carries a different prev_ledger). Captured
+        // empirically from a standalone rippled-2.6.2 (issue #76).
+        Self::insert_genesis_amendments(&mut genesis)?;
 
         genesis.close(0, 0)?;
         Ok(genesis)
@@ -2505,6 +2489,9 @@ impl Node {
         // Add FeeSettings with default values
         Self::insert_genesis_fee_settings(&mut genesis)?;
 
+        // Pre-activated amendments (rippled-2.6.2 compat)
+        Self::insert_genesis_amendments(&mut genesis)?;
+
         // Close genesis ledger
         genesis.close(0, 0)?;
 
@@ -2527,6 +2514,21 @@ impl Node {
         let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes)
             .map_err(|e| NodeError::Config(format!("failed to encode fee settings: {e}")))?;
         genesis.put_state(fee_key, data)?;
+        Ok(())
+    }
+
+    fn insert_genesis_amendments(genesis: &mut Ledger) -> Result<(), NodeError> {
+        let amendments_value = serde_json::json!({
+            "LedgerEntryType": "Amendments",
+            "Amendments": rxrpl_amendment::presets::rippled_2_6_2::GENESIS_AMENDMENTS_HEX,
+            "Flags": 0,
+        });
+        let amendments_key = keylet::amendments();
+        let json_bytes = serde_json::to_vec(&amendments_value)
+            .map_err(|e| NodeError::Config(e.to_string()))?;
+        let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes)
+            .map_err(|e| NodeError::Config(format!("failed to encode amendments: {e}")))?;
+        genesis.put_state(amendments_key, data)?;
         Ok(())
     }
 
@@ -3238,6 +3240,30 @@ mod tests {
         assert_eq!(genesis1.header.hash, genesis2.header.hash);
         assert_eq!(genesis1.header.account_hash, genesis2.header.account_hash);
         assert!(!genesis1.header.hash.is_zero());
+    }
+
+    /// Genesis hash must match rippled-2.6.2 for the same standard master
+    /// account. Captured empirically from `rippled --standalone --start
+    /// --quorum=1` with network_id=10000 and the well-known genesis account
+    /// `rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh`. See issue #76.
+    #[test]
+    fn genesis_hash_matches_rippled_2_6_2() {
+        let address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let genesis = Node::genesis_with_funded_account(address).unwrap();
+
+        let actual_hash = hex::encode_upper(genesis.header.hash.as_bytes());
+        let actual_account_hash = hex::encode_upper(genesis.header.account_hash.as_bytes());
+
+        assert_eq!(
+            actual_account_hash,
+            "3791BF543E5B77A17BC454F7A0720E4615760F457135F399DE67C54D7929546D",
+            "genesis account_hash diverges from rippled-2.6.2"
+        );
+        assert_eq!(
+            actual_hash,
+            "E158C218A9AF027957A54ECD7D25F4AD35C90B2AAF8DE4956723A17D80F5B3F4",
+            "genesis ledger hash diverges from rippled-2.6.2"
+        );
     }
 
     #[test]
