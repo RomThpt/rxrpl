@@ -1879,6 +1879,19 @@ impl Node {
                                                     seq, new_seq
                                                 );
 
+                                                // Surface the catchup-adopted ledger on the WS
+                                                // event stream so dashboards / subscribers tracking
+                                                // `ledgerClosed` see the new validated tip. Without
+                                                // this they stall on the previous event (typically
+                                                // the genesis ledger), even though `complete_ledgers`
+                                                // and `validated_ledger` keep advancing via HTTP.
+                                                let _ = event_tx.send(ServerEvent::LedgerClosed {
+                                                    ledger_index: reconstructed.header.sequence,
+                                                    ledger_hash: reconstructed.header.hash,
+                                                    ledger_time: reconstructed.header.close_time,
+                                                    txn_count: 0,
+                                                });
+
                                                 // Cross-impl: broadcast a validation signed by us
                                                 // for the adopted ledger. Without this, peer's
                                                 // quorum (=2) is never met since rxrpl never
