@@ -34,6 +34,44 @@ struct ClosedLedgersSummary {
     validated_ledger: Option<Value>,
 }
 
+/// Format an ascending list of sequence numbers as rippled-compatible
+/// `complete_ledgers` segments: contiguous runs collapse to `"start-end"`
+/// and disjoint runs are joined with commas — e.g. `[1,2,3,5,7,8]` becomes
+/// `"1-3,5-5,7-8"`. Empty input returns `"empty"`.
+///
+/// Why: a deque that received `push_back` only for consensus-closed ledgers
+/// (and skipped catchup-adopted ones) is not a contiguous range. Reporting
+/// `"first-last"` lies to RPC consumers like the confluence dashboard, which
+/// then 404s when fetching an intermediate seq.
+pub(crate) fn format_ledger_ranges(seqs: &[u32]) -> String {
+    if seqs.is_empty() {
+        return "empty".to_string();
+    }
+    let mut out = String::new();
+    let mut start = seqs[0];
+    let mut prev = seqs[0];
+    for &s in &seqs[1..] {
+        if s == prev {
+            continue;
+        }
+        if s == prev + 1 {
+            prev = s;
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(&format!("{start}-{prev}"));
+        start = s;
+        prev = s;
+    }
+    if !out.is_empty() {
+        out.push(',');
+    }
+    out.push_str(&format!("{start}-{prev}"));
+    out
+}
+
 async fn closed_ledgers_summary(ctx: &Arc<ServerContext>) -> ClosedLedgersSummary {
     // When a network-validated tip is published (networked mode after the
     // first quorum), it is authoritative: `validated_ledger.seq` must reflect
@@ -52,19 +90,19 @@ async fn closed_ledgers_summary(ctx: &Arc<ServerContext>) -> ClosedLedgersSummar
             };
         }
         let first = closed.front().unwrap().header.sequence;
+        let mut seqs: Vec<u32> = closed.iter().map(|l| l.header.sequence).collect();
+        seqs.sort_unstable();
         match net {
             Some(snap) => {
                 let cap = snap.seq;
                 if cap < first {
-                    // Validated tip is older than what we hold (shouldn't
-                    // normally happen). Report empty rather than lie about
-                    // a range we cannot serve as validated.
                     return ClosedLedgersSummary {
                         complete_ledgers: "empty".to_string(),
                         last_seq: 1,
                         validated_ledger: None,
                     };
                 }
+                seqs.retain(|s| *s <= cap);
                 let validated = serde_json::json!({
                     "seq": snap.seq,
                     "hash": snap.hash.to_string(),
@@ -75,7 +113,7 @@ async fn closed_ledgers_summary(ctx: &Arc<ServerContext>) -> ClosedLedgersSummar
                     "reserve_inc_xrp": 2,
                 });
                 ClosedLedgersSummary {
-                    complete_ledgers: format!("{first}-{cap}"),
+                    complete_ledgers: format_ledger_ranges(&seqs),
                     last_seq: cap,
                     validated_ledger: Some(validated),
                 }
@@ -93,7 +131,7 @@ async fn closed_ledgers_summary(ctx: &Arc<ServerContext>) -> ClosedLedgersSummar
                     "reserve_inc_xrp": 2,
                 });
                 ClosedLedgersSummary {
-                    complete_ledgers: format!("{first}-{last}"),
+                    complete_ledgers: format_ledger_ranges(&seqs),
                     last_seq: last,
                     validated_ledger: Some(validated),
                 }
@@ -179,4 +217,49 @@ pub async fn server_state(
             "complete_ledgers": summary.complete_ledgers,
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_ranges_empty() {
+        assert_eq!(format_ledger_ranges(&[]), "empty");
+    }
+
+    #[test]
+    fn format_ranges_singleton() {
+        assert_eq!(format_ledger_ranges(&[1]), "1-1");
+        assert_eq!(format_ledger_ranges(&[42]), "42-42");
+    }
+
+    #[test]
+    fn format_ranges_contiguous() {
+        assert_eq!(format_ledger_ranges(&[1, 2, 3, 4, 5]), "1-5");
+        assert_eq!(format_ledger_ranges(&[10, 11, 12]), "10-12");
+    }
+
+    #[test]
+    fn format_ranges_with_gaps() {
+        assert_eq!(format_ledger_ranges(&[1, 3, 5]), "1-1,3-3,5-5");
+        assert_eq!(format_ledger_ranges(&[1, 2, 3, 7, 8, 9]), "1-3,7-9");
+        assert_eq!(format_ledger_ranges(&[1, 2, 4, 6, 7, 10]), "1-2,4-4,6-7,10-10");
+    }
+
+    #[test]
+    fn format_ranges_alternating_pattern_from_kurtosis() {
+        let seqs: Vec<u32> = vec![
+            1, 3, 5, 7, 8, 9, 11, 12, 15, 18, 19, 22, 23, 26, 27, 29, 30, 32, 33,
+        ];
+        assert_eq!(
+            format_ledger_ranges(&seqs),
+            "1-1,3-3,5-5,7-9,11-12,15-15,18-19,22-23,26-27,29-30,32-33"
+        );
+    }
+
+    #[test]
+    fn format_ranges_handles_duplicates() {
+        assert_eq!(format_ledger_ranges(&[1, 1, 2, 2, 3]), "1-3");
+    }
 }
