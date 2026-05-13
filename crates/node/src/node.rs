@@ -1276,6 +1276,10 @@ impl Node {
             } else {
                 Duration::from_secs(60)
             };
+        // Pre-extracted before the spawn so the close-time-alignment gate
+        // can read it without capturing `self` (which would extend its
+        // lifetime past 'static).
+        let have_unl_peers_for_loop = !self.config.validators.trusted.is_empty();
 
         let validator_id_for_loop = validator_id.clone();
         tokio::spawn(async move {
@@ -1426,6 +1430,37 @@ impl Node {
                                             startup_instant.elapsed()
                                         );
                                         timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
+                                        continue;
+                                    }
+
+                                    // Close-time alignment gate: in mixed-validator topologies,
+                                    // each node's `effective_close_time` MUST land in the same
+                                    // resolution bucket as rippled's, or the produced ledger
+                                    // hash diverges and rxrpl wastes the next 20s recovering
+                                    // via wrong_prev_ledger → catchup → re-close. We anchor
+                                    // close_time off `latest_peer_close_time` whenever we have
+                                    // it; without it, we fall back to wall-clock, which on a
+                                    // ~10s resolution drifts out of bucket whenever rxrpl's
+                                    // round fires a few hundred ms before rippled's. Defer the
+                                    // round until at least one peer has broadcast a
+                                    // proposal (so `latest_peer_close_time` is populated).
+                                    // The cap matches `first_close_grace` so a stuck network
+                                    // still progresses — after that, we fall through and close
+                                    // solo, accepting the divergence as the lesser evil vs.
+                                    // hanging consensus indefinitely.
+                                    let have_peer_ct = consensus.latest_peer_close_time().is_some();
+                                    if have_unl_peers_for_loop
+                                        && !have_peer_ct
+                                        && startup_instant.elapsed() < first_close_grace
+                                    {
+                                        tracing::debug!(
+                                            target: "consensus",
+                                            elapsed_s = startup_instant.elapsed().as_secs(),
+                                            "deferring close: no peer ProposeSet yet (close_time would drift out of rippled's bucket)"
+                                        );
+                                        timer.on_phase_change(
+                                            rxrpl_consensus::ConsensusPhase::Open,
+                                        );
                                         continue;
                                     }
 
