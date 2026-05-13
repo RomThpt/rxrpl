@@ -167,11 +167,29 @@ impl Node {
         rxrpl_tx_engine::handlers::register_pseudo(&mut tx_registry);
         let tx_engine = TxEngine::new_without_sig_check(tx_registry);
 
-        // Initialize genesis ledger
-        let ledger = match &node_store {
-            Some(store) => Ledger::genesis_with_store(Arc::clone(store)),
-            None => Ledger::genesis(),
-        };
+        // Initialize genesis ledger. The networked path (`run_networked`)
+        // uses this constructor, so the genesis MUST carry the same
+        // FeeSettings + Amendments SLEs as rippled-2.6.2 or every close
+        // after #1 diverges: rippled's `LedgerHashes` skip-list at seq=2
+        // includes parent_hash=rippled-genesis, ours included
+        // parent_hash=bare-genesis, the SLE bytes differed → account_hash
+        // diverged → wrong_prev_ledger feedback loop. Using the store-less
+        // ledger keeps SHAMap root-hash deterministic across builds (the
+        // store-backed variant propagates hashes via a different path and
+        // produces a different root for identical content).
+        let _ = &node_store; // SHAMap store attached lazily during close().
+        // Networked genesis MUST match what peers will reconstruct from
+        // their own genesis bootstrap. xrpl-confluence sets rippled
+        // `genesis_amendments_disabled = true`, so kurtosis rippled
+        // genesis contains ONLY the canonical XRPL master AccountRoot
+        // (`rHb9CJAW…`, 100B drops) — no FeeSettings SLE and no
+        // Amendments SLE. Adding either makes our account_hash diverge
+        // from rippled, every close after #1 produces a mismatching
+        // hash, and rxrpl falls into the catchup feedback loop seen on
+        // 2026-05-12.
+        let ledger = Self::genesis_with_master_account_only(
+            "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+        )?;
 
         // Initialize transaction queue
         let tx_queue = TxQueue::new(2000);
@@ -2531,6 +2549,45 @@ impl Node {
             ledger.header.hash = hash;
         }
         Ok(ledger)
+    }
+
+    /// Create a closed genesis ledger holding only the canonical XRPL
+    /// master AccountRoot — matches rippled's bootstrap when
+    /// `genesis_amendments_disabled = true` (the xrpl-confluence
+    /// topology). Use this for networked nodes; the
+    /// `genesis_with_funded_account*` variants additionally pre-activate
+    /// the 28 standalone amendments and are intended for solo/test
+    /// scenarios where peers run the same bootstrap.
+    pub fn genesis_with_master_account_only(
+        genesis_address: &str,
+    ) -> Result<Ledger, NodeError> {
+        let mut genesis = Ledger::genesis();
+
+        let account_id = decode_account_id(genesis_address)
+            .map_err(|e| NodeError::Config(format!("invalid genesis address: {e}")))?;
+        let key = keylet::account(&account_id);
+
+        // Same field set as the funded variant — PreviousTxnID + Seq are
+        // emitted by rippled even at genesis and must be present in our
+        // SLE bytes or the leaf hashes diverge.
+        let account = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": genesis_address,
+            "Balance": genesis.header.drops.to_string(),
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+            "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+            "PreviousTxnLgrSeq": 0,
+        });
+        let json_bytes =
+            serde_json::to_vec(&account).map_err(|e| NodeError::Config(e.to_string()))?;
+        let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes)
+            .map_err(|e| NodeError::Config(format!("failed to encode genesis account: {e}")))?;
+        genesis.put_state(key, data)?;
+
+        genesis.close(0, 0)?;
+        Ok(genesis)
     }
 
     /// Create a genesis ledger with a funded account, optionally backed by a store.
