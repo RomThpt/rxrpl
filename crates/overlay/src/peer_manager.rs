@@ -1025,19 +1025,38 @@ impl PeerManager {
                                             leaves.len()
                                         );
                                         self.ledger_syncer.mark_synced(header.sequence);
+                                        // Send the parsed header FIRST so the consensus loop's
+                                        // catchup_headers cache is populated before LedgerData
+                                        // triggers try_reconstruct_ledger. Without this ordering,
+                                        // the reconstructed ledger has close_time=0 (header
+                                        // fields not copied), and the next local close uses
+                                        // parent_close_time=0 — diverging from rippled's chain.
+                                        let _ = self.consensus_tx.send(ConsensusMessage::LedgerHeader {
+                                            seq: header.sequence,
+                                            header: header.clone(),
+                                        });
                                         let _ =
                                             self.consensus_tx.send(ConsensusMessage::LedgerData {
                                                 hash: header.hash,
                                                 seq: header.sequence,
                                                 nodes: leaves,
                                             });
+                                    } else {
+                                        // Multi-round sync: header is still useful for the
+                                        // eventual reconstruction, send it now.
+                                        let _ = self.consensus_tx.send(ConsensusMessage::LedgerHeader {
+                                            seq: header.sequence,
+                                            header,
+                                        });
                                     }
+                                } else {
+                                    // No store — emit header anyway so future LedgerData arrivals
+                                    // can be reconstructed with the right close_time.
+                                    let _ = self.consensus_tx.send(ConsensusMessage::LedgerHeader {
+                                        seq: header.sequence,
+                                        header,
+                                    });
                                 }
-
-                                let _ = self.consensus_tx.send(ConsensusMessage::LedgerHeader {
-                                    seq: header.sequence,
-                                    header,
-                                });
                             } else {
                                 // Not a header -- raw node data, not useful for reconstruction.
                                 tracing::debug!(

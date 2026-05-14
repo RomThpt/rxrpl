@@ -2005,7 +2005,32 @@ impl Node {
                                     match Node::try_reconstruct_ledger(seq, hash, &nodes, &node_store, cached) {
                                         Ok(reconstructed) => {
                                             let mut history = closed_ledgers.write().await;
-                                            if !history.iter().any(|l| l.header.sequence == seq) {
+                                            // REPLACE on hash mismatch: if we already have a
+                                            // locally-closed ledger at this seq with a different
+                                            // hash, the catchup-reconstructed copy is canonical
+                                            // (a trusted UNL peer references it, we just
+                                            // confirmed via liBASE+state delta). Keeping the
+                                            // local divergent copy means RPC `ledger` queries
+                                            // return the wrong hash and the next ledger's
+                                            // skip-list references the wrong parent.
+                                            if let Some(existing_idx) =
+                                                history.iter().position(|l| l.header.sequence == seq)
+                                            {
+                                                if history[existing_idx].header.hash != reconstructed.header.hash {
+                                                    tracing::info!(
+                                                        "catchup: replacing diverged local ledger #{} (was {}, now {})",
+                                                        seq,
+                                                        history[existing_idx].header.hash,
+                                                        reconstructed.header.hash,
+                                                    );
+                                                    history[existing_idx] = reconstructed.clone();
+                                                } else {
+                                                    tracing::debug!(
+                                                        "catchup: ledger #{} already present with matching hash",
+                                                        seq
+                                                    );
+                                                }
+                                            } else {
                                                 let pos = history.partition_point(|l| l.header.sequence < seq);
                                                 history.insert(pos, reconstructed.clone());
                                                 while history.len() > crate::consensus_adapter::MAX_CLOSED_LEDGERS {
@@ -2295,7 +2320,10 @@ impl Node {
         //     has proposed yet, at least round our own wall-clock so a
         //     peer within the same bucket produces an identical hash.
         let close_flags = consensus.accepted_close_flags();
-        let effective_close_time = consensus
+        let mut l = ledger.write().await;
+        let parent_close_time = l.header.parent_close_time;
+        let resolution = consensus.adaptive_close_time().resolution();
+        let raw_close_time = consensus
             .accepted_close_time()
             .or_else(|| consensus.rounded_close_time())
             // Cross-impl bridge: any peer proposal we've seen (even from a
@@ -2303,18 +2331,23 @@ impl Node {
             // it so two nodes whose close timers fire ~1s apart still land
             // in the same close_time and produce identical ledger hashes.
             .or_else(|| consensus.latest_peer_close_time())
-            .unwrap_or_else(|| {
-                let res = consensus.adaptive_close_time().resolution();
-                rxrpl_consensus::round_close_time(pending_close_time, res)
-            });
+            .unwrap_or_else(|| rxrpl_consensus::round_close_time(pending_close_time, resolution));
+        // Clamp `close_time > parent_close_time` to mirror rippled's
+        // `effCloseTime` (xrpld/consensus/LedgerTiming.h). Without this,
+        // two consecutive ledgers that close within the same resolution
+        // bucket get equal close_time → equal ledger headers but
+        // different account_hash on the next round → unrecoverable
+        // divergence from rippled. See
+        // docs/superpowers/specs/2026-05-14-close-time-monotonicity-fix.md.
+        let effective_close_time =
+            rxrpl_consensus::eff_close_time(raw_close_time, resolution, parent_close_time);
         tracing::debug!(
-            "closing with effective_close_time={} close_flags={} pending_close_time={}",
+            "closing with effective_close_time={} close_flags={} pending_close_time={} parent_close_time={}",
             effective_close_time,
             close_flags,
-            pending_close_time
+            pending_close_time,
+            parent_close_time,
         );
-
-        let mut l = ledger.write().await;
 
         // Apply amendment voting on flag ledgers (before close computes
         // final hashes). Votes are collected from received validations.
@@ -2939,8 +2972,17 @@ impl Node {
     /// Close the current ledger and return a new open ledger derived from it.
     ///
     /// Returns the closed ledger's hash and the new open ledger.
+    ///
+    /// The caller-supplied `close_time` is clamped via `eff_close_time` to
+    /// ensure `close_time > parent_close_time`, mirroring rippled's
+    /// `effCloseTime` invariant. Without this, two ledgers closed in the
+    /// same resolution bucket carry equal `close_time` fields and produce
+    /// divergent hashes from rippled.
     pub fn close_ledger(ledger: &mut Ledger, close_time: u32) -> Result<Hash256, NodeError> {
-        ledger.close(close_time, 0)?;
+        let resolution = ledger.header.close_time_resolution as u32;
+        let parent_close_time = ledger.header.parent_close_time;
+        let eff = rxrpl_consensus::eff_close_time(close_time, resolution, parent_close_time);
+        ledger.close(eff, 0)?;
         Ok(ledger.header.hash)
     }
 
@@ -3515,6 +3557,40 @@ mod tests {
     #[test]
     fn compute_quorum_zero_returns_one() {
         assert_eq!(Node::compute_quorum(0), 1);
+    }
+
+    #[test]
+    fn close_ledger_clamps_close_time_above_parent() {
+        // Reproduces the hive consensus-test divergence:
+        // two consecutive ledgers closed within the same 10s resolution
+        // bucket must NOT carry equal close_time. rippled's effCloseTime
+        // (LedgerTiming.h) clamps close_time > parent_close_time + 1s, and
+        // rxrpl must do the same to produce byte-identical ledger headers.
+        let address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let parent_close = 832_077_840u32;
+
+        let mut child = {
+            let parent = {
+                let mut g = Node::genesis_with_funded_account(address).unwrap();
+                g.header.close_time = parent_close;
+                g.header.close_time_resolution = 10;
+                g
+            };
+            Ledger::new_open(&parent)
+        };
+
+        // Simulate "wall clock 832_077_842" — would round to 832_077_840
+        // (the parent's bucket) without the clamp. After the clamp it
+        // must be strictly greater than parent_close.
+        let raw_close = parent_close + 2;
+        Node::close_ledger(&mut child, raw_close).unwrap();
+
+        assert!(
+            child.header.close_time > parent_close,
+            "close_time must be > parent_close_time, got close={} parent={}",
+            child.header.close_time,
+            parent_close,
+        );
     }
 
     #[test]
