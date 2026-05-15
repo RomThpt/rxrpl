@@ -182,8 +182,6 @@ validators.txt
 [validation_seed]
 {seed}
 
-[validator_token]
-
 [network_id]
 99
 
