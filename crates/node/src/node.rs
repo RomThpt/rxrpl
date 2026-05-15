@@ -1303,6 +1303,10 @@ impl Node {
                 ..ConsensusParams::default()
             };
             let mut timer = ConsensusTimer::new(&consensus_params);
+            // Captured before `consensus_params` is moved into the engine;
+            // the stale-round early-abandon check needs it to gate the
+            // seq-only signal on one full proposal interval.
+            let propose_interval_ms = consensus_params.propose_interval_ms;
             // The engine's `public_key` is echoed verbatim into every emitted
             // ProposeSet `node_pub_key`. For UNL-trusted proposals to be
             // counted by rippled, it MUST be the manifest-bound signing key
@@ -1631,6 +1635,124 @@ impl Node {
                                     }
                                 }
                                 TimerAction::Converge => {
+                                    // Early-abandon of a stale round. If a trusted peer is
+                                    // provably ahead of us, the in-progress Establish round
+                                    // can NEVER reach quorum: every peer ProposeSet references
+                                    // a future prev_ledger and lands in the engine's
+                                    // `future_proposals` holding pen instead of being counted.
+                                    // Left alone, `converge()` burns all `max_consensus_rounds`
+                                    // (25 × 1250ms ≈ 31s) before force-accepting a ledger that
+                                    // diverges, then recovers via wrong_prev_ledger → catchup —
+                                    // an infinite ~31-38s/ledger loop in a mixed network.
+                                    //
+                                    // Detect "behind" from two independent signals and bail
+                                    // into catchup within ~1 round instead:
+                                    //  1. `check_wrong_prev_ledger()` — a trusted supermajority
+                                    //     has signed/proposed a different prev_ledger.
+                                    //  2. `max_peer_seq > our_open_seq` — a peer announced (via
+                                    //     StatusChange / validation) a strictly higher ledger
+                                    //     than the one we are still trying to close.
+                                    //
+                                    // False-positive guards:
+                                    //  - The whole block is gated on `check_wrong_prev_ledger`
+                                    //    returning Some OR `max_peer_seq > our_open_seq`; solo
+                                    //    mode (empty UNL → `check_wrong_prev_ledger` is None,
+                                    //    `max_peer_seq` stays 0) never trips it.
+                                    //  - The seq-only signal additionally requires the round
+                                    //    to have run longer than one `propose_interval_ms`, so
+                                    //    a peer that merely opened ledger N+1 a few hundred ms
+                                    //    before us — normal cross-impl timing jitter — is not
+                                    //    abandoned. `check_wrong_prev_ledger` is a hard signal
+                                    //    (a trusted set already disagreed) and needs no delay.
+                                    //  - Shares the `PREV_LEDGER_SWITCH_COOLDOWN` with the
+                                    //    proposal-path recovery so the two cannot thrash.
+                                    let our_open_seq =
+                                        ledger_seq_shared.load(Ordering::Relaxed);
+                                    let cooldown_ok = last_prev_ledger_switch
+                                        .map(|t| t.elapsed() >= PREV_LEDGER_SWITCH_COOLDOWN)
+                                        .unwrap_or(true);
+                                    let wrong_prev =
+                                        consensus.check_wrong_prev_ledger();
+                                    let round_old_enough = round_started_at
+                                        .map(|t| {
+                                            t.elapsed().as_millis() as u64
+                                                > propose_interval_ms
+                                        })
+                                        .unwrap_or(false);
+                                    let behind_by_seq = max_peer_seq > our_open_seq
+                                        && round_old_enough;
+                                    if cooldown_ok
+                                        && consensus.phase()
+                                            == rxrpl_consensus::ConsensusPhase::Establish
+                                        && (wrong_prev.is_some() || behind_by_seq)
+                                    {
+                                        tracing::warn!(
+                                            wrong_prev = wrong_prev.is_some(),
+                                            max_peer_seq,
+                                            our_open_seq,
+                                            "abandoning stale consensus round: trusted peer is \
+                                             ahead, entering catchup instead of exhausting \
+                                             max_consensus_rounds"
+                                        );
+                                        last_prev_ledger_switch =
+                                            Some(tokio::time::Instant::now());
+                                        syncing = true;
+                                        timer.on_phase_change(
+                                            rxrpl_consensus::ConsensusPhase::Open,
+                                        );
+                                        sync_started_at =
+                                            Some(tokio::time::Instant::now());
+
+                                        // Walk the contiguous run from the OLDEST held
+                                        // ledger and request the lowest gap, so the
+                                        // forward-chain LedgerData adopt path fills every
+                                        // intermediate ledger up to the peer tip. Mirrors
+                                        // the proposal-path recovery block below.
+                                        let highest_contiguous = {
+                                            let history = closed_ledgers.read().await;
+                                            let mut iter = history.iter();
+                                            match iter.next() {
+                                                None => 0,
+                                                Some(first) => {
+                                                    let mut hc =
+                                                        first.header.sequence;
+                                                    for l in iter {
+                                                        if l.header.sequence
+                                                            == hc + 1
+                                                        {
+                                                            hc = l.header
+                                                                .sequence;
+                                                        } else {
+                                                            break;
+                                                        }
+                                                    }
+                                                    hc
+                                                }
+                                            }
+                                        };
+                                        let lowest_missing = highest_contiguous + 1;
+                                        last_sync_seq = lowest_missing;
+                                        let _ = cmd_tx_catchup.send(
+                                            OverlayCommand::RequestLedger {
+                                                seq: lowest_missing,
+                                                hash: None,
+                                            },
+                                        );
+
+                                        // Reset the engine off the stale round. When
+                                        // `check_wrong_prev_ledger` named a preferred
+                                        // ledger, anchor on it; otherwise keep our
+                                        // prev_ledger and let catchup advance us.
+                                        let reset_prev = wrong_prev
+                                            .map(|d| d.preferred_ledger)
+                                            .unwrap_or_else(|| consensus.prev_ledger());
+                                        consensus.start_round(reset_prev, 0);
+                                        amendment_votes.clear();
+                                        trusted_validator_count = 0;
+                                        round_started_at = None;
+                                        continue;
+                                    }
+
                                     if consensus.converge() {
                                         timer.on_phase_change(consensus.phase());
                                         let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
