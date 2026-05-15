@@ -3,8 +3,18 @@
 pub struct ConsensusParams {
     /// Minimum time (ms) to keep the ledger open for transactions.
     pub ledger_idle_interval_ms: u64,
-    /// Minimum time (ms) between proposals during establish phase.
+    /// Minimum time (ms) between proposal re-broadcasts during the
+    /// Establish phase. Independent of how often `converge()` is polled
+    /// (see `converge_poll_interval_ms`).
     pub propose_interval_ms: u64,
+    /// How often (ms) the timer asks the engine to run `converge()`.
+    /// Decoupled from `propose_interval_ms` so the engine can poll its
+    /// agreement / min-consensus-time logic finely (e.g. 250ms) while
+    /// re-broadcasting proposals at the coarser `propose_interval_ms`.
+    /// A finer poll lets a round finalize close to the
+    /// `min_consensus_time_ms` floor instead of overshooting to the next
+    /// coarse tick. `0` falls back to `propose_interval_ms`.
+    pub converge_poll_interval_ms: u64,
     /// Initial threshold percentage for including transactions.
     pub initial_threshold: u32,
     /// Threshold increase per round.
@@ -36,6 +46,9 @@ impl Default for ConsensusParams {
             // validations fast enough for rippled to advance under quorum=2.
             ledger_idle_interval_ms: 2_000,
             propose_interval_ms: 1_250,
+            // 0 → timer falls back to propose_interval_ms (back-compat).
+            // Networked mode sets a finer value (see `Node::run_networked`).
+            converge_poll_interval_ms: 0,
             initial_threshold: 50,
             threshold_increase: 10,
             max_threshold: 80,

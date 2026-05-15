@@ -51,10 +51,21 @@ impl ConsensusTimer {
     /// Create a new timer from consensus params.
     pub fn new(params: &ConsensusParams) -> Self {
         let open_duration = Duration::from_millis(params.ledger_idle_interval_ms);
-        let converge_interval = Duration::from_millis(params.propose_interval_ms);
-        // Stall timeout: max_consensus_rounds * converge_interval * 2
-        // Gives generous headroom beyond what the engine itself would force-accept at.
-        let stall_timeout = converge_interval
+        // Poll cadence for converge(): the finer `converge_poll_interval_ms`
+        // when set, else the proposal-broadcast interval. A finer poll lets a
+        // round finalize near the min-consensus-time floor instead of
+        // overshooting to the next coarse tick.
+        let poll_ms = if params.converge_poll_interval_ms > 0 {
+            params.converge_poll_interval_ms
+        } else {
+            params.propose_interval_ms
+        };
+        let converge_interval = Duration::from_millis(poll_ms);
+        // Stall timeout is anchored to the round cadence (`propose_interval_ms`),
+        // NOT the poll cadence — otherwise a fine poll interval would shrink
+        // the stall window. max_consensus_rounds * propose_interval * 2 gives
+        // generous headroom beyond the engine's own force-accept.
+        let stall_timeout = Duration::from_millis(params.propose_interval_ms)
             .checked_mul(params.max_consensus_rounds * 2)
             .unwrap_or(Duration::from_secs(60));
 
