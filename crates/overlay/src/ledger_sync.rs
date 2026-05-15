@@ -297,31 +297,45 @@ impl LedgerSyncer {
         hash: Hash256,
         store: Arc<dyn NodeStore>,
     ) -> Vec<MissingNode> {
-        // Only sync one ledger at a time. Replace the active sync with
-        // a newer ledger to avoid syncing stale data. The store retains
-        // all previously fetched nodes, so the new sync picks up where
-        // the old one left off.
+        // Only sync one ledger at a time. The store retains all previously
+        // fetched nodes, so a replacement sync picks up where the old one
+        // left off.
+        //
+        // A LOWER seq than the active sync always wins the slot: contiguous
+        // catchup must reconstruct ledgers in ascending order (each adopted
+        // ledger is the prerequisite for the next), so the lowest missing
+        // ledger is never stale — it is exactly the one we must finish first.
+        // Without this, a concurrently-requested higher-seq tip (from the
+        // StatusChange `request_missing` / peer-tip paths) would seize the
+        // slot and silently starve every intermediate ledger, leaving holes
+        // in `closed_ledgers`.
+        //
+        // A HIGHER seq only replaces the active sync once that sync is stuck
+        // (zero-add rounds), to avoid thrashing during real progress.
         if !self.incremental.contains_key(&seq) {
             if let Some(&active_seq) = self.incremental.keys().max() {
-                if seq <= active_seq {
-                    return Vec::new();
+                if seq > active_seq {
+                    let zero_rounds = self
+                        .incremental
+                        .get(&active_seq)
+                        .map(|e| e.zero_rounds)
+                        .unwrap_or(0);
+                    if zero_rounds < 8 {
+                        return Vec::new();
+                    }
+                    tracing::info!(
+                        "replacing stale sync #{} (round {}) with #{}",
+                        active_seq,
+                        zero_rounds,
+                        seq
+                    );
+                } else {
+                    tracing::info!(
+                        "preempting sync #{} with lower contiguous ledger #{}",
+                        active_seq,
+                        seq
+                    );
                 }
-                // Replace when the active sync is stuck (zero-add rounds).
-                // Don't replace during active progress to avoid thrashing.
-                let zero_rounds = self
-                    .incremental
-                    .get(&active_seq)
-                    .map(|e| e.zero_rounds)
-                    .unwrap_or(0);
-                if zero_rounds < 8 {
-                    return Vec::new();
-                }
-                tracing::info!(
-                    "replacing stale sync #{} (round {}) with #{}",
-                    active_seq,
-                    zero_rounds,
-                    seq
-                );
                 self.incremental.clear();
             }
         }

@@ -1696,6 +1696,10 @@ impl Node {
                                     proposal.node_id, proposal.ledger_seq,
                                     proposal.tx_set_hash, proposal.close_time
                                 );
+                                // Capture the proposed round seq before the
+                                // proposal is moved into the engine; recovery
+                                // below needs it to size the catchup target.
+                                let proposal_ledger_seq = proposal.ledger_seq;
                                 consensus.peer_proposal(proposal);
 
                                 // Check if a supermajority of trusted peers
@@ -1720,12 +1724,54 @@ impl Node {
                                         syncing = true;
                                         timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
                                         sync_started_at = Some(tokio::time::Instant::now());
-                                        last_sync_seq = ledger_seq_shared.load(Ordering::Relaxed);
 
-                                        // Request the preferred ledger from peers.
+                                        // The detected preferred_ledger is the prev_ledger
+                                        // of the round the peer is proposing, so its seq is
+                                        // `proposal.ledger_seq - 1`. Bump max_peer_seq to it
+                                        // so the forward-chain (LedgerData adopt path) walks
+                                        // all the way up to the preferred tip.
+                                        let preferred_seq =
+                                            proposal_ledger_seq.saturating_sub(1);
+                                        if preferred_seq > max_peer_seq {
+                                            max_peer_seq = preferred_seq;
+                                        }
+
+                                        // Request the LOWEST missing ledger by seq, not the
+                                        // preferred tip by hash. Requesting the tip directly
+                                        // makes the forward-chain walk UPWARD from the tip
+                                        // only, leaving the intermediate ledgers between our
+                                        // last-held seq and the tip permanently unrequested
+                                        // (the complete_ledgers holes). Starting from the
+                                        // lowest gap lets the existing forward-chain fill
+                                        // every ledger contiguously up to `target`
+                                        // (== max_peer_seq, now the preferred tip).
+                                        // Contiguous run from the OLDEST held ledger — not
+                                        // from seq 1 — so a pruned history (online_delete)
+                                        // starting above seq 1 is handled correctly instead
+                                        // of re-requesting from genesis.
+                                        let highest_contiguous = {
+                                            let history = closed_ledgers.read().await;
+                                            let mut iter = history.iter();
+                                            match iter.next() {
+                                                None => 0,
+                                                Some(first) => {
+                                                    let mut hc = first.header.sequence;
+                                                    for l in iter {
+                                                        if l.header.sequence == hc + 1 {
+                                                            hc = l.header.sequence;
+                                                        } else {
+                                                            break;
+                                                        }
+                                                    }
+                                                    hc
+                                                }
+                                            }
+                                        };
+                                        let lowest_missing = highest_contiguous + 1;
+                                        last_sync_seq = lowest_missing;
                                         let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
-                                            seq: 0, // unknown seq, rely on hash
-                                            hash: Some(detected.preferred_ledger),
+                                            seq: lowest_missing,
+                                            hash: None,
                                         });
 
                                         // Reset consensus state so we don't keep processing
@@ -2068,6 +2114,56 @@ impl Node {
                                                     history.pop_front();
                                                 }
                                                 tracing::info!("catchup: reconstructed ledger #{} hash={}", seq, hash);
+                                            }
+
+                                            // Contiguity backfill: a catchup that jumps
+                                            // straight to a peer's tip (any trigger path —
+                                            // wrong_prev recovery, peer-tip yield,
+                                            // StatusChange) leaves the ledgers between our
+                                            // last-held seq and the tip permanently
+                                            // unrequested — the holes in
+                                            // `closed_ledgers` / `complete_ledgers`.
+                                            //
+                                            // Fix at the single common adopt site: if the
+                                            // ledger directly below the one just
+                                            // reconstructed is missing, request it by hash
+                                            // (= this ledger's `parent_hash`). The
+                                            // reconstructed parent re-enters this block and
+                                            // requests ITS parent, walking the hash chain
+                                            // downward until it reaches a ledger we already
+                                            // hold or genesis. Bounded to the
+                                            // MAX_CLOSED_LEDGERS retention window — a deeper
+                                            // request would be `pop_front`-evicted on
+                                            // insert anyway.
+                                            if seq > 1 {
+                                                let have_parent = history
+                                                    .iter()
+                                                    .any(|l| l.header.sequence == seq - 1);
+                                                let tip_seq = history
+                                                    .iter()
+                                                    .next_back()
+                                                    .map(|l| l.header.sequence)
+                                                    .unwrap_or(seq);
+                                                let within_window = tip_seq.saturating_sub(seq - 1)
+                                                    < crate::consensus_adapter::MAX_CLOSED_LEDGERS
+                                                        as u32;
+                                                let parent_hash = reconstructed.header.parent_hash;
+                                                if !have_parent
+                                                    && within_window
+                                                    && parent_hash != Hash256::ZERO
+                                                {
+                                                    let _ = cmd_tx_catchup.send(
+                                                        OverlayCommand::RequestLedger {
+                                                            seq: seq - 1,
+                                                            hash: Some(parent_hash),
+                                                        },
+                                                    );
+                                                    tracing::debug!(
+                                                        "catchup: backfilling missing parent #{} (hash={})",
+                                                        seq - 1,
+                                                        parent_hash
+                                                    );
+                                                }
                                             }
                                             drop(history);
 
