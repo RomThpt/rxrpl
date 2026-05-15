@@ -101,14 +101,15 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     negative_unl_tracker: NegativeUnlTracker,
     /// Proposals received while not in Establish phase, replayed on close.
     pending_proposals: Vec<Proposal>,
-    /// Number of `converge()` calls since we last re-broadcast our position.
-    /// Periodic re-broadcast (every N converge ticks) keeps our proposal
-    /// fresh in peers' buffers so peers with a longer idle interval (e.g.
-    /// rippled's 20s) see our position within their own Establish window,
-    /// not the stale proposal we emitted ~18s before they opened the round
-    /// (issue #76 — `prev_proposers` jumps from 1 to 3 when a fresh proposal
-    /// reaches rippled mid-Establish).
-    ticks_since_share: u32,
+    /// Instant we last re-broadcast our position. Periodic re-broadcast
+    /// (every `params.propose_interval_ms`) keeps our proposal fresh in
+    /// peers' buffers so peers with a longer idle interval (e.g. rippled's
+    /// 20s) see our position within their own Establish window, not the
+    /// stale proposal we emitted ~18s before they opened the round (issue
+    /// #76 — `prev_proposers` jumps from 1 to 3 when a fresh proposal
+    /// reaches rippled mid-Establish). Time-based so it stays independent
+    /// of how often `converge()` is polled.
+    last_share_at: Option<Instant>,
     /// Tracks proposals from trusted peers that reference a different
     /// `prev_ledger` than ours. Keyed by (node_id -> their prev_ledger).
     /// Used to detect when we are on the wrong chain.
@@ -173,6 +174,13 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     /// agreement is observed, [`Self::converge`] will not accept before this
     /// much wall-clock time has elapsed. `None` outside the Establish phase.
     establish_started_at: Option<Instant>,
+    /// Instant the consensus `round` counter last advanced. `converge()` is
+    /// polled far more often than `propose_interval_ms`, but the round
+    /// counter (threshold escalation + `max_consensus_rounds` window) must
+    /// tick at the proposal cadence so the Establish window stays sized in
+    /// real time, independent of poll frequency. `None` until the first
+    /// advance of the current round.
+    last_round_advance: Option<Instant>,
 }
 
 /// Maximum number of distinct `prev_ledger` hashes held in
@@ -234,7 +242,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             unl,
             negative_unl_tracker: NegativeUnlTracker::new(),
             pending_proposals: Vec::new(),
-            ticks_since_share: 0,
+            last_share_at: None,
             wrong_prev_ledger_votes: HashMap::new(),
             validations_trie,
             prev_ledger_seq: 0,
@@ -245,6 +253,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             proposal_dropped_stale_total: AtomicU64::new(0),
             proposals_held_pending_prev_ledger_total: AtomicU64::new(0),
             establish_started_at: None,
+            last_round_advance: None,
         }
     }
 
@@ -646,7 +655,8 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.proposal_tracker.clear_for(&self.prev_ledger);
         self.disputes.clear();
         self.round = 0;
-        self.ticks_since_share = 0;
+        self.last_share_at = None;
+        self.last_round_advance = None;
         self.prev_ledger = prev_ledger;
         // The new round produces ledger `ledger_seq`; its parent
         // (prev_ledger) therefore lives at `ledger_seq - 1`. Anchor the
@@ -734,7 +744,15 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.our_position = Some(proposal);
         self.our_set = Some(our_set);
         self.phase = ConsensusPhase::Establish;
-        self.establish_started_at = Some(Instant::now());
+        let now = Instant::now();
+        self.establish_started_at = Some(now);
+        // The proposal just emitted counts as our first share this round;
+        // the next periodic re-broadcast is `propose_interval_ms` later.
+        self.last_share_at = Some(now);
+        // Anchor the round-advance clock to Establish start so the round
+        // counter ticks once per `propose_interval_ms` regardless of how
+        // often converge() is polled.
+        self.last_round_advance = Some(now);
 
         // Replay any proposals buffered while we were in Open phase.
         // Use our own `close_time` as the freshness anchor so that a
@@ -1220,7 +1238,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
                     pos.tx_set_hash = our_set.hash;
                     pos.prop_seq += 1;
                     self.adapter.share_position(pos);
-                    self.ticks_since_share = 0;
+                    self.last_share_at = Some(Instant::now());
                 }
                 // Update dispute our_vote to match new reality
                 for dispute in self.disputes.values_mut() {
@@ -1231,21 +1249,22 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         }
 
         // Periodic re-broadcast: if our close_time was realigned this tick OR
-        // we haven't shared in PROPOSAL_REFRESH_TICKS converge calls, push our
-        // current position so peers in a slower idle phase (rippled's 20s
-        // vs our 2s) see a fresh proposal within their Establish window.
-        // Without this, peers count us only when our single initial proposal
-        // happens to land mid-Establish (issue #76 — `prev_proposers`
-        // oscillating 1↔3).
-        const PROPOSAL_REFRESH_TICKS: u32 = 3;
-        self.ticks_since_share = self.ticks_since_share.saturating_add(1);
-        let needs_refresh =
-            close_realigned || self.ticks_since_share >= PROPOSAL_REFRESH_TICKS;
+        // at least `propose_interval_ms` has passed since our last share,
+        // push our current position so peers in a slower idle phase
+        // (rippled's 20s vs our 2s) see a fresh proposal within their
+        // Establish window. Without this, peers count us only when our
+        // single initial proposal happens to land mid-Establish (issue #76
+        // — `prev_proposers` oscillating 1↔3). Time-based so the cadence is
+        // unaffected by how often `converge()` is polled.
+        let refresh_due = self
+            .last_share_at
+            .is_none_or(|t| t.elapsed().as_millis() as u64 >= self.params.propose_interval_ms);
+        let needs_refresh = close_realigned || refresh_due;
         if needs_refresh && !set_changed {
             if let Some(ref mut pos) = self.our_position {
                 pos.prop_seq = pos.prop_seq.saturating_add(1);
                 self.adapter.share_position(pos);
-                self.ticks_since_share = 0;
+                self.last_share_at = Some(Instant::now());
             }
         }
 
@@ -1305,7 +1324,22 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             }
         }
 
+        // Advance the round counter at most once per `propose_interval_ms`.
+        // converge() is polled every `converge_poll_interval_ms` (finer) for
+        // fast quorum / min-consensus-time detection, but the round counter
+        // drives threshold escalation and the `max_consensus_rounds`
+        // Establish window — both must tick at the proposal cadence so the
+        // window stays `max_consensus_rounds * propose_interval_ms` in real
+        // time (must exceed rippled's ~20s idle interval). Without this gate
+        // a fine poll would burn through all rounds in seconds.
+        let round_advance_due = self
+            .last_round_advance
+            .is_none_or(|t| t.elapsed().as_millis() as u64 >= self.params.propose_interval_ms);
+        if !round_advance_due {
+            return false;
+        }
         self.round += 1;
+        self.last_round_advance = Some(Instant::now());
 
         // If we've exceeded max rounds, accept anyway — but ONLY if we have
         // at least one peer position. Otherwise we'd validate a ledger alone

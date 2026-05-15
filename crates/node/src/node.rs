@@ -1294,8 +1294,12 @@ impl Node {
             // (~rippled `ledgerMIN_CONSENSUS`) so a round is not finalized
             // before peer ProposeSets have had time to propagate. Solo mode
             // leaves this at the default 0 — no peers to wait for.
+            // Poll converge() every 250ms (vs the 1250ms proposal cadence)
+            // so a round finalizes close to the 1950ms floor instead of
+            // overshooting to the next coarse 1250ms tick (~2.5s → ~2.0s).
             let consensus_params = ConsensusParams {
                 min_consensus_time_ms: 1_950,
+                converge_poll_interval_ms: 250,
                 ..ConsensusParams::default()
             };
             let mut timer = ConsensusTimer::new(&consensus_params);

@@ -231,13 +231,22 @@ impl ConsensusSimulator {
         let unl = TrustedValidatorList::new(trusted);
         let mut engines = Vec::with_capacity(node_count);
 
+        // The simulator drives converge() in a deterministic loop without
+        // advancing wall-clock time. `propose_interval_ms: 0` makes the
+        // engine's time-based gates (round advance, proposal re-broadcast)
+        // always pass, so each converge() call advances one logical round —
+        // the round-per-call cadence this round-based harness expects.
+        let sim_params = ConsensusParams {
+            propose_interval_ms: 0,
+            ..ConsensusParams::default()
+        };
         for &node_id in node_ids.iter().take(node_count) {
             let adapter = SimAdapter::new();
             let engine = ConsensusEngine::new_with_unl(
                 adapter,
                 node_id,
                 Vec::new(),
-                ConsensusParams::default(),
+                sim_params.clone(),
                 unl.clone(),
             );
             engines.push(engine);
