@@ -187,9 +187,7 @@ impl Node {
         // from rippled, every close after #1 produces a mismatching
         // hash, and rxrpl falls into the catchup feedback loop seen on
         // 2026-05-12.
-        let ledger = Self::genesis_with_master_account_only(
-            "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
-        )?;
+        let ledger = Self::genesis_with_master_account_only("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")?;
 
         // Initialize transaction queue
         let tx_queue = TxQueue::new(2000);
@@ -1329,12 +1327,9 @@ impl Node {
                 let mut t = unl.is_trusted(&node_id);
                 if let Some(vid) = validator_id_for_loop.as_ref() {
                     t = t
-                        || unl.is_trusted(&NodeId::from_public_key(
-                            vid.master_pubkey().as_bytes(),
-                        ))
-                        || unl.is_trusted(&NodeId::from_public_key(
-                            vid.signing_pubkey().as_bytes(),
-                        ));
+                        || unl.is_trusted(&NodeId::from_public_key(vid.master_pubkey().as_bytes()))
+                        || unl
+                            .is_trusted(&NodeId::from_public_key(vid.signing_pubkey().as_bytes()));
                 }
                 t
             };
@@ -1398,8 +1393,7 @@ impl Node {
             }
             tracing::info!("validation quorum initialized to {}", initial_quorum);
 
-            let mut pending_validations =
-                crate::pending_validations::PendingValidations::new();
+            let mut pending_validations = crate::pending_validations::PendingValidations::new();
 
             // Checkpoint bootstrap state (consumed once the anchor resolves).
             let mut checkpoint_anchor: Option<crate::checkpoint::CheckpointAnchor> =
@@ -2598,9 +2592,7 @@ impl Node {
         trusted_validator_count: usize,
         pruner: &Arc<LedgerPruner>,
         node_store: &Option<Arc<dyn NodeStore>>,
-        self_validation_tx: &tokio::sync::mpsc::UnboundedSender<
-            rxrpl_overlay::ConsensusMessage,
-        >,
+        self_validation_tx: &tokio::sync::mpsc::UnboundedSender<rxrpl_overlay::ConsensusMessage>,
     ) {
         // Resolve close_time in priority order:
         //  1. Quorum-accepted close_time from converge() — strongest signal,
@@ -2792,8 +2784,8 @@ impl Node {
             // and never reach quorum=ceil(N*0.8) when N=4 (mixed kurtosis:
             // 2 rxrpl + 2 rippled). Rippled does the equivalent in
             // `Validations::add` from its own onAccept path.
-            let _ = self_validation_tx
-                .send(rxrpl_overlay::ConsensusMessage::Validation(validation));
+            let _ =
+                self_validation_tx.send(rxrpl_overlay::ConsensusMessage::Validation(validation));
         }
 
         // Broadcast StatusChange so peers know our current ledger and our
@@ -2919,9 +2911,7 @@ impl Node {
     /// `genesis_with_funded_account*` variants additionally pre-activate
     /// the 28 standalone amendments and are intended for solo/test
     /// scenarios where peers run the same bootstrap.
-    pub fn genesis_with_master_account_only(
-        genesis_address: &str,
-    ) -> Result<Ledger, NodeError> {
+    pub fn genesis_with_master_account_only(genesis_address: &str) -> Result<Ledger, NodeError> {
         let mut genesis = Ledger::genesis();
 
         let account_id = decode_account_id(genesis_address)
@@ -3075,8 +3065,8 @@ impl Node {
             "Flags": 0,
         });
         let amendments_key = keylet::amendments();
-        let json_bytes = serde_json::to_vec(&amendments_value)
-            .map_err(|e| NodeError::Config(e.to_string()))?;
+        let json_bytes =
+            serde_json::to_vec(&amendments_value).map_err(|e| NodeError::Config(e.to_string()))?;
         let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes)
             .map_err(|e| NodeError::Config(format!("failed to encode amendments: {e}")))?;
         genesis.put_state(amendments_key, data)?;
@@ -3844,13 +3834,11 @@ mod tests {
         let actual_account_hash = hex::encode_upper(genesis.header.account_hash.as_bytes());
 
         assert_eq!(
-            actual_account_hash,
-            "3791BF543E5B77A17BC454F7A0720E4615760F457135F399DE67C54D7929546D",
+            actual_account_hash, "3791BF543E5B77A17BC454F7A0720E4615760F457135F399DE67C54D7929546D",
             "genesis account_hash diverges from rippled-2.6.2"
         );
         assert_eq!(
-            actual_hash,
-            "E158C218A9AF027957A54ECD7D25F4AD35C90B2AAF8DE4956723A17D80F5B3F4",
+            actual_hash, "E158C218A9AF027957A54ECD7D25F4AD35C90B2AAF8DE4956723A17D80F5B3F4",
             "genesis ledger hash diverges from rippled-2.6.2"
         );
     }

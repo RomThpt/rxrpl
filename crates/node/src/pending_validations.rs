@@ -176,7 +176,10 @@ mod tests {
         let t0 = Instant::now();
         for i in 0..MAX_TOTAL {
             let key = format!("k{}", i % 32);
-            buf.buffer(mk_val(key.as_bytes(), i as u32), t0 + Duration::from_millis(i as u64));
+            buf.buffer(
+                mk_val(key.as_bytes(), i as u32),
+                t0 + Duration::from_millis(i as u64),
+            );
         }
         assert_eq!(buf.len(), MAX_TOTAL);
         let later = t0 + Duration::from_secs(1);
