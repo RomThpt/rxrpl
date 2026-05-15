@@ -280,6 +280,18 @@ impl BinarySerializer {
         // Parse into mantissa and exponent
         let (mantissa, exponent) = parse_decimal(abs_str)?;
 
+        // XRPL IOU amounts have a canonical exponent range of [-96, 80]
+        // (rippled STAmount cMinOffset/cMaxOffset). A value outside it is
+        // not a representable IOU amount; refuse it rather than wrapping
+        // `exponent + 97` past 8 bits into a garbage encoding.
+        const MIN_IOU_EXPONENT: i32 = -96;
+        const MAX_IOU_EXPONENT: i32 = 80;
+        if mantissa != 0 && !(MIN_IOU_EXPONENT..=MAX_IOU_EXPONENT).contains(&exponent) {
+            return Err(CodecError::UnsupportedType(format!(
+                "IOU amount exponent {exponent} out of range [{MIN_IOU_EXPONENT}, {MAX_IOU_EXPONENT}]"
+            )));
+        }
+
         // XRPL IOU encoding:
         // bit 63: not XRP (always 1 for IOU)
         // bit 62: positive (1) or negative (0)

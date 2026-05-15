@@ -372,7 +372,7 @@ impl<'a> BinaryParser<'a> {
             Ok(Value::String(drops.to_string()))
         } else {
             // IOU amount
-            let value_str = decode_iou_value(raw);
+            let value_str = decode_iou_value(raw)?;
 
             // Read currency (20 bytes) and issuer (20 bytes)
             let currency_bytes = self.read_bytes(20)?;
@@ -439,10 +439,24 @@ impl<'a> BinaryParser<'a> {
                 }
                 break;
             } else if type_byte == 0xFF {
-                // Path separator
-                paths.push(Value::Array(std::mem::take(&mut current_path)));
+                // Path separator. Skip empty paths: rippled never emits a
+                // path with zero steps, and pushing one here would not
+                // survive a re-encode (encode collapses it away).
+                if !current_path.is_empty() {
+                    paths.push(Value::Array(std::mem::take(&mut current_path)));
+                }
             } else {
-                // Path step
+                // Path step. Valid type bytes only set account (0x01),
+                // currency (0x10) and/or issuer (0x20) bits. Any other bit
+                // makes the step non-canonical: an unrecognized bit (or none
+                // at all) would be dropped on re-encode, breaking round-trip.
+                const PATH_STEP_TYPE_MASK: u8 = 0x01 | 0x10 | 0x20;
+                if type_byte & !PATH_STEP_TYPE_MASK != 0 {
+                    return Err(CodecError::UnsupportedType(format!(
+                        "non-canonical path step type byte: {type_byte:#04x}"
+                    )));
+                }
+
                 let mut step = Map::new();
 
                 if type_byte & 0x01 != 0 {
@@ -476,7 +490,7 @@ impl<'a> BinaryParser<'a> {
 
     pub(crate) fn parse_number(&mut self) -> Result<Value, CodecError> {
         let raw = self.read_u64()?;
-        Ok(Value::String(decode_iou_value(raw)))
+        Ok(Value::String(decode_iou_value(raw)?))
     }
 
     fn parse_issue(&mut self) -> Result<Value, CodecError> {
@@ -518,7 +532,7 @@ fn decode_currency_code(bytes: &[u8]) -> String {
     }
 }
 
-fn decode_iou_value(raw: u64) -> String {
+fn decode_iou_value(raw: u64) -> Result<String, CodecError> {
     // bit 63: not XRP (always 1)
     // bit 62: positive (1) or negative (0)
     // bits 54-61: exponent + 97
@@ -528,7 +542,23 @@ fn decode_iou_value(raw: u64) -> String {
     let mantissa = raw & 0x003F_FFFF_FFFF_FFFF;
 
     if mantissa == 0 {
-        return "0".to_string();
+        return Ok("0".to_string());
+    }
+
+    // A non-zero IOU amount is canonical only when the mantissa is normalized
+    // to 16 significant digits and the exponent is in [-96, 80] (rippled
+    // STAmount cMinValue/cMaxValue/cMinOffset/cMaxOffset). A non-canonical
+    // encoding cannot survive a re-encode round-trip; reject it like rippled.
+    const MIN_MANTISSA: u64 = 1_000_000_000_000_000;
+    const MAX_MANTISSA: u64 = 9_999_999_999_999_999;
+    const MIN_EXPONENT: i32 = -96;
+    const MAX_EXPONENT: i32 = 80;
+    if !(MIN_MANTISSA..=MAX_MANTISSA).contains(&mantissa)
+        || !(MIN_EXPONENT..=MAX_EXPONENT).contains(&exponent)
+    {
+        return Err(CodecError::UnsupportedType(format!(
+            "non-canonical IOU amount: mantissa={mantissa} exponent={exponent}"
+        )));
     }
 
     let sign = if positive { "" } else { "-" };
@@ -560,11 +590,12 @@ fn decode_iou_value(raw: u64) -> String {
             }
         }
     };
-    if raw_str.contains('.') {
+    let result = if raw_str.contains('.') {
         let trimmed = raw_str.trim_end_matches('0');
         let trimmed = trimmed.trim_end_matches('.');
         trimmed.to_string()
     } else {
         raw_str
-    }
+    };
+    Ok(result)
 }

@@ -61,8 +61,11 @@ fn key_map(ids: &[u8]) -> HashMap<NodeId, String> {
 
 #[test]
 fn e2e_negative_unl_generates_and_applies_pseudo_txs() {
-    // Real node (provides tx_engine, fees, ledger).
-    let node = Node::new(NodeConfig::default()).unwrap();
+    // Real node (provides tx_engine, fees, ledger). `new_standalone` yields
+    // an open, mutable ledger -- `Node::new` (reporting mode) holds a closed
+    // genesis that rejects transaction application.
+    let node =
+        Node::new_standalone(NodeConfig::default(), "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh").unwrap();
 
     // Standalone consensus engine wired to the same trust set.
     let trusted: HashSet<NodeId> = (1u8..=5).map(nid).collect();
