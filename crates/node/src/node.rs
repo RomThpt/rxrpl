@@ -187,9 +187,7 @@ impl Node {
         // from rippled, every close after #1 produces a mismatching
         // hash, and rxrpl falls into the catchup feedback loop seen on
         // 2026-05-12.
-        let ledger = Self::genesis_with_master_account_only(
-            "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
-        )?;
+        let ledger = Self::genesis_with_master_account_only("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")?;
 
         // Initialize transaction queue
         let tx_queue = TxQueue::new(2000);
@@ -1303,6 +1301,10 @@ impl Node {
                 ..ConsensusParams::default()
             };
             let mut timer = ConsensusTimer::new(&consensus_params);
+            // Captured before `consensus_params` is moved into the engine;
+            // the stale-round early-abandon check needs it to gate the
+            // seq-only signal on one full proposal interval.
+            let propose_interval_ms = consensus_params.propose_interval_ms;
             // The engine's `public_key` is echoed verbatim into every emitted
             // ProposeSet `node_pub_key`. For UNL-trusted proposals to be
             // counted by rippled, it MUST be the manifest-bound signing key
@@ -1325,12 +1327,9 @@ impl Node {
                 let mut t = unl.is_trusted(&node_id);
                 if let Some(vid) = validator_id_for_loop.as_ref() {
                     t = t
-                        || unl.is_trusted(&NodeId::from_public_key(
-                            vid.master_pubkey().as_bytes(),
-                        ))
-                        || unl.is_trusted(&NodeId::from_public_key(
-                            vid.signing_pubkey().as_bytes(),
-                        ));
+                        || unl.is_trusted(&NodeId::from_public_key(vid.master_pubkey().as_bytes()))
+                        || unl
+                            .is_trusted(&NodeId::from_public_key(vid.signing_pubkey().as_bytes()));
                 }
                 t
             };
@@ -1394,8 +1393,7 @@ impl Node {
             }
             tracing::info!("validation quorum initialized to {}", initial_quorum);
 
-            let mut pending_validations =
-                crate::pending_validations::PendingValidations::new();
+            let mut pending_validations = crate::pending_validations::PendingValidations::new();
 
             // Checkpoint bootstrap state (consumed once the anchor resolves).
             let mut checkpoint_anchor: Option<crate::checkpoint::CheckpointAnchor> =
@@ -1431,6 +1429,15 @@ impl Node {
             // At most one switch per 10 seconds.
             let mut last_prev_ledger_switch: Option<tokio::time::Instant> = None;
             const PREV_LEDGER_SWITCH_COOLDOWN: Duration = Duration::from_secs(10);
+
+            // Strict thresholds for the seq-only stale-round signal. A peer
+            // exactly one ledger ahead is normal cross-impl timing jitter, not
+            // a divergent chain — only a gap of >=2 ledgers, on a round that
+            // has visibly stalled, against a recently-observed peer status,
+            // counts as stale.
+            const STALE_SEQ_GAP: u32 = 2;
+            const STALE_ROUND_FACTOR: u64 = 4;
+            const STALE_PEER_SIGNAL_FRESHNESS: Duration = Duration::from_secs(5);
 
             // Track consensus stalls for escalating recovery.
             let mut stall_metrics = rxrpl_consensus::StallMetrics::new();
@@ -1564,7 +1571,6 @@ impl Node {
                                     // rxrpl participate as an active proposer in mixed-validator
                                     // topologies. Convergence on divergent peer chains is handled
                                     // by the existing wrong_prev_ledger / catchup recovery path.
-                                    let _ = last_peer_status_at;
                                     tracing::info!(
                                         "closing seq={} prev={} peer_seq={}",
                                         seq, prev_hash, max_peer_seq
@@ -1631,6 +1637,137 @@ impl Node {
                                     }
                                 }
                                 TimerAction::Converge => {
+                                    // Early-abandon of a stale round. If a trusted peer is
+                                    // provably ahead of us, the in-progress Establish round
+                                    // can NEVER reach quorum: every peer ProposeSet references
+                                    // a future prev_ledger and lands in the engine's
+                                    // `future_proposals` holding pen instead of being counted.
+                                    // Left alone, `converge()` burns all `max_consensus_rounds`
+                                    // (25 × 1250ms ≈ 31s) before force-accepting a ledger that
+                                    // diverges, then recovers via wrong_prev_ledger → catchup —
+                                    // an infinite ~31-38s/ledger loop in a mixed network.
+                                    //
+                                    // Detect "behind" from two independent signals and bail
+                                    // into catchup within ~1 round instead:
+                                    //  1. `check_wrong_prev_ledger()` — a trusted supermajority
+                                    //     has signed/proposed a different prev_ledger.
+                                    //  2. `max_peer_seq >= our_open_seq + STALE_SEQ_GAP` — a
+                                    //     peer announced a ledger at least two ahead of the one
+                                    //     we are still trying to close.
+                                    //
+                                    // False-positive guards:
+                                    //  - The whole block is gated on `check_wrong_prev_ledger`
+                                    //    returning Some OR the seq signal; solo mode (empty UNL
+                                    //    → `check_wrong_prev_ledger` is None, `max_peer_seq`
+                                    //    stays 0) never trips it.
+                                    //  - The seq-only signal is deliberately strict: `max_peer_seq`
+                                    //    is a monotonic high-water mark and rises by one whenever
+                                    //    any peer closes a ledger slightly before us — normal
+                                    //    cross-impl jitter. A gap of exactly 1 is therefore
+                                    //    ignored; only a gap of >= STALE_SEQ_GAP, on a round that
+                                    //    has run longer than STALE_ROUND_FACTOR propose intervals
+                                    //    (a healthy round converges well within that), and backed
+                                    //    by a peer StatusChange seen within STALE_PEER_SIGNAL_-
+                                    //    FRESHNESS, counts as stale. `check_wrong_prev_ledger`
+                                    //    is a hard signal (a trusted set already disagreed) and
+                                    //    needs no delay.
+                                    //  - Shares the `PREV_LEDGER_SWITCH_COOLDOWN` with the
+                                    //    proposal-path recovery so the two cannot thrash.
+                                    let our_open_seq =
+                                        ledger_seq_shared.load(Ordering::Relaxed);
+                                    let cooldown_ok = last_prev_ledger_switch
+                                        .map(|t| t.elapsed() >= PREV_LEDGER_SWITCH_COOLDOWN)
+                                        .unwrap_or(true);
+                                    let wrong_prev =
+                                        consensus.check_wrong_prev_ledger();
+                                    let round_stalled = round_started_at
+                                        .map(|t| {
+                                            t.elapsed().as_millis() as u64
+                                                > propose_interval_ms
+                                                    .saturating_mul(STALE_ROUND_FACTOR)
+                                        })
+                                        .unwrap_or(false);
+                                    let peer_signal_fresh = last_peer_status_at
+                                        .map(|t| {
+                                            t.elapsed() < STALE_PEER_SIGNAL_FRESHNESS
+                                        })
+                                        .unwrap_or(false);
+                                    let behind_by_seq = max_peer_seq
+                                        >= our_open_seq.saturating_add(STALE_SEQ_GAP)
+                                        && round_stalled
+                                        && peer_signal_fresh;
+                                    if cooldown_ok
+                                        && consensus.phase()
+                                            == rxrpl_consensus::ConsensusPhase::Establish
+                                        && (wrong_prev.is_some() || behind_by_seq)
+                                    {
+                                        tracing::warn!(
+                                            wrong_prev = wrong_prev.is_some(),
+                                            max_peer_seq,
+                                            our_open_seq,
+                                            "abandoning stale consensus round: trusted peer is \
+                                             ahead, entering catchup instead of exhausting \
+                                             max_consensus_rounds"
+                                        );
+                                        last_prev_ledger_switch =
+                                            Some(tokio::time::Instant::now());
+                                        syncing = true;
+                                        timer.on_phase_change(
+                                            rxrpl_consensus::ConsensusPhase::Open,
+                                        );
+                                        sync_started_at =
+                                            Some(tokio::time::Instant::now());
+
+                                        // Walk the contiguous run from the OLDEST held
+                                        // ledger and request the lowest gap, so the
+                                        // forward-chain LedgerData adopt path fills every
+                                        // intermediate ledger up to the peer tip. Mirrors
+                                        // the proposal-path recovery block below.
+                                        let highest_contiguous = {
+                                            let history = closed_ledgers.read().await;
+                                            let mut iter = history.iter();
+                                            match iter.next() {
+                                                None => 0,
+                                                Some(first) => {
+                                                    let mut hc =
+                                                        first.header.sequence;
+                                                    for l in iter {
+                                                        if l.header.sequence
+                                                            == hc + 1
+                                                        {
+                                                            hc = l.header
+                                                                .sequence;
+                                                        } else {
+                                                            break;
+                                                        }
+                                                    }
+                                                    hc
+                                                }
+                                            }
+                                        };
+                                        let lowest_missing = highest_contiguous + 1;
+                                        last_sync_seq = lowest_missing;
+                                        let _ = cmd_tx_catchup.send(
+                                            OverlayCommand::RequestLedger {
+                                                seq: lowest_missing,
+                                                hash: None,
+                                            },
+                                        );
+
+                                        // Reset the engine off the stale round. When
+                                        // `check_wrong_prev_ledger` named a preferred
+                                        // ledger, anchor on it; otherwise keep our
+                                        // prev_ledger and let catchup advance us.
+                                        let reset_prev = wrong_prev
+                                            .map(|d| d.preferred_ledger)
+                                            .unwrap_or_else(|| consensus.prev_ledger());
+                                        consensus.start_round(reset_prev, 0);
+                                        amendment_votes.clear();
+                                        trusted_validator_count = 0;
+                                        round_started_at = None;
+                                        continue;
+                                    }
+
                                     if consensus.converge() {
                                         timer.on_phase_change(consensus.phase());
                                         let _ = event_tx.send(ServerEvent::ConsensusPhaseChange {
@@ -2455,9 +2592,7 @@ impl Node {
         trusted_validator_count: usize,
         pruner: &Arc<LedgerPruner>,
         node_store: &Option<Arc<dyn NodeStore>>,
-        self_validation_tx: &tokio::sync::mpsc::UnboundedSender<
-            rxrpl_overlay::ConsensusMessage,
-        >,
+        self_validation_tx: &tokio::sync::mpsc::UnboundedSender<rxrpl_overlay::ConsensusMessage>,
     ) {
         // Resolve close_time in priority order:
         //  1. Quorum-accepted close_time from converge() — strongest signal,
@@ -2649,8 +2784,8 @@ impl Node {
             // and never reach quorum=ceil(N*0.8) when N=4 (mixed kurtosis:
             // 2 rxrpl + 2 rippled). Rippled does the equivalent in
             // `Validations::add` from its own onAccept path.
-            let _ = self_validation_tx
-                .send(rxrpl_overlay::ConsensusMessage::Validation(validation));
+            let _ =
+                self_validation_tx.send(rxrpl_overlay::ConsensusMessage::Validation(validation));
         }
 
         // Broadcast StatusChange so peers know our current ledger and our
@@ -2776,9 +2911,7 @@ impl Node {
     /// `genesis_with_funded_account*` variants additionally pre-activate
     /// the 28 standalone amendments and are intended for solo/test
     /// scenarios where peers run the same bootstrap.
-    pub fn genesis_with_master_account_only(
-        genesis_address: &str,
-    ) -> Result<Ledger, NodeError> {
+    pub fn genesis_with_master_account_only(genesis_address: &str) -> Result<Ledger, NodeError> {
         let mut genesis = Ledger::genesis();
 
         let account_id = decode_account_id(genesis_address)
@@ -2932,8 +3065,8 @@ impl Node {
             "Flags": 0,
         });
         let amendments_key = keylet::amendments();
-        let json_bytes = serde_json::to_vec(&amendments_value)
-            .map_err(|e| NodeError::Config(e.to_string()))?;
+        let json_bytes =
+            serde_json::to_vec(&amendments_value).map_err(|e| NodeError::Config(e.to_string()))?;
         let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes)
             .map_err(|e| NodeError::Config(format!("failed to encode amendments: {e}")))?;
         genesis.put_state(amendments_key, data)?;
@@ -3701,13 +3834,11 @@ mod tests {
         let actual_account_hash = hex::encode_upper(genesis.header.account_hash.as_bytes());
 
         assert_eq!(
-            actual_account_hash,
-            "3791BF543E5B77A17BC454F7A0720E4615760F457135F399DE67C54D7929546D",
+            actual_account_hash, "3791BF543E5B77A17BC454F7A0720E4615760F457135F399DE67C54D7929546D",
             "genesis account_hash diverges from rippled-2.6.2"
         );
         assert_eq!(
-            actual_hash,
-            "E158C218A9AF027957A54ECD7D25F4AD35C90B2AAF8DE4956723A17D80F5B3F4",
+            actual_hash, "E158C218A9AF027957A54ECD7D25F4AD35C90B2AAF8DE4956723A17D80F5B3F4",
             "genesis ledger hash diverges from rippled-2.6.2"
         );
     }
