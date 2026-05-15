@@ -15,6 +15,13 @@ pub struct ConsensusParams {
     pub max_consensus_rounds: u32,
     /// Close time rounding resolution in seconds.
     pub close_time_resolution: u32,
+    /// Minimum time (ms) to stay in the Establish phase before accepting
+    /// consensus, even once quorum agreement is observed. Mirrors rippled's
+    /// `ledgerMIN_CONSENSUS` (~1.95s): the floor gives peer ProposeSets time
+    /// to propagate so a node does not finalize a round before slower peers
+    /// have weighed in. `0` disables the floor (solo mode / unit tests close
+    /// as soon as the agreement logic is satisfied).
+    pub min_consensus_time_ms: u64,
 }
 
 impl Default for ConsensusParams {
@@ -41,6 +48,10 @@ impl Default for ConsensusParams {
             // guard is rarely needed in practice.
             max_consensus_rounds: 25,
             close_time_resolution: 30,
+            // 0 by default: solo mode and unit tests have no peers to wait
+            // for, so the agreement logic alone gates acceptance. Networked
+            // mode raises this to ~1950ms (see `Node::run_networked`).
+            min_consensus_time_ms: 0,
         }
     }
 }
