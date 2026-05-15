@@ -1436,6 +1436,15 @@ impl Node {
             let mut last_prev_ledger_switch: Option<tokio::time::Instant> = None;
             const PREV_LEDGER_SWITCH_COOLDOWN: Duration = Duration::from_secs(10);
 
+            // Strict thresholds for the seq-only stale-round signal. A peer
+            // exactly one ledger ahead is normal cross-impl timing jitter, not
+            // a divergent chain — only a gap of >=2 ledgers, on a round that
+            // has visibly stalled, against a recently-observed peer status,
+            // counts as stale.
+            const STALE_SEQ_GAP: u32 = 2;
+            const STALE_ROUND_FACTOR: u64 = 4;
+            const STALE_PEER_SIGNAL_FRESHNESS: Duration = Duration::from_secs(5);
+
             // Track consensus stalls for escalating recovery.
             let mut stall_metrics = rxrpl_consensus::StallMetrics::new();
 
@@ -1568,7 +1577,6 @@ impl Node {
                                     // rxrpl participate as an active proposer in mixed-validator
                                     // topologies. Convergence on divergent peer chains is handled
                                     // by the existing wrong_prev_ledger / catchup recovery path.
-                                    let _ = last_peer_status_at;
                                     tracing::info!(
                                         "closing seq={} prev={} peer_seq={}",
                                         seq, prev_hash, max_peer_seq
@@ -1649,21 +1657,26 @@ impl Node {
                                     // into catchup within ~1 round instead:
                                     //  1. `check_wrong_prev_ledger()` — a trusted supermajority
                                     //     has signed/proposed a different prev_ledger.
-                                    //  2. `max_peer_seq > our_open_seq` — a peer announced (via
-                                    //     StatusChange / validation) a strictly higher ledger
-                                    //     than the one we are still trying to close.
+                                    //  2. `max_peer_seq >= our_open_seq + STALE_SEQ_GAP` — a
+                                    //     peer announced a ledger at least two ahead of the one
+                                    //     we are still trying to close.
                                     //
                                     // False-positive guards:
                                     //  - The whole block is gated on `check_wrong_prev_ledger`
-                                    //    returning Some OR `max_peer_seq > our_open_seq`; solo
-                                    //    mode (empty UNL → `check_wrong_prev_ledger` is None,
-                                    //    `max_peer_seq` stays 0) never trips it.
-                                    //  - The seq-only signal additionally requires the round
-                                    //    to have run longer than one `propose_interval_ms`, so
-                                    //    a peer that merely opened ledger N+1 a few hundred ms
-                                    //    before us — normal cross-impl timing jitter — is not
-                                    //    abandoned. `check_wrong_prev_ledger` is a hard signal
-                                    //    (a trusted set already disagreed) and needs no delay.
+                                    //    returning Some OR the seq signal; solo mode (empty UNL
+                                    //    → `check_wrong_prev_ledger` is None, `max_peer_seq`
+                                    //    stays 0) never trips it.
+                                    //  - The seq-only signal is deliberately strict: `max_peer_seq`
+                                    //    is a monotonic high-water mark and rises by one whenever
+                                    //    any peer closes a ledger slightly before us — normal
+                                    //    cross-impl jitter. A gap of exactly 1 is therefore
+                                    //    ignored; only a gap of >= STALE_SEQ_GAP, on a round that
+                                    //    has run longer than STALE_ROUND_FACTOR propose intervals
+                                    //    (a healthy round converges well within that), and backed
+                                    //    by a peer StatusChange seen within STALE_PEER_SIGNAL_-
+                                    //    FRESHNESS, counts as stale. `check_wrong_prev_ledger`
+                                    //    is a hard signal (a trusted set already disagreed) and
+                                    //    needs no delay.
                                     //  - Shares the `PREV_LEDGER_SWITCH_COOLDOWN` with the
                                     //    proposal-path recovery so the two cannot thrash.
                                     let our_open_seq =
@@ -1673,14 +1686,22 @@ impl Node {
                                         .unwrap_or(true);
                                     let wrong_prev =
                                         consensus.check_wrong_prev_ledger();
-                                    let round_old_enough = round_started_at
+                                    let round_stalled = round_started_at
                                         .map(|t| {
                                             t.elapsed().as_millis() as u64
                                                 > propose_interval_ms
+                                                    .saturating_mul(STALE_ROUND_FACTOR)
                                         })
                                         .unwrap_or(false);
-                                    let behind_by_seq = max_peer_seq > our_open_seq
-                                        && round_old_enough;
+                                    let peer_signal_fresh = last_peer_status_at
+                                        .map(|t| {
+                                            t.elapsed() < STALE_PEER_SIGNAL_FRESHNESS
+                                        })
+                                        .unwrap_or(false);
+                                    let behind_by_seq = max_peer_seq
+                                        >= our_open_seq.saturating_add(STALE_SEQ_GAP)
+                                        && round_stalled
+                                        && peer_signal_fresh;
                                     if cooldown_ok
                                         && consensus.phase()
                                             == rxrpl_consensus::ConsensusPhase::Establish
