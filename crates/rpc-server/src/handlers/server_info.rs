@@ -244,7 +244,10 @@ mod tests {
     fn format_ranges_with_gaps() {
         assert_eq!(format_ledger_ranges(&[1, 3, 5]), "1-1,3-3,5-5");
         assert_eq!(format_ledger_ranges(&[1, 2, 3, 7, 8, 9]), "1-3,7-9");
-        assert_eq!(format_ledger_ranges(&[1, 2, 4, 6, 7, 10]), "1-2,4-4,6-7,10-10");
+        assert_eq!(
+            format_ledger_ranges(&[1, 2, 4, 6, 7, 10]),
+            "1-2,4-4,6-7,10-10"
+        );
     }
 
     #[test]

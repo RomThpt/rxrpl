@@ -400,10 +400,7 @@ impl ServerContext {
     /// Attach the overlay's PeerSet so `server_info.peers` reflects live
     /// connection count. Standalone mode leaves this `None` → peers=0.
     /// Same Arc::get_mut constraint as `attach_validator_list_status`.
-    pub fn attach_peer_set(
-        self: &mut Arc<Self>,
-        set: Arc<rxrpl_overlay::peer_set::PeerSet>,
-    ) {
+    pub fn attach_peer_set(self: &mut Arc<Self>, set: Arc<rxrpl_overlay::peer_set::PeerSet>) {
         if let Some(ctx) = Arc::get_mut(self) {
             ctx.peer_set = Some(set);
         }
@@ -459,13 +456,9 @@ impl ServerContext {
     /// readers don't need to disambiguate a freshly-attached slot.
     pub fn network_validated(&self) -> Option<NetworkValidatedSnapshot> {
         self.network_validated.as_ref().and_then(|slot| {
-            slot.read().ok().and_then(|guard| {
-                if guard.seq > 0 {
-                    Some(*guard)
-                } else {
-                    None
-                }
-            })
+            slot.read()
+                .ok()
+                .and_then(|guard| if guard.seq > 0 { Some(*guard) } else { None })
         })
     }
 

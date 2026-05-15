@@ -347,11 +347,7 @@ fn sweep_unfunded_offers(
 
 /// Test whether `owner` currently holds the `TakerGets` amount in full.
 /// XRP: AccountRoot.Balance ≥ amount. IOU: holder-side trust line balance ≥ value.
-fn is_offer_funded(
-    ctx: &mut ApplyContext<'_>,
-    owner: &AccountId,
-    gets: &Value,
-) -> bool {
+fn is_offer_funded(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Value) -> bool {
     if let Some(drops_str) = gets.as_str() {
         let needed: u64 = drops_str.parse().unwrap_or(0);
         if needed == 0 {
@@ -429,12 +425,8 @@ fn remove_from_book_dir(
         };
         let mut dir: Value =
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
-        let next_page = dir
-            .get("IndexNext")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let removed = if let Some(indexes) = dir.get_mut("Indexes").and_then(|v| v.as_array_mut())
-        {
+        let next_page = dir.get("IndexNext").and_then(|v| v.as_u64()).unwrap_or(0);
+        let removed = if let Some(indexes) = dir.get_mut("Indexes").and_then(|v| v.as_array_mut()) {
             let original = indexes.len();
             indexes.retain(|v| v.as_str() != Some(entry_hex.as_str()));
             indexes.len() != original
