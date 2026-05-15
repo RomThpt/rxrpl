@@ -249,8 +249,14 @@ impl Node {
         let tx_store: Arc<dyn TxStore> =
             Arc::new(SqliteStore::in_memory().map_err(|e| NodeError::Config(e.to_string()))?);
 
-        let mut closed_genesis =
-            Self::genesis_with_funded_account_and_store(genesis_address, &node_store)?;
+        // Select the genesis layout to match the rippled peers we connect
+        // to: stock rippled (master AccountRoot + FeeSettings + Amendments)
+        // vs `genesis_amendments_disabled = true` (master AccountRoot only).
+        let mut closed_genesis = if config.network.genesis_amendments_disabled {
+            Self::genesis_with_master_account_only(genesis_address)?
+        } else {
+            Self::genesis_with_funded_account_and_store(genesis_address, &node_store)?
+        };
 
         // Flush genesis to store and compact for memory efficiency
         if node_store.is_some() {
@@ -3495,6 +3501,35 @@ mod tests {
         let closed = node.closed_ledgers.blocking_read();
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].header.sequence, 1);
+    }
+
+    #[test]
+    fn networked_genesis_stock_layout_has_fee_and_amendments() {
+        let config = NodeConfig::default();
+        assert!(!config.network.genesis_amendments_disabled);
+        let address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let node = Node::new_standalone(config, address).unwrap();
+
+        let closed = node.closed_ledgers.blocking_read();
+        let genesis = &closed[0];
+        assert!(genesis.get_state(&keylet::fee_settings()).is_some());
+        assert!(genesis.get_state(&keylet::amendments()).is_some());
+    }
+
+    #[test]
+    fn networked_genesis_master_only_layout_omits_fee_and_amendments() {
+        let mut config = NodeConfig::default();
+        config.network.genesis_amendments_disabled = true;
+        let address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let node = Node::new_standalone(config, address).unwrap();
+
+        let closed = node.closed_ledgers.blocking_read();
+        let genesis = &closed[0];
+        assert!(genesis.get_state(&keylet::fee_settings()).is_none());
+        assert!(genesis.get_state(&keylet::amendments()).is_none());
+
+        let account_id = decode_account_id(address).unwrap();
+        assert!(genesis.get_state(&keylet::account(&account_id)).is_some());
     }
 
     #[test]
