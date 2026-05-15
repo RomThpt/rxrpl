@@ -34,6 +34,12 @@ trusted = []
 # Network ID (0 = mainnet, 1 = testnet)
 network_id = 1
 
+# Genesis (seq=1) layout. Must match the rippled peers this node connects to.
+# false (default): stock-rippled layout (master AccountRoot + FeeSettings +
+#   Amendments). true: master-AccountRoot-only, matching rippled started with
+#   genesis_amendments_disabled = true (xrpl-confluence topology).
+# genesis_amendments_disabled = false
+
 [genesis]
 # Genesis ledger hash (optional, for network identification)
 # ledger_hash = "..."
