@@ -1433,37 +1433,6 @@ impl Node {
                                         continue;
                                     }
 
-                                    // Close-time alignment gate: in mixed-validator topologies,
-                                    // each node's `effective_close_time` MUST land in the same
-                                    // resolution bucket as rippled's, or the produced ledger
-                                    // hash diverges and rxrpl wastes the next 20s recovering
-                                    // via wrong_prev_ledger → catchup → re-close. We anchor
-                                    // close_time off `latest_peer_close_time` whenever we have
-                                    // it; without it, we fall back to wall-clock, which on a
-                                    // ~10s resolution drifts out of bucket whenever rxrpl's
-                                    // round fires a few hundred ms before rippled's. Defer the
-                                    // round until at least one peer has broadcast a
-                                    // proposal (so `latest_peer_close_time` is populated).
-                                    // The cap matches `first_close_grace` so a stuck network
-                                    // still progresses — after that, we fall through and close
-                                    // solo, accepting the divergence as the lesser evil vs.
-                                    // hanging consensus indefinitely.
-                                    let have_peer_ct = consensus.latest_peer_close_time().is_some();
-                                    if have_unl_peers_for_loop
-                                        && !have_peer_ct
-                                        && startup_instant.elapsed() < first_close_grace
-                                    {
-                                        tracing::debug!(
-                                            target: "consensus",
-                                            elapsed_s = startup_instant.elapsed().as_secs(),
-                                            "deferring close: no peer ProposeSet yet (close_time would drift out of rippled's bucket)"
-                                        );
-                                        timer.on_phase_change(
-                                            rxrpl_consensus::ConsensusPhase::Open,
-                                        );
-                                        continue;
-                                    }
-
                                     // XRPL NetClock = seconds since 2000-01-01 UTC.
                                     // See the matching comment in the consensus
                                     // task above; passing Unix epoch here would
@@ -1475,6 +1444,51 @@ impl Node {
                                     let seq = l.header.sequence;
                                     let parent_close_time = l.header.parent_close_time;
                                     drop(l);
+
+                                    // Close-time alignment gate: in mixed-validator topologies,
+                                    // each node's `effective_close_time` MUST land in the same
+                                    // resolution bucket as rippled's, or the produced ledger
+                                    // hash diverges and rxrpl wastes the next ~15s recovering
+                                    // via wrong_prev_ledger → catchup → re-close. We anchor
+                                    // close_time off `latest_peer_close_time` whenever we have
+                                    // a value FOR THIS ROUND; otherwise we fall back to
+                                    // wall-clock, which drifts out of bucket whenever rxrpl's
+                                    // round fires a few hundred ms before rippled's.
+                                    //
+                                    // `latest_peer_close_time` is updated on every peer
+                                    // proposal regardless of round, so a stale value left over
+                                    // from round N-1 equals this round's `parent_close_time`.
+                                    // Gating on `.is_some()` alone therefore lets a stale value
+                                    // through and rxrpl closes with wall-clock anyway — the
+                                    // alternating-divergence bug. Require a value strictly
+                                    // greater than `parent_close_time`, which can only come
+                                    // from rippled's proposal for the CURRENT round, so rxrpl
+                                    // always lands in rippled's exact bucket and produces a
+                                    // matching ledger every round. rxrpl still proposes (just a
+                                    // few hundred ms later) so it stays an active proposer.
+                                    //
+                                    // The cap matches `first_close_grace` so a stuck network
+                                    // still progresses — after that, we fall through and close
+                                    // solo, accepting the divergence as the lesser evil vs.
+                                    // hanging consensus indefinitely.
+                                    let have_fresh_peer_ct = consensus
+                                        .latest_peer_close_time()
+                                        .map(|ct| ct > parent_close_time)
+                                        .unwrap_or(false);
+                                    if have_unl_peers_for_loop
+                                        && !have_fresh_peer_ct
+                                        && startup_instant.elapsed() < first_close_grace
+                                    {
+                                        tracing::debug!(
+                                            target: "consensus",
+                                            elapsed_s = startup_instant.elapsed().as_secs(),
+                                            "deferring close: no fresh peer ProposeSet for this round (close_time would drift out of rippled's bucket)"
+                                        );
+                                        timer.on_phase_change(
+                                            rxrpl_consensus::ConsensusPhase::Open,
+                                        );
+                                        continue;
+                                    }
 
                                     if last_round_seq != seq {
                                         last_round_seq = seq;

@@ -1005,6 +1005,21 @@ impl PeerManager {
                                 self.ledger_syncer
                                     .set_ledger_hash(header.sequence, header.hash);
 
+                                // Emit the parsed header to consensus UNCONDITIONALLY and
+                                // BEFORE any LedgerData. The consensus loop caches it in
+                                // `catchup_headers`; `try_reconstruct_ledger` then copies
+                                // close_time / parent_close_time / drops onto the
+                                // reconstructed ledger. Without a cached header the
+                                // reconstructed ledger has close_time=0, the next open
+                                // ledger inherits parent_close_time=0, and the close-time
+                                // alignment gate is defeated → divergence from rippled.
+                                // Every catchup path below (immediate-complete AND the
+                                // common multi-round `feed_nodes` path) relies on this.
+                                let _ = self.consensus_tx.send(ConsensusMessage::LedgerHeader {
+                                    seq: header.sequence,
+                                    header: header.clone(),
+                                });
+
                                 if let Some(store) = self.get_node_store() {
                                     let missing = self.ledger_syncer.start_incremental_sync(
                                         header.sequence,
@@ -1025,37 +1040,13 @@ impl PeerManager {
                                             leaves.len()
                                         );
                                         self.ledger_syncer.mark_synced(header.sequence);
-                                        // Send the parsed header FIRST so the consensus loop's
-                                        // catchup_headers cache is populated before LedgerData
-                                        // triggers try_reconstruct_ledger. Without this ordering,
-                                        // the reconstructed ledger has close_time=0 (header
-                                        // fields not copied), and the next local close uses
-                                        // parent_close_time=0 — diverging from rippled's chain.
-                                        let _ = self.consensus_tx.send(ConsensusMessage::LedgerHeader {
-                                            seq: header.sequence,
-                                            header: header.clone(),
-                                        });
                                         let _ =
                                             self.consensus_tx.send(ConsensusMessage::LedgerData {
                                                 hash: header.hash,
                                                 seq: header.sequence,
                                                 nodes: leaves,
                                             });
-                                    } else {
-                                        // Multi-round sync: header is still useful for the
-                                        // eventual reconstruction, send it now.
-                                        let _ = self.consensus_tx.send(ConsensusMessage::LedgerHeader {
-                                            seq: header.sequence,
-                                            header,
-                                        });
                                     }
-                                } else {
-                                    // No store — emit header anyway so future LedgerData arrivals
-                                    // can be reconstructed with the right close_time.
-                                    let _ = self.consensus_tx.send(ConsensusMessage::LedgerHeader {
-                                        seq: header.sequence,
-                                        header,
-                                    });
                                 }
                             } else {
                                 // Not a header -- raw node data, not useful for reconstruction.
