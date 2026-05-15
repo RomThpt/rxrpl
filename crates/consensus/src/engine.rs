@@ -1307,11 +1307,22 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
                 .values()
                 .filter(|p| self.unl.is_trusted(&p.node_id) && p.tx_set_hash == our_hash)
                 .count();
-            let self_counts = if self.unl.is_trusted(&self.node_id) {
-                1
-            } else {
-                0
-            };
+            // Self-trust check: `self.node_id` is derived from the node's
+            // peer-to-peer key, but when running as a UNL validator the
+            // engine signs proposals with the manifest-bound *validator*
+            // signing key (`self.public_key`) and the UNL is populated with
+            // validator-key-derived NodeIds. The two never match, so
+            // `is_trusted(&self.node_id)` is always false for a validator
+            // and `self_counts` collapses to 0 — leaving us one short of
+            // quorum forever (we never receive our own proposal as a peer)
+            // and force-accepting at `max_consensus_rounds` every round.
+            // Count ourselves trusted if EITHER identity is in the UNL.
+            let self_in_unl = self.unl.is_trusted(&self.node_id)
+                || (!self.public_key.is_empty()
+                    && self
+                        .unl
+                        .is_trusted(&NodeId::from_public_key(&self.public_key)));
+            let self_counts = if self_in_unl { 1 } else { 0 };
             if agreeing_unl + self_counts >= self.unl.quorum_threshold() {
                 if !self.min_consensus_time_elapsed() {
                     // Quorum met, but hold until the min-consensus floor
