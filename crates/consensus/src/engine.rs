@@ -181,6 +181,15 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     /// real time, independent of poll frequency. `None` until the first
     /// advance of the current round.
     last_round_advance: Option<Instant>,
+    /// Whether this node is itself a trusted UNL member. Set authoritatively
+    /// by the node layer (which knows every form of its own identity —
+    /// node-peer key, validator master key, validator ephemeral signing
+    /// key) via [`Self::set_self_trusted`]. The engine cannot reliably infer
+    /// this by key matching alone: it signs proposals with the ephemeral
+    /// key, but the UNL may list the master key, and the two never match.
+    /// A node never receives its own proposal as a peer, so without
+    /// counting itself a validator is permanently one short of quorum.
+    self_trusted: bool,
 }
 
 /// Maximum number of distinct `prev_ledger` hashes held in
@@ -254,7 +263,17 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             proposals_held_pending_prev_ledger_total: AtomicU64::new(0),
             establish_started_at: None,
             last_round_advance: None,
+            self_trusted: false,
         }
+    }
+
+    /// Declare whether this node is itself a trusted UNL member. Called by
+    /// the node layer, which alone knows every form of the local identity
+    /// (node-peer key, validator master key, validator ephemeral signing
+    /// key) and can match it against the configured UNL. Drives the quorum
+    /// self-count in [`Self::converge`].
+    pub fn set_self_trusted(&mut self, trusted: bool) {
+        self.self_trusted = trusted;
     }
 
     /// Get a mutable reference to the adapter (for simulation/testing).
@@ -1307,17 +1326,21 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
                 .values()
                 .filter(|p| self.unl.is_trusted(&p.node_id) && p.tx_set_hash == our_hash)
                 .count();
-            // Self-trust check: `self.node_id` is derived from the node's
-            // peer-to-peer key, but when running as a UNL validator the
-            // engine signs proposals with the manifest-bound *validator*
-            // signing key (`self.public_key`) and the UNL is populated with
-            // validator-key-derived NodeIds. The two never match, so
-            // `is_trusted(&self.node_id)` is always false for a validator
-            // and `self_counts` collapses to 0 — leaving us one short of
-            // quorum forever (we never receive our own proposal as a peer)
-            // and force-accepting at `max_consensus_rounds` every round.
-            // Count ourselves trusted if EITHER identity is in the UNL.
-            let self_in_unl = self.unl.is_trusted(&self.node_id)
+            // Self-trust check. A node never receives its own proposal as a
+            // peer, so it must count itself toward quorum or it is forever
+            // one short and force-accepts at `max_consensus_rounds`.
+            //
+            // The authoritative signal is `self.self_trusted`, set by the
+            // node layer which knows every form of the local identity
+            // (node-peer key, validator master key, validator ephemeral
+            // signing key) and matches it against the UNL. Key-form
+            // inference inside the engine is unreliable: the engine signs
+            // with the ephemeral key but the UNL may list the master key.
+            // The `is_trusted(...)` fallbacks below still serve solo /
+            // unit-test paths that build the engine without calling
+            // `set_self_trusted`.
+            let self_in_unl = self.self_trusted
+                || self.unl.is_trusted(&self.node_id)
                 || (!self.public_key.is_empty()
                     && self
                         .unl

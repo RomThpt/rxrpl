@@ -1315,6 +1315,25 @@ impl Node {
                 Some(vid) => vid.signing_pubkey().as_bytes().to_vec(),
                 None => identity.public_key_bytes().to_vec(),
             };
+            // The node knows its own identity definitively — node-peer key,
+            // validator master key, and validator ephemeral signing key.
+            // Decide ONCE whether we are a trusted UNL member by matching
+            // every form against the configured UNL, and tell the engine.
+            // The engine cannot do this reliably itself: it signs proposals
+            // with the ephemeral key while the UNL may list the master key.
+            let self_trusted = {
+                let mut t = unl.is_trusted(&node_id);
+                if let Some(vid) = validator_id_for_loop.as_ref() {
+                    t = t
+                        || unl.is_trusted(&NodeId::from_public_key(
+                            vid.master_pubkey().as_bytes(),
+                        ))
+                        || unl.is_trusted(&NodeId::from_public_key(
+                            vid.signing_pubkey().as_bytes(),
+                        ));
+                }
+                t
+            };
             let mut consensus = ConsensusEngine::new_with_unl(
                 adapter,
                 node_id,
@@ -1322,6 +1341,10 @@ impl Node {
                 consensus_params,
                 unl,
             );
+            consensus.set_self_trusted(self_trusted);
+            if self_trusted {
+                tracing::info!("consensus: node is a trusted UNL validator (counts toward quorum)");
+            }
 
             let mut syncing = false;
             let mut max_peer_seq: u32 = 0;
