@@ -316,7 +316,7 @@ pub struct NetworkConfig {
     pub network_id: u32,
     /// Selects the networked genesis (seq=1) layout to match rippled peers.
     /// `false` (default) builds the stock-rippled layout: master AccountRoot
-    /// + FeeSettings + Amendments (28 pre-activated). `true` builds the
+    /// plus FeeSettings and Amendments (28 pre-activated). `true` builds the
     /// master-AccountRoot-only layout that rippled emits when started with
     /// `genesis_amendments_disabled = true` (the xrpl-confluence topology).
     /// Must match peers or cross-impl genesis hashes diverge.

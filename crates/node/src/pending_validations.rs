@@ -100,6 +100,10 @@ impl PendingValidations {
         self.total
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
     pub fn buffered_total(&self) -> u64 {
         self.buffered_total
     }
