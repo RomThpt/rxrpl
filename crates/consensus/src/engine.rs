@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use rxrpl_primitives::Hash256;
 
@@ -167,6 +168,11 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     /// rippled `Counter[ConsensusProposals.heldFutureLedger]` JLOG metric.
     /// Exposed via [`Self::proposals_held_pending_prev_ledger_total`].
     proposals_held_pending_prev_ledger_total: AtomicU64,
+    /// Instant the current Establish phase began (set in [`Self::close_ledger`]).
+    /// Used to enforce `params.min_consensus_time_ms`: even once quorum
+    /// agreement is observed, [`Self::converge`] will not accept before this
+    /// much wall-clock time has elapsed. `None` outside the Establish phase.
+    establish_started_at: Option<Instant>,
 }
 
 /// Maximum number of distinct `prev_ledger` hashes held in
@@ -238,6 +244,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             prior_close_time: 0,
             proposal_dropped_stale_total: AtomicU64::new(0),
             proposals_held_pending_prev_ledger_total: AtomicU64::new(0),
+            establish_started_at: None,
         }
     }
 
@@ -727,6 +734,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.our_position = Some(proposal);
         self.our_set = Some(our_set);
         self.phase = ConsensusPhase::Establish;
+        self.establish_started_at = Some(Instant::now());
 
         // Replay any proposals buffered while we were in Open phase.
         // Use our own `close_time` as the freshness anchor so that a
@@ -1146,6 +1154,22 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         false
     }
 
+    /// Whether the Establish phase has run at least
+    /// `params.min_consensus_time_ms`. Returns `true` when the floor is
+    /// disabled (`0`), when there is no recorded Establish start, or once
+    /// enough wall-clock time has elapsed. Mirrors rippled's
+    /// `ledgerMIN_CONSENSUS` gate on declaring consensus.
+    fn min_consensus_time_elapsed(&self) -> bool {
+        let floor = self.params.min_consensus_time_ms;
+        if floor == 0 {
+            return true;
+        }
+        match self.establish_started_at {
+            Some(started) => started.elapsed().as_millis() as u64 >= floor,
+            None => true,
+        }
+    }
+
     /// Run one round of convergence.
     ///
     /// Adjusts our position based on peer proposals and the current threshold.
@@ -1248,6 +1272,12 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             };
 
             if agreement_pct >= threshold {
+                if !self.min_consensus_time_elapsed() {
+                    // Quorum agrees, but hold the round open until the
+                    // min-consensus floor passes so slower peers can weigh
+                    // in. The node loop calls converge() again next tick.
+                    return false;
+                }
                 self.accept();
                 return true;
             }
@@ -1264,6 +1294,12 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
                 0
             };
             if agreeing_unl + self_counts >= self.unl.quorum_threshold() {
+                if !self.min_consensus_time_elapsed() {
+                    // Quorum met, but hold until the min-consensus floor
+                    // elapses (rippled `ledgerMIN_CONSENSUS`) so peer
+                    // ProposeSets in flight are not finalized past.
+                    return false;
+                }
                 self.accept();
                 return true;
             }
@@ -2041,6 +2077,37 @@ mod tests {
         engine.peer_proposal_at(proposal_for(node(3), set.hash, Hash256::ZERO, 1), 100);
         engine.peer_proposal_at(proposal_for(node(4), set.hash, Hash256::ZERO, 1), 100);
 
+        assert!(engine.converge());
+        assert_eq!(engine.phase(), ConsensusPhase::Accepted);
+    }
+
+    #[test]
+    fn min_consensus_time_floor_holds_round_open() {
+        // With a non-zero min_consensus_time_ms, converge() must NOT accept
+        // even when quorum agrees, until the floor has elapsed. Mirrors
+        // rippled's ledgerMIN_CONSENSUS gate.
+        let unl = make_unl(&[1, 2, 3, 4, 5]);
+        let params = ConsensusParams {
+            min_consensus_time_ms: 80,
+            ..ConsensusParams::default()
+        };
+        let mut engine =
+            ConsensusEngine::new_with_unl(SimpleAdapter, node(1), Vec::new(), params, unl);
+        engine.start_round(Hash256::ZERO, 1);
+
+        let set = TxSet::new(vec![]);
+        engine.close_ledger(set.clone(), 100, 1).unwrap();
+        engine.peer_proposal_at(proposal_for(node(2), set.hash, Hash256::ZERO, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(3), set.hash, Hash256::ZERO, 1), 100);
+        engine.peer_proposal_at(proposal_for(node(4), set.hash, Hash256::ZERO, 1), 100);
+
+        // Quorum is met, but the floor has not elapsed → round stays open.
+        assert!(!engine.converge());
+        assert_eq!(engine.phase(), ConsensusPhase::Establish);
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Floor elapsed → same quorum now accepts.
         assert!(engine.converge());
         assert_eq!(engine.phase(), ConsensusPhase::Accepted);
     }

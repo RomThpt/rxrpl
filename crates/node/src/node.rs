@@ -1290,7 +1290,14 @@ impl Node {
         let validator_id_for_loop = validator_id.clone();
         tokio::spawn(async move {
             let node_id = NodeId(identity.node_id);
-            let consensus_params = ConsensusParams::default();
+            // Networked mode: enforce a minimum Establish-phase duration
+            // (~rippled `ledgerMIN_CONSENSUS`) so a round is not finalized
+            // before peer ProposeSets have had time to propagate. Solo mode
+            // leaves this at the default 0 — no peers to wait for.
+            let consensus_params = ConsensusParams {
+                min_consensus_time_ms: 1_950,
+                ..ConsensusParams::default()
+            };
             let mut timer = ConsensusTimer::new(&consensus_params);
             // The engine's `public_key` is echoed verbatim into every emitted
             // ProposeSet `node_pub_key`. For UNL-trusted proposals to be
