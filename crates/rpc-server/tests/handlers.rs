@@ -241,6 +241,44 @@ async fn server_info_with_ledger() {
     assert_eq!(result["info"]["ledger_current_index"], 2);
 }
 
+/// Reproduces the kurtosis-observed pattern: catchup adopts only the tip at
+/// each cycle, leaving the closed_ledgers deque sparse. The RPC must report
+/// the real holes instead of pretending we have a continuous range.
+#[tokio::test]
+async fn server_info_complete_ledgers_reports_real_holes() {
+    let ledger = genesis_funded_ledger();
+    let engine = make_engine();
+    let fees = FeeSettings::default();
+
+    let mut closed = VecDeque::new();
+    for seq in [1u32, 3, 5, 7, 8, 9, 11, 12, 15] {
+        let mut l = Ledger::genesis();
+        l.header.sequence = seq;
+        l.close(0, 0).unwrap();
+        closed.push_back(l);
+    }
+
+    let ctx = ServerContext::with_node_state(
+        ServerConfig::default(),
+        Arc::new(RwLock::new(ledger)),
+        Arc::new(RwLock::new(closed)),
+        Arc::new(engine),
+        Arc::new(fees),
+        None,
+        None,
+        None,
+    );
+
+    let result = rxrpl_rpc_server::handlers::server_info(json!({}), &ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result["info"]["complete_ledgers"],
+        "1-1,3-3,5-5,7-9,11-12,15-15"
+    );
+}
+
 // -- ledger_current tests --
 
 #[tokio::test]

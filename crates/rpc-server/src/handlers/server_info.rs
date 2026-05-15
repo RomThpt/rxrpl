@@ -1,9 +1,30 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
 use crate::context::ServerContext;
 use crate::error::RpcServerError;
+
+/// XRPL NetClock epoch (2000-01-01 UTC) in Unix seconds. Mirrors
+/// `rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET` but kept inline so this
+/// crate doesn't need a `rxrpl-ledger` dependency just for the constant.
+const RIPPLE_EPOCH_OFFSET: u64 = 946_684_800;
+
+/// Seconds elapsed since `close_time` (NetClock seconds since 2000-01-01).
+/// Returns 0 when `close_time` is unset (catchup-only validation snapshot
+/// before the matching ledger lands locally) or ahead of wall clock.
+fn ledger_age(close_time: u32) -> u64 {
+    if close_time == 0 {
+        return 0;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        .saturating_sub(RIPPLE_EPOCH_OFFSET);
+    now.saturating_sub(close_time as u64)
+}
 
 /// Snapshot of "what's in the closed ledger window" used by both
 /// `server_info` and `server_state`.
@@ -13,7 +34,52 @@ struct ClosedLedgersSummary {
     validated_ledger: Option<Value>,
 }
 
+/// Format an ascending list of sequence numbers as rippled-compatible
+/// `complete_ledgers` segments: contiguous runs collapse to `"start-end"`
+/// and disjoint runs are joined with commas — e.g. `[1,2,3,5,7,8]` becomes
+/// `"1-3,5-5,7-8"`. Empty input returns `"empty"`.
+///
+/// Why: a deque that received `push_back` only for consensus-closed ledgers
+/// (and skipped catchup-adopted ones) is not a contiguous range. Reporting
+/// `"first-last"` lies to RPC consumers like the confluence dashboard, which
+/// then 404s when fetching an intermediate seq.
+pub(crate) fn format_ledger_ranges(seqs: &[u32]) -> String {
+    if seqs.is_empty() {
+        return "empty".to_string();
+    }
+    let mut out = String::new();
+    let mut start = seqs[0];
+    let mut prev = seqs[0];
+    for &s in &seqs[1..] {
+        if s == prev {
+            continue;
+        }
+        if s == prev + 1 {
+            prev = s;
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push_str(&format!("{start}-{prev}"));
+        start = s;
+        prev = s;
+    }
+    if !out.is_empty() {
+        out.push(',');
+    }
+    out.push_str(&format!("{start}-{prev}"));
+    out
+}
+
 async fn closed_ledgers_summary(ctx: &Arc<ServerContext>) -> ClosedLedgersSummary {
+    // When a network-validated tip is published (networked mode after the
+    // first quorum), it is authoritative: `validated_ledger.seq` must reflect
+    // what the UNL has agreed on, and `complete_ledgers` is capped to that
+    // tip so peers don't ask us for locally-closed-but-unvalidated ancestors.
+    // In standalone (no slot attached) or before the first quorum is reached,
+    // fall back to the locally-closed window — that's all the truth we have.
+    let net = ctx.network_validated();
     if let Some(ref closed) = ctx.closed_ledgers {
         let closed = closed.read().await;
         if closed.is_empty() {
@@ -24,26 +90,59 @@ async fn closed_ledgers_summary(ctx: &Arc<ServerContext>) -> ClosedLedgersSummar
             };
         }
         let first = closed.front().unwrap().header.sequence;
-        let last_ledger = closed.back().unwrap();
-        let last = last_ledger.header.sequence;
-        let validated = serde_json::json!({
-            "seq": last,
-            "hash": last_ledger.header.hash.to_string(),
-            "close_time": last_ledger.header.close_time,
-            "base_fee_xrp": 0.00001,
-            "reserve_base_xrp": 10,
-            "reserve_inc_xrp": 2,
-        });
-        return ClosedLedgersSummary {
-            complete_ledgers: format!("{first}-{last}"),
-            last_seq: last,
-            validated_ledger: Some(validated),
-        };
-    }
-    ClosedLedgersSummary {
-        complete_ledgers: "empty".to_string(),
-        last_seq: 1,
-        validated_ledger: None,
+        let mut seqs: Vec<u32> = closed.iter().map(|l| l.header.sequence).collect();
+        seqs.sort_unstable();
+        match net {
+            Some(snap) => {
+                let cap = snap.seq;
+                if cap < first {
+                    return ClosedLedgersSummary {
+                        complete_ledgers: "empty".to_string(),
+                        last_seq: 1,
+                        validated_ledger: None,
+                    };
+                }
+                seqs.retain(|s| *s <= cap);
+                let validated = serde_json::json!({
+                    "seq": snap.seq,
+                    "hash": snap.hash.to_string(),
+                    "close_time": snap.close_time,
+                    "age": ledger_age(snap.close_time),
+                    "base_fee_xrp": 0.00001,
+                    "reserve_base_xrp": 10,
+                    "reserve_inc_xrp": 2,
+                });
+                ClosedLedgersSummary {
+                    complete_ledgers: format_ledger_ranges(&seqs),
+                    last_seq: cap,
+                    validated_ledger: Some(validated),
+                }
+            }
+            None => {
+                let last_ledger = closed.back().unwrap();
+                let last = last_ledger.header.sequence;
+                let validated = serde_json::json!({
+                    "seq": last,
+                    "hash": last_ledger.header.hash.to_string(),
+                    "close_time": last_ledger.header.close_time,
+                    "age": ledger_age(last_ledger.header.close_time),
+                    "base_fee_xrp": 0.00001,
+                    "reserve_base_xrp": 10,
+                    "reserve_inc_xrp": 2,
+                });
+                ClosedLedgersSummary {
+                    complete_ledgers: format_ledger_ranges(&seqs),
+                    last_seq: last,
+                    validated_ledger: Some(validated),
+                }
+            }
+        }
+    } else {
+        ClosedLedgersSummary {
+            complete_ledgers: "empty".to_string(),
+            last_seq: 1,
+            validated_ledger: None,
+        }
     }
 }
 
@@ -118,4 +217,49 @@ pub async fn server_state(
             "complete_ledgers": summary.complete_ledgers,
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_ranges_empty() {
+        assert_eq!(format_ledger_ranges(&[]), "empty");
+    }
+
+    #[test]
+    fn format_ranges_singleton() {
+        assert_eq!(format_ledger_ranges(&[1]), "1-1");
+        assert_eq!(format_ledger_ranges(&[42]), "42-42");
+    }
+
+    #[test]
+    fn format_ranges_contiguous() {
+        assert_eq!(format_ledger_ranges(&[1, 2, 3, 4, 5]), "1-5");
+        assert_eq!(format_ledger_ranges(&[10, 11, 12]), "10-12");
+    }
+
+    #[test]
+    fn format_ranges_with_gaps() {
+        assert_eq!(format_ledger_ranges(&[1, 3, 5]), "1-1,3-3,5-5");
+        assert_eq!(format_ledger_ranges(&[1, 2, 3, 7, 8, 9]), "1-3,7-9");
+        assert_eq!(format_ledger_ranges(&[1, 2, 4, 6, 7, 10]), "1-2,4-4,6-7,10-10");
+    }
+
+    #[test]
+    fn format_ranges_alternating_pattern_from_kurtosis() {
+        let seqs: Vec<u32> = vec![
+            1, 3, 5, 7, 8, 9, 11, 12, 15, 18, 19, 22, 23, 26, 27, 29, 30, 32, 33,
+        ];
+        assert_eq!(
+            format_ledger_ranges(&seqs),
+            "1-1,3-3,5-5,7-9,11-12,15-15,18-19,22-23,26-27,29-30,32-33"
+        );
+    }
+
+    #[test]
+    fn format_ranges_handles_duplicates() {
+        assert_eq!(format_ledger_ranges(&[1, 1, 2, 2, 3]), "1-3");
+    }
 }

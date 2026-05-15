@@ -97,6 +97,13 @@ pub struct ServerContext {
     /// `None` until the first close completes. Used by the kurtosis dashboard
     /// to surface live consensus stats via `server_info.last_close`.
     last_close: Option<Arc<std::sync::RwLock<LastCloseSnapshot>>>,
+    /// Highest-seq ledger that has reached UNL validation quorum, refreshed
+    /// by Node when `ValidationAggregator::add_validation` returns
+    /// `Some(validated)`. Drives `server_info.validated_ledger` and the
+    /// `complete_ledgers` range so RPC consumers see the *network-validated*
+    /// tip, not the locally-closed one. `None` until quorum is reached at
+    /// least once.
+    network_validated: Option<Arc<std::sync::RwLock<NetworkValidatedSnapshot>>>,
     /// Wall-clock instant the server was constructed; used to compute
     /// `server_info.uptime` in seconds.
     startup_instant: std::time::Instant,
@@ -110,6 +117,19 @@ pub struct LastCloseSnapshot {
     pub proposers: u32,
     /// Time from round open to acceptance, in seconds.
     pub converge_time_s: f64,
+}
+
+/// Snapshot of the highest network-quorum-validated ledger. Populated by the
+/// consensus loop once `ValidationAggregator` returns a `ValidatedLedger`
+/// and republished on every subsequent quorum advance. The seq/hash fields
+/// are read by `server_info` to populate `validated_ledger` and trim
+/// `complete_ledgers` so the dashboard reflects what the network has
+/// actually agreed on, not just what this node has locally closed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NetworkValidatedSnapshot {
+    pub seq: u32,
+    pub hash: Hash256,
+    pub close_time: u32,
 }
 
 /// Snapshot of the local validator manifest exposed via the `manifest` RPC.
@@ -156,6 +176,7 @@ impl ServerContext {
             local_manifest: OnceLock::new(),
             peer_set: None,
             last_close: None,
+            network_validated: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -196,6 +217,7 @@ impl ServerContext {
             local_manifest: OnceLock::new(),
             peer_set: None,
             last_close: None,
+            network_validated: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -237,6 +259,7 @@ impl ServerContext {
             local_manifest: OnceLock::new(),
             peer_set: None,
             last_close: None,
+            network_validated: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -278,6 +301,7 @@ impl ServerContext {
             local_manifest: OnceLock::new(),
             peer_set: None,
             last_close: None,
+            network_validated: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -312,6 +336,7 @@ impl ServerContext {
             local_manifest: OnceLock::new(),
             peer_set: None,
             last_close: None,
+            network_validated: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -407,6 +432,35 @@ impl ServerContext {
         self.last_close.as_ref().and_then(|slot| {
             slot.read().ok().and_then(|guard| {
                 if guard.converge_time_s > 0.0 || guard.proposers > 0 {
+                    Some(*guard)
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
+    /// Attach the shared network-validated-tip slot. Same Arc::get_mut
+    /// constraint as `attach_validator_list_status`. The slot is updated by
+    /// Node on every quorum advance.
+    pub fn attach_network_validated(
+        self: &mut Arc<Self>,
+        slot: Arc<std::sync::RwLock<NetworkValidatedSnapshot>>,
+    ) {
+        if let Some(ctx) = Arc::get_mut(self) {
+            ctx.network_validated = Some(slot);
+        }
+    }
+
+    /// Read the highest network-quorum-validated ledger seen so far. Returns
+    /// `None` when no slot is attached (standalone mode, where local close
+    /// is authoritative) or when quorum has not yet been reached at least
+    /// once (seq == 0). The seq=0 sentinel matches the Default value, so
+    /// readers don't need to disambiguate a freshly-attached slot.
+    pub fn network_validated(&self) -> Option<NetworkValidatedSnapshot> {
+        self.network_validated.as_ref().and_then(|slot| {
+            slot.read().ok().and_then(|guard| {
+                if guard.seq > 0 {
                     Some(*guard)
                 } else {
                     None

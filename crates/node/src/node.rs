@@ -167,11 +167,29 @@ impl Node {
         rxrpl_tx_engine::handlers::register_pseudo(&mut tx_registry);
         let tx_engine = TxEngine::new_without_sig_check(tx_registry);
 
-        // Initialize genesis ledger
-        let ledger = match &node_store {
-            Some(store) => Ledger::genesis_with_store(Arc::clone(store)),
-            None => Ledger::genesis(),
-        };
+        // Initialize genesis ledger. The networked path (`run_networked`)
+        // uses this constructor, so the genesis MUST carry the same
+        // FeeSettings + Amendments SLEs as rippled-2.6.2 or every close
+        // after #1 diverges: rippled's `LedgerHashes` skip-list at seq=2
+        // includes parent_hash=rippled-genesis, ours included
+        // parent_hash=bare-genesis, the SLE bytes differed → account_hash
+        // diverged → wrong_prev_ledger feedback loop. Using the store-less
+        // ledger keeps SHAMap root-hash deterministic across builds (the
+        // store-backed variant propagates hashes via a different path and
+        // produces a different root for identical content).
+        let _ = &node_store; // SHAMap store attached lazily during close().
+        // Networked genesis MUST match what peers will reconstruct from
+        // their own genesis bootstrap. xrpl-confluence sets rippled
+        // `genesis_amendments_disabled = true`, so kurtosis rippled
+        // genesis contains ONLY the canonical XRPL master AccountRoot
+        // (`rHb9CJAW…`, 100B drops) — no FeeSettings SLE and no
+        // Amendments SLE. Adding either makes our account_hash diverge
+        // from rippled, every close after #1 produces a mismatching
+        // hash, and rxrpl falls into the catchup feedback loop seen on
+        // 2026-05-12.
+        let ledger = Self::genesis_with_master_account_only(
+            "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+        )?;
 
         // Initialize transaction queue
         let tx_queue = TxQueue::new(2000);
@@ -996,6 +1014,16 @@ impl Node {
             rxrpl_rpc_server::context::LastCloseSnapshot::default(),
         ));
         ctx.attach_last_close(Arc::clone(&last_close_arc));
+        // Network-validated tip: refreshed in the consensus loop when
+        // ValidationAggregator reaches UNL quorum for a new seq. Reading
+        // this in `server_info` keeps `validated_ledger` honest — it
+        // reports what the UNL has agreed on, not what this node has
+        // merely closed locally. Stays at default (seq=0) until the first
+        // quorum lands.
+        let network_validated_arc = Arc::new(std::sync::RwLock::new(
+            rxrpl_rpc_server::NetworkValidatedSnapshot::default(),
+        ));
+        ctx.attach_network_validated(Arc::clone(&network_validated_arc));
         // B5: expose the local manifest to the RPC `manifest` handler.
         if let Some(vid) = validator_id.as_deref() {
             let seq = self.config.validator_identity.sequence.max(1);
@@ -1142,6 +1170,11 @@ impl Node {
             });
         }
 
+        // Capture the consensus-message sender before peer_mgr moves into
+        // the spawned task; the close path uses it to self-inject our own
+        // freshly-signed validations so they count toward UNL quorum.
+        let self_validation_tx = peer_mgr.consensus_sender();
+
         // 6. Spawn PeerManager
         tokio::spawn(async move {
             if let Err(e) = peer_mgr.run().await {
@@ -1204,6 +1237,7 @@ impl Node {
         let pruner = Arc::clone(&self.pruner);
         let ledger_seq_shared = Arc::clone(&ledger_seq);
         let ledger_hash_shared = Arc::clone(&ledger_hash);
+        let network_validated_for_loop = Arc::clone(&network_validated_arc);
         let configured_quorum = self.config.validators.quorum;
         let trusted_validators_for_aggregator = if self.config.validators.require_trusted_validators
             && !self.config.validators.validator_list_sites.is_empty()
@@ -1242,6 +1276,10 @@ impl Node {
             } else {
                 Duration::from_secs(60)
             };
+        // Pre-extracted before the spawn so the close-time-alignment gate
+        // can read it without capturing `self` (which would extend its
+        // lifetime past 'static).
+        let have_unl_peers_for_loop = !self.config.validators.trusted.is_empty();
 
         let validator_id_for_loop = validator_id.clone();
         tokio::spawn(async move {
@@ -1395,6 +1433,37 @@ impl Node {
                                         continue;
                                     }
 
+                                    // Close-time alignment gate: in mixed-validator topologies,
+                                    // each node's `effective_close_time` MUST land in the same
+                                    // resolution bucket as rippled's, or the produced ledger
+                                    // hash diverges and rxrpl wastes the next 20s recovering
+                                    // via wrong_prev_ledger → catchup → re-close. We anchor
+                                    // close_time off `latest_peer_close_time` whenever we have
+                                    // it; without it, we fall back to wall-clock, which on a
+                                    // ~10s resolution drifts out of bucket whenever rxrpl's
+                                    // round fires a few hundred ms before rippled's. Defer the
+                                    // round until at least one peer has broadcast a
+                                    // proposal (so `latest_peer_close_time` is populated).
+                                    // The cap matches `first_close_grace` so a stuck network
+                                    // still progresses — after that, we fall through and close
+                                    // solo, accepting the divergence as the lesser evil vs.
+                                    // hanging consensus indefinitely.
+                                    let have_peer_ct = consensus.latest_peer_close_time().is_some();
+                                    if have_unl_peers_for_loop
+                                        && !have_peer_ct
+                                        && startup_instant.elapsed() < first_close_grace
+                                    {
+                                        tracing::debug!(
+                                            target: "consensus",
+                                            elapsed_s = startup_instant.elapsed().as_secs(),
+                                            "deferring close: no peer ProposeSet yet (close_time would drift out of rippled's bucket)"
+                                        );
+                                        timer.on_phase_change(
+                                            rxrpl_consensus::ConsensusPhase::Open,
+                                        );
+                                        continue;
+                                    }
+
                                     // XRPL NetClock = seconds since 2000-01-01 UTC.
                                     // See the matching comment in the consensus
                                     // task above; passing Unix epoch here would
@@ -1487,6 +1556,7 @@ impl Node {
                                             &amendment_table, &tx_engine, &fees,
                                             &amendment_votes, trusted_validator_count,
                                             &pruner, &node_store,
+                                            &self_validation_tx,
                                         ).await;
                                         if let Ok(mut lc) = last_close_arc.write() {
                                             lc.proposers = proposers_this_round;
@@ -1523,6 +1593,7 @@ impl Node {
                                             &amendment_table, &tx_engine, &fees,
                                             &amendment_votes, trusted_validator_count,
                                             &pruner, &node_store,
+                                            &self_validation_tx,
                                         ).await;
                                         if let Ok(mut lc) = last_close_arc.write() {
                                             lc.proposers = proposers_this_round;
@@ -1726,6 +1797,58 @@ impl Node {
                                     );
                                     let our_seq = ledger_seq_shared.load(Ordering::Relaxed);
 
+                                    // Look up the matching closed ledger so the
+                                    // network-validated snapshot and the
+                                    // `LedgerClosed` event carry the actual
+                                    // close_time + tx count. Peers may validate
+                                    // a hash we haven't reconstructed yet — in
+                                    // that case we still publish the seq/hash
+                                    // (close_time=0) so dashboards see the
+                                    // network is ahead; the proper fields fill
+                                    // in once catchup adopts the matching ledger.
+                                    let (close_time, txn_count) = {
+                                        let history = closed_ledgers.read().await;
+                                        history
+                                            .iter()
+                                            .find(|l| {
+                                                l.header.sequence == validated.seq
+                                                    && l.header.hash == validated.hash
+                                            })
+                                            .map(|l| {
+                                                let mut c = 0u32;
+                                                l.tx_map.for_each(&mut |_, _| c += 1);
+                                                (l.header.close_time, c)
+                                            })
+                                            .unwrap_or((0u32, 0u32))
+                                    };
+
+                                    // Publish the validated tip so `server_info`
+                                    // can report it as `validated_ledger` and
+                                    // cap `complete_ledgers`. Monotone advance
+                                    // only — `add_validation` already returns
+                                    // Some at most once per (seq,hash), but a
+                                    // future cleanup could relax that, and the
+                                    // monotone guard makes this future-proof.
+                                    if let Ok(mut guard) = network_validated_for_loop.write() {
+                                        if validated.seq > guard.seq {
+                                            guard.seq = validated.seq;
+                                            guard.hash = validated.hash;
+                                            guard.close_time = close_time;
+                                            // Emit the network-validated
+                                            // `LedgerClosed` event. This is the
+                                            // single source of truth for the
+                                            // `ledger` subscribe stream in
+                                            // networked mode; the local-close
+                                            // path no longer emits.
+                                            let _ = event_tx.send(ServerEvent::LedgerClosed {
+                                                ledger_index: validated.seq,
+                                                ledger_hash: validated.hash,
+                                                ledger_time: close_time,
+                                                txn_count,
+                                            });
+                                        }
+                                    }
+
                                     // If the network is ahead, enter sync mode
                                     if validated.seq >= our_seq && !syncing {
                                         if validated.seq > our_seq {
@@ -1882,7 +2005,32 @@ impl Node {
                                     match Node::try_reconstruct_ledger(seq, hash, &nodes, &node_store, cached) {
                                         Ok(reconstructed) => {
                                             let mut history = closed_ledgers.write().await;
-                                            if !history.iter().any(|l| l.header.sequence == seq) {
+                                            // REPLACE on hash mismatch: if we already have a
+                                            // locally-closed ledger at this seq with a different
+                                            // hash, the catchup-reconstructed copy is canonical
+                                            // (a trusted UNL peer references it, we just
+                                            // confirmed via liBASE+state delta). Keeping the
+                                            // local divergent copy means RPC `ledger` queries
+                                            // return the wrong hash and the next ledger's
+                                            // skip-list references the wrong parent.
+                                            if let Some(existing_idx) =
+                                                history.iter().position(|l| l.header.sequence == seq)
+                                            {
+                                                if history[existing_idx].header.hash != reconstructed.header.hash {
+                                                    tracing::info!(
+                                                        "catchup: replacing diverged local ledger #{} (was {}, now {})",
+                                                        seq,
+                                                        history[existing_idx].header.hash,
+                                                        reconstructed.header.hash,
+                                                    );
+                                                    history[existing_idx] = reconstructed.clone();
+                                                } else {
+                                                    tracing::debug!(
+                                                        "catchup: ledger #{} already present with matching hash",
+                                                        seq
+                                                    );
+                                                }
+                                            } else {
                                                 let pos = history.partition_point(|l| l.header.sequence < seq);
                                                 history.insert(pos, reconstructed.clone());
                                                 while history.len() > crate::consensus_adapter::MAX_CLOSED_LEDGERS {
@@ -2157,6 +2305,9 @@ impl Node {
         trusted_validator_count: usize,
         pruner: &Arc<LedgerPruner>,
         node_store: &Option<Arc<dyn NodeStore>>,
+        self_validation_tx: &tokio::sync::mpsc::UnboundedSender<
+            rxrpl_overlay::ConsensusMessage,
+        >,
     ) {
         // Resolve close_time in priority order:
         //  1. Quorum-accepted close_time from converge() — strongest signal,
@@ -2169,7 +2320,10 @@ impl Node {
         //     has proposed yet, at least round our own wall-clock so a
         //     peer within the same bucket produces an identical hash.
         let close_flags = consensus.accepted_close_flags();
-        let effective_close_time = consensus
+        let mut l = ledger.write().await;
+        let parent_close_time = l.header.parent_close_time;
+        let resolution = consensus.adaptive_close_time().resolution();
+        let raw_close_time = consensus
             .accepted_close_time()
             .or_else(|| consensus.rounded_close_time())
             // Cross-impl bridge: any peer proposal we've seen (even from a
@@ -2177,18 +2331,23 @@ impl Node {
             // it so two nodes whose close timers fire ~1s apart still land
             // in the same close_time and produce identical ledger hashes.
             .or_else(|| consensus.latest_peer_close_time())
-            .unwrap_or_else(|| {
-                let res = consensus.adaptive_close_time().resolution();
-                rxrpl_consensus::round_close_time(pending_close_time, res)
-            });
+            .unwrap_or_else(|| rxrpl_consensus::round_close_time(pending_close_time, resolution));
+        // Clamp `close_time > parent_close_time` to mirror rippled's
+        // `effCloseTime` (xrpld/consensus/LedgerTiming.h). Without this,
+        // two consecutive ledgers that close within the same resolution
+        // bucket get equal close_time → equal ledger headers but
+        // different account_hash on the next round → unrecoverable
+        // divergence from rippled. See
+        // docs/superpowers/specs/2026-05-14-close-time-monotonicity-fix.md.
+        let effective_close_time =
+            rxrpl_consensus::eff_close_time(raw_close_time, resolution, parent_close_time);
         tracing::debug!(
-            "closing with effective_close_time={} close_flags={} pending_close_time={}",
+            "closing with effective_close_time={} close_flags={} pending_close_time={} parent_close_time={}",
             effective_close_time,
             close_flags,
-            pending_close_time
+            pending_close_time,
+            parent_close_time,
         );
-
-        let mut l = ledger.write().await;
 
         // Apply amendment voting on flag ledgers (before close computes
         // final hashes). Votes are collected from received validations.
@@ -2265,11 +2424,15 @@ impl Node {
             });
         }
 
-        // Note: the `ServerEvent::LedgerClosed` emit is deferred to AFTER the
-        // `closed_ledgers.push_back` below. WS subscribers (e.g. the kurtosis
-        // dashboard) react to `ledgerClosed` by re-reading server_info; if we
-        // emit before the push, the dashboard sees a stale `complete_ledgers`
-        // and the `validated_ledger.seq` (WS) jumps ahead of the HTTP poll.
+        // NOTE: ServerEvent::LedgerClosed is intentionally NOT emitted here.
+        // In networked mode, local close is just the first vote — the round
+        // is only "closed" from the network's perspective once UNL quorum
+        // is reached. The emit happens in the `ConsensusMessage::Validation`
+        // handler when `ValidationAggregator` returns the first
+        // quorum-reaching validation for this seq. That keeps the
+        // `validated_ledger` field and the `ledger` subscribe stream honest
+        // about what the network has actually agreed on (rather than what
+        // this node has merely closed locally).
 
         // Emit path_find update after ledger close
         let _ = event_tx.send(ServerEvent::PathFindUpdate {
@@ -2328,6 +2491,16 @@ impl Node {
                 msg_type: rxrpl_p2p_proto::MessageType::Validation,
                 payload,
             });
+
+            // Self-inject the same validation into our own consensus loop so
+            // it counts toward UNL quorum locally. Peer broadcast does not
+            // loop back through `consensus_tx`, so without this our
+            // aggregator would max out at (UNL_size - 1) votes per ledger
+            // and never reach quorum=ceil(N*0.8) when N=4 (mixed kurtosis:
+            // 2 rxrpl + 2 rippled). Rippled does the equivalent in
+            // `Validations::add` from its own onAccept path.
+            let _ = self_validation_tx
+                .send(rxrpl_overlay::ConsensusMessage::Validation(validation));
         }
 
         // Broadcast StatusChange so peers know our current ledger and our
@@ -2375,45 +2548,31 @@ impl Node {
             }
         }
 
-        {
-            let mut history = closed_ledgers.write().await;
-            let mut compacted = closed;
-            compacted.compact();
-            history.push_back(compacted);
-            while history.len() > crate::consensus_adapter::MAX_CLOSED_LEDGERS {
-                history.pop_front();
-            }
-
-            // Ledger history pruning
-            if pruner.should_prune(closed_seq) {
-                if let Some(store) = node_store {
-                    let retention = pruner.shared_state().retention_window;
-                    let cutoff_seq = closed_seq.saturating_sub(retention);
-
-                    let old: Vec<_> = history
-                        .iter()
-                        .filter(|l| l.header.sequence <= cutoff_seq)
-                        .cloned()
-                        .collect();
-
-                    let retained = history.iter().find(|l| l.header.sequence > cutoff_seq);
-
-                    let _deleted = pruner.prune(closed_seq, &old, retained, store);
-                }
-            }
+        let mut history = closed_ledgers.write().await;
+        let mut compacted = closed;
+        compacted.compact();
+        history.push_back(compacted);
+        while history.len() > crate::consensus_adapter::MAX_CLOSED_LEDGERS {
+            history.pop_front();
         }
 
-        // Surface the new validated tip on the WS event stream AFTER the
-        // ledger is in `closed_ledgers`, so subscribers (kurtosis dashboard,
-        // ops tooling) that re-poll `server_info` upon receiving
-        // `ledgerClosed` always see a `complete_ledgers` range that contains
-        // `ledger_index`. See the deferred-emit note above.
-        let _ = event_tx.send(ServerEvent::LedgerClosed {
-            ledger_index: closed_seq,
-            ledger_hash: hash,
-            ledger_time: effective_close_time,
-            txn_count: tx_count,
-        });
+        // Ledger history pruning
+        if pruner.should_prune(closed_seq) {
+            if let Some(store) = node_store {
+                let retention = pruner.shared_state().retention_window;
+                let cutoff_seq = closed_seq.saturating_sub(retention);
+
+                let old: Vec<_> = history
+                    .iter()
+                    .filter(|l| l.header.sequence <= cutoff_seq)
+                    .cloned()
+                    .collect();
+
+                let retained = history.iter().find(|l| l.header.sequence > cutoff_seq);
+
+                let _deleted = pruner.prune(closed_seq, &old, retained, store);
+            }
+        }
     }
 
     /// Attempt to reconstruct a closed ledger from downloaded leaf nodes.
@@ -2458,6 +2617,45 @@ impl Node {
             ledger.header.hash = hash;
         }
         Ok(ledger)
+    }
+
+    /// Create a closed genesis ledger holding only the canonical XRPL
+    /// master AccountRoot — matches rippled's bootstrap when
+    /// `genesis_amendments_disabled = true` (the xrpl-confluence
+    /// topology). Use this for networked nodes; the
+    /// `genesis_with_funded_account*` variants additionally pre-activate
+    /// the 28 standalone amendments and are intended for solo/test
+    /// scenarios where peers run the same bootstrap.
+    pub fn genesis_with_master_account_only(
+        genesis_address: &str,
+    ) -> Result<Ledger, NodeError> {
+        let mut genesis = Ledger::genesis();
+
+        let account_id = decode_account_id(genesis_address)
+            .map_err(|e| NodeError::Config(format!("invalid genesis address: {e}")))?;
+        let key = keylet::account(&account_id);
+
+        // Same field set as the funded variant — PreviousTxnID + Seq are
+        // emitted by rippled even at genesis and must be present in our
+        // SLE bytes or the leaf hashes diverge.
+        let account = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": genesis_address,
+            "Balance": genesis.header.drops.to_string(),
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+            "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+            "PreviousTxnLgrSeq": 0,
+        });
+        let json_bytes =
+            serde_json::to_vec(&account).map_err(|e| NodeError::Config(e.to_string()))?;
+        let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes)
+            .map_err(|e| NodeError::Config(format!("failed to encode genesis account: {e}")))?;
+        genesis.put_state(key, data)?;
+
+        genesis.close(0, 0)?;
+        Ok(genesis)
     }
 
     /// Create a genesis ledger with a funded account, optionally backed by a store.
@@ -2774,8 +2972,17 @@ impl Node {
     /// Close the current ledger and return a new open ledger derived from it.
     ///
     /// Returns the closed ledger's hash and the new open ledger.
+    ///
+    /// The caller-supplied `close_time` is clamped via `eff_close_time` to
+    /// ensure `close_time > parent_close_time`, mirroring rippled's
+    /// `effCloseTime` invariant. Without this, two ledgers closed in the
+    /// same resolution bucket carry equal `close_time` fields and produce
+    /// divergent hashes from rippled.
     pub fn close_ledger(ledger: &mut Ledger, close_time: u32) -> Result<Hash256, NodeError> {
-        ledger.close(close_time, 0)?;
+        let resolution = ledger.header.close_time_resolution as u32;
+        let parent_close_time = ledger.header.parent_close_time;
+        let eff = rxrpl_consensus::eff_close_time(close_time, resolution, parent_close_time);
+        ledger.close(eff, 0)?;
         Ok(ledger.header.hash)
     }
 
@@ -3350,6 +3557,40 @@ mod tests {
     #[test]
     fn compute_quorum_zero_returns_one() {
         assert_eq!(Node::compute_quorum(0), 1);
+    }
+
+    #[test]
+    fn close_ledger_clamps_close_time_above_parent() {
+        // Reproduces the hive consensus-test divergence:
+        // two consecutive ledgers closed within the same 10s resolution
+        // bucket must NOT carry equal close_time. rippled's effCloseTime
+        // (LedgerTiming.h) clamps close_time > parent_close_time + 1s, and
+        // rxrpl must do the same to produce byte-identical ledger headers.
+        let address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let parent_close = 832_077_840u32;
+
+        let mut child = {
+            let parent = {
+                let mut g = Node::genesis_with_funded_account(address).unwrap();
+                g.header.close_time = parent_close;
+                g.header.close_time_resolution = 10;
+                g
+            };
+            Ledger::new_open(&parent)
+        };
+
+        // Simulate "wall clock 832_077_842" — would round to 832_077_840
+        // (the parent's bucket) without the clamp. After the clamp it
+        // must be strictly greater than parent_close.
+        let raw_close = parent_close + 2;
+        Node::close_ledger(&mut child, raw_close).unwrap();
+
+        assert!(
+            child.header.close_time > parent_close,
+            "close_time must be > parent_close_time, got close={} parent={}",
+            child.header.close_time,
+            parent_close,
+        );
     }
 
     #[test]

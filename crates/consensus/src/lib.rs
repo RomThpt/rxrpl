@@ -25,7 +25,7 @@ pub mod validations_trie;
 
 pub use adapter::ConsensusAdapter;
 pub use close_resolution::AdaptiveCloseTime;
-pub use engine::{ConsensusEngine, WrongPrevLedgerDetected, round_close_time};
+pub use engine::{ConsensusEngine, WrongPrevLedgerDetected, eff_close_time, round_close_time};
 pub use error::ConsensusError;
 pub use ledger_trie::LedgerTrie;
 pub use negative_unl::{FLAG_LEDGER_INTERVAL, NegativeUnlChange, NegativeUnlTracker};
