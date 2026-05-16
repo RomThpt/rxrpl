@@ -35,6 +35,7 @@ async fn standalone_account_info() {
     let port = available_port();
     let mut config = NodeConfig::default();
     config.server.bind = format!("127.0.0.1:{port}").parse().unwrap();
+    config.server.ws_bind = None;
 
     let node = Node::new_standalone(config, GENESIS_ADDR).unwrap();
 
@@ -70,6 +71,7 @@ async fn standalone_ledger_and_fee() {
     let port = available_port();
     let mut config = NodeConfig::default();
     config.server.bind = format!("127.0.0.1:{port}").parse().unwrap();
+    config.server.ws_bind = None;
 
     let node = Node::new_standalone(config, GENESIS_ADDR).unwrap();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -117,6 +119,7 @@ async fn standalone_auto_close() {
     let port = available_port();
     let mut config = NodeConfig::default();
     config.server.bind = format!("127.0.0.1:{port}").parse().unwrap();
+    config.server.ws_bind = None;
 
     let node = Node::new_standalone(config, GENESIS_ADDR).unwrap();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -151,6 +154,7 @@ async fn standalone_ledger_current() {
     let port = available_port();
     let mut config = NodeConfig::default();
     config.server.bind = format!("127.0.0.1:{port}").parse().unwrap();
+    config.server.ws_bind = None;
 
     let node = Node::new_standalone(config, GENESIS_ADDR).unwrap();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -172,6 +176,7 @@ async fn standalone_sign_submit_verify() {
     let port = available_port();
     let mut config = NodeConfig::default();
     config.server.bind = format!("127.0.0.1:{port}").parse().unwrap();
+    config.server.ws_bind = None;
 
     // Fund a genesis whose master key matches the signer keypair so the
     // engine's master-key auth check (which always runs, even with crypto
@@ -252,6 +257,7 @@ async fn standalone_submit_queues_and_close_clears() {
     let port = available_port();
     let mut config = NodeConfig::default();
     config.server.bind = format!("127.0.0.1:{port}").parse().unwrap();
+    config.server.ws_bind = None;
 
     let dummy_seed = Seed::from_passphrase("dummy_signer");
     let dummy_kp = KeyPair::from_seed(&dummy_seed, KeyType::Ed25519);
@@ -336,6 +342,7 @@ async fn standalone_delegate_set_string_permission() {
     let port = available_port();
     let mut config = NodeConfig::default();
     config.server.bind = format!("127.0.0.1:{port}").parse().unwrap();
+    config.server.ws_bind = None;
 
     let owner_seed = Seed::from_passphrase("delegate_owner");
     let owner_kp = KeyPair::from_seed(&owner_seed, KeyType::Secp256k1);

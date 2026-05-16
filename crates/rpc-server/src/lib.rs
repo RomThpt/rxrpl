@@ -19,4 +19,4 @@ pub mod subscriptions;
 pub use context::{LocalManifestSnapshot, NetworkValidatedSnapshot, PrunerState, ServerContext};
 pub use error::RpcServerError;
 pub use events::ServerEvent;
-pub use server::build_router;
+pub use server::{build_router, serve};

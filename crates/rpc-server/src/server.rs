@@ -42,6 +42,55 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
         .with_state(ctx)
 }
 
+/// Serve the RPC router on the HTTP address plus an optional dedicated
+/// WebSocket address.
+///
+/// rippled exposes the WS API on a separate port (`port_ws_public`) from the
+/// HTTP RPC port; the same router handles both because the WS upgrade lives
+/// on `GET /`. Each listener is bound here (so bind errors are reported to
+/// the caller) and served on its own spawned task.
+pub async fn serve(
+    ctx: Arc<ServerContext>,
+    http_bind: SocketAddr,
+    ws_bind: Option<SocketAddr>,
+) -> std::io::Result<()> {
+    let http_listener = tokio::net::TcpListener::bind(http_bind).await?;
+    let ws_listener = match ws_bind {
+        Some(addr) if addr != http_bind => Some(tokio::net::TcpListener::bind(addr).await?),
+        _ => None,
+    };
+
+    let http_app = build_router(Arc::clone(&ctx));
+    tracing::info!("starting RPC server on {}", http_bind);
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(
+            http_listener,
+            http_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        {
+            tracing::error!("RPC server error: {}", e);
+        }
+    });
+
+    if let Some(ws_listener) = ws_listener {
+        let ws_app = build_router(ctx);
+        tracing::info!("starting WebSocket server on {}", ws_listener.local_addr()?);
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(
+                ws_listener,
+                ws_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
+                tracing::error!("WebSocket server error: {}", e);
+            }
+        });
+    }
+
+    Ok(())
+}
+
 /// Serve Prometheus metrics in text exposition format.
 async fn metrics_handler(State(ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
     match &ctx.metrics_handle {
