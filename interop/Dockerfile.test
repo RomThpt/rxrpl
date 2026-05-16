@@ -9,5 +9,6 @@ RUN apt-get update \
 
 COPY tests/ ./tests/
 COPY scripts/ ./scripts/
-RUN pip install --no-cache-dir requests
-ENTRYPOINT ["python", "-m", "pytest", "tests/", "-v", "--tb=short"]
+RUN pip install --no-cache-dir requests pytest
+ENTRYPOINT ["python", "-m", "pytest"]
+CMD ["tests/", "-v", "--tb=short"]

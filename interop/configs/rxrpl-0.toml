@@ -7,20 +7,25 @@ port = 51235
 max_peers = 21
 seeds = []
 fixed_peers = ["172.30.0.10:51235", "172.30.0.11:51235"]
-node_seed = "a00bea5ec7bda12408cb8b215171b4b209190767c0d811f51888b773ece2cf81"
+node_seed = "a1f33f544dbae3d90db16b1bc9e821e9"
 tls_enabled = false
 
 [database]
-path = "/tmp/rxrpl-0"
+path = "/var/lib/rxrpl/data"
 backend = "memory"
 online_delete = 256
 
 [validators]
 enabled = true
-trusted = ["n989cb3095636ff8ddd17655763b218593740ebe5c6bd2e311e0", "n96d889b79e90e074910ce7886e72922918ade6f60534aa31d4c", "n997863d75a1bfec6fb1d6d9c6afd0719b6bc67e68a610b25970"]
-quorum = 3
+trusted = ["n9KXX4mAWwFeEBemh5Kg4e4o41pcmmhrCGFycMSdLx3yFSXZyvyf", "n9Ki1vBTxo26iszNVRoGK1nFMsrfx68xnYcrBEUY62XsgHM7FCM5", "n9Lc8w5xK1kJE4AiHX9kvDQF6shMBWoz8pEXp95xRo227ZMnUPt2"]
+quorum = 2
+
+[validator_identity]
+master_secret = "sEdVZKfQYfinxEpnzyLmQZfSYNV2teD"
+ephemeral_seed = "sEdVZKfQYfinxEpnzyLmQZfSYNV2teD"
 
 [network]
 network_id = 99
-
-[genesis]
+# Confluence topology: match rippled's fresh-network genesis, which holds
+# only the master AccountRoot (no FeeSettings / Amendments SLEs).
+genesis_amendments_disabled = true

@@ -1,150 +1,78 @@
 #!/usr/bin/env python3
-"""Generate interop test network configurations.
+"""Generate interop test network configurations (confluence topology).
 
-Creates configs for a mixed rippled + rxrpl private validator network.
-All nodes share the same UNL (trusted validator list) and connect
-to each other as fixed peers.
+Writes deterministic configs for the mixed validator network defined in
+`interop/docker-compose.yml`: two rippled validators and one rxrpl
+validator, all sharing one UNL.
 
-Usage:
-    python scripts/generate_configs.py [--rippled N] [--rxrpl N]
+The validator keys below are real, pre-harvested fixtures — not stubs:
+
+  * Each rippled `[validation_seed]` is a base58 family seed; the matching
+    `n...` NodePublic was read back from `server_info.pubkey_validator`
+    of a rippled started with that seed.
+  * The rxrpl seed feeds `[validator_identity]`; its `n...` key was read
+    from the running node's loaded validator identity.
+
+Because the keys are fixed, the generated configs are reproducible and
+can be committed as fixtures. To rotate them, re-harvest (start each node
+with a fresh seed, read back its validator public key) and update the
+table below.
 """
 
 import argparse
-import base64
-import hashlib
-import json
 import os
-import secrets
 
 CONFIGS_DIR = os.path.join(os.path.dirname(__file__), "..", "configs")
 
+# Pre-harvested validator fixtures. Order matches docker-compose.yml.
+RIPPLED_VALIDATORS = [
+    {
+        "seed": "ssnxjNzfejgYQUSJFXabJxTmueR8b",
+        "public_key": "n9KXX4mAWwFeEBemh5Kg4e4o41pcmmhrCGFycMSdLx3yFSXZyvyf",
+        "ip": "172.30.0.10",
+    },
+    {
+        "seed": "shq5A3uBkbJsHyeeNZMGdgYwakQEK",
+        "public_key": "n9Ki1vBTxo26iszNVRoGK1nFMsrfx68xnYcrBEUY62XsgHM7FCM5",
+        "ip": "172.30.0.11",
+    },
+]
+RXRPL_VALIDATORS = [
+    {
+        "seed": "sEdVZKfQYfinxEpnzyLmQZfSYNV2teD",
+        "public_key": "n9Lc8w5xK1kJE4AiHX9kvDQF6shMBWoz8pEXp95xRo227ZMnUPt2",
+        "ip": "172.30.0.20",
+        "node_seed": "a1f33f544dbae3d90db16b1bc9e821e9",
+    },
+]
 
-def _try_import_secp256k1_signer():
-    """Return a callable (priv_hex, msg_bytes) -> (sig_hex, pub_hex) or None.
-
-    Prefers the `ecdsa` library which is broadly available; falls back to None
-    if no secp256k1 implementation is reachable.
-    """
-    try:
-        from ecdsa import SigningKey, SECP256k1
-        from ecdsa.util import sigencode_der_canonize
-
-        def sign(priv_hex: str, msg: bytes) -> tuple[str, str]:
-            sk = SigningKey.from_string(bytes.fromhex(priv_hex), curve=SECP256k1)
-            vk = sk.get_verifying_key()
-            # Compressed pubkey (33 bytes) per SEC1.
-            pub_pt = vk.pubkey.point
-            x = pub_pt.x().to_bytes(32, "big")
-            prefix = b"\x02" if pub_pt.y() % 2 == 0 else b"\x03"
-            compressed = prefix + x
-            sig = sk.sign_deterministic(
-                msg,
-                hashfunc=hashlib.sha256,
-                sigencode=sigencode_der_canonize,
-            )
-            return sig.hex().upper(), compressed.hex().upper()
-
-        return sign
-    except Exception:
-        return None
+PEER_PORT = 51235
+RPC_PORT = 5005
+NETWORK_ID = 99
 
 
-def generate_publisher_key() -> dict:
-    """Create a fresh test publisher secp256k1 keypair.
-
-    Returns dict with hex-encoded `secret_key` (32 bytes) and `public_key`
-    (33-byte compressed). If no secp256k1 library is available, falls back
-    to a deterministic stub (still 33 bytes, but not a real curve point).
-    """
-    secret = secrets.token_hex(32)
-    signer = _try_import_secp256k1_signer()
-    if signer is None:
-        # Deterministic stub pubkey for environments without ecdsa.
-        h = hashlib.sha256(secret.encode()).hexdigest()
-        return {
-            "secret_key": secret,
-            "public_key": ("02" + h)[:66].upper(),
-            "_stub": True,
-        }
-    _, pub_hex = signer(secret, b"probe")
-    return {"secret_key": secret, "public_key": pub_hex}
+def all_peers():
+    return [f"{v['ip']}:{PEER_PORT}" for v in RIPPLED_VALIDATORS + RXRPL_VALIDATORS]
 
 
-def write_publisher(path: str, key: dict):
-    with open(path, "w") as f:
-        json.dump(key, f, indent=2)
+def unl_keys():
+    return [v["public_key"] for v in RIPPLED_VALIDATORS + RXRPL_VALIDATORS]
 
 
-def write_manifest(path: str, publisher: dict, validators: list[dict],
-                   sequence: int = 1):
-    """Sign and write the shared validator-list manifest.
-
-    The signed payload is the canonical JSON of `validators + sequence`.
-    Format mirrors rippled's UTE envelope at a JSON layer (B1 scope: parse
-    + presence; full STValidatorList byte-encoding deferred to B3).
-    """
-    blob = {
-        "sequence": sequence,
-        "validators": validators,
-    }
-    blob_bytes = json.dumps(blob, sort_keys=True, separators=(",", ":")).encode()
-    blob_b64 = base64.b64encode(blob_bytes).decode()
-
-    signer = _try_import_secp256k1_signer()
-    if signer is None:
-        # Stub signature: SHA-256 of (priv || blob).  Deterministic, parse-able.
-        h = hashlib.sha256(
-            (publisher["secret_key"] + blob_b64).encode()
-        ).hexdigest()
-        sig_hex = h.upper()
-        signing_pubkey = publisher["public_key"]
-    else:
-        sig_hex, signing_pubkey = signer(publisher["secret_key"], blob_bytes)
-
-    manifest = {
-        "version": 2,
-        "sequence": sequence,
-        "validators": validators,
-        "blob": blob_b64,
-        "signature": sig_hex,
-        "signing_pubkey": signing_pubkey,
-    }
-    with open(path, "w") as f:
-        json.dump(manifest, f, indent=2)
-
-
-def generate_node_seed():
-    """Generate a random 32-byte hex seed for a validator node."""
-    return secrets.token_hex(32)
-
-
-def seed_to_public_key_stub(seed: str, index: int) -> str:
-    """Derive a deterministic fake public key from seed for UNL.
-
-    In production, this would use Ed25519 key derivation.
-    For test configs, we use a deterministic hash as placeholder.
-    """
-    h = hashlib.sha256(f"{seed}:{index}".encode()).hexdigest()
-    return f"n9{h[:50]}"
-
-
-def write_rippled_config(path: str, index: int, seed: str, peer_port: int,
-                         rpc_port: int, fixed_peers: list[str]):
-    """Write a rippled.cfg for a validator node."""
+def write_rippled_config(path, seed, fixed_peers):
     peers_section = "\n".join(fixed_peers)
-
     config = f"""[server]
 port_rpc_admin_local
 port_peer
 
 [port_rpc_admin_local]
-port = {rpc_port}
+port = {RPC_PORT}
 ip = 0.0.0.0
 admin = 0.0.0.0
 protocol = http
 
 [port_peer]
-port = {peer_port}
+port = {PEER_PORT}
 ip = 0.0.0.0
 protocol = peer
 
@@ -164,12 +92,6 @@ earliest_seq=1
 [debug_logfile]
 /var/log/rippled/debug.log
 
-[sntp_servers]
-time.windows.com
-time.apple.com
-time.nist.gov
-pool.ntp.org
-
 [ips_fixed]
 {peers_section}
 
@@ -182,15 +104,12 @@ validators.txt
 [validation_seed]
 {seed}
 
-[validator_token]
-
 [network_id]
-99
+{NETWORK_ID}
 
 [ledger_history]
 256
 
-# Allow standalone-like fast close for testing
 [consensus]
 minimum_duration_ms=200
 """
@@ -198,48 +117,48 @@ minimum_duration_ms=200
         f.write(config)
 
 
-def write_rxrpl_config(path: str, index: int, seed: str, rpc_bind: str,
-                       peer_port: int, fixed_peers: list[str],
-                       trusted_keys: list[str]):
-    """Write a rxrpl TOML config for a validator node."""
+def write_rxrpl_config(path, validator, fixed_peers):
     peers_toml = ", ".join(f'"{p}"' for p in fixed_peers)
-    trusted_toml = ", ".join(f'"{k}"' for k in trusted_keys)
-
+    trusted_toml = ", ".join(f'"{k}"' for k in unl_keys())
     config = f"""[server]
-bind = "{rpc_bind}"
+bind = "0.0.0.0:{RPC_PORT}"
 admin_ips = ["0.0.0.0"]
 
 [peer]
-port = {peer_port}
+port = {PEER_PORT}
 max_peers = 21
 seeds = []
 fixed_peers = [{peers_toml}]
-node_seed = "{seed}"
+node_seed = "{validator['node_seed']}"
 tls_enabled = false
 
 [database]
-path = "/tmp/rxrpl-{index}"
+path = "/var/lib/rxrpl/data"
 backend = "memory"
 online_delete = 256
 
 [validators]
 enabled = true
 trusted = [{trusted_toml}]
-quorum = 3
+quorum = 2
+
+[validator_identity]
+master_secret = "{validator['seed']}"
+ephemeral_seed = "{validator['seed']}"
 
 [network]
-network_id = 99
-
-[genesis]
+network_id = {NETWORK_ID}
+# Confluence topology: match rippled's fresh-network genesis, which holds
+# only the master AccountRoot (no FeeSettings / Amendments SLEs).
+genesis_amendments_disabled = true
 """
     with open(path, "w") as f:
         f.write(config)
 
 
-def write_validators_txt(path: str, public_keys: list[str]):
-    """Write the shared validators.txt for rippled nodes."""
+def write_validators_txt(path):
     lines = ["[validators]"]
-    for key in public_keys:
+    for key in unl_keys():
         lines.append(f"    {key}")
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -247,74 +166,43 @@ def write_validators_txt(path: str, public_keys: list[str]):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate interop test configs")
-    parser.add_argument("--rippled", type=int, default=3, help="Number of rippled nodes")
-    parser.add_argument("--rxrpl", type=int, default=2, help="Number of rxrpl nodes")
+    parser.add_argument("--rippled", type=int, default=2)
+    parser.add_argument("--rxrpl", type=int, default=1)
     args = parser.parse_args()
+    if args.rippled != len(RIPPLED_VALIDATORS) or args.rxrpl != len(RXRPL_VALIDATORS):
+        parser.error(
+            f"fixed-fixture topology is "
+            f"{len(RIPPLED_VALIDATORS)} rippled + {len(RXRPL_VALIDATORS)} rxrpl; "
+            f"re-harvest keys to change it"
+        )
 
     os.makedirs(CONFIGS_DIR, exist_ok=True)
+    peers = all_peers()
 
-    # Generate seeds and keys for all validators
-    seeds = []
-    public_keys = []
-    for i in range(args.rippled + args.rxrpl):
-        seed = generate_node_seed()
-        seeds.append(seed)
-        public_keys.append(seed_to_public_key_stub(seed, i))
-
-    # Build peer addresses
-    rippled_peers = [f"172.30.0.{10 + i}:51235" for i in range(args.rippled)]
-    rxrpl_peers = [f"172.30.0.{20 + i}:51235" for i in range(args.rxrpl)]
-    all_peers = rippled_peers + rxrpl_peers
-
-    # Write rippled configs
-    for i in range(args.rippled):
-        peers = [p for p in all_peers if p != rippled_peers[i]]
+    for i, v in enumerate(RIPPLED_VALIDATORS):
+        own = f"{v['ip']}:{PEER_PORT}"
         write_rippled_config(
             os.path.join(CONFIGS_DIR, f"rippled-{i}.cfg"),
-            index=i,
-            seed=seeds[i],
-            peer_port=51235,
-            rpc_port=5005,
-            fixed_peers=peers,
+            v["seed"],
+            [p for p in peers if p != own],
         )
 
-    # Write rxrpl configs
-    for i in range(args.rxrpl):
-        peers = [p for p in all_peers if p != rxrpl_peers[i]]
+    for i, v in enumerate(RXRPL_VALIDATORS):
+        own = f"{v['ip']}:{PEER_PORT}"
         write_rxrpl_config(
             os.path.join(CONFIGS_DIR, f"rxrpl-{i}.toml"),
-            index=i,
-            seed=seeds[args.rippled + i],
-            rpc_bind=f"0.0.0.0:5005",
-            peer_port=51235,
-            fixed_peers=peers,
-            trusted_keys=public_keys,
+            v,
+            [p for p in peers if p != own],
         )
 
-    # Write shared validators.txt for rippled
-    write_validators_txt(
-        os.path.join(CONFIGS_DIR, "validators.txt"),
-        public_keys,
+    write_validators_txt(os.path.join(CONFIGS_DIR, "validators.txt"))
+
+    print(
+        f"Generated configs for {len(RIPPLED_VALIDATORS)} rippled "
+        f"+ {len(RXRPL_VALIDATORS)} rxrpl nodes"
     )
-
-    # Generate test publisher key + signed manifest binding all validators.
-    publisher = generate_publisher_key()
-    write_publisher(os.path.join(CONFIGS_DIR, "publisher.json"), publisher)
-
-    validator_entries = []
-    for i, key in enumerate(public_keys):
-        role = "rippled" if i < args.rippled else "rxrpl"
-        validator_entries.append({"public_key": key, "role": role})
-    write_manifest(
-        os.path.join(CONFIGS_DIR, "manifest.json"),
-        publisher,
-        validator_entries,
-    )
-
-    print(f"Generated configs for {args.rippled} rippled + {args.rxrpl} rxrpl nodes")
-    print(f"  Configs: {CONFIGS_DIR}/")
-    print(f"  Validators: {len(public_keys)} total")
-    print(f"  Publisher: {publisher['public_key'][:16]}...")
+    print(f"  Configs:    {CONFIGS_DIR}/")
+    print(f"  UNL keys:   {len(unl_keys())}")
 
 
 if __name__ == "__main__":

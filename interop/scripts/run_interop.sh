@@ -43,10 +43,13 @@ echo "--- Building rxrpl Docker image ---"
 docker build -t rxrpl:interop -f "$PROJECT_ROOT/Dockerfile" "$PROJECT_ROOT"
 
 # Step 3: Start the network
+# Only the node services — `test-runner` carries a static IP and is run
+# on demand below via `docker compose run`; starting it here too would
+# collide with that ephemeral container on the same address.
 echo "--- Starting mixed network ---"
 export RIPPLED_IMAGE
 cd "$INTEROP_DIR"
-docker compose -f docker-compose.yml up -d --build
+docker compose -f docker-compose.yml up -d --build rippled-0 rippled-1 rxrpl-0
 
 # Step 4: Run tests
 echo "--- Running interop tests (suite: $SUITE) ---"
@@ -59,9 +62,10 @@ case "$SUITE" in
     *)           echo "Unknown suite: $SUITE"; exit 1 ;;
 esac
 
-# Run tests via the test-runner container, or locally if --local
+# Run tests via the test-runner container. The image entrypoint is
+# `python -m pytest`, so pass only the pytest arguments here.
 docker compose -f docker-compose.yml run --rm test-runner \
-    python -m pytest "$PYTEST_ARGS" -v --tb=short
+    "$PYTEST_ARGS" -v --tb=short
 TEST_EXIT=$?
 
 # Step 5: Collect logs on failure

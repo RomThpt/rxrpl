@@ -44,7 +44,7 @@ services:
       context: ..
       dockerfile: Dockerfile
     container_name: interop-rxrpl-0
-    command: ["run", "--config", "/etc/rxrpl/config.toml"]
+    command: ["run", "--config", "/etc/rxrpl/config.toml", "--mode", "network"]
     volumes:
       - ./configs/rxrpl-0.toml:/etc/rxrpl/config.toml:ro
     ports:
