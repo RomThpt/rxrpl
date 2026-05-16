@@ -2,6 +2,7 @@ use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
+use crate::amount_helpers::{compute_holder_balance, compute_new_iou_balance};
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
@@ -83,21 +84,7 @@ impl Transactor for ClawbackTransactor {
         let tl: Value =
             serde_json::from_slice(&tl_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        // Check holder has positive balance
-        let balance_val = tl
-            .get("Balance")
-            .and_then(|b| b.get("value"))
-            .and_then(|v| v.as_str())
-            .ok_or(TransactionResult::TecNoEntry)?;
-
-        let balance: f64 = balance_val.parse().unwrap_or(0.0);
-
-        // The balance in RippleState is from the perspective of the low account.
-        // If issuer is the low account, a positive balance means the high account (holder) owes.
-        // If issuer is the high account, a negative balance means the low account (holder) owes.
-        let is_issuer_low = issuer_id.as_bytes() < holder_id.as_bytes();
-        let holder_balance = if is_issuer_low { balance } else { -balance };
-
+        let holder_balance = compute_holder_balance(&tl, &issuer_id, &holder_id);
         if holder_balance <= 0.0 {
             return Err(TransactionResult::TecNoEntry);
         }
@@ -136,26 +123,21 @@ impl Transactor for ClawbackTransactor {
         let mut tl: Value =
             serde_json::from_slice(&tl_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        // Get current balance
-        let balance_str = tl["Balance"]["value"]
-            .as_str()
-            .ok_or(TransactionResult::TefInternal)?;
-        let balance: f64 = balance_str.parse().unwrap_or(0.0);
+        let holder_balance = compute_holder_balance(&tl, &issuer_id, &holder_id);
+        if holder_balance <= 0.0 {
+            return Err(TransactionResult::TecNoEntry);
+        }
 
-        let is_issuer_low = issuer_id.as_bytes() < holder_id.as_bytes();
-        let holder_balance = if is_issuer_low { balance } else { -balance };
-
-        // Cap clawback to holder's actual balance
+        // Cap clawback to holder's actual balance.
         let actual_clawback = clawback_value.min(holder_balance);
 
-        // Update balance (reduce holder's balance)
-        let new_balance = if is_issuer_low {
-            balance - actual_clawback
+        let new_balance =
+            compute_new_iou_balance(&tl, &format!("-{actual_clawback}"), &issuer_id, &holder_id)?;
+        tl["Balance"]["value"] = Value::String(if new_balance == new_balance.trunc() {
+            format!("{}", new_balance as i64)
         } else {
-            balance + actual_clawback
-        };
-
-        tl["Balance"]["value"] = Value::String(format!("{new_balance}"));
+            format!("{new_balance}")
+        });
 
         let tl_data = serde_json::to_vec(&tl).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
@@ -228,15 +210,13 @@ mod tests {
             (HOLDER, ISSUER)
         };
 
-        // Balance from the low account's perspective:
-        // If issuer is low, positive means holder owes issuer (holder has tokens).
-        // If holder is low, negative means holder owes issuer (holder has tokens).
+        // RippleState Balance is stored from the low-account perspective;
+        // a holder that is the low account holds a positive balance.
         let stored_balance = if is_issuer_low {
-            balance_value.to_string()
-        } else {
-            // Negate for storage
             let val: f64 = balance_value.parse().unwrap();
             format!("{}", -val)
+        } else {
+            balance_value.to_string()
         };
 
         let tl_obj = serde_json::json!({
@@ -305,7 +285,7 @@ mod tests {
         let balance: f64 = tl["Balance"]["value"].as_str().unwrap().parse().unwrap();
 
         let is_issuer_low = issuer_id.as_bytes() < holder_id.as_bytes();
-        let holder_balance = if is_issuer_low { balance } else { -balance };
+        let holder_balance = if is_issuer_low { -balance } else { balance };
         assert!((holder_balance - 70.0).abs() < 0.001);
     }
 
@@ -348,6 +328,40 @@ mod tests {
 
         let balance: f64 = tl["Balance"]["value"].as_str().unwrap().parse().unwrap();
         assert!(balance.abs() < 0.001);
+    }
+
+    fn setup_flagged_trust_line(balance_value: &str) -> Ledger {
+        const LSF_ALLOW_TRUST_LINE_CLAWBACK: u32 = 0x8000_0000;
+        let mut ledger = setup_with_trust_line(balance_value);
+        let issuer_id = decode_account_id(ISSUER).unwrap();
+        let key = keylet::account(&issuer_id);
+        let mut acct: Value =
+            rxrpl_ledger::sle_codec::decode_state(ledger.get_state(&key).unwrap()).unwrap();
+        acct["Flags"] = Value::from(LSF_ALLOW_TRUST_LINE_CLAWBACK);
+        let json = serde_json::to_vec(&acct).unwrap();
+        let binary = rxrpl_ledger::sle_codec::encode_sle(&json).unwrap();
+        ledger.put_state(key, binary).unwrap();
+        ledger
+    }
+
+    #[test]
+    fn preclaim_accepts_positive_holder_balance() {
+        let ledger = setup_flagged_trust_line("100");
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "Clawback",
+            "Account": ISSUER,
+            "Amount": { "currency": "USD", "issuer": HOLDER, "value": "50" },
+            "Fee": "12",
+        });
+        let ctx = PreclaimContext {
+            tx: &tx,
+            view: &view,
+            rules: &rules,
+        };
+        assert_eq!(ClawbackTransactor.preclaim(&ctx), Ok(()));
     }
 
     #[test]

@@ -220,6 +220,54 @@ fn nftoken_cancel_offer_lifecycle() {
     assert_eq!(read_owner_count(&ledger, &genesis_addr), 1); // only the token remains
 }
 
+#[test]
+fn clawback_repro_real_iou_payment() {
+    let (mut ledger, genesis_addr, dest_addr) = setup_funded_pair();
+    let engine = make_engine();
+    let fees = FeeSettings::default();
+
+    let allow_clawback_tx = serde_json::json!({
+        "TransactionType": "AccountSet",
+        "Account": genesis_addr,
+        "SetFlag": 16,
+        "Fee": "12",
+        "Sequence": 2,
+    });
+    let r = Node::apply_transaction(&mut ledger, &engine, &allow_clawback_tx, &fees).unwrap();
+    assert_eq!(r, TransactionResult::TesSuccess, "accountset");
+
+    let trust_tx = serde_json::json!({
+        "TransactionType": "TrustSet",
+        "Account": dest_addr,
+        "LimitAmount": { "currency": "USD", "issuer": genesis_addr, "value": "1000" },
+        "Fee": "12",
+        "Sequence": 2,
+    });
+    let r = Node::apply_transaction(&mut ledger, &engine, &trust_tx, &fees).unwrap();
+    assert_eq!(r, TransactionResult::TesSuccess, "trustset");
+
+    let pay_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": genesis_addr,
+        "Destination": dest_addr,
+        "Amount": { "currency": "USD", "issuer": genesis_addr, "value": "100" },
+        "Fee": "12",
+        "Sequence": 3,
+    });
+    let r = Node::apply_transaction(&mut ledger, &engine, &pay_tx, &fees).unwrap();
+    assert_eq!(r, TransactionResult::TesSuccess, "iou payment");
+
+    let clawback_tx = serde_json::json!({
+        "TransactionType": "Clawback",
+        "Account": genesis_addr,
+        "Amount": { "currency": "USD", "issuer": dest_addr, "value": "50" },
+        "Fee": "12",
+        "Sequence": 4,
+    });
+    let r = Node::apply_transaction(&mut ledger, &engine, &clawback_tx, &fees).unwrap();
+    assert_eq!(r, TransactionResult::TesSuccess, "clawback");
+}
+
 // -- Clawback lifecycle: trust set -> IOU payment -> clawback -> verify balance --
 
 #[test]
@@ -268,7 +316,7 @@ fn clawback_lifecycle() {
     let mut tl: Value = rxrpl_ledger::sle_codec::decode_state(tl_data).unwrap();
 
     let is_genesis_low = genesis_id.as_bytes() < dest_id.as_bytes();
-    let balance_value = if is_genesis_low { "100" } else { "-100" };
+    let balance_value = if is_genesis_low { "-100" } else { "100" };
     tl["Balance"]["value"] = Value::String(balance_value.to_string());
     let json_bytes = serde_json::to_vec(&tl).unwrap();
     let binary = rxrpl_ledger::sle_codec::encode_sle(&json_bytes).unwrap();
@@ -294,6 +342,6 @@ fn clawback_lifecycle() {
     let tl_data = ledger.get_state(&tl_key).unwrap();
     let tl: Value = rxrpl_ledger::sle_codec::decode_state(tl_data).unwrap();
     let balance: f64 = tl["Balance"]["value"].as_str().unwrap().parse().unwrap();
-    let holder_balance = if is_genesis_low { balance } else { -balance };
+    let holder_balance = if is_genesis_low { -balance } else { balance };
     assert!((holder_balance - 70.0).abs() < 0.001);
 }
