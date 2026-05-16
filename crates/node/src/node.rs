@@ -1,4 +1,5 @@
 use std::collections::{HashSet, VecDeque};
+#[cfg(feature = "grpc")]
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -299,27 +300,12 @@ impl Node {
         }
 
         let ctx = ServerContext::new(self.config.server.clone());
-        let app = rxrpl_rpc_server::build_router(ctx);
-        let bind = self.config.server.bind;
 
-        tracing::info!("starting RPC server on {}", bind);
-
-        let listener = tokio::net::TcpListener::bind(bind)
+        rxrpl_rpc_server::serve(ctx, self.config.server.bind, self.config.server.ws_bind)
             .await
             .map_err(|e| NodeError::Server(e.to_string()))?;
 
         self.running = true;
-
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            {
-                tracing::error!("RPC server error: {}", e);
-            }
-        });
 
         tracing::info!("node started");
         Ok(())
@@ -347,26 +333,9 @@ impl Node {
         #[cfg(feature = "grpc")]
         let grpc_ctx = Arc::clone(&ctx);
 
-        let app = rxrpl_rpc_server::build_router(ctx);
-        let bind = self.config.server.bind;
-
-        tracing::info!("starting standalone RPC server on {}", bind);
-
-        let listener = tokio::net::TcpListener::bind(bind)
+        rxrpl_rpc_server::serve(ctx, self.config.server.bind, self.config.server.ws_bind)
             .await
             .map_err(|e| NodeError::Server(e.to_string()))?;
-
-        // Spawn RPC server
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            {
-                tracing::error!("RPC server error: {}", e);
-            }
-        });
 
         // Spawn gRPC server if enabled
         #[cfg(feature = "grpc")]
@@ -1063,24 +1032,9 @@ impl Node {
         #[cfg(feature = "grpc")]
         let grpc_ctx = Arc::clone(&ctx);
 
-        let app = rxrpl_rpc_server::build_router(ctx);
-        let bind = self.config.server.bind;
-
-        tracing::info!("starting RPC server on {}", bind);
-        let listener = tokio::net::TcpListener::bind(bind)
+        rxrpl_rpc_server::serve(ctx, self.config.server.bind, self.config.server.ws_bind)
             .await
             .map_err(|e| NodeError::Server(e.to_string()))?;
-
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            {
-                tracing::error!("RPC server error: {}", e);
-            }
-        });
 
         // Spawn gRPC server if enabled
         #[cfg(feature = "grpc")]

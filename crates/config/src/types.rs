@@ -68,9 +68,13 @@ impl Default for ReportingConfig {
 /// Server (RPC) configuration.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ServerConfig {
-    /// HTTP/WS bind address.
+    /// HTTP JSON-RPC bind address.
     #[serde(default = "default_rpc_addr")]
     pub bind: SocketAddr,
+    /// Dedicated WebSocket bind address. rippled convention exposes the WS
+    /// API on a separate port (`port_ws_public`) from the HTTP RPC port.
+    #[serde(default = "default_ws_addr")]
+    pub ws_bind: Option<SocketAddr>,
     /// Admin IP addresses (for admin RPC methods).
     #[serde(default)]
     pub admin_ips: Vec<String>,
@@ -80,10 +84,15 @@ fn default_rpc_addr() -> SocketAddr {
     "127.0.0.1:5005".parse().unwrap()
 }
 
+fn default_ws_addr() -> Option<SocketAddr> {
+    Some("0.0.0.0:6006".parse().unwrap())
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: default_rpc_addr(),
+            ws_bind: default_ws_addr(),
             admin_ips: vec!["127.0.0.1".into()],
         }
     }
