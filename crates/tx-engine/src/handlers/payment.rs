@@ -332,7 +332,11 @@ fn apply_iou(
     // destination still receives `value`. The grossed-up debit must fit
     // within SendMax if one was supplied.
     let rate = issuer_transfer_rate(ctx, &issuer_id);
-    let src_debit_value = if dest_id == issuer_id { send_value } else { send_value * rate };
+    let src_debit_value = if dest_id == issuer_id {
+        send_value
+    } else {
+        send_value * rate
+    };
     if let Some((sm_cur, sm_iss, sm_val)) = get_send_max_iou(ctx.tx) {
         if sm_cur == currency && sm_iss == issuer {
             let sm: f64 = sm_val.parse().unwrap_or(0.0);
@@ -526,8 +530,12 @@ fn apply_cross_currency(
     let dst_cur_bytes = helpers::currency_to_bytes(dst_cur);
     let src_cur_bytes = helpers::currency_to_bytes(src_cur);
 
-    let target: f64 = dst_val.parse().map_err(|_| TransactionResult::TemBadAmount)?;
-    let send_max_val: f64 = src_max.parse().map_err(|_| TransactionResult::TemBadAmount)?;
+    let target: f64 = dst_val
+        .parse()
+        .map_err(|_| TransactionResult::TemBadAmount)?;
+    let send_max_val: f64 = src_max
+        .parse()
+        .map_err(|_| TransactionResult::TemBadAmount)?;
     if target <= 0.0 {
         return Err(TransactionResult::TemBadAmount);
     }
@@ -544,8 +552,12 @@ fn apply_cross_currency(
 
     let mut remaining = target;
     let mut src_spent = 0.0;
-    let mut consumed: Vec<(rxrpl_primitives::Hash256, rxrpl_primitives::AccountId, f64, f64)> =
-        Vec::new();
+    let mut consumed: Vec<(
+        rxrpl_primitives::Hash256,
+        rxrpl_primitives::AccountId,
+        f64,
+        f64,
+    )> = Vec::new();
 
     for offer in &offers {
         if remaining <= 1e-9 {
@@ -626,7 +638,9 @@ fn collect_book_offers(
                 let Ok(h) = s.parse::<rxrpl_primitives::Hash256>() else {
                     continue;
                 };
-                let Some(eb) = ctx.view.read(&h) else { continue };
+                let Some(eb) = ctx.view.read(&h) else {
+                    continue;
+                };
                 let Ok(entry) = serde_json::from_slice::<serde_json::Value>(&eb) else {
                     continue;
                 };
@@ -677,7 +691,10 @@ fn update_consumed_offer(
     take_pays: f64,
     take_gets: f64,
 ) -> Result<(), TransactionResult> {
-    let bytes = ctx.view.read(offer_key).ok_or(TransactionResult::TefInternal)?;
+    let bytes = ctx
+        .view
+        .read(offer_key)
+        .ok_or(TransactionResult::TefInternal)?;
     let mut offer: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
     let pays = iou_value(offer.get("TakerPays"));
@@ -1155,7 +1172,9 @@ mod tests {
             "HighLimit": { "currency": currency, "issuer": high_addr, "value": "1000" },
             "Flags": 0,
         });
-        ledger.put_state(key, serde_json::to_vec(&tl).unwrap()).unwrap();
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
     }
 
     fn iou(currency: &str, issuer: &str, value: &str) -> serde_json::Value {
