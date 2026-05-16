@@ -130,6 +130,19 @@ impl Transactor for PaymentTransactor {
 
         // IOU branch: dispatch to issuer-mint handler.
         if let Some((currency, issuer, value)) = helpers::get_iou_amount(ctx.tx) {
+            // Cross-currency: SendMax in a different currency than Amount means
+            // the payment must flow through the order book.
+            if let Some((sm_cur, sm_iss, sm_val)) = get_send_max_iou(ctx.tx) {
+                if sm_cur != currency || sm_iss != issuer {
+                    return apply_cross_currency(
+                        ctx,
+                        account_str,
+                        destination_str,
+                        (currency, issuer, value),
+                        (sm_cur, sm_iss, sm_val),
+                    );
+                }
+            }
             return apply_iou(ctx, account_str, destination_str, currency, issuer, value);
         }
 
@@ -314,6 +327,21 @@ fn apply_iou(
         return Err(TransactionResult::TemBadAmount);
     }
 
+    // TransferRate: when the issuer charges a transfer fee and is not party
+    // to the transfer, the source is debited `value * rate` while the
+    // destination still receives `value`. The grossed-up debit must fit
+    // within SendMax if one was supplied.
+    let rate = issuer_transfer_rate(ctx, &issuer_id);
+    let src_debit_value = if dest_id == issuer_id { send_value } else { send_value * rate };
+    if let Some((sm_cur, sm_iss, sm_val)) = get_send_max_iou(ctx.tx) {
+        if sm_cur == currency && sm_iss == issuer {
+            let sm: f64 = sm_val.parse().unwrap_or(0.0);
+            if src_debit_value > sm + 1e-9 {
+                return Err(TransactionResult::TecPathPartial);
+            }
+        }
+    }
+
     // Source debits ITS trust line balance toward issuer.
     let src_trust_key = keylet::trust_line(&src_id, &issuer_id, &cur_bytes);
     let src_trust_bytes = ctx
@@ -323,11 +351,15 @@ fn apply_iou(
     let mut src_trust: serde_json::Value =
         serde_json::from_slice(&src_trust_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-    let new_src_value =
-        adjust_iou_balance(&src_trust, &format!("-{}", value), &issuer_id, &src_id)?;
+    let new_src_value = adjust_iou_balance(
+        &src_trust,
+        &format!("-{}", src_debit_value),
+        &issuer_id,
+        &src_id,
+    )?;
     // Source must have sufficient balance (cannot go below 0 from holder's perspective).
     let src_holder_balance = compute_holder_balance(&src_trust, &issuer_id, &src_id);
-    if src_holder_balance < send_value {
+    if src_holder_balance < src_debit_value - 1e-9 {
         return Err(TransactionResult::TecPathPartial);
     }
     src_trust["Balance"]["value"] = serde_json::Value::String(new_src_value);
@@ -399,6 +431,342 @@ fn format_iou_value(v: f64) -> String {
         format!("{}", v as i64)
     } else {
         format!("{v}")
+    }
+}
+
+/// Extract a SendMax IOU object as (currency, issuer, value).
+fn get_send_max_iou(tx: &serde_json::Value) -> Option<(&str, &str, &str)> {
+    let sm = tx.get("SendMax")?;
+    if !sm.is_object() {
+        return None;
+    }
+    Some((
+        sm.get("currency")?.as_str()?,
+        sm.get("issuer")?.as_str()?,
+        sm.get("value")?.as_str()?,
+    ))
+}
+
+/// Read the issuer's TransferRate as a multiplier (1.0 = no fee).
+fn issuer_transfer_rate(ctx: &ApplyContext<'_>, issuer_id: &rxrpl_primitives::AccountId) -> f64 {
+    let key = keylet::account(issuer_id);
+    ctx.view
+        .read(&key)
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|a| a.get("TransferRate").and_then(|v| v.as_u64()))
+        .map(|r| {
+            if r > 1_000_000_000 {
+                r as f64 / 1_000_000_000.0
+            } else {
+                1.0
+            }
+        })
+        .unwrap_or(1.0)
+}
+
+/// Adjust a holder's RippleState balance toward an issuer by `delta`
+/// (positive = credit holder, negative = debit holder).
+fn apply_trust_delta(
+    ctx: &mut ApplyContext<'_>,
+    holder_id: &rxrpl_primitives::AccountId,
+    issuer_id: &rxrpl_primitives::AccountId,
+    cur_bytes: &[u8; 20],
+    delta: f64,
+) -> Result<(), TransactionResult> {
+    let key = keylet::trust_line(holder_id, issuer_id, cur_bytes);
+    let bytes = ctx.view.read(&key).ok_or(TransactionResult::TecPathDry)?;
+    let mut trust: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    if delta < 0.0 {
+        let holder_balance = compute_holder_balance(&trust, issuer_id, holder_id);
+        if holder_balance < -delta - 1e-9 {
+            return Err(TransactionResult::TecPathPartial);
+        }
+    }
+    let new_value = adjust_iou_balance(&trust, &format!("{delta}"), issuer_id, holder_id)?;
+    trust["Balance"]["value"] = serde_json::Value::String(new_value);
+    let data = serde_json::to_vec(&trust).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(key, data)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    Ok(())
+}
+
+/// An order-book offer with its parsed IOU amounts.
+struct CrossOffer {
+    key: rxrpl_primitives::Hash256,
+    owner: rxrpl_primitives::AccountId,
+    taker_pays: f64,
+    taker_gets: f64,
+}
+
+/// Apply a cross-currency Payment: the source pays `send_max` (currency A)
+/// and the destination receives `amount` (currency B), bridged through the
+/// order book. Scoped to a single IOU->IOU hop via offers that sell B for A
+/// (book keyed by pays = A, gets = B).
+fn apply_cross_currency(
+    ctx: &mut ApplyContext<'_>,
+    account_str: &str,
+    destination_str: &str,
+    amount: (&str, &str, &str),
+    send_max: (&str, &str, &str),
+) -> Result<TransactionResult, TransactionResult> {
+    let (dst_cur, dst_iss, dst_val) = amount;
+    let (src_cur, src_iss, src_max) = send_max;
+
+    let src_id =
+        decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let dest_id =
+        decode_account_id(destination_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let dst_issuer_id =
+        decode_account_id(dst_iss).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let src_issuer_id =
+        decode_account_id(src_iss).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+
+    let dst_cur_bytes = helpers::currency_to_bytes(dst_cur);
+    let src_cur_bytes = helpers::currency_to_bytes(src_cur);
+
+    let target: f64 = dst_val.parse().map_err(|_| TransactionResult::TemBadAmount)?;
+    let send_max_val: f64 = src_max.parse().map_err(|_| TransactionResult::TemBadAmount)?;
+    if target <= 0.0 {
+        return Err(TransactionResult::TemBadAmount);
+    }
+
+    // Book of offers selling dst currency for src currency:
+    // takers pay src, takers get dst.
+    let book_root = keylet::book_dir(
+        &src_cur_bytes,
+        &src_issuer_id,
+        &dst_cur_bytes,
+        &dst_issuer_id,
+    );
+    let offers = collect_book_offers(ctx, &book_root);
+
+    let mut remaining = target;
+    let mut src_spent = 0.0;
+    let mut consumed: Vec<(rxrpl_primitives::Hash256, rxrpl_primitives::AccountId, f64, f64)> =
+        Vec::new();
+
+    for offer in &offers {
+        if remaining <= 1e-9 {
+            break;
+        }
+        if offer.taker_gets <= 0.0 || offer.taker_pays <= 0.0 {
+            continue;
+        }
+        let take_dst = remaining.min(offer.taker_gets);
+        let take_src = take_dst * offer.taker_pays / offer.taker_gets;
+        if src_spent + take_src > send_max_val + 1e-9 {
+            return Err(TransactionResult::TecPathPartial);
+        }
+        consumed.push((offer.key, offer.owner, take_src, take_dst));
+        remaining -= take_dst;
+        src_spent += take_src;
+    }
+
+    if remaining > 1e-9 {
+        return Err(TransactionResult::TecPathPartial);
+    }
+
+    // Debit source's src-currency trust line by total spent.
+    apply_trust_delta(ctx, &src_id, &src_issuer_id, &src_cur_bytes, -src_spent)?;
+
+    for (offer_key, owner_id, take_src, take_dst) in &consumed {
+        // Offer owner receives src currency and gives up dst currency.
+        if *owner_id != src_issuer_id {
+            apply_trust_delta(ctx, owner_id, &src_issuer_id, &src_cur_bytes, *take_src)?;
+        }
+        if *owner_id != dst_issuer_id {
+            apply_trust_delta(ctx, owner_id, &dst_issuer_id, &dst_cur_bytes, -*take_dst)?;
+        }
+        update_consumed_offer(ctx, offer_key, &book_root, *take_src, *take_dst)?;
+    }
+
+    // Credit destination's dst-currency trust line.
+    apply_trust_delta(ctx, &dest_id, &dst_issuer_id, &dst_cur_bytes, target)?;
+
+    // Bump source Sequence.
+    let src_key = keylet::account(&src_id);
+    let src_bytes = ctx
+        .view
+        .read(&src_key)
+        .ok_or(TransactionResult::TerNoAccount)?;
+    let mut src_acct: serde_json::Value =
+        serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
+    helpers::increment_sequence(&mut src_acct);
+    let src_acct_data =
+        serde_json::to_vec(&src_acct).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(src_key, src_acct_data)
+        .map_err(|_| TransactionResult::TefInternal)?;
+
+    Ok(TransactionResult::TesSuccess)
+}
+
+/// Walk a book directory and collect its offers with parsed IOU amounts.
+fn collect_book_offers(
+    ctx: &mut ApplyContext<'_>,
+    book_root: &rxrpl_primitives::Hash256,
+) -> Vec<CrossOffer> {
+    let mut out = Vec::new();
+    let mut page = 0u64;
+    loop {
+        let page_key = keylet::dir_node(book_root, page);
+        let page_bytes = match ctx.view.read(&page_key) {
+            Some(b) => b,
+            None => break,
+        };
+        let page_json: serde_json::Value = match serde_json::from_slice(&page_bytes) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        if let Some(indexes) = page_json.get("Indexes").and_then(|v| v.as_array()) {
+            for idx in indexes {
+                let Some(s) = idx.as_str() else { continue };
+                let Ok(h) = s.parse::<rxrpl_primitives::Hash256>() else {
+                    continue;
+                };
+                let Some(eb) = ctx.view.read(&h) else { continue };
+                let Ok(entry) = serde_json::from_slice::<serde_json::Value>(&eb) else {
+                    continue;
+                };
+                if entry.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+                    continue;
+                }
+                let owner = entry
+                    .get("Account")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| decode_account_id(s).ok());
+                let Some(owner) = owner else { continue };
+                let taker_pays = iou_value(entry.get("TakerPays"));
+                let taker_gets = iou_value(entry.get("TakerGets"));
+                out.push(CrossOffer {
+                    key: h,
+                    owner,
+                    taker_pays,
+                    taker_gets,
+                });
+            }
+        }
+        match page_json.get("IndexNext").and_then(|v| v.as_u64()) {
+            Some(next) if next != 0 => page = next,
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Parse the numeric value of an IOU (or drops) amount field.
+fn iou_value(v: Option<&serde_json::Value>) -> f64 {
+    match v {
+        Some(serde_json::Value::String(s)) => s.parse().unwrap_or(0.0),
+        Some(obj) => obj
+            .get("value")
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0),
+        None => 0.0,
+    }
+}
+
+/// Reduce a consumed offer's remaining amounts; erase it if fully filled.
+fn update_consumed_offer(
+    ctx: &mut ApplyContext<'_>,
+    offer_key: &rxrpl_primitives::Hash256,
+    book_root: &rxrpl_primitives::Hash256,
+    take_pays: f64,
+    take_gets: f64,
+) -> Result<(), TransactionResult> {
+    let bytes = ctx.view.read(offer_key).ok_or(TransactionResult::TefInternal)?;
+    let mut offer: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let pays = iou_value(offer.get("TakerPays"));
+    let gets = iou_value(offer.get("TakerGets"));
+    let new_pays = (pays - take_pays).max(0.0);
+    let new_gets = (gets - take_gets).max(0.0);
+
+    if new_gets <= 1e-9 || new_pays <= 1e-9 {
+        let owner = offer
+            .get("Account")
+            .and_then(|v| v.as_str())
+            .and_then(|s| decode_account_id(s).ok());
+        if let Some(owner_id) = owner {
+            crate::owner_dir::remove_from_owner_dir(ctx.view, &owner_id, offer_key)?;
+            let owner_key = keylet::account(&owner_id);
+            if let Some(b) = ctx.view.read(&owner_key) {
+                if let Ok(mut acct) = serde_json::from_slice::<serde_json::Value>(&b) {
+                    helpers::adjust_owner_count(&mut acct, -1);
+                    if let Ok(nb) = serde_json::to_vec(&acct) {
+                        let _ = ctx.view.update(owner_key, nb);
+                    }
+                }
+            }
+        }
+        remove_offer_from_book(ctx.view, book_root, offer_key)?;
+        let _ = ctx.view.erase(offer_key);
+        return Ok(());
+    }
+
+    if let Some(tp) = offer.get_mut("TakerPays") {
+        if tp.is_object() {
+            tp["value"] = serde_json::Value::String(format_iou_value(new_pays));
+        }
+    }
+    if let Some(tg) = offer.get_mut("TakerGets") {
+        if tg.is_object() {
+            tg["value"] = serde_json::Value::String(format_iou_value(new_gets));
+        }
+    }
+    let data = serde_json::to_vec(&offer).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(*offer_key, data)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    Ok(())
+}
+
+/// Remove an offer hash from a book directory page.
+fn remove_offer_from_book(
+    view: &mut dyn crate::view::apply_view::ApplyView,
+    book_root: &rxrpl_primitives::Hash256,
+    offer_key: &rxrpl_primitives::Hash256,
+) -> Result<(), TransactionResult> {
+    let entry_hex = offer_key.to_string();
+    let mut page = 0u64;
+    loop {
+        let page_key = keylet::dir_node(book_root, page);
+        let bytes = match view.read(&page_key) {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        let mut dir: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let next_page = dir.get("IndexNext").and_then(|v| v.as_u64()).unwrap_or(0);
+        let removed = if let Some(indexes) = dir.get_mut("Indexes").and_then(|v| v.as_array_mut()) {
+            let original = indexes.len();
+            indexes.retain(|v| v.as_str() != Some(entry_hex.as_str()));
+            indexes.len() != original
+        } else {
+            false
+        };
+        if removed {
+            let empty = dir
+                .get("Indexes")
+                .and_then(|v| v.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(true);
+            if empty && page == 0 {
+                let _ = view.erase(&page_key);
+            } else {
+                let new_bytes =
+                    serde_json::to_vec(&dir).map_err(|_| TransactionResult::TefInternal)?;
+                let _ = view.update(page_key, new_bytes);
+            }
+            return Ok(());
+        }
+        if next_page == 0 {
+            return Ok(());
+        }
+        page = next_page;
     }
 }
 
@@ -737,5 +1105,203 @@ mod tests {
 
         let result = PaymentTransactor.apply(&mut ctx);
         assert_eq!(result, Err(TransactionResult::TerNoAccount));
+    }
+
+    // -- transfer rate / cross-currency tests --
+
+    const ISSUER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    const ALICE: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
+    const BOB: &str = "rGWrZyQqhTp9Xu7G5Pkayo7bXjH4k4QYpf";
+    const MM: &str = "r3kmLJN5D28dHuH8vZNUZpMC43pEHpaocV";
+
+    fn put_account(ledger: &mut Ledger, addr: &str, balance: &str, transfer_rate: Option<u64>) {
+        let id = decode_account_id(addr).unwrap();
+        let key = keylet::account(&id);
+        let mut acct = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": addr,
+            "Balance": balance,
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        if let Some(rate) = transfer_rate {
+            acct["TransferRate"] = serde_json::Value::from(rate);
+        }
+        ledger
+            .put_state(key, serde_json::to_vec(&acct).unwrap())
+            .unwrap();
+    }
+
+    /// Insert a RippleState giving `holder` a positive `value` of `currency`
+    /// from `issuer`.
+    fn put_trust_line(ledger: &mut Ledger, holder: &str, issuer: &str, currency: &str, value: f64) {
+        let holder_id = decode_account_id(holder).unwrap();
+        let issuer_id = decode_account_id(issuer).unwrap();
+        let cur_bytes = helpers::currency_to_bytes(currency);
+        let key = keylet::trust_line(&holder_id, &issuer_id, &cur_bytes);
+
+        let holder_is_low = holder_id.as_bytes() < issuer_id.as_bytes();
+        let stored = if holder_is_low { value } else { -value };
+        let (low_addr, high_addr) = if holder_is_low {
+            (holder, issuer)
+        } else {
+            (issuer, holder)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": currency, "issuer": issuer, "value": format!("{stored}") },
+            "LowLimit": { "currency": currency, "issuer": low_addr, "value": "0" },
+            "HighLimit": { "currency": currency, "issuer": high_addr, "value": "1000" },
+            "Flags": 0,
+        });
+        ledger.put_state(key, serde_json::to_vec(&tl).unwrap()).unwrap();
+    }
+
+    fn iou(currency: &str, issuer: &str, value: &str) -> serde_json::Value {
+        serde_json::json!({ "currency": currency, "issuer": issuer, "value": value })
+    }
+
+    fn holder_balance(view: &dyn ReadView, holder: &str, issuer: &str, currency: &str) -> f64 {
+        let holder_id = decode_account_id(holder).unwrap();
+        let issuer_id = decode_account_id(issuer).unwrap();
+        let cur_bytes = helpers::currency_to_bytes(currency);
+        let key = keylet::trust_line(&holder_id, &issuer_id, &cur_bytes);
+        let bytes = view.read(&key).unwrap();
+        let tl: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        compute_holder_balance(&tl, &issuer_id, &holder_id)
+    }
+
+    #[test]
+    fn apply_iou_transfer_rate_deducts_fee_from_source() {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ISSUER, "100000000", Some(1_200_000_000));
+        put_account(&mut ledger, ALICE, "50000000", None);
+        put_account(&mut ledger, BOB, "50000000", None);
+        put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+        put_trust_line(&mut ledger, BOB, ISSUER, "USD", 0.0);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("USD", ISSUER, "50"),
+            "SendMax": iou("USD", ISSUER, "60"),
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = PaymentTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        assert!((holder_balance(&sandbox, ALICE, ISSUER, "USD") - 40.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, BOB, ISSUER, "USD") - 50.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apply_iou_transfer_rate_send_max_too_low_fails() {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ISSUER, "100000000", Some(1_200_000_000));
+        put_account(&mut ledger, ALICE, "50000000", None);
+        put_account(&mut ledger, BOB, "50000000", None);
+        put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+        put_trust_line(&mut ledger, BOB, ISSUER, "USD", 0.0);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("USD", ISSUER, "50"),
+            "SendMax": iou("USD", ISSUER, "55"),
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = PaymentTransactor.apply(&mut ctx);
+        assert_eq!(result, Err(TransactionResult::TecPathPartial));
+    }
+
+    #[test]
+    fn apply_cross_currency_consumes_offer() {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ISSUER, "100000000", None);
+        put_account(&mut ledger, ALICE, "50000000", None);
+        put_account(&mut ledger, BOB, "50000000", None);
+        put_account(&mut ledger, MM, "50000000", None);
+
+        put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+        put_trust_line(&mut ledger, BOB, ISSUER, "EUR", 0.0);
+        put_trust_line(&mut ledger, MM, ISSUER, "USD", 0.0);
+        put_trust_line(&mut ledger, MM, ISSUER, "EUR", 100.0);
+
+        // MM offer: TakerPays USD 50, TakerGets EUR 50.
+        let mm_id = decode_account_id(MM).unwrap();
+        let offer_key = keylet::offer(&mm_id, 1);
+        let offer = serde_json::json!({
+            "LedgerEntryType": "Offer",
+            "Account": MM,
+            "Sequence": 1,
+            "TakerPays": iou("USD", ISSUER, "50"),
+            "TakerGets": iou("EUR", ISSUER, "50"),
+            "Flags": 0,
+        });
+        ledger
+            .put_state(offer_key, serde_json::to_vec(&offer).unwrap())
+            .unwrap();
+
+        let usd = helpers::currency_to_bytes("USD");
+        let eur = helpers::currency_to_bytes("EUR");
+        let issuer_id = decode_account_id(ISSUER).unwrap();
+        let book_root = keylet::book_dir(&usd, &issuer_id, &eur, &issuer_id);
+        let dir = serde_json::json!({
+            "LedgerEntryType": "DirectoryNode",
+            "Indexes": [offer_key.to_string()],
+            "IndexNext": 0,
+        });
+        ledger
+            .put_state(book_root, serde_json::to_vec(&dir).unwrap())
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("EUR", ISSUER, "20"),
+            "SendMax": iou("USD", ISSUER, "20"),
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = PaymentTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        assert!((holder_balance(&sandbox, BOB, ISSUER, "EUR") - 20.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, ALICE, ISSUER, "USD") - 80.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM, ISSUER, "USD") - 20.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM, ISSUER, "EUR") - 80.0).abs() < 1e-6);
     }
 }
