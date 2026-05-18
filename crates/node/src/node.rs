@@ -406,14 +406,10 @@ impl Node {
                 let prev_hash = l.header.parent_hash;
                 let ledger_seq = l.header.sequence;
 
-                // Collect transaction hashes from open ledger
-                let mut tx_hashes = Vec::new();
-                l.tx_map.for_each(&mut |tx_hash, _data| {
-                    tx_hashes.push(*tx_hash);
-                });
+                // Build the consensus candidate set (with canonical blobs)
+                // from the open ledger.
+                let tx_set = Node::collect_consensus_tx_set(&l);
                 drop(l);
-
-                let tx_set = TxSet::new(tx_hashes);
 
                 // Run consensus (solo = immediate accept)
                 consensus.start_round(prev_hash, ledger_seq);
@@ -1531,13 +1527,8 @@ impl Node {
                                     );
 
                                     let l = ledger.read().await;
-                                    let mut tx_hashes = Vec::new();
-                                    l.tx_map.for_each(&mut |tx_hash, _data| {
-                                        tx_hashes.push(*tx_hash);
-                                    });
+                                    let tx_set = Node::collect_consensus_tx_set(&l);
                                     drop(l);
-
-                                    let tx_set = TxSet::new(tx_hashes);
 
                                     consensus.start_round(prev_hash, seq);
                                     if let Err(e) = consensus.close_ledger(tx_set, close_time, seq) {
@@ -3221,6 +3212,30 @@ impl Node {
         let eff = rxrpl_consensus::eff_close_time(close_time, resolution, parent_close_time);
         ledger.close(eff, 0)?;
         Ok(ledger.header.hash)
+    }
+
+    /// Build the consensus candidate transaction set from an open ledger.
+    ///
+    /// The open ledger's `tx_map` stores a JSON record per transaction; the
+    /// consensus set needs the canonical binary so a peer can acquire and
+    /// re-apply it. Each `tx_json` is re-serialized to canonical form. The
+    /// set hash is the rippled-compatible SHAMap root either way (it is a
+    /// function of the tx ids), so a transaction whose blob fails to encode
+    /// still hashes correctly — it just cannot be served to a peer.
+    fn collect_consensus_tx_set(ledger: &Ledger) -> TxSet {
+        let mut items: Vec<(Hash256, Vec<u8>)> = Vec::new();
+        ledger.tx_map.for_each(&mut |tx_hash, data| {
+            let blob = serde_json::from_slice::<Value>(data)
+                .ok()
+                .and_then(|rec| rec.get("tx_json").cloned())
+                .and_then(|tx_json| rxrpl_codec::binary::encode(&tx_json).ok())
+                .unwrap_or_default();
+            if blob.is_empty() {
+                tracing::warn!("consensus tx-set: no canonical blob for tx {}", tx_hash);
+            }
+            items.push((*tx_hash, blob));
+        });
+        TxSet::from_items(items)
     }
 
     /// Get a reference to the current ledger.

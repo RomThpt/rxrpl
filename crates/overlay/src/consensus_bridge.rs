@@ -102,6 +102,15 @@ impl ConsensusAdapter for NetworkConsensusAdapter {
         self.tx_sets.read().unwrap().get(hash).cloned()
     }
 
+    fn publish_tx_set(&self, tx_set: &TxSet) {
+        // Make the candidate set retrievable by peers that receive our
+        // ProposeSet; `handle_get_tx_set` serves directly from this cache.
+        self.tx_sets
+            .write()
+            .unwrap()
+            .insert(tx_set.hash, tx_set.clone());
+    }
+
     fn on_close(&self, ledger_hash: &Hash256, ledger_seq: u32, _close_time: u32, tx_set: &TxSet) {
         // Cache the tx_set so peers can acquire it
         self.tx_sets

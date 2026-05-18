@@ -1129,6 +1129,53 @@ fn serialize_node_shallow(node: &Arc<SHAMapNode>) -> (Hash256, Vec<u8>) {
     }
 }
 
+/// Compute the SHAMap root hash of a consensus candidate transaction set.
+///
+/// In a transaction-no-metadata SHAMap every leaf node hashes to its own
+/// key — the transaction id is `SHA-512/2(TXN || tx_blob)` and the leaf
+/// hash is computed the same way — so the root is fully determined by the
+/// id set alone, without the transaction blobs. This mirrors the root
+/// rippled computes for an `InboundTransactions` candidate set, letting
+/// rxrpl propose a `transaction_hash` a rippled peer can agree with.
+pub fn transaction_set_root(ids: &[Hash256]) -> Hash256 {
+    use crate::node_id::BRANCH_FACTOR;
+    use rxrpl_crypto::hash_prefix::HashPrefix;
+    use rxrpl_crypto::sha512_half::sha512_half;
+
+    // Hash referenced by a parent inner node's branch slot: a single id is
+    // a leaf node (referenced directly), several ids form a nested inner.
+    fn child_hash(ids: &[Hash256], depth: u8) -> Hash256 {
+        match ids.len() {
+            0 => Hash256::ZERO,
+            1 => ids[0],
+            _ => inner_hash(ids, depth),
+        }
+    }
+
+    fn inner_hash(ids: &[Hash256], depth: u8) -> Hash256 {
+        let mut buckets: [Vec<Hash256>; BRANCH_FACTOR] = Default::default();
+        for &id in ids {
+            buckets[select_branch(&id, depth) as usize].push(id);
+        }
+        let prefix = HashPrefix::INNER_NODE.to_bytes();
+        let mut data = Vec::with_capacity(4 + BRANCH_FACTOR * 32);
+        data.extend_from_slice(&prefix);
+        for bucket in &buckets {
+            data.extend_from_slice(child_hash(bucket, depth + 1).as_bytes());
+        }
+        sha512_half(&[&data])
+    }
+
+    let mut sorted = ids.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    if sorted.is_empty() {
+        return Hash256::ZERO;
+    }
+    // The SHAMap root is always an inner node, even for a single item.
+    inner_hash(&sorted, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1137,6 +1184,38 @@ mod tests {
 
     fn make_key(hex: &str) -> Hash256 {
         Hash256::from_str(hex).unwrap()
+    }
+
+    #[test]
+    fn transaction_set_root_matches_real_shamap() {
+        use rxrpl_crypto::hash_prefix::HashPrefix;
+        use rxrpl_crypto::sha512_half::sha512_half;
+
+        // A transaction-no-meta leaf hashes to SHA-512/2(TXN || data); a
+        // candidate tx set keys each leaf by that same id. Build a real
+        // SHAMap::transaction() with key == leaf hash and confirm the
+        // id-only `transaction_set_root` reproduces the SHAMap root.
+        for count in [1usize, 2, 5, 17, 64] {
+            let mut map = SHAMap::transaction();
+            let mut ids = Vec::new();
+            for i in 0..count {
+                let data = vec![i as u8, (i >> 8) as u8, 0xAB, 0xCD];
+                let prefix = HashPrefix::TRANSACTION_ID.to_bytes();
+                let id = sha512_half(&[&prefix, &data]);
+                map.put(id, data).unwrap();
+                ids.push(id);
+            }
+            assert_eq!(
+                transaction_set_root(&ids),
+                map.root_hash(),
+                "mismatch for {count} txs"
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_set_root_empty_is_zero() {
+        assert_eq!(transaction_set_root(&[]), Hash256::ZERO);
     }
 
     #[test]

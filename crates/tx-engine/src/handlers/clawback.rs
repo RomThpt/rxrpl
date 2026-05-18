@@ -144,7 +144,9 @@ impl Transactor for ClawbackTransactor {
             .update(tl_key, tl_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Increment issuer sequence
+        // Advance the issuer's sequence proxy: consume the Ticket SLE when the
+        // tx uses a TicketSequence, otherwise increment the AccountRoot
+        // Sequence. Mirrors rippled's Transactor::consumeSeqProxy.
         let issuer_acct_key = keylet::account(&issuer_id);
         let issuer_bytes = ctx
             .view
@@ -152,7 +154,22 @@ impl Transactor for ClawbackTransactor {
             .ok_or(TransactionResult::TerNoAccount)?;
         let mut issuer_acct: Value =
             serde_json::from_slice(&issuer_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        helpers::increment_sequence(&mut issuer_acct);
+
+        if let Some(ticket_seq) = helpers::get_u32_field(ctx.tx, "TicketSequence") {
+            let ticket_key = keylet::ticket(&issuer_id, ticket_seq);
+            if !ctx.view.exists(&ticket_key) {
+                return Err(TransactionResult::TefInternal);
+            }
+            crate::owner_dir::remove_from_owner_dir(ctx.view, &issuer_id, &ticket_key)
+                .map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .erase(&ticket_key)
+                .map_err(|_| TransactionResult::TefInternal)?;
+            helpers::adjust_owner_count(&mut issuer_acct, -1);
+        } else {
+            helpers::increment_sequence(&mut issuer_acct);
+        }
+
         let issuer_data =
             serde_json::to_vec(&issuer_acct).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
@@ -287,6 +304,63 @@ mod tests {
         let is_issuer_low = issuer_id.as_bytes() < holder_id.as_bytes();
         let holder_balance = if is_issuer_low { -balance } else { balance };
         assert!((holder_balance - 70.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn clawback_with_ticket_consumes_ticket_not_sequence() {
+        let mut ledger = setup_with_trust_line("100");
+
+        // Give the issuer a Ticket SLE at sequence 5 and an OwnerCount of 1.
+        let issuer_id = decode_account_id(ISSUER).unwrap();
+        let ticket_seq = 5u32;
+        let ticket_key = keylet::ticket(&issuer_id, ticket_seq);
+        let ticket_obj = serde_json::json!({
+            "LedgerEntryType": "Ticket",
+            "Account": ISSUER,
+            "TicketSequence": ticket_seq,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(ticket_key, serde_json::to_vec(&ticket_obj).unwrap())
+            .unwrap();
+
+        let acct_key = keylet::account(&issuer_id);
+        let mut acct: Value = serde_json::from_slice(ledger.get_state(&acct_key).unwrap()).unwrap();
+        acct["OwnerCount"] = Value::from(1u64);
+        ledger
+            .put_state(acct_key, serde_json::to_vec(&acct).unwrap())
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "Clawback",
+            "Account": ISSUER,
+            "Amount": { "currency": "USD", "issuer": HOLDER, "value": "30" },
+            "Fee": "12",
+            "Sequence": 0,
+            "TicketSequence": ticket_seq,
+        });
+
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = ClawbackTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        // Ticket SLE consumed.
+        assert!(!sandbox.exists(&keylet::ticket(&issuer_id, ticket_seq)));
+
+        // Issuer Sequence untouched, OwnerCount decremented.
+        let acct_bytes = sandbox.read(&keylet::account(&issuer_id)).unwrap();
+        let acct: Value = serde_json::from_slice(&acct_bytes).unwrap();
+        assert_eq!(acct["Sequence"].as_u64(), Some(1));
+        assert_eq!(acct["OwnerCount"].as_u64(), Some(0));
     }
 
     #[test]

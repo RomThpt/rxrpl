@@ -2404,7 +2404,7 @@ impl PeerManager {
 
         // Handle tx-set requests (liTS_CANDIDATE) separately.
         if req_ledger_type == LI_TS_CANDIDATE {
-            self.handle_get_tx_set(from, &req_ledger_hash, req_cookie);
+            self.handle_get_tx_set(from, &req_ledger_hash, &req.node_ids, req_cookie);
             return;
         }
 
@@ -2611,7 +2611,20 @@ impl PeerManager {
     }
 
     /// Serve a tx-set request from a peer (GetLedger with itype=liTS_CANDIDATE).
-    fn handle_get_tx_set(&self, from: Hash256, hash_bytes: &[u8], cookie: Option<u32>) {
+    ///
+    /// The candidate set is served as a transaction-no-metadata SHAMap: the
+    /// peer either asks for specific nodes by id (rippled's `TransactionAcquire`
+    /// walks the tree this way) or, with no node ids, gets every leaf. This is
+    /// the same wire encoding `handle_get_ledger` uses for a ledger's tx tree,
+    /// which is what lets a rippled peer acquire and re-apply rxrpl's proposed
+    /// transactions instead of timing the set out.
+    fn handle_get_tx_set(
+        &self,
+        from: Hash256,
+        hash_bytes: &[u8],
+        req_node_ids: &[Vec<u8>],
+        cookie: Option<u32>,
+    ) {
         let set_hash = if hash_bytes.len() >= 32 {
             Hash256::new(hash_bytes[..32].try_into().unwrap_or([0u8; 32]))
         } else {
@@ -2623,17 +2636,9 @@ impl PeerManager {
             .tx_sets
             .as_ref()
             .and_then(|cache| cache.read().unwrap().get(&set_hash).cloned());
-
-        let nodes: Vec<(Vec<u8>, Vec<u8>)> = match tx_set {
-            Some(set) => set
-                .txs
-                .iter()
-                .map(|tx_hash| (tx_hash.as_bytes().to_vec(), Vec::new()))
-                .collect(),
+        let tx_set = match tx_set {
+            Some(set) => set,
             None => {
-                // Match rippled behavior: silently drop the request when the
-                // tx-set is unknown. An empty TMLedgerData would be rejected
-                // by rippled's `nodes_size() <= 0` check.
                 tracing::debug!(
                     "GetLedger liTS_CANDIDATE from {}: tx-set {} not found; dropping",
                     from,
@@ -2642,6 +2647,55 @@ impl PeerManager {
                 return;
             }
         };
+
+        // Materialise the candidate set as a tx-no-metadata SHAMap.
+        let mut map = rxrpl_shamap::SHAMap::transaction();
+        for (id, blob) in &tx_set.blobs {
+            if !blob.is_empty() {
+                let _ = map.put(*id, blob.clone());
+            }
+        }
+        let _ = map.root_hash();
+
+        let mut nodes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let request_node_ids: Vec<ShamapNodeId> = req_node_ids
+            .iter()
+            .filter_map(|id_bytes| {
+                if id_bytes.len() == 33 {
+                    let path: [u8; 32] = id_bytes[..32].try_into().ok()?;
+                    Some(ShamapNodeId::new(id_bytes[32], &Hash256::new(path)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if request_node_ids.is_empty() {
+            // A transaction-no-metadata leaf carries no key on the wire:
+            // rippled recovers the id by hashing the blob. Wire = blob || 0x00.
+            map.for_each(&mut |key, data| {
+                let mut wire = Vec::with_capacity(data.len() + 1);
+                wire.extend_from_slice(data);
+                wire.push(WIRE_TYPE_TX_NO_META);
+                nodes.push((key.as_bytes().to_vec(), wire));
+            });
+        } else {
+            for node_id in &request_node_ids {
+                if let Some((_h, raw)) = map.node_at(*node_id) {
+                    let wire = encode_tx_no_meta_wire_node(&raw);
+                    nodes.push((node_id.to_wire_bytes(), wire));
+                }
+            }
+        }
+
+        if nodes.is_empty() {
+            tracing::debug!(
+                "GetLedger liTS_CANDIDATE from {}: nothing to serve for {}",
+                from,
+                set_hash
+            );
+            return;
+        }
 
         let response =
             proto_convert::encode_ledger_data(&set_hash, 0, LI_TS_CANDIDATE, nodes, cookie);
@@ -2685,9 +2739,10 @@ impl PeerManager {
 
     /// Handle a LedgerData response carrying a tx-set (liTS_CANDIDATE).
     ///
-    /// Each node in the response is a (tx_hash, tx_data) pair.
-    /// Reconstruct the TxSet from the transaction hashes and store it
-    /// in the shared cache, then notify the consensus engine.
+    /// Each leaf node is in rippled tx-no-metadata wire form
+    /// (`tx_blob || tx_id[32] || 0x00`); the transaction id is its key and
+    /// the blob is the canonical transaction. Reconstruct a blob-carrying
+    /// TxSet, store it in the shared cache, and notify the consensus engine.
     fn handle_tx_set_response(&mut self, set_hash: Hash256, nodes: &[(Vec<u8>, Vec<u8>)]) {
         self.pending_tx_set_fetches.remove(&set_hash);
 
@@ -2696,20 +2751,25 @@ impl PeerManager {
             return;
         }
 
-        // Extract transaction hashes from node IDs.
-        let tx_hashes: Vec<Hash256> = nodes
-            .iter()
-            .filter_map(|(id, _data)| {
-                if id.len() >= 32 {
-                    let arr: [u8; 32] = id[..32].try_into().ok()?;
-                    Some(Hash256::new(arr))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Decode leaf nodes: a tx-no-meta leaf is `blob || 0x00`; the
+        // transaction id is recovered by hashing the blob. Inner nodes
+        // (wire ending 0x02) are skipped — the leaves alone fully
+        // determine the candidate set.
+        let mut items: Vec<(Hash256, Vec<u8>)> = Vec::new();
+        for (id, data) in nodes {
+            if data.len() >= 2 && *data.last().unwrap() == WIRE_TYPE_TX_NO_META {
+                let blob = data[..data.len() - 1].to_vec();
+                let prefix = rxrpl_crypto::hash_prefix::HashPrefix::TRANSACTION_ID.to_bytes();
+                let txid = rxrpl_crypto::sha512_half::sha512_half(&[&prefix, &blob]);
+                items.push((txid, blob));
+            } else if id.len() >= 32 && data.is_empty() {
+                // Legacy hash-only entry: id is the tx id, blob unknown.
+                let arr: [u8; 32] = id[..32].try_into().unwrap();
+                items.push((Hash256::new(arr), Vec::new()));
+            }
+        }
 
-        let tx_set = TxSet::new(tx_hashes);
+        let tx_set = TxSet::from_items(items);
 
         // Verify: the computed hash should match what we requested.
         if tx_set.hash != set_hash {
@@ -2862,6 +2922,8 @@ async fn try_accept_inbound(
 const WIRE_TYPE_INNER: u8 = 2;
 const WIRE_TYPE_ACCOUNT_STATE: u8 = 1;
 const WIRE_TYPE_TX_WITH_META: u8 = 4;
+/// Trailing tag for a transaction-no-metadata leaf (consensus candidate set).
+const WIRE_TYPE_TX_NO_META: u8 = 0;
 
 /// Encode a SHAMap node from rxrpl storage form to rippled TMLedgerNode wire form.
 ///
@@ -2877,6 +2939,29 @@ const WIRE_TYPE_TX_WITH_META: u8 = 4;
 ///
 /// `leaf_wire_type` selects the trailing byte for leaves; inner nodes are
 /// always tagged with `WIRE_TYPE_INNER` regardless of the tree.
+/// Encode a candidate-tx-set SHAMap node into rippled wire form.
+///
+/// Inner nodes are `16*32 bytes || 0x02`. A transaction-no-metadata leaf is
+/// `tx_blob || 0x00` — unlike account-state / tx-with-meta leaves it carries
+/// no key, since the transaction id is recoverable by hashing the blob.
+fn encode_tx_no_meta_wire_node(storage: &[u8]) -> Vec<u8> {
+    if storage.len() == 16 * 32 {
+        let mut wire = Vec::with_capacity(storage.len() + 1);
+        wire.extend_from_slice(storage);
+        wire.push(WIRE_TYPE_INNER);
+        wire
+    } else if storage.len() >= 32 {
+        // Leaf storage is `key[32] || data`; the wire form drops the key.
+        let data = &storage[32..];
+        let mut wire = Vec::with_capacity(data.len() + 1);
+        wire.extend_from_slice(data);
+        wire.push(WIRE_TYPE_TX_NO_META);
+        wire
+    } else {
+        storage.to_vec()
+    }
+}
+
 fn encode_shamap_wire_node(storage: &[u8], leaf_wire_type: u8) -> Vec<u8> {
     if storage.len() == 16 * 32 {
         let mut wire = Vec::with_capacity(storage.len() + 1);
@@ -3277,7 +3362,7 @@ mod tests {
         // No tx_sets cache configured -> always miss.
         let unknown_tx_set = Hash256::new([0xCD; 32]);
 
-        mgr.handle_get_tx_set(peer_id, unknown_tx_set.as_bytes(), Some(7));
+        mgr.handle_get_tx_set(peer_id, unknown_tx_set.as_bytes(), &[], Some(7));
 
         match rx.try_recv() {
             Err(mpsc::error::TryRecvError::Empty) => {}

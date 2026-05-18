@@ -195,38 +195,59 @@ impl Validation {
 }
 
 /// A set of transactions proposed for a ledger.
+///
+/// `hash` is the SHAMap root of the transaction-no-metadata tree, computed
+/// exactly as rippled does for an `InboundTransactions` candidate set, so a
+/// rippled peer can agree with the `transaction_hash` rxrpl proposes.
+///
+/// `blobs` carries the canonical binary of each transaction when known. It
+/// is required to *serve* the set to a peer that wants to acquire it, but
+/// not to compute `hash` (a tx-no-meta leaf hashes to its own id, so the
+/// root is determined by the id set alone).
 #[derive(Clone, Debug)]
 pub struct TxSet {
-    /// Hash of this transaction set.
+    /// SHAMap root hash of this transaction set.
     pub hash: Hash256,
-    /// Transaction hashes in this set.
+    /// Transaction ids in this set, sorted ascending.
     pub txs: Vec<Hash256>,
+    /// Canonical transaction binary keyed by id. May be empty/partial when
+    /// the set is known only by id (e.g. rebuilt from a peer proposal).
+    pub blobs: HashMap<Hash256, Vec<u8>>,
 }
 
 impl TxSet {
+    /// Build a set from transaction ids alone (no blobs).
+    ///
+    /// The empty set hashes to `Hash256::ZERO`, matching rippled's
+    /// `transaction_hash` for an empty ProposeSet.
     pub fn new(txs: Vec<Hash256>) -> Self {
-        // Compute hash from sorted tx hashes.
-        //
-        // Empty tx set: rippled uses the canonical empty-SHAMap root hash
-        // `Hash256::ZERO` (32 zero bytes) for `transaction_hash` in
-        // ProposeSet messages with no transactions. Using `sha512_half(&[])`
-        // here would produce `CF83E135…` (SHA-512-half of the empty input),
-        // which makes our empty-round proposals never agree with rippled's
-        // and stalls mixed-validator consensus (issue #76 follow-up).
-        let mut sorted = txs.clone();
+        let mut sorted = txs;
         sorted.sort();
-        if sorted.is_empty() {
-            return Self {
-                hash: Hash256::ZERO,
-                txs: sorted,
-            };
+        sorted.dedup();
+        let hash = rxrpl_shamap::transaction_set_root(&sorted);
+        Self {
+            hash,
+            txs: sorted,
+            blobs: HashMap::new(),
         }
-        let mut data = Vec::with_capacity(sorted.len() * 32);
-        for tx in &sorted {
-            data.extend_from_slice(tx.as_bytes());
+    }
+
+    /// Build a set from `(tx_id, canonical_blob)` pairs.
+    pub fn from_items(items: Vec<(Hash256, Vec<u8>)>) -> Self {
+        let mut sorted: Vec<Hash256> = items.iter().map(|(h, _)| *h).collect();
+        sorted.sort();
+        sorted.dedup();
+        let hash = rxrpl_shamap::transaction_set_root(&sorted);
+        Self {
+            hash,
+            txs: sorted,
+            blobs: items.into_iter().collect(),
         }
-        let hash = rxrpl_crypto::sha512_half::sha512_half(&[&data]);
-        Self { hash, txs: sorted }
+    }
+
+    /// Canonical blob for a transaction id, if carried by this set.
+    pub fn blob(&self, id: &Hash256) -> Option<&[u8]> {
+        self.blobs.get(id).map(|v| v.as_slice())
     }
 
     pub fn len(&self) -> usize {

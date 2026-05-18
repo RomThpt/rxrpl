@@ -190,6 +190,11 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     /// A node never receives its own proposal as a peer, so without
     /// counting itself a validator is permanently one short of quorum.
     self_trusted: bool,
+    /// Canonical transaction blobs seen this round, keyed by tx id. Absorbed
+    /// from `our_set` at close and from every peer set acquired during
+    /// dispute resolution, so a set rebuilt after dispute resolution still
+    /// carries the blobs needed to serve it to an acquiring peer.
+    tx_blobs: HashMap<Hash256, Vec<u8>>,
 }
 
 /// Maximum number of distinct `prev_ledger` hashes held in
@@ -264,6 +269,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             establish_started_at: None,
             last_round_advance: None,
             self_trusted: false,
+            tx_blobs: HashMap::new(),
         }
     }
 
@@ -761,6 +767,15 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
 
         self.adapter.propose(&proposal);
         self.our_position = Some(proposal);
+        // Absorb our own transaction blobs so a set rebuilt after dispute
+        // resolution can still be served to an acquiring peer.
+        self.tx_blobs.clear();
+        for (id, blob) in &our_set.blobs {
+            self.tx_blobs.insert(*id, blob.clone());
+        }
+        // Publish the candidate set so a peer that receives our ProposeSet
+        // can acquire it (the cache is what `handle_get_tx_set` serves from).
+        self.adapter.publish_tx_set(&our_set);
         self.our_set = Some(our_set);
         self.phase = ConsensusPhase::Establish;
         let now = Instant::now();
@@ -983,6 +998,14 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
                 Some(s) => s,
                 None => continue,
             };
+
+            // Absorb the peer set's blobs so a dispute that pulls one of
+            // its transactions into our set can still be served onward.
+            for (id, blob) in &peer_set.blobs {
+                if !blob.is_empty() {
+                    self.tx_blobs.entry(*id).or_insert_with(|| blob.clone());
+                }
+            }
 
             // Find txs in our set but not peer's
             for tx_hash in &our_set.txs {
@@ -1252,10 +1275,20 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             }
 
             if set_changed {
-                *our_set = TxSet::new(new_txs);
+                // Rebuild from blobs so the new set can still be served.
+                let items: Vec<(Hash256, Vec<u8>)> = new_txs
+                    .iter()
+                    .map(|id| {
+                        let blob = self.tx_blobs.get(id).cloned().unwrap_or_default();
+                        (*id, blob)
+                    })
+                    .collect();
+                *our_set = TxSet::from_items(items);
                 if let Some(ref mut pos) = self.our_position {
                     pos.tx_set_hash = our_set.hash;
                     pos.prop_seq += 1;
+                    // Re-publish the rebuilt set so peers can acquire it.
+                    self.adapter.publish_tx_set(our_set);
                     self.adapter.share_position(pos);
                     self.last_share_at = Some(Instant::now());
                 }

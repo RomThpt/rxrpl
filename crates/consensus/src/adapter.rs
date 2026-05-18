@@ -19,6 +19,13 @@ pub trait ConsensusAdapter: Send + Sync {
     /// Acquire a transaction set from the network.
     fn acquire_tx_set(&self, hash: &Hash256) -> Option<TxSet>;
 
+    /// Publish our candidate transaction set so peers can acquire it.
+    ///
+    /// Called when we adopt a set as our consensus position (at close and
+    /// after dispute-driven rebuilds). Distinct from [`Self::on_close`]: it
+    /// only makes the set retrievable, with no network-visible side effect.
+    fn publish_tx_set(&self, _tx_set: &TxSet) {}
+
     /// Called when the ledger is closed.
     fn on_close(&self, ledger_hash: &Hash256, ledger_seq: u32, close_time: u32, tx_set: &TxSet);
 
