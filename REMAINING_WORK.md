@@ -144,12 +144,29 @@ des ledgers **vides**) :
 Le résidu n'est PAS le tx-set (corrigé, voir section « Cause racine »).
 C'est un problème de **cadence de consensus** : rxrpl ferme sur un timer
 fixe rapide au lieu de fermer quand le consensus converge avec les pairs.
-Correctif spec (A) : différer le close local quand un proposal de pair
-indique une chaîne plus avancée (au plus un round, puis fallback catchup).
-Chantier structurel risqué — la cadence « always-active proposer » a été
-choisie volontairement (`node.rs:1520`, issue #76) ; un deferral naïf
-avait rendu rxrpl passif. À implémenter incrémentalement avec
-vérification hive à chaque étape.
+
+Progrès 2026-05-18 :
+
+- Diagnostic field-by-field ajouté au point de catchup (`node.rs`,
+  `catchup: ... diverges from peer parent`). Il révèle le champ exact
+  qui diverge : sur un ledger vide c'est le **`close_time`** (ex.
+  `832428390` vs `832428400` — un bucket de résolution d'écart).
+- `converge()` exige désormais l'accord sur le **bucket de close_time**
+  en plus du `tx_set_hash` (mode UNL). Avant, deux ledgers vides
+  matchaient instantanément sur `tx_set_hash == ZERO` et rxrpl fermait
+  avec son propre close_time non convergé. 236 tests consensus verts.
+- Ce correctif est correct mais **ne suffit pas** : le soak `rxrpl,rippled`
+  diverge toujours au ledger #5. Couches résiduelles : la dérive
+  `effCloseTime` se propage le long de la chaîne (le `close_time` d'un
+  `#N` divergent fausse le `prior` du `#N+1`), et il subsiste une
+  divergence `tx_hash`/`account_hash` sur les ledgers à transactions
+  (ex. `#13`).
+
+Reste à faire (spec A) : différer le close local quand un proposal de
+pair indique une chaîne plus avancée (au plus un round, puis fallback
+catchup) — la cadence « always-active proposer » a été choisie
+volontairement (`node.rs:1520`, issue #76), un deferral naïf avait rendu
+rxrpl passif. À implémenter incrémentalement avec vérification hive.
 
 ## Hors repo rxrpl
 

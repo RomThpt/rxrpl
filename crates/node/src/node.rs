@@ -2187,6 +2187,37 @@ impl Node {
                                     match Node::try_reconstruct_ledger(seq, hash, &nodes, &node_store, cached) {
                                         Ok(reconstructed) => {
                                             let mut history = closed_ledgers.write().await;
+                                            // Diagnostic: a reconstructed peer ledger #N carries
+                                            // the peer's #(N-1) hash + close_time as its parent_*
+                                            // fields. If we locally closed #(N-1) to a different
+                                            // hash, log which header field diverged so the
+                                            // cross-impl close mismatch can be pinpointed.
+                                            if let Some(local_parent) = history
+                                                .iter()
+                                                .find(|l| l.header.sequence + 1 == seq)
+                                            {
+                                                let lp = &local_parent.header;
+                                                if lp.hash != reconstructed.header.parent_hash {
+                                                    let ct_note = if lp.close_time
+                                                        != reconstructed.header.parent_close_time
+                                                    {
+                                                        format!(
+                                                            "close_time {} vs {}",
+                                                            lp.close_time,
+                                                            reconstructed.header.parent_close_time
+                                                        )
+                                                    } else {
+                                                        "close_time identical (divergence in tx_hash/account_hash/flags)".to_string()
+                                                    };
+                                                    tracing::warn!(
+                                                        "catchup: local #{} {} diverges from peer parent {}; {}",
+                                                        lp.sequence,
+                                                        lp.hash,
+                                                        reconstructed.header.parent_hash,
+                                                        ct_note
+                                                    );
+                                                }
+                                            }
                                             // REPLACE on hash mismatch: if we already have a
                                             // locally-closed ledger at this seq with a different
                                             // hash, the catchup-reconstructed copy is canonical
@@ -2204,6 +2235,38 @@ impl Node {
                                                         seq,
                                                         history[existing_idx].header.hash,
                                                         reconstructed.header.hash,
+                                                    );
+                                                    let lo = &history[existing_idx].header;
+                                                    let hi = &reconstructed.header;
+                                                    let mut diff: Vec<String> = Vec::new();
+                                                    if lo.parent_hash != hi.parent_hash {
+                                                        diff.push(format!("parent_hash {} vs {}", lo.parent_hash, hi.parent_hash));
+                                                    }
+                                                    if lo.tx_hash != hi.tx_hash {
+                                                        diff.push(format!("tx_hash {} vs {}", lo.tx_hash, hi.tx_hash));
+                                                    }
+                                                    if lo.account_hash != hi.account_hash {
+                                                        diff.push(format!("account_hash {} vs {}", lo.account_hash, hi.account_hash));
+                                                    }
+                                                    if lo.drops != hi.drops {
+                                                        diff.push(format!("drops {} vs {}", lo.drops, hi.drops));
+                                                    }
+                                                    if lo.parent_close_time != hi.parent_close_time {
+                                                        diff.push(format!("parent_close_time {} vs {}", lo.parent_close_time, hi.parent_close_time));
+                                                    }
+                                                    if lo.close_time != hi.close_time {
+                                                        diff.push(format!("close_time {} vs {}", lo.close_time, hi.close_time));
+                                                    }
+                                                    if lo.close_time_resolution != hi.close_time_resolution {
+                                                        diff.push(format!("close_time_resolution {} vs {}", lo.close_time_resolution, hi.close_time_resolution));
+                                                    }
+                                                    if lo.close_flags != hi.close_flags {
+                                                        diff.push(format!("close_flags {} vs {}", lo.close_flags, hi.close_flags));
+                                                    }
+                                                    tracing::warn!(
+                                                        "catchup: header divergence #{} fields: [{}]",
+                                                        seq,
+                                                        diff.join("; ")
                                                     );
                                                     history[existing_idx] = reconstructed.clone();
                                                 } else {
