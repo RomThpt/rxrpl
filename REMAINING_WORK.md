@@ -173,20 +173,33 @@ Progrès 2026-05-19 — **deferral de close persistant** :
   fermés en local par rxrpl == #5/#9 de rippled. Le mécanisme de
   convergence fonctionne ; les chaînes coïncident.
 
-Résidu (2 bugs ciblés, le test échoue encore) :
+Progrès 2026-05-19 (2) :
 
-1. **close_time d'un round futur.** Quand rxrpl est en retard, le close
-   au niveau nœud (`node.rs:1505`) prend `consensus.latest_peer_close_time()`
-   — la close_time la plus récente *tous rounds confondus*, donc celle
-   d'un ledger futur de rippled. rxrpl ferme alors `#N` avec une close_time
-   10 s+ trop tard. Fix : fermer avec la close_time convergée du round
-   courant (`accepted_close_time` du moteur), pas l'heuristique nœud ;
-   ou ne pas fermer du tout quand on est en retard (catchup).
-2. **account_hash/tx_hash sur ledgers à transactions** (#8, #12 : close_time
-   identique mais hash différent). Divergence d'application ou de tx-set.
+- `effective_close_time` retourne `(close_time, consensus_atteint)`. Sans
+  majorité stricte de bucket, rxrpl ferme à `parent_close_time + 1` (la
+  règle « pas d'opinion » de `effCloseTime` de rippled) au lieu de tie-break
+  vers le bucket le plus tard — qui forkait le hash chaque round. Le flag
+  `accepted_close_flags` dérive du même calcul (cohérence flag/temps).
+- `node.rs` : rxrpl diffère le close quand un pair de confiance a déjà
+  proposé une seq au-delà de la sienne (`latest_peer_ledger_seq`), pour ne
+  pas fermer `#N` en solo avec une close_time de round futur.
+- 1900+ tests workspace verts.
 
-Reste aussi : la vitesse — rxrpl atteint #10 ~au buzzer des 120 s du test
-(cycles defer→catchup trop longs).
+Résidu (le test échoue encore — divergence **intermittente**) :
+
+- rxrpl et rippled n'ont pas toujours la même *vue* d'un round : selon le
+  timing, rxrpl voit « pas de consensus close-time » (→ `parent+1`) là où
+  rippled a atteint un accord de bucket. Quand leurs rounds se chevauchent
+  bien, rxrpl ferme des ledgers **byte-identiques** (vérifié) ; sinon ils
+  divergent d'un bucket. C'est un problème de **synchronisation de round**
+  cross-impl, pas un champ de header isolé.
+- `account_hash`/`tx_hash` sur ledgers à transactions (#8, #12) restent à
+  traiter.
+- Vitesse : rxrpl atteint #10 ~au buzzer des 120 s.
+
+Le vrai correctif restant : garantir que rxrpl et rippled co-exécutent le
+*même* round de consensus (mêmes proposals échangés dans la même fenêtre
+Establish). Travail de synchronisation structurelle, multi-itérations.
 
 ## Hors repo rxrpl
 

@@ -1497,6 +1497,26 @@ impl Node {
                                     let deferred_for = close_defer_start
                                         .map(|t| t.elapsed())
                                         .unwrap_or_default();
+                                    // If a trusted peer has already proposed a ledger past
+                                    // our open seq, rxrpl is behind: closing #N solo here
+                                    // would pick a future-round `latest_peer_close_time`
+                                    // and diverge. Defer unconditionally — the catchup path
+                                    // adopts #N from the peer and advances our seq.
+                                    let peer_ahead = have_unl_peers_for_loop
+                                        && consensus
+                                            .latest_peer_ledger_seq()
+                                            .is_some_and(|s| s > seq);
+                                    if peer_ahead {
+                                        tracing::debug!(
+                                            target: "consensus",
+                                            seq,
+                                            "deferring close: peer is ahead, awaiting catchup adopt"
+                                        );
+                                        timer.on_phase_change(
+                                            rxrpl_consensus::ConsensusPhase::Open,
+                                        );
+                                        continue;
+                                    }
                                     if have_unl_peers_for_loop
                                         && !have_fresh_peer_ct
                                         && deferred_for < CLOSE_DEFER_MAX
