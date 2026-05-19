@@ -91,6 +91,12 @@ pub struct ConsensusEngine<A: ConsensusAdapter> {
     /// each other on the close-timer wall-clock and produce divergent
     /// close_time → divergent ledger hashes for the same content.
     latest_peer_close_time: Option<u32>,
+    /// `ledger_seq` of the most recent peer proposal, regardless of round.
+    /// Lets the node layer tell "the peer proposed our current round" from
+    /// "the peer is already on a later ledger" — the latter means rxrpl is
+    /// behind and must catch up, not close `#N` solo with a future-round
+    /// `latest_peer_close_time`.
+    latest_peer_ledger_seq: Option<u32>,
     /// Close flags (1 = peers disagree on close time).
     accepted_close_flags: u8,
     /// Accepted validation after consensus.
@@ -251,6 +257,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             public_key,
             accepted_close_time: None,
             latest_peer_close_time: None,
+            latest_peer_ledger_seq: None,
             accepted_close_flags: 0,
             accepted_validation: None,
             unl,
@@ -447,6 +454,13 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
     /// with `rounded_close_time` which requires our_position to exist).
     pub fn latest_peer_close_time(&self) -> Option<u32> {
         self.latest_peer_close_time
+    }
+
+    /// `ledger_seq` of the most recent peer proposal seen this engine's
+    /// lifetime. The node layer compares it against its own open seq to
+    /// detect that it is behind the network.
+    pub fn latest_peer_ledger_seq(&self) -> Option<u32> {
+        self.latest_peer_ledger_seq
     }
 
     /// Get the current previous ledger hash.
@@ -859,6 +873,12 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         if proposal.close_time > 0 {
             self.latest_peer_close_time = Some(proposal.close_time);
         }
+        if proposal.ledger_seq > 0 {
+            self.latest_peer_ledger_seq = Some(
+                self.latest_peer_ledger_seq
+                    .map_or(proposal.ledger_seq, |s| s.max(proposal.ledger_seq)),
+            );
+        }
         if self.phase != ConsensusPhase::Establish {
             // Apply UNL + freshness gates BEFORE buffering to prevent
             // pre-Establish memory amplification (audit pass 2 C2). Without
@@ -1050,16 +1070,19 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
     /// This differs from a plain median: when peers and self have very
     /// different times, the most-popular *bucket* (not the median) is
     /// chosen, which is what rippled does for cross-validator agreement.
-    fn effective_close_time(&self) -> u32 {
+    /// Returns `(close_time, had_close_time_consensus)`. When there is no
+    /// consensus the close_time is the rippled "no opinion" value
+    /// (`parentCloseTime + 1`) and the bool is `false`.
+    fn effective_close_time(&self) -> (u32, bool) {
         let our_time = match &self.our_position {
             Some(p) => p.close_time,
-            None => return 0,
+            None => return (0, true),
         };
         let resolution = self.adaptive_close_time.resolution();
         let prior = self.prior_close_time;
 
         if self.peer_positions.is_empty() {
-            return eff_close_time(our_time, resolution, prior);
+            return (eff_close_time(our_time, resolution, prior), true);
         }
 
         // Tally votes per rounded close-time bucket.
@@ -1099,7 +1122,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         // No surviving votes (everyone was filtered out): fall back to
         // the solo path so we still emit a monotonic close_time.
         if votes.is_empty() {
-            return eff_close_time(our_time, resolution, prior);
+            return (eff_close_time(our_time, resolution, prior), true);
         }
 
         // Pick the bucket with the most votes. On ties, pick the LATER
@@ -1115,10 +1138,25 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
                 best_count = *count;
             }
         }
+        // No strict majority for any bucket (e.g. a 1-1 split between rxrpl
+        // and rippled one resolution apart): there is no close-time
+        // consensus. rippled's `effCloseTime` then closes at
+        // `parentCloseTime + 1` (a 0/"no opinion" close time). Match that
+        // exactly — both implementations compute `prior + 1` deterministically
+        // — instead of biasing to the "later" bucket, which rippled would not
+        // pick and which therefore forks the ledger hash every round.
+        //
+        // The denominator is the number of *surviving* votes, not every
+        // peer: a filtered-out garbage vote (H11) must not dilute an
+        // otherwise-unanimous honest cohort into a false "no consensus".
+        let surviving_votes: u32 = votes.values().sum();
+        if best_count * 2 <= surviving_votes {
+            return (eff_close_time(0, resolution, prior), false);
+        }
         // Apply eff_close_time only to the FINAL winning bucket so the
         // monotonicity guarantee (close_time > prior) still holds for
         // the accepted ledger.
-        eff_close_time(best_bucket, resolution, prior)
+        (eff_close_time(best_bucket, resolution, prior), true)
     }
 
     /// Update `our_position.close_time` to match the consensus winner
@@ -1452,35 +1490,14 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
     fn accept(&mut self) {
         self.phase = ConsensusPhase::Accepted;
 
-        // Compute effective close time
-        let close_time = self.effective_close_time();
+        // Compute effective close time. `agreed` is whether a close-time
+        // consensus bucket was reached: it drives both the no-consensus
+        // close flag and `previous_close_agreed` (→ next round's resolution
+        // cadence). Deriving it from the same tally that picks `close_time`
+        // keeps the flag and the time consistent — a flag that disagreed
+        // with the time would itself fork the ledger hash cross-impl.
+        let (close_time, agreed) = self.effective_close_time();
         self.accepted_close_time = Some(close_time);
-
-        // Check whether peers agreed on close time.  The result is
-        // recorded on `previous_close_agreed` and consumed by the next
-        // `start_round`, which feeds it into `next_resolution` to pick
-        // the bin for the upcoming ledger.  This replaces the legacy
-        // `AdaptiveCloseTime::on_agreement` / `on_disagreement`
-        // pathway (deprecated in T03).
-        let current_resolution = self.adaptive_close_time.resolution();
-        let agreed = if self.peer_positions.is_empty() {
-            // Solo mode: no peers to disagree with, treat as agreement
-            // so the cadence keeps pushing toward finer bins.
-            true
-        } else {
-            let our_time = self
-                .our_position
-                .as_ref()
-                .map(|p| p.close_time)
-                .unwrap_or(0);
-            let mut times: Vec<u32> = vec![our_time];
-            for peer in self.peer_positions.values() {
-                times.push(peer.close_time);
-            }
-            let min = *times.iter().min().unwrap();
-            let max = *times.iter().max().unwrap();
-            max - min <= current_resolution
-        };
         if !agreed {
             self.accepted_close_flags = 1;
         }
@@ -1911,10 +1928,17 @@ mod tests {
         );
 
         assert!(engine.converge());
-        // Vote-counting: each of {100→90, 150→150, 200→210} has 1 vote.
-        // Tiebreak picks the LATEST bucket (210) deterministically so two
-        // validators making the same tally agree on the same winner.
-        assert_eq!(engine.accepted_close_time(), Some(210));
+        // Vote-counting: {100→90, 150→150, 200→210} each have 1 vote — a
+        // three-way split with no strict majority, i.e. no close-time
+        // consensus. rippled's effCloseTime then closes at the "no opinion"
+        // time (parentCloseTime + 1), computed identically by every node.
+        // (rxrpl previously tie-broke to the latest bucket — a non-rippled
+        // behavior that forked the ledger hash cross-impl.)
+        let res = engine.adaptive_close_time().resolution();
+        assert_eq!(
+            engine.accepted_close_time(),
+            Some(eff_close_time(0, res, 0))
+        );
     }
 
     #[test]
@@ -3110,7 +3134,7 @@ mod tests {
             },
         );
 
-        let ct = engine.effective_close_time();
+        let (ct, _) = engine.effective_close_time();
         // The accepted close_time MUST come from our honest fresh vote
         // (rounded to the 30s bucket), then clamped to >= prior + 1.
         // It MUST NOT collapse to the floor bucket (prior + 1) by way
