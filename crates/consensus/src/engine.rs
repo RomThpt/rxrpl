@@ -1326,6 +1326,26 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             None => return false,
         };
 
+        // A peer agrees with us only when it shares BOTH our transaction set
+        // AND our close-time bucket. Checking the tx-set alone lets two empty
+        // ledgers (tx_set_hash == ZERO) reach quorum instantly, so rxrpl would
+        // accept and close with its own un-converged close_time — diverging
+        // from a peer that rounds to a different bucket. Requiring the bucket
+        // match holds the round open until `align_close_time_with_peers` (run
+        // at the top of this method) has pulled our close_time onto the
+        // peer-popular bucket. Only enforced in UNL mode; solo/unit-test paths
+        // (empty UNL) keep the tx-set-only predicate.
+        let resolution = self.adaptive_close_time.resolution();
+        let our_ct_bucket = self
+            .our_position
+            .as_ref()
+            .map(|p| round_close_time(p.close_time, resolution))
+            .unwrap_or(0);
+        let agrees = |p: &Proposal| -> bool {
+            p.tx_set_hash == our_hash
+                && round_close_time(p.close_time, resolution) == our_ct_bucket
+        };
+
         if self.unl.is_empty() {
             // Solo mode: percentage-based agreement (original logic)
             let total = self.peer_positions.len() + 1; // +1 for us
@@ -1353,11 +1373,12 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
                 return true;
             }
         } else {
-            // UNL mode: count only trusted members who agree
+            // UNL mode: count only trusted members who agree on our set
+            // AND our close-time bucket.
             let agreeing_unl = self
                 .peer_positions
                 .values()
-                .filter(|p| self.unl.is_trusted(&p.node_id) && p.tx_set_hash == our_hash)
+                .filter(|p| self.unl.is_trusted(&p.node_id) && agrees(p))
                 .count();
             // Self-trust check. A node never receives its own proposal as a
             // peer, so it must count itself toward quorum or it is forever
