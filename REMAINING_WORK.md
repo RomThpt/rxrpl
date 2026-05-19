@@ -162,11 +162,31 @@ Progrès 2026-05-18 :
   divergence `tx_hash`/`account_hash` sur les ledgers à transactions
   (ex. `#13`).
 
-Reste à faire (spec A) : différer le close local quand un proposal de
-pair indique une chaîne plus avancée (au plus un round, puis fallback
-catchup) — la cadence « always-active proposer » a été choisie
-volontairement (`node.rs:1520`, issue #76), un deferral naïf avait rendu
-rxrpl passif. À implémenter incrémentalement avec vérification hive.
+Progrès 2026-05-19 — **deferral de close persistant** :
+
+- Le close local est désormais différé chaque round (jusqu'à 25 s) tant
+  qu'aucun pair de confiance n'a proposé de close_time pour la seq
+  courante (`node.rs`, `CLOSE_DEFER_MAX`). Avant, le deferral était borné
+  par `first_close_grace` (relatif au démarrage) donc inactif en régime.
+- **Résultat vérifié** (`consensus --client rxrpl,rippled`) : rxrpl ferme
+  maintenant des ledgers **byte-identiques à rippled** — ex. #5 et #9
+  fermés en local par rxrpl == #5/#9 de rippled. Le mécanisme de
+  convergence fonctionne ; les chaînes coïncident.
+
+Résidu (2 bugs ciblés, le test échoue encore) :
+
+1. **close_time d'un round futur.** Quand rxrpl est en retard, le close
+   au niveau nœud (`node.rs:1505`) prend `consensus.latest_peer_close_time()`
+   — la close_time la plus récente *tous rounds confondus*, donc celle
+   d'un ledger futur de rippled. rxrpl ferme alors `#N` avec une close_time
+   10 s+ trop tard. Fix : fermer avec la close_time convergée du round
+   courant (`accepted_close_time` du moteur), pas l'heuristique nœud ;
+   ou ne pas fermer du tout quand on est en retard (catchup).
+2. **account_hash/tx_hash sur ledgers à transactions** (#8, #12 : close_time
+   identique mais hash différent). Divergence d'application ou de tx-set.
+
+Reste aussi : la vitesse — rxrpl atteint #10 ~au buzzer des 120 s du test
+(cycles defer→catchup trop longs).
 
 ## Hors repo rxrpl
 

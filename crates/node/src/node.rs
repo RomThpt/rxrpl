@@ -1315,6 +1315,14 @@ impl Node {
             // proposer for mixed-validator support).
             let mut last_peer_status_at: Option<tokio::time::Instant> = None;
             let mut last_round_seq: u32 = 0;
+            // Per-round close deferral: while a trusted peer is present but
+            // has not yet proposed a close_time for the current seq, hold the
+            // local close so rxrpl can adopt the peer's ledger (or close with
+            // the peer's close_time bucket) instead of closing solo and
+            // diverging. Tracked per seq and bounded by CLOSE_DEFER_MAX so a
+            // dead peer never hangs consensus.
+            let mut close_defer_seq: u32 = 0;
+            let mut close_defer_start: Option<tokio::time::Instant> = None;
             // Cache of LedgerHeader objects parsed from peer liBASE responses.
             // We need the full header (parent_hash, parent_close_time,
             // close_time, drops, close_time_resolution, close_flags) when
@@ -1472,14 +1480,32 @@ impl Node {
                                         .latest_peer_close_time()
                                         .map(|ct| ct > parent_close_time)
                                         .unwrap_or(false);
+                                    // Persistent per-round deferral. Each round, hold the
+                                    // local close until a trusted peer has proposed a
+                                    // close_time for THIS seq — then rxrpl closes in the
+                                    // peer's bucket (or has already adopted the peer's
+                                    // ledger via catchup). Bounded by CLOSE_DEFER_MAX: a
+                                    // silent/dead peer still lets rxrpl close solo rather
+                                    // than hang. This replaces the startup-only deferral
+                                    // that stopped firing after first_close_grace and let
+                                    // rxrpl close every steady-state ledger solo.
+                                    const CLOSE_DEFER_MAX: Duration = Duration::from_secs(25);
+                                    if close_defer_seq != seq {
+                                        close_defer_seq = seq;
+                                        close_defer_start = Some(tokio::time::Instant::now());
+                                    }
+                                    let deferred_for = close_defer_start
+                                        .map(|t| t.elapsed())
+                                        .unwrap_or_default();
                                     if have_unl_peers_for_loop
                                         && !have_fresh_peer_ct
-                                        && startup_instant.elapsed() < first_close_grace
+                                        && deferred_for < CLOSE_DEFER_MAX
                                     {
                                         tracing::debug!(
                                             target: "consensus",
-                                            elapsed_s = startup_instant.elapsed().as_secs(),
-                                            "deferring close: no fresh peer ProposeSet for this round (close_time would drift out of rippled's bucket)"
+                                            seq,
+                                            deferred_s = deferred_for.as_secs(),
+                                            "deferring close: awaiting peer ProposeSet for this round"
                                         );
                                         timer.on_phase_change(
                                             rxrpl_consensus::ConsensusPhase::Open,
