@@ -1538,24 +1538,28 @@ impl Node {
                                         round_started_at = Some(tokio::time::Instant::now());
                                     }
 
-                                    // Cross-impl close_time selection priority:
-                                    // 1) Latest observed peer close_time (rippled's CTime) — adopt
-                                    //    the peer's close_time bucket so we land in the same window.
-                                    // 2) Otherwise floor wall-clock to resolution grid (solo close).
+                                    // Propose our own wall-clock floored to the resolution
+                                    // grid. Using `latest_peer_close_time` here was a
+                                    // cross-impl footgun: that value spans ALL rounds, so
+                                    // when rxrpl is even slightly behind it carries
+                                    // rippled's close_time for a *future* ledger — already
+                                    // 10s+ past this round's bucket — and forks the hash
+                                    // every round. The engine's `align_close_time_with_peers`
+                                    // (inside `converge()`) handles within-round bucket
+                                    // alignment from the peer's current-round proposal; and
+                                    // the no-consensus fallback in `effective_close_time`
+                                    // (→ `parent + 1` without a strict majority) keeps a
+                                    // 1-bucket split converging byte-for-byte cross-impl.
                                     let resolution = consensus.close_time_resolution();
                                     let raw_close_time = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs()
-                                        .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
-                                    let close_time = match consensus.latest_peer_close_time() {
-                                        Some(peer_ct) if peer_ct > parent_close_time => peer_ct,
-                                        _ => {
-                                            match raw_close_time.checked_div(resolution) {
-                                                Some(q) => q * resolution,
-                                                None => raw_close_time,
-                                            }
-                                        }
+                                        .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET)
+                                        as u32;
+                                    let close_time = match raw_close_time.checked_div(resolution) {
+                                        Some(q) => q * resolution,
+                                        None => raw_close_time,
                                     }
                                     .max(parent_close_time.saturating_add(1));
 
@@ -2662,14 +2666,14 @@ impl Node {
         let mut l = ledger.write().await;
         let parent_close_time = l.header.parent_close_time;
         let resolution = consensus.adaptive_close_time().resolution();
+        // Prefer the engine's converged value; the `latest_peer_close_time`
+        // fallback was a cross-impl footgun — it picked the peer's close_time
+        // from any round, including future ones, when rxrpl was behind. Fall
+        // back to rippled's no-consensus value (`eff_close_time(0,...)` =
+        // `parent + 1`) instead so the final close stays deterministic.
         let raw_close_time = consensus
             .accepted_close_time()
             .or_else(|| consensus.rounded_close_time())
-            // Cross-impl bridge: any peer proposal we've seen (even from a
-            // different round) reveals the peer's close_time bucket. Adopt
-            // it so two nodes whose close timers fire ~1s apart still land
-            // in the same close_time and produce identical ledger hashes.
-            .or_else(|| consensus.latest_peer_close_time())
             .unwrap_or_else(|| rxrpl_consensus::round_close_time(pending_close_time, resolution));
         // Clamp `close_time > parent_close_time` to mirror rippled's
         // `effCloseTime` (xrpld/consensus/LedgerTiming.h). Without this,
