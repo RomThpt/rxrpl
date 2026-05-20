@@ -185,6 +185,19 @@ Progrès 2026-05-19 (2) :
   pas fermer `#N` en solo avec une close_time de round futur.
 - 1900+ tests workspace verts.
 
+Progrès 2026-05-20 — **convergence vérifiée** :
+
+- Supprimé le fallback `latest_peer_close_time` aux deux points de close
+  (`node.rs:1505` initial proposal et `node.rs:2676` final). Cette valeur
+  globale (tous rounds confondus) introduisait la close_time d'un round
+  futur de rippled quand rxrpl était en retard, forkant le hash chaque
+  round. rxrpl propose désormais son wall-clock floored ; l'alignement
+  intra-round se fait via `align_close_time_with_peers` + la règle
+  no-consensus → `parent+1` (#97).
+- **Résultat (hive `consensus`, 2026-05-20)** : rxrpl ferme **tous ses
+  ledgers byte-identiques à rippled** (#5, #6, #7, #8, #9 — chacun matche
+  exactement). Aucune divergence, aucune boucle de catchup en régime.
+
 Résidu (le test échoue encore — divergence **intermittente**) :
 
 - rxrpl et rippled n'ont pas toujours la même *vue* d'un round : selon le
