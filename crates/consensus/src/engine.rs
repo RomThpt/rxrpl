@@ -1380,8 +1380,7 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
             .map(|p| round_close_time(p.close_time, resolution))
             .unwrap_or(0);
         let agrees = |p: &Proposal| -> bool {
-            p.tx_set_hash == our_hash
-                && round_close_time(p.close_time, resolution) == our_ct_bucket
+            p.tx_set_hash == our_hash && round_close_time(p.close_time, resolution) == our_ct_bucket
         };
 
         if self.unl.is_empty() {
