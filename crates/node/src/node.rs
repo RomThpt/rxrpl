@@ -2354,9 +2354,19 @@ impl Node {
                                             // request would be `pop_front`-evicted on
                                             // insert anyway.
                                             if seq > 1 {
-                                                let have_parent = history
-                                                    .iter()
-                                                    .any(|l| l.header.sequence == seq - 1);
+                                                // A locally-closed ledger at seq-1 whose hash does
+                                                // not match the reconstructed child's parent_hash
+                                                // is a DIVERGENT parent — we must still request the
+                                                // peer's seq-1 so the catchup replace branch
+                                                // (canonical replacement + field-by-field diag)
+                                                // runs. Without this, a diverged local close
+                                                // silently stays in `closed_ledgers` and the
+                                                // skip-list / RPC return the wrong hash.
+                                                let parent_hash = reconstructed.header.parent_hash;
+                                                let have_parent = history.iter().any(|l| {
+                                                    l.header.sequence == seq - 1
+                                                        && l.header.hash == parent_hash
+                                                });
                                                 let tip_seq = history
                                                     .iter()
                                                     .next_back()
@@ -2365,7 +2375,6 @@ impl Node {
                                                 let within_window = tip_seq.saturating_sub(seq - 1)
                                                     < crate::consensus_adapter::MAX_CLOSED_LEDGERS
                                                         as u32;
-                                                let parent_hash = reconstructed.header.parent_hash;
                                                 if !have_parent
                                                     && within_window
                                                     && parent_hash != Hash256::ZERO
