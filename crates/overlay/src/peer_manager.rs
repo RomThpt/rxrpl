@@ -2569,15 +2569,19 @@ impl PeerManager {
             }
         } else {
             // Full sync fallback: serve all leaf nodes in rippled wire format
-            // (data || key || leaf_wire_type) for the selected tree.
-            map.for_each(&mut |key, data| {
+            // (data || key || leaf_wire_type) for the selected tree. The
+            // accompanying NodeId is the 33-byte `(path[32] || depth[1])` wire
+            // identifier — sending the raw 32-byte key fails rippled's parser
+            // which expects the depth byte appended.
+            map.for_each_with_id(&mut |node_id, key, data| {
                 let mut wire = Vec::with_capacity(data.len() + 33);
                 wire.extend_from_slice(data);
                 wire.extend_from_slice(key.as_bytes());
                 wire.push(leaf_wire_type);
-                let entry_size = key.as_bytes().len() + wire.len();
+                let id_bytes = node_id.to_wire_bytes();
+                let entry_size = id_bytes.len() + wire.len();
                 if total_size + entry_size <= MAX_RESPONSE_SIZE {
-                    nodes.push((key.as_bytes().to_vec(), wire));
+                    nodes.push((id_bytes, wire));
                     total_size += entry_size;
                 } else {
                     truncated = true;
@@ -2673,11 +2677,14 @@ impl PeerManager {
         if request_node_ids.is_empty() {
             // A transaction-no-metadata leaf carries no key on the wire:
             // rippled recovers the id by hashing the blob. Wire = blob || 0x00.
-            map.for_each(&mut |key, data| {
+            // The NodeId served is the 33-byte (path[32] || depth[1]) wire id;
+            // rippled rejects the 32-byte raw key, which was the silent failure
+            // that prevented `TransactionAcquire` from completing.
+            map.for_each_with_id(&mut |node_id, _key, data| {
                 let mut wire = Vec::with_capacity(data.len() + 1);
                 wire.extend_from_slice(data);
                 wire.push(WIRE_TYPE_TX_NO_META);
-                nodes.push((key.as_bytes().to_vec(), wire));
+                nodes.push((node_id.to_wire_bytes(), wire));
             });
         } else {
             for node_id in &request_node_ids {
