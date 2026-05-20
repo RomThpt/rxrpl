@@ -223,6 +223,20 @@ impl SHAMap {
         }
     }
 
+    /// Traverse every leaf and call `f(node_id, key, data)`.
+    ///
+    /// `node_id` is the leaf's position in the tree (`NodeId::new(depth, key)`)
+    /// and serializes to the 33-byte wire format rippled expects when serving
+    /// `TMLedgerData` responses for full-tree dumps.
+    pub fn for_each_with_id(&self, f: &mut impl FnMut(NodeId, &Hash256, &[u8])) {
+        match self.root.as_ref() {
+            SHAMapNode::Inner(inner) => {
+                Self::visit_with_id(inner, 1, f, self.store.as_ref(), self.leaf_ctor)
+            }
+            SHAMapNode::Leaf(leaf) => f(NodeId::new(0, leaf.key()), leaf.key(), leaf.data()),
+        }
+    }
+
     /// Create an immutable snapshot sharing the tree structure via Arc.
     pub fn snapshot(&mut self) -> SHAMap {
         Self::update_hashes(Arc::make_mut(&mut self.root));
@@ -789,6 +803,30 @@ impl SHAMap {
                 match child.as_ref() {
                     SHAMapNode::Leaf(leaf) => f(leaf.key(), leaf.data()),
                     SHAMapNode::Inner(inner) => Self::visit(inner, f, store, leaf_ctor),
+                }
+            }
+            mask &= mask - 1;
+        }
+    }
+
+    fn visit_with_id(
+        node: &InnerNode,
+        depth: u8,
+        f: &mut impl FnMut(NodeId, &Hash256, &[u8]),
+        store: Option<&Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+    ) {
+        let mut mask = node.branch_mask();
+        while mask != 0 {
+            let branch = mask.trailing_zeros() as u8;
+            if let Ok(Some(child)) = node.child_with_store(branch, store, leaf_ctor) {
+                match child.as_ref() {
+                    SHAMapNode::Leaf(leaf) => {
+                        f(NodeId::new(depth, leaf.key()), leaf.key(), leaf.data());
+                    }
+                    SHAMapNode::Inner(inner) => {
+                        Self::visit_with_id(inner, depth + 1, f, store, leaf_ctor);
+                    }
                 }
             }
             mask &= mask - 1;
@@ -1423,6 +1461,37 @@ mod tests {
         });
 
         assert_eq!(visited.len(), 3);
+    }
+
+    #[test]
+    fn for_each_with_id_yields_33byte_wire_format() {
+        let mut map = SHAMap::account_state();
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let k2 = make_key("2000000000000000000000000000000000000000000000000000000000000000");
+        let k3 = make_key("3000000000000000000000000000000000000000000000000000000000000000");
+
+        map.put(k1, vec![1]).unwrap();
+        map.put(k2, vec![2]).unwrap();
+        map.put(k3, vec![3]).unwrap();
+
+        let mut visited = Vec::new();
+        map.for_each_with_id(&mut |node_id, key, data| {
+            visited.push((node_id, *key, data.to_vec()));
+        });
+
+        assert_eq!(visited.len(), 3);
+        for (node_id, key, _) in &visited {
+            let wire = node_id.to_wire_bytes();
+            assert_eq!(wire.len(), 33, "wire format must be 33 bytes");
+            // Path nibbles up to `depth` must match the leaf's key.
+            for nibble in 0..node_id.depth() {
+                assert_eq!(
+                    select_branch(node_id.id(), nibble),
+                    select_branch(key, nibble),
+                    "node_id path must match leaf key up to depth"
+                );
+            }
+        }
     }
 
     #[test]
