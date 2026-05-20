@@ -1489,11 +1489,7 @@ impl Node {
                                     // than hang. This replaces the startup-only deferral
                                     // that stopped firing after first_close_grace and let
                                     // rxrpl close every steady-state ledger solo.
-                                    //
-                                    // 50s window absorbs a full rippled cycle (~16s) plus
-                                    // catchup overhead so a slow peer round still aligns
-                                    // before rxrpl falls through to a solo close.
-                                    const CLOSE_DEFER_MAX: Duration = Duration::from_secs(50);
+                                    const CLOSE_DEFER_MAX: Duration = Duration::from_secs(25);
                                     if close_defer_seq != seq {
                                         close_defer_seq = seq;
                                         close_defer_start = Some(tokio::time::Instant::now());
@@ -1521,15 +1517,7 @@ impl Node {
                                         );
                                         continue;
                                     }
-                                    // Proof-of-life gate: only hold for an absent close_time
-                                    // if we've ever observed a peer proposal. Without this,
-                                    // a configured-but-silent UNL peer would force every
-                                    // round to wait the full CLOSE_DEFER_MAX before falling
-                                    // through, dragging the node out of network cadence.
-                                    let peer_proposed_ever =
-                                        consensus.latest_peer_ledger_seq().is_some();
                                     if have_unl_peers_for_loop
-                                        && peer_proposed_ever
                                         && !have_fresh_peer_ct
                                         && deferred_for < CLOSE_DEFER_MAX
                                     {
