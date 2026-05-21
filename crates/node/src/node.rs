@@ -405,14 +405,19 @@ impl Node {
                 let l = ledger.read().await;
                 let prev_hash = l.header.parent_hash;
                 let ledger_seq = l.header.sequence;
+                let parent_close_time = l.header.parent_close_time;
 
                 // Build the consensus candidate set (with canonical blobs)
                 // from the open ledger.
                 let tx_set = Node::collect_consensus_tx_set(&l);
                 drop(l);
 
-                // Run consensus (solo = immediate accept)
-                consensus.start_round(prev_hash, ledger_seq);
+                // Run consensus (solo = immediate accept). Pass the parent's
+                // close_time so eff_close_time clamps to parent+1 (rippled's
+                // monotonicity guarantee). The legacy start_round defaults
+                // prior to 0, which silently disables the clamp and forks
+                // the ledger hash 1 bucket from rippled every round.
+                consensus.start_round_with_prior(prev_hash, ledger_seq, parent_close_time);
                 if let Err(e) = consensus.close_ledger(tx_set, close_time, ledger_seq) {
                     tracing::error!("consensus close_ledger failed: {}", e);
                     continue;
@@ -1580,7 +1585,13 @@ impl Node {
                                     let tx_set = Node::collect_consensus_tx_set(&l);
                                     drop(l);
 
-                                    consensus.start_round(prev_hash, seq);
+                                    // Pass parent_close_time so the engine's
+                                    // eff_close_time monotonicity clamp lands at
+                                    // parent+1 — matching rippled. With the legacy
+                                    // start_round (prior=0), the clamp is inactive
+                                    // and rxrpl forks 1 bucket from rippled every
+                                    // round (CT_DUMP empirical, 2026-05-21).
+                                    consensus.start_round_with_prior(prev_hash, seq, parent_close_time);
                                     if let Err(e) = consensus.close_ledger(tx_set, close_time, seq) {
                                         tracing::error!("consensus close_ledger failed: {}", e);
                                         continue;
@@ -1811,11 +1822,14 @@ impl Node {
 
                                     match action {
                                         rxrpl_consensus::StallAction::Retry => {
-                                            // Abandon round, re-open same ledger
+                                            // Abandon round, re-open same ledger.
+                                            // Pass parent_close_time so eff_close_time
+                                            // keeps the monotonicity clamp active.
                                             let l = ledger.read().await;
-                                            consensus.start_round(
+                                            consensus.start_round_with_prior(
                                                 l.header.parent_hash,
                                                 l.header.sequence,
+                                                l.header.parent_close_time,
                                             );
                                             timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
                                             amendment_votes.clear();
