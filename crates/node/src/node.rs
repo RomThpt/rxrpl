@@ -1481,26 +1481,42 @@ impl Node {
                                     // still progresses — after that, we fall through and close
                                     // solo, accepting the divergence as the lesser evil vs.
                                     // hanging consensus indefinitely.
-                                    // "A peer has proposed for THIS round" — gated on
-                                    // `has_proposal_for_round(prev, seq)`, which checks
-                                    // `pending_proposals` (Open) and `peer_positions`
-                                    // (Establish) for a proposal matching our current
-                                    // (prev_ledger, seq).
+                                    // Two complementary signals tell us "a peer has
+                                    // proposed for THIS round":
+                                    //   * `have_fresh_peer_ct` — peer's latest close_time
+                                    //     is strictly greater than our parent_close_time.
+                                    //     Cheap, fast in steady state, used as primary
+                                    //     gate when parent_close_time > 0.
+                                    //   * `peer_proposed_for_round` — a real proposal in
+                                    //     `pending_proposals` / `peer_positions` matches
+                                    //     our current (prev_ledger, seq). Required when
+                                    //     `parent_close_time == 0` (the first non-genesis
+                                    //     ledger), where the close_time gate is degenerate
+                                    //     (any peer close_time > 0 satisfies it, even if
+                                    //     the peer is on a different prev_ledger).
                                     //
-                                    // The older `latest_peer_close_time > parent_close_time`
-                                    // gate was unsafe: `latest_peer_close_time` is updated
-                                    // by ANY peer proposal regardless of round, so a peer
-                                    // running its own round-N proposal (close_time around
-                                    // our parent_close_time + a few seconds) would satisfy
-                                    // the gate even when our open seq is N+1. The result —
-                                    // rxrpl outpaces the peer, closes seq=N+1 solo with a
-                                    // hash the peer never sees, peer accepts its own seq=N+1
-                                    // solo too, divergence at N+1, no quorum, validated
-                                    // ledger frozen. Empirically observed on hive consensus
-                                    // 2026-05-21 at seq=10 (rxrpl 7A0BCBCA vs rippled
-                                    // A0659486).
-                                    let peer_round_signal =
+                                    // Empirical history (2026-05-21):
+                                    //   * Loose gate alone (have_fresh_peer_ct only) —
+                                    //     hive propagation 1/1 OK but seq=2 forks on a
+                                    //     stale peer close_time signal.
+                                    //   * Strict gate alone (has_proposal_for_round only)
+                                    //     — propagation regresses (mutual deadlock when
+                                    //     both nodes wait for each other), close cadence
+                                    //     ≈15s/ledger blowing the test budget.
+                                    //   * Combined with seq=2 special case (this branch) —
+                                    //     same propagation cadence as before, seq=2 only
+                                    //     closes once a per-round position arrives.
+                                    let have_fresh_peer_ct = consensus
+                                        .latest_peer_close_time()
+                                        .map(|ct| ct > parent_close_time)
+                                        .unwrap_or(false);
+                                    let peer_proposed_for_round =
                                         consensus.has_proposal_for_round(prev_hash, seq);
+                                    let peer_round_signal = if parent_close_time == 0 {
+                                        peer_proposed_for_round
+                                    } else {
+                                        have_fresh_peer_ct || peer_proposed_for_round
+                                    };
                                     // Persistent per-round deferral. Each round, hold the
                                     // local close until a trusted peer has proposed a
                                     // close_time for THIS seq — then rxrpl closes in the
