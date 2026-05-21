@@ -1481,10 +1481,33 @@ impl Node {
                                     // still progresses — after that, we fall through and close
                                     // solo, accepting the divergence as the lesser evil vs.
                                     // hanging consensus indefinitely.
+                                    // Two signals tell us "a peer has proposed for THIS
+                                    // round":
+                                    //   * `have_fresh_peer_ct` — peer's latest close_time
+                                    //     is strictly greater than our parent_close_time.
+                                    //     Cheap and works in steady state.
+                                    //   * `peer_proposed_for_round` — a real proposal in
+                                    //     `pending_proposals` / `peer_positions` matches
+                                    //     our current (prev_ledger, seq). Needed when
+                                    //     `parent_close_time == 0` (the first non-genesis
+                                    //     ledger), where the close_time gate is degenerate
+                                    //     (any peer close_time > 0 satisfies it, even if
+                                    //     the peer is on a different prev_ledger).
+                                    // Either is sufficient to skip the deferral.
                                     let have_fresh_peer_ct = consensus
                                         .latest_peer_close_time()
                                         .map(|ct| ct > parent_close_time)
                                         .unwrap_or(false);
+                                    let peer_proposed_for_round =
+                                        consensus.has_proposal_for_round(prev_hash, seq);
+                                    let peer_round_signal = if parent_close_time == 0 {
+                                        // Genesis-parent round: `have_fresh_peer_ct` is
+                                        // unreliable (every non-zero peer close_time
+                                        // satisfies `> 0`). Require a real position match.
+                                        peer_proposed_for_round
+                                    } else {
+                                        have_fresh_peer_ct || peer_proposed_for_round
+                                    };
                                     // Persistent per-round deferral. Each round, hold the
                                     // local close until a trusted peer has proposed a
                                     // close_time for THIS seq — then rxrpl closes in the
@@ -1523,13 +1546,14 @@ impl Node {
                                         continue;
                                     }
                                     if have_unl_peers_for_loop
-                                        && !have_fresh_peer_ct
+                                        && !peer_round_signal
                                         && deferred_for < CLOSE_DEFER_MAX
                                     {
                                         tracing::debug!(
                                             target: "consensus",
                                             seq,
                                             deferred_s = deferred_for.as_secs(),
+                                            parent_close_time,
                                             "deferring close: awaiting peer ProposeSet for this round"
                                         );
                                         timer.on_phase_change(

@@ -463,6 +463,26 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.latest_peer_ledger_seq
     }
 
+    /// True if any peer has proposed for the round currently being
+    /// constructed — checked across both the `pending_proposals` buffer
+    /// (filled during Open) and `peer_positions` (filled in Establish).
+    ///
+    /// Used by the node layer's pre-close deferral when
+    /// `parent_close_time == 0` (the first non-genesis ledger), where the
+    /// `latest_peer_close_time > parent_close_time` gate cannot
+    /// distinguish "peer proposed for our current round" from "peer
+    /// proposed at some point in its lifetime". Without this signal
+    /// rxrpl closes seq=2 solo and forks the ledger hash before align
+    /// has any data.
+    pub fn has_proposal_for_round(&self, prev_ledger: Hash256, ledger_seq: u32) -> bool {
+        let matches = |p: &Proposal| -> bool {
+            p.prev_ledger == prev_ledger
+                && (p.ledger_seq == 0 || p.ledger_seq == ledger_seq)
+        };
+        self.peer_positions.values().any(matches)
+            || self.pending_proposals.iter().any(matches)
+    }
+
     /// Get the current previous ledger hash.
     pub fn prev_ledger(&self) -> Hash256 {
         self.prev_ledger
