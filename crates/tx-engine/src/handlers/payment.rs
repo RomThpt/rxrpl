@@ -508,6 +508,11 @@ struct CrossOffer {
 /// and the destination receives `amount` (currency B), bridged through the
 /// order book. Scoped to a single IOU->IOU hop via offers that sell B for A
 /// (book keyed by pays = A, gets = B).
+///
+/// When `Paths` is present with a single intermediate currency step, the
+/// payment routes through two book crossings (A -> intermediate -> B). The
+/// fallback path (no Paths or unsupported shape) drives the legacy direct
+/// A/B book lookup.
 fn apply_cross_currency(
     ctx: &mut ApplyContext<'_>,
     account_str: &str,
@@ -515,6 +520,20 @@ fn apply_cross_currency(
     amount: (&str, &str, &str),
     send_max: (&str, &str, &str),
 ) -> Result<TransactionResult, TransactionResult> {
+    // Multi-hop dispatch: a single Path with one intermediate currency step
+    // (e.g. USD->EUR->GBP) is routed through `apply_two_hop_payment`. More
+    // complex shapes (multiple intermediate steps, rippling through accounts,
+    // mixed issuers) still fall through to the direct-book code path below.
+    if let Some(intermediate) = first_simple_intermediate(ctx.tx) {
+        return apply_two_hop_payment(
+            ctx,
+            account_str,
+            destination_str,
+            amount,
+            send_max,
+            intermediate,
+        );
+    }
     let (dst_cur, dst_iss, dst_val) = amount;
     let (src_cur, src_iss, src_max) = send_max;
 
@@ -598,6 +617,194 @@ fn apply_cross_currency(
     apply_trust_delta(ctx, &dest_id, &dst_issuer_id, &dst_cur_bytes, target)?;
 
     // Bump source Sequence.
+    let src_key = keylet::account(&src_id);
+    let src_bytes = ctx
+        .view
+        .read(&src_key)
+        .ok_or(TransactionResult::TerNoAccount)?;
+    let mut src_acct: serde_json::Value =
+        serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
+    helpers::increment_sequence(&mut src_acct);
+    let src_acct_data =
+        serde_json::to_vec(&src_acct).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(src_key, src_acct_data)
+        .map_err(|_| TransactionResult::TefInternal)?;
+
+    Ok(TransactionResult::TesSuccess)
+}
+
+/// Inspect the transaction's `Paths` field and, if it contains a single Path
+/// with exactly one currency-change step, return `(currency, issuer)` of the
+/// intermediate pivot. Returns `None` for any shape we don't yet handle:
+/// missing `Paths`, multiple paths, account-rippling steps, multi-step paths,
+/// or unparseable entries. Mirrors rippled's PathStep bitmap: 0x10 = currency
+/// change, 0x20 = issuer change.
+fn first_simple_intermediate(tx: &serde_json::Value) -> Option<(String, String)> {
+    let paths = tx.get("Paths").and_then(|v| v.as_array())?;
+    if paths.len() != 1 {
+        return None;
+    }
+    let path = paths.first()?.as_array()?;
+    if path.len() != 1 {
+        return None;
+    }
+    let step = path.first()?;
+    let step_type = step.get("type").and_then(|v| v.as_u64()).unwrap_or(0);
+    // Require currency-change (0x10) + issuer (0x20); reject pure-account or
+    // unknown bits so a future implementation pass extends scope cleanly.
+    if step_type != 0x30 {
+        return None;
+    }
+    let currency = step.get("currency").and_then(|v| v.as_str())?.to_string();
+    let issuer = step.get("issuer").and_then(|v| v.as_str())?.to_string();
+    Some((currency, issuer))
+}
+
+/// Apply a two-hop cross-currency Payment: source pays `send_max` (currency
+/// A), routes through an intermediate `(int_cur, int_iss)`, and delivers
+/// `amount` (currency B). Two books are crossed: A/int and int/B. Both must
+/// hold enough offers to cover the target Amount within send_max. Trust-line
+/// debits/credits, offer mutations and the source `Sequence` bump mirror the
+/// single-hop `apply_cross_currency` flow.
+fn apply_two_hop_payment(
+    ctx: &mut ApplyContext<'_>,
+    account_str: &str,
+    destination_str: &str,
+    amount: (&str, &str, &str),
+    send_max: (&str, &str, &str),
+    intermediate: (String, String),
+) -> Result<TransactionResult, TransactionResult> {
+    let (dst_cur, dst_iss, dst_val) = amount;
+    let (src_cur, src_iss, src_max) = send_max;
+    let (int_cur, int_iss) = intermediate;
+
+    let src_id =
+        decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let dest_id =
+        decode_account_id(destination_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let dst_issuer_id =
+        decode_account_id(dst_iss).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let src_issuer_id =
+        decode_account_id(src_iss).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let int_issuer_id =
+        decode_account_id(&int_iss).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+
+    let dst_cur_bytes = helpers::currency_to_bytes(dst_cur);
+    let src_cur_bytes = helpers::currency_to_bytes(src_cur);
+    let int_cur_bytes = helpers::currency_to_bytes(&int_cur);
+
+    let target: f64 = dst_val
+        .parse()
+        .map_err(|_| TransactionResult::TemBadAmount)?;
+    let send_max_val: f64 = src_max
+        .parse()
+        .map_err(|_| TransactionResult::TemBadAmount)?;
+    if target <= 0.0 {
+        return Err(TransactionResult::TemBadAmount);
+    }
+
+    // Hop 2 (int -> dst): book keyed by pays = int, gets = dst. Offers are
+    // selling dst for int. We consume in quality order to back-solve how
+    // much intermediate currency we need to deliver the target.
+    let hop2_book = keylet::book_dir(
+        &int_cur_bytes,
+        &int_issuer_id,
+        &dst_cur_bytes,
+        &dst_issuer_id,
+    );
+    let hop2_offers = collect_book_offers(ctx, &hop2_book);
+
+    let mut hop2_remaining = target;
+    let mut hop2_consumed: Vec<(
+        rxrpl_primitives::Hash256,
+        rxrpl_primitives::AccountId,
+        f64,
+        f64,
+    )> = Vec::new();
+    let mut intermediate_required = 0.0;
+    for offer in &hop2_offers {
+        if hop2_remaining <= 1e-9 {
+            break;
+        }
+        if offer.taker_gets <= 0.0 || offer.taker_pays <= 0.0 {
+            continue;
+        }
+        let take_dst = hop2_remaining.min(offer.taker_gets);
+        let take_int = take_dst * offer.taker_pays / offer.taker_gets;
+        hop2_consumed.push((offer.key, offer.owner, take_int, take_dst));
+        hop2_remaining -= take_dst;
+        intermediate_required += take_int;
+    }
+    if hop2_remaining > 1e-9 {
+        return Err(TransactionResult::TecPathPartial);
+    }
+
+    // Hop 1 (src -> int): book keyed by pays = src, gets = int. Offers sell
+    // int for src. Consume just enough to produce `intermediate_required`.
+    let hop1_book = keylet::book_dir(
+        &src_cur_bytes,
+        &src_issuer_id,
+        &int_cur_bytes,
+        &int_issuer_id,
+    );
+    let hop1_offers = collect_book_offers(ctx, &hop1_book);
+
+    let mut hop1_remaining = intermediate_required;
+    let mut hop1_consumed: Vec<(
+        rxrpl_primitives::Hash256,
+        rxrpl_primitives::AccountId,
+        f64,
+        f64,
+    )> = Vec::new();
+    let mut src_spent = 0.0;
+    for offer in &hop1_offers {
+        if hop1_remaining <= 1e-9 {
+            break;
+        }
+        if offer.taker_gets <= 0.0 || offer.taker_pays <= 0.0 {
+            continue;
+        }
+        let take_int = hop1_remaining.min(offer.taker_gets);
+        let take_src = take_int * offer.taker_pays / offer.taker_gets;
+        if src_spent + take_src > send_max_val + 1e-9 {
+            return Err(TransactionResult::TecPathPartial);
+        }
+        hop1_consumed.push((offer.key, offer.owner, take_src, take_int));
+        hop1_remaining -= take_int;
+        src_spent += take_src;
+    }
+    if hop1_remaining > 1e-9 {
+        return Err(TransactionResult::TecPathPartial);
+    }
+
+    // Apply mutations. All-or-nothing within the sandbox: any error from
+    // here on returns an internal failure code and rolls back via the
+    // outer sandbox commit/abort logic.
+    apply_trust_delta(ctx, &src_id, &src_issuer_id, &src_cur_bytes, -src_spent)?;
+
+    for (offer_key, owner_id, take_src, take_int) in &hop1_consumed {
+        if *owner_id != src_issuer_id {
+            apply_trust_delta(ctx, owner_id, &src_issuer_id, &src_cur_bytes, *take_src)?;
+        }
+        if *owner_id != int_issuer_id {
+            apply_trust_delta(ctx, owner_id, &int_issuer_id, &int_cur_bytes, -*take_int)?;
+        }
+        update_consumed_offer(ctx, offer_key, &hop1_book, *take_src, *take_int)?;
+    }
+
+    for (offer_key, owner_id, take_int, take_dst) in &hop2_consumed {
+        if *owner_id != int_issuer_id {
+            apply_trust_delta(ctx, owner_id, &int_issuer_id, &int_cur_bytes, *take_int)?;
+        }
+        if *owner_id != dst_issuer_id {
+            apply_trust_delta(ctx, owner_id, &dst_issuer_id, &dst_cur_bytes, -*take_dst)?;
+        }
+        update_consumed_offer(ctx, offer_key, &hop2_book, *take_int, *take_dst)?;
+    }
+
+    apply_trust_delta(ctx, &dest_id, &dst_issuer_id, &dst_cur_bytes, target)?;
+
     let src_key = keylet::account(&src_id);
     let src_bytes = ctx
         .view
@@ -1324,26 +1531,23 @@ mod tests {
         assert!((holder_balance(&sandbox, MM, ISSUER, "EUR") - 80.0).abs() < 1e-6);
     }
 
-    // -- multi-hop gap marker --
+    // -- multi-hop walker --
     //
-    // A USD→EUR→GBP payment, where there is no direct USD/GBP book, requires
-    // two book crossings chained via an intermediate EUR position. rippled
-    // supports this via the `Paths` field: each path lists the intermediate
-    // currency/issuer steps the payment must walk.
-    //
-    // `apply_cross_currency` currently expects a single book whose taker pays
-    // SendMax-currency and gets Amount-currency, so the USD/GBP lookup
-    // (`book_dir(USD, EUR, GBP, ...)`) finds nothing and the payment fails
-    // `TecPathPartial`. This test pins the current gap so that an
-    // implementation pass can flip the assertion to `TesSuccess` once the
-    // multi-hop walker is wired in.
-    //
-    // Ignored by default so CI stays green; remove `#[ignore]` to exercise.
+    // A USD→EUR→GBP payment with no direct USD/GBP book walks two book
+    // crossings chained via an intermediate EUR position. `apply_cross_currency`
+    // dispatches to `apply_two_hop_payment` when the transaction's `Paths`
+    // field carries exactly one path with a single currency-change step
+    // (`type == 0x30`). The hop sequence:
+    //   * Hop 1 (USD → EUR): consume offers from `book_dir(USD, EUR)` until
+    //     we've sourced enough EUR to feed the next hop.
+    //   * Hop 2 (EUR → GBP): consume offers from `book_dir(EUR, GBP)` until
+    //     the destination's GBP target is met.
+    // Both hops must complete within `SendMax` worth of source currency or
+    // the payment fails `TecPathPartial`.
     const MM2: &str = "rwUVoVMSURqNyvocPCcvLu3ygJzZyw8qwp";
 
     #[test]
-    #[ignore = "multi-hop Paths walker not yet implemented (item #4 Phase 1)"]
-    fn apply_cross_currency_two_hop_returns_tec_path_partial_until_paths_walker_lands() {
+    fn apply_cross_currency_two_hop_via_paths_succeeds() {
         let mut ledger = Ledger::genesis();
         put_account(&mut ledger, ISSUER, "100000000", None);
         put_account(&mut ledger, ALICE, "50000000", None);
@@ -1445,10 +1649,16 @@ mod tests {
             rules: &rules,
             fees: &fees,
         };
-        let result = PaymentTransactor.apply(&mut ctx);
-        // Once the multi-hop walker is implemented, flip this to assert
-        // `Ok(TesSuccess)` plus the four trust-line deltas (Alice -20 USD,
-        // MM +20 USD / -20 EUR, MM2 +20 EUR / -20 GBP, Bob +20 GBP).
-        assert_eq!(result, Err(TransactionResult::TecPathPartial));
+        let result = PaymentTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        // Trust-line deltas: Alice -20 USD, MM +20 USD / -20 EUR,
+        // MM2 +20 EUR / -20 GBP, Bob +20 GBP.
+        assert!((holder_balance(&sandbox, ALICE, ISSUER, "USD") - 80.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM, ISSUER, "USD") - 20.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM, ISSUER, "EUR") - 80.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM2, ISSUER, "EUR") - 20.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM2, ISSUER, "GBP") - 80.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, BOB, ISSUER, "GBP") - 20.0).abs() < 1e-6);
     }
 }
