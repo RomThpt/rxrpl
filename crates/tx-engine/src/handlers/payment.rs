@@ -520,27 +520,40 @@ fn apply_cross_currency(
     amount: (&str, &str, &str),
     send_max: (&str, &str, &str),
 ) -> Result<TransactionResult, TransactionResult> {
-    // Multi-hop dispatch: iterate over each Path in `Paths` (alternatives)
-    // and route the first one that's a pure currency-change chain through
-    // `apply_n_hop_payment`. Account-rippling steps, mixed-issuer shapes,
-    // and other complex paths fall through to the legacy direct-book lookup
-    // (which fails) — they remain Phase 3+ scope.
+    // Multi-hop dispatch: when `Paths` is present, dry-run a back-solve for
+    // each viable Path (pure currency-change chain), then commit mutations
+    // for the alternative with the lowest source-currency spend. That mirrors
+    // rippled's RippleCalc quality-based ranking: the same target Amount is
+    // delivered with less SendMax spent, so the source pays the minimum.
+    // Paths the back-solve cannot satisfy (insufficient liquidity, books
+    // missing, mismatched issuer/currency, etc.) are skipped. If no Path
+    // succeeds, fall through to the legacy direct-book lookup below.
     if let Some(paths) = ctx.tx.get("Paths").and_then(|v| v.as_array()) {
+        let mut best: Option<NHopPlan> = None;
         for path in paths {
-            if let Some(intermediates) = path.as_array().and_then(simple_path_intermediates) {
-                if !intermediates.is_empty() {
-                    if let Ok(result) = apply_n_hop_payment(
-                        ctx,
-                        account_str,
-                        destination_str,
-                        amount,
-                        send_max,
-                        &intermediates,
-                    ) {
-                        return Ok(result);
-                    }
-                }
+            let Some(intermediates) = path.as_array().and_then(simple_path_intermediates) else {
+                continue;
+            };
+            if intermediates.is_empty() {
+                continue;
             }
+            let Ok(plan) = back_solve_n_hop(
+                ctx,
+                account_str,
+                destination_str,
+                amount,
+                send_max,
+                &intermediates,
+            ) else {
+                continue;
+            };
+            best = Some(match best.take() {
+                Some(prev) if prev.src_spent <= plan.src_spent => prev,
+                _ => plan,
+            });
+        }
+        if let Some(plan) = best {
+            return commit_n_hop_plan(ctx, plan);
         }
     }
     let (dst_cur, dst_iss, dst_val) = amount;
@@ -663,28 +676,47 @@ fn simple_path_intermediates(path: &Vec<serde_json::Value>) -> Option<Vec<(Strin
     Some(out)
 }
 
-/// Apply an N-hop cross-currency Payment: source pays `send_max` (currency
-/// A), routes through any number of intermediate `(currency, issuer)` pivots
-/// in walk order, and delivers `amount` (currency B). N+1 books are crossed
-/// (where N = `intermediates.len()`). Trust-line debits/credits, offer
-/// mutations and the source `Sequence` bump mirror the single-hop
-/// `apply_cross_currency` flow.
+/// Resolved N-hop payment plan ready for application. Produced by
+/// `back_solve_n_hop` (read-only) and consumed by `commit_n_hop_plan`
+/// (mutating). Splitting the two phases lets the multi-path dispatch
+/// dry-run every Path alternative and pick the one with the lowest
+/// `src_spent` before touching the ledger.
+struct NHopPlan {
+    src_id: rxrpl_primitives::AccountId,
+    dest_id: rxrpl_primitives::AccountId,
+    target: f64,
+    src_spent: f64,
+    /// Currency + issuer per hop boundary, `chain[0]` = source side,
+    /// `chain.last()` = destination side. Length = `hop_count + 1`.
+    chain: Vec<([u8; 20], rxrpl_primitives::AccountId)>,
+    /// Per-hop book directory keylet.
+    hop_books: Vec<rxrpl_primitives::Hash256>,
+    /// Per-hop list of `(offer_key, owner, take_in, take_out)` to apply.
+    hop_consumed: Vec<
+        Vec<(
+            rxrpl_primitives::Hash256,
+            rxrpl_primitives::AccountId,
+            f64,
+            f64,
+        )>,
+    >,
+}
+
+/// Dry-run an N-hop cross-currency Payment: build the source→intermediates
+/// →destination chain, back-solve liquidity from destination toward source,
+/// and return the resolved `NHopPlan`. No mutations are applied — every
+/// read is via `collect_book_offers` and the surrounding sandbox view.
 ///
-/// Algorithm:
-///  - Back-solve from destination: for each book in reverse order, consume
-///    offers in quality order to source the required output of that hop;
-///    the input becomes the required output for the previous hop.
-///  - If the final source-side input exceeds `send_max`, fail
-///    `TecPathPartial`.
-///  - Apply mutations in forward walk order (no two-step special-casing).
-fn apply_n_hop_payment(
+/// Returns `Err(TecPathPartial)` if any hop runs short of liquidity or the
+/// total source spend exceeds `SendMax`.
+fn back_solve_n_hop(
     ctx: &mut ApplyContext<'_>,
     account_str: &str,
     destination_str: &str,
     amount: (&str, &str, &str),
     send_max: (&str, &str, &str),
     intermediates: &[(String, String)],
-) -> Result<TransactionResult, TransactionResult> {
+) -> Result<NHopPlan, TransactionResult> {
     let (dst_cur, dst_iss, dst_val) = amount;
     let (src_cur, src_iss, src_max) = send_max;
 
@@ -720,9 +752,6 @@ fn apply_n_hop_payment(
         decode_account_id(dst_iss).map_err(|_| TransactionResult::TemInvalidAccountId)?,
     ));
 
-    // For each hop, the book is keyed by (pays=in_cur, gets=out_cur). Back-
-    // solve from destination so the produced output of hop K is exactly the
-    // input required for hop K+1.
     let hop_count = chain.len() - 1;
     let mut hop_books: Vec<rxrpl_primitives::Hash256> = Vec::with_capacity(hop_count);
     let mut hop_consumed: Vec<
@@ -734,8 +763,6 @@ fn apply_n_hop_payment(
         )>,
     > = vec![Vec::new(); hop_count];
 
-    // `required_output[k]` is how much of `chain[k+1].currency` hop k must
-    // produce. We compute it back-to-front, seeded by the destination target.
     let mut required_output = target;
     for hop in (0..hop_count).rev() {
         let (in_cur, in_iss) = &chain[hop];
@@ -768,15 +795,41 @@ fn apply_n_hop_payment(
     }
     hop_books.reverse();
 
-    // After the back-solve, `required_output` carries the total source-side
-    // input — the amount of `chain[0].currency` the source must spend.
     let src_spent = required_output;
     if src_spent > send_max_val + 1e-9 {
         return Err(TransactionResult::TecPathPartial);
     }
 
-    // Apply mutations in forward walk order (hop 0 first). All-or-nothing
-    // within the sandbox: any error rolls back via the outer commit/abort.
+    Ok(NHopPlan {
+        src_id,
+        dest_id,
+        target,
+        src_spent,
+        chain,
+        hop_books,
+        hop_consumed,
+    })
+}
+
+/// Apply the mutations for a previously back-solved `NHopPlan`. Walks hops
+/// in forward order, applies trust-line deltas to the source, each
+/// market-maker, and the destination, updates each consumed offer, and
+/// bumps the source `Sequence`. All-or-nothing within the sandbox.
+fn commit_n_hop_plan(
+    ctx: &mut ApplyContext<'_>,
+    plan: NHopPlan,
+) -> Result<TransactionResult, TransactionResult> {
+    let NHopPlan {
+        src_id,
+        dest_id,
+        target,
+        src_spent,
+        chain,
+        hop_books,
+        hop_consumed,
+    } = plan;
+    let hop_count = chain.len() - 1;
+
     let (first_cur, first_iss) = &chain[0];
     apply_trust_delta(ctx, &src_id, first_iss, first_cur, -src_spent)?;
 
@@ -1875,5 +1928,177 @@ mod tests {
         assert!((holder_balance(&sandbox, MM2, ISSUER, "JPY") - 80.0).abs() < 1e-6);
         assert!((holder_balance(&sandbox, MM3, ISSUER, "JPY") - 20.0).abs() < 1e-6);
         assert!((holder_balance(&sandbox, MM3, ISSUER, "GBP") - 80.0).abs() < 1e-6);
+    }
+
+    /// Two viable paths reach the same destination at different costs. The
+    /// walker must dry-run both and commit the cheaper one (lower
+    /// `src_spent`).
+    ///
+    /// Setup:
+    ///   * Path A via EUR — MM offers USD/EUR at parity, then MM2 offers
+    ///     EUR/GBP at parity. Cost to deliver 20 GBP: 20 USD.
+    ///   * Path B via JPY — MM offers USD/JPY at 1:16 (16 JPY per USD) and
+    ///     MM3 offers JPY/GBP at 4:1, so 5 USD buys 80 JPY which buys
+    ///     20 GBP. Cost: 5 USD.
+    ///
+    /// First-viable-wins selection (PR #106) would pick Path A because it
+    /// is listed first; the quality-ranked dispatch picks Path B.
+    #[test]
+    fn apply_cross_currency_picks_cheapest_path_via_quality_ranking() {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ISSUER, "100000000", None);
+        put_account(&mut ledger, ALICE, "50000000", None);
+        put_account(&mut ledger, BOB, "50000000", None);
+        put_account(&mut ledger, MM, "50000000", None);
+        put_account(&mut ledger, MM2, "50000000", None);
+        put_account(&mut ledger, MM3, "50000000", None);
+
+        put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+        put_trust_line(&mut ledger, BOB, ISSUER, "GBP", 0.0);
+        // Path A: USD -> EUR -> GBP at parity (rate 1.0 throughout).
+        put_trust_line(&mut ledger, MM, ISSUER, "USD", 0.0);
+        put_trust_line(&mut ledger, MM, ISSUER, "EUR", 100.0);
+        put_trust_line(&mut ledger, MM2, ISSUER, "EUR", 0.0);
+        put_trust_line(&mut ledger, MM2, ISSUER, "GBP", 100.0);
+        // Path B: USD -> JPY -> GBP. MM gives 4 JPY for every USD; MM3 gives
+        // 1 GBP for every JPY.  Net rate USD->GBP = 4x cheaper than parity.
+        put_trust_line(&mut ledger, MM, ISSUER, "JPY", 200.0);
+        put_trust_line(&mut ledger, MM3, ISSUER, "JPY", 0.0);
+        put_trust_line(&mut ledger, MM3, ISSUER, "GBP", 100.0);
+
+        let issuer_id = decode_account_id(ISSUER).unwrap();
+        let mm_id = decode_account_id(MM).unwrap();
+        let mm2_id = decode_account_id(MM2).unwrap();
+        let mm3_id = decode_account_id(MM3).unwrap();
+
+        // MM offer 1: USD/EUR at 1:1.
+        let mm_eur = keylet::offer(&mm_id, 1);
+        ledger
+            .put_state(
+                mm_eur,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "Offer",
+                    "Account": MM,
+                    "Sequence": 1,
+                    "TakerPays": iou("USD", ISSUER, "50"),
+                    "TakerGets": iou("EUR", ISSUER, "50"),
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        // MM2 offer: EUR/GBP at 1:1.
+        let mm2_gbp = keylet::offer(&mm2_id, 1);
+        ledger
+            .put_state(
+                mm2_gbp,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "Offer",
+                    "Account": MM2,
+                    "Sequence": 1,
+                    "TakerPays": iou("EUR", ISSUER, "50"),
+                    "TakerGets": iou("GBP", ISSUER, "50"),
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        // MM offer 2: USD/JPY at 1:16 (16 JPY per USD).
+        let mm_jpy = keylet::offer(&mm_id, 2);
+        ledger
+            .put_state(
+                mm_jpy,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "Offer",
+                    "Account": MM,
+                    "Sequence": 2,
+                    "TakerPays": iou("USD", ISSUER, "50"),
+                    "TakerGets": iou("JPY", ISSUER, "800"),
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        // MM3 offer: JPY/GBP at 4:1 (1 GBP per 4 JPY).
+        // We want 20 GBP from MM3 in exchange for 80 JPY in.
+        let mm3_gbp = keylet::offer(&mm3_id, 1);
+        ledger
+            .put_state(
+                mm3_gbp,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "Offer",
+                    "Account": MM3,
+                    "Sequence": 1,
+                    "TakerPays": iou("JPY", ISSUER, "200"),
+                    "TakerGets": iou("GBP", ISSUER, "50"),
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let usd = helpers::currency_to_bytes("USD");
+        let eur = helpers::currency_to_bytes("EUR");
+        let gbp = helpers::currency_to_bytes("GBP");
+        let jpy = helpers::currency_to_bytes("JPY");
+
+        let usd_eur = keylet::book_dir(&usd, &issuer_id, &eur, &issuer_id);
+        let eur_gbp = keylet::book_dir(&eur, &issuer_id, &gbp, &issuer_id);
+        let usd_jpy = keylet::book_dir(&usd, &issuer_id, &jpy, &issuer_id);
+        let jpy_gbp = keylet::book_dir(&jpy, &issuer_id, &gbp, &issuer_id);
+
+        for (book, offer_key) in [
+            (usd_eur, mm_eur),
+            (eur_gbp, mm2_gbp),
+            (usd_jpy, mm_jpy),
+            (jpy_gbp, mm3_gbp),
+        ] {
+            ledger
+                .put_state(
+                    book,
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "DirectoryNode",
+                        "Indexes": [offer_key.to_string()],
+                        "IndexNext": 0,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("GBP", ISSUER, "20"),
+            "SendMax": iou("USD", ISSUER, "20"),
+            "Paths": [
+                [ { "currency": "EUR", "issuer": ISSUER, "type": 0x30 } ],
+                [ { "currency": "JPY", "issuer": ISSUER, "type": 0x30 } ]
+            ],
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = PaymentTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        // Quality-ranked dispatch picks Path B (JPY pivot).  Alice spends
+        // only 5 USD; the EUR path would have cost 20 USD.
+        assert!((holder_balance(&sandbox, ALICE, ISSUER, "USD") - 95.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, BOB, ISSUER, "GBP") - 20.0).abs() < 1e-6);
+        // JPY books were the ones consumed; EUR books should be untouched.
+        assert!((holder_balance(&sandbox, MM, ISSUER, "EUR") - 100.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM2, ISSUER, "EUR") - 0.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM, ISSUER, "JPY") - 120.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM3, ISSUER, "JPY") - 80.0).abs() < 1e-6);
     }
 }
