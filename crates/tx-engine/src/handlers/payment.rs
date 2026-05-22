@@ -790,6 +790,7 @@ struct NHopPlan {
 /// call fails `TecPathPartial`. Without `partial_allowed`, any shortfall
 /// (insufficient liquidity at any hop OR `src_spent > SendMax`) returns
 /// `TecPathPartial`.
+#[allow(clippy::too_many_arguments)]
 fn back_solve_n_hop(
     ctx: &mut ApplyContext<'_>,
     account_str: &str,
