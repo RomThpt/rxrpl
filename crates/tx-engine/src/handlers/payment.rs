@@ -1323,4 +1323,132 @@ mod tests {
         assert!((holder_balance(&sandbox, MM, ISSUER, "USD") - 20.0).abs() < 1e-6);
         assert!((holder_balance(&sandbox, MM, ISSUER, "EUR") - 80.0).abs() < 1e-6);
     }
+
+    // -- multi-hop gap marker --
+    //
+    // A USD→EUR→GBP payment, where there is no direct USD/GBP book, requires
+    // two book crossings chained via an intermediate EUR position. rippled
+    // supports this via the `Paths` field: each path lists the intermediate
+    // currency/issuer steps the payment must walk.
+    //
+    // `apply_cross_currency` currently expects a single book whose taker pays
+    // SendMax-currency and gets Amount-currency, so the USD/GBP lookup
+    // (`book_dir(USD, EUR, GBP, ...)`) finds nothing and the payment fails
+    // `TecPathPartial`. This test pins the current gap so that an
+    // implementation pass can flip the assertion to `TesSuccess` once the
+    // multi-hop walker is wired in.
+    //
+    // Ignored by default so CI stays green; remove `#[ignore]` to exercise.
+    const MM2: &str = "rwUVoVMSURqNyvocPCcvLu3ygJzZyw8qwp";
+
+    #[test]
+    #[ignore = "multi-hop Paths walker not yet implemented (item #4 Phase 1)"]
+    fn apply_cross_currency_two_hop_returns_tec_path_partial_until_paths_walker_lands() {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ISSUER, "100000000", None);
+        put_account(&mut ledger, ALICE, "50000000", None);
+        put_account(&mut ledger, BOB, "50000000", None);
+        put_account(&mut ledger, MM, "50000000", None);
+        put_account(&mut ledger, MM2, "50000000", None);
+
+        put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+        put_trust_line(&mut ledger, BOB, ISSUER, "GBP", 0.0);
+        put_trust_line(&mut ledger, MM, ISSUER, "USD", 0.0);
+        put_trust_line(&mut ledger, MM, ISSUER, "EUR", 100.0);
+        put_trust_line(&mut ledger, MM2, ISSUER, "EUR", 0.0);
+        put_trust_line(&mut ledger, MM2, ISSUER, "GBP", 100.0);
+
+        // MM1: TakerPays 50 USD, TakerGets 50 EUR.
+        let mm_id = decode_account_id(MM).unwrap();
+        let mm_offer = keylet::offer(&mm_id, 1);
+        ledger
+            .put_state(
+                mm_offer,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "Offer",
+                    "Account": MM,
+                    "Sequence": 1,
+                    "TakerPays": iou("USD", ISSUER, "50"),
+                    "TakerGets": iou("EUR", ISSUER, "50"),
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        // MM2: TakerPays 50 EUR, TakerGets 50 GBP.
+        let mm2_id = decode_account_id(MM2).unwrap();
+        let mm2_offer = keylet::offer(&mm2_id, 1);
+        ledger
+            .put_state(
+                mm2_offer,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "Offer",
+                    "Account": MM2,
+                    "Sequence": 1,
+                    "TakerPays": iou("EUR", ISSUER, "50"),
+                    "TakerGets": iou("GBP", ISSUER, "50"),
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let usd = helpers::currency_to_bytes("USD");
+        let eur = helpers::currency_to_bytes("EUR");
+        let gbp = helpers::currency_to_bytes("GBP");
+        let issuer_id = decode_account_id(ISSUER).unwrap();
+        let usd_eur_book = keylet::book_dir(&usd, &issuer_id, &eur, &issuer_id);
+        let eur_gbp_book = keylet::book_dir(&eur, &issuer_id, &gbp, &issuer_id);
+        ledger
+            .put_state(
+                usd_eur_book,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "DirectoryNode",
+                    "Indexes": [mm_offer.to_string()],
+                    "IndexNext": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        ledger
+            .put_state(
+                eur_gbp_book,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "DirectoryNode",
+                    "Indexes": [mm2_offer.to_string()],
+                    "IndexNext": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        // USD → GBP, single intermediate EUR step in Paths.
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("GBP", ISSUER, "20"),
+            "SendMax": iou("USD", ISSUER, "20"),
+            "Paths": [
+                [
+                    { "currency": "EUR", "issuer": ISSUER, "type": 0x30 }
+                ]
+            ],
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = PaymentTransactor.apply(&mut ctx);
+        // Once the multi-hop walker is implemented, flip this to assert
+        // `Ok(TesSuccess)` plus the four trust-line deltas (Alice -20 USD,
+        // MM +20 USD / -20 EUR, MM2 +20 EUR / -20 GBP, Bob +20 GBP).
+        assert_eq!(result, Err(TransactionResult::TecPathPartial));
+    }
 }
