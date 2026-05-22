@@ -700,28 +700,44 @@ fn apply_cross_currency(
     Ok(TransactionResult::TesSuccess)
 }
 
+/// A resolved Path step expressed as a hop boundary plus its transit kind.
+///
+/// `Book` boundaries are crossed via the order book between the previous
+/// `(cur, iss)` and the new `(cur, iss)`. `Ripple` boundaries are crossed
+/// by transiting through `account`, which absorbs the inbound IOU (same
+/// currency, previous issuer) and re-issues it as its own.
+enum PathHopSpec {
+    Book { cur: String, iss: String },
+    Ripple { cur: String, account: String },
+}
+
 /// Inspect a single Path (array of step objects) and resolve each step's
-/// effective `(currency, issuer)` by walking the inheritance chain from
-/// the source side. Returns the fully resolved chain of intermediates in
-/// walk order, or `None` if any step is account-rippling (`type & 0x01`,
-/// reserved for Phase 3b) or carries no `0x10`/`0x20` bits at all.
+/// effective hop boundary by walking the inheritance chain from the source
+/// side. Returns the fully resolved chain of intermediates in walk order,
+/// or `None` if any step carries an unsupported combination of bits.
 ///
 /// rippled's PathStep bitmap:
+///   * `0x01` (PATH_STEP_ACCOUNT): account-rippling through `account`
 ///   * `0x10` (PATH_STEP_CURRENCY): currency comes from the step
 ///   * `0x20` (PATH_STEP_ISSUER): issuer comes from the step
 ///   * `0x30` (combined): both come from the step
-///   * `0x01` (PATH_STEP_ACCOUNT): account-rippling, NOT supported here
+///
+/// Supported bit shapes:
+///   * pure book: `0x10` / `0x20` / `0x30`
+///   * pure rippling: `0x01`
+///
+/// `0x11` / `0x21` / `0x31` (account combined with currency or issuer)
+/// are intentionally unsupported and fall back to alternative Paths.
 ///
 /// For a `0x10`-only step the issuer is inherited from the previous hop
 /// (or the source side for the first step). For a `0x20`-only step the
-/// currency is inherited the same way. This is how cross-issuer hops
-/// (USD@A → USD@B via a `0x20` step) and currency-only chains are
-/// expressed in rippled's wire format.
+/// currency is inherited the same way. A `0x01` step keeps the currency
+/// and changes the issuer to `account`.
 fn simple_path_intermediates(
     path: &Vec<serde_json::Value>,
     src_cur: &str,
     src_iss: &str,
-) -> Option<Vec<(String, String)>> {
+) -> Option<Vec<PathHopSpec>> {
     const PATH_STEP_ACCOUNT: u64 = 0x01;
     const PATH_STEP_CURRENCY: u64 = 0x10;
     const PATH_STEP_ISSUER: u64 = 0x20;
@@ -731,13 +747,23 @@ fn simple_path_intermediates(
     let mut current_iss = src_iss.to_string();
     for step in path {
         let step_type = step.get("type").and_then(|v| v.as_u64()).unwrap_or(0);
-        if step_type & PATH_STEP_ACCOUNT != 0 {
-            // Account-rippling steps are Phase 3b territory; fall through to
-            // alternative Paths or the legacy direct-book code.
-            return None;
-        }
+        let has_account = step_type & PATH_STEP_ACCOUNT != 0;
         let has_currency = step_type & PATH_STEP_CURRENCY != 0;
         let has_issuer = step_type & PATH_STEP_ISSUER != 0;
+        if has_account {
+            // Mixed account+currency/issuer steps are deferred; only pure
+            // account-rippling (0x01) is supported here.
+            if has_currency || has_issuer {
+                return None;
+            }
+            let account = step.get("account").and_then(|v| v.as_str())?.to_string();
+            current_iss = account.clone();
+            out.push(PathHopSpec::Ripple {
+                cur: current_cur.clone(),
+                account,
+            });
+            continue;
+        }
         if !has_currency && !has_issuer {
             return None;
         }
@@ -747,9 +773,31 @@ fn simple_path_intermediates(
         if has_issuer {
             current_iss = step.get("issuer").and_then(|v| v.as_str())?.to_string();
         }
-        out.push((current_cur.clone(), current_iss.clone()));
+        out.push(PathHopSpec::Book {
+            cur: current_cur.clone(),
+            iss: current_iss.clone(),
+        });
     }
     Some(out)
+}
+
+/// Per-hop application kind. `Book` hops cross an order book and consume
+/// a list of offers; `Ripple` hops transit through `account`, which takes
+/// the inbound IOU into its trust line with the previous issuer.
+enum HopAction {
+    Book {
+        book: rxrpl_primitives::Hash256,
+        consumed: Vec<(
+            rxrpl_primitives::Hash256,
+            rxrpl_primitives::AccountId,
+            f64,
+            f64,
+        )>,
+    },
+    Ripple {
+        account: rxrpl_primitives::AccountId,
+        amount: f64,
+    },
 }
 
 /// Resolved N-hop payment plan ready for application. Produced by
@@ -765,17 +813,8 @@ struct NHopPlan {
     /// Currency + issuer per hop boundary, `chain[0]` = source side,
     /// `chain.last()` = destination side. Length = `hop_count + 1`.
     chain: Vec<([u8; 20], rxrpl_primitives::AccountId)>,
-    /// Per-hop book directory keylet.
-    hop_books: Vec<rxrpl_primitives::Hash256>,
-    /// Per-hop list of `(offer_key, owner, take_in, take_out)` to apply.
-    hop_consumed: Vec<
-        Vec<(
-            rxrpl_primitives::Hash256,
-            rxrpl_primitives::AccountId,
-            f64,
-            f64,
-        )>,
-    >,
+    /// Per-hop application, `hops.len() == chain.len() - 1`.
+    hops: Vec<HopAction>,
 }
 
 /// Dry-run an N-hop cross-currency Payment: build the source→intermediates
@@ -797,7 +836,7 @@ fn back_solve_n_hop(
     destination_str: &str,
     amount: (&str, &str, &str),
     send_max: (&str, &str, &str),
-    intermediates: &[(String, String)],
+    intermediates: &[PathHopSpec],
     partial_allowed: bool,
     deliver_min: Option<f64>,
 ) -> Result<NHopPlan, TransactionResult> {
@@ -819,41 +858,73 @@ fn back_solve_n_hop(
         return Err(TransactionResult::TemBadAmount);
     }
 
-    // Build the (currency, issuer) chain: src -> int1 -> ... -> intN -> dst.
+    // Build the (currency, issuer) chain along with the per-step kind:
+    // src -> step1 -> ... -> stepN. If the last step doesn't land on the
+    // destination boundary, an implicit final book hop is appended.
     let mut chain: Vec<([u8; 20], rxrpl_primitives::AccountId)> = Vec::new();
     chain.push((
         helpers::currency_to_bytes(src_cur),
         decode_account_id(src_iss).map_err(|_| TransactionResult::TemInvalidAccountId)?,
     ));
-    for (cur, iss) in intermediates {
-        chain.push((
-            helpers::currency_to_bytes(cur),
-            decode_account_id(iss).map_err(|_| TransactionResult::TemInvalidAccountId)?,
-        ));
+    // Per-step kind tracking lets back-solve pick the right transit rule.
+    // None marks a Book hop; Some(account) marks a Ripple hop through
+    // that account. Indexed alongside `chain[1..]`.
+    let mut step_kinds: Vec<Option<rxrpl_primitives::AccountId>> = Vec::new();
+    for spec in intermediates {
+        match spec {
+            PathHopSpec::Book { cur, iss } => {
+                chain.push((
+                    helpers::currency_to_bytes(cur),
+                    decode_account_id(iss).map_err(|_| TransactionResult::TemInvalidAccountId)?,
+                ));
+                step_kinds.push(None);
+            }
+            PathHopSpec::Ripple { cur, account } => {
+                let account_id = decode_account_id(account)
+                    .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+                chain.push((helpers::currency_to_bytes(cur), account_id));
+                step_kinds.push(Some(account_id));
+            }
+        }
     }
-    chain.push((
+    let dst_boundary = (
         helpers::currency_to_bytes(dst_cur),
         decode_account_id(dst_iss).map_err(|_| TransactionResult::TemInvalidAccountId)?,
-    ));
-
+    );
+    if chain.last() != Some(&dst_boundary) {
+        chain.push(dst_boundary);
+        step_kinds.push(None);
+    }
     let hop_count = chain.len() - 1;
-    let mut hop_books: Vec<rxrpl_primitives::Hash256> = Vec::with_capacity(hop_count);
-    let mut hop_consumed: Vec<
-        Vec<(
-            rxrpl_primitives::Hash256,
-            rxrpl_primitives::AccountId,
-            f64,
-            f64,
-        )>,
-    > = vec![Vec::new(); hop_count];
+    if hop_count == 0 {
+        return Err(TransactionResult::TecPathPartial);
+    }
+
+    let mut hops: Vec<Option<HopAction>> = (0..hop_count).map(|_| None).collect();
 
     let mut required_output = target;
     for hop in (0..hop_count).rev() {
         let (in_cur, in_iss) = &chain[hop];
         let (out_cur, out_iss) = &chain[hop + 1];
+
+        if let Some(account) = step_kinds[hop] {
+            // Same-currency rippling transit: no exchange, amount through.
+            // The ripple account must already hold a trust line with the
+            // inbound issuer; if it doesn't, fail this path so the
+            // dispatcher tries an alternative.
+            let tl_key = keylet::trust_line(&account, in_iss, in_cur);
+            if ctx.view.read(&tl_key).is_none() {
+                return Err(TransactionResult::TecPathDry);
+            }
+            hops[hop] = Some(HopAction::Ripple {
+                account,
+                amount: required_output,
+            });
+            continue;
+        }
+
         let book = keylet::book_dir(in_cur, in_iss, out_cur, out_iss);
         let offers = collect_book_offers(ctx, &book);
-        hop_books.push(book);
 
         let mut remaining = required_output;
         let mut consumed: Vec<(_, _, _, _)> = Vec::new();
@@ -874,10 +945,10 @@ fn back_solve_n_hop(
         if remaining > 1e-9 {
             return Err(TransactionResult::TecPathPartial);
         }
-        hop_consumed[hop] = consumed;
+        hops[hop] = Some(HopAction::Book { book, consumed });
         required_output = input_required;
     }
-    hop_books.reverse();
+    let mut hops: Vec<HopAction> = hops.into_iter().map(|h| h.expect("hop filled")).collect();
 
     let src_spent_full = required_output;
     if src_spent_full <= send_max_val + 1e-9 {
@@ -887,17 +958,16 @@ fn back_solve_n_hop(
             target,
             src_spent: src_spent_full,
             chain,
-            hop_books,
-            hop_consumed,
+            hops,
         });
     }
 
     // Source spend exceeds SendMax. Without partial mode, fail. With it,
     // scale all consumption proportionally so the actual delivered amount
     // is the maximum reachable within SendMax. The flow is linear in each
-    // hop (offer slices are taken proportionally to the desired output),
-    // so a uniform scale factor `scale = send_max / src_spent_full`
-    // preserves the per-offer ratios.
+    // hop (offer slices and ripple-hop amounts are taken proportionally
+    // to the desired output), so a uniform scale factor preserves all
+    // per-offer and per-ripple ratios.
     if !partial_allowed {
         return Err(TransactionResult::TecPathPartial);
     }
@@ -913,10 +983,17 @@ fn back_solve_n_hop(
         // DeliverMin still requires Amount or fails.)
         return Err(TransactionResult::TecPathPartial);
     }
-    for hop in hop_consumed.iter_mut() {
-        for entry in hop.iter_mut() {
-            entry.2 *= scale;
-            entry.3 *= scale;
+    for action in hops.iter_mut() {
+        match action {
+            HopAction::Book { consumed, .. } => {
+                for entry in consumed.iter_mut() {
+                    entry.2 *= scale;
+                    entry.3 *= scale;
+                }
+            }
+            HopAction::Ripple { amount, .. } => {
+                *amount *= scale;
+            }
         }
     }
 
@@ -926,8 +1003,7 @@ fn back_solve_n_hop(
         target: scaled_target,
         src_spent: send_max_val,
         chain,
-        hop_books,
-        hop_consumed,
+        hops,
     })
 }
 
@@ -945,26 +1021,38 @@ fn commit_n_hop_plan(
         target,
         src_spent,
         chain,
-        hop_books,
-        hop_consumed,
+        hops,
     } = plan;
     let hop_count = chain.len() - 1;
+    debug_assert_eq!(hops.len(), hop_count);
 
     let (first_cur, first_iss) = &chain[0];
     apply_trust_delta(ctx, &src_id, first_iss, first_cur, -src_spent)?;
 
-    for hop in 0..hop_count {
+    for (hop, action) in hops.iter().enumerate() {
         let (in_cur, in_iss) = &chain[hop];
         let (out_cur, out_iss) = &chain[hop + 1];
-        let book = &hop_books[hop];
-        for (offer_key, owner_id, take_in, take_out) in &hop_consumed[hop] {
-            if *owner_id != *in_iss {
-                apply_trust_delta(ctx, owner_id, in_iss, in_cur, *take_in)?;
+        match action {
+            HopAction::Book { book, consumed } => {
+                for (offer_key, owner_id, take_in, take_out) in consumed {
+                    if *owner_id != *in_iss {
+                        apply_trust_delta(ctx, owner_id, in_iss, in_cur, *take_in)?;
+                    }
+                    if *owner_id != *out_iss {
+                        apply_trust_delta(ctx, owner_id, out_iss, out_cur, -*take_out)?;
+                    }
+                    update_consumed_offer(ctx, offer_key, book, *take_in, *take_out)?;
+                }
             }
-            if *owner_id != *out_iss {
-                apply_trust_delta(ctx, owner_id, out_iss, out_cur, -*take_out)?;
+            HopAction::Ripple { account, amount } => {
+                // Ripple-through: account absorbs the inbound IOU into its
+                // trust line with `in_iss`. The corresponding outflow as
+                // IOU issued by `account` is realised by the next hop's
+                // payer (book offer owner, next ripple account, or the
+                // destination), so we don't credit `account` against
+                // itself here.
+                apply_trust_delta(ctx, account, in_iss, in_cur, *amount)?;
             }
-            update_consumed_offer(ctx, offer_key, book, *take_in, *take_out)?;
         }
     }
 
@@ -2640,5 +2728,207 @@ mod tests {
         };
         let result = PaymentTransactor.apply(&mut ctx);
         assert_eq!(result, Err(TransactionResult::TecPathPartial));
+    }
+
+    // -- Account-rippling (Phase 3b) --
+
+    /// Two pure account-rippling hops chained: USD@ISSUER → MM → MM2,
+    /// with BOB holding (BOB, MM2, USD). No order books are crossed; each
+    /// hop just absorbs IOUs into the next account's trust line with the
+    /// inbound issuer.
+    #[test]
+    fn apply_cross_currency_ripple_two_hop_via_paths_succeeds() {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ISSUER, "100000000", None);
+        put_account(&mut ledger, ALICE, "50000000", None);
+        put_account(&mut ledger, BOB, "50000000", None);
+        put_account(&mut ledger, MM, "50000000", None);
+        put_account(&mut ledger, MM2, "50000000", None);
+
+        put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+        put_trust_line(&mut ledger, MM, ISSUER, "USD", 0.0);
+        put_trust_line(&mut ledger, MM2, MM, "USD", 0.0);
+        put_trust_line(&mut ledger, BOB, MM2, "USD", 0.0);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("USD", MM2, "30"),
+            "SendMax": iou("USD", ISSUER, "30"),
+            "Paths": [[
+                { "account": MM, "type": 0x01 },
+                { "account": MM2, "type": 0x01 }
+            ]],
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = PaymentTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        // Alice's USD@ISSUER trust line drained by the source spend; each
+        // rippling account picks up that amount against its inbound issuer.
+        assert!((holder_balance(&sandbox, ALICE, ISSUER, "USD") - 70.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM, ISSUER, "USD") - 30.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM2, MM, "USD") - 30.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, BOB, MM2, "USD") - 30.0).abs() < 1e-6);
+    }
+
+    /// Mixed strand: a ripple hop followed by a book hop. ALICE pays USD@A,
+    /// MM rippling-account absorbs it as (MM, ISSUER, USD), then an offer
+    /// owned by MM2 sells GBP@ISSUER for USD@MM — crossing the book moves
+    /// the GBP to BOB.
+    #[test]
+    fn apply_cross_currency_ripple_then_book_succeeds() {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ISSUER, "100000000", None);
+        put_account(&mut ledger, ALICE, "50000000", None);
+        put_account(&mut ledger, BOB, "50000000", None);
+        put_account(&mut ledger, MM, "50000000", None);
+        put_account(&mut ledger, MM2, "50000000", None);
+
+        // Source side trust line + ripple account's inbound trust line.
+        put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+        put_trust_line(&mut ledger, MM, ISSUER, "USD", 0.0);
+        // Book side: MM2 holds GBP@ISSUER and USD@MM trust lines.
+        put_trust_line(&mut ledger, MM2, MM, "USD", 0.0);
+        put_trust_line(&mut ledger, MM2, ISSUER, "GBP", 100.0);
+        // Destination's inbound trust line for GBP@ISSUER.
+        put_trust_line(&mut ledger, BOB, ISSUER, "GBP", 0.0);
+
+        // MM2 offers USD@MM ↔ GBP@ISSUER at 1:1.
+        let mm2_id = decode_account_id(MM2).unwrap();
+        let mm2_offer = keylet::offer(&mm2_id, 1);
+        ledger
+            .put_state(
+                mm2_offer,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "Offer",
+                    "Account": MM2,
+                    "Sequence": 1,
+                    "TakerPays": iou("USD", MM, "50"),
+                    "TakerGets": iou("GBP", ISSUER, "50"),
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let usd = helpers::currency_to_bytes("USD");
+        let gbp = helpers::currency_to_bytes("GBP");
+        let mm_id = decode_account_id(MM).unwrap();
+        let issuer_id = decode_account_id(ISSUER).unwrap();
+        let usd_mm_gbp_book = keylet::book_dir(&usd, &mm_id, &gbp, &issuer_id);
+        ledger
+            .put_state(
+                usd_mm_gbp_book,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "DirectoryNode",
+                    "Indexes": [mm2_offer.to_string()],
+                    "IndexNext": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("GBP", ISSUER, "25"),
+            "SendMax": iou("USD", ISSUER, "25"),
+            "Paths": [[
+                { "account": MM, "type": 0x01 },
+                { "currency": "GBP", "issuer": ISSUER, "type": 0x30 }
+            ]],
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = PaymentTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        assert!((holder_balance(&sandbox, ALICE, ISSUER, "USD") - 75.0).abs() < 1e-6);
+        // MM absorbed the 25 USD@ISSUER inflow during the ripple step.
+        assert!((holder_balance(&sandbox, MM, ISSUER, "USD") - 25.0).abs() < 1e-6);
+        // MM2 received 25 USD@MM and gave up 25 GBP@ISSUER.
+        assert!((holder_balance(&sandbox, MM2, MM, "USD") - 25.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM2, ISSUER, "GBP") - 75.0).abs() < 1e-6);
+        // BOB credited the 25 GBP@ISSUER.
+        assert!((holder_balance(&sandbox, BOB, ISSUER, "GBP") - 25.0).abs() < 1e-6);
+    }
+
+    /// A ripple path whose intermediate account lacks the inbound trust
+    /// line must be rejected, and the walker must fall back to a viable
+    /// alternative Path. Two alternatives: (a) ripple through MM3 (no
+    /// trust line — dead end) and (b) ripple through MM (live trust
+    /// line). MM2 is the destination-side issuer in both.
+    #[test]
+    fn apply_cross_currency_ripple_skips_path_without_trust_line() {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ISSUER, "100000000", None);
+        put_account(&mut ledger, ALICE, "50000000", None);
+        put_account(&mut ledger, BOB, "50000000", None);
+        put_account(&mut ledger, MM, "50000000", None);
+        put_account(&mut ledger, MM2, "50000000", None);
+        put_account(&mut ledger, MM3, "50000000", None);
+
+        put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+        // MM has the inbound trust line, MM3 does not.
+        put_trust_line(&mut ledger, MM, ISSUER, "USD", 0.0);
+        put_trust_line(&mut ledger, MM2, MM, "USD", 0.0);
+        put_trust_line(&mut ledger, BOB, MM2, "USD", 0.0);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("USD", MM2, "15"),
+            "SendMax": iou("USD", ISSUER, "15"),
+            "Paths": [
+                [
+                    { "account": MM3, "type": 0x01 },
+                    { "account": MM2, "type": 0x01 }
+                ],
+                [
+                    { "account": MM, "type": 0x01 },
+                    { "account": MM2, "type": 0x01 }
+                ],
+            ],
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = PaymentTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        // Routed via MM, leaving MM3's (non-existent) trust line untouched.
+        assert!((holder_balance(&sandbox, MM, ISSUER, "USD") - 15.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM2, MM, "USD") - 15.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, BOB, MM2, "USD") - 15.0).abs() < 1e-6);
     }
 }
