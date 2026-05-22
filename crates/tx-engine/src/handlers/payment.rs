@@ -1662,10 +1662,12 @@ mod tests {
     /// Two MMs both publish their own intermediate-currency offers and the
     /// transaction's `Paths` field lists both as alternatives. The walker
     /// must try each in order and route through the first viable Path.
+    ///
     /// Sets up:
     ///   * MM1 offers USD/EUR -> EUR/GBP (a usable 2-hop chain)
     ///   * MM2 offers USD/CHF only (a dead-end alternative; the EUR-step
     ///     book never gets crossed because CHF/GBP has no offers)
+    ///
     /// Asserts that the EUR alternative wins despite being listed second.
     #[test]
     fn apply_cross_currency_two_hop_picks_viable_alternative_path() {
