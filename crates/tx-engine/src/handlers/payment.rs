@@ -707,8 +707,12 @@ fn apply_two_hop_payment(
     // Hop 2 (int -> dst): book keyed by pays = int, gets = dst. Offers are
     // selling dst for int. We consume in quality order to back-solve how
     // much intermediate currency we need to deliver the target.
-    let hop2_book =
-        keylet::book_dir(&int_cur_bytes, &int_issuer_id, &dst_cur_bytes, &dst_issuer_id);
+    let hop2_book = keylet::book_dir(
+        &int_cur_bytes,
+        &int_issuer_id,
+        &dst_cur_bytes,
+        &dst_issuer_id,
+    );
     let hop2_offers = collect_book_offers(ctx, &hop2_book);
 
     let mut hop2_remaining = target;
@@ -738,8 +742,12 @@ fn apply_two_hop_payment(
 
     // Hop 1 (src -> int): book keyed by pays = src, gets = int. Offers sell
     // int for src. Consume just enough to produce `intermediate_required`.
-    let hop1_book =
-        keylet::book_dir(&src_cur_bytes, &src_issuer_id, &int_cur_bytes, &int_issuer_id);
+    let hop1_book = keylet::book_dir(
+        &src_cur_bytes,
+        &src_issuer_id,
+        &int_cur_bytes,
+        &int_issuer_id,
+    );
     let hop1_offers = collect_book_offers(ctx, &hop1_book);
 
     let mut hop1_remaining = intermediate_required;
