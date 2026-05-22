@@ -529,9 +529,12 @@ fn apply_cross_currency(
     // missing, mismatched issuer/currency, etc.) are skipped. If no Path
     // succeeds, fall through to the legacy direct-book lookup below.
     if let Some(paths) = ctx.tx.get("Paths").and_then(|v| v.as_array()) {
+        let (src_cur_for_inherit, src_iss_for_inherit, _) = send_max;
         let mut best: Option<NHopPlan> = None;
         for path in paths {
-            let Some(intermediates) = path.as_array().and_then(simple_path_intermediates) else {
+            let Some(intermediates) = path.as_array().and_then(|p| {
+                simple_path_intermediates(p, src_cur_for_inherit, src_iss_for_inherit)
+            }) else {
                 continue;
             };
             if intermediates.is_empty() {
@@ -656,22 +659,54 @@ fn apply_cross_currency(
     Ok(TransactionResult::TesSuccess)
 }
 
-/// Inspect a single Path (array of step objects) and, if every step is a
-/// pure currency-change (`type == 0x30`, currency + issuer), return the
-/// chain of `(currency, issuer)` intermediates in walk order. Returns
-/// `None` if any step is account-rippling, has an unsupported type bitmap,
-/// or is unparseable. Mirrors rippled's PathStep bitmap: 0x10 = currency
-/// change, 0x20 = issuer change.
-fn simple_path_intermediates(path: &Vec<serde_json::Value>) -> Option<Vec<(String, String)>> {
+/// Inspect a single Path (array of step objects) and resolve each step's
+/// effective `(currency, issuer)` by walking the inheritance chain from
+/// the source side. Returns the fully resolved chain of intermediates in
+/// walk order, or `None` if any step is account-rippling (`type & 0x01`,
+/// reserved for Phase 3b) or carries no `0x10`/`0x20` bits at all.
+///
+/// rippled's PathStep bitmap:
+///   * `0x10` (PATH_STEP_CURRENCY): currency comes from the step
+///   * `0x20` (PATH_STEP_ISSUER): issuer comes from the step
+///   * `0x30` (combined): both come from the step
+///   * `0x01` (PATH_STEP_ACCOUNT): account-rippling, NOT supported here
+///
+/// For a `0x10`-only step the issuer is inherited from the previous hop
+/// (or the source side for the first step). For a `0x20`-only step the
+/// currency is inherited the same way. This is how cross-issuer hops
+/// (USD@A → USD@B via a `0x20` step) and currency-only chains are
+/// expressed in rippled's wire format.
+fn simple_path_intermediates(
+    path: &Vec<serde_json::Value>,
+    src_cur: &str,
+    src_iss: &str,
+) -> Option<Vec<(String, String)>> {
+    const PATH_STEP_ACCOUNT: u64 = 0x01;
+    const PATH_STEP_CURRENCY: u64 = 0x10;
+    const PATH_STEP_ISSUER: u64 = 0x20;
+
     let mut out = Vec::with_capacity(path.len());
+    let mut current_cur = src_cur.to_string();
+    let mut current_iss = src_iss.to_string();
     for step in path {
         let step_type = step.get("type").and_then(|v| v.as_u64()).unwrap_or(0);
-        if step_type != 0x30 {
+        if step_type & PATH_STEP_ACCOUNT != 0 {
+            // Account-rippling steps are Phase 3b territory; fall through to
+            // alternative Paths or the legacy direct-book code.
             return None;
         }
-        let currency = step.get("currency").and_then(|v| v.as_str())?.to_string();
-        let issuer = step.get("issuer").and_then(|v| v.as_str())?.to_string();
-        out.push((currency, issuer));
+        let has_currency = step_type & PATH_STEP_CURRENCY != 0;
+        let has_issuer = step_type & PATH_STEP_ISSUER != 0;
+        if !has_currency && !has_issuer {
+            return None;
+        }
+        if has_currency {
+            current_cur = step.get("currency").and_then(|v| v.as_str())?.to_string();
+        }
+        if has_issuer {
+            current_iss = step.get("issuer").and_then(|v| v.as_str())?.to_string();
+        }
+        out.push((current_cur.clone(), current_iss.clone()));
     }
     Some(out)
 }
@@ -2100,5 +2135,206 @@ mod tests {
         assert!((holder_balance(&sandbox, MM2, ISSUER, "EUR") - 0.0).abs() < 1e-6);
         assert!((holder_balance(&sandbox, MM, ISSUER, "JPY") - 120.0).abs() < 1e-6);
         assert!((holder_balance(&sandbox, MM3, ISSUER, "JPY") - 80.0).abs() < 1e-6);
+    }
+
+    // -- Mixed-issuer hops (Phase 3c) --
+
+    const ISSUER2: &str = "rJrxi4Wxev4bnAGVNP9YCdKPdAoKfAmcsi";
+
+    /// A Path step with `type == 0x10` carries a currency change but no
+    /// issuer field; the walker must inherit the issuer from the previous
+    /// hop (source side here). Hop chain: USD@ISSUER -> EUR@ISSUER.
+    /// Verifies the inheritance behavior on a single step.
+    #[test]
+    fn apply_cross_currency_inherits_issuer_from_source_side() {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ISSUER, "100000000", None);
+        put_account(&mut ledger, ALICE, "50000000", None);
+        put_account(&mut ledger, BOB, "50000000", None);
+        put_account(&mut ledger, MM, "50000000", None);
+
+        put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+        put_trust_line(&mut ledger, BOB, ISSUER, "EUR", 0.0);
+        put_trust_line(&mut ledger, MM, ISSUER, "USD", 0.0);
+        put_trust_line(&mut ledger, MM, ISSUER, "EUR", 100.0);
+
+        let mm_id = decode_account_id(MM).unwrap();
+        let mm_offer = keylet::offer(&mm_id, 1);
+        ledger
+            .put_state(
+                mm_offer,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "Offer",
+                    "Account": MM,
+                    "Sequence": 1,
+                    "TakerPays": iou("USD", ISSUER, "50"),
+                    "TakerGets": iou("EUR", ISSUER, "50"),
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let usd = helpers::currency_to_bytes("USD");
+        let eur = helpers::currency_to_bytes("EUR");
+        let issuer_id = decode_account_id(ISSUER).unwrap();
+        let book = keylet::book_dir(&usd, &issuer_id, &eur, &issuer_id);
+        ledger
+            .put_state(
+                book,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "DirectoryNode",
+                    "Indexes": [mm_offer.to_string()],
+                    "IndexNext": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("EUR", ISSUER, "20"),
+            "SendMax": iou("USD", ISSUER, "20"),
+            // type == 0x10 → currency-only step; issuer is inherited from
+            // the source side (ISSUER) and produces the same hop chain as
+            // the 0x30 form `{ "currency": "EUR", "issuer": ISSUER }`.
+            "Paths": [[ { "currency": "EUR", "type": 0x10 } ]],
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = PaymentTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+        assert!((holder_balance(&sandbox, BOB, ISSUER, "EUR") - 20.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, ALICE, ISSUER, "USD") - 80.0).abs() < 1e-6);
+    }
+
+    /// Cross-issuer chain: USD@ISSUER -> USD@ISSUER2 (issuer-only step
+    /// `type == 0x20`, currency inherited from source) -> EUR@ISSUER2
+    /// (final hop into the destination Amount). Exercises both inheritance
+    /// directions and the `book_dir(pays_cur, pays_iss, gets_cur, gets_iss)`
+    /// lookup with `pays_cur == gets_cur` but distinct issuers.
+    #[test]
+    fn apply_cross_currency_two_hop_mixed_issuer() {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ISSUER, "100000000", None);
+        put_account(&mut ledger, ISSUER2, "100000000", None);
+        put_account(&mut ledger, ALICE, "50000000", None);
+        put_account(&mut ledger, BOB, "50000000", None);
+        put_account(&mut ledger, MM, "50000000", None);
+        put_account(&mut ledger, MM2, "50000000", None);
+
+        put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+        put_trust_line(&mut ledger, BOB, ISSUER2, "EUR", 0.0);
+        // MM accepts USD@ISSUER, gives USD@ISSUER2.
+        put_trust_line(&mut ledger, MM, ISSUER, "USD", 0.0);
+        put_trust_line(&mut ledger, MM, ISSUER2, "USD", 100.0);
+        // MM2 accepts USD@ISSUER2, gives EUR@ISSUER2.
+        put_trust_line(&mut ledger, MM2, ISSUER2, "USD", 0.0);
+        put_trust_line(&mut ledger, MM2, ISSUER2, "EUR", 100.0);
+
+        let mm_id = decode_account_id(MM).unwrap();
+        let mm_offer = keylet::offer(&mm_id, 1);
+        ledger
+            .put_state(
+                mm_offer,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "Offer",
+                    "Account": MM,
+                    "Sequence": 1,
+                    "TakerPays": iou("USD", ISSUER, "50"),
+                    "TakerGets": iou("USD", ISSUER2, "50"),
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let mm2_id = decode_account_id(MM2).unwrap();
+        let mm2_offer = keylet::offer(&mm2_id, 1);
+        ledger
+            .put_state(
+                mm2_offer,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "Offer",
+                    "Account": MM2,
+                    "Sequence": 1,
+                    "TakerPays": iou("USD", ISSUER2, "50"),
+                    "TakerGets": iou("EUR", ISSUER2, "50"),
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let usd = helpers::currency_to_bytes("USD");
+        let eur = helpers::currency_to_bytes("EUR");
+        let issuer_id = decode_account_id(ISSUER).unwrap();
+        let issuer2_id = decode_account_id(ISSUER2).unwrap();
+        let usd_usd2 = keylet::book_dir(&usd, &issuer_id, &usd, &issuer2_id);
+        let usd2_eur2 = keylet::book_dir(&usd, &issuer2_id, &eur, &issuer2_id);
+        ledger
+            .put_state(
+                usd_usd2,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "DirectoryNode",
+                    "Indexes": [mm_offer.to_string()],
+                    "IndexNext": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        ledger
+            .put_state(
+                usd2_eur2,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "DirectoryNode",
+                    "Indexes": [mm2_offer.to_string()],
+                    "IndexNext": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("EUR", ISSUER2, "20"),
+            "SendMax": iou("USD", ISSUER, "20"),
+            // Single intermediate USD@ISSUER2 expressed with an issuer-only
+            // step (`type == 0x20`); currency stays USD via inheritance. The
+            // destination Amount (EUR@ISSUER2) closes the chain — the walker
+            // appends it as the final hop boundary automatically.
+            "Paths": [[
+                { "issuer": ISSUER2, "type": 0x20 }
+            ]],
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = PaymentTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+        assert!((holder_balance(&sandbox, BOB, ISSUER2, "EUR") - 20.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, ALICE, ISSUER, "USD") - 80.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM, ISSUER, "USD") - 20.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM, ISSUER2, "USD") - 80.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM2, ISSUER2, "USD") - 20.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM2, ISSUER2, "EUR") - 80.0).abs() < 1e-6);
     }
 }
