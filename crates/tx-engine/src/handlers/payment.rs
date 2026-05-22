@@ -451,6 +451,21 @@ fn get_send_max_iou(tx: &serde_json::Value) -> Option<(&str, &str, &str)> {
     ))
 }
 
+/// Extract a DeliverMin IOU object as (currency, issuer, value). Returned
+/// only when `DeliverMin` is set as an IOU object; XRP-amount variants are
+/// not yet supported here (they only matter for XRP-only Payments).
+fn get_deliver_min_iou(tx: &serde_json::Value) -> Option<(&str, &str, &str)> {
+    let dm = tx.get("DeliverMin")?;
+    if !dm.is_object() {
+        return None;
+    }
+    Some((
+        dm.get("currency")?.as_str()?,
+        dm.get("issuer")?.as_str()?,
+        dm.get("value")?.as_str()?,
+    ))
+}
+
 /// Read the issuer's TransferRate as a multiplier (1.0 = no fee).
 fn issuer_transfer_rate(ctx: &ApplyContext<'_>, issuer_id: &rxrpl_primitives::AccountId) -> f64 {
     let key = keylet::account(issuer_id);
@@ -528,6 +543,30 @@ fn apply_cross_currency(
     // Paths the back-solve cannot satisfy (insufficient liquidity, books
     // missing, mismatched issuer/currency, etc.) are skipped. If no Path
     // succeeds, fall through to the legacy direct-book lookup below.
+    // tfPartialPayment allows delivering less than `Amount` when the
+    // requested target is unreachable within `SendMax`. The minimum
+    // acceptable delivery is given by `DeliverMin` (defaults to `Amount`,
+    // i.e. partial mode disabled for paths that can reach the full target).
+    const TF_PARTIAL_PAYMENT: u32 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT;
+    let partial_allowed = helpers::get_flags(ctx.tx) & TF_PARTIAL_PAYMENT != 0;
+    let deliver_min: Option<f64> = get_deliver_min_iou(ctx.tx).and_then(|(cur, iss, val)| {
+        if cur == amount.0 && iss == amount.1 {
+            val.parse::<f64>().ok()
+        } else {
+            None
+        }
+    });
+    // DeliverMin must not exceed Amount when both are present.
+    if let Some(d_min) = deliver_min {
+        let target_val: f64 = amount
+            .2
+            .parse()
+            .map_err(|_| TransactionResult::TemBadAmount)?;
+        if d_min > target_val + 1e-9 {
+            return Err(TransactionResult::TemBadAmount);
+        }
+    }
+
     if let Some(paths) = ctx.tx.get("Paths").and_then(|v| v.as_array()) {
         let (src_cur_for_inherit, src_iss_for_inherit, _) = send_max;
         let mut best: Option<NHopPlan> = None;
@@ -547,6 +586,8 @@ fn apply_cross_currency(
                 amount,
                 send_max,
                 &intermediates,
+                partial_allowed,
+                deliver_min,
             ) else {
                 continue;
             };
@@ -742,8 +783,14 @@ struct NHopPlan {
 /// and return the resolved `NHopPlan`. No mutations are applied — every
 /// read is via `collect_book_offers` and the surrounding sandbox view.
 ///
-/// Returns `Err(TecPathPartial)` if any hop runs short of liquidity or the
-/// total source spend exceeds `SendMax`.
+/// When `partial_allowed` is `true` and the back-solve's required source
+/// spend exceeds `SendMax`, the plan is scaled down linearly so the actual
+/// delivered amount is the maximum reachable within `SendMax`. The scaled
+/// delivery must still be at least `deliver_min` (when supplied) or the
+/// call fails `TecPathPartial`. Without `partial_allowed`, any shortfall
+/// (insufficient liquidity at any hop OR `src_spent > SendMax`) returns
+/// `TecPathPartial`.
+#[allow(clippy::too_many_arguments)]
 fn back_solve_n_hop(
     ctx: &mut ApplyContext<'_>,
     account_str: &str,
@@ -751,6 +798,8 @@ fn back_solve_n_hop(
     amount: (&str, &str, &str),
     send_max: (&str, &str, &str),
     intermediates: &[(String, String)],
+    partial_allowed: bool,
+    deliver_min: Option<f64>,
 ) -> Result<NHopPlan, TransactionResult> {
     let (dst_cur, dst_iss, dst_val) = amount;
     let (src_cur, src_iss, src_max) = send_max;
@@ -830,16 +879,52 @@ fn back_solve_n_hop(
     }
     hop_books.reverse();
 
-    let src_spent = required_output;
-    if src_spent > send_max_val + 1e-9 {
+    let src_spent_full = required_output;
+    if src_spent_full <= send_max_val + 1e-9 {
+        return Ok(NHopPlan {
+            src_id,
+            dest_id,
+            target,
+            src_spent: src_spent_full,
+            chain,
+            hop_books,
+            hop_consumed,
+        });
+    }
+
+    // Source spend exceeds SendMax. Without partial mode, fail. With it,
+    // scale all consumption proportionally so the actual delivered amount
+    // is the maximum reachable within SendMax. The flow is linear in each
+    // hop (offer slices are taken proportionally to the desired output),
+    // so a uniform scale factor `scale = send_max / src_spent_full`
+    // preserves the per-offer ratios.
+    if !partial_allowed {
         return Err(TransactionResult::TecPathPartial);
+    }
+    let scale = send_max_val / src_spent_full;
+    let scaled_target = target * scale;
+    if let Some(d_min) = deliver_min {
+        if scaled_target + 1e-9 < d_min {
+            return Err(TransactionResult::TecPathPartial);
+        }
+    } else if scaled_target + 1e-9 < target {
+        // No DeliverMin specified: partial mode requires Amount delivered
+        // in full. (rippled's behavior — tfPartialPayment without
+        // DeliverMin still requires Amount or fails.)
+        return Err(TransactionResult::TecPathPartial);
+    }
+    for hop in hop_consumed.iter_mut() {
+        for entry in hop.iter_mut() {
+            entry.2 *= scale;
+            entry.3 *= scale;
+        }
     }
 
     Ok(NHopPlan {
         src_id,
         dest_id,
-        target,
-        src_spent,
+        target: scaled_target,
+        src_spent: send_max_val,
         chain,
         hop_books,
         hop_consumed,
@@ -2336,5 +2421,224 @@ mod tests {
         assert!((holder_balance(&sandbox, MM, ISSUER2, "USD") - 80.0).abs() < 1e-6);
         assert!((holder_balance(&sandbox, MM2, ISSUER2, "USD") - 20.0).abs() < 1e-6);
         assert!((holder_balance(&sandbox, MM2, ISSUER2, "EUR") - 80.0).abs() < 1e-6);
+    }
+
+    // -- DeliverMin / tfPartialPayment (Phase 4) --
+
+    const TF_PARTIAL_PAYMENT_TEST: u32 = 0x0002_0000;
+
+    /// SendMax is half of what's needed to deliver the full Amount. Without
+    /// `tfPartialPayment` the walker returns TecPathPartial. With the flag
+    /// set and a DeliverMin <= the achievable amount, the walker scales the
+    /// flow down linearly and delivers exactly half.
+    #[test]
+    fn apply_cross_currency_partial_payment_with_deliver_min() {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ISSUER, "100000000", None);
+        put_account(&mut ledger, ALICE, "50000000", None);
+        put_account(&mut ledger, BOB, "50000000", None);
+        put_account(&mut ledger, MM, "50000000", None);
+        put_account(&mut ledger, MM2, "50000000", None);
+
+        put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+        put_trust_line(&mut ledger, BOB, ISSUER, "GBP", 0.0);
+        put_trust_line(&mut ledger, MM, ISSUER, "USD", 0.0);
+        put_trust_line(&mut ledger, MM, ISSUER, "EUR", 100.0);
+        put_trust_line(&mut ledger, MM2, ISSUER, "EUR", 0.0);
+        put_trust_line(&mut ledger, MM2, ISSUER, "GBP", 100.0);
+
+        let mm_id = decode_account_id(MM).unwrap();
+        let mm_offer = keylet::offer(&mm_id, 1);
+        ledger
+            .put_state(
+                mm_offer,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "Offer",
+                    "Account": MM,
+                    "Sequence": 1,
+                    "TakerPays": iou("USD", ISSUER, "50"),
+                    "TakerGets": iou("EUR", ISSUER, "50"),
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let mm2_id = decode_account_id(MM2).unwrap();
+        let mm2_offer = keylet::offer(&mm2_id, 1);
+        ledger
+            .put_state(
+                mm2_offer,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "Offer",
+                    "Account": MM2,
+                    "Sequence": 1,
+                    "TakerPays": iou("EUR", ISSUER, "50"),
+                    "TakerGets": iou("GBP", ISSUER, "50"),
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let usd = helpers::currency_to_bytes("USD");
+        let eur = helpers::currency_to_bytes("EUR");
+        let gbp = helpers::currency_to_bytes("GBP");
+        let issuer_id = decode_account_id(ISSUER).unwrap();
+        for (book, key) in [
+            (
+                keylet::book_dir(&usd, &issuer_id, &eur, &issuer_id),
+                mm_offer,
+            ),
+            (
+                keylet::book_dir(&eur, &issuer_id, &gbp, &issuer_id),
+                mm2_offer,
+            ),
+        ] {
+            ledger
+                .put_state(
+                    book,
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "DirectoryNode",
+                        "Indexes": [key.to_string()],
+                        "IndexNext": 0,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        // Want 20 GBP but only willing to spend 10 USD (need 20 USD for the
+        // full target). Partial mode with DeliverMin = 5 GBP allows the
+        // walker to deliver 10 GBP (the max within SendMax).
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("GBP", ISSUER, "20"),
+            "SendMax": iou("USD", ISSUER, "10"),
+            "DeliverMin": iou("GBP", ISSUER, "5"),
+            "Flags": TF_PARTIAL_PAYMENT_TEST,
+            "Paths": [[ { "currency": "EUR", "issuer": ISSUER, "type": 0x30 } ]],
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = PaymentTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        // Alice spent SendMax (10 USD), Bob received scaled half (10 GBP).
+        assert!((holder_balance(&sandbox, ALICE, ISSUER, "USD") - 90.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, BOB, ISSUER, "GBP") - 10.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM, ISSUER, "USD") - 10.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM, ISSUER, "EUR") - 90.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM2, ISSUER, "EUR") - 10.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM2, ISSUER, "GBP") - 90.0).abs() < 1e-6);
+    }
+
+    /// Same setup as above but without the `tfPartialPayment` flag: the
+    /// walker must reject the under-funded payment with TecPathPartial.
+    #[test]
+    fn apply_cross_currency_partial_disabled_returns_tec_path_partial() {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ISSUER, "100000000", None);
+        put_account(&mut ledger, ALICE, "50000000", None);
+        put_account(&mut ledger, BOB, "50000000", None);
+        put_account(&mut ledger, MM, "50000000", None);
+        put_account(&mut ledger, MM2, "50000000", None);
+        put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+        put_trust_line(&mut ledger, BOB, ISSUER, "GBP", 0.0);
+        put_trust_line(&mut ledger, MM, ISSUER, "USD", 0.0);
+        put_trust_line(&mut ledger, MM, ISSUER, "EUR", 100.0);
+        put_trust_line(&mut ledger, MM2, ISSUER, "EUR", 0.0);
+        put_trust_line(&mut ledger, MM2, ISSUER, "GBP", 100.0);
+
+        let mm_id = decode_account_id(MM).unwrap();
+        let mm_offer = keylet::offer(&mm_id, 1);
+        ledger
+            .put_state(
+                mm_offer,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "Offer",
+                    "Account": MM,
+                    "Sequence": 1,
+                    "TakerPays": iou("USD", ISSUER, "50"),
+                    "TakerGets": iou("EUR", ISSUER, "50"),
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let mm2_id = decode_account_id(MM2).unwrap();
+        let mm2_offer = keylet::offer(&mm2_id, 1);
+        ledger
+            .put_state(
+                mm2_offer,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "Offer",
+                    "Account": MM2,
+                    "Sequence": 1,
+                    "TakerPays": iou("EUR", ISSUER, "50"),
+                    "TakerGets": iou("GBP", ISSUER, "50"),
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let usd = helpers::currency_to_bytes("USD");
+        let eur = helpers::currency_to_bytes("EUR");
+        let gbp = helpers::currency_to_bytes("GBP");
+        let issuer_id = decode_account_id(ISSUER).unwrap();
+        for (book, key) in [
+            (
+                keylet::book_dir(&usd, &issuer_id, &eur, &issuer_id),
+                mm_offer,
+            ),
+            (
+                keylet::book_dir(&eur, &issuer_id, &gbp, &issuer_id),
+                mm2_offer,
+            ),
+        ] {
+            ledger
+                .put_state(
+                    book,
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "DirectoryNode",
+                        "Indexes": [key.to_string()],
+                        "IndexNext": 0,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("GBP", ISSUER, "20"),
+            "SendMax": iou("USD", ISSUER, "10"),
+            // No DeliverMin, no tfPartialPayment.
+            "Paths": [[ { "currency": "EUR", "issuer": ISSUER, "type": 0x30 } ]],
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = PaymentTransactor.apply(&mut ctx);
+        assert_eq!(result, Err(TransactionResult::TecPathPartial));
     }
 }
