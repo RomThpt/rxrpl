@@ -323,6 +323,25 @@ impl ValidatorIdentity {
         }
     }
 
+    /// Same as [`two_key`] but with explicit key types per seed. Use this
+    /// when the seeds were originally parsed from base58 family-seed
+    /// strings whose prefix encodes the algorithm (`sEd...` → ed25519,
+    /// `sn...`/`sp...` → secp256k1). The legacy [`two_key`] always
+    /// derives secp256k1; this honors the algorithm declared by the seed.
+    ///
+    /// [`two_key`]: ValidatorIdentity::two_key
+    pub fn two_key_typed(
+        master_seed: &Seed,
+        master_kt: rxrpl_crypto::KeyType,
+        signing_seed: &Seed,
+        signing_kt: rxrpl_crypto::KeyType,
+    ) -> Self {
+        Self {
+            master: rxrpl_crypto::KeyPair::from_seed(master_seed, master_kt),
+            signing: rxrpl_crypto::KeyPair::from_seed(signing_seed, signing_kt),
+        }
+    }
+
     /// Construct a validator identity with master == signing (single seed).
     ///
     /// Convenience for tests, dev networks, and the legacy single-key

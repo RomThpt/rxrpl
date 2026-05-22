@@ -3721,18 +3721,42 @@ fn build_validator_identity(
         )
     })?;
 
-    let master_bytes = parse_node_seed(master_str)
+    let (master_bytes, master_kt) = parse_node_seed_with_type(master_str)
         .map_err(|e| NodeError::Config(format!("invalid validator_identity.master_secret: {e}")))?;
-    let ephemeral_bytes = parse_node_seed(ephemeral_str).map_err(|e| {
-        NodeError::Config(format!("invalid validator_identity.ephemeral_seed: {e}"))
-    })?;
+    let (ephemeral_bytes, ephemeral_kt) =
+        parse_node_seed_with_type(ephemeral_str).map_err(|e| {
+            NodeError::Config(format!("invalid validator_identity.ephemeral_seed: {e}"))
+        })?;
 
     let master_seed = rxrpl_crypto::Seed::from_bytes(master_bytes);
     let ephemeral_seed = rxrpl_crypto::Seed::from_bytes(ephemeral_bytes);
-    Ok(Some(rxrpl_overlay::identity::ValidatorIdentity::two_key(
-        &master_seed,
-        &ephemeral_seed,
-    )))
+    Ok(Some(
+        rxrpl_overlay::identity::ValidatorIdentity::two_key_typed(
+            &master_seed,
+            master_kt,
+            &ephemeral_seed,
+            ephemeral_kt,
+        ),
+    ))
+}
+
+/// Like `parse_node_seed` but also returns the inferred [`KeyType`] from
+/// the base58 family-seed prefix (`sEd...` → ed25519, `sn...`/`sp...` →
+/// secp256k1). Hex-only input defaults to secp256k1 since the raw bytes
+/// carry no prefix.
+fn parse_node_seed_with_type(s: &str) -> Result<([u8; 16], rxrpl_crypto::KeyType), String> {
+    let trimmed = s.trim();
+    if trimmed.len() == 32 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        let bytes = hex::decode(trimmed).map_err(|e| format!("invalid hex: {e}"))?;
+        if bytes.len() != 16 {
+            return Err("hex seed must decode to 16 bytes".into());
+        }
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&bytes);
+        return Ok((out, rxrpl_crypto::KeyType::Secp256k1));
+    }
+    rxrpl_codec::address::seed::decode_seed(trimmed)
+        .map_err(|e| format!("invalid base58 family seed: {e}"))
 }
 
 /// Decode a `node_seed` config value into raw 16-byte seed entropy.
