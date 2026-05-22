@@ -781,9 +781,23 @@ fn simple_path_intermediates(
     Some(out)
 }
 
+/// AMM swap consumed during a Book hop's back-solve. The remaining
+/// required output not satisfied by the order book is routed through
+/// the AMM via constant-product math.
+struct AmmConsume {
+    amm_key: rxrpl_primitives::Hash256,
+    in_amount: f64,
+    out_amount: f64,
+    /// `true` when the inbound currency matches PoolBalance1 in the AMM
+    /// SLE, `false` when it matches PoolBalance2. Drives which side of
+    /// the pool gets incremented vs decremented at commit time.
+    in_is_pool1: bool,
+}
+
 /// Per-hop application kind. `Book` hops cross an order book and consume
-/// a list of offers; `Ripple` hops transit through `account`, which takes
-/// the inbound IOU into its trust line with the previous issuer.
+/// a list of offers (plus an optional AMM swap for the residual output);
+/// `Ripple` hops transit through `account`, which takes the inbound IOU
+/// into its trust line with the previous issuer.
 enum HopAction {
     Book {
         book: rxrpl_primitives::Hash256,
@@ -793,6 +807,7 @@ enum HopAction {
             f64,
             f64,
         )>,
+        amm: Option<AmmConsume>,
     },
     Ripple {
         account: rxrpl_primitives::AccountId,
@@ -942,10 +957,28 @@ fn back_solve_n_hop(
             remaining -= take_out;
             input_required += take_in;
         }
+
+        // Residual liquidity from the AMM, when one is registered for the
+        // (in, out) pair and the book ran out before satisfying
+        // `required_output`. The swap input feeds back into `input_required`
+        // so the upstream hop sees the AMM cost as part of the source spend.
+        let mut amm: Option<AmmConsume> = None;
+        if remaining > 1e-9 {
+            if let Some(quote) = quote_amm_swap(ctx, in_cur, in_iss, out_cur, out_iss, remaining) {
+                input_required += quote.in_amount;
+                remaining = 0.0;
+                amm = Some(quote);
+            }
+        }
+
         if remaining > 1e-9 {
             return Err(TransactionResult::TecPathPartial);
         }
-        hops[hop] = Some(HopAction::Book { book, consumed });
+        hops[hop] = Some(HopAction::Book {
+            book,
+            consumed,
+            amm,
+        });
         required_output = input_required;
     }
     let mut hops: Vec<HopAction> = hops.into_iter().map(|h| h.expect("hop filled")).collect();
@@ -983,6 +1016,16 @@ fn back_solve_n_hop(
         // DeliverMin still requires Amount or fails.)
         return Err(TransactionResult::TecPathPartial);
     }
+    // Refuse partial scaling for strands that touch the AMM: the swap is
+    // non-linear (constant product), so a uniform `scale` would diverge
+    // from the actual on-chain quote. A future revision could re-solve
+    // every AMM leg under the scaled target; for now, callers must size
+    // their SendMax / DeliverMin so the strand fits without scaling.
+    for action in hops.iter() {
+        if let HopAction::Book { amm: Some(_), .. } = action {
+            return Err(TransactionResult::TecPathPartial);
+        }
+    }
     for action in hops.iter_mut() {
         match action {
             HopAction::Book { consumed, .. } => {
@@ -1005,6 +1048,103 @@ fn back_solve_n_hop(
         chain,
         hops,
     })
+}
+
+/// Back-solve a single-leg AMM swap for the given hop pair. Returns
+/// `Some(AmmConsume)` when an AMM SLE exists for `(in, out)` and has
+/// enough liquidity to deliver `out_take`; otherwise `None`.
+///
+/// Pricing follows rippled's constant-product convention with the
+/// trading fee taken from the input:
+///
+///   effective_in = input * (1 - fee_bps / 100_000)
+///   (pool_in + effective_in) * (pool_out - out_take) = pool_in * pool_out
+///
+/// Solving for `input` gives `out_take`'s required quote.
+fn quote_amm_swap(
+    ctx: &mut ApplyContext<'_>,
+    in_cur: &[u8; 20],
+    in_iss: &rxrpl_primitives::AccountId,
+    out_cur: &[u8; 20],
+    out_iss: &rxrpl_primitives::AccountId,
+    out_take: f64,
+) -> Option<AmmConsume> {
+    if out_take <= 1e-9 {
+        return None;
+    }
+    let amm_key = rxrpl_protocol::keylet::amm(in_cur, in_iss, out_cur, out_iss);
+    let amm_bytes = ctx.view.read(&amm_key)?;
+    let amm: serde_json::Value = serde_json::from_slice(&amm_bytes).ok()?;
+
+    let pool1 = crate::amm_helpers::get_pool_field(&amm, "PoolBalance1") as f64;
+    let pool2 = crate::amm_helpers::get_pool_field(&amm, "PoolBalance2") as f64;
+    if pool1 <= 0.0 || pool2 <= 0.0 {
+        return None;
+    }
+
+    // The AMM keylet sorts its two assets canonically (see
+    // `amm_helpers::sort_assets`). PoolBalance1 corresponds to the
+    // lexicographically-smaller `(currency, issuer)` tuple. Match the
+    // incoming currency against that ordering to pick the right side.
+    let in_key = (in_cur.as_slice(), in_iss.as_bytes());
+    let out_key = (out_cur.as_slice(), out_iss.as_bytes());
+    let in_is_pool1 = in_key <= out_key;
+    let (pool_in, pool_out) = if in_is_pool1 {
+        (pool1, pool2)
+    } else {
+        (pool2, pool1)
+    };
+    if out_take >= pool_out {
+        // Cannot withdraw the entire pool; rippled rejects this as
+        // insufficient liquidity.
+        return None;
+    }
+
+    let fee_bps = amm.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as f64;
+    let fee_fraction = (fee_bps / 100_000.0).clamp(0.0, 0.999);
+    let new_pool_out = pool_out - out_take;
+    let effective_in = pool_in * pool_out / new_pool_out - pool_in;
+    let in_amount = effective_in / (1.0 - fee_fraction);
+    if !in_amount.is_finite() || in_amount <= 0.0 {
+        return None;
+    }
+
+    Some(AmmConsume {
+        amm_key,
+        in_amount,
+        out_amount: out_take,
+        in_is_pool1,
+    })
+}
+
+/// Commit the AMM-side of a Book hop: update the SLE's `PoolBalance1`
+/// and `PoolBalance2` fields to reflect the swap. Mirrors the
+/// `amm_deposit` handler's policy of touching only the on-SLE pool
+/// fields and skipping the pseudo-account's trust-line balances.
+fn apply_amm_swap(ctx: &mut ApplyContext<'_>, swap: &AmmConsume) -> Result<(), TransactionResult> {
+    let bytes = ctx
+        .view
+        .read(&swap.amm_key)
+        .ok_or(TransactionResult::TecNoEntry)?;
+    let mut amm: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let pool1 = crate::amm_helpers::get_pool_field(&amm, "PoolBalance1") as f64;
+    let pool2 = crate::amm_helpers::get_pool_field(&amm, "PoolBalance2") as f64;
+    let (new_pool1, new_pool2) = if swap.in_is_pool1 {
+        (pool1 + swap.in_amount, pool2 - swap.out_amount)
+    } else {
+        (pool1 - swap.out_amount, pool2 + swap.in_amount)
+    };
+    if new_pool1 < 0.0 || new_pool2 < 0.0 {
+        return Err(TransactionResult::TecPathPartial);
+    }
+    amm["PoolBalance1"] = serde_json::Value::String((new_pool1 as u64).to_string());
+    amm["PoolBalance2"] = serde_json::Value::String((new_pool2 as u64).to_string());
+    let data = serde_json::to_vec(&amm).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(swap.amm_key, data)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    Ok(())
 }
 
 /// Apply the mutations for a previously back-solved `NHopPlan`. Walks hops
@@ -1033,7 +1173,11 @@ fn commit_n_hop_plan(
         let (in_cur, in_iss) = &chain[hop];
         let (out_cur, out_iss) = &chain[hop + 1];
         match action {
-            HopAction::Book { book, consumed } => {
+            HopAction::Book {
+                book,
+                consumed,
+                amm,
+            } => {
                 for (offer_key, owner_id, take_in, take_out) in consumed {
                     if *owner_id != *in_iss {
                         apply_trust_delta(ctx, owner_id, in_iss, in_cur, *take_in)?;
@@ -1042,6 +1186,9 @@ fn commit_n_hop_plan(
                         apply_trust_delta(ctx, owner_id, out_iss, out_cur, -*take_out)?;
                     }
                     update_consumed_offer(ctx, offer_key, book, *take_in, *take_out)?;
+                }
+                if let Some(swap) = amm {
+                    apply_amm_swap(ctx, swap)?;
                 }
             }
             HopAction::Ripple { account, amount } => {
@@ -2930,5 +3077,216 @@ mod tests {
         assert!((holder_balance(&sandbox, MM, ISSUER, "USD") - 15.0).abs() < 1e-6);
         assert!((holder_balance(&sandbox, MM2, MM, "USD") - 15.0).abs() < 1e-6);
         assert!((holder_balance(&sandbox, BOB, MM2, "USD") - 15.0).abs() < 1e-6);
+    }
+
+    // -- AMM strand (Phase 5a) --
+
+    #[allow(clippy::too_many_arguments)]
+    fn put_amm(
+        ledger: &mut Ledger,
+        asset_cur: &str,
+        asset_iss: &str,
+        asset2_cur: &str,
+        asset2_iss: &str,
+        pool1: u64,
+        pool2: u64,
+        trading_fee_bps: u32,
+    ) -> rxrpl_primitives::Hash256 {
+        let cur1 = helpers::currency_to_bytes(asset_cur);
+        let cur2 = helpers::currency_to_bytes(asset2_cur);
+        let iss1 = decode_account_id(asset_iss).unwrap();
+        let iss2 = decode_account_id(asset2_iss).unwrap();
+        let key = rxrpl_protocol::keylet::amm(&cur1, &iss1, &cur2, &iss2);
+        let amm = serde_json::json!({
+            "LedgerEntryType": "AMM",
+            "Asset": { "currency": asset_cur, "issuer": asset_iss },
+            "Asset2": { "currency": asset2_cur, "issuer": asset2_iss },
+            "PoolBalance1": pool1.to_string(),
+            "PoolBalance2": pool2.to_string(),
+            "LPTokenBalance": "1000",
+            "TradingFee": trading_fee_bps,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&amm).unwrap())
+            .unwrap();
+        key
+    }
+
+    /// Single-hop cross-currency strand with no book offers — the AMM is
+    /// the sole liquidity source. Verifies that the walker quotes the
+    /// constant-product swap, debits the source, credits the destination,
+    /// and updates the pool balances on the SLE.
+    #[test]
+    fn apply_cross_currency_amm_only_strand_succeeds() {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ISSUER, "100000000", None);
+        put_account(&mut ledger, ALICE, "50000000", None);
+        put_account(&mut ledger, BOB, "50000000", None);
+
+        put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+        put_trust_line(&mut ledger, BOB, ISSUER, "GBP", 0.0);
+
+        // Pool keylet sorts assets canonically. GBP < USD bytewise, so
+        // PoolBalance1 corresponds to GBP and PoolBalance2 to USD.
+        let amm_key = put_amm(&mut ledger, "GBP", ISSUER, "USD", ISSUER, 1000, 1000, 0);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("GBP", ISSUER, "50"),
+            "SendMax": iou("USD", ISSUER, "100"),
+            "Paths": [[ { "currency": "GBP", "issuer": ISSUER, "type": 0x30 } ]],
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = PaymentTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        // Bob received the full 50 GBP. Alice paid the AMM quote
+        // (52.63... USD, rounded by the AMM SLE's u64 storage).
+        assert!((holder_balance(&sandbox, BOB, ISSUER, "GBP") - 50.0).abs() < 1e-6);
+        let alice_after = holder_balance(&sandbox, ALICE, ISSUER, "USD");
+        assert!(alice_after < 100.0 - 52.0 && alice_after > 100.0 - 53.0);
+
+        // Pool balances reflect the swap: GBP side drained by 50, USD
+        // side topped up by the input that produced 50 GBP of output.
+        let amm_bytes = sandbox.read(&amm_key).unwrap();
+        let amm: serde_json::Value = serde_json::from_slice(&amm_bytes).unwrap();
+        let new_gbp: u64 = amm["PoolBalance1"].as_str().unwrap().parse().unwrap();
+        let new_usd: u64 = amm["PoolBalance2"].as_str().unwrap().parse().unwrap();
+        assert_eq!(new_gbp, 950);
+        assert!((1052..=1053).contains(&new_usd));
+    }
+
+    /// A book that satisfies part of the target leaves the remainder to
+    /// the AMM. The MM offer sells 20 GBP for 20 USD; the strand needs
+    /// 30 GBP total, so 10 GBP comes from the constant-product pool.
+    #[test]
+    fn apply_cross_currency_book_then_amm_combined() {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ISSUER, "100000000", None);
+        put_account(&mut ledger, ALICE, "50000000", None);
+        put_account(&mut ledger, BOB, "50000000", None);
+        put_account(&mut ledger, MM, "50000000", None);
+
+        put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+        put_trust_line(&mut ledger, BOB, ISSUER, "GBP", 0.0);
+        put_trust_line(&mut ledger, MM, ISSUER, "USD", 0.0);
+        put_trust_line(&mut ledger, MM, ISSUER, "GBP", 100.0);
+
+        // MM offers 20 USD for 20 GBP (1:1).
+        let mm_id = decode_account_id(MM).unwrap();
+        let mm_offer = keylet::offer(&mm_id, 1);
+        ledger
+            .put_state(
+                mm_offer,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "Offer",
+                    "Account": MM,
+                    "Sequence": 1,
+                    "TakerPays": iou("USD", ISSUER, "20"),
+                    "TakerGets": iou("GBP", ISSUER, "20"),
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let usd = helpers::currency_to_bytes("USD");
+        let gbp = helpers::currency_to_bytes("GBP");
+        let issuer_id = decode_account_id(ISSUER).unwrap();
+        let usd_gbp_book = keylet::book_dir(&usd, &issuer_id, &gbp, &issuer_id);
+        ledger
+            .put_state(
+                usd_gbp_book,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "DirectoryNode",
+                    "Indexes": [mm_offer.to_string()],
+                    "IndexNext": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let amm_key = put_amm(&mut ledger, "GBP", ISSUER, "USD", ISSUER, 1000, 1000, 0);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("GBP", ISSUER, "30"),
+            "SendMax": iou("USD", ISSUER, "100"),
+            "Paths": [[ { "currency": "GBP", "issuer": ISSUER, "type": 0x30 } ]],
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = PaymentTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        assert!((holder_balance(&sandbox, BOB, ISSUER, "GBP") - 30.0).abs() < 1e-6);
+        // MM consumed the full offer: +20 USD, -20 GBP.
+        assert!((holder_balance(&sandbox, MM, ISSUER, "USD") - 20.0).abs() < 1e-6);
+        assert!((holder_balance(&sandbox, MM, ISSUER, "GBP") - 80.0).abs() < 1e-6);
+        // AMM supplied the residual 10 GBP via the pool.
+        let amm_bytes = sandbox.read(&amm_key).unwrap();
+        let amm: serde_json::Value = serde_json::from_slice(&amm_bytes).unwrap();
+        let new_gbp: u64 = amm["PoolBalance1"].as_str().unwrap().parse().unwrap();
+        assert_eq!(new_gbp, 990);
+    }
+
+    /// When no AMM is registered for the pair and the book is empty, the
+    /// strand fails `TecPathPartial` — the AMM lookup is a pure read with
+    /// no side effects, so absent AMM falls through to the existing
+    /// insufficient-liquidity error path.
+    #[test]
+    fn apply_cross_currency_no_amm_no_book_fails_path_partial() {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ISSUER, "100000000", None);
+        put_account(&mut ledger, ALICE, "50000000", None);
+        put_account(&mut ledger, BOB, "50000000", None);
+
+        put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+        put_trust_line(&mut ledger, BOB, ISSUER, "GBP", 0.0);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("GBP", ISSUER, "10"),
+            "SendMax": iou("USD", ISSUER, "20"),
+            "Paths": [[ { "currency": "GBP", "issuer": ISSUER, "type": 0x30 } ]],
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = PaymentTransactor.apply(&mut ctx);
+        assert_eq!(result, Err(TransactionResult::TecPathPartial));
     }
 }
