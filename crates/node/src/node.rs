@@ -1623,6 +1623,7 @@ impl Node {
                                             &amendment_votes, trusted_validator_count,
                                             &pruner, &node_store,
                                             &self_validation_tx,
+                                            &val_aggregator,
                                         ).await;
                                         if let Ok(mut lc) = last_close_arc.write() {
                                             lc.proposers = proposers_this_round;
@@ -1791,6 +1792,7 @@ impl Node {
                                             &amendment_votes, trusted_validator_count,
                                             &pruner, &node_store,
                                             &self_validation_tx,
+                                            &val_aggregator,
                                         ).await;
                                         if let Ok(mut lc) = last_close_arc.write() {
                                             lc.proposers = proposers_this_round;
@@ -2674,6 +2676,7 @@ impl Node {
         pruner: &Arc<LedgerPruner>,
         node_store: &Option<Arc<dyn NodeStore>>,
         self_validation_tx: &tokio::sync::mpsc::UnboundedSender<rxrpl_overlay::ConsensusMessage>,
+        val_aggregator: &rxrpl_overlay::validation_aggregator::ValidationAggregator,
     ) {
         // Resolve close_time in priority order:
         //  1. Quorum-accepted close_time from converge() — strongest signal,
@@ -2824,8 +2827,26 @@ impl Node {
         );
         drop(l);
 
-        // Broadcast validation (STObject format, rippled-compatible)
-        {
+        // Broadcast validation (STObject format, rippled-compatible).
+        //
+        // Spec fix (A) — divergent-close skip: if a trusted peer has
+        // already submitted a validation for `closed_seq` naming a
+        // different hash, the network is on a different chain and our
+        // local close is divergent. Broadcasting under our hash would
+        // only fragment quorum across `(seq, our_hash)` and
+        // `(seq, peer_hash)`, freezing the validated ledger. Skip the
+        // broadcast and let the catchup-adopt path produce the canonical
+        // validation once we have reconstructed the network-agreed
+        // ledger. See docs/superpowers/specs/2026-05-15-cross-impl-
+        // validation-lag-fix.md section (A).
+        if val_aggregator.peer_has_other_hash_for(closed_seq, &hash) {
+            tracing::info!(
+                target: "consensus",
+                seq = closed_seq,
+                local_hash = %hash,
+                "skip_validation_broadcast: peer already validated a different hash; awaiting catchup-adopt"
+            );
+        } else {
             use rxrpl_consensus::types::Validation;
             // Include our amendment votes in the validation message
             let our_amendment_votes = amendment_table.read().await.get_votes();

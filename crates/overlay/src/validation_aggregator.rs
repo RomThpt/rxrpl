@@ -331,6 +331,20 @@ impl ValidationAggregator {
         self.validated_seqs.get(&seq).copied()
     }
 
+    /// True if at least one trusted peer has already submitted a validation
+    /// for `seq` naming a hash different from `our_hash`. Used by the node
+    /// layer before broadcasting its own validation for `seq`: if the
+    /// network has already started validating a different chain, our local
+    /// close is divergent and re-broadcasting under our hash would only
+    /// fragment quorum across `(seq, hash_ours)` and `(seq, hash_peer)`.
+    /// The catchup-adopt path will broadcast the canonical hash once the
+    /// adopted ledger is reconstructed.
+    pub fn peer_has_other_hash_for(&self, seq: u32, our_hash: &Hash256) -> bool {
+        self.by_ledger
+            .iter()
+            .any(|((s, h), v)| *s == seq && h != our_hash && !v.is_empty())
+    }
+
     /// Remove old entries to prevent unbounded growth.
     fn cleanup(&mut self, current_seq: u32) {
         if current_seq < 100 {
