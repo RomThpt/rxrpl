@@ -111,8 +111,8 @@ fn parse_raw(data: &[u8]) -> Result<RawManifest, ManifestError> {
         pos += consumed;
 
         match (type_id, field_id) {
-            // sfSequence: UINT32, field 1
-            (2, 1) => {
+            // sfSequence: UInt32, nth=4 (per XRPL definitions.json)
+            (2, 4) => {
                 if pos + 4 > data.len() {
                     return Err(ManifestError::Truncated);
                 }
@@ -139,22 +139,22 @@ fn parse_raw(data: &[u8]) -> Result<RawManifest, ManifestError> {
 
                 match fid {
                     1 => {
-                        // sfPublicKey (master)
+                        // sfPublicKey (master), Blob nth=1
                         master_pk = Some(value);
                         signing_ranges.push((field_start, pos));
                     }
                     3 => {
-                        // sfSigningPubKey (ephemeral)
+                        // sfSigningPubKey (ephemeral), Blob nth=3
                         ephemeral_pk = Some(value);
                         signing_ranges.push((field_start, pos));
                     }
-                    4 => {
-                        // sfMasterSignature: excluded from signing data
+                    18 => {
+                        // sfMasterSignature, Blob nth=18 — excluded from signing data
                         master_signature = Some(value);
                         master_sig_range = Some((field_start, pos));
                     }
                     6 => {
-                        // sfSignature (ephemeral sig): excluded from signing data
+                        // sfSignature (ephemeral sig), Blob nth=6 — excluded
                         signature = Some(value);
                     }
                     7 => {
@@ -286,7 +286,12 @@ pub fn parse_and_verify(data: &[u8]) -> Result<Manifest, ManifestError> {
 
 /// Build a manifest STObject from parts (for testing).
 ///
-/// Produces the binary format that `parse_and_verify` expects.
+/// Produces the binary format that `parse_and_verify` expects, matching
+/// rippled's canonical STObject serialization (fields sorted by
+/// `(type_id, nth)`). XRPL field IDs come from `definitions.json`:
+/// sfSequence = (UInt32, 4); sfPublicKey = (Blob, 1);
+/// sfSigningPubKey = (Blob, 3); sfSignature = (Blob, 6);
+/// sfDomain = (Blob, 7); sfMasterSignature = (Blob, 18).
 pub fn build_manifest_bytes(
     sequence: u32,
     master_pk: &[u8],
@@ -297,33 +302,31 @@ pub fn build_manifest_bytes(
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256);
 
-    // sfSequence (UINT32 type=2, field=1)
-    stobject::put_uint32(&mut buf, 1, sequence);
+    // sfSequence (UINT32 type=2, field=4)
+    stobject::put_uint32(&mut buf, 4, sequence);
 
-    // sfPublicKey (VL type=7, field=1)
+    // Blob fields (type=7) in canonical nth order.
+    // sfPublicKey (master), nth=1
     stobject::put_vl(&mut buf, 1, master_pk);
-
-    // sfSigningPubKey (VL type=7, field=3)
+    // sfSigningPubKey (ephemeral), nth=3
     stobject::put_vl(&mut buf, 3, ephemeral_pk);
-
-    // sfDomain (VL type=7, field=7) -- optional
+    // sfSignature (ephemeral sig over body), nth=6
+    stobject::put_vl(&mut buf, 6, ephemeral_sig);
+    // sfDomain (optional), nth=7
     if let Some(d) = domain {
         stobject::put_vl(&mut buf, 7, d.as_bytes());
     }
-
-    // sfSignature (VL type=7, field=6)
-    stobject::put_vl(&mut buf, 6, ephemeral_sig);
-
-    // sfMasterSignature (VL type=7, field=4)
-    stobject::put_vl(&mut buf, 4, master_sig);
+    // sfMasterSignature (master sig over body), nth=18
+    stobject::put_vl(&mut buf, 18, master_sig);
 
     buf
 }
 
 /// Build the signing data for a manifest (for computing signatures).
 ///
-/// This is HashPrefix::MANIFEST + non-signature fields only.
-/// Both sfSignature and sfMasterSignature are excluded.
+/// This is `HashPrefix::MANIFEST` + the non-signature fields in their
+/// canonical XRPL serialization order. Both sfSignature and
+/// sfMasterSignature are excluded — they're what these bytes will sign.
 pub fn build_signing_data(
     sequence: u32,
     master_pk: &[u8],
@@ -334,9 +337,14 @@ pub fn build_signing_data(
     let mut buf = Vec::with_capacity(256);
     buf.extend_from_slice(&prefix);
 
-    stobject::put_uint32(&mut buf, 1, sequence);
+    // sfSequence (UINT32, nth=4)
+    stobject::put_uint32(&mut buf, 4, sequence);
+    // sfPublicKey (master, Blob nth=1)
     stobject::put_vl(&mut buf, 1, master_pk);
+    // sfSigningPubKey (ephemeral, Blob nth=3)
     stobject::put_vl(&mut buf, 3, ephemeral_pk);
+    // sfDomain (Blob nth=7) — optional, comes after SigningPubKey when
+    // present per canonical (type, nth) ordering.
     if let Some(d) = domain {
         stobject::put_vl(&mut buf, 7, d.as_bytes());
     }
