@@ -337,8 +337,8 @@ impl ValidatorIdentity {
         signing_kt: rxrpl_crypto::KeyType,
     ) -> Self {
         Self {
-            master: rxrpl_crypto::KeyPair::from_seed(master_seed, master_kt),
-            signing: rxrpl_crypto::KeyPair::from_seed(signing_seed, signing_kt),
+            master: derive_validator_keypair_typed(master_seed, master_kt),
+            signing: derive_validator_keypair_typed(signing_seed, signing_kt),
         }
     }
 
@@ -412,11 +412,36 @@ impl ValidatorIdentity {
 /// Derive a keypair using the rippled validator-key path (secp256k1, no
 /// account-level scalar). Mirrors [`NodeIdentity::from_seed`].
 fn derive_validator_keypair(seed: &Seed) -> rxrpl_crypto::KeyPair {
-    let (public_key, private_key) = rxrpl_crypto::secp256k1::derive_keypair(seed, true);
-    rxrpl_crypto::KeyPair {
-        public_key,
-        private_key,
-        key_type: rxrpl_crypto::KeyType::Secp256k1,
+    derive_validator_keypair_typed(seed, rxrpl_crypto::KeyType::Secp256k1)
+}
+
+/// Derive a validator keypair honoring the requested algorithm. For
+/// secp256k1, uses the rippled validator derivation path (the `true`
+/// arg to `derive_keypair`) so the resulting pubkey matches what
+/// `validation_create` would emit on rippled with the same seed. For
+/// ed25519, the derivation is single-path and identical to a regular
+/// account keypair.
+fn derive_validator_keypair_typed(
+    seed: &Seed,
+    key_type: rxrpl_crypto::KeyType,
+) -> rxrpl_crypto::KeyPair {
+    match key_type {
+        rxrpl_crypto::KeyType::Secp256k1 => {
+            let (public_key, private_key) = rxrpl_crypto::secp256k1::derive_keypair(seed, true);
+            rxrpl_crypto::KeyPair {
+                public_key,
+                private_key,
+                key_type: rxrpl_crypto::KeyType::Secp256k1,
+            }
+        }
+        rxrpl_crypto::KeyType::Ed25519 => {
+            let (public_key, private_key) = rxrpl_crypto::ed25519::derive_keypair(seed);
+            rxrpl_crypto::KeyPair {
+                public_key,
+                private_key,
+                key_type: rxrpl_crypto::KeyType::Ed25519,
+            }
+        }
     }
 }
 
