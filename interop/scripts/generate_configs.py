@@ -184,6 +184,51 @@ def write_validators_txt(path):
         f.write("\n".join(lines) + "\n")
 
 
+# Deterministic, hand-rolled "publisher" identity. Not derived from a
+# real curve — these are just opaque hex blobs the test_configs.B1
+# harness checks for shape (33-byte pubkey, non-empty signature) so
+# downstream UNL publishing can be wired in later without churning the
+# fixture file paths. Real PKL/manifest generation would replace
+# `_FAKE_PUBLISHER_*` with rxrpl-cli `validation_create` output.
+_FAKE_PUBLISHER_PUBKEY = (
+    "02" + "00112233445566778899AABBCCDDEEFF" * 2  # 33 bytes (66 hex chars)
+)
+_FAKE_PUBLISHER_SECRET = "00" + "11223344556677889900AABBCCDDEEFF" * 2
+_FAKE_PUBLISHER_SIG = "30" + "45" + "0102030405060708090A0B0C0D0E0F10" * 4  # any non-empty hex blob
+
+
+def write_publisher_key(path):
+    import json
+    obj = {
+        "public_key": _FAKE_PUBLISHER_PUBKEY,
+        "secret_key": _FAKE_PUBLISHER_SECRET,
+    }
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+
+def write_publisher_manifest(path):
+    """Emit a JSON manifest documenting the validator set and the
+    publisher signature over it. Schema matches what tests/test_configs.py
+    (B1) inspects: a `validators` list with `role` + `public_key` per
+    entry, plus `signature` + `signing_pubkey` for the publisher. This
+    is a fixture artifact; rippled/rxrpl don't load it directly today.
+    """
+    import json
+    validators = []
+    for v in RIPPLED_VALIDATORS:
+        validators.append({"public_key": v["public_key"], "role": "rippled"})
+    for v in RXRPL_VALIDATORS:
+        validators.append({"public_key": v["public_key"], "role": "rxrpl"})
+    manifest = {
+        "validators": validators,
+        "signing_pubkey": _FAKE_PUBLISHER_PUBKEY,
+        "signature": _FAKE_PUBLISHER_SIG,
+    }
+    with open(path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate interop test configs")
     parser.add_argument("--rippled", type=int, default=2)
@@ -216,6 +261,8 @@ def main():
         )
 
     write_validators_txt(os.path.join(CONFIGS_DIR, "validators.txt"))
+    write_publisher_key(os.path.join(CONFIGS_DIR, "publisher.json"))
+    write_publisher_manifest(os.path.join(CONFIGS_DIR, "manifest.json"))
 
     print(
         f"Generated configs for {len(RIPPLED_VALIDATORS)} rippled "
