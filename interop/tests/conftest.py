@@ -19,7 +19,14 @@ ALL_URLS = RIPPLED_URLS + RXRPL_URLS
 GENESIS_ACCOUNT = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
 GENESIS_SECRET = "snoPBrXtMeMyMHUVTgbuqAfg1SUTb"
 
-TIMEOUT = 120  # seconds
+# Cross-impl mixed networks (rxrpl + rippled) pay a non-trivial initial
+# peer handshake + boot-catchup tax (~30-60s) before consensus rounds
+# start producing validated ledgers, then average ~12s/ledger in steady
+# state under rippled's default 20s idle interval. 120s left no headroom
+# for the startup phase and the test would Fatalf while consensus was
+# still actively advancing. 300s scopes the timeout to "consensus
+# genuinely stuck" rather than "still warming up".
+TIMEOUT = 300  # seconds
 
 
 def rpc(url: str, method: str, params: dict | None = None) -> dict:

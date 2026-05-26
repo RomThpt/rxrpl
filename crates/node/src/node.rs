@@ -3721,21 +3721,31 @@ fn build_validator_identity(
         )
     })?;
 
-    let (master_bytes, master_kt) = parse_node_seed_with_type(master_str)
+    let (master_bytes, _master_kt) = parse_node_seed_with_type(master_str)
         .map_err(|e| NodeError::Config(format!("invalid validator_identity.master_secret: {e}")))?;
-    let (ephemeral_bytes, ephemeral_kt) =
+    let (ephemeral_bytes, _ephemeral_kt) =
         parse_node_seed_with_type(ephemeral_str).map_err(|e| {
             NodeError::Config(format!("invalid validator_identity.ephemeral_seed: {e}"))
         })?;
 
+    // Validator identities MUST be secp256k1, regardless of the seed
+    // prefix. Rippled's `PeerImp::onMessage(TMProposeSet)` enforces
+    // `publicKeyType(nodepubkey) == KeyType::secp256k1` and rejects any
+    // proposal whose public key starts with `0xED` (ed25519). So even
+    // when the operator's seed is `sEd...` (the ed25519 family-seed
+    // prefix from XLS-1d / wallet_propose), the resulting validator
+    // identity has to be secp256k1 or every cross-impl peer drops our
+    // proposals as "Proposal: malformed". The seed entropy is still
+    // honored — only the key algorithm is forced.
+    let kt = rxrpl_crypto::KeyType::Secp256k1;
     let master_seed = rxrpl_crypto::Seed::from_bytes(master_bytes);
     let ephemeral_seed = rxrpl_crypto::Seed::from_bytes(ephemeral_bytes);
     Ok(Some(
         rxrpl_overlay::identity::ValidatorIdentity::two_key_typed(
             &master_seed,
-            master_kt,
+            kt,
             &ephemeral_seed,
-            ephemeral_kt,
+            kt,
         ),
     ))
 }

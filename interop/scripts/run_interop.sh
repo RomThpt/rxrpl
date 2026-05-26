@@ -5,7 +5,7 @@
 #   ./interop/scripts/run_interop.sh [--rippled-image IMAGE] [--suite SUITE]
 #
 # Options:
-#   --rippled-image   Docker image for rippled (default: rippleci/rippled:2.3.0)
+#   --rippled-image   Docker image for rippled (default: rippleci/rippled:3.1.3)
 #   --suite           Test suite: all, propagation, consensus, sync (default: all)
 #
 # Prerequisites:
@@ -18,7 +18,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INTEROP_DIR="$(dirname "$SCRIPT_DIR")"
 PROJECT_ROOT="$(dirname "$INTEROP_DIR")"
 
-RIPPLED_IMAGE="${RIPPLED_IMAGE:-rippleci/rippled:2.3.0}"
+# Default to 3.1.3 — the 2.3.0 image bootloops on its own startup
+# sed-in-place against a read-only mounted rippled.cfg ("Device or
+# resource busy") and never reaches the RPC port, so any test against
+# it hangs through the entire pytest timeout.
+RIPPLED_IMAGE="${RIPPLED_IMAGE:-rippleci/rippled:3.1.3}"
 SUITE="all"
 
 while [[ $# -gt 0 ]]; do
