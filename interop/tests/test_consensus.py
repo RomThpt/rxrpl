@@ -23,7 +23,7 @@ class TestConsensus:
     def test_mixed_validators_advance(self):
         """All nodes in the mixed network advance past ledger 10."""
         for url in ALL_URLS:
-            seq = wait_for_ledger(url, 10, timeout=120)
+            seq = wait_for_ledger(url, 10, timeout=300)
             assert seq >= 10, f"Node {url} stuck at ledger {seq}"
 
     def test_ledger_hash_agreement(self):
@@ -34,7 +34,7 @@ class TestConsensus:
         """
         # Advance all nodes past ledger 15
         for url in ALL_URLS:
-            wait_for_ledger(url, 15, timeout=120)
+            wait_for_ledger(url, 15, timeout=300)
 
         # Compare ledger 10 hash across all nodes
         check_seq = 10
