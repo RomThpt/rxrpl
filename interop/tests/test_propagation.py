@@ -16,8 +16,12 @@ from conftest import (
     wait_for_ledger,
 )
 
-# Deterministic test destination addresses
-DEST_RIPPLED_TO_RXRPL = "rPMh7Pi9ct699iZUTWzJaUPfRhPgenRpBk"
+# Deterministic test destination addresses.
+# Note: the original "rPMh7Pi9ct699iZUTWzJaUPfRhPgenRpBk" had an
+# invalid XRPL base58 checksum, so every submit fell through to
+# tem_BAD_DST. Replaced with a freshly-generated wallet_propose output
+# (secret discarded — the test only needs a receivable destination).
+DEST_RIPPLED_TO_RXRPL = "rp6wjufxqKa1S4q8BhrVuf5oSmJ9fXGpw4"
 DEST_RXRPL_TO_RIPPLED = "r3kmLJN5D28dHuH8vZNUZpMC43pEHpaocV"
 
 
