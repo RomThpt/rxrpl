@@ -59,14 +59,16 @@ pub async fn sign(params: Value, _ctx: &Arc<ServerContext>) -> Result<Value, Rpc
             }
         }
 
-        // Auto-fill NetworkID when the local node is on a non-mainnet network.
-        // Modern rippled (post-NetworkID amendment) requires every tx to
-        // declare its target network or it returns telREQUIRES_NETWORK_ID
-        // and refuses to apply. Mainnet (network_id=0) is the historical
-        // default and rippled accepts a missing field there.
+        // Auto-fill NetworkID only for network IDs above rippled's legacy
+        // threshold (1024). Per `Transactor::preflight1`, networks with
+        // id <= 1024 reject any tx that carries sfNetworkID with
+        // telNETWORK_ID_MAKES_TX_NON_CANONICAL, while networks with id
+        // > 1024 require it (telREQUIRES_NETWORK_ID when absent). The
+        // earlier `net != 0` heuristic broke interop with mainnet-like
+        // private networks (e.g. network_id=99 used by the interop suite).
         if !obj.contains_key("NetworkID") {
             if let Some(net) = _ctx.network_id {
-                if net != 0 {
+                if net > 1024 {
                     obj.insert("NetworkID".to_string(), Value::Number(net.into()));
                 }
             }
