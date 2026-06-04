@@ -1702,10 +1702,31 @@ impl Node {
                                         >= our_open_seq.saturating_add(STALE_SEQ_GAP)
                                         && round_stalled
                                         && peer_signal_fresh;
+                                    // Suppress wrong_prev when the "preferred" alternative is a
+                                    // ledger we already own. That happens routinely on 2-node
+                                    // bootstraps: peer A closes seq N a moment before peer B, so
+                                    // B's still-establishing proposals reference prev = hash_of_(N-1)
+                                    // while A is already proposing for seq N+1 with prev = hash_of_N.
+                                    // A's `check_wrong_prev_ledger` then sees 100% trusted support
+                                    // for `hash_of_(N-1)`, but that hash is *behind* us, not a
+                                    // competing chain — A already has it in `closed_ledgers`.
+                                    // Catching up to a ledger we already own forces a round trip
+                                    // every other consensus round, producing ~30s/ledger ping-pong.
+                                    let wrong_prev_is_known_history = match wrong_prev.as_ref() {
+                                        Some(detected) => {
+                                            let history = closed_ledgers.read().await;
+                                            history
+                                                .iter()
+                                                .any(|l| l.header.hash == detected.preferred_ledger)
+                                        }
+                                        None => false,
+                                    };
+                                    let wrong_prev_trips =
+                                        wrong_prev.is_some() && !wrong_prev_is_known_history;
                                     if cooldown_ok
                                         && consensus.phase()
                                             == rxrpl_consensus::ConsensusPhase::Establish
-                                        && (wrong_prev.is_some() || behind_by_seq)
+                                        && (wrong_prev_trips || behind_by_seq)
                                     {
                                         tracing::warn!(
                                             wrong_prev = wrong_prev.is_some(),
