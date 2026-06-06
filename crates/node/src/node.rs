@@ -1562,11 +1562,45 @@ impl Node {
                                         .as_secs()
                                         .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET)
                                         as u32;
-                                    let close_time = match raw_close_time.checked_div(resolution) {
+                                    let own_bucket = match raw_close_time.checked_div(resolution) {
                                         Some(q) => q * resolution,
                                         None => raw_close_time,
                                     }
                                     .max(parent_close_time.saturating_add(1));
+
+                                    // Adopt the peer's close-time bucket when a trusted
+                                    // peer has proposed a close_time for THIS round
+                                    // (`have_fresh_peer_ct`). At the Open→Establish close
+                                    // boundary the engine's `peer_positions` is still
+                                    // empty (it only fills during `converge()`), so
+                                    // `effective_close_time` takes the solo path and we
+                                    // close with our own wall-clock bucket. The
+                                    // CT_SKEW_DUMP shows `our_close_time` vs
+                                    // `latest_peer_ct` differing by exactly one 10s
+                                    // resolution step every round → a 1-bucket fork that
+                                    // costs a wrong_prev → catchup recovery before
+                                    // reconverging. Flooring the peer's already-fresh
+                                    // close_time to our resolution lands us in rippled's
+                                    // bucket deterministically. The historical "footgun"
+                                    // (a stale cross-round value carrying a future
+                                    // ledger's time) is now guarded by the `peer_ahead`
+                                    // deferral above: if the peer is past our seq we
+                                    // defer instead of closing, so a fresh peer ct here
+                                    // always belongs to the current round.
+                                    let close_time = if have_fresh_peer_ct {
+                                        consensus
+                                            .latest_peer_close_time()
+                                            .map(|pct| {
+                                                match pct.checked_div(resolution) {
+                                                    Some(q) => q * resolution,
+                                                    None => pct,
+                                                }
+                                                .max(parent_close_time.saturating_add(1))
+                                            })
+                                            .unwrap_or(own_bucket)
+                                    } else {
+                                        own_bucket
+                                    };
 
                                     // Always-active proposer: close on schedule like rippled.
                                     // Previous deferrals (peer_at_or_past, peer_behind_alive) kept
@@ -1579,6 +1613,25 @@ impl Node {
                                     tracing::info!(
                                         "closing seq={} prev={} peer_seq={}",
                                         seq, prev_hash, max_peer_seq
+                                    );
+
+                                    // DEBUG close-time skew diagnosis: capture the
+                                    // cross-round vs per-round signals at the close
+                                    // decision point. Confirms whether rxrpl closes
+                                    // with a fresh latest_peer_close_time (cross-round)
+                                    // but zero peer_positions for THIS round (per-round)
+                                    // — the 1-bucket transient fork hypothesis.
+                                    tracing::debug!(
+                                        target: "consensus",
+                                        "CT_SKEW_DUMP seq={} our_close_time={} resolution={} parent_close_time={} latest_peer_ct={:?} peer_pos_count={} have_fresh_peer_ct={} deferred_s={}",
+                                        seq,
+                                        close_time,
+                                        resolution,
+                                        parent_close_time,
+                                        consensus.latest_peer_close_time(),
+                                        consensus.peer_position_count(),
+                                        have_fresh_peer_ct,
+                                        deferred_for.as_secs(),
                                     );
 
                                     let l = ledger.read().await;

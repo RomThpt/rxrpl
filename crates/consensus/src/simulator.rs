@@ -47,6 +47,12 @@ pub struct NodeResult {
     pub accepted: bool,
     pub accepted_set: Option<Hash256>,
     pub rounds: u32,
+    /// Close time the node accepted for the ledger. Together with the
+    /// accepted set and flags this fully determines the ledger hash, so
+    /// two nodes that accept the same set but a different close_time still
+    /// produce divergent ledgers — the soak failure mode.
+    pub accepted_close_time: Option<u32>,
+    pub accepted_close_flags: u8,
 }
 
 /// A message scheduled for delivery at a specific tick.
@@ -266,9 +272,19 @@ impl ConsensusSimulator {
     /// If `tx_sets` has fewer entries than nodes, remaining nodes use the first set.
     /// Returns the simulation result after convergence or max ticks.
     pub fn run_round(&mut self, tx_sets: Vec<TxSet>) -> SimResult {
+        self.run_round_skewed(tx_sets, Vec::new())
+    }
+
+    /// Like [`Self::run_round`], but each node closes its ledger at its own
+    /// `close_time` (a per-node clock value). `close_times[i]` is used for
+    /// node `i`; nodes past the end of the slice fall back to a default of
+    /// 100. This reproduces the cross-impl reality where rxrpl and rippled
+    /// read slightly different wall clocks and therefore propose different
+    /// close times — the exact condition the soak test exercises.
+    pub fn run_round_skewed(&mut self, tx_sets: Vec<TxSet>, close_times: Vec<u32>) -> SimResult {
         let prev_ledger = Hash256::ZERO;
         let ledger_seq = 1u32;
-        let close_time = 100u32;
+        let default_close_time = 100u32;
 
         let node_count = self.engines.len();
 
@@ -287,6 +303,7 @@ impl ConsensusSimulator {
             } else {
                 tx_sets[0].clone()
             };
+            let close_time = close_times.get(i).copied().unwrap_or(default_close_time);
 
             engine.start_round(prev_ledger, ledger_seq);
             engine.close_ledger(set, close_time, ledger_seq).unwrap();
@@ -372,13 +389,25 @@ impl ConsensusSimulator {
                 accepted: e.phase() == crate::phase::ConsensusPhase::Accepted,
                 accepted_set: e.accepted_set(),
                 rounds: converge_round,
+                accepted_close_time: e.accepted_close_time(),
+                accepted_close_flags: e.accepted_close_flags(),
             })
             .collect();
 
         let all_accepted = per_node.iter().all(|n| n.accepted);
+        // Agreement requires the FULL ledger-determining triple to match:
+        // set + close_time + close_flags. Two nodes that agree on the set
+        // but disagree on close_time still fork the ledger hash.
         let agreed_set = if all_accepted {
             let first = per_node[0].accepted_set;
-            if per_node.iter().all(|n| n.accepted_set == first) {
+            let set_match = per_node.iter().all(|n| n.accepted_set == first);
+            let ct_match = per_node
+                .iter()
+                .all(|n| n.accepted_close_time == per_node[0].accepted_close_time);
+            let flags_match = per_node
+                .iter()
+                .all(|n| n.accepted_close_flags == per_node[0].accepted_close_flags);
+            if set_match && ct_match && flags_match {
                 first
             } else {
                 None
@@ -526,6 +555,81 @@ mod tests {
         // After max rounds, all nodes force-accept
         for node in &result.per_node {
             assert!(node.accepted);
+        }
+    }
+
+    /// Decisive probe for the soak 2-node 50/50 divergence: two rxrpl
+    /// validators, one proposing {tx1} and the other proposing {} (an
+    /// asymmetric tx-set, exactly what happens when a tx is submitted to
+    /// one node but not yet broadcast to the peer at close time). If two
+    /// identical rxrpl engines diverge here, the bug is in the algorithm
+    /// and reproducible in-sim. If they converge, the soak divergence is
+    /// an rxrpl-vs-rippled impl difference (byte-level), not an algo gap.
+    #[test]
+    fn two_node_asymmetric_tx_convergence_probe() {
+        let config = SimConfig {
+            node_count: 2,
+            ..SimConfig::default()
+        };
+        let mut sim = ConsensusSimulator::new(config);
+
+        let tx1 = Hash256::new([0x01; 32]);
+        let set_with = TxSet::new(vec![tx1]);
+        let set_empty = TxSet::new(vec![]);
+
+        let result = sim.run_round(vec![set_with, set_empty]);
+
+        eprintln!(
+            "2-node asymmetric: accepted={} agreed_set={:?}",
+            result.accepted, result.agreed_set
+        );
+        for n in &result.per_node {
+            eprintln!(
+                "  node {:?}: accepted={} set={:?}",
+                n.node_id, n.accepted, n.accepted_set
+            );
+        }
+        // Both must accept AND agree on the same set, or we've reproduced
+        // the divergence at the algorithm level.
+        assert!(result.accepted, "2-node failed to accept");
+        assert!(
+            result.agreed_set.is_some(),
+            "DIVERGENCE reproduced in-sim: two rxrpl engines accepted different sets"
+        );
+    }
+
+    /// Second decisive probe: 2 nodes propose the SAME tx-set but read
+    /// clocks that differ by a few seconds (clock skew). The soak network
+    /// has rxrpl and rippled closing at slightly different wall-clock
+    /// times. If the close-time agreement collapses both onto one bucket,
+    /// the ledger hashes match; if each keeps its own close_time, the
+    /// ledger forks even though the transactions are identical. Sweeps a
+    /// range of skews against the 10s genesis resolution.
+    #[test]
+    fn two_node_clock_skew_close_time_probe() {
+        let tx1 = Hash256::new([0x01; 32]);
+        for skew in [0u32, 1, 3, 7, 11, 15] {
+            let config = SimConfig {
+                node_count: 2,
+                ..SimConfig::default()
+            };
+            let mut sim = ConsensusSimulator::new(config);
+            let set = TxSet::new(vec![tx1]);
+            // node 0 closes at 100, node 1 at 100 + skew.
+            let result =
+                sim.run_round_skewed(vec![set.clone(), set.clone()], vec![100, 100 + skew]);
+            let ct: Vec<_> = result
+                .per_node
+                .iter()
+                .map(|n| n.accepted_close_time)
+                .collect();
+            eprintln!(
+                "skew={:>2}s -> accepted={} agreed={} close_times={:?}",
+                skew,
+                result.accepted,
+                result.agreed_set.is_some(),
+                ct
+            );
         }
     }
 
