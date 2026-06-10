@@ -100,6 +100,7 @@ mod tests {
             tick_size: None,
             transfer_rate: None,
             nftoken_minter: None,
+            extra: Default::default(),
         }
     }
 

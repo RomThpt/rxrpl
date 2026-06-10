@@ -28,6 +28,8 @@ pub struct AccountRoot {
     pub transfer_rate: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nftoken_minter: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl LedgerObject for AccountRoot {
@@ -57,5 +59,27 @@ mod tests {
         assert_eq!(ar.account, "rN7n3473SaZBCG4dFL83w7p1W9cgZB6xkk");
         assert_eq!(ar.balance, "1000000000");
         assert_eq!(ar.sequence, 1);
+    }
+
+    #[test]
+    fn roundtrip_preserves_unmodeled_fields() {
+        let json = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": "rN7n3473SaZBCG4dFL83w7p1W9cgZB6xkk",
+            "Balance": "1000000000",
+            "Sequence": 5,
+            "OwnerCount": 2,
+            "Flags": 1114112,
+            "PreviousTxnID": "DEADBEEF",
+            "PreviousTxnLgrSeq": 42,
+            "Domain": "6578616D706C652E636F6D",
+            "MintedNFTokens": 7,
+            "BurnedNFTokens": 3,
+            "FirstNFTokenSequence": 100,
+            "AMMID": "ABCD1234",
+            "WalletLocator": "00FF",
+        });
+        let ar = AccountRoot::from_json(&json).unwrap();
+        assert_eq!(ar.to_json().unwrap(), json);
     }
 }
