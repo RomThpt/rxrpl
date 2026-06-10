@@ -1,4 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_protocol::ledger::AccountRoot;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
@@ -36,10 +37,10 @@ impl Transactor for DIDDeleteTransactor {
             .view
             .read(&account_key)
             .ok_or(TransactionResult::TerNoAccount)?;
-        let mut account: serde_json::Value =
+        let mut account: AccountRoot =
             serde_json::from_slice(&account_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        helpers::increment_sequence(&mut account);
+        account.sequence += 1;
 
         let did_key = keylet::did(&account_id);
         remove_from_owner_dir(ctx.view, &account_id, &did_key)?;
@@ -47,7 +48,7 @@ impl Transactor for DIDDeleteTransactor {
             .erase(&did_key)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        helpers::adjust_owner_count(&mut account, -1);
+        account.owner_count = account.owner_count.saturating_sub(1);
 
         let account_data =
             serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
