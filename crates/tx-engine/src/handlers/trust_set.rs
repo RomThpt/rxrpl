@@ -278,7 +278,7 @@ impl Transactor for TrustSetTransactor {
                 let mut acct: Value = serde_json::from_slice(&acct_bytes)
                     .map_err(|_| TransactionResult::TemMalformed)?;
                 helpers::adjust_owner_count(&mut acct, 1);
-                helpers::increment_sequence(&mut acct);
+                crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, &mut acct, ctx.tx)?;
                 let new_bytes =
                     serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
                 ctx.view

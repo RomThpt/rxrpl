@@ -130,8 +130,9 @@ impl Transactor for OfferCreateTransactor {
             keylet::book_dir(&pays_currency, &pays_issuer, &gets_currency, &gets_issuer);
         add_to_dir(ctx.view, &book_root, &offer_key)?;
 
-        // Update account: increment sequence and owner count
-        helpers::increment_sequence(&mut acct);
+        // Update account: consume the sequence (or ticket) and bump owner count
+        // for the new offer.
+        crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, &mut acct, ctx.tx)?;
         helpers::adjust_owner_count(&mut acct, 1);
 
         let new_bytes = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;

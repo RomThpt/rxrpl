@@ -165,6 +165,36 @@ pub fn remove_from_owner_dir(
     Ok(())
 }
 
+/// Consume the transaction's sequence proxy: either bump the account
+/// `Sequence`, or — when a `TicketSequence` is present — consume the Ticket
+/// SLE (remove it from the owner directory, erase it, and decrement
+/// `OwnerCount`) instead. Mirrors rippled's `Transactor::consumeSeqProxy`.
+///
+/// `check_seq_proxy` has already validated that the ticket exists at preclaim;
+/// the `exists` guard here keeps apply self-consistent if it was consumed
+/// earlier in the same ledger.
+pub fn consume_seq_or_ticket(
+    view: &mut dyn ApplyView,
+    account_id: &AccountId,
+    account_obj: &mut Value,
+    tx: &Value,
+) -> Result<(), TransactionResult> {
+    match tx.get("TicketSequence").and_then(|v| v.as_u64()) {
+        Some(ticket_seq) => {
+            let ticket_key = keylet::ticket(account_id, ticket_seq as u32);
+            if !view.exists(&ticket_key) {
+                return Err(TransactionResult::TefNoTicket);
+            }
+            remove_from_owner_dir(view, account_id, &ticket_key)?;
+            view.erase(&ticket_key)
+                .map_err(|_| TransactionResult::TefInternal)?;
+            crate::helpers::adjust_owner_count(account_obj, -1);
+        }
+        None => crate::helpers::increment_sequence(account_obj),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +323,67 @@ mod tests {
         }
         let err = add_to_owner_dir(&mut sandbox, &account, &entry(0xff)).unwrap_err();
         assert_eq!(err, TransactionResult::TecDirFull);
+    }
+
+    fn account_obj(seq: u32, owner_count: u32) -> Value {
+        serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": ACCT,
+            "Balance": "1000000",
+            "Sequence": seq,
+            "OwnerCount": owner_count,
+            "Flags": 0,
+        })
+    }
+
+    #[test]
+    fn consume_plain_sequence_increments_seq() {
+        let (ledger, fees) = fresh_sandbox();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let mut sandbox = Sandbox::new(&view);
+        let mut acct = account_obj(5, 2);
+        let tx = serde_json::json!({ "Account": ACCT, "Sequence": 5 });
+
+        consume_seq_or_ticket(&mut sandbox, &id(), &mut acct, &tx).unwrap();
+
+        assert_eq!(acct["Sequence"], serde_json::json!(6));
+        assert_eq!(acct["OwnerCount"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn consume_existing_ticket_erases_and_decrements_owner_count() {
+        let (ledger, fees) = fresh_sandbox();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let mut sandbox = Sandbox::new(&view);
+
+        let ticket_key = keylet::ticket(&id(), 3);
+        let ticket = serde_json::json!({
+            "LedgerEntryType": "Ticket", "Account": ACCT, "TicketSequence": 3, "Flags": 0,
+        });
+        sandbox
+            .insert(ticket_key, serde_json::to_vec(&ticket).unwrap())
+            .unwrap();
+
+        let mut acct = account_obj(5, 2);
+        let tx = serde_json::json!({ "Account": ACCT, "TicketSequence": 3 });
+
+        consume_seq_or_ticket(&mut sandbox, &id(), &mut acct, &tx).unwrap();
+
+        // Sequence unchanged, owner count decremented, ticket gone.
+        assert_eq!(acct["Sequence"], serde_json::json!(5));
+        assert_eq!(acct["OwnerCount"], serde_json::json!(1));
+        assert!(!sandbox.exists(&ticket_key));
+    }
+
+    #[test]
+    fn consume_missing_ticket_errors() {
+        let (ledger, fees) = fresh_sandbox();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let mut sandbox = Sandbox::new(&view);
+        let mut acct = account_obj(5, 2);
+        let tx = serde_json::json!({ "Account": ACCT, "TicketSequence": 3 });
+
+        let err = consume_seq_or_ticket(&mut sandbox, &id(), &mut acct, &tx).unwrap_err();
+        assert_eq!(err, TransactionResult::TefNoTicket);
     }
 }
