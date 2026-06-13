@@ -1215,15 +1215,20 @@ impl Node {
         // - Seq(s):   create immediately for sequence `s`.
         // - Recent:   wait until we have observed at least one peer, then
         //             anchor at `max_peer_seq - 1024` (saturating).
-        // - Hash(h):  not yet wired — header-by-hash lookup is the missing
-        //             piece. Logged on entry.
+        // - Hash(h):  request the header by hash from peers; the anchor is
+        //             created when the matching LedgerData arrives (its `seq`
+        //             resolves the hash). Tracked in `hash_anchor_pending`.
         let starting_ledger_for_loop = starting_ledger;
-        if let Some(crate::checkpoint::StartingLedger::Hash(h)) = starting_ledger_for_loop {
-            tracing::warn!(
-                "checkpoint bootstrap by hash {} not yet implemented; node will start from genesis",
-                h
-            );
-        }
+        let mut hash_anchor_pending: Option<Hash256> =
+            if let Some(crate::checkpoint::StartingLedger::Hash(h)) = starting_ledger_for_loop {
+                tracing::info!(
+                    "checkpoint bootstrap by hash {}: requesting header from peers",
+                    h
+                );
+                Some(h)
+            } else {
+                None
+            };
 
         // SECURITY: --starting-ledger guard is enforced at the top of
         // `run_networked` via `validate_starting_ledger_unl` so the error
@@ -2301,6 +2306,17 @@ impl Node {
                                     );
                                     recent_anchor_pending = false;
                                 }
+                                // Hash bootstrap: while unresolved, ask this peer
+                                // for the target ledger by hash. The `seq` hint is
+                                // the peer's tip so a peer is selectable; the server
+                                // resolves by hash and the reply's real `seq` lands
+                                // the anchor in the LedgerData handler below.
+                                if let Some(h) = hash_anchor_pending {
+                                    let _ = cmd_tx_catchup.send(OverlayCommand::RequestLedger {
+                                        seq: peer_seq,
+                                        hash: Some(h),
+                                    });
+                                }
                                 if peer_seq > our_seq + 1 {
                                     if !syncing {
                                         tracing::info!(
@@ -2324,6 +2340,22 @@ impl Node {
                                     "received LedgerData hash={} seq={} nodes={}",
                                     hash, seq, nodes.len()
                                 );
+                                // Hash bootstrap resolution: the requested hash now
+                                // maps to a concrete seq, so anchor the checkpoint
+                                // there (same shape as the Seq path).
+                                if hash_anchor_pending == Some(hash) && checkpoint_anchor.is_none() {
+                                    tracing::info!(
+                                        "checkpoint bootstrap (hash): resolved {} to ledger #{}",
+                                        hash, seq
+                                    );
+                                    checkpoint_anchor = Some(crate::checkpoint::CheckpointAnchor::new(
+                                        crate::checkpoint::AnchorConfig {
+                                            target_seq: seq,
+                                            quorum: initial_quorum,
+                                        },
+                                    ));
+                                    hash_anchor_pending = None;
+                                }
                                 if !nodes.is_empty() {
                                     let cached = catchup_headers.get(&seq);
                                     match Node::try_reconstruct_ledger(seq, hash, &nodes, &node_store, cached) {
