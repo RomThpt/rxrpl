@@ -32,6 +32,26 @@ fn check_seq_proxy(tx: &Value, view: &dyn ReadView) -> Result<(), TransactionRes
         serde_json::from_slice(&account_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
     let a_seq = helpers::get_sequence(&account_obj);
+
+    // Ticket path (rippled Transactor::checkSeqProxy): when a TicketSequence
+    // is present the tx consumes a Ticket SLE instead of the account Sequence.
+    // The ticket must already exist; otherwise the tx is invalid. A ticket
+    // below the account sequence was never created or is already spent
+    // (tefNO_TICKET); one at/above the account sequence has not been created
+    // yet, so the tx may apply later (terPRE_TICKET, retryable).
+    if let Some(ticket_seq) = tx.get("TicketSequence").and_then(|v| v.as_u64()) {
+        let ticket_seq = ticket_seq as u32;
+        let ticket_key = keylet::ticket(&account_id, ticket_seq);
+        if view.read(&ticket_key).is_some() {
+            return Ok(());
+        }
+        return if ticket_seq < a_seq {
+            Err(TransactionResult::TefNoTicket)
+        } else {
+            Err(TransactionResult::TerPreTicket)
+        };
+    }
+
     let t_seq = tx.get("Sequence").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
     if t_seq == a_seq {
@@ -271,11 +291,12 @@ impl TxEngine {
             }
         }
 
-        // Sequence check: rippled Transactor::checkSeqProxy. Tx Sequence must
-        // exactly match the AccountRoot Sequence; otherwise tefPAST_SEQ (used)
-        // or terPRE_SEQ (gap, retry). Skipped for pseudo-transactions and when
-        // a TicketSequence is used (ticket path not yet wired through engine).
-        if !is_pseudo && tx.get("TicketSequence").is_none() {
+        // Sequence check: rippled Transactor::checkSeqProxy. With a plain
+        // Sequence the tx must match the AccountRoot Sequence (else tefPAST_SEQ
+        // / terPRE_SEQ); with a TicketSequence the referenced Ticket SLE must
+        // exist (else tefNO_TICKET / terPRE_TICKET). Skipped only for
+        // pseudo-transactions, which carry neither.
+        if !is_pseudo {
             if let Err(result) = check_seq_proxy(tx, &view) {
                 return Ok(result);
             }
@@ -613,6 +634,88 @@ mod tests {
         let data = rxrpl_ledger::sle_codec::encode_sle(&json_bytes).unwrap();
         ledger.put_state(key, data).unwrap();
         ledger
+    }
+
+    fn ledger_with_seq_and_ticket(
+        address: &str,
+        account_seq: u32,
+        ticket_seq: Option<u32>,
+    ) -> Ledger {
+        let mut ledger = Ledger::genesis();
+        let account_id = decode_account_id(address).unwrap();
+        let account = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": address,
+            "Balance": "1000000",
+            "Sequence": account_seq,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        let bytes = serde_json::to_vec(&account).unwrap();
+        ledger
+            .put_state(
+                keylet::account(&account_id),
+                rxrpl_ledger::sle_codec::encode_sle(&bytes).unwrap(),
+            )
+            .unwrap();
+        if let Some(tseq) = ticket_seq {
+            let ticket = serde_json::json!({
+                "LedgerEntryType": "Ticket",
+                "Account": address,
+                "TicketSequence": tseq,
+                "Flags": 0,
+            });
+            let tbytes = serde_json::to_vec(&ticket).unwrap();
+            ledger
+                .put_state(
+                    keylet::ticket(&account_id, tseq),
+                    rxrpl_ledger::sle_codec::encode_sle(&tbytes).unwrap(),
+                )
+                .unwrap();
+        }
+        ledger
+    }
+
+    fn ticket_tx(address: &str, ticket_seq: u32) -> Value {
+        serde_json::json!({
+            "TransactionType": "AccountSet",
+            "Account": address,
+            "Fee": "10",
+            "Sequence": 0,
+            "TicketSequence": ticket_seq,
+        })
+    }
+
+    #[test]
+    fn check_seq_proxy_accepts_existing_ticket() {
+        let addr = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let ledger = ledger_with_seq_and_ticket(addr, 5, Some(3));
+        let view = LedgerView::with_fees(&ledger, FeeSettings::default());
+        assert_eq!(check_seq_proxy(&ticket_tx(addr, 3), &view), Ok(()));
+    }
+
+    #[test]
+    fn check_seq_proxy_rejects_spent_ticket_with_no_ticket() {
+        let addr = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        // ticket_seq 3 < account seq 5, and no ticket SLE -> already spent.
+        let ledger = ledger_with_seq_and_ticket(addr, 5, None);
+        let view = LedgerView::with_fees(&ledger, FeeSettings::default());
+        assert_eq!(
+            check_seq_proxy(&ticket_tx(addr, 3), &view),
+            Err(TransactionResult::TefNoTicket)
+        );
+    }
+
+    #[test]
+    fn check_seq_proxy_defers_future_ticket_with_pre_ticket() {
+        let addr = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        // ticket_seq 10 >= account seq 5, not yet created -> retryable.
+        let ledger = ledger_with_seq_and_ticket(addr, 5, None);
+        let view = LedgerView::with_fees(&ledger, FeeSettings::default());
+        assert_eq!(
+            check_seq_proxy(&ticket_tx(addr, 10), &view),
+            Err(TransactionResult::TerPreTicket)
+        );
     }
 
     #[test]
