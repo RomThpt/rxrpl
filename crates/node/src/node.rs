@@ -3777,10 +3777,37 @@ fn build_validator_identity(
     }
 
     if cfg.validator_token.is_some() || cfg.validator_token_path.is_some() {
-        return Err(NodeError::Config(
-            "validator_token / validator_token_path loading not yet wired \
-             (use master_secret + ephemeral_seed for now)"
-                .into(),
+        let token_str = match (&cfg.validator_token, &cfg.validator_token_path) {
+            (Some(t), _) => t.clone(),
+            (None, Some(path)) => std::fs::read_to_string(path).map_err(|e| {
+                NodeError::Config(format!(
+                    "failed to read validator_token_path {}: {e}",
+                    path.display()
+                ))
+            })?,
+            (None, None) => unreachable!("guarded by the is_some checks above"),
+        };
+        let token = rxrpl_config::parse_validator_token(&token_str)
+            .map_err(|e| NodeError::Config(format!("invalid validator_token: {e}")))?;
+        // The manifest is master-signed and binds the ephemeral signing key;
+        // parse_and_verify checks both signatures, so a malformed or tampered
+        // token is rejected here rather than producing untrusted validations.
+        let manifest = rxrpl_overlay::manifest::parse_and_verify(&token.manifest)
+            .map_err(|e| NodeError::Config(format!("validator_token manifest invalid: {e:?}")))?;
+        let signing_pubkey = manifest.ephemeral_public_key.ok_or_else(|| {
+            NodeError::Config("validator_token manifest is a revocation (no signing key)".into())
+        })?;
+        let signing = rxrpl_crypto::KeyPair {
+            public_key: signing_pubkey,
+            private_key: token.validation_secret_key,
+            key_type: rxrpl_crypto::KeyType::Secp256k1,
+        };
+        return Ok(Some(
+            rxrpl_overlay::identity::ValidatorIdentity::from_token(
+                manifest.master_public_key,
+                signing,
+                manifest.raw,
+            ),
         ));
     }
 

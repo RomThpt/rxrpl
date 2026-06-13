@@ -73,6 +73,8 @@ pub enum ManifestError {
     Revoked,
     #[error("sfDomain field is not valid UTF-8")]
     InvalidDomain,
+    #[error("cannot sign a manifest without the master secret (token-loaded identity)")]
+    NoMasterSecret,
 }
 
 /// Intermediate parse result before verification.

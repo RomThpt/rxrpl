@@ -64,6 +64,53 @@ fn build_validator_identity_rejects_master_without_ephemeral() {
 }
 
 #[test]
+fn build_validator_identity_loads_from_token() {
+    use base64::Engine;
+
+    // Build a real rippled-style validator token: a master-signed manifest
+    // plus the ephemeral signing secret, then load it through the config path.
+    let master_seed = rxrpl_crypto::Seed::from_passphrase("token-e2e-master");
+    let signing_seed = rxrpl_crypto::Seed::from_passphrase("token-e2e-signing");
+    let id = rxrpl_overlay::identity::ValidatorIdentity::two_key_typed(
+        &master_seed,
+        rxrpl_crypto::KeyType::Secp256k1,
+        &signing_seed,
+        rxrpl_crypto::KeyType::Secp256k1,
+    );
+    let manifest = id.sign_manifest(1, None).expect("manifest");
+    let signing_secret = id.signing_keypair().private_key.clone();
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let inner = format!(
+        r#"{{"manifest":"{}","validation_secret_key":"{}"}}"#,
+        b64.encode(&manifest),
+        hex::encode(&signing_secret),
+    );
+    let token = b64.encode(inner.as_bytes());
+
+    let cfg = rxrpl_config::ValidatorIdentityConfig {
+        validator_token: Some(token),
+        ..Default::default()
+    };
+    let loaded = build_validator_identity(&cfg).unwrap().expect("id present");
+
+    assert_eq!(
+        loaded.master_pubkey().as_bytes(),
+        id.master_pubkey().as_bytes(),
+        "token load must recover the master public key"
+    );
+    assert_eq!(
+        loaded.signing_pubkey().as_bytes(),
+        id.signing_pubkey().as_bytes(),
+        "token load must recover the ephemeral signing key"
+    );
+    assert!(
+        loaded.master_keypair().is_none(),
+        "token identity carries no master secret"
+    );
+}
+
+#[test]
 fn create_node() {
     let config = NodeConfig::default();
     let node = Node::new(config).unwrap();
