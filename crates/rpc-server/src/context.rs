@@ -92,6 +92,10 @@ pub struct ServerContext {
     /// mode (no P2P). The `server_info.peers` field reads `.len()` at query
     /// time so dashboards see the current count without polling overhead.
     peer_set: Option<Arc<rxrpl_overlay::peer_set::PeerSet>>,
+    /// Command channel to the overlay manager, populated in network mode.
+    /// `None` in standalone/reporting mode. Used by the `connect` admin RPC
+    /// to initiate an outbound peer connection via `OverlayCommand::ConnectTo`.
+    overlay_command: Option<mpsc::UnboundedSender<rxrpl_overlay::command::OverlayCommand>>,
     /// Snapshot of the last completed consensus round (proposer count and
     /// convergence duration), refreshed by Node on each `close_consensus_round`.
     /// `None` until the first close completes. Used by the kurtosis dashboard
@@ -175,6 +179,7 @@ impl ServerContext {
             network_id: None,
             local_manifest: OnceLock::new(),
             peer_set: None,
+            overlay_command: None,
             last_close: None,
             network_validated: None,
             startup_instant: std::time::Instant::now(),
@@ -216,6 +221,7 @@ impl ServerContext {
             network_id: None,
             local_manifest: OnceLock::new(),
             peer_set: None,
+            overlay_command: None,
             last_close: None,
             network_validated: None,
             startup_instant: std::time::Instant::now(),
@@ -258,6 +264,7 @@ impl ServerContext {
             network_id: None,
             local_manifest: OnceLock::new(),
             peer_set: None,
+            overlay_command: None,
             last_close: None,
             network_validated: None,
             startup_instant: std::time::Instant::now(),
@@ -300,6 +307,7 @@ impl ServerContext {
             network_id: None,
             local_manifest: OnceLock::new(),
             peer_set: None,
+            overlay_command: None,
             last_close: None,
             network_validated: None,
             startup_instant: std::time::Instant::now(),
@@ -335,6 +343,7 @@ impl ServerContext {
             network_id: None,
             local_manifest: OnceLock::new(),
             peer_set: None,
+            overlay_command: None,
             last_close: None,
             network_validated: None,
             startup_instant: std::time::Instant::now(),
@@ -403,6 +412,27 @@ impl ServerContext {
     pub fn attach_peer_set(self: &mut Arc<Self>, set: Arc<rxrpl_overlay::peer_set::PeerSet>) {
         if let Some(ctx) = Arc::get_mut(self) {
             ctx.peer_set = Some(set);
+        }
+    }
+
+    /// Attach the overlay command channel so the `connect` admin RPC can
+    /// initiate outbound peer connections. Must be called before the `Arc`
+    /// is shared (same constraint as `attach_peer_set`).
+    pub fn attach_overlay_command(
+        self: &mut Arc<Self>,
+        tx: mpsc::UnboundedSender<rxrpl_overlay::command::OverlayCommand>,
+    ) {
+        if let Some(ctx) = Arc::get_mut(self) {
+            ctx.overlay_command = Some(tx);
+        }
+    }
+
+    /// Send a command to the overlay manager. Returns `false` when no overlay
+    /// is attached (standalone/reporting mode) or the channel is closed.
+    pub fn send_overlay_command(&self, cmd: rxrpl_overlay::command::OverlayCommand) -> bool {
+        match &self.overlay_command {
+            Some(tx) => tx.send(cmd).is_ok(),
+            None => false,
         }
     }
 
