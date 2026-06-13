@@ -10,7 +10,13 @@ import time
 
 import pytest
 
-from conftest import ALL_URLS, RIPPLED_URLS, RXRPL_URLS, get_ledger_hash, wait_for_ledger
+from conftest import (
+    ALL_URLS,
+    RIPPLED_URLS,
+    RXRPL_URLS,
+    wait_for_ledger,
+    wait_for_ledger_hash,
+)
 from docker_helpers import (
     RXRPL_CONTAINERS,
     require_docker,
@@ -67,7 +73,7 @@ class TestFlakyRxrpl:
 
         # 4. All 3 nodes agree on a settled ledger after recovery.
         check_seq = baseline_seq + 1
-        hashes = {url: get_ledger_hash(url, check_seq) for url in ALL_URLS}
+        hashes = {url: wait_for_ledger_hash(url, check_seq) for url in ALL_URLS}
         for url, h in hashes.items():
             assert h is not None, f"{url} missing hash for ledger {check_seq}"
         unique = set(hashes.values())

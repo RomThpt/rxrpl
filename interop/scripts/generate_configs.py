@@ -2,8 +2,10 @@
 """Generate interop test network configurations (confluence topology).
 
 Writes deterministic configs for the mixed validator network defined in
-`interop/docker-compose.yml`: two rippled validators and one rxrpl
-validator, all sharing one UNL.
+`interop/docker-compose.yml`: three rippled validators and two rxrpl
+validators, all sharing one UNL. The 5-validator set gives an 80% quorum
+of 4, so the network tolerates losing any single validator (required by
+the chaos/fault-tolerance tests).
 
 The validator keys below are real, pre-harvested fixtures — not stubs:
 
@@ -36,6 +38,11 @@ RIPPLED_VALIDATORS = [
         "public_key": "n9Ki1vBTxo26iszNVRoGK1nFMsrfx68xnYcrBEUY62XsgHM7FCM5",
         "ip": "172.30.0.11",
     },
+    {
+        "seed": "shqEDAXNxM8Y94qj4Hq2EocLqZEKz",
+        "public_key": "n9KXHLvP8vsxhNLNFKxUDqziUMbqoLikk3Y2jHh1dnaqMCb3gnn4",
+        "ip": "172.30.0.12",
+    },
 ]
 RXRPL_VALIDATORS = [
     {
@@ -43,6 +50,12 @@ RXRPL_VALIDATORS = [
         "public_key": "n9Lc8w5xK1kJE4AiHX9kvDQF6shMBWoz8pEXp95xRo227ZMnUPt2",
         "ip": "172.30.0.20",
         "node_seed": "a1f33f544dbae3d90db16b1bc9e821e9",
+    },
+    {
+        "seed": "shVHki9rwyRX52LWJkUqcH2H17bhh",
+        "public_key": "n9J5N9HSH3cYmJmJDxjq3JPwxFDo62CakvCCZkjn2crcgxs3dztj",
+        "ip": "172.30.0.21",
+        "node_seed": "57c2cb534e657e81da3dc09c69a33607",
     },
 ]
 
@@ -83,7 +96,6 @@ tiny
 type=NuDB
 path=/var/lib/rippled/db/nudb
 advisory_delete=0
-online_delete=256
 earliest_seq=1
 
 [database_path]
@@ -118,7 +130,7 @@ Overlay=debug
 {NETWORK_ID}
 
 [ledger_history]
-256
+full
 
 [consensus]
 minimum_duration_ms=200
@@ -231,8 +243,8 @@ def write_publisher_manifest(path):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate interop test configs")
-    parser.add_argument("--rippled", type=int, default=2)
-    parser.add_argument("--rxrpl", type=int, default=1)
+    parser.add_argument("--rippled", type=int, default=3)
+    parser.add_argument("--rxrpl", type=int, default=2)
     args = parser.parse_args()
     if args.rippled != len(RIPPLED_VALIDATORS) or args.rxrpl != len(RXRPL_VALIDATORS):
         parser.error(

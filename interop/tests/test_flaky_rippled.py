@@ -12,7 +12,13 @@ import time
 
 import pytest
 
-from conftest import ALL_URLS, RIPPLED_URLS, RXRPL_URLS, get_ledger_hash, wait_for_ledger
+from conftest import (
+    ALL_URLS,
+    RIPPLED_URLS,
+    RXRPL_URLS,
+    wait_for_ledger,
+    wait_for_ledger_hash,
+)
 from docker_helpers import (
     RIPPLED_CONTAINERS,
     container_logs,
@@ -68,7 +74,7 @@ class TestFlakyRippled:
 
         # 6. Hash agreement at a ledger closed *after* recovery.
         check_seq = baseline_seq + 2
-        hashes = {url: get_ledger_hash(url, check_seq) for url in ALL_URLS}
+        hashes = {url: wait_for_ledger_hash(url, check_seq) for url in ALL_URLS}
         for url, h in hashes.items():
             assert h is not None, f"{url} missing hash for ledger {check_seq}"
         unique = set(hashes.values())
