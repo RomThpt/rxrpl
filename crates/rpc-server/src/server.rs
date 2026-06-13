@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::DefaultBodyLimit;
 use axum::extract::connect_info::ConnectInfo;
@@ -32,6 +33,14 @@ use crate::subscriptions::ConnectionSubscriptions;
 /// few hundred KB at worst. 1 MiB is generous and stops a remote attacker
 /// from holding an arbitrary amount of memory open per request (audit H3).
 pub const MAX_RPC_BODY: usize = 1024 * 1024;
+
+/// Wall-clock ceiling for dispatching a single HTTP RPC request. A handler
+/// that blocks (lock contention, a pathological query) would otherwise hold
+/// the connection open indefinitely; bounding it lets the server shed a stuck
+/// request and reply with an error instead. Generous enough for legitimately
+/// heavy reads (paginated `account_tx`, large `ledger_data`). Does not apply
+/// to the WebSocket path, whose subscriptions are intentionally long-lived.
+pub const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     Router::new()
@@ -370,7 +379,35 @@ async fn rpc_handler(
     let role = ConnectionRole::from_ip(addr.ip(), &ctx.config);
     let req_ctx = RequestContext { role, api_version };
 
-    match dispatch(method, params, &ctx, &req_ctx).await {
+    let dispatched = match tokio::time::timeout(
+        RPC_REQUEST_TIMEOUT,
+        dispatch(method, params, &ctx, &req_ctx),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => {
+            tracing::warn!(
+                "RPC method {:?} timed out after {}s",
+                method,
+                RPC_REQUEST_TIMEOUT.as_secs()
+            );
+            let response = serde_json::json!({
+                "result": {
+                    "status": "error",
+                    "error": "timeout",
+                    "error_message": format!(
+                        "request timed out after {}s",
+                        RPC_REQUEST_TIMEOUT.as_secs()
+                    ),
+                    "request": body,
+                }
+            });
+            return (StatusCode::OK, Json(response));
+        }
+    };
+
+    match dispatched {
         Ok(result) => {
             let mut obj = result.as_object().cloned().unwrap_or_default();
             obj.insert("status".into(), Value::String("success".into()));
