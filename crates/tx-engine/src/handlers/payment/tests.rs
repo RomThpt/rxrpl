@@ -1999,5 +1999,5 @@ fn apply_cross_currency_amm_partial_scales_to_send_max() {
     let amm_bytes = sandbox.read(&amm_key).unwrap();
     let amm: serde_json::Value = serde_json::from_slice(&amm_bytes).unwrap();
     let new_gbp: u64 = amm["PoolBalance1"].as_str().unwrap().parse().unwrap();
-    assert!(new_gbp < 1000 && new_gbp >= 970, "pool GBP {new_gbp}");
+    assert!((970..1000).contains(&new_gbp), "pool GBP {new_gbp}");
 }
