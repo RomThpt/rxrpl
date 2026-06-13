@@ -859,6 +859,7 @@ impl Node {
         let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<(Hash256, Vec<u8>)>();
         let cmd_tx_relay = cmd_tx.clone();
         let cmd_tx_catchup = cmd_tx.clone();
+        let cmd_tx_rpc = cmd_tx.clone();
 
         // 5. Create NetworkConsensusAdapter (consumes cmd_tx). When a
         // validator identity is configured, attach it so that proposals are
@@ -981,6 +982,9 @@ impl Node {
         // Peer set: shared with the overlay so `server_info.peers` reads the
         // live connection count.
         ctx.attach_peer_set(peer_mgr.peer_set());
+        // Overlay command channel: lets the `connect` admin RPC initiate
+        // outbound peer connections via OverlayCommand::ConnectTo.
+        ctx.attach_overlay_command(cmd_tx_rpc);
         // Last-close snapshot: populated below by close_consensus_round on
         // each accepted round (proposer count + converge duration). Surfaced
         // as `server_info.last_close`.
