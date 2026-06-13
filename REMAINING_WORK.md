@@ -31,33 +31,45 @@ durcissement, pas de bugs bloquants.
   étaient dans le harness de test.
 - **Paiements cross-currency multi-hop** : Phases 1-4 livrées (PRs #104-#109).
 
+## Livré le 2026-06-13
+
+Les trous secondaires « non bloquants » ont été comblés :
+
+1. **`validator_token` / `validator_token_path`** — chargé via le parser
+   existant ; `ValidatorIdentity` porte désormais un master *pubkey-only* +
+   un manifest pré-signé relayé tel quel (PR #123).
+2. **Indexation de l'historique des transactions NFT** — index
+   `nft_transactions` (sqlite + postgres), alimenté au close en collectant
+   les `NFTokenID` du tx + meta ; `nft_history` lit l'index (PR #126).
+3. **Initiation de connexion P2P via RPC** — `connect` câblé à
+   `OverlayCommand::ConnectTo` via le canal de commande overlay (PR #125).
+4. **Chemin `TicketSequence` à travers le moteur** — validation centrale
+   (`checkSeqProxy` : `tefNO_TICKET`/`terPRE_TICKET`, PR #127) + consommation
+   du Ticket SLE dans OfferCreate/TrustSet (PR #128) et tous les chemins de
+   Payment (PR #129).
+5. **Durcissement RPC** — timeout de 30 s sur le dispatch HTTP (PR #124).
+
+**Routage AMM dans les paiements** : déjà implémenté et testé (PRs multi-hop
+#104-#109). `quote_amm_swap` + `AmmConsume` dans `payment.rs` couvrent les
+strands AMM-seul, book+AMM combinés, et l'échec `tecPATH_PARTIAL` quand ni
+book ni AMM ne satisfont la cible (voir les tests `apply_cross_currency_*`).
+
 ## À faire
 
-### Fonctionnalités secondaires (trous précis, non bloquants)
+### Différé par conception
 
-Tous présents sous forme de `TODO`/`not yet wired` dans le code de prod :
+- **Bootstrap checkpoint par hash** (`node.rs`, branche `StartingLedger::Hash`) :
+  résoudre un hash arbitraire → seq exige une requête P2P header-by-hash
+  asynchrone greffée dans la boucle de consensus/catchup — code critique,
+  risque élevé pour une faible valeur (`--starting-ledger=<seq>` et `recent`
+  couvrent le bootstrap). Laissé non implémenté volontairement.
 
-1. **`validator_token` / `validator_token_path`** (`crates/node/src/node.rs`,
-   `build_validator_identity`). Seule la forme explicite `master_secret` +
-   `ephemeral_seed` est câblée. Le parser existe déjà
-   (`crates/config/src/validator_token.rs`) mais n'est pas branché : il faut
-   permettre à `ValidatorIdentity` de porter un master *pubkey-only* (le
-   master secret ne vit jamais sur le validateur en mode token), parser le
-   manifest du token pour en extraire master-pubkey + sequence, et diffuser
-   ce manifest pré-signé au lieu d'en régénérer un. Chantier dédié (touche le
-   cœur de l'identité validateur).
-2. **Bootstrap checkpoint par hash** (`node.rs`) : le lookup d'un header par
-   hash n'est pas câblé ; un node démarre depuis genesis.
-3. **Indexation de l'historique des transactions NFT**
-   (`crates/rpc-server/src/handlers/nft_history.rs`).
-4. **Initiation de connexion P2P via RPC**
-   (`crates/rpc-server/src/handlers/connect.rs`).
-5. **Chemin `TicketSequence` à travers le moteur** (`crates/tx-engine/src/engine.rs`).
+### Améliorations mineures connues
 
-### Routage AMM dans les paiements
-
-Le multi-hop cross-currency est livré ; le routage via AMM (Automated Market
-Maker) reste à brancher (`crates/pathfind/` strands → `payment.rs`).
+- **Scaling partiel des strands AMM** (`payment.rs`) : une strand touchant
+  l'AMM refuse le scaling partiel (`tecPATH_PARTIAL`) au lieu de re-résoudre
+  le swap constant-product sous une cible réduite. Comportement sûr mais
+  non optimal.
 
 ### Durcissement production
 
