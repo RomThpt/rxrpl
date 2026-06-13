@@ -3487,6 +3487,32 @@ impl Node {
         self.node_store.as_ref()
     }
 
+    /// Recursively collect every `NFTokenID` value (64-char hex) reachable in
+    /// a JSON value — covers both tx_json fields (burn/offers) and metadata
+    /// AffectedNodes (mint).
+    fn collect_nftoken_ids(value: &Value, out: &mut std::collections::HashSet<String>) {
+        match value {
+            Value::Object(map) => {
+                for (k, v) in map {
+                    if k == "NFTokenID" {
+                        if let Some(s) = v.as_str() {
+                            if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                                out.insert(s.to_string());
+                            }
+                        }
+                    }
+                    Self::collect_nftoken_ids(v, out);
+                }
+            }
+            Value::Array(items) => {
+                for v in items {
+                    Self::collect_nftoken_ids(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Index all transactions from a closed ledger into the transaction store.
     pub fn index_ledger_transactions(store: &dyn TxStore, ledger: &Ledger) {
         let seq = ledger.header.sequence;
@@ -3539,6 +3565,28 @@ impl Node {
                             tx_hash.as_bytes(),
                         ) {
                             tracing::error!("failed to index dest account tx: {}", e);
+                        }
+                    }
+                }
+
+                // Index by NFTokenID: a tx may touch several NFTs (mint emits
+                // the id in metadata; burn/offers carry it in tx_json), so
+                // collect every NFTokenID appearing in the record and map each
+                // to this tx.
+                let mut nft_ids = std::collections::HashSet::new();
+                Self::collect_nftoken_ids(&record, &mut nft_ids);
+                for nft_id_hex in &nft_ids {
+                    if let Ok(bytes) = hex::decode(nft_id_hex) {
+                        if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                            let nft_id = Hash256::new(arr);
+                            if let Err(e) = store.insert_nft_transaction(
+                                nft_id.as_bytes(),
+                                seq,
+                                tx_index,
+                                tx_hash.as_bytes(),
+                            ) {
+                                tracing::error!("failed to index nft tx: {}", e);
+                            }
                         }
                     }
                 }

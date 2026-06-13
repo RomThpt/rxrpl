@@ -415,3 +415,35 @@ fn loose_seed_file_mode_fails_node_creation() {
     };
     assert!(matches!(err, NodeError::SeedFile(_)), "got {err:?}");
 }
+
+#[test]
+fn collect_nftoken_ids_finds_ids_in_tx_and_meta() {
+    let id_a = "00080000".to_string() + &"A".repeat(56);
+    let id_b = "00080000".to_string() + &"B".repeat(56);
+    // id in tx_json (burn/offer style) and a different id nested in meta
+    // AffectedNodes (mint style).
+    let record = serde_json::json!({
+        "tx_json": { "TransactionType": "NFTokenBurn", "NFTokenID": id_a },
+        "meta": {
+            "AffectedNodes": [
+                { "CreatedNode": { "NewFields": { "NFTokens": [ { "NFTokenID": id_b } ] } } }
+            ]
+        }
+    });
+    let mut out = std::collections::HashSet::new();
+    Node::collect_nftoken_ids(&record, &mut out);
+    assert_eq!(out.len(), 2);
+    assert!(out.contains(&id_a));
+    assert!(out.contains(&id_b));
+}
+
+#[test]
+fn collect_nftoken_ids_ignores_malformed() {
+    let record = serde_json::json!({
+        "tx_json": { "NFTokenID": "tooshort" },
+        "other": { "NFTokenID": 12345 }
+    });
+    let mut out = std::collections::HashSet::new();
+    Node::collect_nftoken_ids(&record, &mut out);
+    assert!(out.is_empty());
+}

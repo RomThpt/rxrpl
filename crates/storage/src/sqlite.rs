@@ -63,6 +63,17 @@ impl SqliteStore {
 
             CREATE INDEX IF NOT EXISTS idx_acct_tx_hash
                 ON account_transactions (tx_hash);
+
+            CREATE TABLE IF NOT EXISTS nft_transactions (
+                nft_id      BLOB NOT NULL,
+                ledger_seq  INTEGER NOT NULL,
+                tx_index    INTEGER NOT NULL,
+                tx_hash     BLOB NOT NULL,
+                PRIMARY KEY (nft_id, ledger_seq, tx_index)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_nft_tx_hash
+                ON nft_transactions (tx_hash);
             ",
         )?;
         Ok(())
@@ -196,6 +207,51 @@ impl TxStore for SqliteStore {
             .collect::<Result<Vec<Vec<u8>>, _>>()?;
         Ok(hashes)
     }
+
+    fn insert_nft_transaction(
+        &self,
+        nft_id: &[u8],
+        ledger_seq: u32,
+        tx_index: u32,
+        tx_hash: &[u8],
+    ) -> Result<(), StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO nft_transactions (nft_id, ledger_seq, tx_index, tx_hash)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![nft_id, ledger_seq, tx_index, tx_hash],
+        )?;
+        Ok(())
+    }
+
+    fn get_nft_transactions(
+        &self,
+        nft_id: &[u8],
+        limit: u32,
+        ledger_index_min: u32,
+        ledger_index_max: u32,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT tx_hash FROM nft_transactions
+             WHERE nft_id = ?1 AND ledger_seq >= ?2 AND ledger_seq <= ?3
+             ORDER BY ledger_seq DESC, tx_index DESC
+             LIMIT ?4",
+        )?;
+        let hashes = stmt
+            .query_map(
+                rusqlite::params![nft_id, ledger_index_min, ledger_index_max, limit],
+                |row| row.get(0),
+            )?
+            .collect::<Result<Vec<Vec<u8>>, _>>()?;
+        Ok(hashes)
+    }
 }
 
 /// Extension trait to convert `rusqlite::Error::QueryReturnedNoRows` to `None`.
@@ -265,5 +321,38 @@ mod tests {
         // Reverse chronological
         assert_eq!(results[0], tx2);
         assert_eq!(results[1], tx1);
+    }
+
+    #[test]
+    fn nft_transaction_lookup_and_range() {
+        let store = SqliteStore::in_memory().unwrap();
+        let nft = b"nft_id_padded_out_to_32_bytes!!_";
+        let mint = b"mint_tx_hash_padded_to_32_bytes_";
+        let offer = b"offer_tx_hash_padded_to_32_byte_";
+        let burn = b"burn_tx_hash_padded_to_32_bytes_";
+
+        store.insert_nft_transaction(nft, 100, 0, mint).unwrap();
+        store.insert_nft_transaction(nft, 105, 2, offer).unwrap();
+        store.insert_nft_transaction(nft, 110, 0, burn).unwrap();
+
+        // Newest first, full range.
+        let all = store.get_nft_transactions(nft, 10, 0, u32::MAX).unwrap();
+        assert_eq!(all, vec![burn.to_vec(), offer.to_vec(), mint.to_vec()]);
+
+        // Bounded range excludes endpoints outside [101, 109].
+        let mid = store.get_nft_transactions(nft, 10, 101, 109).unwrap();
+        assert_eq!(mid, vec![offer.to_vec()]);
+
+        // Limit caps the result count.
+        let capped = store.get_nft_transactions(nft, 1, 0, u32::MAX).unwrap();
+        assert_eq!(capped, vec![burn.to_vec()]);
+
+        // Unknown NFT yields nothing.
+        assert!(
+            store
+                .get_nft_transactions(b"unknown_nft_padded_to_32_bytes!_", 10, 0, u32::MAX)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
