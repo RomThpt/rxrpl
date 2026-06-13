@@ -1016,15 +1016,59 @@ fn back_solve_n_hop(
         // DeliverMin still requires Amount or fails.)
         return Err(TransactionResult::TecPathPartial);
     }
-    // Refuse partial scaling for strands that touch the AMM: the swap is
-    // non-linear (constant product), so a uniform `scale` would diverge
-    // from the actual on-chain quote. A future revision could re-solve
-    // every AMM leg under the scaled target; for now, callers must size
-    // their SendMax / DeliverMin so the strand fits without scaling.
-    for action in hops.iter() {
-        if let HopAction::Book { amm: Some(_), .. } = action {
+    // Strands that touch the AMM cannot be scaled uniformly: the swap is
+    // non-linear (constant product), so a single `scale` factor diverges
+    // from the actual on-chain quote. Instead bisect on the deliverable
+    // target — source cost is monotonically increasing in target — and
+    // rebuild the plan at the largest target whose cost fits SendMax.
+    // `back_solve_n_hop` is read-only, so re-invoking it is side-effect
+    // free; `partial_allowed=false` on the recursive calls makes them
+    // return the full plan when it fits and `tecPATH_PARTIAL` otherwise,
+    // which is exactly the feasibility predicate we bisect on.
+    let touches_amm = hops
+        .iter()
+        .any(|a| matches!(a, HopAction::Book { amm: Some(_), .. }));
+    if touches_amm {
+        let mut lo = 0.0f64;
+        let mut hi = target;
+        // 64 halvings drives the f64 interval well below any representable
+        // amount; cost monotonicity guarantees convergence to the SendMax tip.
+        for _ in 0..64 {
+            let mid = (lo + hi) / 2.0;
+            let mid_s = format!("{mid}");
+            match back_solve_n_hop(
+                ctx,
+                account_str,
+                destination_str,
+                (dst_cur, dst_iss, &mid_s),
+                send_max,
+                intermediates,
+                false,
+                None,
+            ) {
+                Ok(p) if p.src_spent <= send_max_val + 1e-9 => lo = mid,
+                _ => hi = mid,
+            }
+        }
+        if lo <= 0.0 {
             return Err(TransactionResult::TecPathPartial);
         }
+        if let Some(d_min) = deliver_min {
+            if lo + 1e-9 < d_min {
+                return Err(TransactionResult::TecPathPartial);
+            }
+        }
+        let lo_s = format!("{lo}");
+        return back_solve_n_hop(
+            ctx,
+            account_str,
+            destination_str,
+            (dst_cur, dst_iss, &lo_s),
+            send_max,
+            intermediates,
+            false,
+            None,
+        );
     }
     for action in hops.iter_mut() {
         match action {

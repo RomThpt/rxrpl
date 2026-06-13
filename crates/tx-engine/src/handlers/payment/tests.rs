@@ -1940,3 +1940,64 @@ fn apply_cross_currency_no_amm_no_book_fails_path_partial() {
     let result = PaymentTransactor.apply(&mut ctx);
     assert_eq!(result, Err(TransactionResult::TecPathPartial));
 }
+
+/// Partial payment through an AMM-only strand when SendMax cannot cover the
+/// full Amount. The constant-product swap is non-linear, so the walker
+/// bisects on the deliverable target and delivers the most the SendMax can
+/// buy (>= DeliverMin) instead of failing tecPATH_PARTIAL.
+#[test]
+fn apply_cross_currency_amm_partial_scales_to_send_max() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, ALICE, "50000000", None);
+    put_account(&mut ledger, BOB, "50000000", None);
+    put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+    put_trust_line(&mut ledger, BOB, ISSUER, "GBP", 0.0);
+    // GBP < USD bytewise -> PoolBalance1 = GBP, PoolBalance2 = USD.
+    let amm_key = put_amm(&mut ledger, "GBP", ISSUER, "USD", ISSUER, 1000, 1000, 0);
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    // Want 50 GBP (~52.6 USD) but only allow 30 USD; partial + DeliverMin 20.
+    let tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": BOB,
+        "Amount": iou("GBP", ISSUER, "50"),
+        "SendMax": iou("USD", ISSUER, "30"),
+        "DeliverMin": iou("GBP", ISSUER, "20"),
+        "Flags": 0x0002_0000u32,
+        "Paths": [[ { "currency": "GBP", "issuer": ISSUER, "type": 0x30 } ]],
+        "Fee": "10",
+    });
+    let rules = Rules::new();
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    let result = PaymentTransactor.apply(&mut ctx).unwrap();
+    assert_eq!(result, TransactionResult::TesSuccess);
+
+    // With pool 1000/1000 and 30 USD in, output GBP = 1000 - 1000*1000/1030
+    // ~= 29.1, between DeliverMin (20) and Amount (50).
+    let bob_gbp = holder_balance(&sandbox, BOB, ISSUER, "GBP");
+    assert!(bob_gbp >= 20.0, "delivered {bob_gbp} below DeliverMin");
+    assert!(bob_gbp < 50.0, "delivered {bob_gbp} should be partial");
+    assert!(
+        (bob_gbp - 29.1).abs() < 1.5,
+        "delivered {bob_gbp} off AMM quote"
+    );
+
+    // Alice spent at most the 30 USD SendMax.
+    let alice_usd = holder_balance(&sandbox, ALICE, ISSUER, "USD");
+    assert!(alice_usd >= 100.0 - 30.0 - 1e-6, "spent more than SendMax");
+
+    // Pool drained on the GBP side by the delivered amount.
+    let amm_bytes = sandbox.read(&amm_key).unwrap();
+    let amm: serde_json::Value = serde_json::from_slice(&amm_bytes).unwrap();
+    let new_gbp: u64 = amm["PoolBalance1"].as_str().unwrap().parse().unwrap();
+    assert!((970..1000).contains(&new_gbp), "pool GBP {new_gbp}");
+}
