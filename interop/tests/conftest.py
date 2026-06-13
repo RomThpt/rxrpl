@@ -100,6 +100,24 @@ def get_ledger_hash(url: str, seq: int) -> str | None:
         return None
 
 
+def wait_for_ledger_hash(url: str, seq: int, timeout: int = TIMEOUT) -> str | None:
+    """Return the hash of ledger `seq`, waiting until the node can serve it.
+
+    A node that rejoins after a crash reports `validated_ledger` at the tip
+    before it has backfilled the historical ledger range, so a point read of
+    an older ledger transiently returns nothing. Retry until the history is
+    available (or the timeout elapses) so hash-agreement checks don't race
+    the asynchronous backfill.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        h = get_ledger_hash(url, seq)
+        if h is not None:
+            return h
+        time.sleep(2)
+    return None
+
+
 def pytest_collection_modifyitems(config, items):
     """Skip network tests when INTEROP_OFFLINE=1 (unit-only mode)."""
     if os.environ.get("INTEROP_OFFLINE") == "1":

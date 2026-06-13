@@ -53,7 +53,7 @@ docker build -t rxrpl:interop -f "$PROJECT_ROOT/Dockerfile" "$PROJECT_ROOT"
 echo "--- Starting mixed network ---"
 export RIPPLED_IMAGE
 cd "$INTEROP_DIR"
-docker compose -f docker-compose.yml up -d --build rippled-0 rippled-1 rxrpl-0
+docker compose -f docker-compose.yml up -d --build rippled-0 rippled-1 rippled-2 rxrpl-0 rxrpl-1
 
 # Step 4: Run tests
 echo "--- Running interop tests (suite: $SUITE) ---"

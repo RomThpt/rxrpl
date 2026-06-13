@@ -26,7 +26,7 @@ GENERATE = os.path.join(SCRIPTS_DIR, "generate_configs.py")
 def regenerate_configs():
     """Run generate_configs.py with a known node count before each test module."""
     subprocess.run(
-        [sys.executable, GENERATE, "--rippled", "2", "--rxrpl", "1"],
+        [sys.executable, GENERATE, "--rippled", "3", "--rxrpl", "2"],
         check=True,
         cwd=INTEROP_DIR,
     )
@@ -47,17 +47,19 @@ class TestConfigsB1:
         assert len(pub["public_key"]) == 66, "publisher pubkey must be 33-byte compressed"
 
     def test_manifest_contains_mixed_validators(self, regenerate_configs):
-        """The signed manifest lists exactly 2 rippled + 1 rxrpl entries."""
+        """The signed manifest lists exactly 3 rippled + 2 rxrpl entries."""
         path = os.path.join(CONFIGS_DIR, "manifest.json")
         assert os.path.isfile(path), f"missing manifest: {path}"
         with open(path) as f:
             manifest = json.load(f)
         assert "validators" in manifest
         validators = manifest["validators"]
-        assert len(validators) == 3, f"expected 3 validators, got {len(validators)}"
+        assert len(validators) == 5, f"expected 5 validators, got {len(validators)}"
         # Each entry must carry pubkey + role tag
         roles = sorted(v["role"] for v in validators)
-        assert roles == ["rippled", "rippled", "rxrpl"], f"role mix: {roles}"
+        assert roles == ["rippled", "rippled", "rippled", "rxrpl", "rxrpl"], (
+            f"role mix: {roles}"
+        )
 
     def test_manifest_signature_present(self, regenerate_configs):
         """The manifest carries a publisher signature over the validator blob."""
@@ -68,7 +70,7 @@ class TestConfigsB1:
         assert "signing_pubkey" in manifest
 
     def test_validators_txt_lists_all_keys(self, regenerate_configs):
-        """validators.txt contains all 3 master public keys."""
+        """validators.txt contains all 5 master public keys."""
         path = os.path.join(CONFIGS_DIR, "validators.txt")
         with open(path) as f:
             content = f.read()
@@ -77,10 +79,10 @@ class TestConfigsB1:
             ln.strip() for ln in content.splitlines()
             if ln.strip() and not ln.strip().startswith("[")
         ]
-        assert len(keys) == 3, f"expected 3 validator keys, got {len(keys)}: {keys}"
+        assert len(keys) == 5, f"expected 5 validator keys, got {len(keys)}: {keys}"
 
     def test_rxrpl_config_trusts_rippled_keys(self, regenerate_configs):
-        """rxrpl-0.toml trusted set contains all 3 keys (self + 2 peers)."""
+        """rxrpl-0.toml trusted set contains all 5 keys (self + 4 peers)."""
         path = os.path.join(CONFIGS_DIR, "rxrpl-0.toml")
         with open(path) as f:
             content = f.read()
@@ -90,4 +92,4 @@ class TestConfigsB1:
         m = re.search(r"trusted\s*=\s*\[([^\]]*)\]", content)
         assert m, "trusted = [...] block not found"
         entries = [s for s in re.findall(r'"([^"]+)"', m.group(1))]
-        assert len(entries) == 3, f"expected 3 trusted keys, got {len(entries)}"
+        assert len(entries) == 5, f"expected 5 trusted keys, got {len(entries)}"

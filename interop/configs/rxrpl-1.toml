@@ -6,8 +6,8 @@ admin_ips = ["0.0.0.0"]
 port = 51235
 max_peers = 21
 seeds = []
-fixed_peers = ["172.30.0.10:51235", "172.30.0.11:51235", "172.30.0.12:51235", "172.30.0.21:51235"]
-node_seed = "a1f33f544dbae3d90db16b1bc9e821e9"
+fixed_peers = ["172.30.0.10:51235", "172.30.0.11:51235", "172.30.0.12:51235", "172.30.0.20:51235"]
+node_seed = "57c2cb534e657e81da3dc09c69a33607"
 tls_enabled = false
 
 [database]
@@ -21,8 +21,8 @@ trusted = ["n9KXX4mAWwFeEBemh5Kg4e4o41pcmmhrCGFycMSdLx3yFSXZyvyf", "n9Ki1vBTxo26
 quorum = 2
 
 [validator_identity]
-master_secret = "sEdVZKfQYfinxEpnzyLmQZfSYNV2teD"
-ephemeral_seed = "sEdVZKfQYfinxEpnzyLmQZfSYNV2teD"
+master_secret = "shVHki9rwyRX52LWJkUqcH2H17bhh"
+ephemeral_seed = "shVHki9rwyRX52LWJkUqcH2H17bhh"
 
 [network]
 network_id = 99
