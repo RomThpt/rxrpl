@@ -55,4 +55,23 @@ pub trait TxStore: Send + Sync + 'static {
         account: &[u8],
         limit: u32,
     ) -> Result<Vec<Vec<u8>>, StorageError>;
+
+    /// Insert an NFT-transaction mapping (one row per NFTokenID touched by a tx).
+    fn insert_nft_transaction(
+        &self,
+        nft_id: &[u8],
+        ledger_seq: u32,
+        tx_index: u32,
+        tx_hash: &[u8],
+    ) -> Result<(), StorageError>;
+
+    /// Get transaction hashes touching an NFT, newest first, optionally bounded
+    /// to a `[ledger_index_min, ledger_index_max]` range.
+    fn get_nft_transactions(
+        &self,
+        nft_id: &[u8],
+        limit: u32,
+        ledger_index_min: u32,
+        ledger_index_max: u32,
+    ) -> Result<Vec<Vec<u8>>, StorageError>;
 }

@@ -65,6 +65,25 @@ impl PostgresStore {
         .execute(&self.pool)
         .await?;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS nft_transactions (
+                nft_id      BYTEA NOT NULL,
+                ledger_seq  INTEGER NOT NULL,
+                tx_index    INTEGER NOT NULL,
+                tx_hash     BYTEA NOT NULL,
+                PRIMARY KEY (nft_id, ledger_seq, tx_index)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_nft_tx_hash
+                ON nft_transactions (tx_hash)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 }
@@ -203,6 +222,58 @@ impl TxStore for PostgresStore {
                  LIMIT $2",
             )
             .bind(&account)
+            .bind(limit as i32)
+            .fetch_all(&self.pool)
+            .await?;
+
+            Ok(rows.iter().map(|r| r.get("tx_hash")).collect())
+        })
+    }
+
+    fn insert_nft_transaction(
+        &self,
+        nft_id: &[u8],
+        ledger_seq: u32,
+        tx_index: u32,
+        tx_hash: &[u8],
+    ) -> Result<(), StorageError> {
+        let nft_id = nft_id.to_vec();
+        let tx_hash = tx_hash.to_vec();
+        self.rt.block_on(async {
+            sqlx::query(
+                "INSERT INTO nft_transactions (nft_id, ledger_seq, tx_index, tx_hash)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (nft_id, ledger_seq, tx_index) DO UPDATE SET
+                    tx_hash = EXCLUDED.tx_hash",
+            )
+            .bind(&nft_id)
+            .bind(ledger_seq as i32)
+            .bind(tx_index as i32)
+            .bind(&tx_hash)
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn get_nft_transactions(
+        &self,
+        nft_id: &[u8],
+        limit: u32,
+        ledger_index_min: u32,
+        ledger_index_max: u32,
+    ) -> Result<Vec<Vec<u8>>, StorageError> {
+        let nft_id = nft_id.to_vec();
+        self.rt.block_on(async {
+            let rows = sqlx::query(
+                "SELECT tx_hash FROM nft_transactions
+                 WHERE nft_id = $1 AND ledger_seq >= $2 AND ledger_seq <= $3
+                 ORDER BY ledger_seq DESC, tx_index DESC
+                 LIMIT $4",
+            )
+            .bind(&nft_id)
+            .bind(ledger_index_min as i32)
+            .bind(ledger_index_max as i32)
             .bind(limit as i32)
             .fetch_all(&self.pool)
             .await?;
