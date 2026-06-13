@@ -307,9 +307,24 @@ use rxrpl_primitives::PublicKey;
 /// Distinct from [`NodeIdentity`], which is the **P2P** identity used in
 /// the peer handshake (driven by `peer.node_seed`). A node can have a
 /// `NodeIdentity` without being a validator; a validator always has both.
+/// The master key material backing a [`ValidatorIdentity`].
+///
+/// `Full` holds the master keypair (the operator supplied a master seed and
+/// can sign fresh manifests). `PubkeyOnly` holds just the master public key —
+/// the validator-token form, where the master secret stays offline and the
+/// node carries a pre-signed manifest instead.
+enum MasterKey {
+    Full(rxrpl_crypto::KeyPair),
+    PubkeyOnly(rxrpl_primitives::PublicKey),
+}
+
 pub struct ValidatorIdentity {
-    master: rxrpl_crypto::KeyPair,
+    master: MasterKey,
     signing: rxrpl_crypto::KeyPair,
+    /// Pre-signed manifest (validator-token form). When set, `sign_manifest`
+    /// returns it verbatim instead of building a fresh one — the master
+    /// secret needed to sign is not available.
+    manifest: Option<Vec<u8>>,
 }
 
 impl ValidatorIdentity {
@@ -318,8 +333,9 @@ impl ValidatorIdentity {
     /// derivation (secp256k1).
     pub fn two_key(master_seed: &Seed, signing_seed: &Seed) -> Self {
         Self {
-            master: derive_validator_keypair(master_seed),
+            master: MasterKey::Full(derive_validator_keypair(master_seed)),
             signing: derive_validator_keypair(signing_seed),
+            manifest: None,
         }
     }
 
@@ -337,8 +353,27 @@ impl ValidatorIdentity {
         signing_kt: rxrpl_crypto::KeyType,
     ) -> Self {
         Self {
-            master: derive_validator_keypair_typed(master_seed, master_kt),
+            master: MasterKey::Full(derive_validator_keypair_typed(master_seed, master_kt)),
             signing: derive_validator_keypair_typed(signing_seed, signing_kt),
+            manifest: None,
+        }
+    }
+
+    /// Construct a validator identity from a rippled-style validator token.
+    ///
+    /// The token carries the master *public* key (inside the pre-signed
+    /// manifest) and the ephemeral signing *secret* key; the master secret
+    /// stays offline. The node signs validations/proposals with the signing
+    /// key and relays `manifest` so peers bind signing → master.
+    pub fn from_token(
+        master_pubkey: rxrpl_primitives::PublicKey,
+        signing: rxrpl_crypto::KeyPair,
+        manifest: Vec<u8>,
+    ) -> Self {
+        Self {
+            master: MasterKey::PubkeyOnly(master_pubkey),
+            signing,
+            manifest: Some(manifest),
         }
     }
 
@@ -355,14 +390,18 @@ impl ValidatorIdentity {
         // Re-derive a second copy because KeyPair is not Clone (private
         // material). Both copies represent the same key.
         Self {
-            master: kp,
+            master: MasterKey::Full(kp),
             signing: derive_validator_keypair(seed),
+            manifest: None,
         }
     }
 
     /// The long-term master public key (the one published by the UNL).
     pub fn master_pubkey(&self) -> &PublicKey {
-        &self.master.public_key
+        match &self.master {
+            MasterKey::Full(kp) => &kp.public_key,
+            MasterKey::PubkeyOnly(pk) => pk,
+        }
     }
 
     /// The ephemeral signing public key (embedded in every validation).
@@ -371,8 +410,14 @@ impl ValidatorIdentity {
     }
 
     /// Reference to the master keypair (used to sign manifests only).
-    pub fn master_keypair(&self) -> &rxrpl_crypto::KeyPair {
-        &self.master
+    ///
+    /// `None` for token-loaded identities, where the master secret is offline
+    /// and only the master public key is known.
+    pub fn master_keypair(&self) -> Option<&rxrpl_crypto::KeyPair> {
+        match &self.master {
+            MasterKey::Full(kp) => Some(kp),
+            MasterKey::PubkeyOnly(_) => None,
+        }
     }
 
     /// Reference to the signing keypair (used for validations + proposals).
@@ -405,7 +450,15 @@ impl ValidatorIdentity {
         sequence: u32,
         domain: Option<&str>,
     ) -> Result<Vec<u8>, crate::manifest::ManifestError> {
-        crate::manifest::create_signed(&self.master, &self.signing, sequence, domain)
+        if let Some(manifest) = &self.manifest {
+            return Ok(manifest.clone());
+        }
+        match &self.master {
+            MasterKey::Full(master) => {
+                crate::manifest::create_signed(master, &self.signing, sequence, domain)
+            }
+            MasterKey::PubkeyOnly(_) => Err(crate::manifest::ManifestError::NoMasterSecret),
+        }
     }
 }
 
@@ -450,7 +503,7 @@ impl std::fmt::Debug for ValidatorIdentity {
         f.debug_struct("ValidatorIdentity")
             .field(
                 "master_pubkey",
-                &hex::encode(self.master.public_key.as_bytes()),
+                &hex::encode(self.master_pubkey().as_bytes()),
             )
             .field(
                 "signing_pubkey",
@@ -615,6 +668,64 @@ mod tests {
         // Replace public key with a different node's key -- should fail
         validation.public_key = id2.public_key_bytes().to_vec();
         assert!(!verify_validation_signature(&validation));
+    }
+
+    #[test]
+    fn from_token_exposes_master_pubkey_and_relays_manifest() {
+        use rxrpl_consensus::types::{NodeId, Validation};
+        use rxrpl_primitives::Hash256;
+
+        // Start from a full two-key identity, sign a manifest, then rebuild a
+        // token-form identity from (master pubkey, ephemeral keypair, manifest)
+        // — mirroring how a validator-token is loaded.
+        let master_seed = Seed::from_passphrase("from-token-master");
+        let signing_seed = Seed::from_passphrase("from-token-signing");
+        let full = ValidatorIdentity::two_key_typed(
+            &master_seed,
+            KeyType::Secp256k1,
+            &signing_seed,
+            KeyType::Secp256k1,
+        );
+        let manifest = full.sign_manifest(7, None).expect("sign manifest");
+        let master_pk = full.master_pubkey().clone();
+        let signing_pk = full.signing_pubkey().clone();
+        let signing_priv = full.signing_keypair().private_key.clone();
+
+        let signing = KeyPair {
+            public_key: signing_pk.clone(),
+            private_key: signing_priv,
+            key_type: KeyType::Secp256k1,
+        };
+        let token_id = ValidatorIdentity::from_token(master_pk.clone(), signing, manifest.clone());
+
+        assert_eq!(token_id.master_pubkey(), &master_pk);
+        assert_eq!(token_id.signing_pubkey(), &signing_pk);
+        assert!(
+            token_id.master_keypair().is_none(),
+            "token identity has no master secret"
+        );
+        // sign_manifest returns the pre-signed manifest verbatim, ignoring args.
+        assert_eq!(
+            token_id.sign_manifest(999, Some("ignored")).unwrap(),
+            manifest
+        );
+
+        // The ephemeral key still produces verifiable validations.
+        let mut v = Validation {
+            node_id: NodeId(Hash256::new([0x11; 32])),
+            public_key: token_id.signing_pubkey().as_bytes().to_vec(),
+            ledger_hash: Hash256::new([0xAB; 32]),
+            ledger_seq: 5,
+            full: true,
+            close_time: 1000,
+            sign_time: 1000,
+            signature: None,
+            amendments: vec![],
+            signing_payload: None,
+            ..Default::default()
+        };
+        token_id.sign_validation(&mut v);
+        assert!(verify_validation_signature(&v));
     }
 
     #[test]
