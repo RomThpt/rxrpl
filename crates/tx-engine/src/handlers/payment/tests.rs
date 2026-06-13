@@ -237,6 +237,61 @@ fn apply_transfer_to_existing_account() {
 }
 
 #[test]
+fn apply_xrp_payment_with_ticket_consumes_ticket_not_sequence() {
+    // Source owns one ticket (OwnerCount=1) and pays via TicketSequence
+    // instead of Sequence; the ticket must be consumed and the account
+    // Sequence left untouched.
+    let mut ledger = Ledger::genesis();
+    let src_id = decode_account_id(SRC_ADDRESS).unwrap();
+    let ticket_seq = 7u32;
+    let src = serde_json::json!({
+        "LedgerEntryType": "AccountRoot",
+        "Account": SRC_ADDRESS,
+        "Balance": "10000000",
+        "Sequence": 9,
+        "OwnerCount": 1,
+        "Flags": 0,
+    });
+    ledger
+        .put_state(keylet::account(&src_id), serde_json::to_vec(&src).unwrap())
+        .unwrap();
+    let ticket_key = keylet::ticket(&src_id, ticket_seq);
+    let ticket = serde_json::json!({
+        "LedgerEntryType": "Ticket",
+        "Account": SRC_ADDRESS,
+        "TicketSequence": ticket_seq,
+        "Flags": 0,
+    });
+    ledger
+        .put_state(ticket_key, serde_json::to_vec(&ticket).unwrap())
+        .unwrap();
+    add_account(&mut ledger, DST_ADDRESS, 5_000_000);
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let mut tx = make_payment_tx(SRC_ADDRESS, DST_ADDRESS, "1000000", "10");
+    tx["TicketSequence"] = serde_json::json!(ticket_seq);
+    let rules = Rules::new();
+
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    let result = PaymentTransactor.apply(&mut ctx).unwrap();
+    assert_eq!(result, TransactionResult::TesSuccess);
+
+    let src_bytes = sandbox.read(&keylet::account(&src_id)).unwrap();
+    let src: serde_json::Value = serde_json::from_slice(&src_bytes).unwrap();
+    // Sequence unchanged, ticket consumed (OwnerCount back to 0, SLE gone).
+    assert_eq!(src["Sequence"].as_u64().unwrap(), 9);
+    assert_eq!(src["OwnerCount"].as_u64().unwrap(), 0);
+    assert!(!sandbox.exists(&keylet::ticket(&src_id, ticket_seq)));
+}
+
+#[test]
 fn apply_creates_new_destination_account() {
     // Funding a new account requires sending at least account_reserve.
     let ledger = setup_ledger_with_account(SRC_ADDRESS, 50_000_000);

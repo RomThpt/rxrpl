@@ -171,7 +171,7 @@ impl Transactor for PaymentTransactor {
             .ok_or(TransactionResult::TecUnfundedPayment)?;
 
         helpers::set_balance(&mut src_account, new_src_balance);
-        helpers::increment_sequence(&mut src_account);
+        crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut src_account, ctx.tx)?;
 
         let src_data =
             serde_json::to_vec(&src_account).map_err(|_| TransactionResult::TefInternal)?;
@@ -401,7 +401,7 @@ fn apply_iou(
         .ok_or(TransactionResult::TerNoAccount)?;
     let mut src_acct: serde_json::Value =
         serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
-    helpers::increment_sequence(&mut src_acct);
+    crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut src_acct, ctx.tx)?;
     let src_acct_data =
         serde_json::to_vec(&src_acct).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view
@@ -690,7 +690,7 @@ fn apply_cross_currency(
         .ok_or(TransactionResult::TerNoAccount)?;
     let mut src_acct: serde_json::Value =
         serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
-    helpers::increment_sequence(&mut src_acct);
+    crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut src_acct, ctx.tx)?;
     let src_acct_data =
         serde_json::to_vec(&src_acct).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view
@@ -1213,7 +1213,7 @@ fn commit_n_hop_plan(
         .ok_or(TransactionResult::TerNoAccount)?;
     let mut src_acct: serde_json::Value =
         serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
-    helpers::increment_sequence(&mut src_acct);
+    crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut src_acct, ctx.tx)?;
     let src_acct_data =
         serde_json::to_vec(&src_acct).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view
