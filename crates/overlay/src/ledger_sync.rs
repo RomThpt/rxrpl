@@ -553,6 +553,16 @@ impl LedgerSyncer {
         !self.incremental.is_empty()
     }
 
+    /// Sequence of the currently active incremental sync, if any.
+    ///
+    /// Catchup keeps a single active sync at a time, so this is the target a
+    /// content-addressed node response (e.g. `TMGetObjectByHash`, whose nodes
+    /// are valid regardless of the ledger seq echoed in the reply) should be
+    /// fed into when the echoed seq no longer matches an active sync.
+    pub fn active_incremental_seq(&self) -> Option<u32> {
+        self.incremental.keys().max().copied()
+    }
+
     /// Check if a sequence has already been fully synced.
     pub fn is_synced(&self, seq: u32) -> bool {
         self.synced_seqs.contains(&seq)
@@ -981,6 +991,23 @@ mod tests {
         );
         assert!(syncer.has_incremental_sync(105));
         assert!(!syncer.has_incremental_sync(100));
+    }
+
+    /// Content-addressed responses for an abandoned seq must route to the
+    /// currently active sync rather than being dropped.
+    #[test]
+    fn active_incremental_seq_tracks_the_live_target() {
+        let store = Arc::new(rxrpl_shamap::InMemoryNodeStore::new());
+        let mut syncer = LedgerSyncer::new();
+        assert_eq!(syncer.active_incremental_seq(), None);
+
+        let _ = syncer.start_incremental_sync(100, Hash256::new([0x11; 32]), store.clone());
+        assert_eq!(syncer.active_incremental_seq(), Some(100));
+
+        // A late reply tagged with an old, no-longer-active seq still has a live
+        // target to feed: the active sync.
+        assert!(!syncer.has_incremental_sync(88));
+        assert_eq!(syncer.active_incremental_seq(), Some(100));
     }
 
     fn run_large_state_delta_sync(compress_inner: bool) {

@@ -1272,30 +1272,41 @@ impl PeerManager {
                                     crate::ledger_sync::object_blob_to_wire(&d).map(|w| (h, w))
                                 })
                                 .collect();
-                            if self.ledger_syncer.has_incremental_sync(ledger_seq) {
+                            // GetObjectByHash nodes are content-addressed, so they
+                            // are valid for whatever sync is active regardless of
+                            // the seq rippled echoes. A reply for an abandoned seq
+                            // (the tip moved on while it was in flight) would
+                            // otherwise be dropped, wasting nodes the active sync
+                            // still needs from the shared store.
+                            let feed_seq = if self.ledger_syncer.has_incremental_sync(ledger_seq) {
+                                Some(ledger_seq)
+                            } else {
+                                self.ledger_syncer.active_incremental_seq()
+                            };
+                            if let Some(seq) = feed_seq {
                                 use crate::ledger_sync::FeedResult;
-                                let ledger_hash = self.ledger_syncer.get_ledger_hash(ledger_seq);
+                                let ledger_hash = self.ledger_syncer.get_ledger_hash(seq);
                                 let hash = ledger_hash.unwrap_or(Hash256::ZERO);
-                                match self.ledger_syncer.feed_nodes(ledger_seq, &nodes) {
+                                match self.ledger_syncer.feed_nodes(seq, &nodes) {
                                     FeedResult::Complete(leaves) => {
                                         tracing::info!(
                                             "incremental sync complete (via hash fallback) for #{} ({} leaves)",
-                                            ledger_seq,
+                                            seq,
                                             leaves.len()
                                         );
-                                        self.ledger_syncer.mark_synced(ledger_seq);
+                                        self.ledger_syncer.mark_synced(seq);
                                         let _ =
                                             self.consensus_tx.send(ConsensusMessage::LedgerData {
                                                 hash,
-                                                seq: ledger_seq,
+                                                seq,
                                                 nodes: leaves,
                                             });
                                     }
                                     FeedResult::FallbackToHashFetch(content_hashes) => {
-                                        self.send_get_objects_by_hash(ledger_seq, &content_hashes);
+                                        self.send_get_objects_by_hash(seq, &content_hashes);
                                     }
                                     FeedResult::Continue => {
-                                        self.send_get_ledger_as_node(ledger_seq);
+                                        self.send_get_ledger_as_node(seq);
                                     }
                                     FeedResult::Removed => {}
                                 }
