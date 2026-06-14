@@ -54,6 +54,17 @@ pub trait NodeStore: Send + Sync {
     fn delete_batch(&self, _hashes: &[Hash256]) -> Result<(), SHAMapError> {
         Ok(())
     }
+
+    /// Number of nodes currently held. Default 0 for backends that do not track
+    /// it; used to observe catchup progress (real store growth, as opposed to a
+    /// single sync's added count).
+    fn len(&self) -> usize {
+        0
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// In-memory node store backed by a HashMap.
@@ -95,6 +106,10 @@ impl NodeStore for InMemoryNodeStore {
             data.remove(hash);
         }
         Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.data.read().map(|d| d.len()).unwrap_or(0)
     }
 }
 
