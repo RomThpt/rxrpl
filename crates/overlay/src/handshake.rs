@@ -60,10 +60,15 @@ fn build_upgrade_headers(
         ("Connect-As".into(), "Peer".into()),
         ("Public-Key".into(), pubkey_b58),
         ("Session-Signature".into(), sig_b64),
-        ("Network-ID".into(), network_id.to_string()),
         ("Crawl".into(), "public".into()),
         ("User-Agent".into(), OUR_USER_AGENT.into()),
     ];
+    // rippled omits Network-ID on mainnet (network 0) and only sends it for
+    // non-default networks. Match that so mainnet peers don't see an
+    // unexpected header (and so absence is unambiguously network 0).
+    if network_id != 0 {
+        headers.push(("Network-ID".into(), network_id.to_string()));
+    }
     // Only send Closed-Ledger if we have a real ledger hash (rippled expects hex uint256)
     if *ledger_hash != Hash256::ZERO {
         headers.push(("Closed-Ledger".into(), ledger_hash.to_string()));
@@ -113,13 +118,15 @@ fn verify_peer_http_headers(
         .ok_or_else(|| OverlayError::Handshake("missing Public-Key header".into()))?;
     let peer_sig_hex = http::get_header(headers, "Session-Signature")
         .ok_or_else(|| OverlayError::Handshake("missing Session-Signature header".into()))?;
-    let network_id_str = http::get_header(headers, "Network-ID")
-        .ok_or_else(|| OverlayError::Handshake("missing Network-ID header".into()))?;
-
-    // Verify network ID
-    let peer_network_id: u32 = network_id_str
-        .parse()
-        .map_err(|_| OverlayError::Handshake(format!("invalid Network-ID: {network_id_str}")))?;
+    // rippled omits the Network-ID header on mainnet (network 0), so a missing
+    // header means network 0 rather than a protocol error — rejecting it dropped
+    // every mainnet peer. A present header is parsed and must match.
+    let peer_network_id: u32 = match http::get_header(headers, "Network-ID") {
+        Some(s) => s
+            .parse()
+            .map_err(|_| OverlayError::Handshake(format!("invalid Network-ID: {s}")))?,
+        None => 0,
+    };
     if peer_network_id != expected_network_id {
         return Err(OverlayError::Handshake(format!(
             "network_id mismatch: expected {expected_network_id}, got {peer_network_id}"
@@ -340,6 +347,56 @@ mod tests {
         assert!(server_result.is_err());
         let err = server_result.err().unwrap().to_string();
         assert!(err.contains("network_id mismatch"), "got: {err}");
+    }
+
+    /// Mainnet (network 0) handshake: rippled omits the Network-ID header, so
+    /// both sides must complete the handshake with no header present. Exercises
+    /// the emit-side omission and the receive-side absent-means-0 default.
+    #[tokio::test]
+    async fn http_handshake_mainnet_no_network_id_header() {
+        let network_id = 0;
+        let ledger_hash = Hash256::new([0xDD; 32]);
+
+        let id_b = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("mainnet-b"));
+        let server_config = tls::build_server_config(&id_b);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let stream = tls::accept_tls(tcp, &server_config).await.unwrap();
+            handshake_inbound_http(stream, &id_b, network_id, 1, &ledger_hash).await
+        });
+
+        let id_a = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("mainnet-a"));
+        let client_config = tls::build_client_config();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let stream = tls::connect_tls(tcp, &client_config).await.unwrap();
+
+        let result = handshake_outbound_http(stream, &id_a, network_id, 1, &ledger_hash).await;
+        assert!(
+            result.is_ok(),
+            "mainnet outbound failed: {:?}",
+            result.err()
+        );
+        let inbound = handle.await.unwrap();
+        assert!(
+            inbound.is_ok(),
+            "mainnet inbound failed: {:?}",
+            inbound.err()
+        );
+
+        // And the headers we build for network 0 carry no Network-ID at all.
+        let id = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("hdr-check"));
+        let headers = build_upgrade_headers(&id, &Hash256::new([0x01; 32]), 0, &ledger_hash);
+        assert!(!headers.iter().any(|(k, _)| k == "Network-ID"));
+        let headers_net2 = build_upgrade_headers(&id, &Hash256::new([0x01; 32]), 2, &ledger_hash);
+        assert!(
+            headers_net2
+                .iter()
+                .any(|(k, v)| k == "Network-ID" && v == "2")
+        );
     }
 
     #[tokio::test]
