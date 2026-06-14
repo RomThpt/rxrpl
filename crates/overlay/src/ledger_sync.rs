@@ -13,6 +13,24 @@ const MAX_DELTA_NODES_PER_REQUEST: usize = 512;
 const MAX_INCREMENTAL_ROUNDS: u32 = 50;
 /// Number of consecutive zero-add rounds before falling back to hash-based fetch.
 const HASH_FALLBACK_THRESHOLD: u32 = 5;
+/// Consecutive zero-add rounds before a higher tip seq may preempt the active
+/// sync during normal tip-following (we already hold a base state).
+const TIP_PREEMPT_ZERO_ROUNDS: u32 = 8;
+/// Consecutive zero-add rounds before the LOCKED initial-catchup target is
+/// considered dead (its state has aged out of every peer) and may be replaced
+/// by a newer tip. Far higher than `TIP_PREEMPT_ZERO_ROUNDS` so a large state
+/// fetch is not reset mid-flight by the ~4s-moving mainnet tip.
+const CATCHUP_PREEMPT_ZERO_ROUNDS: u32 = 40;
+/// Consecutive zero-add rounds before an active sync is abandoned outright.
+/// Normal tip-following uses the lower bound; the locked initial-catchup target
+/// uses the higher one so preemption by a newer tip (above) stays the primary
+/// release path and removal is only a backstop when no newer tip arrives.
+const STUCK_REMOVE_ZERO_ROUNDS: u32 = 20;
+const CATCHUP_STUCK_REMOVE_ZERO_ROUNDS: u32 = 48;
+/// How long a requested node hash is considered in-flight before it may be
+/// requested again. Long enough to outlast a normal round-trip so duplicate
+/// requests are suppressed, short enough that a lost request is retried soon.
+const INFLIGHT_WINDOW: Duration = Duration::from_secs(8);
 
 /// Data received from a synced ledger.
 pub struct SyncedLedgerData {
@@ -191,6 +209,10 @@ pub struct LedgerSyncer {
     ledger_hashes: HashMap<u32, Hash256>,
     /// Sequences that have already been synced (to avoid re-processing).
     synced_seqs: HashSet<u32>,
+    /// Content hashes requested within the in-flight window, with their request
+    /// time. Used to suppress duplicate node requests that would otherwise flood
+    /// peers and drown the responses carrying genuinely new frontier nodes.
+    inflight: HashMap<Hash256, Instant>,
 }
 
 struct PendingRequest {
@@ -211,6 +233,7 @@ impl LedgerSyncer {
             incremental: HashMap::new(),
             ledger_hashes: HashMap::new(),
             synced_seqs: HashSet::new(),
+            inflight: HashMap::new(),
         }
     }
 
@@ -313,6 +336,7 @@ impl LedgerSyncer {
         self.incremental.clear();
         self.ledger_hashes.clear();
         self.synced_seqs.clear();
+        self.inflight.clear();
     }
 
     // --- Incremental (delta) sync ---
@@ -342,6 +366,9 @@ impl LedgerSyncer {
         //
         // A HIGHER seq only replaces the active sync once that sync is stuck
         // (zero-add rounds), to avoid thrashing during real progress.
+        // Initial state catchup = we have never completed a ledger yet. In that
+        // mode we lock onto a single target instead of chasing the moving tip.
+        let initial_catchup = self.synced_seqs.is_empty();
         if !self.incremental.contains_key(&seq) {
             if let Some(&active_seq) = self.incremental.keys().max() {
                 if seq > active_seq {
@@ -350,7 +377,12 @@ impl LedgerSyncer {
                         .get(&active_seq)
                         .map(|e| e.zero_rounds)
                         .unwrap_or(0);
-                    if zero_rounds < 8 {
+                    let preempt_threshold = if initial_catchup {
+                        CATCHUP_PREEMPT_ZERO_ROUNDS
+                    } else {
+                        TIP_PREEMPT_ZERO_ROUNDS
+                    };
+                    if zero_rounds < preempt_threshold {
                         return Vec::new();
                     }
                     tracing::info!(
@@ -405,6 +437,14 @@ impl LedgerSyncer {
     /// - `Continue` if the sync is still in progress.
     /// - `Removed` if the sync was abandoned or not found.
     pub fn feed_nodes(&mut self, seq: u32, nodes: &[(Vec<u8>, Vec<u8>)]) -> FeedResult {
+        // Read before borrowing `incremental`: a locked initial-catchup target
+        // (nothing synced yet) survives far more zero-add rounds than a normal
+        // tip-following sync before being abandoned.
+        let stuck_remove_threshold = if self.synced_seqs.is_empty() {
+            CATCHUP_STUCK_REMOVE_ZERO_ROUNDS
+        } else {
+            STUCK_REMOVE_ZERO_ROUNDS
+        };
         let entry = match self.incremental.get_mut(&seq) {
             Some(e) => e,
             None => return FeedResult::Removed,
@@ -458,7 +498,7 @@ impl LedgerSyncer {
             }
         } else {
             entry.zero_rounds += 1;
-            if entry.zero_rounds > 20 {
+            if entry.zero_rounds > stuck_remove_threshold {
                 tracing::warn!(
                     "incremental sync for ledger #{} stuck ({} consecutive zero-add rounds), removing",
                     seq,
@@ -521,6 +561,60 @@ impl LedgerSyncer {
     /// Check if any incremental sync is active.
     pub fn has_any_incremental_sync(&self) -> bool {
         !self.incremental.is_empty()
+    }
+
+    /// Sequence of the currently active incremental sync, if any.
+    ///
+    /// Catchup keeps a single active sync at a time, so this is the target a
+    /// content-addressed node response (e.g. `TMGetObjectByHash`, whose nodes
+    /// are valid regardless of the ledger seq echoed in the reply) should be
+    /// fed into when the echoed seq no longer matches an active sync.
+    pub fn active_incremental_seq(&self) -> Option<u32> {
+        self.incremental.keys().max().copied()
+    }
+
+    /// Filter `missing` down to nodes not already requested within the in-flight
+    /// window, recording the survivors as now requested. Newly discovered
+    /// frontier nodes always pass through (they were never in-flight), so normal
+    /// response-driven progress is unaffected; only redundant re-requests for
+    /// nodes still awaited are dropped. Expired entries are pruned each call so a
+    /// lost request is retried after the window.
+    pub fn take_unrequested(&mut self, missing: &[MissingNode], now: Instant) -> Vec<MissingNode> {
+        self.prune_inflight(now);
+        let mut out = Vec::new();
+        for mn in missing {
+            if self.mark_inflight(mn.hash, now) {
+                out.push(mn.clone());
+            }
+        }
+        out
+    }
+
+    /// Content-hash variant of [`Self::take_unrequested`] for the
+    /// `TMGetObjectByHash` fallback path.
+    pub fn take_unrequested_hashes(&mut self, hashes: &[Hash256], now: Instant) -> Vec<Hash256> {
+        self.prune_inflight(now);
+        let mut out = Vec::new();
+        for &h in hashes {
+            if self.mark_inflight(h, now) {
+                out.push(h);
+            }
+        }
+        out
+    }
+
+    fn prune_inflight(&mut self, now: Instant) {
+        self.inflight
+            .retain(|_, t| now.duration_since(*t) < INFLIGHT_WINDOW);
+    }
+
+    fn mark_inflight(&mut self, hash: Hash256, now: Instant) -> bool {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.inflight.entry(hash) {
+            e.insert(now);
+            true
+        } else {
+            false
+        }
     }
 
     /// Check if a sequence has already been fully synced.
@@ -829,5 +923,250 @@ mod tests {
     fn object_blob_to_wire_rejects_unknown_prefix() {
         let blob = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
         assert!(object_blob_to_wire(&blob).is_none());
+    }
+
+    /// Build a server-side account-state SHAMap with `count` well-spread items.
+    fn build_server_map(count: usize) -> (rxrpl_shamap::SHAMap, Hash256) {
+        use rxrpl_shamap::InMemoryNodeStore;
+        let store = Arc::new(InMemoryNodeStore::new());
+        let mut map = rxrpl_shamap::SHAMap::account_state_with_store(store);
+        for i in 0..count {
+            // Spread keys uniformly across the tree so it grows several nibbles deep.
+            let key = rxrpl_crypto::sha512_half::sha512_half(&[b"key", &(i as u64).to_be_bytes()]);
+            // Small payload so storage (key32 || data) is never exactly 512 bytes.
+            let data = vec![(i & 0xFF) as u8; 40];
+            map.put(key, data).unwrap();
+        }
+        let root = map.root_hash();
+        (map, root)
+    }
+
+    /// Serve a single requested node id from the server map, returning the wire
+    /// node bytes in the same `content || wireType` layout `decode_wire_node`
+    /// parses (mirrors `peer_manager::encode_shamap_wire_node`).
+    fn serve_node_inner(
+        server: &rxrpl_shamap::SHAMap,
+        node_id: rxrpl_shamap::NodeId,
+        compress_inner: bool,
+    ) -> Option<(Hash256, Vec<u8>)> {
+        let (content_hash, storage, is_inner) = server.node_at(node_id)?;
+        let wire = if is_inner && compress_inner {
+            // rippled-style compressed inner: only non-zero branches, each as
+            // (hash[32] || branch[1]), then wireType 3.
+            let mut w = Vec::new();
+            for branch in 0..16u8 {
+                let h = &storage[branch as usize * 32..(branch as usize + 1) * 32];
+                if h != [0u8; 32] {
+                    w.extend_from_slice(h);
+                    w.push(branch);
+                }
+            }
+            w.push(WIRE_TYPE_COMPRESSED_INNER);
+            w
+        } else if is_inner {
+            let mut w = storage.clone();
+            w.push(WIRE_TYPE_INNER);
+            w
+        } else {
+            let key = &storage[..32];
+            let data = &storage[32..];
+            let mut w = Vec::with_capacity(storage.len() + 1);
+            w.extend_from_slice(data);
+            w.extend_from_slice(key);
+            w.push(WIRE_TYPE_ACCOUNT_STATE);
+            w
+        };
+        Some((content_hash, wire))
+    }
+
+    /// In-process reproduction of the mainnet AS_NODE delta-sync loop with a
+    /// LARGE, multi-level account-state map and a STABLE target. Server and
+    /// client are both rxrpl: if the loop cannot complete, the bug is a pure
+    /// rxrpl logic bug in missing_nodes/node_at/feed_nodes; if it completes, the
+    /// got_in_want=0 mainnet failure is specific to rippled wire interop.
+    #[test]
+    fn large_state_delta_sync_completes_against_rxrpl_server() {
+        run_large_state_delta_sync(false);
+    }
+
+    /// Same loop, but the server emits rippled-style COMPRESSED inner nodes
+    /// (wireType 3). This is what a real rippled peer sends on mainnet to save
+    /// bandwidth, and the path the full-inner test above does not exercise.
+    #[test]
+    fn large_state_delta_sync_completes_with_compressed_inner_nodes() {
+        run_large_state_delta_sync(true);
+    }
+
+    /// During initial state catchup (nothing synced yet) a newer tip must NOT
+    /// preempt the locked target while it is below the catchup dead threshold,
+    /// even past the normal tip-following preemption point. This is the fix for
+    /// the moving mainnet tip resetting a large state fetch mid-flight.
+    #[test]
+    fn initial_catchup_locks_target_against_moving_tip() {
+        let store = Arc::new(rxrpl_shamap::InMemoryNodeStore::new());
+        let mut syncer = LedgerSyncer::new();
+        let missing = syncer.start_incremental_sync(100, Hash256::new([0x11; 32]), store.clone());
+        assert!(!missing.is_empty());
+
+        // Pump zero-add rounds past the tip threshold (8) but below the catchup
+        // dead threshold (40).
+        for _ in 0..12 {
+            let _ = syncer.feed_nodes(100, &[]);
+        }
+
+        let preempt = syncer.start_incremental_sync(105, Hash256::new([0x22; 32]), store);
+        assert!(
+            preempt.is_empty(),
+            "newer tip must not preempt the locked catchup target"
+        );
+        assert!(
+            syncer.has_incremental_sync(100),
+            "catchup target #100 must stay active"
+        );
+        assert!(!syncer.has_incremental_sync(105));
+    }
+
+    /// Once a base state is held (a ledger has synced) we return to responsive
+    /// tip-following: a newer tip preempts a stuck sync at the lower threshold.
+    #[test]
+    fn tip_following_preempts_stuck_sync_after_base_state() {
+        let store = Arc::new(rxrpl_shamap::InMemoryNodeStore::new());
+        let mut syncer = LedgerSyncer::new();
+        syncer.mark_synced(99);
+        let _ = syncer.start_incremental_sync(100, Hash256::new([0x11; 32]), store.clone());
+        for _ in 0..10 {
+            let _ = syncer.feed_nodes(100, &[]);
+        }
+
+        let m = syncer.start_incremental_sync(105, Hash256::new([0x22; 32]), store);
+        assert!(
+            !m.is_empty(),
+            "newer tip preempts a stuck sync once a base state is held"
+        );
+        assert!(syncer.has_incremental_sync(105));
+        assert!(!syncer.has_incremental_sync(100));
+    }
+
+    /// Content-addressed responses for an abandoned seq must route to the
+    /// currently active sync rather than being dropped.
+    #[test]
+    fn active_incremental_seq_tracks_the_live_target() {
+        let store = Arc::new(rxrpl_shamap::InMemoryNodeStore::new());
+        let mut syncer = LedgerSyncer::new();
+        assert_eq!(syncer.active_incremental_seq(), None);
+
+        let _ = syncer.start_incremental_sync(100, Hash256::new([0x11; 32]), store.clone());
+        assert_eq!(syncer.active_incremental_seq(), Some(100));
+
+        // A late reply tagged with an old, no-longer-active seq still has a live
+        // target to feed: the active sync.
+        assert!(!syncer.has_incremental_sync(88));
+        assert_eq!(syncer.active_incremental_seq(), Some(100));
+    }
+
+    /// In-flight dedup suppresses a re-request within the window but lets a new
+    /// hash through, and retries once the window expires.
+    #[test]
+    fn inflight_dedup_suppresses_then_retries() {
+        use rxrpl_shamap::NodeId;
+        let mut syncer = LedgerSyncer::new();
+        let mk = |b: u8| MissingNode {
+            hash: Hash256::new([b; 32]),
+            node_id: NodeId::ROOT,
+        };
+        let now = Instant::now();
+        let batch = vec![mk(1), mk(2)];
+
+        let first = syncer.take_unrequested(&batch, now);
+        assert_eq!(first.len(), 2, "all fresh nodes pass through");
+
+        // Same batch within the window is fully suppressed.
+        let again = syncer.take_unrequested(&batch, now + Duration::from_secs(1));
+        assert!(again.is_empty(), "in-flight nodes are not re-requested");
+
+        // A brand-new hash still passes even while others are in-flight.
+        let mixed = syncer.take_unrequested(&[mk(2), mk(3)], now + Duration::from_secs(2));
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].hash, Hash256::new([3; 32]));
+
+        // After the window expires the original nodes are retried.
+        let retry = syncer.take_unrequested(&batch, now + INFLIGHT_WINDOW + Duration::from_secs(1));
+        assert_eq!(retry.len(), 2, "expired in-flight nodes are retried");
+    }
+
+    fn run_large_state_delta_sync(compress_inner: bool) {
+        const COUNT: usize = 4096;
+        let (server, server_root) = build_server_map(COUNT);
+
+        let client_store = Arc::new(rxrpl_shamap::InMemoryNodeStore::new());
+        let mut syncer = LedgerSyncer::new();
+        let seq = 2u32;
+        syncer.set_ledger_hash(seq, server_root);
+
+        let mut missing = syncer.start_incremental_sync(seq, server_root, client_store);
+        assert!(!missing.is_empty(), "first round must request the root");
+
+        let mut total_requested = 0usize;
+        let mut total_matched = 0usize;
+        let mut leaves_out: Option<Vec<(Vec<u8>, Vec<u8>)>> = None;
+
+        for round in 0..2000 {
+            // Serve every requested node id, recording request<->response hash match.
+            let mut served: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(missing.len());
+            let mut matched_this_round = 0usize;
+            for mn in &missing {
+                total_requested += 1;
+                if let Some((content_hash, wire)) =
+                    serve_node_inner(&server, mn.node_id, compress_inner)
+                {
+                    if content_hash == mn.hash {
+                        matched_this_round += 1;
+                        total_matched += 1;
+                    }
+                    served.push((mn.node_id.to_wire_bytes(), wire));
+                }
+            }
+
+            // got_in_want: how many served nodes match what we asked for.
+            assert!(
+                missing.is_empty() || matched_this_round > 0,
+                "round {round}: got_in_want=0 (requested {} node ids, none matched by hash)",
+                missing.len()
+            );
+
+            match syncer.feed_nodes(seq, &served) {
+                FeedResult::Complete(leaves) => {
+                    leaves_out = Some(leaves);
+                    break;
+                }
+                FeedResult::Continue | FeedResult::FallbackToHashFetch(_) => {
+                    missing = syncer.get_missing_node_ids(seq);
+                    if missing.is_empty() {
+                        if let Some(leaves) = syncer.try_complete_sync(seq) {
+                            leaves_out = Some(leaves);
+                            break;
+                        }
+                    }
+                }
+                FeedResult::Removed => panic!("round {round}: sync removed (gave up)"),
+            }
+        }
+
+        let leaves = leaves_out.expect("sync must complete within the round budget");
+        assert_eq!(
+            total_requested, total_matched,
+            "every requested node id must be served with a matching hash"
+        );
+        assert_eq!(leaves.len(), COUNT, "all leaves must be recovered");
+
+        // Every recovered leaf must match the server's value.
+        for (key_bytes, data) in &leaves {
+            let key = Hash256::new(key_bytes[..32].try_into().unwrap());
+            assert_eq!(
+                server.get(&key),
+                Some(data.as_slice()),
+                "leaf {key} mismatch"
+            );
+        }
     }
 }

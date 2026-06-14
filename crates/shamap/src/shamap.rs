@@ -897,7 +897,12 @@ impl SHAMap {
     /// Used by `handle_get_ledger` to serve rippled-style 33-byte NodeId
     /// requests (path + depth). Returns `None` if any branch on the path
     /// is empty or unloadable from the store.
-    pub fn node_at(&self, node_id: NodeId) -> Option<(Hash256, Vec<u8>)> {
+    ///
+    /// The returned `bool` is `true` for an inner node, `false` for a leaf.
+    /// Callers must NOT infer the node type from byte length: a leaf whose data
+    /// is exactly 480 bytes serializes to 512 bytes, colliding with an inner
+    /// node's 16×32 layout.
+    pub fn node_at(&self, node_id: NodeId) -> Option<(Hash256, Vec<u8>, bool)> {
         let target_depth = node_id.depth();
         let key = *node_id.id();
         let mut current: &Arc<SHAMapNode> = &self.root;
@@ -1149,20 +1154,20 @@ impl SHAMap {
 /// The trailing depth byte expected by rippled's TMLedgerNode wire format is
 /// NOT appended here; that is the caller's responsibility (since depth comes
 /// from the NodeId being requested, not the node itself).
-fn serialize_node_shallow(node: &Arc<SHAMapNode>) -> (Hash256, Vec<u8>) {
+fn serialize_node_shallow(node: &Arc<SHAMapNode>) -> (Hash256, Vec<u8>, bool) {
     match node.as_ref() {
         SHAMapNode::Inner(inner) => {
             let mut data = Vec::with_capacity(16 * 32);
             for i in 0..16u8 {
                 data.extend_from_slice(inner.child_hash(i).as_bytes());
             }
-            (inner.hash(), data)
+            (inner.hash(), data, true)
         }
         SHAMapNode::Leaf(leaf) => {
             let mut data = Vec::with_capacity(32 + leaf.data().len());
             data.extend_from_slice(leaf.key().as_bytes());
             data.extend_from_slice(leaf.data());
-            (leaf.hash(), data)
+            (leaf.hash(), data, false)
         }
     }
 }
@@ -1273,8 +1278,9 @@ mod tests {
         }
         map.flush().unwrap();
 
-        let (hash, bytes) = map.node_at(NodeId::ROOT).expect("root must exist");
+        let (hash, bytes, is_inner) = map.node_at(NodeId::ROOT).expect("root must exist");
         assert_eq!(hash, map.root_hash());
+        assert!(is_inner, "root is an inner node");
         assert_eq!(bytes.len(), 16 * 32, "inner root serializes as 16 hashes");
     }
 
@@ -1291,7 +1297,8 @@ mod tests {
         let branch = select_branch(&key, 0);
         let _ = branch; // depth=1 lookup
         let leaf_node_id = NodeId::new(1, &key);
-        let (_h, bytes) = map.node_at(leaf_node_id).expect("leaf must exist");
+        let (_h, bytes, is_inner) = map.node_at(leaf_node_id).expect("leaf must exist");
+        assert!(!is_inner, "leaf is not an inner node");
         assert_eq!(&bytes[..32], key.as_bytes(), "leaf bytes start with key");
         assert_eq!(&bytes[32..], &data[..], "then leaf data");
     }

@@ -1272,30 +1272,41 @@ impl PeerManager {
                                     crate::ledger_sync::object_blob_to_wire(&d).map(|w| (h, w))
                                 })
                                 .collect();
-                            if self.ledger_syncer.has_incremental_sync(ledger_seq) {
+                            // GetObjectByHash nodes are content-addressed, so they
+                            // are valid for whatever sync is active regardless of
+                            // the seq rippled echoes. A reply for an abandoned seq
+                            // (the tip moved on while it was in flight) would
+                            // otherwise be dropped, wasting nodes the active sync
+                            // still needs from the shared store.
+                            let feed_seq = if self.ledger_syncer.has_incremental_sync(ledger_seq) {
+                                Some(ledger_seq)
+                            } else {
+                                self.ledger_syncer.active_incremental_seq()
+                            };
+                            if let Some(seq) = feed_seq {
                                 use crate::ledger_sync::FeedResult;
-                                let ledger_hash = self.ledger_syncer.get_ledger_hash(ledger_seq);
+                                let ledger_hash = self.ledger_syncer.get_ledger_hash(seq);
                                 let hash = ledger_hash.unwrap_or(Hash256::ZERO);
-                                match self.ledger_syncer.feed_nodes(ledger_seq, &nodes) {
+                                match self.ledger_syncer.feed_nodes(seq, &nodes) {
                                     FeedResult::Complete(leaves) => {
                                         tracing::info!(
                                             "incremental sync complete (via hash fallback) for #{} ({} leaves)",
-                                            ledger_seq,
+                                            seq,
                                             leaves.len()
                                         );
-                                        self.ledger_syncer.mark_synced(ledger_seq);
+                                        self.ledger_syncer.mark_synced(seq);
                                         let _ =
                                             self.consensus_tx.send(ConsensusMessage::LedgerData {
                                                 hash,
-                                                seq: ledger_seq,
+                                                seq,
                                                 nodes: leaves,
                                             });
                                     }
                                     FeedResult::FallbackToHashFetch(content_hashes) => {
-                                        self.send_get_objects_by_hash(ledger_seq, &content_hashes);
+                                        self.send_get_objects_by_hash(seq, &content_hashes);
                                     }
                                     FeedResult::Continue => {
-                                        self.send_get_ledger_as_node(ledger_seq);
+                                        self.send_get_ledger_as_node(seq);
                                     }
                                     FeedResult::Removed => {}
                                 }
@@ -1839,6 +1850,13 @@ impl PeerManager {
         {
             // Request only the latest peer ledger, not all intermediary ones.
             self.send_get_ledger(max_peer_seq, None);
+        } else if let Some(seq) = self.ledger_syncer.active_incremental_seq() {
+            // Re-drive the active catchup. The response-driven loop can fall
+            // quiet when in-flight dedup suppresses a round's requests and the
+            // responses that would have driven the next send are lost; this
+            // periodic kick re-requests any frontier nodes whose in-flight
+            // window has expired.
+            self.send_get_ledger_as_node(seq);
         }
     }
 
@@ -1965,6 +1983,9 @@ impl PeerManager {
         };
 
         let missing = self.ledger_syncer.get_missing_node_ids(seq);
+        let missing = self
+            .ledger_syncer
+            .take_unrequested(&missing, std::time::Instant::now());
         if missing.is_empty() {
             return;
         }
@@ -2120,8 +2141,12 @@ impl PeerManager {
                 Ok(Some(raw)) => {
                     // Storage holds rxrpl's internal node form (no wireType
                     // byte); rippled expects TMLedgerNode-style wire form.
-                    // Wrap before sending so peers can decode the response.
-                    let wire = encode_shamap_wire_node(&raw, leaf_wire_type);
+                    // Wrap before sending so peers can decode the response. The
+                    // node store is untyped, so inner-ness is inferred from the
+                    // 16×32 layout here -- the one path where the node type is
+                    // genuinely unavailable (a 480-byte leaf collides; rare).
+                    let is_inner = raw.len() == 16 * 32;
+                    let wire = encode_shamap_wire_node(&raw, is_inner, leaf_wire_type);
                     let entry_size = 32 + wire.len();
                     if total_size + entry_size > MAX_RESPONSE_SIZE {
                         break;
@@ -2286,12 +2311,16 @@ impl PeerManager {
     /// node_ids) gets stuck after repeated zero-add rounds. Instead of
     /// requesting nodes by their SHAMapNodeID position, we request them
     /// directly by their content hash via the GetObjects (type 42) message.
-    fn send_get_objects_by_hash(&self, seq: u32, content_hashes: &[Hash256]) {
+    fn send_get_objects_by_hash(&mut self, seq: u32, content_hashes: &[Hash256]) {
         let ledger_hash = match self.ledger_syncer.get_ledger_hash(seq) {
             Some(h) => h,
             None => return,
         };
 
+        let content_hashes = self
+            .ledger_syncer
+            .take_unrequested_hashes(content_hashes, std::time::Instant::now());
+        let content_hashes = content_hashes.as_slice();
         if content_hashes.is_empty() {
             return;
         }
@@ -2556,10 +2585,10 @@ impl PeerManager {
             // - Leaf (key || data in storage): reorder to data || key + the
             //   tree-specific leaf wireType byte selected above.
             for node_id in &request_node_ids {
-                let Some((_content_hash, raw)) = map.node_at(*node_id) else {
+                let Some((_content_hash, raw, is_inner)) = map.node_at(*node_id) else {
                     continue;
                 };
-                let wire = encode_shamap_wire_node(&raw, leaf_wire_type);
+                let wire = encode_shamap_wire_node(&raw, is_inner, leaf_wire_type);
                 let id_bytes = node_id.to_wire_bytes();
                 let entry_size = id_bytes.len() + wire.len();
                 if total_size + entry_size <= MAX_RESPONSE_SIZE {
@@ -2700,7 +2729,7 @@ impl PeerManager {
             });
         } else {
             for node_id in &request_node_ids {
-                if let Some((_h, raw)) = map.node_at(*node_id) {
+                if let Some((_h, raw, _is_inner)) = map.node_at(*node_id) {
                     let wire = encode_tx_no_meta_wire_node(&raw);
                     nodes.push((node_id.to_wire_bytes(), wire));
                 }
@@ -2981,8 +3010,14 @@ fn encode_tx_no_meta_wire_node(storage: &[u8]) -> Vec<u8> {
     }
 }
 
-fn encode_shamap_wire_node(storage: &[u8], leaf_wire_type: u8) -> Vec<u8> {
-    if storage.len() == 16 * 32 {
+/// Wrap a node's internal storage bytes in rippled's TMLedgerNode wire form.
+///
+/// `is_inner` MUST come from the node's actual type (e.g. `SHAMap::node_at`),
+/// never from byte length: a leaf with exactly 480 bytes of data serializes to
+/// 512 bytes and collides with an inner node's 16×32 layout, which would tag it
+/// as an inner and corrupt the peer's catchup.
+fn encode_shamap_wire_node(storage: &[u8], is_inner: bool, leaf_wire_type: u8) -> Vec<u8> {
+    if is_inner {
         let mut wire = Vec::with_capacity(storage.len() + 1);
         wire.extend_from_slice(storage);
         wire.push(WIRE_TYPE_INNER);
