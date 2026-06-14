@@ -1162,7 +1162,11 @@ mod tests {
         // Every recovered leaf must match the server's value.
         for (key_bytes, data) in &leaves {
             let key = Hash256::new(key_bytes[..32].try_into().unwrap());
-            assert_eq!(server.get(&key), Some(data.as_slice()), "leaf {key} mismatch");
+            assert_eq!(
+                server.get(&key),
+                Some(data.as_slice()),
+                "leaf {key} mismatch"
+            );
         }
     }
 }

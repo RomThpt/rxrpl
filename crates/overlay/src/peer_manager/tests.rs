@@ -96,7 +96,11 @@ fn encode_shamap_wire_node_480_byte_leaf_is_not_misread_as_inner() {
     let mut storage = Vec::new();
     storage.extend_from_slice(&key);
     storage.extend_from_slice(&data);
-    assert_eq!(storage.len(), 16 * 32, "this leaf collides with inner length");
+    assert_eq!(
+        storage.len(),
+        16 * 32,
+        "this leaf collides with inner length"
+    );
 
     let wire = encode_shamap_wire_node(&storage, false, WIRE_TYPE_ACCOUNT_STATE);
     assert_eq!(&wire[..480], &data[..]);
