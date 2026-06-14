@@ -213,6 +213,10 @@ pub struct LedgerSyncer {
     /// time. Used to suppress duplicate node requests that would otherwise flood
     /// peers and drown the responses carrying genuinely new frontier nodes.
     inflight: HashMap<Hash256, Instant>,
+    /// Cumulative count of genuinely new nodes added to the shared store across
+    /// all syncs. Backend-independent progress metric (the per-sync `total_added`
+    /// resets on every re-target and hides cross-target accumulation).
+    lifetime_added: u64,
 }
 
 struct PendingRequest {
@@ -234,6 +238,7 @@ impl LedgerSyncer {
             ledger_hashes: HashMap::new(),
             synced_seqs: HashSet::new(),
             inflight: HashMap::new(),
+            lifetime_added: 0,
         }
     }
 
@@ -481,6 +486,7 @@ impl LedgerSyncer {
         );
 
         if added > 0 {
+            self.lifetime_added += added as u64;
             entry.zero_rounds = 0;
             entry.total_added += added as u32;
             if entry.total_added % 5000 < added as u32 {
@@ -571,6 +577,12 @@ impl LedgerSyncer {
     /// fed into when the echoed seq no longer matches an active sync.
     pub fn active_incremental_seq(&self) -> Option<u32> {
         self.incremental.keys().max().copied()
+    }
+
+    /// Cumulative count of genuinely new nodes added to the shared store across
+    /// all syncs (true catchup progress, unlike the per-sync `total_added`).
+    pub fn lifetime_added(&self) -> u64 {
+        self.lifetime_added
     }
 
     /// Filter `missing` down to nodes not already requested within the in-flight

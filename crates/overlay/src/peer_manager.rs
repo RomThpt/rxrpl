@@ -1856,6 +1856,11 @@ impl PeerManager {
             // responses that would have driven the next send are lost; this
             // periodic kick re-requests any frontier nodes whose in-flight
             // window has expired.
+            tracing::info!(
+                "catchup #{}: {} cumulative nodes acquired",
+                seq,
+                self.ledger_syncer.lifetime_added()
+            );
             self.send_get_ledger_as_node(seq);
         }
     }
