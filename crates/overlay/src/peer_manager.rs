@@ -1260,6 +1260,18 @@ impl PeerManager {
                                 nodes.len(),
                                 ledger_seq
                             );
+                            // TMGetObjectByHash returns NodeObject blobs
+                            // (`HASH_PREFIX[4] || content`), not the SHAMap wire
+                            // form (`content || trailing-type-byte`) that
+                            // feed_nodes decodes. Convert so the hash recomputes
+                            // correctly; otherwise every object decoded to a
+                            // wrong hash and was rejected as already-present.
+                            let nodes: Vec<(Vec<u8>, Vec<u8>)> = nodes
+                                .into_iter()
+                                .filter_map(|(h, d)| {
+                                    crate::ledger_sync::object_blob_to_wire(&d).map(|w| (h, w))
+                                })
+                                .collect();
                             if self.ledger_syncer.has_incremental_sync(ledger_seq) {
                                 use crate::ledger_sync::FeedResult;
                                 let ledger_hash = self.ledger_syncer.get_ledger_hash(ledger_seq);

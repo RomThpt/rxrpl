@@ -128,6 +128,36 @@ fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
     }
 }
 
+/// Convert a `TMGetObjectByHash` NodeObject blob into the SHAMap wire form
+/// that `decode_wire_node` expects.
+///
+/// `GetObjectByHash` returns `serializeWithPrefix` blobs shaped as a 4-byte
+/// `HASH_PREFIX` followed by the node content. `GetLedger` / `TMLedgerData` —
+/// what `decode_wire_node` parses — instead puts the content first and a single
+/// wire-type byte last. The prefix identifies the node type, so this maps that
+/// prefix to the matching trailing byte and moves it from the front to the
+/// back. The recomputed `SHA512Half(HASH_PREFIX, content)` then matches the
+/// object's real hash, which is why misparsing the prefix blob as a wire node
+/// produced wrong hashes and left mainnet catchup stuck.
+pub fn object_blob_to_wire(blob: &[u8]) -> Option<Vec<u8>> {
+    if blob.len() < 4 {
+        return None;
+    }
+    let prefix: [u8; 4] = blob[..4].try_into().ok()?;
+    let content = &blob[4..];
+    let wire_type = match prefix {
+        HASH_PREFIX_INNER => WIRE_TYPE_INNER,
+        HASH_PREFIX_LEAF => WIRE_TYPE_ACCOUNT_STATE,
+        HASH_PREFIX_TX_NODE => WIRE_TYPE_TRANSACTION_WITH_META,
+        HASH_PREFIX_TX_ID => WIRE_TYPE_TRANSACTION,
+        _ => return None,
+    };
+    let mut wire = Vec::with_capacity(content.len() + 1);
+    wire.extend_from_slice(content);
+    wire.push(wire_type);
+    Some(wire)
+}
+
 /// Result of feeding nodes into an incremental sync.
 pub enum FeedResult {
     /// Sync is still in progress; continue with tree-based requests.
@@ -752,5 +782,52 @@ mod tests {
         assert!(syncer.pending_count() > 0);
         syncer.clear();
         assert_eq!(syncer.pending_count(), 0);
+    }
+
+    /// A GetObjectByHash inner NodeObject (`MIN\0 || 16*32 child hashes`)
+    /// must convert to wire form and decode back to the object's real hash —
+    /// the bug that left mainnet catchup stuck (objects rejected as already
+    /// present because the prefix blob was misparsed as a trailing-type wire
+    /// node).
+    #[test]
+    fn object_blob_to_wire_inner_roundtrips_hash() {
+        let mut child_hashes = vec![0u8; 16 * 32];
+        for (i, b) in child_hashes.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let mut blob = HASH_PREFIX_INNER.to_vec();
+        blob.extend_from_slice(&child_hashes);
+        let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &child_hashes]);
+
+        let wire = object_blob_to_wire(&blob).expect("inner converts");
+        assert_eq!(*wire.last().unwrap(), WIRE_TYPE_INNER);
+        let (hash, storage) = decode_wire_node(&wire).expect("wire decodes");
+        assert_eq!(hash, expected);
+        assert_eq!(storage, child_hashes);
+    }
+
+    /// A leaf account-state NodeObject (`MLN\0 || data || key`) likewise.
+    #[test]
+    fn object_blob_to_wire_leaf_roundtrips_hash() {
+        let data = vec![0xABu8; 87];
+        let key = vec![0xCDu8; 32];
+        let mut blob = HASH_PREFIX_LEAF.to_vec();
+        blob.extend_from_slice(&data);
+        blob.extend_from_slice(&key);
+        let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_LEAF, &data, &key]);
+
+        let wire = object_blob_to_wire(&blob).expect("leaf converts");
+        assert_eq!(*wire.last().unwrap(), WIRE_TYPE_ACCOUNT_STATE);
+        let (hash, storage) = decode_wire_node(&wire).expect("wire decodes");
+        assert_eq!(hash, expected);
+        // storage layout is key || data.
+        assert_eq!(&storage[..32], &key[..]);
+        assert_eq!(&storage[32..], &data[..]);
+    }
+
+    #[test]
+    fn object_blob_to_wire_rejects_unknown_prefix() {
+        let blob = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
+        assert!(object_blob_to_wire(&blob).is_none());
     }
 }
