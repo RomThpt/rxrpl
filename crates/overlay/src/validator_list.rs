@@ -3,14 +3,15 @@
 /// A ValidatorList message carries:
 ///   - `manifest`: the list publisher's manifest (serialized STObject)
 ///   - `blob`: base64-encoded JSON containing the validator entries
-///   - `signature`: hex-encoded signature over the raw blob bytes
+///   - `signature`: hex-encoded signature over the decoded blob bytes
 ///   - `version`: protocol version
 ///
 /// The signature is computed by the publisher's *ephemeral* key over the
-/// raw blob bytes (before base64-decoding).  To verify:
+/// base64-*decoded* blob bytes (the list JSON), matching rippled.  To verify:
 ///   1. Parse the publisher's manifest to extract the ephemeral key
-///   2. Verify the blob signature against that ephemeral key
-///   3. Base64-decode and parse the blob JSON for validator entries
+///   2. Base64-decode the blob
+///   3. Verify the signature over the decoded bytes against the ephemeral key
+///   4. Parse the decoded blob JSON for validator entries
 ///
 /// Each validator entry in the blob has:
 ///   - `validation_public_key`: hex master public key
@@ -127,20 +128,22 @@ pub fn verify_and_parse(
         .as_ref()
         .ok_or(ValidatorListError::MissingData)?;
 
-    // Verify the signature over the blob bytes
     let sig_bytes = hex::decode(signature_hex)
         .map_err(|e| ValidatorListError::BlobDecode(format!("signature hex: {}", e)))?;
 
-    let verified = verify_blob_signature(blob_base64, ephemeral_pk.as_bytes(), &sig_bytes);
-    if !verified {
-        return Err(ValidatorListError::BlobSignatureInvalid);
-    }
-
-    // Base64-decode the blob
+    // The publisher signs the *decoded* blob bytes (the list JSON), not the
+    // base64 string. Decode first, then verify the signature over those bytes
+    // and reuse them to parse the list. Verifying over the base64 string
+    // rejected every real (e.g. vl.ripple.com) list as "blob signature invalid".
     use base64::Engine;
     let blob_json = base64::engine::general_purpose::STANDARD
         .decode(blob_base64)
         .map_err(|e| ValidatorListError::BlobDecode(format!("base64: {}", e)))?;
+
+    let verified = verify_blob_signature(&blob_json, ephemeral_pk.as_bytes(), &sig_bytes);
+    if !verified {
+        return Err(ValidatorListError::BlobSignatureInvalid);
+    }
 
     // Parse the blob JSON
     let blob: serde_json::Value = serde_json::from_slice(&blob_json)
@@ -740,12 +743,12 @@ mod tests {
             "validators": validator_entries,
         });
 
-        let blob_b64 = base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_vec(&blob_json).unwrap());
+        let blob_raw = serde_json::to_vec(&blob_json).unwrap();
+        let blob_b64 = base64::engine::general_purpose::STANDARD.encode(&blob_raw);
 
-        // Sign the blob with ephemeral key
-        let blob_sig =
-            rxrpl_crypto::ed25519::sign(blob_b64.as_bytes(), &eph_kp.private_key).unwrap();
+        // Sign the *decoded* blob bytes with the ephemeral key, matching
+        // rippled (the signature covers the list JSON, not the base64 string).
+        let blob_sig = rxrpl_crypto::ed25519::sign(&blob_raw, &eph_kp.private_key).unwrap();
         let sig_hex = hex::encode(blob_sig.as_bytes());
 
         (
@@ -1368,5 +1371,34 @@ mod tests {
             .cache_validator_list(vl_c)
             .expect_err("post-revocation caching must be refused");
         assert!(matches!(err, ValidatorListError::PublisherRevoked));
+    }
+
+    /// Regression: the real vl.ripple.com list (version 1, 35 validators) must
+    /// verify. The publisher signs the *decoded* blob bytes; verifying over the
+    /// base64 string rejected every real list as "blob signature invalid".
+    #[test]
+    fn verify_real_ripple_validator_list() {
+        use base64::Engine;
+        let raw = include_str!("../tests/fixtures/vl_ripple_com.json");
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let manifest = base64::engine::general_purpose::STANDARD
+            .decode(v["manifest"].as_str().unwrap())
+            .unwrap();
+        let blob = v["blob"].as_str().unwrap().as_bytes();
+        let sig = v["signature"].as_str().unwrap().as_bytes();
+
+        let mut store = ManifestStore::new();
+        let result = verify_and_parse(&manifest, blob, sig, &mut store);
+        assert!(
+            result.is_ok(),
+            "real Ripple VL rejected: {:?}",
+            result.err()
+        );
+        let vl = result.unwrap();
+        assert_eq!(vl.validators.len(), 35);
+        assert_eq!(
+            hex::encode_upper(vl.publisher_master_key.as_bytes()),
+            "ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734"
+        );
     }
 }
