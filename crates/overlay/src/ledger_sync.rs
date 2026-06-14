@@ -27,6 +27,10 @@ const CATCHUP_PREEMPT_ZERO_ROUNDS: u32 = 40;
 /// release path and removal is only a backstop when no newer tip arrives.
 const STUCK_REMOVE_ZERO_ROUNDS: u32 = 20;
 const CATCHUP_STUCK_REMOVE_ZERO_ROUNDS: u32 = 48;
+/// How long a requested node hash is considered in-flight before it may be
+/// requested again. Long enough to outlast a normal round-trip so duplicate
+/// requests are suppressed, short enough that a lost request is retried soon.
+const INFLIGHT_WINDOW: Duration = Duration::from_secs(8);
 
 /// Data received from a synced ledger.
 pub struct SyncedLedgerData {
@@ -205,6 +209,10 @@ pub struct LedgerSyncer {
     ledger_hashes: HashMap<u32, Hash256>,
     /// Sequences that have already been synced (to avoid re-processing).
     synced_seqs: HashSet<u32>,
+    /// Content hashes requested within the in-flight window, with their request
+    /// time. Used to suppress duplicate node requests that would otherwise flood
+    /// peers and drown the responses carrying genuinely new frontier nodes.
+    inflight: HashMap<Hash256, Instant>,
 }
 
 struct PendingRequest {
@@ -225,6 +233,7 @@ impl LedgerSyncer {
             incremental: HashMap::new(),
             ledger_hashes: HashMap::new(),
             synced_seqs: HashSet::new(),
+            inflight: HashMap::new(),
         }
     }
 
@@ -327,6 +336,7 @@ impl LedgerSyncer {
         self.incremental.clear();
         self.ledger_hashes.clear();
         self.synced_seqs.clear();
+        self.inflight.clear();
     }
 
     // --- Incremental (delta) sync ---
@@ -561,6 +571,50 @@ impl LedgerSyncer {
     /// fed into when the echoed seq no longer matches an active sync.
     pub fn active_incremental_seq(&self) -> Option<u32> {
         self.incremental.keys().max().copied()
+    }
+
+    /// Filter `missing` down to nodes not already requested within the in-flight
+    /// window, recording the survivors as now requested. Newly discovered
+    /// frontier nodes always pass through (they were never in-flight), so normal
+    /// response-driven progress is unaffected; only redundant re-requests for
+    /// nodes still awaited are dropped. Expired entries are pruned each call so a
+    /// lost request is retried after the window.
+    pub fn take_unrequested(&mut self, missing: &[MissingNode], now: Instant) -> Vec<MissingNode> {
+        self.prune_inflight(now);
+        let mut out = Vec::new();
+        for mn in missing {
+            if self.mark_inflight(mn.hash, now) {
+                out.push(mn.clone());
+            }
+        }
+        out
+    }
+
+    /// Content-hash variant of [`Self::take_unrequested`] for the
+    /// `TMGetObjectByHash` fallback path.
+    pub fn take_unrequested_hashes(&mut self, hashes: &[Hash256], now: Instant) -> Vec<Hash256> {
+        self.prune_inflight(now);
+        let mut out = Vec::new();
+        for &h in hashes {
+            if self.mark_inflight(h, now) {
+                out.push(h);
+            }
+        }
+        out
+    }
+
+    fn prune_inflight(&mut self, now: Instant) {
+        self.inflight
+            .retain(|_, t| now.duration_since(*t) < INFLIGHT_WINDOW);
+    }
+
+    fn mark_inflight(&mut self, hash: Hash256, now: Instant) -> bool {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.inflight.entry(hash) {
+            e.insert(now);
+            true
+        } else {
+            false
+        }
     }
 
     /// Check if a sequence has already been fully synced.
@@ -1008,6 +1062,36 @@ mod tests {
         // target to feed: the active sync.
         assert!(!syncer.has_incremental_sync(88));
         assert_eq!(syncer.active_incremental_seq(), Some(100));
+    }
+
+    /// In-flight dedup suppresses a re-request within the window but lets a new
+    /// hash through, and retries once the window expires.
+    #[test]
+    fn inflight_dedup_suppresses_then_retries() {
+        use rxrpl_shamap::NodeId;
+        let mut syncer = LedgerSyncer::new();
+        let mk = |b: u8| MissingNode {
+            hash: Hash256::new([b; 32]),
+            node_id: NodeId::ROOT,
+        };
+        let now = Instant::now();
+        let batch = vec![mk(1), mk(2)];
+
+        let first = syncer.take_unrequested(&batch, now);
+        assert_eq!(first.len(), 2, "all fresh nodes pass through");
+
+        // Same batch within the window is fully suppressed.
+        let again = syncer.take_unrequested(&batch, now + Duration::from_secs(1));
+        assert!(again.is_empty(), "in-flight nodes are not re-requested");
+
+        // A brand-new hash still passes even while others are in-flight.
+        let mixed = syncer.take_unrequested(&[mk(2), mk(3)], now + Duration::from_secs(2));
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].hash, Hash256::new([3; 32]));
+
+        // After the window expires the original nodes are retried.
+        let retry = syncer.take_unrequested(&batch, now + INFLIGHT_WINDOW + Duration::from_secs(1));
+        assert_eq!(retry.len(), 2, "expired in-flight nodes are retried");
     }
 
     fn run_large_state_delta_sync(compress_inner: bool) {

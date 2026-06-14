@@ -1850,6 +1850,13 @@ impl PeerManager {
         {
             // Request only the latest peer ledger, not all intermediary ones.
             self.send_get_ledger(max_peer_seq, None);
+        } else if let Some(seq) = self.ledger_syncer.active_incremental_seq() {
+            // Re-drive the active catchup. The response-driven loop can fall
+            // quiet when in-flight dedup suppresses a round's requests and the
+            // responses that would have driven the next send are lost; this
+            // periodic kick re-requests any frontier nodes whose in-flight
+            // window has expired.
+            self.send_get_ledger_as_node(seq);
         }
     }
 
@@ -1976,6 +1983,9 @@ impl PeerManager {
         };
 
         let missing = self.ledger_syncer.get_missing_node_ids(seq);
+        let missing = self
+            .ledger_syncer
+            .take_unrequested(&missing, std::time::Instant::now());
         if missing.is_empty() {
             return;
         }
@@ -2301,12 +2311,16 @@ impl PeerManager {
     /// node_ids) gets stuck after repeated zero-add rounds. Instead of
     /// requesting nodes by their SHAMapNodeID position, we request them
     /// directly by their content hash via the GetObjects (type 42) message.
-    fn send_get_objects_by_hash(&self, seq: u32, content_hashes: &[Hash256]) {
+    fn send_get_objects_by_hash(&mut self, seq: u32, content_hashes: &[Hash256]) {
         let ledger_hash = match self.ledger_syncer.get_ledger_hash(seq) {
             Some(h) => h,
             None => return,
         };
 
+        let content_hashes = self
+            .ledger_syncer
+            .take_unrequested_hashes(content_hashes, std::time::Instant::now());
+        let content_hashes = content_hashes.as_slice();
         if content_hashes.is_empty() {
             return;
         }
