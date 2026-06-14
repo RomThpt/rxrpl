@@ -10,14 +10,26 @@ const DEFAULT_GENERAL_BURST: u32 = 200;
 const DEFAULT_TRANSACTION_RATE: f64 = 50.0;
 const DEFAULT_TRANSACTION_BURST: u32 = 100;
 
-const DEFAULT_PROPOSAL_RATE: f64 = 20.0;
-const DEFAULT_PROPOSAL_BURST: u32 = 40;
+// Proposals and validations are gossip-relayed: a single peer forwards the
+// messages of every UNL validator it sees (mainnet has 35+), and the same
+// message arrives from several peers before squelching converges. 20/s was
+// calibrated for a small test network and disconnected legitimate mainnet
+// peers for "rate-limit abuse" within seconds. Size for the real relayed
+// volume; a genuine flood is still well above these.
+const DEFAULT_PROPOSAL_RATE: f64 = 200.0;
+const DEFAULT_PROPOSAL_BURST: u32 = 400;
 
-const DEFAULT_VALIDATION_RATE: f64 = 20.0;
-const DEFAULT_VALIDATION_BURST: u32 = 40;
+const DEFAULT_VALIDATION_RATE: f64 = 200.0;
+const DEFAULT_VALIDATION_BURST: u32 = 400;
 
 /// Number of consecutive rate-limit drops before disconnecting a peer.
-const DEFAULT_DISCONNECT_THRESHOLD: u32 = 10;
+///
+/// Dropping a surplus (usually duplicate) consensus message is cheap and
+/// harmless; disconnecting the peer is not — it costs connectivity. On
+/// mainnet a peer relaying a transient burst of legitimate proposals/
+/// validations could cross a low threshold and get cut, so keep this high:
+/// only a sustained flood (100 consecutive drops) disconnects.
+const DEFAULT_DISCONNECT_THRESHOLD: u32 = 100;
 
 /// Reputation penalty applied when a message is rate-limited.
 const RATE_LIMIT_PENALTY: i32 = -5;
@@ -447,11 +459,11 @@ mod tests {
         assert_eq!(config.general_burst, 200);
         assert!((config.transaction_rate - 50.0).abs() < f64::EPSILON);
         assert_eq!(config.transaction_burst, 100);
-        assert!((config.proposal_rate - 20.0).abs() < f64::EPSILON);
-        assert_eq!(config.proposal_burst, 40);
-        assert!((config.validation_rate - 20.0).abs() < f64::EPSILON);
-        assert_eq!(config.validation_burst, 40);
-        assert_eq!(config.disconnect_threshold, 10);
+        assert!((config.proposal_rate - 200.0).abs() < f64::EPSILON);
+        assert_eq!(config.proposal_burst, 400);
+        assert!((config.validation_rate - 200.0).abs() < f64::EPSILON);
+        assert_eq!(config.validation_burst, 400);
+        assert_eq!(config.disconnect_threshold, 100);
     }
 
     #[test]
