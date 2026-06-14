@@ -77,13 +77,31 @@ fn encode_shamap_wire_node_inner_appends_inner_tag() {
     // Tagged byte must NOT depend on the leaf wireType argument since
     // inner nodes are tree-agnostic.
     let storage = vec![0xAB; 16 * 32];
-    let wire = encode_shamap_wire_node(&storage, WIRE_TYPE_ACCOUNT_STATE);
+    let wire = encode_shamap_wire_node(&storage, true, WIRE_TYPE_ACCOUNT_STATE);
     assert_eq!(wire.len(), 16 * 32 + 1);
     assert_eq!(&wire[..16 * 32], &storage[..]);
     assert_eq!(*wire.last().unwrap(), WIRE_TYPE_INNER);
 
-    let wire_tx = encode_shamap_wire_node(&storage, WIRE_TYPE_TX_WITH_META);
+    let wire_tx = encode_shamap_wire_node(&storage, true, WIRE_TYPE_TX_WITH_META);
     assert_eq!(*wire_tx.last().unwrap(), WIRE_TYPE_INNER);
+}
+
+/// A leaf whose data is exactly 480 bytes serializes to 512 storage bytes,
+/// colliding with an inner node's 16×32 layout. With the explicit `is_inner`
+/// flag it must still be tagged as a leaf, not an inner.
+#[test]
+fn encode_shamap_wire_node_480_byte_leaf_is_not_misread_as_inner() {
+    let key = vec![0x55u8; 32];
+    let data = vec![0x66u8; 480];
+    let mut storage = Vec::new();
+    storage.extend_from_slice(&key);
+    storage.extend_from_slice(&data);
+    assert_eq!(storage.len(), 16 * 32, "this leaf collides with inner length");
+
+    let wire = encode_shamap_wire_node(&storage, false, WIRE_TYPE_ACCOUNT_STATE);
+    assert_eq!(&wire[..480], &data[..]);
+    assert_eq!(&wire[480..512], &key[..]);
+    assert_eq!(*wire.last().unwrap(), WIRE_TYPE_ACCOUNT_STATE);
 }
 
 #[test]
@@ -94,7 +112,7 @@ fn encode_shamap_wire_node_account_state_leaf_reorders_and_tags() {
     let mut storage = Vec::new();
     storage.extend_from_slice(&key);
     storage.extend_from_slice(&data);
-    let wire = encode_shamap_wire_node(&storage, WIRE_TYPE_ACCOUNT_STATE);
+    let wire = encode_shamap_wire_node(&storage, false, WIRE_TYPE_ACCOUNT_STATE);
     assert_eq!(wire.len(), 32 + 50 + 1);
     assert_eq!(&wire[..50], &data[..]);
     assert_eq!(&wire[50..82], &key[..]);
@@ -109,7 +127,7 @@ fn encode_shamap_wire_node_tx_leaf_uses_with_meta_tag() {
     let mut storage = Vec::new();
     storage.extend_from_slice(&key);
     storage.extend_from_slice(&data);
-    let wire = encode_shamap_wire_node(&storage, WIRE_TYPE_TX_WITH_META);
+    let wire = encode_shamap_wire_node(&storage, false, WIRE_TYPE_TX_WITH_META);
     assert_eq!(&wire[..80], &data[..]);
     assert_eq!(&wire[80..112], &key[..]);
     assert_eq!(*wire.last().unwrap(), WIRE_TYPE_TX_WITH_META);

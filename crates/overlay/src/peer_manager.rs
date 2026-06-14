@@ -2120,8 +2120,12 @@ impl PeerManager {
                 Ok(Some(raw)) => {
                     // Storage holds rxrpl's internal node form (no wireType
                     // byte); rippled expects TMLedgerNode-style wire form.
-                    // Wrap before sending so peers can decode the response.
-                    let wire = encode_shamap_wire_node(&raw, leaf_wire_type);
+                    // Wrap before sending so peers can decode the response. The
+                    // node store is untyped, so inner-ness is inferred from the
+                    // 16×32 layout here -- the one path where the node type is
+                    // genuinely unavailable (a 480-byte leaf collides; rare).
+                    let is_inner = raw.len() == 16 * 32;
+                    let wire = encode_shamap_wire_node(&raw, is_inner, leaf_wire_type);
                     let entry_size = 32 + wire.len();
                     if total_size + entry_size > MAX_RESPONSE_SIZE {
                         break;
@@ -2556,10 +2560,10 @@ impl PeerManager {
             // - Leaf (key || data in storage): reorder to data || key + the
             //   tree-specific leaf wireType byte selected above.
             for node_id in &request_node_ids {
-                let Some((_content_hash, raw)) = map.node_at(*node_id) else {
+                let Some((_content_hash, raw, is_inner)) = map.node_at(*node_id) else {
                     continue;
                 };
-                let wire = encode_shamap_wire_node(&raw, leaf_wire_type);
+                let wire = encode_shamap_wire_node(&raw, is_inner, leaf_wire_type);
                 let id_bytes = node_id.to_wire_bytes();
                 let entry_size = id_bytes.len() + wire.len();
                 if total_size + entry_size <= MAX_RESPONSE_SIZE {
@@ -2700,7 +2704,7 @@ impl PeerManager {
             });
         } else {
             for node_id in &request_node_ids {
-                if let Some((_h, raw)) = map.node_at(*node_id) {
+                if let Some((_h, raw, _is_inner)) = map.node_at(*node_id) {
                     let wire = encode_tx_no_meta_wire_node(&raw);
                     nodes.push((node_id.to_wire_bytes(), wire));
                 }
@@ -2981,8 +2985,14 @@ fn encode_tx_no_meta_wire_node(storage: &[u8]) -> Vec<u8> {
     }
 }
 
-fn encode_shamap_wire_node(storage: &[u8], leaf_wire_type: u8) -> Vec<u8> {
-    if storage.len() == 16 * 32 {
+/// Wrap a node's internal storage bytes in rippled's TMLedgerNode wire form.
+///
+/// `is_inner` MUST come from the node's actual type (e.g. `SHAMap::node_at`),
+/// never from byte length: a leaf with exactly 480 bytes of data serializes to
+/// 512 bytes and collides with an inner node's 16×32 layout, which would tag it
+/// as an inner and corrupt the peer's catchup.
+fn encode_shamap_wire_node(storage: &[u8], is_inner: bool, leaf_wire_type: u8) -> Vec<u8> {
+    if is_inner {
         let mut wire = Vec::with_capacity(storage.len() + 1);
         wire.extend_from_slice(storage);
         wire.push(WIRE_TYPE_INNER);
