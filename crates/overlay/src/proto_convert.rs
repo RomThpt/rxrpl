@@ -590,7 +590,10 @@ pub fn encode_get_ledger_with_nodes(
             None
         },
         query_type: None,
-        query_depth: if has_nodes { Some(2) } else { None },
+        // Ask the server to pack deeper fat subtrees per requested node so each
+        // reply carries more of the frontier (rippled still caps by response
+        // size); shallow depth was a major catchup throughput limiter.
+        query_depth: if has_nodes { Some(3) } else { None },
     };
     msg.encode_to_vec()
 }
