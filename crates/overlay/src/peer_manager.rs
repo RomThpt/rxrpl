@@ -2997,7 +2997,12 @@ fn spawn_peer_loops(
     event_tx: mpsc::Sender<PeerEvent>,
 ) -> mpsc::Sender<PeerMessage> {
     let (write, read) = framed.split();
-    let (tx, rx) = mpsc::channel(256);
+    // Per-peer outbound send queue. 256 overflowed under mainnet load — a sync
+    // burst (e.g. 512 GetObjectByHash node ids, plus GetLedger requests) filled
+    // it faster than the TLS write loop drained, so try_send returned "no
+    // available capacity" and dropped the very requests catchup depends on,
+    // stalling the sync. 2048 absorbs those bursts.
+    let (tx, rx) = mpsc::channel(2048);
 
     tokio::spawn(peer_loop::run_peer_read_loop(node_id, read, event_tx));
     tokio::spawn(peer_loop::run_peer_write_loop(write, rx));
