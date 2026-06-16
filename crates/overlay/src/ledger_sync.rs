@@ -221,6 +221,12 @@ pub struct LedgerSyncer {
     /// all syncs. Backend-independent progress metric (the per-sync `total_added`
     /// resets on every re-target and hides cross-target accumulation).
     lifetime_added: u64,
+    /// Hashes of SHAMap subtrees already fully present in the shared store, so
+    /// `missing_nodes` never re-walks them. Without this, frontier discovery is
+    /// O(stored nodes) per round and catchup is O(n²) -- the dominant wall for a
+    /// multi-million-node mainnet state. Shared across re-targets (a complete
+    /// subtree stays complete for any target referencing it).
+    complete: HashSet<Hash256>,
 }
 
 struct PendingRequest {
@@ -243,6 +249,7 @@ impl LedgerSyncer {
             synced_seqs: HashSet::new(),
             inflight: HashMap::new(),
             lifetime_added: 0,
+            complete: HashSet::new(),
         }
     }
 
@@ -346,6 +353,7 @@ impl LedgerSyncer {
         self.ledger_hashes.clear();
         self.synced_seqs.clear();
         self.inflight.clear();
+        self.complete.clear();
     }
 
     // --- Incremental (delta) sync ---
@@ -437,7 +445,9 @@ impl LedgerSyncer {
             return Vec::new();
         }
 
-        entry.map.missing_nodes(hash, MAX_DELTA_NODES_PER_REQUEST)
+        entry
+            .map
+            .missing_nodes(hash, MAX_DELTA_NODES_PER_REQUEST, &mut self.complete)
     }
 
     /// Feed received nodes into an active incremental sync.
@@ -526,9 +536,12 @@ impl LedgerSyncer {
             if entry.zero_rounds >= HASH_FALLBACK_THRESHOLD
                 && entry.zero_rounds % HASH_FALLBACK_THRESHOLD == 0
             {
-                let missing = entry
-                    .map
-                    .missing_nodes(entry.hash, MAX_DELTA_NODES_PER_REQUEST);
+                let target = entry.hash;
+                let missing = entry.map.missing_nodes(
+                    target,
+                    MAX_DELTA_NODES_PER_REQUEST,
+                    &mut self.complete,
+                );
                 if !missing.is_empty() {
                     let content_hashes: Vec<Hash256> = missing.iter().map(|mn| mn.hash).collect();
                     tracing::info!(
@@ -547,8 +560,13 @@ impl LedgerSyncer {
             return FeedResult::Continue;
         }
 
-        // Check if the tree is now complete.
-        if entry.map.is_complete() {
+        // Complete iff no node is missing (memoized walk, O(frontier) not O(n)).
+        let target = entry.hash;
+        let is_done = entry
+            .map
+            .missing_nodes(target, 1, &mut self.complete)
+            .is_empty();
+        if is_done {
             tracing::info!(
                 "incremental sync for ledger #{} complete after {} rounds",
                 seq,
@@ -680,7 +698,12 @@ impl LedgerSyncer {
         if entry.map.is_empty() {
             return None;
         }
-        if !entry.map.is_complete() {
+        let target = entry.hash;
+        if !entry
+            .map
+            .missing_nodes(target, 1, &mut self.complete)
+            .is_empty()
+        {
             return None;
         }
         let entry = self.incremental.remove(&seq).unwrap();
@@ -694,11 +717,13 @@ impl LedgerSyncer {
     /// Get the missing node hashes for an active incremental sync, if any.
     ///
     /// Called by `send_get_ledger` to populate `node_ids` in the request.
-    pub fn get_missing_node_ids(&self, seq: u32) -> Vec<MissingNode> {
+    pub fn get_missing_node_ids(&mut self, seq: u32) -> Vec<MissingNode> {
         match self.incremental.get(&seq) {
-            Some(entry) => entry
-                .map
-                .missing_nodes(entry.hash, MAX_DELTA_NODES_PER_REQUEST),
+            Some(entry) => {
+                let target = entry.hash;
+                let map = &entry.map;
+                map.missing_nodes(target, MAX_DELTA_NODES_PER_REQUEST, &mut self.complete)
+            }
             None => Vec::new(),
         }
     }

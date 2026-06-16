@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use rxrpl_primitives::Hash256;
@@ -932,7 +933,20 @@ impl SHAMap {
     /// so the caller can request the root node first.
     ///
     /// Returns up to `max_count` hashes of missing nodes.
-    pub fn missing_nodes(&self, target_root_hash: Hash256, max_count: usize) -> Vec<MissingNode> {
+    ///
+    /// `complete` memoizes the hashes of inner nodes whose entire subtree is
+    /// already present, so already-filled regions are never re-walked. Without
+    /// it the walk is O(stored nodes) per call and the whole catchup is O(n²) --
+    /// the dominant wall for a multi-million-node state. The cache is sound
+    /// because the store only grows during a sync (content-addressed, no
+    /// eviction), so "complete" never becomes stale; callers must clear it if
+    /// nodes are ever removed.
+    pub fn missing_nodes(
+        &self,
+        target_root_hash: Hash256,
+        max_count: usize,
+        complete: &mut HashSet<Hash256>,
+    ) -> Vec<MissingNode> {
         if max_count == 0 {
             return Vec::new();
         }
@@ -946,25 +960,41 @@ impl SHAMap {
         }
 
         let mut missing = Vec::new();
-        match self.root.as_ref() {
-            SHAMapNode::Inner(inner) => {
-                Self::collect_missing(
-                    inner,
-                    &self.store,
-                    self.leaf_ctor,
-                    max_count,
-                    0,
-                    Hash256::ZERO,
-                    &mut missing,
-                );
+        if let SHAMapNode::Inner(inner) = self.root.as_ref() {
+            let whole = Self::collect_missing(
+                inner,
+                &self.store,
+                self.leaf_ctor,
+                max_count,
+                0,
+                Hash256::ZERO,
+                &mut missing,
+                complete,
+            );
+            if whole {
+                complete.insert(inner.hash());
             }
-            SHAMapNode::Leaf(_) => {}
         }
         missing
     }
 
-    /// Recursively collect nodes that are referenced but not available,
-    /// tracking the SHAMapNodeID (path + depth) for the wire protocol.
+    /// Child key (masked path) for `branch` at a node of the given `depth`.
+    fn child_key(path: Hash256, depth: u8, branch: u8) -> Hash256 {
+        let mut child_path = *path.as_bytes();
+        let byte_idx = (depth / 2) as usize;
+        if depth & 1 == 0 {
+            child_path[byte_idx] = (child_path[byte_idx] & 0x0F) | (branch << 4);
+        } else {
+            child_path[byte_idx] = (child_path[byte_idx] & 0xF0) | branch;
+        }
+        Hash256::new(child_path)
+    }
+
+    /// Recursively collect missing nodes under `inner`, tracking the
+    /// SHAMapNodeID (path + depth). Returns `true` if this node's entire subtree
+    /// is present and fully explored (no missing, not truncated by `max_count`),
+    /// in which case the caller memoizes it in `complete` to skip it next time.
+    #[allow(clippy::too_many_arguments)]
     fn collect_missing(
         inner: &InnerNode,
         store: &Option<Arc<dyn NodeStore>>,
@@ -973,68 +1003,81 @@ impl SHAMap {
         depth: u8,
         path: Hash256,
         out: &mut Vec<MissingNode>,
-    ) {
+        complete: &mut HashSet<Hash256>,
+    ) -> bool {
+        let mut subtree_complete = true;
         let mut mask = inner.branch_mask();
-        while mask != 0 && out.len() < max_count {
-            let branch = mask.trailing_zeros() as u8;
-
-            // Build child path: set the nibble at `depth` to `branch`.
-            let mut child_path = *path.as_bytes();
-            let byte_idx = (depth / 2) as usize;
-            if depth & 1 == 0 {
-                child_path[byte_idx] = (child_path[byte_idx] & 0x0F) | (branch << 4);
-            } else {
-                child_path[byte_idx] = (child_path[byte_idx] & 0xF0) | branch;
+        while mask != 0 {
+            if out.len() >= max_count {
+                // Truncated: remaining branches unexplored, cannot memoize.
+                return false;
             }
-            let child_key = Hash256::new(child_path);
-            let child_node_id = NodeId::new(depth + 1, &child_key);
+            let branch = mask.trailing_zeros() as u8;
+            mask &= mask - 1;
+            let child_hash = inner.child_hash(branch);
 
-            // Try to get the child: first check if loaded, then try store.
-            if inner.child(branch).is_some() {
-                if let Some(child) = inner.child(branch) {
-                    if let SHAMapNode::Inner(child_inner) = child.as_ref() {
-                        Self::collect_missing(
-                            child_inner,
-                            store,
-                            leaf_ctor,
-                            max_count,
-                            depth + 1,
-                            child_key,
-                            out,
-                        );
-                    }
+            // Known-complete subtree: skip the walk entirely.
+            if complete.contains(&child_hash) {
+                continue;
+            }
+
+            // Resolve the child: in-memory if loaded, else a single store fetch.
+            let loaded = inner.child(branch).cloned();
+            let child_inner: Option<Box<InnerNode>> = match loaded.as_deref() {
+                Some(SHAMapNode::Inner(ci)) => Some(ci.clone()),
+                Some(SHAMapNode::Leaf(_)) => {
+                    complete.insert(child_hash);
+                    continue;
                 }
-            } else {
-                let child_hash = inner.child_hash(branch);
-                let available = store
+                None => match store
                     .as_ref()
                     .and_then(|s| s.fetch(&child_hash).ok())
                     .flatten()
-                    .is_some();
-                if !available {
-                    out.push(MissingNode {
-                        hash: child_hash,
-                        node_id: child_node_id,
-                    });
-                } else if let Some(s) = store.as_ref()
-                    && let Ok(Some(data)) = s.fetch(&child_hash)
-                    && let Ok(SHAMapNode::Inner(child_inner)) =
-                        crate::node_store::deserialize_node(&data, &child_hash, leaf_ctor)
                 {
-                    Self::collect_missing(
-                        &child_inner,
-                        store,
-                        leaf_ctor,
-                        max_count,
-                        depth + 1,
-                        child_key,
-                        out,
-                    );
+                    Some(data) => {
+                        match crate::node_store::deserialize_node(&data, &child_hash, leaf_ctor) {
+                            Ok(SHAMapNode::Inner(ci)) => Some(ci),
+                            Ok(SHAMapNode::Leaf(_)) => {
+                                complete.insert(child_hash);
+                                continue;
+                            }
+                            Err(_) => {
+                                subtree_complete = false;
+                                continue;
+                            }
+                        }
+                    }
+                    None => {
+                        out.push(MissingNode {
+                            hash: child_hash,
+                            node_id: NodeId::new(depth + 1, &Self::child_key(path, depth, branch)),
+                        });
+                        subtree_complete = false;
+                        continue;
+                    }
+                },
+            };
+
+            if let Some(ci) = child_inner {
+                let child_key = Self::child_key(path, depth, branch);
+                let whole = Self::collect_missing(
+                    ci.as_ref(),
+                    store,
+                    leaf_ctor,
+                    max_count,
+                    depth + 1,
+                    child_key,
+                    out,
+                    complete,
+                );
+                if whole {
+                    complete.insert(child_hash);
+                } else {
+                    subtree_complete = false;
                 }
             }
-
-            mask &= mask - 1;
         }
+        subtree_complete
     }
 
     /// Insert a raw node (inner or leaf) fetched from a peer into the backing store.
