@@ -104,3 +104,10 @@ path = "fuzz_targets/decode_validation_composite.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "catchup_wire"
+path = "fuzz_targets/catchup_wire.rs"
+test = false
+doc = false
+bench = false
