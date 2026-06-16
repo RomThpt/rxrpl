@@ -784,21 +784,49 @@ impl Node {
                         seq + 1
                     );
 
-                    // Download the full state tree via RPC to pre-populate the store.
+                    // Bulk-download and VERIFY the full validated state via RPC,
+                    // then install it as our base ledger -- the fast, completing
+                    // alternative to node-by-node P2P SHAMap sync.
                     if let Some(ref store) = self.node_store {
                         let hash_hex = hex::encode(hash.as_bytes());
-                        match Self::download_state_via_rpc(rpc_url, &hash_hex, Arc::clone(store))
-                            .await
-                        {
-                            Ok(count) => {
-                                tracing::info!(
-                                    "pre-populated store with {} state entries via RPC",
-                                    count
-                                );
+                        match Self::fetch_validated_header(rpc_url, &hash_hex).await {
+                            Ok(header) => {
+                                match Self::download_state_via_rpc(
+                                    rpc_url,
+                                    &hash_hex,
+                                    header.account_hash,
+                                    Arc::clone(store),
+                                )
+                                .await
+                                {
+                                    Ok(state_map) => {
+                                        let mut validated = Ledger::from_catchup_with_store(
+                                            seq,
+                                            hash,
+                                            state_map,
+                                            Arc::clone(store),
+                                        );
+                                        // Apply the trusted validated header so the
+                                        // next local close agrees with the chain.
+                                        validated.header = header;
+                                        *self.ledger.write().await = Ledger::new_open(&validated);
+                                        self.closed_ledgers.write().await.push_back(validated);
+                                        tracing::info!(
+                                            "installed RPC-bootstrapped validated state for ledger #{}",
+                                            seq
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "RPC state download failed (P2P sync will be used): {}",
+                                            e
+                                        );
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                    "RPC state download failed (P2P sync will be used): {}",
+                                    "could not fetch validated header for RPC bootstrap: {}",
                                     e
                                 );
                             }
@@ -3690,18 +3718,82 @@ impl Node {
         Ok((seq, hash))
     }
 
-    /// Download the full state tree for a ledger via RPC `ledger_data` pagination.
+    /// Fetch the validated ledger header via the RPC `ledger` command. Provides
+    /// the `account_hash` that the bulk state download is verified against, plus
+    /// the close-time / drops fields needed to build a header the next local
+    /// close agrees with.
+    async fn fetch_validated_header(
+        rpc_url: &str,
+        ledger_hash: &str,
+    ) -> Result<rxrpl_ledger::LedgerHeader, Box<dyn std::error::Error + Send + Sync>> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .danger_accept_invalid_certs(true)
+            .build()?;
+        let resp = client
+            .post(rpc_url)
+            .json(&serde_json::json!({
+                "method": "ledger",
+                "params": [{"ledger_hash": ledger_hash, "transactions": false, "expand": false}]
+            }))
+            .send()
+            .await?
+            .json::<serde_json::Value>()
+            .await?;
+        let l = resp
+            .get("result")
+            .and_then(|r| r.get("ledger"))
+            .ok_or("missing result.ledger in ledger response")?;
+
+        let hash32 = |v: Option<&serde_json::Value>| -> Result<Hash256, String> {
+            let s = v.and_then(|x| x.as_str()).ok_or("missing hash field")?;
+            let b = hex::decode(s).map_err(|e| format!("bad hex: {e}"))?;
+            let arr: [u8; 32] = b.as_slice().try_into().map_err(|_| "hash not 32 bytes")?;
+            Ok(Hash256::new(arr))
+        };
+        // Numeric fields can arrive as JSON numbers or strings depending on the
+        // server; accept both.
+        let num = |v: Option<&serde_json::Value>| -> u64 {
+            v.and_then(|x| {
+                x.as_u64()
+                    .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+            })
+            .unwrap_or(0)
+        };
+
+        let mut header = rxrpl_ledger::LedgerHeader::new();
+        header.sequence = num(l.get("ledger_index")) as u32;
+        header.drops = num(l.get("total_coins"));
+        header.parent_hash = hash32(l.get("parent_hash"))?;
+        header.tx_hash = hash32(l.get("transaction_hash"))?;
+        header.account_hash = hash32(l.get("account_hash"))?;
+        header.parent_close_time = num(l.get("parent_close_time")) as u32;
+        header.close_time = num(l.get("close_time")) as u32;
+        header.close_time_resolution = num(l.get("close_time_resolution")) as u8;
+        header.close_flags = num(l.get("close_flags")) as u8;
+        header.hash = hash32(l.get("ledger_hash"))?;
+        Ok(header)
+    }
+
+    /// Bulk-acquire a ledger's full account state via the RPC `ledger_data`
+    /// pagination, rebuild the SHAMap locally, and verify its root equals the
+    /// validated `expected_account_hash`. This is the fast, completing
+    /// alternative to node-by-node P2P SHAMap sync (which peers rate-limit and
+    /// which races the moving tip): pages of ~2048 entries from one full-history
+    /// server, built into the tree in O(n), proven against the trusted root.
     async fn download_state_via_rpc(
         rpc_url: &str,
         ledger_hash: &str,
+        expected_account_hash: Hash256,
         store: Arc<dyn NodeStore>,
-    ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<SHAMap, Box<dyn std::error::Error + Send + Sync>> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .connect_timeout(std::time::Duration::from_secs(10))
             .danger_accept_invalid_certs(true)
             .build()?;
 
+        let mut state_map = SHAMap::account_state_with_store(Arc::clone(&store));
         let mut marker: Option<String> = None;
         let mut total = 0u32;
         let mut page = 0u32;
@@ -3770,7 +3862,6 @@ impl Node {
                 break;
             }
 
-            let mut batch: Vec<(Hash256, Vec<u8>)> = Vec::with_capacity(state.len());
             for entry in state {
                 let index = match entry.get("index").and_then(|v| v.as_str()) {
                     Some(i) => i,
@@ -3790,22 +3881,14 @@ impl Node {
                     _ => continue,
                 };
 
-                let mut raw = Vec::with_capacity(32 + data_bytes.len());
-                raw.extend_from_slice(&key_bytes);
-                raw.extend_from_slice(&data_bytes);
-
-                let prefix: [u8; 4] = [0x4D, 0x4C, 0x4E, 0x00];
-                let hash = rxrpl_crypto::sha512_half::sha512_half(&[&prefix, &raw]);
-                batch.push((hash, raw));
+                // Insert as an account-state leaf; `put` computes the correct
+                // leaf hash (SHA512Half(MLN\0 || data || key)) and builds the
+                // inner nodes, so the rebuilt root can be checked against the
+                // validated account_hash below.
+                let key = Hash256::new(key_bytes.as_slice().try_into().unwrap());
+                state_map.put(key, data_bytes)?;
+                total += 1;
             }
-
-            let count = batch.len();
-            if count > 0 {
-                let refs: Vec<(&Hash256, &[u8])> =
-                    batch.iter().map(|(h, d)| (h, d.as_slice())).collect();
-                store.store_batch(&refs)?;
-            }
-            total += count as u32;
             page += 1;
 
             if page % 100 == 0 {
@@ -3829,14 +3912,25 @@ impl Node {
             }
         }
 
+        state_map.flush()?;
+        let root = state_map.root_hash();
         let elapsed = start.elapsed().as_secs();
+        if root != expected_account_hash {
+            return Err(format!(
+                "RPC state verification FAILED: rebuilt root {} != validated account_hash {} \
+                 ({} entries, {} pages, {}s)",
+                root, expected_account_hash, total, page, elapsed
+            )
+            .into());
+        }
         tracing::info!(
-            "RPC state download complete: {} entries in {} pages ({}s)",
+            "RPC state download VERIFIED: {} entries in {} pages ({}s), root == account_hash {}",
             total,
             page,
-            elapsed
+            elapsed,
+            root
         );
-        Ok(total)
+        Ok(state_map)
     }
 }
 
