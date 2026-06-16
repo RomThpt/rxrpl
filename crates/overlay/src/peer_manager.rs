@@ -1862,6 +1862,13 @@ impl PeerManager {
                 self.ledger_syncer.lifetime_added()
             );
             self.send_get_ledger_as_node(seq);
+            // During initial catchup keep pulling the freshest tip header so a
+            // drained target always has a fresher ledger to re-target to -- the
+            // fresh ledger still serves the deep frontier the aged target won't.
+            // start_incremental_sync ignores it until the current target drains.
+            if self.ledger_syncer.in_initial_catchup() && max_peer_seq > seq {
+                self.send_get_ledger(max_peer_seq, None);
+            }
         }
     }
 

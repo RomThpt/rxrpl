@@ -16,17 +16,21 @@ const HASH_FALLBACK_THRESHOLD: u32 = 5;
 /// Consecutive zero-add rounds before a higher tip seq may preempt the active
 /// sync during normal tip-following (we already hold a base state).
 const TIP_PREEMPT_ZERO_ROUNDS: u32 = 8;
-/// Consecutive zero-add rounds before the LOCKED initial-catchup target is
-/// considered dead (its state has aged out of every peer) and may be replaced
-/// by a newer tip. Far higher than `TIP_PREEMPT_ZERO_ROUNDS` so a large state
-/// fetch is not reset mid-flight by the ~4s-moving mainnet tip.
-const CATCHUP_PREEMPT_ZERO_ROUNDS: u32 = 40;
-/// Consecutive zero-add rounds before an active sync is abandoned outright.
-/// Normal tip-following uses the lower bound; the locked initial-catchup target
-/// uses the higher one so preemption by a newer tip (above) stays the primary
-/// release path and removal is only a backstop when no newer tip arrives.
+/// Consecutive zero-add rounds before the initial-catchup target re-targets to a
+/// fresher tip. Peers keep a recent ledger fully in memory and serve its deep
+/// frontier in bulk, but stop serving an aged one's deep nodes -- so once the
+/// current target is DRAINED (a few rounds add nothing more), jumping forward to
+/// a ledger peers still serve in depth is what lets the deep state accumulate.
+/// Holding the target instead (the old `40`) plateaus: live mainnet stalled flat
+/// at ~442k nodes on a single held target for 6+ minutes. A low value re-targets
+/// when drained without thrashing, since any real progress resets the counter.
+const CATCHUP_PREEMPT_ZERO_ROUNDS: u32 = 6;
+/// Consecutive zero-add rounds before an active sync is abandoned outright. The
+/// catchup bound stays above `CATCHUP_PREEMPT_ZERO_ROUNDS` so re-targeting to a
+/// fresher tip is the primary path and removal is only a backstop when no fresher
+/// tip is available to adopt.
 const STUCK_REMOVE_ZERO_ROUNDS: u32 = 20;
-const CATCHUP_STUCK_REMOVE_ZERO_ROUNDS: u32 = 48;
+const CATCHUP_STUCK_REMOVE_ZERO_ROUNDS: u32 = 16;
 /// How long a requested node hash is considered in-flight before it may be
 /// requested again. Long enough to outlast a normal round-trip so duplicate
 /// requests are suppressed, short enough that a lost request is retried soon.
@@ -369,10 +373,13 @@ impl LedgerSyncer {
         // slot and silently starve every intermediate ledger, leaving holes
         // in `closed_ledgers`.
         //
-        // A HIGHER seq only replaces the active sync once that sync is stuck
-        // (zero-add rounds), to avoid thrashing during real progress.
-        // Initial state catchup = we have never completed a ledger yet. In that
-        // mode we lock onto a single target instead of chasing the moving tip.
+        // A HIGHER seq only replaces the active sync once that sync stops
+        // producing new nodes (zero-add rounds), to avoid thrashing during real
+        // progress. Initial state catchup (no ledger completed yet) re-targets
+        // aggressively once the current target is drained: a fresher ledger
+        // still serves the deep frontier the aged one no longer will, so the
+        // shared store deepens across successive fresh targets. The store is
+        // content-addressed and shared, so re-targeting never loses progress.
         let initial_catchup = self.synced_seqs.is_empty();
         if !self.incremental.contains_key(&seq) {
             if let Some(&active_seq) = self.incremental.keys().max() {
@@ -577,6 +584,12 @@ impl LedgerSyncer {
     /// fed into when the echoed seq no longer matches an active sync.
     pub fn active_incremental_seq(&self) -> Option<u32> {
         self.incremental.keys().max().copied()
+    }
+
+    /// True while no ledger has been fully synced yet (initial state catchup),
+    /// where the strategy re-targets to fresher tips rather than tip-following.
+    pub fn in_initial_catchup(&self) -> bool {
+        self.synced_seqs.is_empty()
     }
 
     /// Cumulative count of genuinely new nodes added to the shared store across
@@ -1009,33 +1022,37 @@ mod tests {
         run_large_state_delta_sync(true);
     }
 
-    /// During initial state catchup (nothing synced yet) a newer tip must NOT
-    /// preempt the locked target while it is below the catchup dead threshold,
-    /// even past the normal tip-following preemption point. This is the fix for
-    /// the moving mainnet tip resetting a large state fetch mid-flight.
+    /// During initial state catchup a newer tip must not re-target while the
+    /// current target is still producing nodes, but once it is DRAINED (a few
+    /// zero-add rounds) a fresher tip takes over -- the fresh ledger still serves
+    /// the deep frontier the aged one stopped serving, so the store deepens.
     #[test]
-    fn initial_catchup_locks_target_against_moving_tip() {
+    fn initial_catchup_retargets_to_fresh_tip_when_drained() {
         let store = Arc::new(rxrpl_shamap::InMemoryNodeStore::new());
         let mut syncer = LedgerSyncer::new();
         let missing = syncer.start_incremental_sync(100, Hash256::new([0x11; 32]), store.clone());
         assert!(!missing.is_empty());
 
-        // Pump zero-add rounds past the tip threshold (8) but below the catchup
-        // dead threshold (40).
-        for _ in 0..12 {
+        // A couple of zero-add rounds: still below the drain threshold -> hold.
+        for _ in 0..(CATCHUP_PREEMPT_ZERO_ROUNDS - 1) {
             let _ = syncer.feed_nodes(100, &[]);
         }
-
-        let preempt = syncer.start_incremental_sync(105, Hash256::new([0x22; 32]), store);
-        assert!(
-            preempt.is_empty(),
-            "newer tip must not preempt the locked catchup target"
-        );
-        assert!(
-            syncer.has_incremental_sync(100),
-            "catchup target #100 must stay active"
-        );
+        let held = syncer.start_incremental_sync(105, Hash256::new([0x22; 32]), store.clone());
+        assert!(held.is_empty(), "a productive target is not re-targeted");
+        assert!(syncer.has_incremental_sync(100));
         assert!(!syncer.has_incremental_sync(105));
+
+        // Drain it past the threshold -> a fresher tip re-targets forward.
+        for _ in 0..2 {
+            let _ = syncer.feed_nodes(100, &[]);
+        }
+        let retarget = syncer.start_incremental_sync(106, Hash256::new([0x33; 32]), store);
+        assert!(
+            !retarget.is_empty(),
+            "a drained target re-targets to the fresher tip"
+        );
+        assert!(syncer.has_incremental_sync(106));
+        assert!(!syncer.has_incremental_sync(100));
     }
 
     /// Once a base state is held (a ledger has synced) we return to responsive
