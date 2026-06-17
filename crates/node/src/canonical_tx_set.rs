@@ -117,9 +117,8 @@ mod tests {
         let ids = |v: &[(Hash256, Vec<u8>)]| v.iter().map(|(h, _)| *h).collect::<Vec<_>>();
         assert_eq!(ids(&first), ids(&second));
         // Account a's two txs stay in sequence order relative to each other.
-        let pos = |v: &[(Hash256, Vec<u8>)], id: Hash256| {
-            v.iter().position(|(h, _)| *h == id).unwrap()
-        };
+        let pos =
+            |v: &[(Hash256, Vec<u8>)], id: Hash256| v.iter().position(|(h, _)| *h == id).unwrap();
         assert!(pos(&first, txid(0x10)) < pos(&first, txid(0x30)));
     }
 
