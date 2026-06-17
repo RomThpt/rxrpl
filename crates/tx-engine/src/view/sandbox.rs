@@ -209,6 +209,42 @@ pub struct SandboxChanges {
 }
 
 impl SandboxChanges {
+    /// Stamp `PreviousTxnID` / `PreviousTxnLgrSeq` on every created or modified
+    /// entry that carries those fields.
+    ///
+    /// rippled records, on each touched SLE that has the `sfPreviousTxnID`
+    /// field, the id of the transaction that last modified it and the ledger it
+    /// was applied in. Handlers previously set this ad hoc (only Payment, and
+    /// only on freshly created accounts — with a zero id), so every other
+    /// modified entry diverged from rippled on these two fields. Doing it here,
+    /// centrally, covers all transaction types. We only touch entries that
+    /// already expose `PreviousTxnID` so field-less types (DirectoryNode,
+    /// LedgerHashes, Amendments, ...) are left untouched.
+    pub fn stamp_previous_txn(&mut self, tx_id_hex: &str, ledger_seq: u32) {
+        for data in self.inserts.values_mut().chain(self.updates.values_mut()) {
+            let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(data) else {
+                continue;
+            };
+            let Some(obj) = v.as_object_mut() else {
+                continue;
+            };
+            if !obj.contains_key("PreviousTxnID") {
+                continue;
+            }
+            obj.insert(
+                "PreviousTxnID".to_string(),
+                serde_json::Value::String(tx_id_hex.to_string()),
+            );
+            obj.insert(
+                "PreviousTxnLgrSeq".to_string(),
+                serde_json::Value::Number(ledger_seq.into()),
+            );
+            if let Ok(bytes) = serde_json::to_vec(&v) {
+                *data = bytes;
+            }
+        }
+    }
+
     /// Apply these changes to a ledger.
     ///
     /// JSON data from handlers is encoded to XRPL binary before storage

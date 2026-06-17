@@ -403,7 +403,7 @@ impl TxEngine {
         };
 
         // 8. Invariant checks
-        let changes = sandbox.into_changes();
+        let mut changes = sandbox.into_changes();
         let drops_after = drops_before.saturating_sub(changes.destroyed_drops);
 
         let tx_for_invariants = if is_pseudo { None } else { Some(tx) };
@@ -419,14 +419,19 @@ impl TxEngine {
 
         // 9. Commit to ledger
         if should_commit {
+            // Record the modifying transaction on every touched entry that
+            // carries PreviousTxnID, mirroring rippled, before metadata/commit.
+            let tx_hash = rxrpl_protocol::tx::compute_tx_hash(tx)
+                .map_err(|e| TxEngineError::Codec(e.to_string()))?;
+            changes.stamp_previous_txn(
+                &hex::encode_upper(tx_hash.as_bytes()),
+                ledger.header.sequence,
+            );
+
             // Build metadata before consuming changes
             let meta = changes.build_metadata(0, result.code());
 
             changes.apply_to_ledger(ledger)?;
-
-            // Record transaction + metadata in tx_map
-            let tx_hash = rxrpl_protocol::tx::compute_tx_hash(tx)
-                .map_err(|e| TxEngineError::Codec(e.to_string()))?;
             let tx_record = serde_json::json!({
                 "tx_json": tx,
                 "result": result.as_str(),
