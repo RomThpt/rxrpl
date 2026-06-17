@@ -9,6 +9,7 @@ pub mod error;
 pub mod local_manifest_store;
 pub mod node;
 pub mod pending_validations;
+pub mod play_forward;
 pub mod pruner;
 pub mod reporting;
 pub mod shutdown;
