@@ -293,8 +293,17 @@ impl Ledger {
         use rxrpl_protocol::keylet;
         let key = keylet::skip();
 
-        // Read existing SLE if any → extract current hashes
+        // Read existing SLE if any → extract current hashes. Also carry forward
+        // FirstLedgerSequence: it is a DEPRECATED field that only exists on the
+        // recent-hashes object of chains old enough to predate an early rippled
+        // bug (Mainnet holds the value 2, propagated on every update). Freshly
+        // started networks never have it. We therefore preserve it iff it is
+        // already present, instead of synthesising it — adding it
+        // unconditionally diverges from a fresh-network rippled (caught by the
+        // hive consensus suite); dropping it diverges from a Mainnet-bootstrapped
+        // ledger whose downloaded SLE carries it.
         let mut hashes: Vec<String> = Vec::with_capacity(256);
+        let mut first_ledger_seq: Option<u64> = None;
         if let Some(existing) = self.state_map.get(&key) {
             if let Ok(value) = crate::sle_codec::decode_state(existing) {
                 if let Some(arr) = value.get("Hashes").and_then(|v| v.as_array()) {
@@ -304,6 +313,7 @@ impl Ledger {
                         }
                     }
                 }
+                first_ledger_seq = value.get("FirstLedgerSequence").and_then(|v| v.as_u64());
             }
         }
         // Cap at 256: drop oldest if at capacity, then append parent.
@@ -321,12 +331,15 @@ impl Ledger {
         hashes.push(parent_hex);
 
         let last_ledger_seq = self.header.sequence - 1;
-        let sle = serde_json::json!({
+        let mut sle = serde_json::json!({
             "LedgerEntryType": "LedgerHashes",
             "Flags": 0,
             "Hashes": hashes,
             "LastLedgerSequence": last_ledger_seq,
         });
+        if let Some(first) = first_ledger_seq {
+            sle["FirstLedgerSequence"] = serde_json::json!(first);
+        }
         let json_bytes = serde_json::to_vec(&sle)
             .map_err(|e| LedgerError::Codec(format!("encode skip SLE json: {e}")))?;
         let data = crate::sle_codec::encode_sle(&json_bytes)
