@@ -142,21 +142,41 @@ pub fn replay_forward(
     ledger.header.close_time_resolution = header.close_time_resolution;
 
     let rules = Rules::new();
+
+    // Decode once, in canonical order. Anything that fails to decode is dropped.
+    let total = txs.len();
+    let mut pending: Vec<Value> = canonical_order(set_hash, txs)
+        .into_iter()
+        .filter_map(|(_id, blob)| rxrpl_codec::binary::decode(&blob).ok())
+        .collect();
+
+    // rippled applies the set over multiple passes: each pass applies the
+    // still-pending transactions in canonical order, deferring any that return
+    // a retriable (`ter`) result to the next pass. The loop ends when a pass
+    // resolves nothing more, so a transaction whose precondition is satisfied
+    // only by a later-canonical transaction still applies. Without this, a
+    // single pass would drop such transactions and diverge from the chain.
     let mut applied = 0usize;
-    let mut failed = 0usize;
-    for (_txid, blob) in canonical_order(set_hash, txs) {
-        let json = match rxrpl_codec::binary::decode(&blob) {
-            Ok(v) => v,
-            Err(_) => {
-                failed += 1;
-                continue;
+    loop {
+        let before = pending.len();
+        let mut deferred = Vec::new();
+        for json in std::mem::take(&mut pending) {
+            match tx_engine.apply(&json, &mut ledger, &rules, fees) {
+                Ok(result) if result.is_retryable() => deferred.push(json),
+                Ok(result) => {
+                    if result.is_claimed() {
+                        applied += 1;
+                    }
+                }
+                Err(_) => {}
             }
-        };
-        match tx_engine.apply(&json, &mut ledger, &rules, fees) {
-            Ok(result) if result.is_success() => applied += 1,
-            _ => failed += 1,
+        }
+        pending = deferred;
+        if pending.is_empty() || pending.len() == before {
+            break;
         }
     }
+    let failed = total - applied;
 
     ledger
         .close(header.close_time, header.close_flags)
@@ -315,5 +335,122 @@ mod tests {
         assert_eq!(header.close_time_resolution, 10);
         assert_eq!(header.account_hash, Hash256::new([0x33; 32]));
         assert_eq!(header.hash, Hash256::new([0x44; 32]));
+    }
+
+    /// Live fidelity check: our canonical ordering must reproduce rippled's
+    /// real apply order (`metaData.TransactionIndex`) on a mainnet ledger.
+    ///
+    /// Ignored — it needs network access to a full-history rippled. Run with:
+    /// `RXRPL_PLAY_FORWARD_RPC=http://host:5005 cargo test -p rxrpl-node \
+    ///  --lib canonical_order_matches_mainnet_apply_order -- --ignored --nocapture`
+    #[test]
+    #[ignore = "hits a live mainnet RPC server"]
+    fn canonical_order_matches_mainnet_apply_order() {
+        let Ok(url) = std::env::var("RXRPL_PLAY_FORWARD_RPC") else {
+            eprintln!("RXRPL_PLAY_FORWARD_RPC unset; skipping live check");
+            return;
+        };
+        let ledger_index: u64 = std::env::var("RXRPL_PLAY_FORWARD_LEDGER")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(104983000);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let resp: Value = rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .unwrap();
+            client
+                .post(&url)
+                .json(&serde_json::json!({
+                    "method": "ledger",
+                    "params": [{
+                        "ledger_index": ledger_index,
+                        "transactions": true,
+                        "expand": true,
+                        "binary": false,
+                    }]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap()
+        });
+
+        let entries = resp["result"]["ledger"]["transactions"]
+            .as_array()
+            .expect("transactions array");
+        assert!(!entries.is_empty(), "ledger has no transactions");
+
+        let mut set: TxSet = Vec::new();
+        let mut expected: Vec<(u64, Hash256)> = Vec::new();
+        for t in entries {
+            let account = t["Account"].as_str().expect("Account");
+            let sequence = t["Sequence"].as_u64().unwrap_or(0);
+            let txid_bytes: [u8; 32] = hex::decode(t["hash"].as_str().expect("hash"))
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let txid = Hash256::new(txid_bytes);
+            let apply_index = t["metaData"]["TransactionIndex"]
+                .as_u64()
+                .expect("TransactionIndex");
+            let blob = rxrpl_codec::binary::encode(&serde_json::json!({
+                "Account": account,
+                "Sequence": sequence,
+            }))
+            .unwrap();
+            set.push((txid, blob));
+            expected.push((apply_index, txid));
+        }
+
+        let ids: Vec<Hash256> = set.iter().map(|(id, _)| *id).collect();
+        let set_hash = rxrpl_shamap::transaction_set_root(&ids);
+        let parent_hash = parse_header(&resp["result"]["ledger"])
+            .map(|h| h.parent_hash)
+            .unwrap_or(Hash256::ZERO);
+        let ledger_hash = parse_header(&resp["result"]["ledger"])
+            .map(|h| h.hash)
+            .unwrap_or(Hash256::ZERO);
+
+        expected.sort_by_key(|(idx, _)| *idx);
+        let want: Vec<Hash256> = expected.into_iter().map(|(_, id)| id).collect();
+
+        // rippled's final order is a concatenation of retry passes, each
+        // strictly increasing in OUR canonical index. The correct salt
+        // minimises the number of such runs; a wrong salt scrambles the
+        // inter-account order into near-random descents. The set hash must
+        // beat every other candidate, proving it is rippled's salt.
+        let runs = |salt: Hash256| -> usize {
+            let got: Vec<Hash256> = canonical_order(salt, set.clone())
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            let idx: std::collections::HashMap<Hash256, usize> =
+                got.iter().enumerate().map(|(i, h)| (*h, i)).collect();
+            let s: Vec<usize> = want.iter().map(|h| idx[h]).collect();
+            s.windows(2).filter(|w| w[1] <= w[0]).count() + 1
+        };
+        let set_runs = runs(set_hash);
+        eprintln!(
+            "ledger #{ledger_index}: {} txs | runs: set_hash={set_runs} zero={} parent={} ledger={}",
+            want.len(),
+            runs(Hash256::ZERO),
+            runs(parent_hash),
+            runs(ledger_hash),
+        );
+        assert!(
+            set_runs < runs(Hash256::ZERO)
+                && set_runs < runs(parent_hash)
+                && set_runs < runs(ledger_hash),
+            "set hash must be the best canonical-ordering salt"
+        );
+        assert!(
+            set_runs <= want.len() / 4 + 2,
+            "too many retry passes ({set_runs}); canonical sort likely wrong"
+        );
     }
 }
