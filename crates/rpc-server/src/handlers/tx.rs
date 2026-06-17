@@ -45,7 +45,7 @@ pub async fn tx(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcSer
     if let Some(ref ledger) = ctx.ledger {
         let ledger = ledger.read().await;
         if let Some(data) = ledger.tx_map.get(&hash) {
-            let record: Value = serde_json::from_slice(data)
+            let record: Value = rxrpl_codec::binary::decode_tx_record(data)
                 .map_err(|e| RpcServerError::Internal(format!("failed to deserialize tx: {e}")))?;
             return Ok(record);
         }
@@ -56,7 +56,7 @@ pub async fn tx(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcSer
         let closed = closed.read().await;
         for ledger in closed.iter().rev() {
             if let Some(data) = ledger.tx_map.get(&hash) {
-                let record: Value = serde_json::from_slice(data).map_err(|e| {
+                let record: Value = rxrpl_codec::binary::decode_tx_record(data).map_err(|e| {
                     RpcServerError::Internal(format!("failed to deserialize tx: {e}"))
                 })?;
                 return Ok(record);

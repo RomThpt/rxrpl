@@ -22,6 +22,43 @@ pub fn decode(bytes: &[u8]) -> Result<Value, CodecError> {
     p.parse_object()
 }
 
+/// Prefix `bytes` with their XRPL variable-length encoding. Used to build the
+/// transaction+metadata SHAMap leaf, whose content is `VL(tx) || VL(meta)`.
+pub fn encode_vl(bytes: &[u8]) -> Vec<u8> {
+    let len = bytes.len();
+    let mut out = Vec::with_capacity(len + 3);
+    if len <= 192 {
+        out.push(len as u8);
+    } else if len <= 12480 {
+        let a = len - 193;
+        out.push((a >> 8) as u8 + 193);
+        out.push((a & 0xFF) as u8);
+    } else {
+        let a = len - 12481;
+        out.push(241 + (a >> 16) as u8);
+        out.push(((a >> 8) & 0xFF) as u8);
+        out.push((a & 0xFF) as u8);
+    }
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// Split a transaction+metadata SHAMap leaf (`VL(tx) || VL(meta)`) back into the
+/// decoded transaction and metadata JSON values.
+pub fn decode_tx_leaf(data: &[u8]) -> Result<(Value, Value), CodecError> {
+    let mut p = parser::BinaryParser::new(data);
+    let tx_bytes = p.read_vl_blob()?;
+    let meta_bytes = p.read_vl_blob()?;
+    Ok((decode(&tx_bytes)?, decode(&meta_bytes)?))
+}
+
+/// Decode a transaction SHAMap leaf into the `{tx_json, meta}` record shape
+/// consumed by the RPC handlers and event emitters.
+pub fn decode_tx_record(data: &[u8]) -> Result<Value, CodecError> {
+    let (tx, meta) = decode_tx_leaf(data)?;
+    Ok(serde_json::json!({ "tx_json": tx, "meta": meta }))
+}
+
 /// Encode for signing: prepend STX prefix, skip non-signing fields.
 pub fn encode_for_signing(json: &Value) -> Result<Vec<u8>, CodecError> {
     let prefix = HashPrefix::TX_SIGN.to_bytes();

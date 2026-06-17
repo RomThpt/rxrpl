@@ -34,7 +34,7 @@ pub async fn transaction_entry(
         RpcServerError::InvalidParams("transaction not found in specified ledger".into())
     })?;
 
-    let record: Value = serde_json::from_slice(data)
+    let record: Value = rxrpl_codec::binary::decode_tx_record(data)
         .map_err(|e| RpcServerError::Internal(format!("failed to deserialize tx: {e}")))?;
 
     // If the stored data contains tx_json and metadata separately

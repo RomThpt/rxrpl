@@ -487,7 +487,7 @@ impl Node {
                 let mut has_offer_changes = false;
                 closed.tx_map.for_each(&mut |_tx_hash, data| {
                     tx_count += 1;
-                    if let Ok(record) = serde_json::from_slice::<Value>(data) {
+                    if let Ok(record) = rxrpl_codec::binary::decode_tx_record(data) {
                         let tx_json = record.get("tx_json").cloned().unwrap_or_default();
 
                         // Check for order book changes
@@ -2897,7 +2897,7 @@ impl Node {
         let mut has_offer_changes = false;
         closed.tx_map.for_each(&mut |_tx_hash, data| {
             tx_count += 1;
-            if let Ok(record) = serde_json::from_slice::<Value>(data) {
+            if let Ok(record) = rxrpl_codec::binary::decode_tx_record(data) {
                 let tx_json = record.get("tx_json").cloned().unwrap_or_default();
 
                 // Check for order book changes
@@ -3499,10 +3499,11 @@ impl Node {
     fn collect_consensus_tx_set(ledger: &Ledger) -> TxSet {
         let mut items: Vec<(Hash256, Vec<u8>)> = Vec::new();
         ledger.tx_map.for_each(&mut |tx_hash, data| {
-            let blob = serde_json::from_slice::<Value>(data)
+            // tx_map leaves are `VL(tx) || VL(meta)`; the consensus set needs the
+            // canonical no-metadata transaction blob.
+            let blob = rxrpl_codec::binary::decode_tx_leaf(data)
                 .ok()
-                .and_then(|rec| rec.get("tx_json").cloned())
-                .and_then(|tx_json| rxrpl_codec::binary::encode(&tx_json).ok())
+                .and_then(|(tx_json, _meta)| rxrpl_codec::binary::encode(&tx_json).ok())
                 .unwrap_or_default();
             if blob.is_empty() {
                 tracing::warn!("consensus tx-set: no canonical blob for tx {}", tx_hash);
@@ -3579,17 +3580,23 @@ impl Node {
         let mut tx_index = 0u32;
 
         ledger.tx_map.for_each(&mut |tx_hash, data| {
-            // Parse tx record to extract Account
-            if let Ok(record) = serde_json::from_slice::<Value>(data) {
-                let tx_blob = data;
+            // tx_map leaves are `VL(tx) || VL(meta)`; the store keeps the tx and
+            // metadata as JSON for the RPC handlers to render.
+            if let Ok(record) = rxrpl_codec::binary::decode_tx_record(data) {
+                let tx_blob = serde_json::to_vec(record.get("tx_json").unwrap_or(&Value::Null))
+                    .unwrap_or_default();
 
                 // Extract metadata as bytes (reuse the full record)
                 let meta_blob = serde_json::to_vec(&record.get("meta").unwrap_or(&Value::Null))
                     .unwrap_or_default();
 
-                if let Err(e) =
-                    store.insert_transaction(tx_hash.as_bytes(), seq, tx_index, tx_blob, &meta_blob)
-                {
+                if let Err(e) = store.insert_transaction(
+                    tx_hash.as_bytes(),
+                    seq,
+                    tx_index,
+                    &tx_blob,
+                    &meta_blob,
+                ) {
                     tracing::error!("failed to index tx {}: {}", tx_hash, e);
                 }
 
