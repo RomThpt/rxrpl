@@ -539,7 +539,7 @@ mod tests {
         let fees = parent
             .state_map
             .get(&rxrpl_protocol::keylet::fee_settings())
-            .and_then(|b| rxrpl_codec::binary::decode(&b).ok())
+            .and_then(|b| rxrpl_codec::binary::decode(b).ok())
             .map(|fs| FeeSettings {
                 base_fee: fs
                     .get("BaseFee")
