@@ -7,6 +7,18 @@ use crate::helpers;
 use crate::owner_dir::add_to_owner_dir;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
+// RippleState (trust line) flags.
+const LSF_LOW_RESERVE: u32 = 0x0001_0000;
+const LSF_HIGH_RESERVE: u32 = 0x0002_0000;
+const LSF_LOW_NO_RIPPLE: u32 = 0x0010_0000;
+const LSF_HIGH_NO_RIPPLE: u32 = 0x0020_0000;
+const LSF_LOW_FREEZE: u32 = 0x0040_0000;
+const LSF_HIGH_FREEZE: u32 = 0x0080_0000;
+// AccountRoot flag.
+const LSF_DEFAULT_RIPPLE: u32 = 0x0080_0000;
+// Quality value that rippled treats as "unset" (1.0).
+const QUALITY_ONE: u32 = 1_000_000_000;
+
 /// TrustSet transaction handler.
 ///
 /// Creates or modifies a trust line between two accounts.
@@ -174,49 +186,134 @@ impl Transactor for TrustSetTransactor {
                 }
             }
 
-            let new_bytes =
-                serde_json::to_vec(&obj).map_err(|_| TransactionResult::TemMalformed)?;
-            ctx.view
-                .update(tl_key, new_bytes)
-                .map_err(|_| TransactionResult::TemMalformed)?;
+            // Reserve accounting (rippled SetTrust::doApply): a side counts
+            // toward its account's owner reserve when its trust line is not in
+            // the default state — non-zero limit, balance owed to it, quality
+            // set, freeze, or a noRipple flag that disagrees with the account's
+            // DefaultRipple. Flipping that state sets/clears lsfLow/HighReserve
+            // and adjusts the owning account's OwnerCount.
+            let amt = |o: &Value, field: &str| -> f64 {
+                o.get(field)
+                    .and_then(|a| a.get("value"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0)
+            };
+            let qual = |o: &Value, field: &str| -> u32 {
+                let q = o.get(field).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                if q == QUALITY_ONE { 0 } else { q }
+            };
+            let low_id = if is_low { account_id } else { issuer_id };
+            let high_id = if is_low { issuer_id } else { account_id };
+            let low_key = keylet::account(&low_id);
+            let high_key = keylet::account(&high_id);
+            let mut low_acct = ctx
+                .view
+                .read(&low_key)
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+            let mut high_acct = ctx
+                .view
+                .read(&high_key)
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+            let def_ripple = |a: &Option<Value>| -> bool {
+                a.as_ref()
+                    .map(|a| {
+                        (a.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) as u32
+                            & LSF_DEFAULT_RIPPLE)
+                            != 0
+                    })
+                    .unwrap_or(false)
+            };
+            let flags_in = obj.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let low_balance = amt(&obj, "Balance");
+            let low_reserve_set = qual(&obj, "LowQualityIn") != 0
+                || qual(&obj, "LowQualityOut") != 0
+                || ((flags_in & LSF_LOW_NO_RIPPLE) == 0) != def_ripple(&low_acct)
+                || (flags_in & LSF_LOW_FREEZE) != 0
+                || amt(&obj, "LowLimit") != 0.0
+                || low_balance > 0.0;
+            let high_reserve_set = qual(&obj, "HighQualityIn") != 0
+                || qual(&obj, "HighQualityOut") != 0
+                || ((flags_in & LSF_HIGH_NO_RIPPLE) == 0) != def_ripple(&high_acct)
+                || (flags_in & LSF_HIGH_FREEZE) != 0
+                || amt(&obj, "HighLimit") != 0.0
+                || (-low_balance) > 0.0;
 
-            // Auto-clear: if both limits and the balance are zero after this
-            // update, delete the trust line — matches rippled's
-            // `removeEmptyTrustLine` and is required by the
-            // `NoZeroBalanceEntries` invariant.
-            let lo: f64 = obj
-                .get("LowLimit")
-                .and_then(|o| o.get("value"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0.0);
-            let hi: f64 = obj
-                .get("HighLimit")
-                .and_then(|o| o.get("value"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0.0);
-            let bal: f64 = obj
-                .get("Balance")
-                .and_then(|b| b.get("value"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0.0);
-            if lo == 0.0 && hi == 0.0 && bal == 0.0 {
-                crate::owner_dir::remove_from_owner_dir(ctx.view, &account_id, &tl_key)?;
-                crate::owner_dir::remove_from_owner_dir(ctx.view, &issuer_id, &tl_key)?;
+            // Only accounts actually mutated here are written back (and thus
+            // get their PreviousTxnID restamped) — rippled leaves the
+            // counterparty untouched when its reserve state does not change.
+            let mut low_dirty = false;
+            let mut high_dirty = false;
+            let mut flags_out = flags_in;
+            if low_reserve_set && (flags_in & LSF_LOW_RESERVE) == 0 {
+                flags_out |= LSF_LOW_RESERVE;
+                if let Some(a) = low_acct.as_mut() {
+                    helpers::adjust_owner_count(a, 1);
+                    low_dirty = true;
+                }
+            } else if !low_reserve_set && (flags_in & LSF_LOW_RESERVE) != 0 {
+                flags_out &= !LSF_LOW_RESERVE;
+                if let Some(a) = low_acct.as_mut() {
+                    helpers::adjust_owner_count(a, -1);
+                    low_dirty = true;
+                }
+            }
+            if high_reserve_set && (flags_in & LSF_HIGH_RESERVE) == 0 {
+                flags_out |= LSF_HIGH_RESERVE;
+                if let Some(a) = high_acct.as_mut() {
+                    helpers::adjust_owner_count(a, 1);
+                    high_dirty = true;
+                }
+            } else if !high_reserve_set && (flags_in & LSF_HIGH_RESERVE) != 0 {
+                flags_out &= !LSF_HIGH_RESERVE;
+                if let Some(a) = high_acct.as_mut() {
+                    helpers::adjust_owner_count(a, -1);
+                    high_dirty = true;
+                }
+            }
+            obj["Flags"] = serde_json::json!(flags_out);
+
+            // Bump the sender's sequence (rippled consumes the seq proxy for
+            // every TrustSet, including modifications of an existing line).
+            {
+                let sender_acct = if is_low {
+                    low_acct.as_mut()
+                } else {
+                    high_acct.as_mut()
+                };
+                if let Some(a) = sender_acct {
+                    crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, a, ctx.tx)?;
+                }
+            }
+            if is_low {
+                low_dirty = true;
+            } else {
+                high_dirty = true;
+            }
+
+            // rippled deletes a trust line that ends in the default state with a
+            // zero balance (removeEmptyTrustLine); otherwise it persists.
+            let b_default = !low_reserve_set && !high_reserve_set;
+            if b_default && low_balance == 0.0 {
+                crate::owner_dir::remove_from_owner_dir(ctx.view, &low_id, &tl_key)?;
+                crate::owner_dir::remove_from_owner_dir(ctx.view, &high_id, &tl_key)?;
                 let _ = ctx.view.erase(&tl_key);
-                for endpoint in [&account_id, &issuer_id].iter() {
-                    let acct_key = keylet::account(endpoint);
-                    if let Some(b) = ctx.view.read(&acct_key) {
-                        if let Ok(mut acct) = serde_json::from_slice::<Value>(&b) {
-                            helpers::adjust_owner_count(&mut acct, -1);
-                            if let Ok(nb) = serde_json::to_vec(&acct) {
-                                let _ = ctx.view.update(acct_key, nb);
-                            }
+            } else {
+                let new_bytes =
+                    serde_json::to_vec(&obj).map_err(|_| TransactionResult::TemMalformed)?;
+                ctx.view
+                    .update(tl_key, new_bytes)
+                    .map_err(|_| TransactionResult::TemMalformed)?;
+            }
+
+            for (key, acct, dirty) in [
+                (low_key, low_acct, low_dirty),
+                (high_key, high_acct, high_dirty),
+            ] {
+                if dirty {
+                    if let Some(a) = acct {
+                        if let Ok(nb) = serde_json::to_vec(&a) {
+                            let _ = ctx.view.update(key, nb);
                         }
                     }
                 }
