@@ -93,6 +93,22 @@ impl Transactor for OfferCreateTransactor {
         let (pays_currency, pays_issuer) = currency_and_issuer(&ctx.tx["TakerPays"]);
         let (gets_currency, gets_issuer) = currency_and_issuer(&ctx.tx["TakerGets"]);
 
+        // Consume the sequence up front: rippled charges it (and the fee) even
+        // when the transaction ends in a tec claim below.
+        crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, &mut acct, ctx.tx)?;
+
+        // Owner reserve: a resting offer needs reserve for one more owned
+        // object. rippled returns tecINSUF_RESERVE_OFFER — fee and sequence
+        // charged, no offer placed — when the account cannot afford it.
+        let owner_count = acct.get("OwnerCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        if helpers::get_balance(&acct) < ctx.fees.account_reserve(owner_count + 1) {
+            let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
+            ctx.view
+                .update(acct_key, nb)
+                .map_err(|_| TransactionResult::TemMalformed)?;
+            return Ok(TransactionResult::TecInsufReserveOffer);
+        }
+
         // Sweep unfunded crossing offers from the inverse book. Matching the
         // taker side of this new offer means existing offers where someone
         // pays our `TakerGets` to receive our `TakerPays` — i.e. the book
@@ -130,9 +146,7 @@ impl Transactor for OfferCreateTransactor {
             keylet::book_dir(&pays_currency, &pays_issuer, &gets_currency, &gets_issuer);
         add_to_dir(ctx.view, &book_root, &offer_key)?;
 
-        // Update account: consume the sequence (or ticket) and bump owner count
-        // for the new offer.
-        crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, &mut acct, ctx.tx)?;
+        // Bump owner count for the new resting offer (sequence already consumed).
         helpers::adjust_owner_count(&mut acct, 1);
 
         let new_bytes = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;

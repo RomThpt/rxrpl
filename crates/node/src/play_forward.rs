@@ -534,6 +534,35 @@ mod tests {
         let mut parent = Ledger::from_catchup(parent_seq, parent_header.hash, state);
         parent.header = parent_header;
 
+        // Read the ledger's real FeeSettings (reserves differ per era) instead
+        // of defaults, so reserve checks reproduce the chain.
+        let fees = parent
+            .state_map
+            .get(&rxrpl_protocol::keylet::fee_settings())
+            .and_then(|b| rxrpl_codec::binary::decode(&b).ok())
+            .map(|fs| FeeSettings {
+                base_fee: fs
+                    .get("BaseFee")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| u64::from_str_radix(s, 16).ok())
+                    .unwrap_or(10),
+                reserve_base: fs
+                    .get("ReserveBase")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(10_000_000),
+                reserve_increment: fs
+                    .get("ReserveIncrement")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(50_000_000),
+            })
+            // Early ledgers predate the FeeSettings SLE; reserves were protocol
+            // constants (200 XRP base, 50 XRP per owner) at that era.
+            .unwrap_or(FeeSettings {
+                base_fee: 10,
+                reserve_base: 200_000_000,
+                reserve_increment: 50_000_000,
+            });
+
         // 2. Successor header (binary:false → JSON fields) and transaction set
         //    (binary:true → tx_blobs). The header is a binary blob under
         //    `ledger_data` when binary:true, so the two need separate calls.
@@ -549,15 +578,8 @@ mod tests {
         let (set_hash, txs) = parse_tx_set(&next_txs_resp["result"]).expect("tx set");
 
         // 3. Play forward and verify against the validated header.
-        let outcome = replay_forward(
-            &parent,
-            set_hash,
-            txs,
-            &next_header,
-            &full_engine(),
-            &FeeSettings::default(),
-        )
-        .expect("replay");
+        let outcome = replay_forward(&parent, set_hash, txs, &next_header, &full_engine(), &fees)
+            .expect("replay");
 
         eprintln!(
             "ledger #{next}: applied {}/{} | account_hash={} tx_hash={} drops={} ledger_hash={}",
