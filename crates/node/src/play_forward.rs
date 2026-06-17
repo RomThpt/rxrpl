@@ -10,12 +10,94 @@
 //! ledger hash byte-for-byte.
 
 use rxrpl_amendment::Rules;
+use rxrpl_crypto::hash_prefix::HashPrefix;
+use rxrpl_crypto::sha512_half::sha512_half;
 use rxrpl_ledger::{Ledger, LedgerHeader};
 use rxrpl_primitives::Hash256;
 use rxrpl_tx_engine::{FeeSettings, TxEngine};
+use serde_json::Value;
 
 use crate::canonical_tx_set::canonical_order;
 use crate::error::NodeError;
+
+/// A transaction set as `(txid, canonical_blob)` pairs.
+pub type TxSet = Vec<(Hash256, Vec<u8>)>;
+
+/// Compute the transaction id of a canonical (no-metadata) transaction blob:
+/// `SHA512Half(TXN\0 || blob)`. This equals the leaf hash a transaction takes
+/// in the consensus set SHAMap, so the set of these ids reconstructs the salt.
+pub fn transaction_id(blob: &[u8]) -> Hash256 {
+    sha512_half(&[&HashPrefix::TRANSACTION_ID.to_bytes(), blob])
+}
+
+/// Parse a `result.ledger` JSON object (from a `ledger` RPC call) into a
+/// `LedgerHeader`. Numeric fields may arrive as JSON numbers or strings
+/// depending on the server; both are accepted.
+pub fn parse_header(l: &Value) -> Result<LedgerHeader, NodeError> {
+    let hash32 = |v: Option<&Value>, what: &str| -> Result<Hash256, NodeError> {
+        let s = v
+            .and_then(Value::as_str)
+            .ok_or_else(|| NodeError::Server(format!("missing {what}")))?;
+        let b = hex::decode(s).map_err(|e| NodeError::Server(format!("bad {what} hex: {e}")))?;
+        let arr: [u8; 32] = b
+            .as_slice()
+            .try_into()
+            .map_err(|_| NodeError::Server(format!("{what} not 32 bytes")))?;
+        Ok(Hash256::new(arr))
+    };
+    let num = |v: Option<&Value>| -> u64 {
+        v.and_then(|x| {
+            x.as_u64()
+                .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(0)
+    };
+
+    let mut header = LedgerHeader::new();
+    header.sequence = num(l.get("ledger_index")) as u32;
+    header.drops = num(l.get("total_coins"));
+    header.parent_hash = hash32(l.get("parent_hash"), "parent_hash")?;
+    header.tx_hash = hash32(l.get("transaction_hash"), "transaction_hash")?;
+    header.account_hash = hash32(l.get("account_hash"), "account_hash")?;
+    header.parent_close_time = num(l.get("parent_close_time")) as u32;
+    header.close_time = num(l.get("close_time")) as u32;
+    header.close_time_resolution = num(l.get("close_time_resolution")) as u8;
+    header.close_flags = num(l.get("close_flags")) as u8;
+    header.hash = hash32(l.get("ledger_hash"), "ledger_hash")?;
+    Ok(header)
+}
+
+/// Parse the `result` of a `ledger` RPC call made with
+/// `transactions: true, expand: true, binary: true` into the consensus set
+/// hash (the canonical-ordering salt) and the `(txid, tx_blob)` pairs to
+/// replay. The blobs are the signed transactions without metadata, exactly
+/// what `replay_forward` re-applies.
+pub fn parse_tx_set(result: &Value) -> Result<(Hash256, TxSet), NodeError> {
+    let entries = result
+        .get("ledger")
+        .and_then(|l| l.get("transactions"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| NodeError::Server("missing ledger.transactions in response".into()))?;
+
+    let mut txs = Vec::with_capacity(entries.len());
+    for entry in entries {
+        // Binary+expand entries are `{tx_blob, meta}`; a bare hex string can
+        // also appear when a server inlines the blob directly.
+        let blob_hex = entry
+            .get("tx_blob")
+            .or(Some(entry))
+            .and_then(Value::as_str)
+            .ok_or_else(|| NodeError::Server("transaction entry missing tx_blob".into()))?;
+        let blob = hex::decode(blob_hex)
+            .map_err(|e| NodeError::Server(format!("bad tx_blob hex: {e}")))?;
+        let txid = transaction_id(&blob);
+        txs.push((txid, blob));
+    }
+
+    let ids: Vec<Hash256> = txs.iter().map(|(id, _)| *id).collect();
+    let set_hash = rxrpl_shamap::transaction_set_root(&ids);
+    Ok((set_hash, txs))
+}
 
 /// Result of replaying a transaction set forward onto a parent ledger.
 pub struct ReplayOutcome {
@@ -49,7 +131,7 @@ impl ReplayOutcome {
 pub fn replay_forward(
     parent: &Ledger,
     set_hash: Hash256,
-    txs: Vec<(Hash256, Vec<u8>)>,
+    txs: TxSet,
     header: &LedgerHeader,
     tx_engine: &TxEngine,
     fees: &FeeSettings,
@@ -179,5 +261,59 @@ mod tests {
         let b = replay_forward(&parent, salt, txs, &blank, &engine, &fees).unwrap();
         assert_eq!(a.ledger.header.hash, b.ledger.header.hash);
         assert_eq!(a.ledger.header.account_hash, b.ledger.header.account_hash);
+    }
+
+    #[test]
+    fn parse_tx_set_extracts_blobs_and_salt() {
+        let built = [
+            payment(1, AccountId([0xaa; 20]), 1_000_000_000),
+            payment(2, AccountId([0xbb; 20]), 2_000_000_000),
+        ];
+        let result = serde_json::json!({
+            "ledger": {
+                "transactions": built
+                    .iter()
+                    .map(|(_, blob)| serde_json::json!({
+                        "tx_blob": hex::encode_upper(blob),
+                        "meta": "",
+                    }))
+                    .collect::<Vec<_>>(),
+            }
+        });
+
+        let (set_hash, txs) = parse_tx_set(&result).expect("parse");
+        assert_eq!(txs.len(), 2);
+        // Recovered blobs match the originals, and ids are the canonical txid.
+        for ((got_id, got_blob), (_, blob)) in txs.iter().zip(built.iter()) {
+            assert_eq!(got_blob, blob);
+            assert_eq!(*got_id, transaction_id(blob));
+        }
+        let ids: Vec<Hash256> = txs.iter().map(|(id, _)| *id).collect();
+        assert_eq!(set_hash, rxrpl_shamap::transaction_set_root(&ids));
+        assert!(!set_hash.is_zero());
+    }
+
+    #[test]
+    fn parse_header_reads_numbers_and_strings() {
+        let h32 = |b: u8| hex::encode_upper([b; 32]);
+        let l = serde_json::json!({
+            "ledger_index": 104972441u64,        // number
+            "total_coins": "99988765432100000",  // string
+            "parent_hash": h32(0x11),
+            "transaction_hash": h32(0x22),
+            "account_hash": h32(0x33),
+            "parent_close_time": 781234560u64,
+            "close_time": "781234563",
+            "close_time_resolution": 10u64,
+            "close_flags": 0u64,
+            "ledger_hash": h32(0x44),
+        });
+        let header = parse_header(&l).expect("parse header");
+        assert_eq!(header.sequence, 104972441);
+        assert_eq!(header.drops, 99988765432100000);
+        assert_eq!(header.close_time, 781234563);
+        assert_eq!(header.close_time_resolution, 10);
+        assert_eq!(header.account_hash, Hash256::new([0x33; 32]));
+        assert_eq!(header.hash, Hash256::new([0x44; 32]));
     }
 }
