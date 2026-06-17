@@ -64,6 +64,12 @@ impl<'a> BinaryParser<'a> {
         }
     }
 
+    /// Read a variable-length-prefixed blob (length header + that many bytes).
+    pub fn read_vl_blob(&mut self) -> Result<Vec<u8>, CodecError> {
+        let len = self.read_vl_length()?;
+        Ok(self.read_bytes(len)?.to_vec())
+    }
+
     /// Parse a complete XRPL binary object into JSON.
     pub fn parse_object(&mut self) -> Result<Value, CodecError> {
         let mut map = Map::new();

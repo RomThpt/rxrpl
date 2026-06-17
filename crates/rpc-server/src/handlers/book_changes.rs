@@ -21,7 +21,7 @@ pub async fn book_changes(
     let mut books_seen: BTreeMap<String, Vec<Value>> = BTreeMap::new();
 
     for (hash, data) in ledger.tx_map.iter() {
-        let record: Value = match serde_json::from_slice(&data) {
+        let record: Value = match rxrpl_codec::binary::decode_tx_record(&data) {
             Ok(v) => v,
             Err(_) => continue,
         };

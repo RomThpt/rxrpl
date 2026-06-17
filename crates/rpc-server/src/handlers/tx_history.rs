@@ -30,7 +30,7 @@ pub async fn tx_history(params: Value, ctx: &Arc<ServerContext>) -> Result<Value
             if txns.len() >= max_count {
                 break 'outer;
             }
-            if let Ok(mut record) = serde_json::from_slice::<Value>(&data) {
+            if let Ok(mut record) = rxrpl_codec::binary::decode_tx_record(&data) {
                 if let Some(obj) = record.as_object_mut() {
                     obj.insert("hash".to_string(), Value::String(hash.to_string()));
                     obj.insert(

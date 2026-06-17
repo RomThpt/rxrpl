@@ -20,12 +20,14 @@ fn index_closed_ledger(store: &dyn TxStore, ledger: &Ledger) {
     let mut tx_index = 0u32;
 
     ledger.tx_map.for_each(&mut |tx_hash, data| {
-        if let Ok(record) = serde_json::from_slice::<Value>(data) {
+        if let Ok(record) = rxrpl_codec::binary::decode_tx_record(data) {
+            let tx_blob = serde_json::to_vec(record.get("tx_json").unwrap_or(&Value::Null))
+                .unwrap_or_default();
             let meta_blob =
                 serde_json::to_vec(record.get("meta").unwrap_or(&Value::Null)).unwrap_or_default();
 
             if let Err(e) =
-                store.insert_transaction(tx_hash.as_bytes(), seq, tx_index, data, &meta_blob)
+                store.insert_transaction(tx_hash.as_bytes(), seq, tx_index, &tx_blob, &meta_blob)
             {
                 tracing::error!("failed to index tx {}: {}", tx_hash, e);
             }
@@ -112,7 +114,7 @@ pub async fn ledger_accept(
         // Mirror what the natural-close loop in node.rs does so subscribers
         // on the `transactions` stream get notified for txs that were applied
         // in a manually-closed (ledger_accept) ledger.
-        if let Ok(record) = serde_json::from_slice::<serde_json::Value>(data) {
+        if let Ok(record) = rxrpl_codec::binary::decode_tx_record(data) {
             let tx_json = record.get("tx_json").cloned().unwrap_or_default();
             let _ = ctx
                 .event_sender()

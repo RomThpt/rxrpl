@@ -428,22 +428,42 @@ impl TxEngine {
                 ledger.header.sequence,
             );
 
-            // Build metadata before consuming changes
+            // Build metadata before consuming changes, then store the
+            // transaction SHAMap leaf in rippled's canonical form,
+            // `VL(tx) || VL(meta)`, so the transaction tree root (tx_hash)
+            // matches the validated chain.
             let meta = changes.build_metadata(0, result.code());
+            let meta_json = meta.to_canonical_json();
 
             changes.apply_to_ledger(ledger)?;
-            let tx_record = serde_json::json!({
-                "tx_json": tx,
-                "result": result.as_str(),
-                "meta": {
-                    "TransactionIndex": meta.tx_index,
-                    "TransactionResult": result.as_str(),
-                    "AffectedNodes": meta.affected_nodes.len(),
-                },
-            });
-            let tx_data =
-                serde_json::to_vec(&tx_record).map_err(|e| TxEngineError::Codec(e.to_string()))?;
-            ledger.add_transaction(tx_hash, tx_data)?;
+
+            // Build the canonical `VL(tx) || VL(meta)` leaf. If either fails to
+            // encode (e.g. a pseudo-transaction whose SLE is not yet stored in
+            // canonical form), fall back to a tx-only leaf rather than failing
+            // the apply — the state is already correct, only this ledger's
+            // tx_hash would differ. Tracked as separate metadata-fidelity work.
+            let leaf = match (
+                rxrpl_codec::binary::encode(tx),
+                rxrpl_codec::binary::encode(&meta_json),
+            ) {
+                (Ok(tx_blob), Ok(meta_blob)) => {
+                    let mut leaf = rxrpl_codec::binary::encode_vl(&tx_blob);
+                    leaf.extend_from_slice(&rxrpl_codec::binary::encode_vl(&meta_blob));
+                    leaf
+                }
+                (tx_enc, meta_enc) => {
+                    tracing::warn!(
+                        "non-canonical tx leaf for {} (tx_ok={}, meta_err={:?})",
+                        tx_hash,
+                        tx_enc.is_ok(),
+                        meta_enc.err(),
+                    );
+                    let mut leaf = rxrpl_codec::binary::encode_vl(&tx_enc.unwrap_or_default());
+                    leaf.extend_from_slice(&rxrpl_codec::binary::encode_vl(&[]));
+                    leaf
+                }
+            };
+            ledger.add_transaction(tx_hash, leaf)?;
         }
 
         Ok(result)

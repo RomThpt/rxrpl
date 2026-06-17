@@ -46,6 +46,46 @@ fn extract_entry_type(data: &[u8]) -> String {
         .unwrap_or_else(|| "Unknown".into())
 }
 
+/// Fields lifted to the affected-node level (not repeated inside Final/New fields).
+const NODE_LEVEL_FIELDS: [&str; 3] = ["LedgerEntryType", "PreviousTxnID", "PreviousTxnLgrSeq"];
+
+fn decode_sle(bytes: &Option<Vec<u8>>) -> serde_json::Map<String, serde_json::Value> {
+    bytes
+        .as_ref()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// The SLE's fields minus the ones promoted to the affected-node level.
+fn entry_fields(sle: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (k, v) in sle {
+        if !NODE_LEVEL_FIELDS.contains(&k.as_str()) {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Fields whose value differs between `prev` and `final`, carrying the PREVIOUS
+/// value — rippled's `PreviousFields`. Node-level fields are excluded.
+fn changed_previous_fields(
+    prev: &serde_json::Map<String, serde_json::Value>,
+    fin: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (k, pv) in prev {
+        if NODE_LEVEL_FIELDS.contains(&k.as_str()) {
+            continue;
+        }
+        if fin.get(k) != Some(pv) {
+            out.insert(k.clone(), pv.clone());
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
 impl SandboxChanges {
     /// Build transaction metadata from these sandbox changes.
     pub fn build_metadata(&self, tx_index: u32, result_code: i32) -> TxMeta {
@@ -91,6 +131,68 @@ impl SandboxChanges {
             result_code,
             delivered_amount: None,
         }
+    }
+}
+
+impl TxMeta {
+    /// Serialize to rippled's canonical transaction-metadata JSON shape, ready
+    /// for binary encoding. Affected nodes are sorted by ledger index (rippled
+    /// convention); each carries the node-level LedgerEntryType / LedgerIndex /
+    /// PreviousTxnID(LgrSeq) plus FinalFields / PreviousFields / NewFields.
+    pub fn to_canonical_json(&self) -> serde_json::Value {
+        let mut nodes = self.affected_nodes.clone();
+        nodes.sort_by(|a, b| a.key.as_bytes().cmp(b.key.as_bytes()));
+
+        let affected: Vec<serde_json::Value> = nodes
+            .iter()
+            .map(|n| {
+                let index = hex::encode_upper(n.key.as_bytes());
+                let mut inner = serde_json::Map::new();
+                inner.insert("LedgerEntryType".into(), n.ledger_entry_type.clone().into());
+                inner.insert("LedgerIndex".into(), index.into());
+
+                let prev = decode_sle(&n.previous);
+                let fin = decode_sle(&n.final_fields);
+                let wrapper = match n.change_type {
+                    ChangeType::Created => {
+                        inner.insert("NewFields".into(), entry_fields(&fin));
+                        "CreatedNode"
+                    }
+                    ChangeType::Modified => {
+                        for f in ["PreviousTxnID", "PreviousTxnLgrSeq"] {
+                            if let Some(v) = prev.get(f) {
+                                inner.insert(f.into(), v.clone());
+                            }
+                        }
+                        inner.insert("FinalFields".into(), entry_fields(&fin));
+                        inner.insert(
+                            "PreviousFields".into(),
+                            changed_previous_fields(&prev, &fin),
+                        );
+                        "ModifiedNode"
+                    }
+                    ChangeType::Deleted => {
+                        for f in ["PreviousTxnID", "PreviousTxnLgrSeq"] {
+                            if let Some(v) = prev.get(f) {
+                                inner.insert(f.into(), v.clone());
+                            }
+                        }
+                        inner.insert("FinalFields".into(), entry_fields(&prev));
+                        "DeletedNode"
+                    }
+                };
+                serde_json::json!({ wrapper: serde_json::Value::Object(inner) })
+            })
+            .collect();
+
+        let mut meta = serde_json::Map::new();
+        meta.insert("TransactionIndex".into(), self.tx_index.into());
+        meta.insert("TransactionResult".into(), self.result_code.into());
+        meta.insert("AffectedNodes".into(), serde_json::Value::Array(affected));
+        if let Some(amt) = &self.delivered_amount {
+            meta.insert("DeliveredAmount".into(), amt.clone().into());
+        }
+        serde_json::Value::Object(meta)
     }
 }
 
