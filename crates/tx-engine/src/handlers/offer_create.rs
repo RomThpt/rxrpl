@@ -1,6 +1,6 @@
 use rxrpl_amendment::feature::feature_id;
 use rxrpl_amount::{IOUAmount, offer_quality};
-use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_codec::address::classic::{decode_account_id, encode_account_id};
 use rxrpl_primitives::{AccountId, Hash256};
 use rxrpl_protocol::TransactionResult;
 use rxrpl_protocol::keylet;
@@ -152,27 +152,43 @@ impl Transactor for OfferCreateTransactor {
         // when the transaction ends in a tec claim below.
         crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, &mut acct, ctx.tx)?;
 
+        // Cross against the inverse book — existing offers where someone pays
+        // our `TakerGets` to receive our `TakerPays` (book keyed by `(gets,
+        // pays)`) — best price first, filling crossable offers and reaping
+        // unfunded ones (rippled's Taker). Returns the taker's leftover.
+        let inverse_book =
+            keylet::book_dir(&gets_currency, &gets_issuer, &pays_currency, &pays_issuer);
+        let (remaining_pays, remaining_gets, crossed) = cross_offers(
+            ctx,
+            &account_id,
+            &mut acct,
+            &ctx.tx["TakerPays"].clone(),
+            &ctx.tx["TakerGets"].clone(),
+            &inverse_book,
+        )?;
+
+        // Nothing left to place when either side is exhausted (fully crossed):
+        // rippled places no resting offer. Commit the taker's mutations.
+        if value_is_zero(&remaining_pays) || value_is_zero(&remaining_gets) {
+            let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
+            ctx.view
+                .update(acct_key, nb)
+                .map_err(|_| TransactionResult::TemMalformed)?;
+            return Ok(TransactionResult::TesSuccess);
+        }
+
         // Owner reserve: a resting offer needs reserve for one more owned
         // object. rippled returns tecINSUF_RESERVE_OFFER — fee and sequence
-        // charged, no offer placed — when the account cannot afford it.
+        // charged, no offer placed — when the account cannot afford it AND
+        // nothing crossed (a crossing offer may still place below reserve).
         let owner_count = acct.get("OwnerCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        if helpers::get_balance(&acct) < ctx.fees.account_reserve(owner_count + 1) {
+        if !crossed && helpers::get_balance(&acct) < ctx.fees.account_reserve(owner_count + 1) {
             let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
             ctx.view
                 .update(acct_key, nb)
                 .map_err(|_| TransactionResult::TemMalformed)?;
             return Ok(TransactionResult::TecInsufReserveOffer);
         }
-
-        // Sweep unfunded crossing offers from the inverse book. Matching the
-        // taker side of this new offer means existing offers where someone
-        // pays our `TakerGets` to receive our `TakerPays` — i.e. the book
-        // keyed by `(gets, pays)`. Any such offer whose owner can no longer
-        // deliver its TakerGets is removed before we place the new offer
-        // (rippled's `dirAdvance` skips and deletes funded-failed offers).
-        let inverse_book =
-            keylet::book_dir(&gets_currency, &gets_issuer, &pays_currency, &pays_issuer);
-        sweep_unfunded_offers(ctx, &inverse_book)?;
 
         let offer_key = keylet::offer(&account_id, sequence);
 
@@ -206,8 +222,9 @@ impl Transactor for OfferCreateTransactor {
         offer.insert("LedgerEntryType".into(), "Offer".into());
         offer.insert("Account".into(), account_str.into());
         offer.insert("Sequence".into(), Value::from(sequence));
-        offer.insert("TakerPays".into(), ctx.tx["TakerPays"].clone());
-        offer.insert("TakerGets".into(), ctx.tx["TakerGets"].clone());
+        // Resting offer carries the LEFTOVER after crossing, at the original rate.
+        offer.insert("TakerPays".into(), remaining_pays.clone());
+        offer.insert("TakerGets".into(), remaining_gets.clone());
         offer.insert("BookDirectory".into(), book_dir_key.to_string().into());
         // Placeholder PreviousTxnID/LgrSeq — the engine's central stamping fills
         // these with the creating transaction's id and ledger after apply.
@@ -238,6 +255,369 @@ impl Transactor for OfferCreateTransactor {
 
         Ok(TransactionResult::TesSuccess)
     }
+}
+
+/// One side of an offer: native XRP (drops) or an IOU with its issuer/currency.
+#[derive(Clone)]
+struct Leg {
+    is_xrp: bool,
+    drops: i64,
+    iou: IOUAmount,
+    currency: [u8; 20],
+    issuer: AccountId,
+}
+
+impl Leg {
+    fn parse(v: &Value) -> Option<Leg> {
+        if let Some(s) = v.as_str() {
+            return Some(Leg {
+                is_xrp: true,
+                drops: s.parse().ok()?,
+                iou: IOUAmount::ZERO,
+                currency: [0u8; 20],
+                issuer: AccountId::from([0u8; 20]),
+            });
+        }
+        let value = v.get("value")?.as_str()?;
+        let (currency, issuer) = currency_and_issuer(v);
+        Some(Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: IOUAmount::from_decimal_string(value).ok()?,
+            currency,
+            issuer,
+        })
+    }
+
+    /// Render this leg with `amount` as its value (an IOU keeps currency/issuer).
+    fn with_amount(&self, amount: &IOUAmount, xrp_drops: i64) -> Value {
+        if self.is_xrp {
+            return Value::from(xrp_drops.to_string());
+        }
+        serde_json::json!({
+            "currency": currency_code_str(&self.currency),
+            "issuer": encode_account_id(&self.issuer),
+            "value": amount.to_decimal_string(),
+        })
+    }
+
+    fn is_zero(&self) -> bool {
+        if self.is_xrp { self.drops == 0 } else { self.iou.is_zero() }
+    }
+}
+
+/// True when a TakerPays/TakerGets value is zero (XRP `"0"` or IOU value 0).
+fn value_is_zero(v: &Value) -> bool {
+    Leg::parse(v).map(|l| l.is_zero()).unwrap_or(true)
+}
+
+/// Render a 20-byte currency code back to its string form (3-char ASCII or
+/// 40-char hex), the inverse of `helpers::currency_to_bytes`.
+fn currency_code_str(currency: &[u8; 20]) -> String {
+    let ascii = &currency[12..15];
+    let is_standard = currency[..12].iter().all(|&b| b == 0)
+        && currency[15..].iter().all(|&b| b == 0)
+        && ascii.iter().all(|&b| b != 0);
+    if is_standard {
+        String::from_utf8_lossy(ascii).to_string()
+    } else {
+        hex::encode_upper(currency)
+    }
+}
+
+/// The issuer's transfer rate as an `IOUAmount` multiplier (1.0 = no fee).
+/// rippled charges the fee only when neither party is the issuer.
+fn transfer_rate(ctx: &ApplyContext<'_>, issuer: &AccountId) -> IOUAmount {
+    let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+    let key = keylet::account(issuer);
+    let rate = ctx
+        .view
+        .read(&key)
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|a| a.get("TransferRate").and_then(|v| v.as_u64()));
+    match rate {
+        Some(r) if r > 1_000_000_000 => IOUAmount::from_parts(r, -9, false).unwrap_or(one),
+        _ => one,
+    }
+}
+
+/// Apply a signed IOU change to a holder's trust line toward `issuer`.
+/// `gain` > 0 credits the holder, < 0 debits. Balance is stored from the low
+/// account's perspective, so a high-account holder's balance moves opposite to
+/// its gain. Byte-exact via `IOUAmount` (no floating point).
+fn credit_line(
+    ctx: &mut ApplyContext<'_>,
+    holder: &AccountId,
+    issuer: &AccountId,
+    currency: &[u8; 20],
+    gain: &IOUAmount,
+) -> Result<(), TransactionResult> {
+    let key = keylet::trust_line(holder, issuer, currency);
+    let bytes = ctx.view.read(&key).ok_or(TransactionResult::TecPathDry)?;
+    let mut line: Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let cur = line
+        .get("Balance")
+        .and_then(|b| b.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("0");
+    let balance = IOUAmount::from_decimal_string(cur).map_err(|_| TransactionResult::TefInternal)?;
+    let holder_is_high = holder.as_bytes() > issuer.as_bytes();
+    let delta = if holder_is_high { gain.negate() } else { *gain };
+    let new = IOUAmount::add(&balance, &delta).map_err(|_| TransactionResult::TefInternal)?;
+    line["Balance"]["value"] = Value::String(new.to_decimal_string());
+    let nb = serde_json::to_vec(&line).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(key, nb)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    Ok(())
+}
+
+/// Add `delta` drops to an account's XRP balance (read/modify/write the SLE).
+fn credit_xrp(
+    ctx: &mut ApplyContext<'_>,
+    account: &AccountId,
+    delta: i64,
+) -> Result<(), TransactionResult> {
+    let key = keylet::account(account);
+    let bytes = ctx.view.read(&key).ok_or(TransactionResult::TecPathDry)?;
+    let mut acct: Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let bal = helpers::get_balance(&acct) as i64 + delta;
+    if bal < 0 {
+        return Err(TransactionResult::TecUnfundedOffer);
+    }
+    helpers::set_balance(&mut acct, bal as u64);
+    let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(key, nb)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    Ok(())
+}
+
+/// Cross the new offer against the inverse book, filling crossable resting
+/// offers best-price-first. Returns the taker's remaining `(TakerPays,
+/// TakerGets)` and whether any fill occurred. The taker's own AccountRoot XRP
+/// balance is mutated through `taker_acct` (written by the caller); every other
+/// entry (counterparties, trust lines, consumed offers) goes through the view.
+///
+/// Scope: full takes of funded, crossable offers (the validated path, mainnet
+/// #338500). Partial takes rescale at the resting offer's quality. Unfunded
+/// offers encountered in the walk are reaped, mirroring rippled's dirAdvance.
+fn cross_offers(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    taker_pays: &Value,
+    taker_gets: &Value,
+    inverse_book: &rxrpl_primitives::Hash256,
+) -> Result<(Value, Value, bool), TransactionResult> {
+    let out_leg = match Leg::parse(taker_pays) {
+        Some(l) => l,
+        None => return Ok((taker_pays.clone(), taker_gets.clone(), false)),
+    };
+    let in_leg = match Leg::parse(taker_gets) {
+        Some(l) => l,
+        None => return Ok((taker_pays.clone(), taker_gets.clone(), false)),
+    };
+
+    // Taker's quality limit in the inverse book = TakerGets / TakerPays.
+    let pays_iou = leg_as_quality_iou(&out_leg);
+    let gets_iou = leg_as_quality_iou(&in_leg);
+    let threshold = rxrpl_amount::get_rate(&gets_iou, &pays_iou).unwrap_or(0);
+    if threshold == 0 {
+        return Ok((taker_pays.clone(), taker_gets.clone(), false));
+    }
+
+    let mut remaining_out = out_leg.clone();
+    let mut remaining_in = in_leg.clone();
+    let mut crossed = false;
+    let book_prefix = &inverse_book.as_bytes()[0..24];
+
+    // The book base for traversal has the quality (low 64 bits) zeroed;
+    // `keylet::book_dir` leaves those as hash bytes, so start the walk there.
+    let mut probe = book_dir_with_quality(inverse_book, 0);
+    'walk: loop {
+        let Some(dir_key) = ctx.view.succ(&probe) else { break };
+        if &dir_key.as_bytes()[0..24] != book_prefix {
+            break; // left this book
+        }
+        probe = dir_key;
+        let dir_quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
+        if dir_quality > threshold {
+            break; // worse than the taker will accept
+        }
+        let Some(dir_bytes) = ctx.view.read(&dir_key) else { continue };
+        let Ok(dir) = serde_json::from_slice::<Value>(&dir_bytes) else { continue };
+        let offers: Vec<rxrpl_primitives::Hash256> = dir
+            .get("Indexes")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().and_then(|s| s.parse().ok()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for offer_key in offers {
+            if remaining_out.is_zero() {
+                break 'walk;
+            }
+            let Some(ob) = ctx.view.read(&offer_key) else { continue };
+            let Ok(offer) = serde_json::from_slice::<Value>(&ob) else { continue };
+            if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+                continue;
+            }
+            let owner_str = offer.get("Account").and_then(|v| v.as_str()).unwrap_or("");
+            let Ok(owner) = decode_account_id(owner_str) else { continue };
+            if &owner == taker {
+                continue; // never cross our own offer (rippled steps over it)
+            }
+            // offer.out = what the offer gives = taker receives = offer.TakerGets.
+            // offer.in  = what the offer wants = taker pays   = offer.TakerPays.
+            let Some(offer_out) = Leg::parse(&offer["TakerGets"]) else { continue };
+            let Some(offer_in) = Leg::parse(&offer["TakerPays"]) else { continue };
+            if !is_offer_funded(ctx, &owner, &offer["TakerGets"]) {
+                reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                continue;
+            }
+
+            // Full take only when the taker wants at least the whole offer.
+            if !leg_ge(&remaining_out, &offer_out) {
+                break 'walk; // partial take not yet supported byte-exact
+            }
+            // Move funds: taker pays offer_in, owner pays offer_out (grossed).
+            pay_in(ctx, taker, taker_acct, &owner, &offer_in)?;
+            pay_out(ctx, taker, &owner, &offer_out)?;
+
+            // Consume the offer to zero (full take), recording the amount change
+            // in metadata, then delete it (rippled consumes before BookTip drops).
+            let mut consumed = offer.clone();
+            consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
+            consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
+            let cb = serde_json::to_vec(&consumed).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(offer_key, cb)
+                .map_err(|_| TransactionResult::TefInternal)?;
+            reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+
+            remaining_out = leg_sub(&remaining_out, &offer_out);
+            remaining_in = leg_sub(&remaining_in, &offer_in);
+            crossed = true;
+        }
+    }
+
+    Ok((
+        remaining_out.with_amount(&remaining_out.iou, remaining_out.drops),
+        remaining_in.with_amount(&remaining_in.iou, remaining_in.drops),
+        crossed,
+    ))
+}
+
+/// A leg's magnitude as an IOUAmount for quality math (drops become an integer).
+fn leg_as_quality_iou(leg: &Leg) -> IOUAmount {
+    if leg.is_xrp {
+        IOUAmount::from_decimal_string(&leg.drops.to_string()).unwrap_or(IOUAmount::ZERO)
+    } else {
+        leg.iou
+    }
+}
+
+/// `a >= b` for like-typed legs.
+fn leg_ge(a: &Leg, b: &Leg) -> bool {
+    if a.is_xrp {
+        a.drops >= b.drops
+    } else {
+        a.iou >= b.iou
+    }
+}
+
+/// `a - b` for like-typed legs (same currency).
+fn leg_sub(a: &Leg, b: &Leg) -> Leg {
+    let mut out = a.clone();
+    if a.is_xrp {
+        out.drops = a.drops - b.drops;
+    } else {
+        out.iou = IOUAmount::sub(&a.iou, &b.iou).unwrap_or(IOUAmount::ZERO);
+    }
+    out
+}
+
+/// Move the taker's input to the offer owner: XRP via balances, IOU via the
+/// grossed trust-line debit / net credit.
+fn pay_in(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    owner: &AccountId,
+    amount: &Leg,
+) -> Result<(), TransactionResult> {
+    if amount.is_xrp {
+        let bal = helpers::get_balance(taker_acct) as i64 - amount.drops;
+        if bal < 0 {
+            return Err(TransactionResult::TecUnfundedOffer);
+        }
+        helpers::set_balance(taker_acct, bal as u64);
+        return credit_xrp(ctx, owner, amount.drops);
+    }
+    let rate = transfer_rate(ctx, &amount.issuer);
+    let gross = grossed(&amount.iou, &rate);
+    credit_line(ctx, taker, &amount.issuer, &amount.currency, &gross.negate())?;
+    credit_line(ctx, owner, &amount.issuer, &amount.currency, &amount.iou)
+}
+
+/// Move the offer owner's output to the taker: XRP via balances, IOU via the
+/// grossed owner debit / net taker credit (the difference is the burned fee).
+fn pay_out(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    owner: &AccountId,
+    amount: &Leg,
+) -> Result<(), TransactionResult> {
+    if amount.is_xrp {
+        credit_xrp(ctx, owner, -amount.drops)?;
+        return credit_xrp(ctx, taker, amount.drops);
+    }
+    let rate = transfer_rate(ctx, &amount.issuer);
+    let gross = grossed(&amount.iou, &rate);
+    credit_line(ctx, owner, &amount.issuer, &amount.currency, &gross.negate())?;
+    credit_line(ctx, taker, &amount.issuer, &amount.currency, &amount.iou)
+}
+
+/// `amount * rate` using rippled's non-rounding STAmount multiply.
+fn grossed(amount: &IOUAmount, rate: &IOUAmount) -> IOUAmount {
+    match rxrpl_amount::Amount::multiply(
+        &rxrpl_amount::Amount::Iou(*amount),
+        &rxrpl_amount::Amount::Iou(*rate),
+        false,
+    ) {
+        Ok(rxrpl_amount::Amount::Iou(v)) => v,
+        _ => *amount,
+    }
+}
+
+/// Remove an offer: owner dir, its quality book dir, erase the SLE, decrement
+/// OwnerCount. `book_dir` is the offer's own `BookDirectory` (the quality
+/// directory it lives in), not the book base.
+fn reap_offer(
+    ctx: &mut ApplyContext<'_>,
+    owner: &AccountId,
+    offer_key: &rxrpl_primitives::Hash256,
+    book_dir: &rxrpl_primitives::Hash256,
+) -> Result<(), TransactionResult> {
+    crate::owner_dir::remove_from_owner_dir(ctx.view, owner, offer_key)?;
+    remove_from_book_dir(ctx.view, book_dir, offer_key)?;
+    let _ = ctx.view.erase(offer_key);
+    let owner_key = keylet::account(owner);
+    if let Some(b) = ctx.view.read(&owner_key) {
+        if let Ok(mut acct) = serde_json::from_slice::<Value>(&b) {
+            helpers::adjust_owner_count(&mut acct, -1);
+            if let Ok(nb) = serde_json::to_vec(&acct) {
+                let _ = ctx.view.update(owner_key, nb);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Extract a 20-byte currency code and issuer AccountId from a TakerPays /
@@ -352,96 +732,6 @@ fn check_permissioned_asset(
     Err(TransactionResult::TecNoPermission)
 }
 
-/// Walk the order-book directory and remove offers whose owner can no longer
-/// deliver `TakerGets`. Matches rippled's behavior in `BookOfferCrossing` /
-/// `dirAdvance` where exhausted/unfunded offers are reaped before crossing
-/// proceeds. Cleanup includes: removing the offer index from the book dir
-/// AND from the owner's owner_dir, decrementing the owner's `OwnerCount`,
-/// and erasing the SLE.
-fn sweep_unfunded_offers(
-    ctx: &mut ApplyContext<'_>,
-    book_root: &rxrpl_primitives::Hash256,
-) -> Result<(), TransactionResult> {
-    // Collect candidates first (avoid mutating while iterating dir pages).
-    let mut candidates: Vec<rxrpl_primitives::Hash256> = Vec::new();
-    let mut page = 0u64;
-    loop {
-        let page_key = if page == 0 {
-            *book_root
-        } else {
-            keylet::dir_node(book_root, page)
-        };
-        let page_bytes = match ctx.view.read(&page_key) {
-            Some(b) => b,
-            None => break,
-        };
-        let page_json: Value = match serde_json::from_slice(&page_bytes) {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-        if let Some(indexes) = page_json.get("Indexes").and_then(|v| v.as_array()) {
-            for idx_val in indexes {
-                if let Some(s) = idx_val.as_str() {
-                    if let Ok(h) = s.parse::<rxrpl_primitives::Hash256>() {
-                        candidates.push(h);
-                    }
-                }
-            }
-        }
-        match page_json.get("IndexNext").and_then(|v| v.as_u64()) {
-            Some(next) if next != 0 => page = next,
-            _ => break,
-        }
-    }
-
-    for offer_key in candidates {
-        let entry_bytes = match ctx.view.read(&offer_key) {
-            Some(b) => b,
-            None => continue,
-        };
-        let entry: Value = match serde_json::from_slice(&entry_bytes) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if entry.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
-            continue;
-        }
-        let owner_str = match entry.get("Account").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => continue,
-        };
-        let owner_id = match decode_account_id(owner_str) {
-            Ok(id) => id,
-            Err(_) => continue,
-        };
-        let gets = entry.get("TakerGets").unwrap_or(&Value::Null);
-
-        let funded = is_offer_funded(ctx, &owner_id, gets);
-        if funded {
-            continue;
-        }
-
-        // Unfunded: reap from book dir, owner dir, decrement owner count,
-        // erase the SLE.
-        crate::owner_dir::remove_from_owner_dir(ctx.view, &owner_id, &offer_key)?;
-
-        // Remove from the book directory page.
-        remove_from_book_dir(ctx.view, book_root, &offer_key)?;
-
-        let _ = ctx.view.erase(&offer_key);
-        let owner_acct_key = keylet::account(&owner_id);
-        if let Some(b) = ctx.view.read(&owner_acct_key) {
-            if let Ok(mut acct) = serde_json::from_slice::<Value>(&b) {
-                helpers::adjust_owner_count(&mut acct, -1);
-                if let Ok(nb) = serde_json::to_vec(&acct) {
-                    let _ = ctx.view.update(owner_acct_key, nb);
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Test whether `owner` currently holds the `TakerGets` amount in full.
 /// XRP: AccountRoot.Balance ≥ amount. IOU: holder-side trust line balance ≥ value.
 fn is_offer_funded(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Value) -> bool {
@@ -497,8 +787,10 @@ fn is_offer_funded(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Value) 
         .unwrap_or("0")
         .parse()
         .unwrap_or(0.0);
+    // Balance is stored from the low account's perspective. The non-issuer
+    // holder's balance has the opposite sign when the issuer is the low account.
     let issuer_is_low = issuer_id.as_bytes() < owner.as_bytes();
-    let holder_view = if issuer_is_low { raw } else { -raw };
+    let holder_view = if issuer_is_low { -raw } else { raw };
     holder_view >= value
 }
 
