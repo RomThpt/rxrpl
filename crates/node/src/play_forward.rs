@@ -624,13 +624,158 @@ mod tests {
         });
         eprintln!("state entries differing from rippled: {diffs}");
 
-        // The transaction-set plumbing is what this harness guarantees today:
-        // every transaction is acquired, ordered and applied, and the burned
-        // fees reproduce the validated total coins exactly.
+        // Byte-exact fidelity: every transaction applies, and the replay
+        // reproduces the validated header's account_hash, tx_hash, ledger_hash
+        // and total coins. Holds for the supported mainnet ledgers (#268000,
+        // #300000, #316000); a ledger exercising not-yet-faithful transactor
+        // logic would trip this and the `diffs` counter above.
         assert_eq!(outcome.failed, 0, "every transaction in the set must apply");
-        assert!(
-            outcome.drops_match,
-            "total coins must be reproduced exactly"
+        assert!(outcome.is_faithful(), "replay must reproduce the validated header");
+        assert_eq!(diffs, 0, "no state entry may differ from rippled");
+    }
+
+    /// Diagnostic: per-transaction metadata-blob comparison against rippled.
+    /// Replays a mainnet ledger, then for each transaction compares our binary
+    /// metadata leaf to rippled's `meta` blob byte-for-byte. On mismatch it
+    /// decodes both and prints the differing fields. This isolates the
+    /// remaining `tx_hash` divergence (offer / directory metadata).
+    ///
+    /// Ignored — needs network. Run with:
+    /// `RXRPL_PLAY_FORWARD_RPC=http://host:5005 RXRPL_PLAY_FORWARD_LEDGER=316000 \
+    ///  cargo test -p rxrpl-node --lib offer_meta_diff_mainnet -- --ignored --nocapture`
+    #[test]
+    #[ignore = "hits a live mainnet RPC server"]
+    fn offer_meta_diff_mainnet() {
+        let Ok(url) = std::env::var("RXRPL_PLAY_FORWARD_RPC") else {
+            eprintln!("RXRPL_PLAY_FORWARD_RPC unset; skipping");
+            return;
+        };
+        let next: u32 = std::env::var("RXRPL_PLAY_FORWARD_LEDGER")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(316000);
+        let parent_seq = next - 1;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let rpc = |params: serde_json::Value| -> Value {
+            rt.block_on(async {
+                client.post(&url).json(&params).send().await.unwrap().json().await.unwrap()
+            })
+        };
+
+        let parent_resp = rpc(serde_json::json!({
+            "method":"ledger",
+            "params":[{"ledger_index":parent_seq,"transactions":false,"expand":false}]
+        }));
+        let parent_header = parse_header(&parent_resp["result"]["ledger"]).expect("parent header");
+        let mut state = rxrpl_shamap::SHAMap::account_state();
+        let mut marker: Option<String> = None;
+        loop {
+            let mut p = serde_json::json!({"ledger_index":parent_seq,"binary":true,"limit":2048});
+            if let Some(m) = &marker {
+                p["marker"] = serde_json::Value::String(m.clone());
+            }
+            let r = rpc(serde_json::json!({"method":"ledger_data","params":[p]}));
+            for e in r["result"]["state"].as_array().unwrap() {
+                let key: [u8; 32] =
+                    hex::decode(e["index"].as_str().unwrap()).unwrap().try_into().unwrap();
+                let data = hex::decode(e["data"].as_str().unwrap()).unwrap();
+                state.put(Hash256::new(key), data).unwrap();
+            }
+            marker = r["result"]["marker"].as_str().map(|s| s.to_string());
+            if marker.is_none() {
+                break;
+            }
+        }
+        assert_eq!(state.root_hash(), parent_header.account_hash, "parent state root");
+        let mut parent = Ledger::from_catchup(parent_seq, parent_header.hash, state);
+        parent.header = parent_header;
+        let fees = FeeSettings {
+            base_fee: 10,
+            reserve_base: 200_000_000,
+            reserve_increment: 50_000_000,
+        };
+
+        let next_hdr_resp = rpc(serde_json::json!({
+            "method":"ledger",
+            "params":[{"ledger_index":next,"transactions":false,"expand":false}]
+        }));
+        let next_header = parse_header(&next_hdr_resp["result"]["ledger"]).expect("next header");
+        let bin_resp = rpc(serde_json::json!({
+            "method":"ledger",
+            "params":[{"ledger_index":next,"transactions":true,"expand":true,"binary":true}]
+        }));
+        let (set_hash, txs) = parse_tx_set(&bin_resp["result"]).expect("tx set");
+        let outcome = replay_forward(&parent, set_hash, txs, &next_header, &full_engine(), &fees)
+            .expect("replay");
+        eprintln!(
+            "ledger #{next}: tx_hash_match={} account_hash_match={}",
+            outcome.tx_hash_match, outcome.account_hash_match
         );
+
+        // rippled meta blob per txid.
+        let mut their_meta: std::collections::HashMap<Hash256, Vec<u8>> = Default::default();
+        for entry in bin_resp["result"]["ledger"]["transactions"].as_array().unwrap() {
+            let blob = hex::decode(entry["tx_blob"].as_str().unwrap()).unwrap();
+            let meta = hex::decode(entry["meta"].as_str().unwrap()).unwrap();
+            their_meta.insert(transaction_id(&blob), meta);
+        }
+
+        let mut leaves: Vec<(Hash256, Vec<u8>)> = Vec::new();
+        outcome.ledger.tx_map.for_each(&mut |k, v| leaves.push((*k, v.to_vec())));
+        let mut mismatches = 0;
+        for (txid, leaf) in &leaves {
+            let (_tx, our_meta_json) =
+                rxrpl_codec::binary::decode_tx_leaf(leaf).expect("decode our leaf");
+            let our_meta = rxrpl_codec::binary::encode(&our_meta_json).expect("encode our meta");
+            let their = their_meta.get(txid).expect("rippled meta for txid");
+            if &our_meta == their {
+                continue;
+            }
+            mismatches += 1;
+            let their_json = rxrpl_codec::binary::decode(their).expect("decode rippled meta");
+            eprintln!("\n=== META MISMATCH tx {} ===", hex::encode_upper(txid.as_bytes()));
+            eprintln!("TxIndex ours={} theirs={}",
+                our_meta_json["TransactionIndex"], their_json["TransactionIndex"]);
+            diff_json("", &our_meta_json, &their_json);
+        }
+        eprintln!("\n{mismatches}/{} transactions have mismatched metadata", leaves.len());
+    }
+
+    /// Recursively print where `ours` and `theirs` differ (ours=LEFT, theirs=RIGHT).
+    fn diff_json(path: &str, ours: &Value, theirs: &Value) {
+        match (ours, theirs) {
+            (Value::Object(a), Value::Object(b)) => {
+                let mut keys: std::collections::BTreeSet<&String> = a.keys().collect();
+                keys.extend(b.keys());
+                for k in keys {
+                    let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                    match (a.get(k), b.get(k)) {
+                        (Some(x), Some(y)) => diff_json(&p, x, y),
+                        (Some(x), None) => eprintln!("  ONLY-OURS  {p} = {x}"),
+                        (None, Some(y)) => eprintln!("  ONLY-THEIRS {p} = {y}"),
+                        (None, None) => {}
+                    }
+                }
+            }
+            (Value::Array(a), Value::Array(b)) => {
+                if a.len() != b.len() {
+                    eprintln!("  LEN  {path}: ours={} theirs={}", a.len(), b.len());
+                }
+                for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                    diff_json(&format!("{path}[{i}]"), x, y);
+                }
+            }
+            _ => {
+                if ours != theirs {
+                    eprintln!("  DIFF {path}: ours={ours} theirs={theirs}");
+                }
+            }
+        }
     }
 }

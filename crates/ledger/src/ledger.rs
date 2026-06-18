@@ -31,6 +31,10 @@ pub struct Ledger {
     state: LedgerState,
     /// Total drops destroyed (fees) since this ledger was opened.
     destroyed_drops: u64,
+    /// Number of transactions applied since this ledger was opened. Mirrors
+    /// rippled's `view.txCount()`: the next applied transaction's metadata
+    /// `TransactionIndex`.
+    tx_count: u32,
 }
 
 impl Ledger {
@@ -58,6 +62,7 @@ impl Ledger {
             tx_map,
             state: LedgerState::Open,
             destroyed_drops: 0,
+            tx_count: 0,
         }
     }
 
@@ -83,6 +88,7 @@ impl Ledger {
             tx_map,
             state: LedgerState::Open,
             destroyed_drops: 0,
+            tx_count: 0,
         }
     }
 
@@ -108,6 +114,7 @@ impl Ledger {
             tx_map,
             state: LedgerState::Open,
             destroyed_drops: 0,
+            tx_count: 0,
         }
     }
 
@@ -156,6 +163,7 @@ impl Ledger {
             tx_map,
             state: LedgerState::Closed,
             destroyed_drops: 0,
+            tx_count: 0,
         })
     }
 
@@ -180,6 +188,7 @@ impl Ledger {
             tx_map,
             state: LedgerState::Closed,
             destroyed_drops: 0,
+            tx_count: 0,
         }
     }
 
@@ -207,6 +216,7 @@ impl Ledger {
             tx_map,
             state: LedgerState::Closed,
             destroyed_drops: 0,
+            tx_count: 0,
         }
     }
 
@@ -268,7 +278,14 @@ impl Ledger {
             return Err(LedgerError::Immutable);
         }
         self.tx_map.put(key, data)?;
+        self.tx_count += 1;
         Ok(())
+    }
+
+    /// The metadata `TransactionIndex` the next applied transaction will take:
+    /// the count of transactions already applied to this open ledger.
+    pub fn tx_count(&self) -> u32 {
+        self.tx_count
     }
 
     /// Record destroyed XRP (transaction fees).

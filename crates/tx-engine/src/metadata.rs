@@ -46,8 +46,44 @@ fn extract_entry_type(data: &[u8]) -> String {
         .unwrap_or_else(|| "Unknown".into())
 }
 
-/// Fields lifted to the affected-node level (not repeated inside Final/New fields).
-const NODE_LEVEL_FIELDS: [&str; 3] = ["LedgerEntryType", "PreviousTxnID", "PreviousTxnLgrSeq"];
+// rippled per-field metadata flags (`SField::kSmd*`). A field appears in a
+// metadata section only when its flags intersect that section's mask.
+const SMD_CHANGE_ORIG: u32 = 0x01; // previous value when it changes
+const SMD_CHANGE_NEW: u32 = 0x02; // new value when it changes
+const SMD_DELETE_FINAL: u32 = 0x04; // final value when it is deleted
+const SMD_CREATE: u32 = 0x08; // value when it is created
+const SMD_ALWAYS: u32 = 0x10; // value whenever the node is affected
+const SMD_DEFAULT: u32 = SMD_CHANGE_ORIG | SMD_CHANGE_NEW | SMD_DELETE_FINAL | SMD_CREATE;
+
+/// rippled's metadata flags for `field`. Only fields whose flags differ from
+/// `kSmdDefault` are listed (`include/xrpl/protocol/detail/sfields.macro`);
+/// everything else takes the default and appears in every section.
+fn smd_flags(field: &str) -> u32 {
+    match field {
+        "Indexes" | "LedgerEntryType" => 0,
+        "PreviousTxnID" | "PreviousTxnLgrSeq" => SMD_DELETE_FINAL,
+        "RootIndex" => SMD_ALWAYS,
+        _ => SMD_DEFAULT,
+    }
+}
+
+fn should_meta(field: &str, mask: u32) -> bool {
+    smd_flags(field) & mask != 0
+}
+
+/// True when `v` equals its field type's default value, mirroring rippled's
+/// `STBase::isDefault()`. Default fields are omitted from `NewFields`.
+fn is_default_json(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => true,
+        serde_json::Value::Bool(b) => !b,
+        serde_json::Value::Number(n) => n.as_u64() == Some(0) || n.as_i64() == Some(0),
+        serde_json::Value::String(s) => s.is_empty() || s.chars().all(|c| c == '0'),
+        serde_json::Value::Array(a) => a.is_empty(),
+        // STAmount: default is a zero value (XRP or IOU).
+        serde_json::Value::Object(o) => o.get("value").and_then(|x| x.as_str()) == Some("0"),
+    }
+}
 
 fn decode_sle(bytes: &Option<Vec<u8>>) -> serde_json::Map<String, serde_json::Value> {
     bytes
@@ -57,33 +93,35 @@ fn decode_sle(bytes: &Option<Vec<u8>>) -> serde_json::Map<String, serde_json::Va
         .unwrap_or_default()
 }
 
-/// The SLE's fields minus the ones promoted to the affected-node level.
-fn entry_fields(sle: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+/// Fields of `sle` kept for a metadata section, per rippled's `shouldMeta`.
+/// `creating` additionally drops default-valued fields (the `NewFields` rule).
+fn section_fields(
+    sle: &serde_json::Map<String, serde_json::Value>,
+    mask: u32,
+    creating: bool,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut out = serde_json::Map::new();
     for (k, v) in sle {
-        if !NODE_LEVEL_FIELDS.contains(&k.as_str()) {
+        if should_meta(k, mask) && !(creating && is_default_json(v)) {
             out.insert(k.clone(), v.clone());
         }
     }
-    serde_json::Value::Object(out)
+    out
 }
 
-/// Fields whose value differs between `prev` and `final`, carrying the PREVIOUS
-/// value — rippled's `PreviousFields`. Node-level fields are excluded.
+/// `PreviousFields`: original values of fields that changed and carry the
+/// `ChangeOrig` flag (rippled's `shouldMeta(kSmdChangeOrig)` over the orig node).
 fn changed_previous_fields(
     prev: &serde_json::Map<String, serde_json::Value>,
     fin: &serde_json::Map<String, serde_json::Value>,
-) -> serde_json::Value {
+) -> serde_json::Map<String, serde_json::Value> {
     let mut out = serde_json::Map::new();
     for (k, pv) in prev {
-        if NODE_LEVEL_FIELDS.contains(&k.as_str()) {
-            continue;
-        }
-        if fin.get(k) != Some(pv) {
+        if should_meta(k, SMD_CHANGE_ORIG) && fin.get(k) != Some(pv) {
             out.insert(k.clone(), pv.clone());
         }
     }
-    serde_json::Value::Object(out)
+    out
 }
 
 impl SandboxChanges {
@@ -143,47 +181,55 @@ impl TxMeta {
         let mut nodes = self.affected_nodes.clone();
         nodes.sort_by(|a, b| a.key.as_bytes().cmp(b.key.as_bytes()));
 
-        let affected: Vec<serde_json::Value> = nodes
-            .iter()
-            .map(|n| {
-                let index = hex::encode_upper(n.key.as_bytes());
-                let mut inner = serde_json::Map::new();
-                inner.insert("LedgerEntryType".into(), n.ledger_entry_type.clone().into());
-                inner.insert("LedgerIndex".into(), index.into());
+        let mut affected: Vec<serde_json::Value> = Vec::with_capacity(nodes.len());
+        for n in &nodes {
+            let prev = decode_sle(&n.previous);
+            let fin = decode_sle(&n.final_fields);
 
-                let prev = decode_sle(&n.previous);
-                let fin = decode_sle(&n.final_fields);
-                let wrapper = match n.change_type {
-                    ChangeType::Created => {
-                        inner.insert("NewFields".into(), entry_fields(&fin));
-                        "CreatedNode"
+            let mut inner = serde_json::Map::new();
+            inner.insert("LedgerEntryType".into(), n.ledger_entry_type.clone().into());
+            inner.insert("LedgerIndex".into(), hex::encode_upper(n.key.as_bytes()).into());
+
+            let wrapper = match n.change_type {
+                ChangeType::Created => {
+                    let news = section_fields(&fin, SMD_CREATE | SMD_ALWAYS, true);
+                    if !news.is_empty() {
+                        inner.insert("NewFields".into(), news.into());
                     }
-                    ChangeType::Modified => {
-                        for f in ["PreviousTxnID", "PreviousTxnLgrSeq"] {
-                            if let Some(v) = prev.get(f) {
-                                inner.insert(f.into(), v.clone());
-                            }
+                    "CreatedNode"
+                }
+                ChangeType::Modified => {
+                    // rippled skips a modified node whose final state equals the original.
+                    if prev == fin {
+                        continue;
+                    }
+                    // Threaded types (those carrying PreviousTxnID) record the
+                    // PREVIOUS values at the node level, via threadItem.
+                    for f in ["PreviousTxnID", "PreviousTxnLgrSeq"] {
+                        if let Some(v) = prev.get(f).filter(|v| !is_default_json(v)) {
+                            inner.insert(f.into(), v.clone());
                         }
-                        inner.insert("FinalFields".into(), entry_fields(&fin));
-                        inner.insert(
-                            "PreviousFields".into(),
-                            changed_previous_fields(&prev, &fin),
-                        );
-                        "ModifiedNode"
                     }
-                    ChangeType::Deleted => {
-                        for f in ["PreviousTxnID", "PreviousTxnLgrSeq"] {
-                            if let Some(v) = prev.get(f) {
-                                inner.insert(f.into(), v.clone());
-                            }
-                        }
-                        inner.insert("FinalFields".into(), entry_fields(&prev));
-                        "DeletedNode"
+                    let finals = section_fields(&fin, SMD_ALWAYS | SMD_CHANGE_NEW, false);
+                    if !finals.is_empty() {
+                        inner.insert("FinalFields".into(), finals.into());
                     }
-                };
-                serde_json::json!({ wrapper: serde_json::Value::Object(inner) })
-            })
-            .collect();
+                    let prevs = changed_previous_fields(&prev, &fin);
+                    if !prevs.is_empty() {
+                        inner.insert("PreviousFields".into(), prevs.into());
+                    }
+                    "ModifiedNode"
+                }
+                ChangeType::Deleted => {
+                    let finals = section_fields(&prev, SMD_ALWAYS | SMD_DELETE_FINAL, false);
+                    if !finals.is_empty() {
+                        inner.insert("FinalFields".into(), finals.into());
+                    }
+                    "DeletedNode"
+                }
+            };
+            affected.push(serde_json::json!({ wrapper: serde_json::Value::Object(inner) }));
+        }
 
         let mut meta = serde_json::Map::new();
         meta.insert("TransactionIndex".into(), self.tx_index.into());
