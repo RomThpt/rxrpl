@@ -24,6 +24,29 @@ Reference source: `XRPLF/rippled` tag `1.12.0` (last tag carrying the full
 `Taker.cpp`/`Taker.h`; on 3.1.3/develop the legacy files are emptied because
 FlowCross is mandatory). Original paths: `src/ripple/app/tx/impl/{Taker,CreateOffer,OfferStream,BookTip}.*`, `src/ripple/protocol/STAmount.cpp`, `src/ripple/ledger/impl/View.cpp`.
 
+### Reference availability (checked 2026-06-18)
+
+- **Local rippled** (`/Users/romt/Developer/rippled`, 3.2.0-b7/develop): legacy
+  Taker is **gone** — `Taker.cpp/.h` absent, `FlowCross` is `XRPL_RETIRE_FEATURE`
+  (mandatory). Only the Flow path exists (`OfferCreate::flowCross` →
+  `BookOfferCrossingStep`). So this checkout **cannot** replay pre-2018 crossing
+  byte-exact; the legacy Taker reference must come from an old tag (≤1.6.x /
+  1.12.0). Use it as the **Flow** reference once we tackle the modern tip.
+- **go-xrpl** (`/Users/romt/Developer/go-xrpl` = `goXRPLd`, targets rippled
+  2.6.2): a full node with a **line-traced Go port of the modern Flow crossing**
+  (`internal/tx/offer/*`, `internal/tx/payment/{flow_cross,step_book,
+  step_book_offer,step_book_consume,step}.go`) including AMM + PermissionedDEX.
+  Not legacy Taker either. Its `offer_quality.go`/`step.go` STAmount arithmetic
+  (`math/big` port of `mulRound`/`divRound`/`canonicalizeRound`, native-aware)
+  is the **portable reference for increment 1** — it is common to both engines.
+
+### Strategic order
+
+Build the **legacy Taker first** (small-state oracles like #338500 are
+harness-validatable; bounded surface), keeping go-xrpl as the STAmount + Flow
+reference. Increment 1 (unified XRP+IOU `Amount` arithmetic) is shared by both
+the Taker and a future Flow path, so it is never wasted work.
+
 ## Oracle ledger: mainnet #338500 (the first crossing increment target)
 
 Single-tx 2013 ledger, full-fill XRP↔IOU crossing with a transfer fee — the
