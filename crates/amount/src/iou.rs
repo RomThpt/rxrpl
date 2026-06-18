@@ -426,6 +426,66 @@ impl IOUAmount {
         Ok(result)
     }
 
+    /// Parse a decimal string (e.g. `"-3.022389776875825"`) exactly, with no
+    /// floating point. Significant digits beyond 16 are dropped by the
+    /// normalization loop, matching rippled's STAmount parsing for the values
+    /// stored in trust-line balances.
+    pub fn from_decimal_string(s: &str) -> Result<IOUAmount, AmountError> {
+        let s = s.trim();
+        let negative = s.starts_with('-');
+        let body = s.trim_start_matches(['-', '+']);
+        let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+        if int_part.is_empty() && frac_part.is_empty() {
+            return Err(AmountError::Overflow);
+        }
+        if !int_part.bytes().chain(frac_part.bytes()).all(|b| b.is_ascii_digit()) {
+            return Err(AmountError::Overflow);
+        }
+        let digits = format!("{int_part}{frac_part}");
+        let trimmed = digits.trim_start_matches('0');
+        if trimmed.is_empty() {
+            return Ok(IOUAmount::ZERO);
+        }
+        // Keep at most 17 leading digits so the mantissa fits u64 before the
+        // normalize loop trims it to the canonical 16.
+        let kept = &trimmed[..trimmed.len().min(17)];
+        let dropped = trimmed.len() - kept.len();
+        let mantissa: u64 = kept.parse().map_err(|_| AmountError::Overflow)?;
+        let exponent = -(frac_part.len() as i32) + dropped as i32;
+        IOUAmount::from_parts(mantissa, exponent, negative)
+    }
+
+    /// Render as a plain decimal string that [`IOUAmount::from_decimal_string`]
+    /// (and rippled's STAmount parser) round-trips back to the same value.
+    /// No exponent form, no trailing fractional zeros.
+    pub fn to_decimal_string(&self) -> String {
+        if self.is_zero() {
+            return "0".to_string();
+        }
+        let sign = if self.negative { "-" } else { "" };
+        let digits = self.mantissa.to_string();
+        let exp = self.exponent;
+        if exp >= 0 {
+            return format!("{sign}{digits}{}", "0".repeat(exp as usize));
+        }
+        let frac = (-exp) as usize;
+        let body = if frac >= digits.len() {
+            let zeros = "0".repeat(frac - digits.len());
+            let frac_digits = format!("{zeros}{digits}");
+            format!("0.{}", frac_digits.trim_end_matches('0'))
+        } else {
+            let point = digits.len() - frac;
+            let (int_part, frac_part) = digits.split_at(point);
+            let frac_part = frac_part.trim_end_matches('0');
+            if frac_part.is_empty() {
+                int_part.to_string()
+            } else {
+                format!("{int_part}.{frac_part}")
+            }
+        };
+        format!("{sign}{body}")
+    }
+
     /// Add two IOU amounts.
     pub fn add(a: &IOUAmount, b: &IOUAmount) -> Result<IOUAmount, AmountError> {
         if a.is_zero() {
@@ -1006,6 +1066,54 @@ mod tests {
         // should return MIN_POSITIVE
         let result = IOUAmount::mul_round(&IOUAmount::ZERO, &IOUAmount::ZERO, true).unwrap();
         assert_eq!(result, IOUAmount::MIN_POSITIVE);
+    }
+
+    #[test]
+    fn decimal_roundtrip_338500_balances() {
+        // The #338500 RippleState balances must round-trip byte-exactly.
+        for s in [
+            "-3.022389776875825",
+            "-2.020389776875825",
+            "1.002",
+            "-1",
+            "149.562159591",
+            "0",
+        ] {
+            let a = IOUAmount::from_decimal_string(s).unwrap();
+            let rendered = a.to_decimal_string();
+            let b = IOUAmount::from_decimal_string(&rendered).unwrap();
+            assert_eq!(a, b, "round-trip mismatch for {s} -> {rendered}");
+        }
+    }
+
+    #[test]
+    fn decimal_string_forms() {
+        assert_eq!(
+            IOUAmount::from_decimal_string("1.002").unwrap().to_decimal_string(),
+            "1.002"
+        );
+        assert_eq!(
+            IOUAmount::from_decimal_string("100").unwrap().to_decimal_string(),
+            "100"
+        );
+        assert_eq!(
+            IOUAmount::from_decimal_string("-1").unwrap().to_decimal_string(),
+            "-1"
+        );
+        assert_eq!(
+            IOUAmount::from_decimal_string("0.5").unwrap().to_decimal_string(),
+            "0.5"
+        );
+        assert_eq!(IOUAmount::from_decimal_string("0").unwrap().to_decimal_string(), "0");
+    }
+
+    #[test]
+    fn decimal_delta_338500_owner() {
+        // Owner BTC line: -3.022389776875825 + 1.002 (debit grossed) = -2.020389776875825.
+        let before = IOUAmount::from_decimal_string("-3.022389776875825").unwrap();
+        let gross = IOUAmount::from_decimal_string("1.002").unwrap();
+        let after = IOUAmount::add(&before, &gross).unwrap();
+        assert_eq!(after.to_decimal_string(), "-2.020389776875825");
     }
 
     #[test]
