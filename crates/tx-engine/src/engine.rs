@@ -1,4 +1,5 @@
 use rxrpl_amendment::Rules;
+use rxrpl_amendment::feature::feature_id;
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::{TransactionResult, TransactionType, keylet};
 use serde_json::Value;
@@ -316,6 +317,7 @@ impl TxEngine {
         let drops_before = ledger.header.drops;
         let view = LedgerView::with_fees(ledger, fees.clone());
         let mut sandbox = Sandbox::new(&view);
+        sandbox.set_sorted_directories(rules.enabled(&feature_id("SortedDirectories")));
 
         if !is_pseudo {
             let fee_drops = helpers::get_fee(tx);
