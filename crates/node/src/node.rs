@@ -562,9 +562,9 @@ impl Node {
                     let pending = q.drain_for_retry();
                     drop(q);
 
-                    let rules = Rules::new();
                     let mut requeue = Vec::new();
                     let mut l = ledger.write().await;
+                    let rules = crate::play_forward::rules_for_ledger(&l);
                     for entry in pending {
                         match tx_engine_close.apply(&entry.tx, &mut l, &rules, &fees_close) {
                             Ok(result) if result.is_success() => {
@@ -2243,8 +2243,8 @@ impl Node {
                                 };
 
                                 // Apply to open ledger (speculative)
-                                let rules = Rules::new();
                                 let mut l = ledger.write().await;
+                                let rules = crate::play_forward::rules_for_ledger(&l);
                                 match tx_engine.apply(&tx_json, &mut l, &rules, &fees) {
                                     Ok(result) => {
                                         drop(l);
@@ -3033,9 +3033,9 @@ impl Node {
             let pending = q.drain_for_retry();
             drop(q);
 
-            let rules = Rules::new();
             let mut requeue = Vec::new();
             let mut l = ledger.write().await;
+            let rules = crate::play_forward::rules_for_ledger(&l);
             for entry in pending {
                 match tx_engine.apply(&entry.tx, &mut l, &rules, fees) {
                     Ok(result) if result.is_success() => {
@@ -3312,7 +3312,7 @@ impl Node {
         if !ledger.is_open() {
             return Err(NodeError::LedgerNotOpen);
         }
-        let rules = Rules::new();
+        let rules = crate::play_forward::rules_for_ledger(ledger);
         let result = tx_engine.apply(tx, ledger, &rules, fees)?;
         Ok(result)
     }
@@ -3437,7 +3437,7 @@ impl Node {
             return Vec::new();
         }
 
-        let rules = Rules::new();
+        let rules = crate::play_forward::rules_for_ledger(ledger);
         let mut results = Vec::with_capacity(changes.len());
         for change in changes {
             let tx = serde_json::json!({
