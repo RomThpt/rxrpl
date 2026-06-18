@@ -159,7 +159,10 @@ impl SandboxChanges {
                     .get(key)
                     .cloned()
                     .or_else(|| Some(data.clone())),
-                final_fields: None,
+                // The deleted entry's FINAL state (e.g. an offer consumed to
+                // zero before deletion). Equals the original when nothing
+                // mutated it first, so a plain delete shows no PreviousFields.
+                final_fields: Some(data.clone()),
             });
         }
 
@@ -221,9 +224,13 @@ impl TxMeta {
                     "ModifiedNode"
                 }
                 ChangeType::Deleted => {
-                    let finals = section_fields(&prev, SMD_ALWAYS | SMD_DELETE_FINAL, false);
+                    let finals = section_fields(&fin, SMD_ALWAYS | SMD_DELETE_FINAL, false);
                     if !finals.is_empty() {
                         inner.insert("FinalFields".into(), finals.into());
+                    }
+                    let prevs = changed_previous_fields(&prev, &fin);
+                    if !prevs.is_empty() {
+                        inner.insert("PreviousFields".into(), prevs.into());
                     }
                     "DeletedNode"
                 }
@@ -311,6 +318,8 @@ mod tests {
         assert_eq!(meta.affected_nodes.len(), 1);
         assert_eq!(meta.affected_nodes[0].change_type, ChangeType::Deleted);
         assert!(meta.affected_nodes[0].previous.is_some());
-        assert!(meta.affected_nodes[0].final_fields.is_none());
+        // The deleted node carries its final state (here equal to the original,
+        // since nothing mutated it before deletion).
+        assert!(meta.affected_nodes[0].final_fields.is_some());
     }
 }
