@@ -49,7 +49,24 @@ impl Transactor for OfferCancelTransactor {
         let offer_seq = ctx.tx["OfferSequence"].as_u64().unwrap_or(0) as u32;
         let offer_key = keylet::offer(&account_id, offer_seq);
 
-        // Unlink from owner directory then delete the offer
+        // Unlink from BOTH the owner directory and the order-book directory
+        // (the offer records its book root in BookDirectory), then delete it.
+        if let Some(bytes) = ctx.view.read(&offer_key) {
+            if let Ok(offer) = serde_json::from_slice::<Value>(&bytes) {
+                if let Some(book_dir) = offer
+                    .get("BookDirectory")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| hex::decode(s).ok())
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                {
+                    crate::owner_dir::dir_remove(
+                        ctx.view,
+                        &rxrpl_primitives::Hash256::new(book_dir),
+                        &offer_key,
+                    )?;
+                }
+            }
+        }
         remove_from_owner_dir(ctx.view, &account_id, &offer_key)?;
         ctx.view
             .erase(&offer_key)

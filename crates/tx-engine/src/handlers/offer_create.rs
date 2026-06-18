@@ -1,13 +1,68 @@
 use rxrpl_amendment::feature::feature_id;
+use rxrpl_amount::{IOUAmount, offer_quality};
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_primitives::AccountId;
+use rxrpl_primitives::{AccountId, Hash256};
 use rxrpl_protocol::TransactionResult;
 use rxrpl_protocol::keylet;
 use serde_json::Value;
 
 use crate::helpers;
-use crate::owner_dir::{add_to_dir, add_to_owner_dir};
+use crate::owner_dir::{add_to_book_dir, add_to_owner_dir};
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
+
+fn u64_hex(n: u64) -> String {
+    format!("{n:016X}")
+}
+
+/// The order-book directory index for a given quality: the book base with its
+/// low 64 bits replaced by the quality (rate).
+fn book_dir_with_quality(book_base: &Hash256, quality: u64) -> Hash256 {
+    let mut bytes = *book_base.as_bytes();
+    bytes[24..32].copy_from_slice(&quality.to_be_bytes());
+    Hash256::new(bytes)
+}
+
+/// Parse a decimal value string (e.g. `"277.167203027"`) into an `IOUAmount`,
+/// normalising the mantissa into rippled's `[10^15, 10^16)` range.
+fn iou_from_decimal(s: &str) -> Option<IOUAmount> {
+    let negative = s.starts_with('-');
+    let s = s.trim_start_matches(['-', '+']);
+    let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
+    let digits = format!("{int_part}{frac_part}");
+    let mut mantissa: u128 = digits.parse().ok()?;
+    if mantissa == 0 {
+        return IOUAmount::from_parts(0, 0, false).ok();
+    }
+    let mut exponent: i32 = -(frac_part.len() as i32);
+    while mantissa < 1_000_000_000_000_000 {
+        mantissa *= 10;
+        exponent -= 1;
+    }
+    while mantissa >= 10_000_000_000_000_000 {
+        mantissa /= 10;
+        exponent += 1;
+    }
+    IOUAmount::from_parts(mantissa as u64, exponent, negative).ok()
+}
+
+/// Convert a TakerPays/TakerGets amount (IOU object or XRP drops string) to an
+/// `IOUAmount` for quality computation.
+fn amount_to_iou(amount: &Value) -> Option<IOUAmount> {
+    if let Some(drops) = amount.as_str() {
+        // XRP: drops as an integer value.
+        return iou_from_decimal(drops);
+    }
+    iou_from_decimal(amount.get("value").and_then(|v| v.as_str())?)
+}
+
+/// The offer's quality (rate) = TakerPays / TakerGets, encoded as rippled's
+/// 64-bit rate. Returns 0 if either side cannot be parsed.
+fn offer_book_quality(taker_pays: &Value, taker_gets: &Value) -> u64 {
+    match (amount_to_iou(taker_pays), amount_to_iou(taker_gets)) {
+        (Some(p), Some(g)) => offer_quality(&p, &g).unwrap_or(0),
+        _ => 0,
+    }
+}
 
 /// OfferCreate transaction handler.
 ///
@@ -119,32 +174,56 @@ impl Transactor for OfferCreateTransactor {
             keylet::book_dir(&gets_currency, &gets_issuer, &pays_currency, &pays_issuer);
         sweep_unfunded_offers(ctx, &inverse_book)?;
 
-        // Create the offer ledger entry
         let offer_key = keylet::offer(&account_id, sequence);
-        let offer_obj = serde_json::json!({
-            "LedgerEntryType": "Offer",
-            "Account": account_str,
-            "Sequence": sequence,
-            "TakerPays": ctx.tx["TakerPays"],
-            "TakerGets": ctx.tx["TakerGets"],
-            "Flags": ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0),
-        });
 
-        let offer_bytes =
-            serde_json::to_vec(&offer_obj).map_err(|_| TransactionResult::TemMalformed)?;
+        // The order-book directory is keyed by the book base (currencies +
+        // issuers) with its low 64 bits replaced by the offer's quality (rate),
+        // so offers sort by price. rippled stores this as the offer's
+        // BookDirectory and tags the directory with the rate + book assets.
+        let quality = offer_book_quality(&ctx.tx["TakerPays"], &ctx.tx["TakerGets"]);
+        let book_base =
+            keylet::book_dir(&pays_currency, &pays_issuer, &gets_currency, &gets_issuer);
+        let book_dir_key = book_dir_with_quality(&book_base, quality);
+        let book_describe = [
+            ("ExchangeRate", Value::from(u64_hex(quality))),
+            ("TakerPaysCurrency", hex::encode_upper(pays_currency).into()),
+            (
+                "TakerPaysIssuer",
+                hex::encode_upper(pays_issuer.as_bytes()).into(),
+            ),
+            ("TakerGetsCurrency", hex::encode_upper(gets_currency).into()),
+            (
+                "TakerGetsIssuer",
+                hex::encode_upper(gets_issuer.as_bytes()).into(),
+            ),
+        ];
+        let book_node = add_to_book_dir(ctx.view, &book_dir_key, &offer_key, &book_describe)?;
+        let owner_node = add_to_owner_dir(ctx.view, &account_id, &offer_key)?;
+
+        // Build the Offer SLE. U64 page fields and Flags are omitted when zero,
+        // matching rippled's serialization.
+        let mut offer = serde_json::Map::new();
+        offer.insert("LedgerEntryType".into(), "Offer".into());
+        offer.insert("Account".into(), account_str.into());
+        offer.insert("Sequence".into(), Value::from(sequence));
+        offer.insert("TakerPays".into(), ctx.tx["TakerPays"].clone());
+        offer.insert("TakerGets".into(), ctx.tx["TakerGets"].clone());
+        offer.insert("BookDirectory".into(), book_dir_key.to_string().into());
+        let flags = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
+        if flags != 0 {
+            offer.insert("Flags".into(), Value::from(flags));
+        }
+        if book_node != 0 {
+            offer.insert("BookNode".into(), u64_hex(book_node).into());
+        }
+        if owner_node != 0 {
+            offer.insert("OwnerNode".into(), u64_hex(owner_node).into());
+        }
+        let offer_bytes = serde_json::to_vec(&Value::Object(offer))
+            .map_err(|_| TransactionResult::TemMalformed)?;
         ctx.view
             .insert(offer_key, offer_bytes)
             .map_err(|_| TransactionResult::TemMalformed)?;
-
-        add_to_owner_dir(ctx.view, &account_id, &offer_key)?;
-
-        // Link the offer into the order book directory so book_offers can
-        // find it. The book is keyed by (taker_pays, taker_gets) currency
-        // and issuer pairs. XRP is encoded with a zero issuer + zero
-        // currency (20 bytes of 0).
-        let book_root =
-            keylet::book_dir(&pays_currency, &pays_issuer, &gets_currency, &gets_issuer);
-        add_to_dir(ctx.view, &book_root, &offer_key)?;
 
         // Bump owner count for the new resting offer (sequence already consumed).
         helpers::adjust_owner_count(&mut acct, 1);

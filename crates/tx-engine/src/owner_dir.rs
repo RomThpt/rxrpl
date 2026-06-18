@@ -17,152 +17,233 @@ use serde_json::Value;
 
 use crate::view::apply_view::ApplyView;
 
-/// Maximum entries kept in the root page before we'd need to split.
-/// rippled's `dirNodeMaxEntries` is 32; we cap at 31 to leave headroom.
-const MAX_ENTRIES_PER_PAGE: usize = 31;
+/// rippled's `dirNodeMaxEntries`.
+const MAX_ENTRIES_PER_PAGE: usize = 32;
 
-/// Add an entry's hash to the account's owner directory.
-///
-/// Creates the root page if it doesn't exist yet. If the entry is already
-/// listed (idempotency), returns `Ok(())` without modification.
-pub fn add_to_owner_dir(
-    view: &mut dyn ApplyView,
-    account_id: &AccountId,
-    entry_key: &Hash256,
-) -> Result<(), TransactionResult> {
-    let root_key = keylet::owner_dir(account_id);
-    let entry_hex = entry_key.to_string();
-
-    match view.read(&root_key) {
-        None => {
-            // Root page absent → create.
-            let dir = serde_json::json!({
-                "LedgerEntryType": "DirectoryNode",
-                "Owner": encode_account_id(account_id),
-                "RootIndex": root_key.to_string(),
-                "Indexes": [entry_hex],
-                "Flags": 0,
-            });
-            let bytes = serde_json::to_vec(&dir).map_err(|_| TransactionResult::TefInternal)?;
-            view.insert(root_key, bytes)
-                .map_err(|_| TransactionResult::TefInternal)?;
-        }
-        Some(bytes) => {
-            let mut dir: Value =
-                serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
-            let indexes = dir
-                .get_mut("Indexes")
-                .and_then(|v| v.as_array_mut())
-                .ok_or(TransactionResult::TefInternal)?;
-
-            if indexes
-                .iter()
-                .any(|v| v.as_str() == Some(entry_hex.as_str()))
-            {
-                return Ok(());
-            }
-            if indexes.len() >= MAX_ENTRIES_PER_PAGE {
-                return Err(TransactionResult::TecDirFull);
-            }
-            indexes.push(Value::String(entry_hex));
-
-            let new_bytes = serde_json::to_vec(&dir).map_err(|_| TransactionResult::TefInternal)?;
-            view.update(root_key, new_bytes)
-                .map_err(|_| TransactionResult::TefInternal)?;
-        }
-    }
-    Ok(())
+fn u64_hex(n: u64) -> String {
+    format!("{n:016X}")
 }
 
-/// Add an entry's hash to a directory rooted at `root_key`.
-///
-/// Generic over directory kind (book directory, deposit-preauth, etc.).
-/// The created `DirectoryNode` carries the supplied root hash and a fresh
-/// `Indexes` list; subsequent calls append to the existing page.
-pub fn add_to_dir(
+fn read_u64_field(obj: &Value, field: &str) -> u64 {
+    obj.get(field)
+        .and_then(|v| v.as_str())
+        .and_then(|s| u64::from_str_radix(s, 16).ok())
+        .unwrap_or(0)
+}
+
+fn dir_page(obj: &Value) -> Vec<String> {
+    obj.get("Indexes")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_uppercase()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Insert `entry_key` into a paginated directory rooted at `root_key`, mirroring
+/// rippled's `ApplyView::dirAdd`. Owner directories sort each touched page
+/// (`sorted = true`); book directories preserve insertion order. `describe` is
+/// the type-specific field set written onto newly created pages. Returns the
+/// page number the entry landed in — the `OwnerNode` / `BookNode` value.
+pub fn dir_insert(
+    view: &mut dyn ApplyView,
+    root_key: &Hash256,
+    entry_key: &Hash256,
+    sorted: bool,
+    describe: &[(&str, Value)],
+) -> Result<u64, TransactionResult> {
+    let entry_hex = entry_key.to_string().to_uppercase();
+
+    let make_page = |indexes: Vec<String>, extra: &[(&str, Value)]| -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("LedgerEntryType".into(), "DirectoryNode".into());
+        m.insert("Flags".into(), Value::from(0u32));
+        m.insert("RootIndex".into(), root_key.to_string().into());
+        for (k, v) in describe {
+            m.insert((*k).to_string(), v.clone());
+        }
+        for (k, v) in extra {
+            m.insert((*k).to_string(), v.clone());
+        }
+        m.insert(
+            "Indexes".into(),
+            Value::Array(indexes.into_iter().map(Value::from).collect()),
+        );
+        Value::Object(m)
+    };
+    let put = |view: &mut dyn ApplyView, key: Hash256, v: &Value, insert: bool| {
+        let bytes = serde_json::to_vec(v).map_err(|_| TransactionResult::TefInternal)?;
+        if insert {
+            view.insert(key, bytes)
+        } else {
+            view.update(key, bytes)
+        }
+        .map_err(|_| TransactionResult::TefInternal)
+    };
+
+    let Some(root_bytes) = view.read(root_key) else {
+        put(view, *root_key, &make_page(vec![entry_hex], &[]), true)?;
+        return Ok(0);
+    };
+    let root: Value =
+        serde_json::from_slice(&root_bytes).map_err(|_| TransactionResult::TefInternal)?;
+
+    let last_page = read_u64_field(&root, "IndexPrevious");
+    let node_key = keylet::dir_node(root_key, last_page);
+    let mut node: Value = if last_page == 0 {
+        root.clone()
+    } else {
+        let b = view.read(&node_key).ok_or(TransactionResult::TefInternal)?;
+        serde_json::from_slice(&b).map_err(|_| TransactionResult::TefInternal)?
+    };
+    let mut indexes = dir_page(&node);
+
+    if indexes.iter().any(|h| h == &entry_hex) {
+        return Ok(last_page);
+    }
+
+    if indexes.len() < MAX_ENTRIES_PER_PAGE {
+        indexes.push(entry_hex);
+        if sorted {
+            indexes.sort();
+        }
+        node["Indexes"] = Value::Array(indexes.into_iter().map(Value::from).collect());
+        put(view, node_key, &node, false)?;
+        return Ok(last_page);
+    }
+
+    // Page full: link a new page at the end of the chain.
+    let new_page = last_page.wrapping_add(1);
+    if last_page == 0 {
+        node["IndexNext"] = u64_hex(new_page).into();
+        node["IndexPrevious"] = u64_hex(new_page).into();
+        put(view, node_key, &node, false)?;
+    } else {
+        node["IndexNext"] = u64_hex(new_page).into();
+        put(view, node_key, &node, false)?;
+        let mut root_mut = root;
+        root_mut["IndexPrevious"] = u64_hex(new_page).into();
+        put(view, *root_key, &root_mut, false)?;
+    }
+    let extra: Vec<(&str, Value)> = if new_page != 1 {
+        vec![("IndexPrevious", u64_hex(new_page - 1).into())]
+    } else {
+        vec![]
+    };
+    put(
+        view,
+        keylet::dir_node(root_key, new_page),
+        &make_page(vec![entry_key.to_string().to_uppercase()], &extra),
+        true,
+    )?;
+    Ok(new_page)
+}
+
+/// Remove `entry_key` from a paginated directory, walking the page chain from
+/// the root. Empties non-root pages are unlinked and erased; an empty root with
+/// no successor is erased. No-op if the entry is absent.
+pub fn dir_remove(
     view: &mut dyn ApplyView,
     root_key: &Hash256,
     entry_key: &Hash256,
 ) -> Result<(), TransactionResult> {
-    let entry_hex = entry_key.to_string();
-
-    match view.read(root_key) {
-        None => {
-            let dir = serde_json::json!({
-                "LedgerEntryType": "DirectoryNode",
-                "RootIndex": root_key.to_string(),
-                "Indexes": [entry_hex],
-                "Flags": 0,
-            });
-            let bytes = serde_json::to_vec(&dir).map_err(|_| TransactionResult::TefInternal)?;
-            view.insert(*root_key, bytes)
-                .map_err(|_| TransactionResult::TefInternal)?;
-        }
-        Some(bytes) => {
-            let mut dir: Value =
-                serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
-            let indexes = dir
-                .get_mut("Indexes")
-                .and_then(|v| v.as_array_mut())
-                .ok_or(TransactionResult::TefInternal)?;
-            if indexes
-                .iter()
-                .any(|v| v.as_str() == Some(entry_hex.as_str()))
-            {
-                return Ok(());
+    let entry_hex = entry_key.to_string().to_uppercase();
+    let mut page = 0u64;
+    loop {
+        let page_key = keylet::dir_node(root_key, page);
+        let Some(bytes) = view.read(&page_key) else {
+            return Ok(());
+        };
+        let mut node: Value =
+            serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let mut indexes = dir_page(&node);
+        let next = read_u64_field(&node, "IndexNext");
+        if let Some(pos) = indexes.iter().position(|h| h == &entry_hex) {
+            indexes.remove(pos);
+            if indexes.is_empty() && page != 0 {
+                // Unlink this page from the chain, then erase it.
+                let prev = read_u64_field(&node, "IndexPrevious");
+                relink(view, root_key, prev, next)?;
+                view.erase(&page_key)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+            } else if indexes.is_empty() && page == 0 && next == 0 {
+                view.erase(&page_key)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+            } else {
+                node["Indexes"] = Value::Array(indexes.into_iter().map(Value::from).collect());
+                let nb = serde_json::to_vec(&node).map_err(|_| TransactionResult::TefInternal)?;
+                view.update(page_key, nb)
+                    .map_err(|_| TransactionResult::TefInternal)?;
             }
-            if indexes.len() >= MAX_ENTRIES_PER_PAGE {
-                return Err(TransactionResult::TecDirFull);
-            }
-            indexes.push(Value::String(entry_hex));
-            let new_bytes = serde_json::to_vec(&dir).map_err(|_| TransactionResult::TefInternal)?;
-            view.update(*root_key, new_bytes)
-                .map_err(|_| TransactionResult::TefInternal)?;
+            return Ok(());
         }
+        if next == 0 {
+            return Ok(());
+        }
+        page = next;
     }
+}
+
+/// Repair the `IndexNext`/`IndexPrevious` links around a removed page.
+fn relink(
+    view: &mut dyn ApplyView,
+    root_key: &Hash256,
+    prev: u64,
+    next: u64,
+) -> Result<(), TransactionResult> {
+    let patch = |view: &mut dyn ApplyView, page: u64, field: &str, val: u64| {
+        let key = keylet::dir_node(root_key, page);
+        if let Some(b) = view.read(&key) {
+            if let Ok(mut n) = serde_json::from_slice::<Value>(&b) {
+                if val == 0 {
+                    n.as_object_mut().map(|o| o.remove(field));
+                } else {
+                    n[field] = u64_hex(val).into();
+                }
+                if let Ok(nb) = serde_json::to_vec(&n) {
+                    let _ = view.update(key, nb);
+                }
+            }
+        }
+    };
+    patch(view, prev, "IndexNext", next);
+    patch(view, next, "IndexPrevious", prev);
     Ok(())
 }
 
-/// Remove an entry's hash from the account's owner directory.
-///
-/// Erases the root page if it becomes empty. Removing a non-existent
-/// entry is a no-op (returns `Ok(())`) — defensive parity with rippled
-/// which tolerates redundant unlinks during cleanup paths.
+/// Add an entry to the account's (sorted, paginated) owner directory. Returns
+/// the page number (`OwnerNode`) the entry landed in.
+pub fn add_to_owner_dir(
+    view: &mut dyn ApplyView,
+    account_id: &AccountId,
+    entry_key: &Hash256,
+) -> Result<u64, TransactionResult> {
+    let root_key = keylet::owner_dir(account_id);
+    let describe = [("Owner", Value::from(encode_account_id(account_id)))];
+    dir_insert(view, &root_key, entry_key, true, &describe)
+}
+
+/// Append an entry to a book directory page. `describe` carries the book's
+/// `ExchangeRate` / `TakerPays*` / `TakerGets*` fields for new pages. Returns
+/// the `BookNode` page the entry landed in.
+pub fn add_to_book_dir(
+    view: &mut dyn ApplyView,
+    root_key: &Hash256,
+    entry_key: &Hash256,
+    describe: &[(&str, Value)],
+) -> Result<u64, TransactionResult> {
+    dir_insert(view, root_key, entry_key, false, describe)
+}
+
+/// Remove an entry from the account's owner directory (paginated).
 pub fn remove_from_owner_dir(
     view: &mut dyn ApplyView,
     account_id: &AccountId,
     entry_key: &Hash256,
 ) -> Result<(), TransactionResult> {
-    let root_key = keylet::owner_dir(account_id);
-    let entry_hex = entry_key.to_string();
-
-    let bytes = match view.read(&root_key) {
-        Some(b) => b,
-        None => return Ok(()),
-    };
-
-    let mut dir: Value =
-        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
-    let indexes = dir
-        .get_mut("Indexes")
-        .and_then(|v| v.as_array_mut())
-        .ok_or(TransactionResult::TefInternal)?;
-
-    let original_len = indexes.len();
-    indexes.retain(|v| v.as_str() != Some(entry_hex.as_str()));
-    if indexes.len() == original_len {
-        return Ok(());
-    }
-
-    if indexes.is_empty() {
-        view.erase(&root_key)
-            .map_err(|_| TransactionResult::TefInternal)?;
-    } else {
-        let new_bytes = serde_json::to_vec(&dir).map_err(|_| TransactionResult::TefInternal)?;
-        view.update(root_key, new_bytes)
-            .map_err(|_| TransactionResult::TefInternal)?;
-    }
-    Ok(())
+    dir_remove(view, &keylet::owner_dir(account_id), entry_key)
 }
 
 /// Consume the transaction's sequence proxy: either bump the account
@@ -312,17 +393,20 @@ mod tests {
     }
 
     #[test]
-    fn full_page_returns_tec_dir_full() {
+    fn full_page_spills_into_new_page() {
         let (ledger, fees) = fresh_sandbox();
         let view = LedgerView::with_fees(&ledger, fees);
         let mut sandbox = Sandbox::new(&view);
 
         let account = id();
+        // First MAX_ENTRIES_PER_PAGE entries fill the root page (page 0).
         for i in 0..MAX_ENTRIES_PER_PAGE {
-            add_to_owner_dir(&mut sandbox, &account, &entry(i as u8)).unwrap();
+            let page = add_to_owner_dir(&mut sandbox, &account, &entry(i as u8)).unwrap();
+            assert_eq!(page, 0);
         }
-        let err = add_to_owner_dir(&mut sandbox, &account, &entry(0xff)).unwrap_err();
-        assert_eq!(err, TransactionResult::TecDirFull);
+        // The next entry spills into a freshly linked page (page 1).
+        let page = add_to_owner_dir(&mut sandbox, &account, &entry(0xff)).unwrap();
+        assert_eq!(page, 1);
     }
 
     fn account_obj(seq: u32, owner_count: u32) -> Value {
