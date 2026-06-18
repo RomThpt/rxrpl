@@ -676,9 +676,9 @@ mod tests {
         // Byte-exact fidelity: every transaction applies, and the replay
         // reproduces the validated header's account_hash, tx_hash, ledger_hash
         // and total coins. Holds for the supported mainnet ledgers (#268000,
-        // #300000, #316000, #338500 full-fill offer crossing); a ledger
-        // exercising not-yet-faithful transactor logic would trip this and the
-        // `diffs` counter above.
+        // #300000, #316000, #338500 full-fill + #346750 partial-fill offer
+        // crossing); a ledger exercising not-yet-faithful transactor logic
+        // would trip this and the `diffs` counter above.
         assert_eq!(outcome.failed, 0, "every transaction in the set must apply");
         assert!(outcome.is_faithful(), "replay must reproduce the validated header");
         assert_eq!(diffs, 0, "no state entry may differ from rippled");

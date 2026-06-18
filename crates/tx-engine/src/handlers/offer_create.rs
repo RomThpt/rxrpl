@@ -482,27 +482,54 @@ fn cross_offers(
                 continue;
             }
 
-            // Full take only when the taker wants at least the whole offer.
-            if !leg_ge(&remaining_out, &offer_out) {
-                break 'walk; // partial take not yet supported byte-exact
-            }
-            // Move funds: taker pays offer_in, owner pays offer_out (grossed).
-            pay_in(ctx, taker, taker_acct, &owner, &offer_in)?;
-            pay_out(ctx, taker, &owner, &offer_out)?;
-
-            // Consume the offer to zero (full take), recording the amount change
-            // in metadata, then delete it (rippled consumes before BookTip drops).
-            let mut consumed = offer.clone();
-            consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
-            consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
-            let cb = serde_json::to_vec(&consumed).map_err(|_| TransactionResult::TefInternal)?;
-            ctx.view
-                .update(offer_key, cb)
+            // Full take when the taker wants the whole offer; otherwise a
+            // partial take of just `remaining_out`, priced at the offer's
+            // quality (`order_in = order_out * rate`, clamped to the offer).
+            let full_take = leg_ge(&remaining_out, &offer_out);
+            let (order_out, order_in) = if full_take {
+                (offer_out.clone(), offer_in.clone())
+            } else {
+                let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
+                let computed = rxrpl_amount::Amount::multiply(
+                    &leg_to_amount(&remaining_out),
+                    &rxrpl_amount::Amount::Iou(rate),
+                    in_leg.is_xrp,
+                )
                 .map_err(|_| TransactionResult::TefInternal)?;
-            reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                let order_in = leg_min(&amount_to_leg(&computed, &offer_in), &offer_in);
+                (remaining_out.clone(), order_in)
+            };
 
-            remaining_out = leg_sub(&remaining_out, &offer_out);
-            remaining_in = leg_sub(&remaining_in, &offer_in);
+            // Move funds: taker pays order_in (grossed), owner pays order_out.
+            pay_in(ctx, taker, taker_acct, &owner, &order_in)?;
+            pay_out(ctx, taker, taker_acct, &owner, &order_out)?;
+
+            if full_take {
+                // Consume to zero (records the change in metadata) then delete,
+                // as rippled consumes before BookTip drops the offer.
+                let mut consumed = offer.clone();
+                consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
+                consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
+                let cb = serde_json::to_vec(&consumed).map_err(|_| TransactionResult::TefInternal)?;
+                ctx.view
+                    .update(offer_key, cb)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+                reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+            } else {
+                // Reduce the resting offer in place by the filled amounts.
+                let new_gets = leg_sub(&offer_out, &order_out);
+                let new_pays = leg_sub(&offer_in, &order_in);
+                let mut reduced = offer.clone();
+                reduced["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
+                reduced["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
+                let rb = serde_json::to_vec(&reduced).map_err(|_| TransactionResult::TefInternal)?;
+                ctx.view
+                    .update(offer_key, rb)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+            }
+
+            remaining_out = leg_sub(&remaining_out, &order_out);
+            remaining_in = leg_sub(&remaining_in, &order_in);
             crossed = true;
         }
     }
@@ -521,6 +548,30 @@ fn leg_as_quality_iou(leg: &Leg) -> IOUAmount {
     } else {
         leg.iou
     }
+}
+
+/// A leg as a unified `Amount` (XRP drops or IOU).
+fn leg_to_amount(leg: &Leg) -> rxrpl_amount::Amount {
+    if leg.is_xrp {
+        rxrpl_amount::Amount::Xrp(leg.drops)
+    } else {
+        rxrpl_amount::Amount::Iou(leg.iou)
+    }
+}
+
+/// Build a leg carrying `amount`, keeping `template`'s currency/issuer/kind.
+fn amount_to_leg(amount: &rxrpl_amount::Amount, template: &Leg) -> Leg {
+    let mut out = template.clone();
+    match amount {
+        rxrpl_amount::Amount::Xrp(d) => out.drops = *d,
+        rxrpl_amount::Amount::Iou(v) => out.iou = *v,
+    }
+    out
+}
+
+/// The smaller of two like-typed legs.
+fn leg_min(a: &Leg, b: &Leg) -> Leg {
+    if leg_ge(a, b) { b.clone() } else { a.clone() }
 }
 
 /// `a >= b` for like-typed legs.
@@ -568,15 +619,19 @@ fn pay_in(
 
 /// Move the offer owner's output to the taker: XRP via balances, IOU via the
 /// grossed owner debit / net taker credit (the difference is the burned fee).
+/// The taker's XRP credit goes through `taker_acct` (the caller's working copy),
+/// not the view, so the apply's final account write does not clobber it.
 fn pay_out(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
+    taker_acct: &mut Value,
     owner: &AccountId,
     amount: &Leg,
 ) -> Result<(), TransactionResult> {
     if amount.is_xrp {
         credit_xrp(ctx, owner, -amount.drops)?;
-        return credit_xrp(ctx, taker, amount.drops);
+        helpers::set_balance(taker_acct, helpers::get_balance(taker_acct) + amount.drops as u64);
+        return Ok(());
     }
     let rate = transfer_rate(ctx, &amount.issuer);
     let gross = grossed(&amount.iou, &rate);
