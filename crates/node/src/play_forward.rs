@@ -99,6 +99,31 @@ pub fn parse_tx_set(result: &Value) -> Result<(Hash256, TxSet), NodeError> {
     Ok((set_hash, txs))
 }
 
+/// Build the amendment `Rules` in force for a ledger from its `Amendments`
+/// state object, the way rippled derives them. Returns empty rules (every
+/// amendment off) when the object is absent — correct for pre-amendment
+/// ledgers. This is the source of truth for amendment-gated apply logic, so
+/// replaying or applying onto a ledger reproduces its era's behaviour.
+pub fn rules_for_ledger(ledger: &Ledger) -> Rules {
+    let enabled = ledger
+        .get_state(&rxrpl_protocol::keylet::amendments())
+        .and_then(|b| rxrpl_ledger::sle_codec::decode_state(b).ok())
+        .and_then(|v| {
+            v.get("Amendments")
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str())
+                        .filter_map(|s| hex::decode(s).ok())
+                        .filter_map(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                        .map(Hash256::new)
+                        .collect::<Vec<_>>()
+                })
+        })
+        .unwrap_or_default();
+    Rules::from_enabled(enabled)
+}
+
 /// Result of replaying a transaction set forward onto a parent ledger.
 pub struct ReplayOutcome {
     /// The reconstructed closed ledger.
@@ -141,7 +166,9 @@ pub fn replay_forward(
     // inherits the parent's, which can differ from the chain's chosen value.
     ledger.header.close_time_resolution = header.close_time_resolution;
 
-    let rules = Rules::new();
+    // Amendments in force are those enabled in the (inherited) parent state, so
+    // each replayed ledger applies with its own era's amendment-gated logic.
+    let rules = rules_for_ledger(&ledger);
 
     // Decode once, in canonical order. Anything that fails to decode is dropped.
     let total = txs.len();
@@ -311,6 +338,28 @@ mod tests {
         let ids: Vec<Hash256> = txs.iter().map(|(id, _)| *id).collect();
         assert_eq!(set_hash, rxrpl_shamap::transaction_set_root(&ids));
         assert!(!set_hash.is_zero());
+    }
+
+    #[test]
+    fn rules_for_ledger_reads_enabled_amendments() {
+        use rxrpl_amendment::feature::feature_id;
+        let mut ledger = Ledger::genesis();
+        let sorted = feature_id("SortedDirectories");
+        // No Amendments object yet -> nothing enabled (pre-amendment ledgers).
+        assert!(!rules_for_ledger(&ledger).enabled(&sorted));
+
+        let amendments = serde_json::json!({
+            "LedgerEntryType": "Amendments",
+            "Amendments": [hex::encode_upper(sorted.as_bytes())],
+            "Flags": 0,
+        });
+        let bytes = rxrpl_ledger::sle_codec::encode_sle(&serde_json::to_vec(&amendments).unwrap())
+            .unwrap();
+        ledger
+            .put_state(rxrpl_protocol::keylet::amendments(), bytes)
+            .unwrap();
+
+        assert!(rules_for_ledger(&ledger).enabled(&sorted));
     }
 
     #[test]
