@@ -432,7 +432,7 @@ impl TxEngine {
             // transaction SHAMap leaf in rippled's canonical form,
             // `VL(tx) || VL(meta)`, so the transaction tree root (tx_hash)
             // matches the validated chain.
-            let meta = changes.build_metadata(0, result.code());
+            let meta = changes.build_metadata(ledger.tx_count(), result.code());
             let meta_json = meta.to_canonical_json();
 
             changes.apply_to_ledger(ledger)?;
