@@ -209,16 +209,19 @@ impl Transactor for OfferCreateTransactor {
         offer.insert("TakerPays".into(), ctx.tx["TakerPays"].clone());
         offer.insert("TakerGets".into(), ctx.tx["TakerGets"].clone());
         offer.insert("BookDirectory".into(), book_dir_key.to_string().into());
+        // Placeholder PreviousTxnID/LgrSeq — the engine's central stamping fills
+        // these with the creating transaction's id and ledger after apply.
+        offer.insert(
+            "PreviousTxnID".into(),
+            "0000000000000000000000000000000000000000000000000000000000000000".into(),
+        );
+        offer.insert("PreviousTxnLgrSeq".into(), Value::from(0u32));
+        // rippled's Offer always carries Flags, BookNode and OwnerNode, even
+        // when zero.
         let flags = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
-        if flags != 0 {
-            offer.insert("Flags".into(), Value::from(flags));
-        }
-        if book_node != 0 {
-            offer.insert("BookNode".into(), u64_hex(book_node).into());
-        }
-        if owner_node != 0 {
-            offer.insert("OwnerNode".into(), u64_hex(owner_node).into());
-        }
+        offer.insert("Flags".into(), Value::from(flags));
+        offer.insert("BookNode".into(), u64_hex(book_node).into());
+        offer.insert("OwnerNode".into(), u64_hex(owner_node).into());
         let offer_bytes = serde_json::to_vec(&Value::Object(offer))
             .map_err(|_| TransactionResult::TemMalformed)?;
         ctx.view

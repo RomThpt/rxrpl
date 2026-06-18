@@ -107,12 +107,14 @@ pub fn book_dir(
     gets_currency: &[u8; 20],
     gets_issuer: &AccountId,
 ) -> Hash256 {
+    // rippled getBookBase order: in.currency, out.currency, in.account,
+    // out.account — currencies grouped before issuers.
     index_hash(
         LedgerNamespace::BookDir,
         &[
             pays_currency,
-            pays_issuer.as_bytes(),
             gets_currency,
+            pays_issuer.as_bytes(),
             gets_issuer.as_bytes(),
         ],
     )

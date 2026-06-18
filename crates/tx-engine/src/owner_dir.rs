@@ -161,7 +161,11 @@ pub fn dir_remove(
         let mut indexes = dir_page(&node);
         let next = read_u64_field(&node, "IndexNext");
         if let Some(pos) = indexes.iter().position(|h| h == &entry_hex) {
-            indexes.remove(pos);
+            // Pre-SortedDirectories removal: swap the entry with the last and
+            // pop (rippled's legacy dirDelete). Replays the directory ordering
+            // of historical ledgers; order-preserving removal is the modern,
+            // amendment-gated behaviour (follow-up).
+            indexes.swap_remove(pos);
             if indexes.is_empty() && page != 0 {
                 // Unlink this page from the chain, then erase it.
                 let prev = read_u64_field(&node, "IndexPrevious");
@@ -222,7 +226,9 @@ pub fn add_to_owner_dir(
 ) -> Result<u64, TransactionResult> {
     let root_key = keylet::owner_dir(account_id);
     let describe = [("Owner", Value::from(encode_account_id(account_id)))];
-    dir_insert(view, &root_key, entry_key, true, &describe)
+    // Owner directories preserve insertion order (rippled appends, leaving
+    // legacy pages unsorted).
+    dir_insert(view, &root_key, entry_key, false, &describe)
 }
 
 /// Append an entry to a book directory page. `describe` carries the book's
