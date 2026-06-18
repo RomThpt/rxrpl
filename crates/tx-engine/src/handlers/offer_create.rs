@@ -442,10 +442,7 @@ fn cross_offers(
     // The book base for traversal has the quality (low 64 bits) zeroed;
     // `keylet::book_dir` leaves those as hash bytes, so start the walk there.
     let mut probe = book_dir_with_quality(inverse_book, 0);
-    'walk: loop {
-        let Some(dir_key) = ctx.view.succ(&probe) else {
-            break;
-        };
+    'walk: while let Some(dir_key) = ctx.view.succ(&probe) {
         if &dir_key.as_bytes()[0..24] != book_prefix {
             break; // left this book
         }
