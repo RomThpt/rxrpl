@@ -132,6 +132,25 @@ impl ReadView for Sandbox<'_> {
         self.parent.exists(key)
     }
 
+    fn succ(&self, key: &Hash256) -> Option<Hash256> {
+        // Walk the parent's successors, skipping entries deleted in this
+        // sandbox, then fold in any sandbox-local insert that lands earlier.
+        let mut candidate = self.parent.succ(key);
+        while let Some(k) = candidate {
+            if self.deletes.contains_key(&k) {
+                candidate = self.parent.succ(&k);
+            } else {
+                break;
+            }
+        }
+        for ik in self.inserts.keys() {
+            if ik > key && candidate.is_none_or(|c| *ik < c) {
+                candidate = Some(*ik);
+            }
+        }
+        candidate
+    }
+
     fn seq(&self) -> u32 {
         self.parent.seq()
     }
@@ -421,5 +440,30 @@ mod tests {
 
         assert_eq!(ledger.get_state(&k1), Some(&[10][..]));
         assert!(!ledger.has_state(&k2));
+    }
+
+    #[test]
+    fn sandbox_succ_merges_parent_and_local() {
+        // High-prefix keys sort after the genesis entries.
+        let a = Hash256::new([0xF0; 32]);
+        let b = Hash256::new([0xF2; 32]);
+        let c = Hash256::new([0xF4; 32]);
+        let (mut ledger, _) = genesis_view();
+        ledger.put_state(a, vec![1]).unwrap();
+        ledger.put_state(c, vec![1]).unwrap();
+
+        let view = LedgerView::new(&ledger);
+        let mut sandbox = Sandbox::new(&view);
+        // Local insert b lands between parent's a and c.
+        sandbox.insert(b, vec![1]).unwrap();
+
+        let below = Hash256::new([0xEF; 32]);
+        assert_eq!(sandbox.succ(&below), Some(a));
+        assert_eq!(sandbox.succ(&a), Some(b), "local insert is found");
+        assert_eq!(sandbox.succ(&b), Some(c));
+
+        // Deleting c locally makes succ(b) skip past it.
+        sandbox.erase(&c).unwrap();
+        assert_eq!(sandbox.succ(&b), None);
     }
 }
