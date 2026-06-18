@@ -302,7 +302,11 @@ impl Leg {
     }
 
     fn is_zero(&self) -> bool {
-        if self.is_xrp { self.drops == 0 } else { self.iou.is_zero() }
+        if self.is_xrp {
+            self.drops == 0
+        } else {
+            self.iou.is_zero()
+        }
     }
 }
 
@@ -361,7 +365,8 @@ fn credit_line(
         .and_then(|b| b.get("value"))
         .and_then(|v| v.as_str())
         .unwrap_or("0");
-    let balance = IOUAmount::from_decimal_string(cur).map_err(|_| TransactionResult::TefInternal)?;
+    let balance =
+        IOUAmount::from_decimal_string(cur).map_err(|_| TransactionResult::TefInternal)?;
     let holder_is_high = holder.as_bytes() > issuer.as_bytes();
     let delta = if holder_is_high { gain.negate() } else { *gain };
     let new = IOUAmount::add(&balance, &delta).map_err(|_| TransactionResult::TefInternal)?;
@@ -438,7 +443,9 @@ fn cross_offers(
     // `keylet::book_dir` leaves those as hash bytes, so start the walk there.
     let mut probe = book_dir_with_quality(inverse_book, 0);
     'walk: loop {
-        let Some(dir_key) = ctx.view.succ(&probe) else { break };
+        let Some(dir_key) = ctx.view.succ(&probe) else {
+            break;
+        };
         if &dir_key.as_bytes()[0..24] != book_prefix {
             break; // left this book
         }
@@ -447,8 +454,12 @@ fn cross_offers(
         if dir_quality > threshold {
             break; // worse than the taker will accept
         }
-        let Some(dir_bytes) = ctx.view.read(&dir_key) else { continue };
-        let Ok(dir) = serde_json::from_slice::<Value>(&dir_bytes) else { continue };
+        let Some(dir_bytes) = ctx.view.read(&dir_key) else {
+            continue;
+        };
+        let Ok(dir) = serde_json::from_slice::<Value>(&dir_bytes) else {
+            continue;
+        };
         let offers: Vec<rxrpl_primitives::Hash256> = dir
             .get("Indexes")
             .and_then(|v| v.as_array())
@@ -463,20 +474,30 @@ fn cross_offers(
             if remaining_out.is_zero() {
                 break 'walk;
             }
-            let Some(ob) = ctx.view.read(&offer_key) else { continue };
-            let Ok(offer) = serde_json::from_slice::<Value>(&ob) else { continue };
+            let Some(ob) = ctx.view.read(&offer_key) else {
+                continue;
+            };
+            let Ok(offer) = serde_json::from_slice::<Value>(&ob) else {
+                continue;
+            };
             if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
                 continue;
             }
             let owner_str = offer.get("Account").and_then(|v| v.as_str()).unwrap_or("");
-            let Ok(owner) = decode_account_id(owner_str) else { continue };
+            let Ok(owner) = decode_account_id(owner_str) else {
+                continue;
+            };
             if &owner == taker {
                 continue; // never cross our own offer (rippled steps over it)
             }
             // offer.out = what the offer gives = taker receives = offer.TakerGets.
             // offer.in  = what the offer wants = taker pays   = offer.TakerPays.
-            let Some(offer_out) = Leg::parse(&offer["TakerGets"]) else { continue };
-            let Some(offer_in) = Leg::parse(&offer["TakerPays"]) else { continue };
+            let Some(offer_out) = Leg::parse(&offer["TakerGets"]) else {
+                continue;
+            };
+            let Some(offer_in) = Leg::parse(&offer["TakerPays"]) else {
+                continue;
+            };
             if !is_offer_funded(ctx, &owner, &offer["TakerGets"]) {
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
                 continue;
@@ -510,7 +531,8 @@ fn cross_offers(
                 let mut consumed = offer.clone();
                 consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
                 consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
-                let cb = serde_json::to_vec(&consumed).map_err(|_| TransactionResult::TefInternal)?;
+                let cb =
+                    serde_json::to_vec(&consumed).map_err(|_| TransactionResult::TefInternal)?;
                 ctx.view
                     .update(offer_key, cb)
                     .map_err(|_| TransactionResult::TefInternal)?;
@@ -522,7 +544,8 @@ fn cross_offers(
                 let mut reduced = offer.clone();
                 reduced["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
                 reduced["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
-                let rb = serde_json::to_vec(&reduced).map_err(|_| TransactionResult::TefInternal)?;
+                let rb =
+                    serde_json::to_vec(&reduced).map_err(|_| TransactionResult::TefInternal)?;
                 ctx.view
                     .update(offer_key, rb)
                     .map_err(|_| TransactionResult::TefInternal)?;
@@ -613,7 +636,13 @@ fn pay_in(
     }
     let rate = transfer_rate(ctx, &amount.issuer);
     let gross = grossed(&amount.iou, &rate);
-    credit_line(ctx, taker, &amount.issuer, &amount.currency, &gross.negate())?;
+    credit_line(
+        ctx,
+        taker,
+        &amount.issuer,
+        &amount.currency,
+        &gross.negate(),
+    )?;
     credit_line(ctx, owner, &amount.issuer, &amount.currency, &amount.iou)
 }
 
@@ -630,12 +659,21 @@ fn pay_out(
 ) -> Result<(), TransactionResult> {
     if amount.is_xrp {
         credit_xrp(ctx, owner, -amount.drops)?;
-        helpers::set_balance(taker_acct, helpers::get_balance(taker_acct) + amount.drops as u64);
+        helpers::set_balance(
+            taker_acct,
+            helpers::get_balance(taker_acct) + amount.drops as u64,
+        );
         return Ok(());
     }
     let rate = transfer_rate(ctx, &amount.issuer);
     let gross = grossed(&amount.iou, &rate);
-    credit_line(ctx, owner, &amount.issuer, &amount.currency, &gross.negate())?;
+    credit_line(
+        ctx,
+        owner,
+        &amount.issuer,
+        &amount.currency,
+        &gross.negate(),
+    )?;
     credit_line(ctx, taker, &amount.issuer, &amount.currency, &amount.iou)
 }
 

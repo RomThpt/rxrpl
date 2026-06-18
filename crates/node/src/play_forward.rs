@@ -109,16 +109,14 @@ pub fn rules_for_ledger(ledger: &Ledger) -> Rules {
         .get_state(&rxrpl_protocol::keylet::amendments())
         .and_then(|b| rxrpl_ledger::sle_codec::decode_state(b).ok())
         .and_then(|v| {
-            v.get("Amendments")
-                .and_then(|a| a.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|x| x.as_str())
-                        .filter_map(|s| hex::decode(s).ok())
-                        .filter_map(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-                        .map(Hash256::new)
-                        .collect::<Vec<_>>()
-                })
+            v.get("Amendments").and_then(|a| a.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str())
+                    .filter_map(|s| hex::decode(s).ok())
+                    .filter_map(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                    .map(Hash256::new)
+                    .collect::<Vec<_>>()
+            })
         })
         .unwrap_or_default();
     Rules::from_enabled(enabled)
@@ -353,8 +351,8 @@ mod tests {
             "Amendments": [hex::encode_upper(sorted.as_bytes())],
             "Flags": 0,
         });
-        let bytes = rxrpl_ledger::sle_codec::encode_sle(&serde_json::to_vec(&amendments).unwrap())
-            .unwrap();
+        let bytes =
+            rxrpl_ledger::sle_codec::encode_sle(&serde_json::to_vec(&amendments).unwrap()).unwrap();
         ledger
             .put_state(rxrpl_protocol::keylet::amendments(), bytes)
             .unwrap();
@@ -680,7 +678,10 @@ mod tests {
         // crossing); a ledger exercising not-yet-faithful transactor logic
         // would trip this and the `diffs` counter above.
         assert_eq!(outcome.failed, 0, "every transaction in the set must apply");
-        assert!(outcome.is_faithful(), "replay must reproduce the validated header");
+        assert!(
+            outcome.is_faithful(),
+            "replay must reproduce the validated header"
+        );
         assert_eq!(diffs, 0, "no state entry may differ from rippled");
     }
 
@@ -714,7 +715,15 @@ mod tests {
             .unwrap();
         let rpc = |params: serde_json::Value| -> Value {
             rt.block_on(async {
-                client.post(&url).json(&params).send().await.unwrap().json().await.unwrap()
+                client
+                    .post(&url)
+                    .json(&params)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap()
             })
         };
 
@@ -732,8 +741,10 @@ mod tests {
             }
             let r = rpc(serde_json::json!({"method":"ledger_data","params":[p]}));
             for e in r["result"]["state"].as_array().unwrap() {
-                let key: [u8; 32] =
-                    hex::decode(e["index"].as_str().unwrap()).unwrap().try_into().unwrap();
+                let key: [u8; 32] = hex::decode(e["index"].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
                 let data = hex::decode(e["data"].as_str().unwrap()).unwrap();
                 state.put(Hash256::new(key), data).unwrap();
             }
@@ -742,7 +753,11 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(state.root_hash(), parent_header.account_hash, "parent state root");
+        assert_eq!(
+            state.root_hash(),
+            parent_header.account_hash,
+            "parent state root"
+        );
         let mut parent = Ledger::from_catchup(parent_seq, parent_header.hash, state);
         parent.header = parent_header;
         let fees = FeeSettings {
@@ -770,14 +785,20 @@ mod tests {
 
         // rippled meta blob per txid.
         let mut their_meta: std::collections::HashMap<Hash256, Vec<u8>> = Default::default();
-        for entry in bin_resp["result"]["ledger"]["transactions"].as_array().unwrap() {
+        for entry in bin_resp["result"]["ledger"]["transactions"]
+            .as_array()
+            .unwrap()
+        {
             let blob = hex::decode(entry["tx_blob"].as_str().unwrap()).unwrap();
             let meta = hex::decode(entry["meta"].as_str().unwrap()).unwrap();
             their_meta.insert(transaction_id(&blob), meta);
         }
 
         let mut leaves: Vec<(Hash256, Vec<u8>)> = Vec::new();
-        outcome.ledger.tx_map.for_each(&mut |k, v| leaves.push((*k, v.to_vec())));
+        outcome
+            .ledger
+            .tx_map
+            .for_each(&mut |k, v| leaves.push((*k, v.to_vec())));
         let mut mismatches = 0;
         for (txid, leaf) in &leaves {
             let (_tx, our_meta_json) =
@@ -789,12 +810,20 @@ mod tests {
             }
             mismatches += 1;
             let their_json = rxrpl_codec::binary::decode(their).expect("decode rippled meta");
-            eprintln!("\n=== META MISMATCH tx {} ===", hex::encode_upper(txid.as_bytes()));
-            eprintln!("TxIndex ours={} theirs={}",
-                our_meta_json["TransactionIndex"], their_json["TransactionIndex"]);
+            eprintln!(
+                "\n=== META MISMATCH tx {} ===",
+                hex::encode_upper(txid.as_bytes())
+            );
+            eprintln!(
+                "TxIndex ours={} theirs={}",
+                our_meta_json["TransactionIndex"], their_json["TransactionIndex"]
+            );
             diff_json("", &our_meta_json, &their_json);
         }
-        eprintln!("\n{mismatches}/{} transactions have mismatched metadata", leaves.len());
+        eprintln!(
+            "\n{mismatches}/{} transactions have mismatched metadata",
+            leaves.len()
+        );
     }
 
     /// Recursively print where `ours` and `theirs` differ (ours=LEFT, theirs=RIGHT).
@@ -804,7 +833,11 @@ mod tests {
                 let mut keys: std::collections::BTreeSet<&String> = a.keys().collect();
                 keys.extend(b.keys());
                 for k in keys {
-                    let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                    let p = if path.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{path}.{k}")
+                    };
                     match (a.get(k), b.get(k)) {
                         (Some(x), Some(y)) => diff_json(&p, x, y),
                         (Some(x), None) => eprintln!("  ONLY-OURS  {p} = {x}"),
