@@ -191,7 +191,10 @@ impl TxMeta {
 
             let mut inner = serde_json::Map::new();
             inner.insert("LedgerEntryType".into(), n.ledger_entry_type.clone().into());
-            inner.insert("LedgerIndex".into(), hex::encode_upper(n.key.as_bytes()).into());
+            inner.insert(
+                "LedgerIndex".into(),
+                hex::encode_upper(n.key.as_bytes()).into(),
+            );
 
             let wrapper = match n.change_type {
                 ChangeType::Created => {

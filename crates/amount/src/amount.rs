@@ -90,11 +90,18 @@ impl Amount {
     /// Build a result of the requested kind from a raw `(mantissa, exponent,
     /// negative)` triple. Native results truncate toward zero (rippled's
     /// `STAmount::canonicalize` for XRP); IOU results normalise.
-    fn finish(mantissa: u64, exponent: i32, negative: bool, native: bool) -> Result<Amount, AmountError> {
+    fn finish(
+        mantissa: u64,
+        exponent: i32,
+        negative: bool,
+        native: bool,
+    ) -> Result<Amount, AmountError> {
         if native {
             Ok(Amount::Xrp(drops_floor(mantissa, exponent, negative)?))
         } else {
-            Ok(Amount::Iou(IOUAmount::from_parts(mantissa, exponent, negative)?))
+            Ok(Amount::Iou(IOUAmount::from_parts(
+                mantissa, exponent, negative,
+            )?))
         }
     }
 
@@ -102,7 +109,11 @@ impl Amount {
     /// chosen by `native`. Mirrors `STAmount::multiply` (pre-Number regime).
     pub fn multiply(a: &Amount, b: &Amount, native: bool) -> Result<Amount, AmountError> {
         if a.is_zero() || b.is_zero() {
-            return Ok(if native { Amount::Xrp(0) } else { Amount::Iou(IOUAmount::ZERO) });
+            return Ok(if native {
+                Amount::Xrp(0)
+            } else {
+                Amount::Iou(IOUAmount::ZERO)
+            });
         }
         let (m1, e1, n1) = a.normalized_parts();
         let (m2, e2, n2) = b.normalized_parts();
@@ -117,7 +128,11 @@ impl Amount {
             return Err(AmountError::DivisionByZero);
         }
         if num.is_zero() {
-            return Ok(if native { Amount::Xrp(0) } else { Amount::Iou(IOUAmount::ZERO) });
+            return Ok(if native {
+                Amount::Xrp(0)
+            } else {
+                Amount::Iou(IOUAmount::ZERO)
+            });
         }
         let (m1, e1, n1) = num.normalized_parts();
         let (m2, e2, n2) = den.normalized_parts();
@@ -134,12 +149,20 @@ impl Amount {
         round_up: bool,
     ) -> Result<Amount, AmountError> {
         if a.is_zero() || b.is_zero() {
-            return Ok(round_zero(native, round_up, a.is_negative() || b.is_negative()));
+            return Ok(round_zero(
+                native,
+                round_up,
+                a.is_negative() || b.is_negative(),
+            ));
         }
         let (m1, e1, n1) = a.normalized_parts();
         let (m2, e2, n2) = b.normalized_parts();
         let negative = n1 != n2;
-        let bias = if negative != round_up { TEN_TO_14 - 1 } else { 0 };
+        let bias = if negative != round_up {
+            TEN_TO_14 - 1
+        } else {
+            0
+        };
         let raw = ((m1 as u128) * (m2 as u128) + bias) / TEN_TO_14;
         Self::round_finish(u128_to_u64(raw)?, e1 + e2 + 14, negative, native, round_up)
     }
@@ -160,7 +183,11 @@ impl Amount {
         let (m1, e1, n1) = num.normalized_parts();
         let (m2, e2, n2) = den.normalized_parts();
         let negative = n1 != n2;
-        let bias = if negative != round_up { (m2 as u128) - 1 } else { 0 };
+        let bias = if negative != round_up {
+            (m2 as u128) - 1
+        } else {
+            0
+        };
         let raw = ((m1 as u128) * TEN_TO_17 + bias) / (m2 as u128);
         Self::round_finish(u128_to_u64(raw)?, e1 - e2 - 17, negative, native, round_up)
     }
@@ -184,7 +211,11 @@ impl Amount {
             if round_up && !negative && drops == 0 {
                 return Ok(Amount::Xrp(1));
             }
-            return Ok(Amount::Xrp(if negative { -(drops as i64) } else { drops as i64 }));
+            return Ok(Amount::Xrp(if negative {
+                -(drops as i64)
+            } else {
+                drops as i64
+            }));
         }
 
         let (mut m, mut e) = (mantissa, exponent);
@@ -370,15 +401,24 @@ mod tests {
     fn drops_round_quirk_one_loop_rounds_up() {
         // exponent -1 → zero division loops, adder 10:
         // (15_000_000_000_000_000 + 10)/10 = 1_500_000_000_000_001 drops.
-        assert_eq!(canonicalize_drops_round(15_000_000_000_000_000, -1), 1_500_000_000_000_001);
+        assert_eq!(
+            canonicalize_drops_round(15_000_000_000_000_000, -1),
+            1_500_000_000_000_001
+        );
         // exponent -3 → two division loops (value→150e12), adder 9:
         // (150_000_000_000_000 + 9)/10 = 15_000_000_000_000 drops.
-        assert_eq!(canonicalize_drops_round(15_000_000_000_000_000, -3), 15_000_000_000_000);
+        assert_eq!(
+            canonicalize_drops_round(15_000_000_000_000_000, -3),
+            15_000_000_000_000
+        );
     }
 
     #[test]
     fn native_overflow_errors() {
         let huge = iou(MIN_MANTISSA, 40, false);
-        assert_eq!(Amount::multiply(&huge, &huge, true), Err(AmountError::Overflow));
+        assert_eq!(
+            Amount::multiply(&huge, &huge, true),
+            Err(AmountError::Overflow)
+        );
     }
 }

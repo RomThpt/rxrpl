@@ -438,7 +438,11 @@ impl IOUAmount {
         if int_part.is_empty() && frac_part.is_empty() {
             return Err(AmountError::Overflow);
         }
-        if !int_part.bytes().chain(frac_part.bytes()).all(|b| b.is_ascii_digit()) {
+        if !int_part
+            .bytes()
+            .chain(frac_part.bytes())
+            .all(|b| b.is_ascii_digit())
+        {
             return Err(AmountError::Overflow);
         }
         let digits = format!("{int_part}{frac_part}");
@@ -1089,22 +1093,35 @@ mod tests {
     #[test]
     fn decimal_string_forms() {
         assert_eq!(
-            IOUAmount::from_decimal_string("1.002").unwrap().to_decimal_string(),
+            IOUAmount::from_decimal_string("1.002")
+                .unwrap()
+                .to_decimal_string(),
             "1.002"
         );
         assert_eq!(
-            IOUAmount::from_decimal_string("100").unwrap().to_decimal_string(),
+            IOUAmount::from_decimal_string("100")
+                .unwrap()
+                .to_decimal_string(),
             "100"
         );
         assert_eq!(
-            IOUAmount::from_decimal_string("-1").unwrap().to_decimal_string(),
+            IOUAmount::from_decimal_string("-1")
+                .unwrap()
+                .to_decimal_string(),
             "-1"
         );
         assert_eq!(
-            IOUAmount::from_decimal_string("0.5").unwrap().to_decimal_string(),
+            IOUAmount::from_decimal_string("0.5")
+                .unwrap()
+                .to_decimal_string(),
             "0.5"
         );
-        assert_eq!(IOUAmount::from_decimal_string("0").unwrap().to_decimal_string(), "0");
+        assert_eq!(
+            IOUAmount::from_decimal_string("0")
+                .unwrap()
+                .to_decimal_string(),
+            "0"
+        );
     }
 
     #[test]
