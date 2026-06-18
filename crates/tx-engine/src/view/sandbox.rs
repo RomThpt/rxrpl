@@ -20,6 +20,8 @@ pub struct Sandbox<'a> {
     /// Captured on first update/erase so TxMeta can show previous fields.
     originals: HashMap<Hash256, Vec<u8>>,
     destroyed_drops: u64,
+    /// Whether the `SortedDirectories` amendment is active for this apply.
+    sorted_directories: bool,
 }
 
 impl<'a> Sandbox<'a> {
@@ -32,12 +34,21 @@ impl<'a> Sandbox<'a> {
             deletes: HashMap::new(),
             originals: HashMap::new(),
             destroyed_drops: 0,
+            sorted_directories: false,
         }
+    }
+
+    /// Record whether the `SortedDirectories` amendment is active. Set once per
+    /// apply from the engine's `Rules`; inherited by child sandboxes.
+    pub fn set_sorted_directories(&mut self, enabled: bool) {
+        self.sorted_directories = enabled;
     }
 
     /// Create a nested sandbox for speculative execution.
     pub fn child(&self) -> Sandbox<'_> {
-        Sandbox::new(self)
+        let mut c = Sandbox::new(self);
+        c.sorted_directories = self.sorted_directories;
+        c
     }
 
     /// Get the total drops destroyed in this sandbox.
@@ -194,6 +205,9 @@ impl ApplyView for Sandbox<'_> {
 
     fn destroy_drops(&mut self, drops: u64) {
         self.destroyed_drops += drops;
+    }
+    fn sorted_directories(&self) -> bool {
+        self.sorted_directories
     }
 }
 

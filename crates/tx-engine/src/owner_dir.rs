@@ -150,6 +150,7 @@ pub fn dir_remove(
     entry_key: &Hash256,
 ) -> Result<(), TransactionResult> {
     let entry_hex = entry_key.to_string().to_uppercase();
+    let order_preserving = view.sorted_directories();
     let mut page = 0u64;
     loop {
         let page_key = keylet::dir_node(root_key, page);
@@ -161,11 +162,14 @@ pub fn dir_remove(
         let mut indexes = dir_page(&node);
         let next = read_u64_field(&node, "IndexNext");
         if let Some(pos) = indexes.iter().position(|h| h == &entry_hex) {
-            // Pre-SortedDirectories removal: swap the entry with the last and
-            // pop (rippled's legacy dirDelete). Replays the directory ordering
-            // of historical ledgers; order-preserving removal is the modern,
-            // amendment-gated behaviour (follow-up).
-            indexes.swap_remove(pos);
+            // SortedDirectories preserves relative order on removal; the legacy
+            // dirDelete swapped the entry with the last and popped. Gating on
+            // the amendment replays both eras' page ordering byte-for-byte.
+            if order_preserving {
+                indexes.remove(pos);
+            } else {
+                indexes.swap_remove(pos);
+            }
             if indexes.is_empty() && page != 0 {
                 // Unlink this page from the chain, then erase it.
                 let prev = read_u64_field(&node, "IndexPrevious");
@@ -226,9 +230,10 @@ pub fn add_to_owner_dir(
 ) -> Result<u64, TransactionResult> {
     let root_key = keylet::owner_dir(account_id);
     let describe = [("Owner", Value::from(encode_account_id(account_id)))];
-    // Owner directories preserve insertion order (rippled appends, leaving
-    // legacy pages unsorted).
-    dir_insert(view, &root_key, entry_key, false, &describe)
+    // With SortedDirectories the owner directory is kept sorted; before the
+    // amendment rippled appended, leaving legacy pages in insertion order.
+    let sorted = view.sorted_directories();
+    dir_insert(view, &root_key, entry_key, sorted, &describe)
 }
 
 /// Append an entry to a book directory page. `describe` carries the book's
@@ -413,6 +418,72 @@ mod tests {
         // The next entry spills into a freshly linked page (page 1).
         let page = add_to_owner_dir(&mut sandbox, &account, &entry(0xff)).unwrap();
         assert_eq!(page, 1);
+    }
+
+    #[test]
+    fn legacy_appends_and_swaps_on_remove() {
+        let (ledger, fees) = fresh_sandbox();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let mut sandbox = Sandbox::new(&view); // SortedDirectories off (default)
+
+        let account = id();
+        // Out-of-order insert: legacy keeps insertion order (append).
+        for b in [3u8, 1, 2] {
+            add_to_owner_dir(&mut sandbox, &account, &entry(b)).unwrap();
+        }
+        let dir = |s: &Sandbox| -> Vec<String> {
+            let v: Value =
+                serde_json::from_slice(&s.read(&keylet::owner_dir(&account)).unwrap()).unwrap();
+            dir_page(&v)
+        };
+        assert_eq!(
+            dir(&sandbox),
+            [entry(3), entry(1), entry(2)].map(|e| e.to_string().to_uppercase())
+        );
+        // Legacy removal swaps the gap with the last entry.
+        remove_from_owner_dir(&mut sandbox, &account, &entry(3)).unwrap();
+        assert_eq!(
+            dir(&sandbox),
+            [entry(2), entry(1)].map(|e| e.to_string().to_uppercase())
+        );
+    }
+
+    #[test]
+    fn sorted_directories_sorts_and_preserves_order_on_remove() {
+        let (ledger, fees) = fresh_sandbox();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let mut sandbox = Sandbox::new(&view);
+        sandbox.set_sorted_directories(true);
+
+        let account = id();
+        for b in [3u8, 1, 2] {
+            add_to_owner_dir(&mut sandbox, &account, &entry(b)).unwrap();
+        }
+        let dir = |s: &Sandbox| -> Vec<String> {
+            let v: Value =
+                serde_json::from_slice(&s.read(&keylet::owner_dir(&account)).unwrap()).unwrap();
+            dir_page(&v)
+        };
+        // Modern owner dir is kept sorted ascending.
+        assert_eq!(
+            dir(&sandbox),
+            [entry(1), entry(2), entry(3)].map(|e| e.to_string().to_uppercase())
+        );
+        // Order-preserving removal shifts rather than swapping with the last.
+        remove_from_owner_dir(&mut sandbox, &account, &entry(2)).unwrap();
+        assert_eq!(
+            dir(&sandbox),
+            [entry(1), entry(3)].map(|e| e.to_string().to_uppercase())
+        );
+    }
+
+    #[test]
+    fn child_sandbox_inherits_sorted_flag() {
+        let (ledger, fees) = fresh_sandbox();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let mut sandbox = Sandbox::new(&view);
+        sandbox.set_sorted_directories(true);
+        assert!(sandbox.child().sorted_directories());
     }
 
     fn account_obj(seq: u32, owner_count: u32) -> Value {

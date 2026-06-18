@@ -18,6 +18,14 @@ pub trait ApplyView: ReadView {
 
     /// Record destroyed XRP drops (transaction fees).
     fn destroy_drops(&mut self, drops: u64);
+
+    /// Whether the `SortedDirectories` amendment is active. Gates directory
+    /// maintenance: when enabled, owner directories are kept sorted and entry
+    /// removal preserves order; otherwise rippled's legacy append / swap-with-
+    /// last behaviour applies (correct for replaying pre-amendment ledgers).
+    fn sorted_directories(&self) -> bool {
+        false
+    }
 }
 
 /// Errors from apply view operations.
