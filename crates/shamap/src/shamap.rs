@@ -259,6 +259,13 @@ impl SHAMap {
         SHAMapRefIter::new(&self.root, self.store.as_ref(), self.leaf_ctor)
     }
 
+    /// The smallest key strictly greater than `key`, or `None` if none exists.
+    /// Leaves iterate in ascending key order, so this stops at the first hit.
+    /// Used to walk order-book quality directories (rippled's `ReadView::succ`).
+    pub fn succ(&self, key: &Hash256) -> Option<Hash256> {
+        self.iter().map(|(k, _)| k).find(|k| k > key)
+    }
+
     /// Create a SHAMap from a root hash, loading nodes lazily from the store.
     ///
     /// Only the root node is fetched immediately. Children are loaded on demand
@@ -1270,6 +1277,25 @@ mod tests {
 
     fn make_key(hex: &str) -> Hash256 {
         Hash256::from_str(hex).unwrap()
+    }
+
+    #[test]
+    fn succ_returns_next_greater_key() {
+        let mut map = SHAMap::account_state();
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let k2 = make_key("5000000000000000000000000000000000000000000000000000000000000000");
+        let k3 = make_key("9000000000000000000000000000000000000000000000000000000000000000");
+        for k in [k3, k1, k2] {
+            map.insert(k, vec![1]).unwrap();
+        }
+        let below = make_key("0000000000000000000000000000000000000000000000000000000000000000");
+        assert_eq!(map.succ(&below), Some(k1));
+        assert_eq!(map.succ(&k1), Some(k2));
+        assert_eq!(map.succ(&k2), Some(k3));
+        assert_eq!(map.succ(&k3), None);
+        // A key between k1 and k2 returns k2.
+        let mid = make_key("3000000000000000000000000000000000000000000000000000000000000000");
+        assert_eq!(map.succ(&mid), Some(k2));
     }
 
     #[test]

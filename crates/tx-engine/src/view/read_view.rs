@@ -15,6 +15,13 @@ pub trait ReadView {
         self.read(key).is_some()
     }
 
+    /// The smallest state key strictly greater than `key`, or `None`. Used to
+    /// walk order-book quality directories (rippled's `ReadView::succ`). The
+    /// default returns `None` for views without ordered traversal.
+    fn succ(&self, _key: &Hash256) -> Option<Hash256> {
+        None
+    }
+
     /// Get the ledger sequence number.
     fn seq(&self) -> u32;
 

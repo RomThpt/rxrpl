@@ -255,6 +255,12 @@ impl Ledger {
     }
 
     /// Get a state entry by key.
+    /// The smallest state key strictly greater than `key`. Used to walk
+    /// order-book quality directories in ascending order.
+    pub fn succ_state(&self, key: &Hash256) -> Option<Hash256> {
+        self.state_map.succ(key)
+    }
+
     pub fn get_state(&self, key: &Hash256) -> Option<&[u8]> {
         self.state_map.get(key)
     }

@@ -36,6 +36,10 @@ impl ReadView for LedgerView<'_> {
         self.ledger.has_state(key)
     }
 
+    fn succ(&self, key: &Hash256) -> Option<Hash256> {
+        self.ledger.succ_state(key)
+    }
+
     fn seq(&self) -> u32 {
         self.ledger.header.sequence
     }
