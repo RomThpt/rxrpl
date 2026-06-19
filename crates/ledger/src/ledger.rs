@@ -314,19 +314,52 @@ impl Ledger {
             return Ok(());
         }
         use rxrpl_protocol::keylet;
-        let key = keylet::skip();
+        let prev_index = self.header.sequence - 1;
+        // Hash256 hex format (uppercase, no 0x prefix) — matches rippled JSON.
+        let parent_hex: String = self
+            .header
+            .parent_hash
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect();
 
-        // Read existing SLE if any → extract current hashes. Also carry forward
-        // FirstLedgerSequence: it is a DEPRECATED field that only exists on the
+        // Historical batch: every 256th ledger records the parent hash in the
+        // windowed skip-list so the chain can be walked back further than the
+        // most recent 256 ledgers. Mirrors rippled's `(prevIndex & 0xff) == 0`
+        // branch. These batches never carry FirstLedgerSequence.
+        if prev_index & 0xff == 0 {
+            self.append_skip_sle(keylet::skip_seq(prev_index), &parent_hex, prev_index, None)?;
+        }
+
+        // Recent skip-list: every ledger appends the parent hash. Carry forward
+        // FirstLedgerSequence — a DEPRECATED field that only exists on the
         // recent-hashes object of chains old enough to predate an early rippled
         // bug (Mainnet holds the value 2, propagated on every update). Freshly
-        // started networks never have it. We therefore preserve it iff it is
-        // already present, instead of synthesising it — adding it
-        // unconditionally diverges from a fresh-network rippled (caught by the
-        // hive consensus suite); dropping it diverges from a Mainnet-bootstrapped
-        // ledger whose downloaded SLE carries it.
+        // started networks never have it, so preserve it iff already present:
+        // adding it unconditionally diverges from a fresh-network rippled
+        // (caught by the hive consensus suite); dropping it diverges from a
+        // Mainnet-bootstrapped ledger whose downloaded SLE carries it.
+        let key = keylet::skip();
+        let first_ledger_seq = self
+            .state_map
+            .get(&key)
+            .and_then(|b| crate::sle_codec::decode_state(b).ok())
+            .and_then(|v| v.get("FirstLedgerSequence").and_then(|x| x.as_u64()));
+        self.append_skip_sle(key, &parent_hex, prev_index, first_ledger_seq)?;
+        Ok(())
+    }
+
+    /// Append `parent_hex` to the `LedgerHashes` SLE at `key` (capped at 256),
+    /// stamping `LastLedgerSequence` and an optional `FirstLedgerSequence`.
+    fn append_skip_sle(
+        &mut self,
+        key: Hash256,
+        parent_hex: &str,
+        last_ledger_seq: u32,
+        first_ledger_seq: Option<u64>,
+    ) -> Result<(), LedgerError> {
         let mut hashes: Vec<String> = Vec::with_capacity(256);
-        let mut first_ledger_seq: Option<u64> = None;
         if let Some(existing) = self.state_map.get(&key) {
             if let Ok(value) = crate::sle_codec::decode_state(existing) {
                 if let Some(arr) = value.get("Hashes").and_then(|v| v.as_array()) {
@@ -336,24 +369,13 @@ impl Ledger {
                         }
                     }
                 }
-                first_ledger_seq = value.get("FirstLedgerSequence").and_then(|v| v.as_u64());
             }
         }
-        // Cap at 256: drop oldest if at capacity, then append parent.
         if hashes.len() >= 256 {
             hashes.remove(0);
         }
-        // Hash256 hex format (uppercase, no 0x prefix) — matches rippled JSON.
-        let parent_hex: String = self
-            .header
-            .parent_hash
-            .as_bytes()
-            .iter()
-            .map(|b| format!("{:02X}", b))
-            .collect();
-        hashes.push(parent_hex);
+        hashes.push(parent_hex.to_string());
 
-        let last_ledger_seq = self.header.sequence - 1;
         let mut sle = serde_json::json!({
             "LedgerEntryType": "LedgerHashes",
             "Flags": 0,
