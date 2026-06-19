@@ -313,15 +313,7 @@ fn adjust_iou_balance(
     issuer_id: &rxrpl_primitives::AccountId,
     holder_id: &rxrpl_primitives::AccountId,
 ) -> Result<String, TransactionResult> {
-    let new = compute_new_iou_balance(trust, delta_str, issuer_id, holder_id)?;
-    Ok(if new == new.trunc() {
-        format!("{}", new as i64)
-    } else {
-        format!("{:.15}", new)
-            .trim_end_matches('0')
-            .trim_end_matches('.')
-            .to_string()
-    })
+    compute_new_iou_balance(trust, delta_str, issuer_id, holder_id)
 }
 
 #[cfg(test)]

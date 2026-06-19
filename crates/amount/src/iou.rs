@@ -544,6 +544,58 @@ impl IOUAmount {
     pub fn sub(a: &IOUAmount, b: &IOUAmount) -> Result<IOUAmount, AmountError> {
         Self::add(a, &b.negate())
     }
+
+    /// Add with round-to-nearest (half-up) to the 16-digit mantissa, matching
+    /// rippled's `Number`/post-amendment STAmount addition. Unlike [`add`],
+    /// which aligns by truncating the smaller term (the pre-`Number` behavior),
+    /// this adds at the lower exponent — losing no digit before the sum — then
+    /// rounds. Used for IOU balance updates outside the legacy crossing path.
+    pub fn add_round(a: &IOUAmount, b: &IOUAmount) -> Result<IOUAmount, AmountError> {
+        if a.is_zero() {
+            return Ok(*b);
+        }
+        if b.is_zero() {
+            return Ok(*a);
+        }
+        let lo = a.exponent.min(b.exponent);
+        let hi = a.exponent.max(b.exponent);
+        if (hi - lo) > 19 {
+            return Ok(if a.exponent == hi { *a } else { *b });
+        }
+        let ma = (a.mantissa as i128) * 10i128.pow((a.exponent - lo) as u32);
+        let mb = (b.mantissa as i128) * 10i128.pow((b.exponent - lo) as u32);
+        let va = if a.negative { -ma } else { ma };
+        let vb = if b.negative { -mb } else { mb };
+        let sum = va + vb;
+        if sum == 0 {
+            return Ok(IOUAmount::ZERO);
+        }
+        let negative = sum < 0;
+        let mut mag = sum.unsigned_abs();
+        let mut exp = lo;
+        const MAXM: u128 = MAX_MANTISSA as u128;
+        if mag > MAXM {
+            let mut digits_over = 0u32;
+            let mut probe = mag;
+            while probe > MAXM {
+                probe /= 10;
+                digits_over += 1;
+            }
+            let div = 10u128.pow(digits_over);
+            let rem = mag % div;
+            let mut rounded = mag / div;
+            if rem * 2 >= div {
+                rounded += 1;
+            }
+            exp += digits_over as i32;
+            if rounded > MAXM {
+                rounded /= 10;
+                exp += 1;
+            }
+            mag = rounded;
+        }
+        IOUAmount::from_parts(mag as u64, exp, negative)
+    }
 }
 
 /// Canonicalize rounding for oversized mantissa values.

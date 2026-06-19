@@ -133,11 +133,7 @@ impl Transactor for ClawbackTransactor {
 
         let new_balance =
             compute_new_iou_balance(&tl, &format!("-{actual_clawback}"), &issuer_id, &holder_id)?;
-        tl["Balance"]["value"] = Value::String(if new_balance == new_balance.trunc() {
-            format!("{}", new_balance as i64)
-        } else {
-            format!("{new_balance}")
-        });
+        tl["Balance"]["value"] = Value::String(new_balance);
 
         let tl_data = serde_json::to_vec(&tl).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
