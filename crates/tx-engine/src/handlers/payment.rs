@@ -130,10 +130,13 @@ impl Transactor for PaymentTransactor {
 
         // IOU branch: dispatch to issuer-mint handler.
         if let Some((currency, issuer, value)) = helpers::get_iou_amount(ctx.tx) {
-            // Cross-currency: SendMax in a different currency than Amount means
-            // the payment must flow through the order book.
+            // Cross-currency: a SendMax in a different currency, or one naming a
+            // third-party issuer, means the payment must flow through the order
+            // book. A same-currency SendMax whose issuer is the sender itself is
+            // the "spend from my own holdings" convention (e.g. redeeming an IOU
+            // back to its issuer), which the direct IOU path handles.
             if let Some((sm_cur, sm_iss, sm_val)) = get_send_max_iou(ctx.tx) {
-                if sm_cur != currency || sm_iss != issuer {
+                if sm_cur != currency || (sm_iss != issuer && sm_iss != account_str) {
                     return apply_cross_currency(
                         ctx,
                         account_str,
