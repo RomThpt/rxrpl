@@ -1,3 +1,4 @@
+use rxrpl_amendment::feature::feature_id;
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::TransactionResult;
 use rxrpl_protocol::keylet;
@@ -226,15 +227,31 @@ impl Transactor for TrustSetTransactor {
             };
             let flags_in = obj.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let low_balance = amt(&obj, "Balance");
+            // The noRipple term that contributes to reserve changed with the
+            // DefaultRipple amendment (2015). Before it, a side counts a noRipple
+            // line toward reserve when its line flag is set; after it, when the
+            // line's noRipple state disagrees with the account's DefaultRipple.
+            // Replaying pre-amendment (2013) ledgers needs the historical form.
+            let default_ripple = ctx.rules.enabled(&feature_id("DefaultRipple"));
+            let low_no_ripple_reserve = if default_ripple {
+                ((flags_in & LSF_LOW_NO_RIPPLE) == 0) != def_ripple(&low_acct)
+            } else {
+                (flags_in & LSF_LOW_NO_RIPPLE) != 0
+            };
+            let high_no_ripple_reserve = if default_ripple {
+                ((flags_in & LSF_HIGH_NO_RIPPLE) == 0) != def_ripple(&high_acct)
+            } else {
+                (flags_in & LSF_HIGH_NO_RIPPLE) != 0
+            };
             let low_reserve_set = qual(&obj, "LowQualityIn") != 0
                 || qual(&obj, "LowQualityOut") != 0
-                || ((flags_in & LSF_LOW_NO_RIPPLE) == 0) != def_ripple(&low_acct)
+                || low_no_ripple_reserve
                 || (flags_in & LSF_LOW_FREEZE) != 0
                 || amt(&obj, "LowLimit") != 0.0
                 || low_balance > 0.0;
             let high_reserve_set = qual(&obj, "HighQualityIn") != 0
                 || qual(&obj, "HighQualityOut") != 0
-                || ((flags_in & LSF_HIGH_NO_RIPPLE) == 0) != def_ripple(&high_acct)
+                || high_no_ripple_reserve
                 || (flags_in & LSF_HIGH_FREEZE) != 0
                 || amt(&obj, "HighLimit") != 0.0
                 || (-low_balance) > 0.0;
