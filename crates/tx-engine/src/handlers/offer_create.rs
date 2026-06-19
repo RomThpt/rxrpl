@@ -495,27 +495,33 @@ fn cross_offers(
             let Some(offer_in) = Leg::parse(&offer["TakerPays"]) else {
                 continue;
             };
-            if !is_offer_funded(ctx, &owner, &offer["TakerGets"]) {
+            // Owner-funds clamp: an offer can give at most what its owner
+            // holds. Fully funded → the whole offer is available; underfunded
+            // but positive → fill against the funded amount; zero → reap.
+            let funds = owner_funds_leg(ctx, &owner, &offer_out);
+            if funds.is_zero() {
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
                 continue;
             }
+            let avail_out = leg_min(&offer_out, &funds);
+            let take_out = leg_min(&remaining_out, &avail_out);
 
-            // Full take when the taker wants the whole offer; otherwise a
-            // partial take of just `remaining_out`, priced at the offer's
-            // quality (`order_in = order_out * rate`, clamped to the offer).
-            let full_take = leg_ge(&remaining_out, &offer_out);
+            // Full take when the taker consumes the whole original offer;
+            // otherwise a partial take of `take_out`, priced at the offer's
+            // quality (`order_in = take_out * rate`, clamped to the offer).
+            let full_take = leg_ge(&take_out, &offer_out);
             let (order_out, order_in) = if full_take {
                 (offer_out.clone(), offer_in.clone())
             } else {
                 let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
                 let computed = rxrpl_amount::Amount::multiply(
-                    &leg_to_amount(&remaining_out),
+                    &leg_to_amount(&take_out),
                     &rxrpl_amount::Amount::Iou(rate),
                     in_leg.is_xrp,
                 )
                 .map_err(|_| TransactionResult::TefInternal)?;
                 let order_in = leg_min(&amount_to_leg(&computed, &offer_in), &offer_in);
-                (remaining_out.clone(), order_in)
+                (take_out.clone(), order_in)
             };
 
             // Move funds: taker pays order_in (grossed), owner pays order_out.
@@ -824,64 +830,74 @@ fn check_permissioned_asset(
 
 /// Test whether `owner` currently holds the `TakerGets` amount in full.
 /// XRP: AccountRoot.Balance ≥ amount. IOU: holder-side trust line balance ≥ value.
-fn is_offer_funded(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Value) -> bool {
-    if let Some(drops_str) = gets.as_str() {
-        let needed: u64 = drops_str.parse().unwrap_or(0);
-        if needed == 0 {
-            return false;
-        }
-        let key = keylet::account(owner);
-        let Some(b) = ctx.view.read(&key) else {
-            return false;
-        };
-        let Ok(acct) = serde_json::from_slice::<Value>(&b) else {
-            return false;
-        };
-        let bal: u64 = acct
-            .get("Balance")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        return bal >= needed;
-    }
-    let cur_str = gets.get("currency").and_then(|v| v.as_str()).unwrap_or("");
-    let issuer_str = gets.get("issuer").and_then(|v| v.as_str()).unwrap_or("");
-    let value: f64 = gets
-        .get("value")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0);
-    if value <= 0.0 {
-        return false;
-    }
-    let issuer_id = match decode_account_id(issuer_str) {
-        Ok(id) => id,
-        Err(_) => return false,
+/// The owner's spendable funds in the offer's `gets` currency, as a `Leg`.
+/// A zero result means the offer is unfunded (the caller reaps it); otherwise
+/// the fill is clamped to this amount (rippled fills against owner funds rather
+/// than requiring the whole offer to be funded). XRP uses the raw balance; an
+/// IOU issuer can always issue its own currency (not a binding constraint); an
+/// IOU holder is bounded by its trust-line balance.
+fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) -> Leg {
+    let zero = Leg {
+        is_xrp: gets.is_xrp,
+        drops: 0,
+        iou: IOUAmount::ZERO,
+        currency: gets.currency,
+        issuer: gets.issuer,
     };
-    if &issuer_id == owner {
-        // Issuer can always issue its own currency.
-        return true;
+    if gets.is_xrp {
+        let key = keylet::account(owner);
+        let bal = ctx
+            .view
+            .read(&key)
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|a| {
+                a.get("Balance")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<i64>().ok())
+            })
+            .unwrap_or(0);
+        if bal <= 0 {
+            return zero;
+        }
+        return Leg {
+            is_xrp: true,
+            drops: bal,
+            iou: IOUAmount::ZERO,
+            currency: gets.currency,
+            issuer: gets.issuer,
+        };
     }
-    let cur_bytes = helpers::currency_to_bytes(cur_str);
-    let tl_key = keylet::trust_line(owner, &issuer_id, &cur_bytes);
+    if &gets.issuer == owner {
+        return gets.clone();
+    }
+    let tl_key = keylet::trust_line(owner, &gets.issuer, &gets.currency);
     let Some(tl_bytes) = ctx.view.read(&tl_key) else {
-        return false;
+        return zero;
     };
     let Ok(tl) = serde_json::from_slice::<Value>(&tl_bytes) else {
-        return false;
+        return zero;
     };
-    let raw: f64 = tl
+    let raw_str = tl
         .get("Balance")
         .and_then(|b| b.get("value"))
         .and_then(|v| v.as_str())
-        .unwrap_or("0")
-        .parse()
-        .unwrap_or(0.0);
-    // Balance is stored from the low account's perspective. The non-issuer
-    // holder's balance has the opposite sign when the issuer is the low account.
-    let issuer_is_low = issuer_id.as_bytes() < owner.as_bytes();
-    let holder_view = if issuer_is_low { -raw } else { raw };
-    holder_view >= value
+        .unwrap_or("0");
+    let raw_f: f64 = raw_str.parse().unwrap_or(0.0);
+    // Balance is stored from the low account's perspective; the holder's view
+    // flips sign when the issuer is the low account.
+    let issuer_is_low = gets.issuer.as_bytes() < owner.as_bytes();
+    let holder_positive = if issuer_is_low { raw_f < 0.0 } else { raw_f > 0.0 };
+    if !holder_positive {
+        return zero;
+    }
+    let mag = raw_str.trim_start_matches('-');
+    Leg {
+        is_xrp: false,
+        drops: 0,
+        iou: IOUAmount::from_decimal_string(mag).unwrap_or(IOUAmount::ZERO),
+        currency: gets.currency,
+        issuer: gets.issuer,
+    }
 }
 
 /// Remove an offer hash from a book directory (inverse of `add_to_dir`).
