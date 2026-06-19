@@ -337,8 +337,9 @@ pub fn replay_forward(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rxrpl_codec::address::classic::encode_account_id;
+    use rxrpl_codec::address::classic::{decode_account_id, encode_account_id};
     use rxrpl_primitives::AccountId;
+    use rxrpl_protocol::keylet;
     use rxrpl_tx_engine::{TransactorRegistry, handlers};
 
     const MASTER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
@@ -356,6 +357,179 @@ mod tests {
         handlers::register_phase_f(&mut r);
         handlers::register_pseudo(&mut r);
         TxEngine::new_without_sig_check(r)
+    }
+
+    /// Targeted single-transaction oracle: validate one mainnet transaction
+    /// byte-exact WITHOUT bootstrapping the full ~19M-entry state. Fetches only
+    /// the SLEs the tx touches or reads (affected nodes + FeeSettings +
+    /// Amendments + the tx's accounts) at the parent ledger, applies the single
+    /// tx, and compares every affected SLE to rippled's stored bytes at ledger N.
+    ///
+    /// Run with:
+    /// `RXRPL_PLAY_FORWARD_RPC=http://host:5005 RXRPL_PLAY_FORWARD_LEDGER=N \
+    ///  RXRPL_PLAY_FORWARD_TXHASH=<hash> cargo test -p rxrpl-node --lib \
+    ///  single_tx_oracle_mainnet -- --ignored --nocapture`
+    #[test]
+    #[ignore = "hits a live mainnet RPC server"]
+    fn single_tx_oracle_mainnet() {
+        let Ok(url) = std::env::var("RXRPL_PLAY_FORWARD_RPC") else {
+            eprintln!("RXRPL_PLAY_FORWARD_RPC unset; skipping");
+            return;
+        };
+        let (Some(n), Ok(txhash)) = (
+            std::env::var("RXRPL_PLAY_FORWARD_LEDGER")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok()),
+            std::env::var("RXRPL_PLAY_FORWARD_TXHASH"),
+        ) else {
+            eprintln!("RXRPL_PLAY_FORWARD_LEDGER / _TXHASH unset; skipping");
+            return;
+        };
+        let parent = n - 1;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let rpc = |params: serde_json::Value| -> Value {
+            rt.block_on(async {
+                client
+                    .post(&url)
+                    .json(&params)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap()
+            })
+        };
+
+        // Target tx as a canonical blob (binary) -> our JSON, exactly like replay.
+        let txs_resp = rpc(serde_json::json!({
+            "method":"ledger","params":[{"ledger_index":n,"transactions":true,"expand":true,"binary":true}]
+        }));
+        let (_set_hash, txs) = parse_tx_set(&txs_resp["result"]).expect("tx set");
+        let want_id: Hash256 = txhash.parse().expect("txhash");
+        let blob = txs
+            .into_iter()
+            .find(|(id, _)| *id == want_id)
+            .map(|(_, b)| b)
+            .expect("tx not in ledger");
+        let tx_json = rxrpl_codec::binary::decode(&blob).expect("decode tx");
+
+        // Affected SLE keys + classification from the expanded metadata.
+        let meta_resp = rpc(serde_json::json!({
+            "method":"ledger","params":[{"ledger_index":n,"transactions":true,"expand":true}]
+        }));
+        let entries = meta_resp["result"]["ledger"]["transactions"]
+            .as_array()
+            .expect("transactions");
+        let txm = entries
+            .iter()
+            .find(|t| t["hash"].as_str() == Some(&txhash))
+            .expect("tx meta");
+        let mut affected: Vec<(String, String)> = Vec::new(); // (key, nodeType)
+        for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
+            for nt in ["CreatedNode", "ModifiedNode", "DeletedNode"] {
+                if let Some(e) = node.get(nt) {
+                    affected.push((
+                        e["LedgerIndex"].as_str().unwrap().to_uppercase(),
+                        nt.to_string(),
+                    ));
+                }
+            }
+        }
+
+        // Read-set = affected keys + the SLEs every apply reads: FeeSettings,
+        // Amendments (for Rules), and the tx's account / destination / issuer.
+        let acct_keylet = |a: &str| -> String {
+            let id = decode_account_id(a).unwrap();
+            keylet::account(&id).to_string().to_uppercase()
+        };
+        let mut read_keys: std::collections::BTreeSet<String> =
+            affected.iter().map(|(k, _)| k.clone()).collect();
+        read_keys.insert(keylet::fee_settings().to_string().to_uppercase());
+        read_keys.insert(keylet::amendments().to_string().to_uppercase());
+        if let Some(a) = tx_json.get("Account").and_then(|v| v.as_str()) {
+            read_keys.insert(acct_keylet(a));
+        }
+        if let Some(d) = tx_json.get("Destination").and_then(|v| v.as_str()) {
+            read_keys.insert(acct_keylet(d));
+        }
+        if let Some(iss) = tx_json
+            .get("Amount")
+            .and_then(|a| a.get("issuer"))
+            .and_then(|v| v.as_str())
+        {
+            read_keys.insert(acct_keylet(iss));
+        }
+
+        // Seed a partial state map from the parent ledger.
+        let mut state = rxrpl_shamap::SHAMap::account_state();
+        for key in &read_keys {
+            let r = rpc(serde_json::json!({
+                "method":"ledger_entry","params":[{"index":key,"ledger_index":parent,"binary":true}]
+            }));
+            if let Some(hex_node) = r["result"]["node_binary"].as_str() {
+                let kb: [u8; 32] = hex::decode(key).unwrap().try_into().unwrap();
+                state
+                    .put(Hash256::new(kb), hex::decode(hex_node).unwrap())
+                    .unwrap();
+            }
+        }
+
+        let parent_hdr = rpc(serde_json::json!({
+            "method":"ledger","params":[{"ledger_index":parent,"transactions":false,"expand":false}]
+        }));
+        let parent_header = parse_header(&parent_hdr["result"]["ledger"]).expect("parent header");
+        let mut base = Ledger::from_catchup(parent, parent_header.hash, state);
+        base.header = parent_header;
+        let mut open = Ledger::new_open(&base);
+        let rules = rules_for_ledger(&open);
+        let fees = fees_for_ledger(&base);
+
+        let res = full_engine().apply(&tx_json, &mut open, &rules, &fees);
+        eprintln!("apply result: {res:?}");
+
+        // Compare each affected SLE to rippled's stored bytes at ledger N.
+        let mut mismatches = 0;
+        for (key, nt) in &affected {
+            let kb: [u8; 32] = hex::decode(key).unwrap().try_into().unwrap();
+            let ours = open.state_map.get(&Hash256::new(kb)).map(hex::encode_upper);
+            if nt == "DeletedNode" {
+                if ours.is_some() {
+                    eprintln!("  DELETE-MISS {key}: we still hold it");
+                    mismatches += 1;
+                }
+                continue;
+            }
+            let r = rpc(serde_json::json!({
+                "method":"ledger_entry","params":[{"index":key,"ledger_index":n,"binary":true}]
+            }));
+            let theirs = r["result"]["node_binary"]
+                .as_str()
+                .map(|s| s.to_uppercase());
+            if ours.as_deref() != theirs.as_deref() {
+                mismatches += 1;
+                let typ = ours
+                    .as_deref()
+                    .and_then(|h| hex::decode(h).ok())
+                    .and_then(|b| rxrpl_codec::binary::decode(&b).ok())
+                    .and_then(|j| {
+                        j.get("LedgerEntryType")
+                            .and_then(|t| t.as_str().map(String::from))
+                    })
+                    .unwrap_or_default();
+                eprintln!("  DIFF {key} ({nt} {typ})");
+                eprintln!("    ours:   {}", ours.as_deref().unwrap_or("<absent>"));
+                eprintln!("    theirs: {}", theirs.as_deref().unwrap_or("<absent>"));
+            }
+        }
+        eprintln!("affected={} mismatches={mismatches}", affected.len());
+        assert_eq!(mismatches, 0, "every affected SLE must match rippled");
     }
 
     fn payment(seq: u32, dest: AccountId, amount_drops: u64) -> (Hash256, Vec<u8>) {
