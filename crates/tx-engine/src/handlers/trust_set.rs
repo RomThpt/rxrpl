@@ -1,4 +1,6 @@
-use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_amendment::feature::feature_id;
+use rxrpl_codec::address::classic::{decode_account_id, encode_account_id};
+use rxrpl_primitives::AccountId;
 use rxrpl_protocol::TransactionResult;
 use rxrpl_protocol::keylet;
 use serde_json::Value;
@@ -226,15 +228,31 @@ impl Transactor for TrustSetTransactor {
             };
             let flags_in = obj.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let low_balance = amt(&obj, "Balance");
+            // The noRipple term that contributes to reserve changed with the
+            // DefaultRipple amendment (2015). Before it, a side counts a noRipple
+            // line toward reserve when its line flag is set; after it, when the
+            // line's noRipple state disagrees with the account's DefaultRipple.
+            // Replaying pre-amendment (2013) ledgers needs the historical form.
+            let default_ripple = ctx.rules.enabled(&feature_id("DefaultRipple"));
+            let low_no_ripple_reserve = if default_ripple {
+                ((flags_in & LSF_LOW_NO_RIPPLE) == 0) != def_ripple(&low_acct)
+            } else {
+                (flags_in & LSF_LOW_NO_RIPPLE) != 0
+            };
+            let high_no_ripple_reserve = if default_ripple {
+                ((flags_in & LSF_HIGH_NO_RIPPLE) == 0) != def_ripple(&high_acct)
+            } else {
+                (flags_in & LSF_HIGH_NO_RIPPLE) != 0
+            };
             let low_reserve_set = qual(&obj, "LowQualityIn") != 0
                 || qual(&obj, "LowQualityOut") != 0
-                || ((flags_in & LSF_LOW_NO_RIPPLE) == 0) != def_ripple(&low_acct)
+                || low_no_ripple_reserve
                 || (flags_in & LSF_LOW_FREEZE) != 0
                 || amt(&obj, "LowLimit") != 0.0
                 || low_balance > 0.0;
             let high_reserve_set = qual(&obj, "HighQualityIn") != 0
                 || qual(&obj, "HighQualityOut") != 0
-                || ((flags_in & LSF_HIGH_NO_RIPPLE) == 0) != def_ripple(&high_acct)
+                || high_no_ripple_reserve
                 || (flags_in & LSF_HIGH_FREEZE) != 0
                 || amt(&obj, "HighLimit") != 0.0
                 || (-low_balance) > 0.0;
@@ -326,7 +344,6 @@ impl Transactor for TrustSetTransactor {
             // counterparty's. `Balance.issuer` is the low account by
             // convention; sign of the balance encodes which side owes whom.
             let is_low = account_id.as_bytes() < issuer_id.as_bytes();
-            let low_str = if is_low { account_str } else { issuer_str };
             let acct_value = limit.get("value").cloned().unwrap_or_else(|| "0".into());
             let currency = limit["currency"].clone();
             let acct_limit = serde_json::json!({
@@ -345,36 +362,66 @@ impl Transactor for TrustSetTransactor {
                 (peer_limit, acct_limit)
             };
 
+            // Link the new RippleState into BOTH parties' owner directories
+            // (rippled's `trustCreate` inserts into lowDir and highDir),
+            // capturing the page each landed in for Low/HighNode.
+            let acct_page = add_to_owner_dir(ctx.view, &account_id, &tl_key)?;
+            let issuer_page = add_to_owner_dir(ctx.view, &issuer_id, &tl_key)?;
+            let (low_node, high_node) = if is_low {
+                (acct_page, issuer_page)
+            } else {
+                (issuer_page, acct_page)
+            };
+
+            // The creator set a non-default (non-zero) limit, so its side counts
+            // toward the owner reserve: set its reserve flag and increment only
+            // that account's OwnerCount. A fresh line carries no noRipple/freeze
+            // and a zero balance, so the counterparty side stays default.
+            let creator_reserves = acct_value.as_str().map(|s| s != "0").unwrap_or(true);
+            let flags = if creator_reserves {
+                if is_low {
+                    LSF_LOW_RESERVE
+                } else {
+                    LSF_HIGH_RESERVE
+                }
+            } else {
+                0
+            };
+
+            // RippleState Balance is an STAmount whose issuer is rippled's
+            // ACCOUNT_ONE placeholder (20 bytes ending in 1, "rrrr…BZbvji"), not
+            // ACCOUNT_ZERO; the sign of the balance encodes which side owes whom.
+            let mut account_one = [0u8; 20];
+            account_one[19] = 1;
+            let no_account = encode_account_id(&AccountId::from(account_one));
             let tl_obj = serde_json::json!({
                 "LedgerEntryType": "RippleState",
-                "Balance": {
-                    "currency": currency,
-                    "issuer": low_str,
-                    "value": "0"
-                },
+                "Balance": { "currency": currency, "issuer": no_account, "value": "0" },
                 "LowLimit": low_limit,
                 "HighLimit": high_limit,
-                "Flags": 0,
+                "LowNode": format!("{low_node:016X}"),
+                "HighNode": format!("{high_node:016X}"),
+                "Flags": flags,
+                // Placeholder so the central PreviousTxnID stamping records this
+                // tx on the newly created line (it only touches entries that
+                // already expose the field).
+                "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+                "PreviousTxnLgrSeq": 0,
             });
-
             let bytes = serde_json::to_vec(&tl_obj).map_err(|_| TransactionResult::TemMalformed)?;
             ctx.view
                 .insert(tl_key, bytes)
                 .map_err(|_| TransactionResult::TemMalformed)?;
 
-            // Link the new RippleState into BOTH parties' owner directories
-            // so account_lines / account_objects / gateway_balances find it
-            // from either side. Matches rippled's `trustCreate` which inserts
-            // into both lowDir and highDir.
-            add_to_owner_dir(ctx.view, &account_id, &tl_key)?;
-            add_to_owner_dir(ctx.view, &issuer_id, &tl_key)?;
-
-            // Increment owner count for the account
+            // Increment owner count for the creator (it took the reserve) and
+            // consume its sequence.
             let acct_key = keylet::account(&account_id);
             if let Some(acct_bytes) = ctx.view.read(&acct_key) {
                 let mut acct: Value = serde_json::from_slice(&acct_bytes)
                     .map_err(|_| TransactionResult::TemMalformed)?;
-                helpers::adjust_owner_count(&mut acct, 1);
+                if creator_reserves {
+                    helpers::adjust_owner_count(&mut acct, 1);
+                }
                 crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, &mut acct, ctx.tx)?;
                 let new_bytes =
                     serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
