@@ -3782,54 +3782,6 @@ impl Node {
         Ok(header)
     }
 
-    /// Fetch a single ledger's validated header and full transaction set via
-    /// one `ledger` RPC call (binary + expanded). Returns the trusted header,
-    /// the consensus set hash (canonical-ordering salt) and the `(txid, blob)`
-    /// pairs to replay forward. This is the transaction-set source for
-    /// play-forward sync: bounded by the ledger's transaction count, not its
-    /// ~19M state entries.
-    #[allow(dead_code)]
-    async fn fetch_ledger_for_replay(
-        rpc_url: &str,
-        ledger_index: u32,
-    ) -> Result<
-        (
-            rxrpl_ledger::LedgerHeader,
-            Hash256,
-            crate::play_forward::TxSet,
-        ),
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .danger_accept_invalid_certs(true)
-            .build()?;
-        let resp = client
-            .post(rpc_url)
-            .json(&serde_json::json!({
-                "method": "ledger",
-                "params": [{
-                    "ledger_index": ledger_index,
-                    "transactions": true,
-                    "expand": true,
-                    "binary": true,
-                }]
-            }))
-            .send()
-            .await?
-            .json::<serde_json::Value>()
-            .await?;
-        let result = resp
-            .get("result")
-            .ok_or("missing result in ledger response")?;
-        let l = result
-            .get("ledger")
-            .ok_or("missing result.ledger in ledger response")?;
-        let header = crate::play_forward::parse_header(l)?;
-        let (set_hash, txs) = crate::play_forward::parse_tx_set(result)?;
-        Ok((header, set_hash, txs))
-    }
-
     /// Bulk-acquire a ledger's full account state via the RPC `ledger_data`
     /// pagination, rebuild the SHAMap locally, and verify its root equals the
     /// validated `expected_account_hash`. This is the fast, completing

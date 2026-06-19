@@ -122,6 +122,122 @@ pub fn rules_for_ledger(ledger: &Ledger) -> Rules {
     Rules::from_enabled(enabled)
 }
 
+/// Read the era-correct fee and reserve settings from a ledger's `FeeSettings`
+/// SLE. Early ledgers (pre-2014) predate that object, where reserves were the
+/// protocol constants (200 XRP base, 50 XRP per owner).
+pub fn fees_for_ledger(ledger: &Ledger) -> FeeSettings {
+    ledger
+        .state_map
+        .get(&rxrpl_protocol::keylet::fee_settings())
+        .and_then(|b| rxrpl_codec::binary::decode(b).ok())
+        .map(|fs| FeeSettings {
+            base_fee: fs
+                .get("BaseFee")
+                .and_then(|v| v.as_str())
+                .and_then(|s| u64::from_str_radix(s, 16).ok())
+                .unwrap_or(10),
+            reserve_base: fs
+                .get("ReserveBase")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10_000_000),
+            reserve_increment: fs
+                .get("ReserveIncrement")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50_000_000),
+        })
+        .unwrap_or(FeeSettings {
+            base_fee: 10,
+            reserve_base: 200_000_000,
+            reserve_increment: 50_000_000,
+        })
+}
+
+/// Fetch a validated ledger's header, transaction-set root and transaction set
+/// (canonical blobs without metadata) over RPC. This is the transaction-set
+/// source for play-forward sync: bounded by the ledger's transaction count, not
+/// its ~19M state entries.
+pub async fn fetch_ledger_for_replay(
+    rpc_url: &str,
+    ledger_index: u32,
+) -> Result<(LedgerHeader, Hash256, TxSet), Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .danger_accept_invalid_certs(true)
+        .build()?;
+    let call = |params: Value| {
+        let client = client.clone();
+        let rpc_url = rpc_url.to_string();
+        async move {
+            client
+                .post(&rpc_url)
+                .json(&params)
+                .send()
+                .await?
+                .json::<Value>()
+                .await
+        }
+    };
+    // The header needs JSON fields (parent_hash, close_time, …) — only present
+    // with binary:false. The transaction set needs binary:true to get the
+    // canonical no-metadata blobs. These are two distinct RPC shapes.
+    let hdr_resp = call(serde_json::json!({
+        "method": "ledger",
+        "params": [{ "ledger_index": ledger_index, "transactions": false, "expand": false }]
+    }))
+    .await?;
+    let header = parse_header(
+        hdr_resp
+            .get("result")
+            .and_then(|r| r.get("ledger"))
+            .ok_or("missing result.ledger in header response")?,
+    )?;
+    let txs_resp = call(serde_json::json!({
+        "method": "ledger",
+        "params": [{ "ledger_index": ledger_index, "transactions": true, "expand": true, "binary": true }]
+    }))
+    .await?;
+    let (set_hash, txs) = parse_tx_set(
+        txs_resp
+            .get("result")
+            .ok_or("missing result in tx-set response")?,
+    )?;
+    Ok((header, set_hash, txs))
+}
+
+/// Advance from a held `base` ledger up to `to_seq` (inclusive) by fetching each
+/// successor's validated transaction set over RPC and replaying it forward onto
+/// the running parent state. Returns the replayed ledgers in order. Stops with
+/// an error at the first replay that is not byte-faithful to its validated
+/// header, so the caller can fall back to P2P state acquisition.
+pub async fn catchup_via_replay(
+    rpc_url: &str,
+    base: Ledger,
+    to_seq: u32,
+    tx_engine: &TxEngine,
+) -> Result<Vec<Ledger>, NodeError> {
+    let mut chain = Vec::new();
+    let mut parent = base;
+    for seq in (parent.header.sequence + 1)..=to_seq {
+        let (header, set_hash, txs) = fetch_ledger_for_replay(rpc_url, seq)
+            .await
+            .map_err(|e| NodeError::Server(format!("fetch #{seq} for replay: {e}")))?;
+        let fees = fees_for_ledger(&parent);
+        let outcome = replay_forward(&parent, set_hash, txs, &header, tx_engine, &fees)?;
+        if !outcome.is_faithful() {
+            return Err(NodeError::Server(format!(
+                "replay #{seq} unfaithful (account_hash={} tx_hash={} ledger_hash={} drops={})",
+                outcome.account_hash_match,
+                outcome.tx_hash_match,
+                outcome.ledger_hash_match,
+                outcome.drops_match,
+            )));
+        }
+        parent = outcome.ledger.clone();
+        chain.push(outcome.ledger);
+    }
+    Ok(chain)
+}
+
 /// Result of replaying a transaction set forward onto a parent ledger.
 pub struct ReplayOutcome {
     /// The reconstructed closed ledger.
@@ -665,8 +781,23 @@ mod tests {
         let mut diffs = 0;
         outcome.ledger.state_map.for_each(&mut |k, v| {
             let key = hex::encode_upper(k.as_bytes());
-            if theirs.get(&key) != Some(&hex::encode_upper(v)) {
+            let ours = hex::encode_upper(v);
+            if theirs.get(&key) != Some(&ours) {
                 diffs += 1;
+                let typ = rxrpl_codec::binary::decode(v)
+                    .ok()
+                    .and_then(|j| j.get("LedgerEntryType").and_then(|t| t.as_str().map(String::from)))
+                    .unwrap_or_else(|| "?".into());
+                eprintln!("  DIFF {key} ({typ})");
+                eprintln!("    ours:   {ours}");
+                eprintln!("    theirs: {}", theirs.get(&key).map(String::as_str).unwrap_or("<absent>"));
+                if let (Ok(o), Some(t)) = (
+                    rxrpl_codec::binary::decode(v),
+                    theirs.get(&key).and_then(|h| hex::decode(h).ok()).and_then(|b| rxrpl_codec::binary::decode(&b).ok()),
+                ) {
+                    eprintln!("    ours json:   {o}");
+                    eprintln!("    theirs json: {t}");
+                }
             }
         });
         eprintln!("state entries differing from rippled: {diffs}");
@@ -683,6 +814,102 @@ mod tests {
             "replay must reproduce the validated header"
         );
         assert_eq!(diffs, 0, "no state entry may differ from rippled");
+    }
+
+    /// Multi-ledger play-forward: bootstrap one base ledger's state, then follow
+    /// the chain by replaying each successor's transaction set over RPC. Proves
+    /// the node can *track* mainnet (not just replay a single step). Each step
+    /// must stay byte-faithful or `catchup_via_replay` errors out.
+    ///
+    /// Run with (base held = RXRPL_PLAY_FORWARD_LEDGER, steps = COUNT):
+    /// `RXRPL_PLAY_FORWARD_RPC=http://host:5005 RXRPL_PLAY_FORWARD_LEDGER=267999 \
+    ///  RXRPL_PLAY_FORWARD_COUNT=3 cargo test -p rxrpl-node --lib \
+    ///  catchup_via_replay_mainnet -- --ignored --nocapture`
+    #[test]
+    #[ignore = "hits a live mainnet RPC server"]
+    fn catchup_via_replay_mainnet() {
+        let Ok(url) = std::env::var("RXRPL_PLAY_FORWARD_RPC") else {
+            eprintln!("RXRPL_PLAY_FORWARD_RPC unset; skipping");
+            return;
+        };
+        let base_seq: u32 = std::env::var("RXRPL_PLAY_FORWARD_LEDGER")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(267999);
+        let count: u32 = std::env::var("RXRPL_PLAY_FORWARD_COUNT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let rpc = |params: serde_json::Value| -> Value {
+            rt.block_on(async {
+                client
+                    .post(&url)
+                    .json(&params)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap()
+            })
+        };
+
+        let base_resp = rpc(serde_json::json!({
+            "method":"ledger",
+            "params":[{"ledger_index":base_seq,"transactions":false,"expand":false}]
+        }));
+        let base_header = parse_header(&base_resp["result"]["ledger"]).expect("base header");
+
+        let mut state = rxrpl_shamap::SHAMap::account_state();
+        let mut marker: Option<String> = None;
+        loop {
+            let mut p = serde_json::json!({"ledger_index":base_seq,"binary":true,"limit":2048});
+            if let Some(m) = &marker {
+                p["marker"] = serde_json::Value::String(m.clone());
+            }
+            let r = rpc(serde_json::json!({"method":"ledger_data","params":[p]}));
+            for e in r["result"]["state"].as_array().unwrap() {
+                let key: [u8; 32] = hex::decode(e["index"].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                let data = hex::decode(e["data"].as_str().unwrap()).unwrap();
+                state.put(Hash256::new(key), data).unwrap();
+            }
+            marker = r["result"]["marker"].as_str().map(|s| s.to_string());
+            if marker.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            state.root_hash(),
+            base_header.account_hash,
+            "downloaded base state root must equal validated account_hash"
+        );
+
+        let mut base = Ledger::from_catchup(base_seq, base_header.hash, state);
+        base.header = base_header;
+
+        let to_seq = base_seq + count;
+        let chain = rt
+            .block_on(catchup_via_replay(&url, base, to_seq, &full_engine()))
+            .expect("catchup_via_replay must stay faithful across the range");
+
+        eprintln!(
+            "play-forward tracked #{}..=#{}: {} ledgers, tip account_hash={}",
+            base_seq + 1,
+            to_seq,
+            chain.len(),
+            chain.last().unwrap().header.account_hash,
+        );
+        assert_eq!(chain.len() as u32, count, "must replay every ledger in range");
     }
 
     /// Diagnostic: per-transaction metadata-blob comparison against rippled.
