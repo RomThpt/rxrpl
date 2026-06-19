@@ -413,7 +413,6 @@ impl Transactor for TrustSetTransactor {
                 .insert(tl_key, bytes)
                 .map_err(|_| TransactionResult::TemMalformed)?;
 
-
             // Increment owner count for the creator (it took the reserve) and
             // consume its sequence.
             let acct_key = keylet::account(&account_id);

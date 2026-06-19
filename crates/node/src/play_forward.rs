@@ -786,14 +786,23 @@ mod tests {
                 diffs += 1;
                 let typ = rxrpl_codec::binary::decode(v)
                     .ok()
-                    .and_then(|j| j.get("LedgerEntryType").and_then(|t| t.as_str().map(String::from)))
+                    .and_then(|j| {
+                        j.get("LedgerEntryType")
+                            .and_then(|t| t.as_str().map(String::from))
+                    })
                     .unwrap_or_else(|| "?".into());
                 eprintln!("  DIFF {key} ({typ})");
                 eprintln!("    ours:   {ours}");
-                eprintln!("    theirs: {}", theirs.get(&key).map(String::as_str).unwrap_or("<absent>"));
+                eprintln!(
+                    "    theirs: {}",
+                    theirs.get(&key).map(String::as_str).unwrap_or("<absent>")
+                );
                 if let (Ok(o), Some(t)) = (
                     rxrpl_codec::binary::decode(v),
-                    theirs.get(&key).and_then(|h| hex::decode(h).ok()).and_then(|b| rxrpl_codec::binary::decode(&b).ok()),
+                    theirs
+                        .get(&key)
+                        .and_then(|h| hex::decode(h).ok())
+                        .and_then(|b| rxrpl_codec::binary::decode(&b).ok()),
                 ) {
                     eprintln!("    ours json:   {o}");
                     eprintln!("    theirs json: {t}");
@@ -909,7 +918,11 @@ mod tests {
             chain.len(),
             chain.last().unwrap().header.account_hash,
         );
-        assert_eq!(chain.len() as u32, count, "must replay every ledger in range");
+        assert_eq!(
+            chain.len() as u32,
+            count,
+            "must replay every ledger in range"
+        );
     }
 
     /// Diagnostic: per-transaction metadata-blob comparison against rippled.

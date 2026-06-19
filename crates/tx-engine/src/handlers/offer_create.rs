@@ -886,7 +886,11 @@ fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) ->
     // Balance is stored from the low account's perspective; the holder's view
     // flips sign when the issuer is the low account.
     let issuer_is_low = gets.issuer.as_bytes() < owner.as_bytes();
-    let holder_positive = if issuer_is_low { raw_f < 0.0 } else { raw_f > 0.0 };
+    let holder_positive = if issuer_is_low {
+        raw_f < 0.0
+    } else {
+        raw_f > 0.0
+    };
     if !holder_positive {
         return zero;
     }

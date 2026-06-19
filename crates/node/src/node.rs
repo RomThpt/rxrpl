@@ -1329,8 +1329,7 @@ impl Node {
                                 let mut hist = closed_ledgers.write().await;
                                 for led in &chain {
                                     hist.push_back(led.clone());
-                                    while hist.len()
-                                        > crate::consensus_adapter::MAX_CLOSED_LEDGERS
+                                    while hist.len() > crate::consensus_adapter::MAX_CLOSED_LEDGERS
                                     {
                                         hist.pop_front();
                                     }
