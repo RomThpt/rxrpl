@@ -428,8 +428,7 @@ fn adjust_iou_balance(
     issuer_id: &rxrpl_primitives::AccountId,
     holder_id: &rxrpl_primitives::AccountId,
 ) -> Result<String, TransactionResult> {
-    let new = compute_new_iou_balance(trust, delta_str, issuer_id, holder_id)?;
-    Ok(format_iou_value(new))
+    compute_new_iou_balance(trust, delta_str, issuer_id, holder_id)
 }
 
 /// Render an IOU value back as a string in a stable form.
