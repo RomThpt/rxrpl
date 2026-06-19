@@ -1277,6 +1277,91 @@ impl Node {
         // lifetime past 'static).
         let have_unl_peers_for_loop = !self.config.validators.trusted.is_empty();
 
+        // Play-forward follow mode (step 4): when RXRPL_PLAY_FORWARD_FOLLOW is
+        // set and an RPC source is available, a background task advances the
+        // held tip by fetching each successor's validated transaction set and
+        // replaying it forward — bounded by transaction count, not the ~19M
+        // state entries P2P catchup re-acquires. The consensus close tick is
+        // gated off (below) so this task is the sole ledger driver. With no
+        // env var and no RPC (e.g. hive), the task is never spawned and the
+        // close path is unchanged.
+        let follow_rpc: Option<String> = if std::env::var("RXRPL_PLAY_FORWARD_FOLLOW").is_ok() {
+            sync_rpc_url.map(|s| s.to_string())
+        } else {
+            None
+        };
+        let follow_mode = follow_rpc.is_some();
+        if let Some(rpc) = follow_rpc {
+            let ledger = Arc::clone(&self.ledger);
+            let closed_ledgers = Arc::clone(&self.closed_ledgers);
+            let tx_engine = Arc::clone(&self.tx_engine);
+            let ledger_seq = Arc::clone(&ledger_seq);
+            let ledger_hash = Arc::clone(&ledger_hash);
+            let event_tx = event_tx.clone();
+            let poll = Duration::from_secs(close_interval_secs.max(1));
+            tokio::spawn(async move {
+                // Cap per-iteration work so a large gap does not block on one
+                // long replay; the next tick continues from the new tip.
+                const MAX_STEP: u32 = 256;
+                let mut ticker = tokio::time::interval(poll);
+                loop {
+                    ticker.tick().await;
+                    let Some(base) = closed_ledgers.read().await.back().cloned() else {
+                        continue;
+                    };
+                    let from = base.header.sequence;
+                    let latest = match Self::bootstrap_from_rpc(&rpc).await {
+                        Ok((seq, _)) => seq,
+                        Err(e) => {
+                            tracing::warn!("play-forward follow: latest fetch failed: {e}");
+                            continue;
+                        }
+                    };
+                    if latest <= from {
+                        continue;
+                    }
+                    let target = (from + MAX_STEP).min(latest);
+                    match crate::play_forward::catchup_via_replay(&rpc, base, target, &tx_engine)
+                        .await
+                    {
+                        Ok(chain) if !chain.is_empty() => {
+                            {
+                                let mut hist = closed_ledgers.write().await;
+                                for led in &chain {
+                                    hist.push_back(led.clone());
+                                    while hist.len()
+                                        > crate::consensus_adapter::MAX_CLOSED_LEDGERS
+                                    {
+                                        hist.pop_front();
+                                    }
+                                }
+                            }
+                            let tip = chain.last().unwrap();
+                            *ledger.write().await = Ledger::new_open(tip);
+                            ledger_seq.store(tip.header.sequence, Ordering::Relaxed);
+                            *ledger_hash.write().await = tip.header.hash;
+                            let _ = event_tx.send(ServerEvent::LedgerClosed {
+                                ledger_index: tip.header.sequence,
+                                ledger_hash: tip.header.hash,
+                                ledger_time: tip.header.close_time,
+                                txn_count: 0,
+                            });
+                            tracing::info!(
+                                "play-forward: followed #{}..=#{} ({} ledgers)",
+                                from + 1,
+                                tip.header.sequence,
+                                chain.len()
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("play-forward follow stalled at #{}: {e}", from + 1)
+                        }
+                    }
+                }
+            });
+        }
+
         let validator_id_for_loop = validator_id.clone();
         tokio::spawn(async move {
             let node_id = NodeId(identity.node_id);
@@ -1457,7 +1542,9 @@ impl Node {
 
             loop {
                 tokio::select! {
-                    _ = tick_interval.tick(), if !syncing => {
+                    // In follow mode the background play-forward task is the
+                    // sole ledger driver; the consensus close stays dormant.
+                    _ = tick_interval.tick(), if !syncing && !follow_mode => {
                         if let Some(action) = timer.tick() {
                             match action {
                                 TimerAction::CloseLedger => {
