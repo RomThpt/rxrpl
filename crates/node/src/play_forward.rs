@@ -549,6 +549,12 @@ mod tests {
                 let Some(let_type) = e.get("LedgerEntryType").and_then(|v| v.as_str()) else {
                     continue;
                 };
+                // DirectoryNode metadata omits the `Indexes` array; reconstructing
+                // from it would wipe the directory's existing entries. Keep the
+                // parent-ledger seed (fetched above) which carries full Indexes.
+                if let_type == "DirectoryNode" {
+                    continue;
+                }
                 let mut pre = e
                     .get("FinalFields")
                     .cloned()
@@ -703,6 +709,32 @@ mod tests {
 
             let theirs = if nt == "DeletedNode" {
                 None
+            } else if let_type == "DirectoryNode" {
+                // DirectoryNode metadata omits Indexes, so compare against the
+                // real on-chain entry at N. But owner directories on a busy
+                // account are re-modified by later txs in the ledger; when the
+                // on-chain page's PreviousTxnID is not our tx, its Indexes reflect
+                // those later txs and our tx's effect cannot be isolated — skip.
+                let r = rpc(serde_json::json!({
+                    "method":"ledger_entry","params":[{"index":key,"ledger_index":n,"binary":true}]
+                }));
+                let th = r["result"]["node_binary"]
+                    .as_str()
+                    .map(|s| s.to_uppercase());
+                let dir_last_tx = th
+                    .as_deref()
+                    .and_then(|h| hex::decode(h).ok())
+                    .and_then(|b| rxrpl_codec::binary::decode(&b).ok())
+                    .and_then(|j| {
+                        j.get("PreviousTxnID")
+                            .and_then(|v| v.as_str().map(|s| s.to_uppercase()))
+                    });
+                if dir_last_tx.as_deref() == Some(txid_upper.as_str()) {
+                    th
+                } else {
+                    eprintln!("  SKIP-DIR {key}: re-modified by a later tx in the ledger");
+                    ours.clone()
+                }
             } else {
                 let fields = if nt == "CreatedNode" {
                     "NewFields"
