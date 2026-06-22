@@ -1,9 +1,10 @@
 use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
 use crate::helpers;
-use crate::owner_dir::add_to_owner_dir;
+use crate::owner_dir::{add_to_nft_offer_dir, add_to_owner_dir};
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 /// tfSellNFToken flag
@@ -126,18 +127,46 @@ impl Transactor for NFTokenCreateOfferTransactor {
         // Create NFTokenOffer entry
         let offer_key = keylet::nftoken_offer(&account_id, tx_seq);
         let flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
-        let nftoken_id = helpers::get_str_field(ctx.tx, "NFTokenID").unwrap();
-        let amount = helpers::get_xrp_amount(ctx.tx).unwrap_or(0);
+        let is_sell = flags & TF_SELL_NFTOKEN != 0;
+        let nftoken_id = helpers::get_str_field(ctx.tx, "NFTokenID")
+            .ok_or(TransactionResult::TemMalformed)?
+            .to_string();
 
+        // Link into the creator's owner directory and the per-NFToken offer
+        // book (buy or sell), recording the owner-directory page as OwnerNode.
+        let owner_node = add_to_owner_dir(ctx.view, &account_id, &offer_key)?;
+        let nft_bytes: [u8; 32] = hex::decode(&nftoken_id)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or(TransactionResult::TemMalformed)?;
+        let nft_id_hash = Hash256::new(nft_bytes);
+        let book_key = if is_sell {
+            keylet::nft_sells(&nft_id_hash)
+        } else {
+            keylet::nft_buys(&nft_id_hash)
+        };
+        add_to_nft_offer_dir(ctx.view, &book_key, &nftoken_id, &offer_key)?;
+
+        // Amount passes through in its original shape (XRP drops string or IOU
+        // object). rippled stores no Sequence on the offer, and sfFlags only
+        // when non-zero (a sell offer carries tfSellNFToken).
+        let amount_value = ctx
+            .tx
+            .get("Amount")
+            .cloned()
+            .unwrap_or_else(|| Value::String("0".to_string()));
         let mut offer = serde_json::json!({
             "LedgerEntryType": "NFTokenOffer",
             "Owner": account_str,
             "NFTokenID": nftoken_id,
-            "Amount": amount.to_string(),
-            "Flags": flags,
-            "Sequence": tx_seq,
+            "Amount": amount_value,
+            "OwnerNode": format!("{owner_node:016X}"),
+            "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+            "PreviousTxnLgrSeq": 0,
         });
-
+        if flags != 0 {
+            offer["Flags"] = Value::from(flags);
+        }
         if let Some(dest) = helpers::get_str_field(ctx.tx, "Destination") {
             offer["Destination"] = Value::String(dest.to_string());
         }
@@ -150,7 +179,19 @@ impl Transactor for NFTokenCreateOfferTransactor {
             .insert(offer_key, offer_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        add_to_owner_dir(ctx.view, &account_id, &offer_key)?;
+        // A Destination-restricted offer touches the destination AccountRoot
+        // (its PreviousTxnID is threaded though no field changes), as rippled
+        // does when validating the named destination.
+        if let Some(dest) = helpers::get_str_field(ctx.tx, "Destination") {
+            if let Ok(dest_id) = decode_account_id(dest) {
+                let dest_key = keylet::account(&dest_id);
+                if let Some(dest_bytes) = ctx.view.read(&dest_key) {
+                    ctx.view
+                        .update(dest_key, dest_bytes)
+                        .map_err(|_| TransactionResult::TefInternal)?;
+                }
+            }
+        }
 
         Ok(TransactionResult::TesSuccess)
     }
