@@ -743,7 +743,8 @@ pub(crate) fn cross_book_payment(
                 let mut consumed = offer.clone();
                 consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
                 consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
-                let cb = serde_json::to_vec(&consumed).map_err(|_| TransactionResult::TefInternal)?;
+                let cb =
+                    serde_json::to_vec(&consumed).map_err(|_| TransactionResult::TefInternal)?;
                 ctx.view
                     .update(offer_key, cb)
                     .map_err(|_| TransactionResult::TefInternal)?;
@@ -754,7 +755,8 @@ pub(crate) fn cross_book_payment(
                 let mut reduced = offer.clone();
                 reduced["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
                 reduced["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
-                let rb = serde_json::to_vec(&reduced).map_err(|_| TransactionResult::TefInternal)?;
+                let rb =
+                    serde_json::to_vec(&reduced).map_err(|_| TransactionResult::TefInternal)?;
                 ctx.view
                     .update(offer_key, rb)
                     .map_err(|_| TransactionResult::TefInternal)?;
@@ -867,7 +869,14 @@ fn pay_in(
         &gross.negate(),
         round,
     )?;
-    credit_line(ctx, owner, &amount.issuer, &amount.currency, &amount.iou, round)
+    credit_line(
+        ctx,
+        owner,
+        &amount.issuer,
+        &amount.currency,
+        &amount.iou,
+        round,
+    )
 }
 
 /// Move the offer owner's output to the taker: XRP via balances, IOU via the
@@ -900,7 +909,14 @@ fn pay_out(
         &gross.negate(),
         round,
     )?;
-    credit_line(ctx, taker, &amount.issuer, &amount.currency, &amount.iou, round)
+    credit_line(
+        ctx,
+        taker,
+        &amount.issuer,
+        &amount.currency,
+        &amount.iou,
+        round,
+    )
 }
 
 /// `amount * rate` using rippled's non-rounding STAmount multiply.

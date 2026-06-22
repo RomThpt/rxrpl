@@ -592,8 +592,12 @@ mod tests {
         // The on-chain value at N reflects every transaction in the ledger, so it
         // is wrong for any SLE that a *later* tx in N also touched; the metadata
         // records the value as our tx left it.
-        let non_threaded =
-            |t: &str| matches!(t, "DirectoryNode" | "LedgerHashes" | "Amendments" | "FeeSettings");
+        let non_threaded = |t: &str| {
+            matches!(
+                t,
+                "DirectoryNode" | "LedgerHashes" | "Amendments" | "FeeSettings"
+            )
+        };
         let txid_upper = txhash.to_uppercase();
         let mut mismatches = 0;
         for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
@@ -609,7 +613,10 @@ mod tests {
             let key = e["LedgerIndex"].as_str().unwrap().to_uppercase();
             let kb: [u8; 32] = hex::decode(&key).unwrap().try_into().unwrap();
             let ours = open.state_map.get(&Hash256::new(kb)).map(hex::encode_upper);
-            let let_type = e.get("LedgerEntryType").and_then(|v| v.as_str()).unwrap_or("");
+            let let_type = e
+                .get("LedgerEntryType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
 
             let theirs = if nt == "DeletedNode" {
                 None
@@ -619,7 +626,10 @@ mod tests {
                 } else {
                     "FinalFields"
                 };
-                let mut post = e.get(fields).cloned().unwrap_or_else(|| serde_json::json!({}));
+                let mut post = e
+                    .get(fields)
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
                 if let Some(obj) = post.as_object_mut() {
                     obj.insert("LedgerEntryType".into(), Value::String(let_type.into()));
                     if !non_threaded(let_type) {
@@ -658,7 +668,10 @@ mod tests {
             }
         }
         eprintln!("affected={} mismatches={mismatches}", affected.len());
-        assert_eq!(mismatches, 0, "every affected SLE must match its tx metadata");
+        assert_eq!(
+            mismatches, 0,
+            "every affected SLE must match its tx metadata"
+        );
     }
 
     fn payment(seq: u32, dest: AccountId, amount_drops: u64) -> (Hash256, Vec<u8>) {

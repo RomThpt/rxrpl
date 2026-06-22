@@ -2095,8 +2095,15 @@ fn conversion_send_max_binds_partial_delivery() {
         "Sequence": 1,
         "Fee": "10",
     });
-    let mut octx = ApplyContext { tx: &offer_tx, view: &mut sandbox, rules: &rules, fees: &fees };
-    crate::handlers::offer_create::OfferCreateTransactor.apply(&mut octx).unwrap();
+    let mut octx = ApplyContext {
+        tx: &offer_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    crate::handlers::offer_create::OfferCreateTransactor
+        .apply(&mut octx)
+        .unwrap();
 
     const TF_PARTIAL_PAYMENT: u64 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT as u64;
     let convert_tx = serde_json::json!({
@@ -2109,7 +2116,12 @@ fn conversion_send_max_binds_partial_delivery() {
         "Sequence": 1,
         "Fee": "10",
     });
-    let mut pctx = ApplyContext { tx: &convert_tx, view: &mut sandbox, rules: &rules, fees: &fees };
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
     let r = PaymentTransactor.apply(&mut pctx).unwrap();
     assert_eq!(r, TransactionResult::TesSuccess);
 
@@ -2122,7 +2134,11 @@ fn conversion_send_max_binds_partial_delivery() {
         let a: serde_json::Value = serde_json::from_slice(&b).unwrap();
         helpers::get_balance(&a)
     };
-    assert_eq!(read_xrp(ALICE), 90_000_000, "ALICE spends the full 10 XRP budget");
+    assert_eq!(
+        read_xrp(ALICE),
+        90_000_000,
+        "ALICE spends the full 10 XRP budget"
+    );
     assert_eq!(read_xrp(BOB), 110_000_000, "BOB receives 10 XRP");
 }
 
@@ -2155,8 +2171,15 @@ fn conversion_iou_to_iou_caps_at_source_balance() {
         "Sequence": 1,
         "Fee": "10",
     });
-    let mut octx = ApplyContext { tx: &offer_tx, view: &mut sandbox, rules: &rules, fees: &fees };
-    crate::handlers::offer_create::OfferCreateTransactor.apply(&mut octx).unwrap();
+    let mut octx = ApplyContext {
+        tx: &offer_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    crate::handlers::offer_create::OfferCreateTransactor
+        .apply(&mut octx)
+        .unwrap();
 
     const TF_PARTIAL_PAYMENT: u64 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT as u64;
     let convert_tx = serde_json::json!({
@@ -2169,11 +2192,19 @@ fn conversion_iou_to_iou_caps_at_source_balance() {
         "Sequence": 1,
         "Fee": "10",
     });
-    let mut pctx = ApplyContext { tx: &convert_tx, view: &mut sandbox, rules: &rules, fees: &fees };
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
     let r = PaymentTransactor.apply(&mut pctx).unwrap();
     assert_eq!(r, TransactionResult::TesSuccess);
 
-    assert!(holder_balance(&sandbox, ALICE, ISSUER, "USD").abs() < 1e-6, "ALICE USD drained, not negative");
+    assert!(
+        holder_balance(&sandbox, ALICE, ISSUER, "USD").abs() < 1e-6,
+        "ALICE USD drained, not negative"
+    );
     assert!((holder_balance(&sandbox, ALICE, ISSUER2, "EUR") - 20.0).abs() < 1e-6);
     assert!((holder_balance(&sandbox, BOB, ISSUER, "USD") - 10.0).abs() < 1e-6);
     assert!((holder_balance(&sandbox, BOB, ISSUER2, "EUR") - 980.0).abs() < 1e-6);

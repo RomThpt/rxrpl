@@ -587,8 +587,9 @@ fn apply_conversion(
         serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
     crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut acct, ctx.tx)?;
 
-    let (delivered, _spent) =
-        crate::handlers::offer_create::cross_book_payment(ctx, &src_id, &mut acct, &amount, &send_max)?;
+    let (delivered, _spent) = crate::handlers::offer_create::cross_book_payment(
+        ctx, &src_id, &mut acct, &amount, &send_max,
+    )?;
 
     const TF_PARTIAL_PAYMENT: u32 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT;
     let partial = helpers::get_flags(ctx.tx) & TF_PARTIAL_PAYMENT != 0;
