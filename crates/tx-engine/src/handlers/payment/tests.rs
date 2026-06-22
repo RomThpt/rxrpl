@@ -2209,3 +2209,155 @@ fn conversion_iou_to_iou_caps_at_source_balance() {
     assert!((holder_balance(&sandbox, BOB, ISSUER, "USD") - 10.0).abs() < 1e-6);
     assert!((holder_balance(&sandbox, BOB, ISSUER2, "EUR") - 980.0).abs() < 1e-6);
 }
+
+#[test]
+fn cross_currency_delivers_to_distinct_destination() {
+    // BOB sells 100 USD for 50 XRP. ALICE pays XRP and the converted USD is
+    // delivered to a *different* account (ISSUER2 used here as a plain holder),
+    // exercising the distinct source/destination path: ALICE's XRP is debited,
+    // the destination's USD line is credited, ALICE is never credited USD.
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, BOB, "100000000", None);
+    put_account(&mut ledger, ALICE, "100000000", None);
+    put_account(&mut ledger, ISSUER2, "100000000", None);
+    put_trust_line(&mut ledger, BOB, ISSUER, "USD", 1000.0);
+    put_trust_line(&mut ledger, ISSUER2, ISSUER, "USD", 0.0);
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let offer_tx = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": BOB,
+        "TakerGets": iou("USD", ISSUER, "100"),
+        "TakerPays": "50000000",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &offer_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    crate::handlers::offer_create::OfferCreateTransactor
+        .apply(&mut octx)
+        .unwrap();
+
+    let pay_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ISSUER2,
+        "Amount": iou("USD", ISSUER, "40"),
+        "SendMax": "30000000",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &pay_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    let r = PaymentTransactor.apply(&mut pctx).unwrap();
+    assert_eq!(r, TransactionResult::TesSuccess);
+
+    assert!(
+        (holder_balance(&sandbox, ISSUER2, ISSUER, "USD") - 40.0).abs() < 1e-6,
+        "dest gets USD"
+    );
+    assert!((holder_balance(&sandbox, BOB, ISSUER, "USD") - 960.0).abs() < 1e-6);
+    let read_xrp = |addr: &str| -> u64 {
+        let id = decode_account_id(addr).unwrap();
+        let b = sandbox.read(&keylet::account(&id)).unwrap();
+        let a: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        helpers::get_balance(&a)
+    };
+    assert_eq!(read_xrp(ALICE), 80_000_000, "ALICE pays 20 XRP");
+    assert_eq!(read_xrp(BOB), 120_000_000, "BOB receives 20 XRP");
+}
+
+#[test]
+fn conversion_crosses_multiple_offers_best_price_first() {
+    // Two makers rest USD-for-XRP offers at different prices: ISSUER2 at
+    // 0.5 XRP/USD (better) and BOB at 0.6 XRP/USD. ALICE converts XRP->USD for
+    // 80 USD; the walk takes the cheaper offer first (50 USD, fully) then the
+    // dearer one (30 USD, partial), spending 25M + 18M = 43M XRP.
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, BOB, "200000000", None);
+    put_account(&mut ledger, ISSUER2, "200000000", None);
+    put_account(&mut ledger, ALICE, "100000000", None);
+    put_trust_line(&mut ledger, BOB, ISSUER, "USD", 1000.0);
+    put_trust_line(&mut ledger, ISSUER2, ISSUER, "USD", 1000.0);
+    put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 0.0);
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    for (maker, pays_xrp) in [(ISSUER2, "25000000"), (BOB, "30000000")] {
+        let offer_tx = serde_json::json!({
+            "TransactionType": "OfferCreate",
+            "Account": maker,
+            "TakerGets": iou("USD", ISSUER, "50"),
+            "TakerPays": pays_xrp,
+            "Sequence": 1,
+            "Fee": "10",
+        });
+        let mut octx = ApplyContext {
+            tx: &offer_tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap();
+    }
+
+    const TF_PARTIAL_PAYMENT: u64 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT as u64;
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": iou("USD", ISSUER, "80"),
+        "SendMax": "60000000",
+        "Flags": TF_PARTIAL_PAYMENT,
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    assert!((holder_balance(&sandbox, ALICE, ISSUER, "USD") - 80.0).abs() < 1e-6);
+    assert!(
+        (holder_balance(&sandbox, ISSUER2, ISSUER, "USD") - 950.0).abs() < 1e-6,
+        "cheaper offer fully taken"
+    );
+    assert!(
+        (holder_balance(&sandbox, BOB, ISSUER, "USD") - 970.0).abs() < 1e-6,
+        "dearer offer partially taken"
+    );
+    let read_xrp = |addr: &str| -> u64 {
+        let id = decode_account_id(addr).unwrap();
+        let b = sandbox.read(&keylet::account(&id)).unwrap();
+        let a: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        helpers::get_balance(&a)
+    };
+    assert_eq!(read_xrp(ALICE), 57_000_000, "ALICE spends 43M XRP");
+    assert_eq!(read_xrp(ISSUER2), 225_000_000);
+    assert_eq!(read_xrp(BOB), 218_000_000);
+}
