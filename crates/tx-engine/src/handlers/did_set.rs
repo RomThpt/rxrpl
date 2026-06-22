@@ -63,10 +63,14 @@ impl Transactor for DIDSetTransactor {
         let is_create = !ctx.view.exists(&did_key);
 
         let mut entry = if is_create {
+            // sfFlags is default-droppable (rippled omits it at 0). The
+            // PreviousTxnID/LgrSeq placeholders are overwritten by the engine's
+            // central transaction stamping after apply.
             serde_json::json!({
                 "LedgerEntryType": "DID",
                 "Account": account_str,
-                "Flags": 0,
+                "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+                "PreviousTxnLgrSeq": 0,
             })
         } else {
             let entry_bytes = ctx
