@@ -235,14 +235,52 @@ impl IOUAmount {
         let scaled = (m1 as u128) * TEN_TO_17;
         let result = scaled / (m2 as u128) + 5;
 
-        if result > u64::MAX as u128 {
-            return Err(AmountError::Overflow);
-        }
-
         let result_negative = num.negative != den.negative;
         let result_exponent = e1 - e2 - 17;
 
-        IOUAmount::from_parts(result as u64, result_exponent, result_negative)
+        // rippled reduces the quotient to canonical precision through `Number`,
+        // which rounds half-to-even — not the truncation `from_parts` uses. The
+        // `+ 5` bias above mirrors rippled's `divide`; pairing it with the same
+        // rounding makes the last digit byte-exact (e.g. issuer TickSize offers).
+        Self::from_parts_round_half_even(result, result_exponent, result_negative)
+    }
+
+    /// Build an IOU from a possibly over-precise mantissa, reducing to canonical
+    /// 16-digit precision with round-half-to-even (rippled `Number` semantics).
+    fn from_parts_round_half_even(
+        mut mantissa: u128,
+        mut exponent: i32,
+        negative: bool,
+    ) -> Result<IOUAmount, AmountError> {
+        if mantissa == 0 {
+            return Ok(IOUAmount::ZERO);
+        }
+        let max = MAX_MANTISSA as u128;
+        let mut drop = 0u32;
+        let mut probe = mantissa;
+        while probe > max {
+            probe /= 10;
+            drop += 1;
+        }
+        if drop > 0 {
+            let div = 10u128.pow(drop);
+            let q = mantissa / div;
+            let r = mantissa % div;
+            let half = div / 2;
+            let round_up = r > half || (r == half && (q & 1 == 1));
+            mantissa = if round_up { q + 1 } else { q };
+            exponent += drop as i32;
+            // Rounding up can carry into a 17th digit (e.g. 10^16); a trailing
+            // power-of-ten reduction is exact, so no further rounding needed.
+            while mantissa > max {
+                mantissa /= 10;
+                exponent += 1;
+            }
+        }
+        if mantissa > u64::MAX as u128 {
+            return Err(AmountError::Overflow);
+        }
+        IOUAmount::from_parts(mantissa as u64, exponent, negative)
     }
 
     /// Multiply two IOU amounts with rounding control.
@@ -910,8 +948,10 @@ mod tests {
         let one = IOUAmount::new(1_000_000_000_000_000, -15).unwrap();
         let three = IOUAmount::new(3_000_000_000_000_000, -15).unwrap();
         let result = IOUAmount::divide(&one, &three).unwrap();
-        // 0.333333333333333... = 3333333333333333 * 10^-16
-        assert_eq!(result.mantissa(), 3_333_333_333_333_333);
+        // 0.3333... reduces to 16 digits with round-half-to-even, matching
+        // rippled's Number: the floor quotient + 5 bias yields ...338, which
+        // rounds up to ...334.
+        assert_eq!(result.mantissa(), 3_333_333_333_333_334);
         assert_eq!(result.exponent(), -16);
     }
 

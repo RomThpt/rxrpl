@@ -1,5 +1,5 @@
 use rxrpl_amendment::feature::feature_id;
-use rxrpl_amount::{IOUAmount, offer_quality};
+use rxrpl_amount::{IOUAmount, from_rate, offer_quality, round_quality};
 use rxrpl_codec::address::classic::{decode_account_id, encode_account_id};
 use rxrpl_primitives::{AccountId, Hash256};
 use rxrpl_protocol::TransactionResult;
@@ -62,6 +62,79 @@ fn offer_book_quality(taker_pays: &Value, taker_gets: &Value) -> u64 {
         (Some(p), Some(g)) => offer_quality(&p, &g).unwrap_or(0),
         _ => 0,
     }
+}
+
+/// tfSell flag: the offer is a sell, so TakerGets is the exact amount.
+const TF_SELL: u64 = 0x0008_0000;
+
+/// rippled's `Quality::kMaxTickSize` — no rounding at or above 16 digits.
+const MAX_TICK_SIZE: u8 = 16;
+
+/// Reserialize an IOU offer side with a recomputed magnitude, preserving its
+/// currency/issuer. Returns `None` for XRP sides (no tick rounding applies to
+/// a recomputed native amount here).
+fn rebuild_iou(original: &Value, value: &IOUAmount) -> Option<Value> {
+    let obj = original.as_object()?;
+    let mut out = obj.clone();
+    out.insert("value".into(), Value::from(value.to_decimal_string()));
+    Some(Value::Object(out))
+}
+
+/// Apply issuer `TickSize` rounding to the offer amounts before crossing,
+/// matching rippled's OfferCreate. When an IOU side's issuer sets a TickSize
+/// below the 16-digit maximum, the offer quality is rounded up to that many
+/// significant digits and the non-fixed side re-derived, snapping the offer to
+/// the issuer's price grid. Offers with no tick size are returned unchanged.
+fn tick_round_amounts(
+    ctx: &ApplyContext<'_>,
+    taker_pays: &Value,
+    taker_gets: &Value,
+    is_sell: bool,
+) -> (Value, Value) {
+    let tick_of = |amount: &Value| -> u8 {
+        let Some(issuer) = amount.get("issuer").and_then(|v| v.as_str()) else {
+            return MAX_TICK_SIZE;
+        };
+        let Ok(id) = decode_account_id(issuer) else {
+            return MAX_TICK_SIZE;
+        };
+        ctx.view
+            .read(&keylet::account(&id))
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|a| a.get("TickSize").and_then(|v| v.as_u64()))
+            .map(|t| t as u8)
+            .unwrap_or(MAX_TICK_SIZE)
+    };
+
+    let tick = tick_of(taker_pays).min(tick_of(taker_gets));
+    if tick >= MAX_TICK_SIZE {
+        return (taker_pays.clone(), taker_gets.clone());
+    }
+
+    let (Some(p_iou), Some(g_iou)) = (amount_to_iou(taker_pays), amount_to_iou(taker_gets)) else {
+        return (taker_pays.clone(), taker_gets.clone());
+    };
+    let Ok(quality) = offer_quality(&p_iou, &g_iou) else {
+        return (taker_pays.clone(), taker_gets.clone());
+    };
+    let Ok(rate) = from_rate(round_quality(quality, tick)) else {
+        return (taker_pays.clone(), taker_gets.clone());
+    };
+
+    if is_sell {
+        if let Some(new_pays) = IOUAmount::multiply(&g_iou, &rate)
+            .ok()
+            .and_then(|p| rebuild_iou(taker_pays, &p))
+        {
+            return (new_pays, taker_gets.clone());
+        }
+    } else if let Some(new_gets) = IOUAmount::divide(&p_iou, &rate)
+        .ok()
+        .and_then(|g| rebuild_iou(taker_gets, &g))
+    {
+        return (taker_pays.clone(), new_gets);
+    }
+    (taker_pays.clone(), taker_gets.clone())
 }
 
 /// OfferCreate transaction handler.
@@ -148,6 +221,13 @@ impl Transactor for OfferCreateTransactor {
         let (pays_currency, pays_issuer) = currency_and_issuer(&ctx.tx["TakerPays"]);
         let (gets_currency, gets_issuer) = currency_and_issuer(&ctx.tx["TakerGets"]);
 
+        // Snap the offer to the issuer's TickSize grid before crossing, exactly
+        // as rippled does: the placed rate and re-derived amounts both flow from
+        // the rounded quality. No-op when neither issuer sets a tick size.
+        let is_sell = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_SELL != 0;
+        let (taker_pays, taker_gets) =
+            tick_round_amounts(ctx, &ctx.tx["TakerPays"], &ctx.tx["TakerGets"], is_sell);
+
         // Consume the sequence up front: rippled charges it (and the fee) even
         // when the transaction ends in a tec claim below.
         crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, &mut acct, ctx.tx)?;
@@ -162,8 +242,8 @@ impl Transactor for OfferCreateTransactor {
             ctx,
             &account_id,
             &mut acct,
-            &ctx.tx["TakerPays"].clone(),
-            &ctx.tx["TakerGets"].clone(),
+            &taker_pays,
+            &taker_gets,
             &inverse_book,
         )?;
 
@@ -196,7 +276,7 @@ impl Transactor for OfferCreateTransactor {
         // issuers) with its low 64 bits replaced by the offer's quality (rate),
         // so offers sort by price. rippled stores this as the offer's
         // BookDirectory and tags the directory with the rate + book assets.
-        let quality = offer_book_quality(&ctx.tx["TakerPays"], &ctx.tx["TakerGets"]);
+        let quality = offer_book_quality(&taker_pays, &taker_gets);
         let book_base =
             keylet::book_dir(&pays_currency, &pays_issuer, &gets_currency, &gets_issuer);
         let book_dir_key = book_dir_with_quality(&book_base, quality);
