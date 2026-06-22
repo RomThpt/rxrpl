@@ -40,6 +40,42 @@ pub fn from_rate(rate: u64) -> Result<IOUAmount, AmountError> {
     IOUAmount::from_parts(mantissa, exponent, false)
 }
 
+/// Round a packed quality up to `digits` significant mantissa digits.
+///
+/// Mirrors rippled's `Quality::round`, applied when an offer's issuer has a
+/// `TickSize` set: the rate is rounded up (worse for the placer) so the offer
+/// is quantized to the tick grid.
+pub fn round_quality(rate: u64, digits: u8) -> u64 {
+    const K_MOD: [u64; 17] = [
+        10_000_000_000_000_000,
+        1_000_000_000_000_000,
+        100_000_000_000_000,
+        10_000_000_000_000,
+        1_000_000_000_000,
+        100_000_000_000,
+        10_000_000_000,
+        1_000_000_000,
+        100_000_000,
+        10_000_000,
+        1_000_000,
+        100_000,
+        10_000,
+        1_000,
+        100,
+        10,
+        1,
+    ];
+    if rate == 0 || digits >= 16 {
+        return rate;
+    }
+    let m = K_MOD[digits as usize];
+    let exponent = rate >> 56;
+    let mut mantissa = rate & 0x00FF_FFFF_FFFF_FFFF;
+    mantissa += m - 1;
+    mantissa -= mantissa % m;
+    (exponent << 56) | mantissa
+}
+
 /// Compare two quality values.
 ///
 /// Returns true if quality `a` represents a better (lower) rate than `b`.
