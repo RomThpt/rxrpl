@@ -118,10 +118,10 @@ impl Transactor for OfferCreateTransactor {
             return Err(TransactionResult::TerNoAccount);
         }
 
-        // PermissionedDEX: if the amendment is enabled and an IOU asset's
-        // issuer has the lsfPermissionedDEX flag set, verify the trader
-        // holds accepted credentials from the issuer's PermissionedDomain.
-        if ctx.rules.enabled(&feature_id("PermissionedDEX")) {
+        // PermissionedDEX gates only domain-scoped offers (those carrying a
+        // DomainID); an open offer trades on the public book unrestricted. The
+        // credential check applies only when a DomainID is present.
+        if ctx.rules.enabled(&feature_id("PermissionedDEX")) && ctx.tx.get("DomainID").is_some() {
             check_permissioned_asset(ctx, &account_id, ctx.tx.get("TakerPays"))?;
             check_permissioned_asset(ctx, &account_id, ctx.tx.get("TakerGets"))?;
         }
@@ -233,12 +233,18 @@ impl Transactor for OfferCreateTransactor {
             "0000000000000000000000000000000000000000000000000000000000000000".into(),
         );
         offer.insert("PreviousTxnLgrSeq".into(), Value::from(0u32));
-        // rippled's Offer always carries Flags, BookNode and OwnerNode, even
-        // when zero.
+        // Flags, BookNode and OwnerNode are default-droppable: rippled omits
+        // them when zero (offer on the root page of each directory).
         let flags = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
-        offer.insert("Flags".into(), Value::from(flags));
-        offer.insert("BookNode".into(), u64_hex(book_node).into());
-        offer.insert("OwnerNode".into(), u64_hex(owner_node).into());
+        if flags != 0 {
+            offer.insert("Flags".into(), Value::from(flags));
+        }
+        if book_node != 0 {
+            offer.insert("BookNode".into(), u64_hex(book_node).into());
+        }
+        if owner_node != 0 {
+            offer.insert("OwnerNode".into(), u64_hex(owner_node).into());
+        }
         let offer_bytes = serde_json::to_vec(&Value::Object(offer))
             .map_err(|_| TransactionResult::TemMalformed)?;
         ctx.view
