@@ -84,8 +84,17 @@ impl Transactor for CheckCreateTransactor {
             .update(src_key, src_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
+        let dst_id = decode_account_id(destination_str)
+            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+
         // Create Check entry
         let check_key = keylet::check(&src_id, tx_seq);
+
+        // A check is linked into both the creator's and the destination's owner
+        // directories; the resulting page numbers are recorded as OwnerNode and
+        // DestinationNode so each side can later unlink it without a walk.
+        let owner_node = add_to_owner_dir(ctx.view, &src_id, &check_key)?;
+        let dest_node = add_to_owner_dir(ctx.view, &dst_id, &check_key)?;
 
         // Pass through SendMax in its original shape — preserves the IOU
         // object form ({currency, issuer, value}) needed for IOU checks.
@@ -94,13 +103,18 @@ impl Transactor for CheckCreateTransactor {
             .get("SendMax")
             .cloned()
             .unwrap_or_else(|| serde_json::Value::String("0".to_string()));
+        // rippled does not set sfFlags on a Check, so it is absent (unlike a
+        // Ticket, which carries Flags=0). Emitting it here breaks byte fidelity.
         let mut check = serde_json::json!({
             "LedgerEntryType": "Check",
             "Account": account_str,
             "Destination": destination_str,
             "SendMax": send_max_value,
             "Sequence": tx_seq,
-            "Flags": 0,
+            "OwnerNode": format!("{owner_node:016X}"),
+            "DestinationNode": format!("{dest_node:016X}"),
+            "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+            "PreviousTxnLgrSeq": 0,
         });
 
         if let Some(expiration) = helpers::get_u32_field(ctx.tx, "Expiration") {
@@ -121,7 +135,15 @@ impl Transactor for CheckCreateTransactor {
             .insert(check_key, check_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        add_to_owner_dir(ctx.view, &src_id, &check_key)?;
+        // Linking the check into the destination's owner directory threads the
+        // destination AccountRoot's PreviousTxnID even though no field changes,
+        // so re-write it unchanged to register the modification.
+        let dst_key = keylet::account(&dst_id);
+        if let Some(dst_bytes) = ctx.view.read(&dst_key) {
+            ctx.view
+                .update(dst_key, dst_bytes)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
 
         Ok(TransactionResult::TesSuccess)
     }
@@ -216,5 +238,18 @@ mod tests {
         let check: serde_json::Value = serde_json::from_slice(&check_bytes).unwrap();
         assert_eq!(check["SendMax"].as_str().unwrap(), "5000000");
         assert_eq!(check["Destination"].as_str().unwrap(), DST);
+        // Linked into both directories, with page hints recorded and no sfFlags.
+        assert!(check.get("OwnerNode").is_some());
+        assert!(check.get("DestinationNode").is_some());
+        assert!(check.get("Flags").is_none());
+
+        // The check is in the destination's owner directory too.
+        let dst_id = decode_account_id(DST).unwrap();
+        let dst_dir = sandbox.read(&keylet::owner_dir(&dst_id)).unwrap();
+        let dst_dir: serde_json::Value = serde_json::from_slice(&dst_dir).unwrap();
+        assert_eq!(
+            dst_dir["Indexes"][0].as_str().unwrap().to_uppercase(),
+            check_key.to_string().to_uppercase()
+        );
     }
 }
