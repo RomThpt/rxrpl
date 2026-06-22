@@ -307,7 +307,12 @@ impl BinarySerializer {
     }
 
     fn serialize_currency_code(&mut self, currency: &str) -> Result<(), CodecError> {
-        if currency.len() == 3 {
+        if currency == "XRP" {
+            // XRP's currency code is 20 zero bytes, not the ASCII "XRP" — the
+            // parser decodes all-zero codes back to "XRP", so the encoder must
+            // mirror it (e.g. an Oracle PriceData BaseAsset of XRP).
+            self.write_bytes(&[0u8; 20]);
+        } else if currency.len() == 3 {
             // Standard 3-char currency code
             let mut bytes = [0u8; 20];
             bytes[12] = currency.as_bytes()[0];

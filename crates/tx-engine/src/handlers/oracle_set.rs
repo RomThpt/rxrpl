@@ -106,8 +106,38 @@ impl Transactor for OracleSetTransactor {
         if let Some(last_update_time) = helpers::get_u32_field(ctx.tx, "LastUpdateTime") {
             entry["LastUpdateTime"] = serde_json::Value::from(last_update_time);
         }
-        if let Some(series) = ctx.tx.get("PriceDataSeries") {
-            entry["PriceDataSeries"] = series.clone();
+        if let Some(tx_series) = ctx.tx.get("PriceDataSeries").and_then(|v| v.as_array()) {
+            // rippled merges the update into the existing series: each tx entry
+            // updates the matching (BaseAsset, QuoteAsset) pair in place, keeping
+            // the existing order, and new pairs are appended. A replacement would
+            // reorder the array and diverge byte-for-byte.
+            let asset_key = |p: &serde_json::Value| -> (String, String) {
+                let pd = p.get("PriceData").unwrap_or(p);
+                (
+                    pd.get("BaseAsset")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    pd.get("QuoteAsset")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            };
+            let mut merged: Vec<serde_json::Value> = entry
+                .get("PriceDataSeries")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for tx_pd in tx_series {
+                let k = asset_key(tx_pd);
+                if let Some(pos) = merged.iter().position(|e| asset_key(e) == k) {
+                    merged[pos] = tx_pd.clone();
+                } else {
+                    merged.push(tx_pd.clone());
+                }
+            }
+            entry["PriceDataSeries"] = serde_json::Value::Array(merged);
         }
 
         let entry_data = serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?;
