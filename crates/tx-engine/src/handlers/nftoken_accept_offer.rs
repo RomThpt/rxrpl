@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use crate::helpers;
 use crate::nftoken;
+use crate::owner_dir::{dir_remove, remove_from_owner_dir_page};
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct NFTokenAcceptOfferTransactor;
@@ -156,7 +157,8 @@ impl NFTokenAcceptOfferTransactor {
             .cloned();
         tokens.retain(|t| nftoken::entry_nftoken_id(t) != Some(nftoken_id));
 
-        if tokens.is_empty() {
+        let from_page_deleted = tokens.is_empty();
+        if from_page_deleted {
             ctx.view
                 .erase(&from_page_key)
                 .map_err(|_| TransactionResult::TefInternal)?;
@@ -168,20 +170,23 @@ impl NFTokenAcceptOfferTransactor {
                 .map_err(|_| TransactionResult::TefInternal)?;
         }
 
-        // Adjust seller owner count.
-        let from_acct_key = keylet::account(&from_id);
-        let from_acct_bytes = ctx
-            .view
-            .read(&from_acct_key)
-            .ok_or(TransactionResult::TerNoAccount)?;
-        let mut from_acct: Value =
-            serde_json::from_slice(&from_acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        helpers::adjust_owner_count(&mut from_acct, -1);
-        let from_data =
-            serde_json::to_vec(&from_acct).map_err(|_| TransactionResult::TefInternal)?;
-        ctx.view
-            .update(from_acct_key, from_data)
-            .map_err(|_| TransactionResult::TefInternal)?;
+        // Moving a token only changes the seller's reserve when its page is
+        // emptied and removed.
+        if from_page_deleted {
+            let from_acct_key = keylet::account(&from_id);
+            let from_acct_bytes = ctx
+                .view
+                .read(&from_acct_key)
+                .ok_or(TransactionResult::TerNoAccount)?;
+            let mut from_acct: Value = serde_json::from_slice(&from_acct_bytes)
+                .map_err(|_| TransactionResult::TefInternal)?;
+            helpers::adjust_owner_count(&mut from_acct, -1);
+            let from_data =
+                serde_json::to_vec(&from_acct).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(from_acct_key, from_data)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
 
         // Add the token to the buyer's pages (owner count rises on a new page).
         if let Some(token) = token_obj {
@@ -257,17 +262,45 @@ impl NFTokenAcceptOfferTransactor {
         Ok(())
     }
 
+    /// Consume an NFToken offer: unlink it from its owner directory (via the
+    /// recorded OwnerNode) and the per-NFToken buy/sell book, erase it, and drop
+    /// the offer owner's reserve by one. Mirrors NFTokenCancelOffer's cleanup.
     fn erase_offer_and_adjust(
         ctx: &mut ApplyContext<'_>,
         offer_key: &Hash256,
-        owner_addr: &str,
+        offer: &Value,
     ) -> Result<(), TransactionResult> {
+        let owner_addr = offer["Owner"]
+            .as_str()
+            .ok_or(TransactionResult::TefInternal)?;
+        let owner_id =
+            decode_account_id(owner_addr).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+
+        let owner_node = offer
+            .get("OwnerNode")
+            .and_then(|v| v.as_str())
+            .and_then(|s| u64::from_str_radix(s, 16).ok())
+            .unwrap_or(0);
+        remove_from_owner_dir_page(ctx.view, &owner_id, owner_node, offer_key)?;
+
+        let is_sell = offer.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & 1 != 0;
+        if let Some(nft_id_hex) = offer.get("NFTokenID").and_then(|v| v.as_str()) {
+            if let Ok(bytes) = hex::decode(nft_id_hex) {
+                if let Ok(h) = Hash256::from_slice(&bytes) {
+                    let book = if is_sell {
+                        keylet::nft_sells(&h)
+                    } else {
+                        keylet::nft_buys(&h)
+                    };
+                    dir_remove(ctx.view, &book, offer_key)?;
+                }
+            }
+        }
+
         ctx.view
             .erase(offer_key)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        let owner_id =
-            decode_account_id(owner_addr).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let owner_acct_key = keylet::account(&owner_id);
         let owner_bytes = ctx
             .view
@@ -325,8 +358,8 @@ impl NFTokenAcceptOfferTransactor {
         }
         // Transfer token from seller to buyer
         Self::transfer_token(ctx, &nftoken_id, &seller_addr, buyer_addr)?;
-        // Erase offer
-        Self::erase_offer_and_adjust(ctx, &sell_key, &seller_addr)?;
+        // Consume the offer (unlink from both directories, erase, owner reserve)
+        Self::erase_offer_and_adjust(ctx, &sell_key, &sell_offer)?;
 
         Ok(())
     }
@@ -377,8 +410,8 @@ impl NFTokenAcceptOfferTransactor {
         Self::transfer_xrp(ctx, &buyer_addr, seller_addr, amount)?;
         // Transfer token from seller (caller) to buyer
         Self::transfer_token(ctx, &nftoken_id, seller_addr, &buyer_addr)?;
-        // Erase offer
-        Self::erase_offer_and_adjust(ctx, &buy_key, &buyer_addr)?;
+        // Consume the offer (unlink from both directories, erase, owner reserve)
+        Self::erase_offer_and_adjust(ctx, &buy_key, &buy_offer)?;
 
         Ok(())
     }
@@ -425,9 +458,9 @@ impl NFTokenAcceptOfferTransactor {
         // Transfer token
         Self::transfer_token(ctx, &nftoken_id, &seller_addr, &buyer_addr)?;
 
-        // Erase both offers
-        Self::erase_offer_and_adjust(ctx, &sell_key, &seller_addr)?;
-        Self::erase_offer_and_adjust(ctx, &buy_key, &buyer_addr)?;
+        // Consume both offers (unlink directories, erase, owner reserve)
+        Self::erase_offer_and_adjust(ctx, &sell_key, &sell_offer)?;
+        Self::erase_offer_and_adjust(ctx, &buy_key, &buy_offer)?;
 
         Ok(())
     }
