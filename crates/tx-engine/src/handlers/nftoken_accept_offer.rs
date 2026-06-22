@@ -419,7 +419,7 @@ impl NFTokenAcceptOfferTransactor {
     fn accept_brokered(
         &self,
         ctx: &mut ApplyContext<'_>,
-        _broker_addr: &str,
+        broker_addr: &str,
         sell_hex: &str,
         buy_hex: &str,
     ) -> Result<(), TransactionResult> {
@@ -439,20 +439,36 @@ impl NFTokenAcceptOfferTransactor {
             .ok_or(TransactionResult::TefInternal)?
             .to_string();
 
-        let sell_amount: u64 = sell_offer["Amount"]
-            .as_str()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let buy_amount: u64 = buy_offer["Amount"]
+        // The buyer pays the buy-offer amount. rippled distributes it in a
+        // fixed order so the issuer's cut never exceeds what the seller
+        // authorized: broker fee first, then issuer royalty on the remainder,
+        // then whatever is left goes to the seller.
+        let mut amount: u64 = buy_offer["Amount"]
             .as_str()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
-        // Buyer pays seller the sell amount, broker gets the difference
-        Self::transfer_xrp(ctx, &buyer_addr, &seller_addr, sell_amount)?;
-        if buy_amount > sell_amount {
-            let broker_fee = buy_amount - sell_amount;
-            Self::transfer_xrp(ctx, &buyer_addr, _broker_addr, broker_fee)?;
+        let broker_fee: u64 = helpers::get_str_field(ctx.tx, "NFTokenBrokerFee")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if broker_fee > 0 {
+            Self::transfer_xrp(ctx, &buyer_addr, broker_addr, broker_fee)?;
+            amount = amount.saturating_sub(broker_fee);
+        }
+
+        let transfer_fee = u32::from_str_radix(&nftoken_id[4..8], 16).unwrap_or(0);
+        if amount > 0 && transfer_fee != 0 {
+            if let Some(issuer) = issuer_from_nftoken_id(&nftoken_id) {
+                if issuer != seller_addr && issuer != buyer_addr {
+                    let cut = (amount as u128 * transfer_fee as u128 / 100_000u128) as u64;
+                    Self::transfer_xrp(ctx, &buyer_addr, &issuer, cut)?;
+                    amount = amount.saturating_sub(cut);
+                }
+            }
+        }
+
+        if amount > 0 {
+            Self::transfer_xrp(ctx, &buyer_addr, &seller_addr, amount)?;
         }
 
         // Transfer token
