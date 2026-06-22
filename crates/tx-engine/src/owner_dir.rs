@@ -61,6 +61,12 @@ pub fn dir_insert(
         m.insert("LedgerEntryType".into(), "DirectoryNode".into());
         m.insert("Flags".into(), Value::from(0u32));
         m.insert("RootIndex".into(), root_key.to_string().into());
+        // Directory pages are threaded; the placeholder is filled by central
+        // stamping after apply.
+        m.insert(
+            "PreviousTxnID".into(),
+            "0000000000000000000000000000000000000000000000000000000000000000".into(),
+        );
         for (k, v) in describe {
             m.insert((*k).to_string(), v.clone());
         }
