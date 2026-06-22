@@ -65,18 +65,43 @@ impl Transactor for AMMWithdrawTransactor {
             return Err(TransactionResult::TecUnfunded);
         }
 
-        // Withdraw-all flags drain the caller's entire LP position. Without
-        // a per-account LP ledger entry we only know about the AMM's
-        // Creator; reject any other caller so an account with no LP tokens
-        // can't drain the pool via tfWithdrawAll / tfOneAssetWithdrawAll.
+        // Withdraw-all flags drain the caller's entire LP position: the caller
+        // must hold an LPToken trust line with the AMM (real model). The legacy
+        // stub had no per-account LP ledger entry and gated on the AMM Creator;
+        // here we verify the real trust line exists when the AMM entry carries
+        // its LPToken issue.
         let flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
         if flags & (TF_WITHDRAW_ALL | TF_ONE_ASSET_WITHDRAW_ALL) != 0 {
-            let creator = amm
-                .get("Creator")
+            let lpt = amm.get("LPTokenBalance");
+            let real = lpt
+                .and_then(|l| l.get("currency"))
                 .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            if creator != account_str {
-                return Err(TransactionResult::TecUnfunded);
+                .zip(amm.get("Account").and_then(|v| v.as_str()));
+            match real {
+                Some((cur_hex, amm_acct_str)) => {
+                    let account_id = decode_account_id(account_str)
+                        .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+                    let amm_account = decode_account_id(amm_acct_str)
+                        .map_err(|_| TransactionResult::TefInternal)?;
+                    let cur_bytes: [u8; 20] = hex::decode(cur_hex)
+                        .ok()
+                        .and_then(|b| b.try_into().ok())
+                        .ok_or(TransactionResult::TefInternal)?;
+                    let tl_key = keylet::trust_line(&account_id, &amm_account, &cur_bytes);
+                    if !ctx.view.exists(&tl_key) {
+                        return Err(TransactionResult::TecUnfunded);
+                    }
+                }
+                None => {
+                    // Legacy stub fallback.
+                    let creator = amm
+                        .get("Creator")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if creator != account_str {
+                        return Err(TransactionResult::TecUnfunded);
+                    }
+                }
             }
         }
 
@@ -90,6 +115,23 @@ impl Transactor for AMMWithdrawTransactor {
 
         let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
         let mut amm = amm_helpers::read_amm(ctx.view, &amm_key)?;
+
+        // Byte-exact paths on the real AMM model for single-asset XRP.
+        let tx_flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
+        let amount_field = ctx.tx.get("Amount");
+        let amount_is_xrp = amount_field.map(|v| v.is_string()).unwrap_or(false);
+        let has_lp_in = ctx.tx.get("LPTokenIn").is_some();
+        if amount_is_xrp && ctx.tx.get("Amount2").is_none() && !has_lp_in {
+            // tfOneAssetWithdrawAll: withdraw the holder's entire LP into XRP,
+            // deleting their LPToken trust line.
+            if tx_flags & TF_ONE_ASSET_WITHDRAW_ALL != 0 {
+                return self.single_xrp_withdraw_all(ctx, &account_id, &amm_key, &mut amm);
+            }
+            let withdraw = amount_field
+                .and_then(amm_helpers::amount_value_drops_or_iou)
+                .unwrap_or(0);
+            return self.single_xrp_withdraw(ctx, &account_id, &amm_key, &mut amm, withdraw);
+        }
 
         let pool1 = amm_helpers::get_pool_field(&amm, "PoolBalance1");
         let pool2 = amm_helpers::get_pool_field(&amm, "PoolBalance2");
@@ -199,6 +241,257 @@ impl Transactor for AMMWithdrawTransactor {
 
         Ok(TransactionResult::TesSuccess)
     }
+}
+
+impl AMMWithdrawTransactor {
+    /// Single-asset XRP withdraw on the real AMM model (byte-exact path).
+    fn single_xrp_withdraw(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+        withdrawer: &rxrpl_primitives::AccountId,
+        amm_key: &rxrpl_primitives::Hash256,
+        amm: &mut serde_json::Value,
+        withdraw: u64,
+    ) -> Result<TransactionResult, TransactionResult> {
+        use rxrpl_amount::number::Number;
+
+        let amm_account_str = amm["Account"]
+            .as_str()
+            .ok_or(TransactionResult::TefInternal)?
+            .to_string();
+        let amm_account =
+            decode_account_id(&amm_account_str).map_err(|_| TransactionResult::TefInternal)?;
+        let tfee = amm["TradingFee"].as_u64().unwrap_or(0) as u16;
+        let lpt = amm
+            .get("LPTokenBalance")
+            .ok_or(TransactionResult::TefInternal)?;
+        let lp_currency_hex = lpt["currency"]
+            .as_str()
+            .ok_or(TransactionResult::TefInternal)?
+            .to_string();
+        let total_lp = amm_helpers::parse_iou_value(lpt["value"].as_str().unwrap_or("0"));
+
+        let amm_acct_key = keylet::account(&amm_account);
+        let amm_acct_bytes = ctx
+            .view
+            .read(&amm_acct_key)
+            .ok_or(TransactionResult::TerNoAccount)?;
+        let mut amm_acct: serde_json::Value =
+            serde_json::from_slice(&amm_acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let pool = helpers::get_balance(&amm_acct);
+
+        // LP tokens to burn, and the actual XRP paid out (min of requested and
+        // the re-derived ammAssetOut).
+        let tokens = amm_helpers::lp_tokens_in_single(pool, withdraw, &total_lp, tfee);
+        let asset_out = amm_helpers::amm_asset_out_single_xrp(pool, &total_lp, &tokens, tfee);
+        let amount_out = withdraw.min(asset_out);
+
+        // AMM.LPTokenBalance -= tokens.
+        let new_total = Number::from_iou(&total_lp)
+            .sub(&Number::from_iou(&tokens))
+            .to_iou();
+        amm["LPTokenBalance"]["value"] = serde_json::Value::String(new_total.to_decimal_string());
+        let amm_data = serde_json::to_vec(&*amm).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(*amm_key, amm_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        // AMM account XRP -= amount_out.
+        helpers::set_balance(&mut amm_acct, pool.saturating_sub(amount_out));
+        let amm_acct_data =
+            serde_json::to_vec(&amm_acct).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(amm_acct_key, amm_acct_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        // Debit the withdrawer's LPToken trust line.
+        debit_lp_line(ctx, withdrawer, &amm_account, &lp_currency_hex, &tokens)?;
+
+        // Withdrawer XRP += amount_out, bump sequence.
+        let acct_key = keylet::account(withdrawer);
+        let acct_bytes = ctx
+            .view
+            .read(&acct_key)
+            .ok_or(TransactionResult::TerNoAccount)?;
+        let mut account: serde_json::Value =
+            serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let bal = helpers::get_balance(&account);
+        helpers::set_balance(&mut account, bal + amount_out);
+        helpers::increment_sequence(&mut account);
+        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(acct_key, acct_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        Ok(TransactionResult::TesSuccess)
+    }
+
+    /// tfOneAssetWithdrawAll: redeem the holder's entire LP balance into XRP,
+    /// deleting their LPToken trust line.
+    fn single_xrp_withdraw_all(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+        holder: &rxrpl_primitives::AccountId,
+        amm_key: &rxrpl_primitives::Hash256,
+        amm: &mut serde_json::Value,
+    ) -> Result<TransactionResult, TransactionResult> {
+        use rxrpl_amount::number::Number;
+
+        let amm_account_str = amm["Account"]
+            .as_str()
+            .ok_or(TransactionResult::TefInternal)?
+            .to_string();
+        let amm_account =
+            decode_account_id(&amm_account_str).map_err(|_| TransactionResult::TefInternal)?;
+        let tfee = amm["TradingFee"].as_u64().unwrap_or(0) as u16;
+        let lpt = amm
+            .get("LPTokenBalance")
+            .ok_or(TransactionResult::TefInternal)?;
+        let lp_currency_hex = lpt["currency"]
+            .as_str()
+            .ok_or(TransactionResult::TefInternal)?
+            .to_string();
+        let total_lp = amm_helpers::parse_iou_value(lpt["value"].as_str().unwrap_or("0"));
+
+        let amm_acct_key = keylet::account(&amm_account);
+        let amm_acct_bytes = ctx
+            .view
+            .read(&amm_acct_key)
+            .ok_or(TransactionResult::TerNoAccount)?;
+        let mut amm_acct: serde_json::Value =
+            serde_json::from_slice(&amm_acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let pool = helpers::get_balance(&amm_acct);
+
+        // The holder's entire LP balance (magnitude of the trust-line balance).
+        let cur_bytes: [u8; 20] = hex::decode(&lp_currency_hex)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or(TransactionResult::TefInternal)?;
+        let tl_key = keylet::trust_line(holder, &amm_account, &cur_bytes);
+        let line_bytes = ctx
+            .view
+            .read(&tl_key)
+            .ok_or(TransactionResult::TecNoEntry)?;
+        let line: serde_json::Value =
+            serde_json::from_slice(&line_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let holder_lp = amm_helpers::parse_iou_value(
+            line["Balance"]["value"]
+                .as_str()
+                .unwrap_or("0")
+                .trim_start_matches('-'),
+        );
+
+        // XRP paid out for burning the holder's entire LP.
+        let amount_out = amm_helpers::amm_asset_out_single_xrp(pool, &total_lp, &holder_lp, tfee);
+
+        // AMM.LPTokenBalance -= holder LP.
+        let new_total = Number::from_iou(&total_lp)
+            .sub(&Number::from_iou(&holder_lp))
+            .to_iou();
+        amm["LPTokenBalance"]["value"] = serde_json::Value::String(new_total.to_decimal_string());
+        let amm_data = serde_json::to_vec(&*amm).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(*amm_key, amm_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        // AMM account XRP -= amount_out.
+        helpers::set_balance(&mut amm_acct, pool.saturating_sub(amount_out));
+        let amm_acct_data =
+            serde_json::to_vec(&amm_acct).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(amm_acct_key, amm_acct_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        // Delete the holder's LPToken trust line: unlink from both owner
+        // directories (using the line's LowNode/HighNode page hints, since
+        // intermediate pages may be unseeded) and erase it. The AMM issuer side
+        // carries no reserve.
+        let node_of = |field: &str| -> u64 {
+            line.get(field)
+                .and_then(|v| v.as_str())
+                .and_then(|s| u64::from_str_radix(s, 16).ok())
+                .unwrap_or(0)
+        };
+        let low_node = node_of("LowNode");
+        let high_node = node_of("HighNode");
+        let (low_acct, low_page, high_acct, high_page) =
+            if holder.as_bytes() < amm_account.as_bytes() {
+                (holder, low_node, &amm_account, high_node)
+            } else {
+                (&amm_account, low_node, holder, high_node)
+            };
+        crate::owner_dir::remove_from_owner_dir_page(ctx.view, low_acct, low_page, &tl_key)?;
+        crate::owner_dir::remove_from_owner_dir_page(ctx.view, high_acct, high_page, &tl_key)?;
+        ctx.view
+            .erase(&tl_key)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        // Holder: XRP += amount_out, drop the LP-line reserve, bump sequence.
+        let acct_key = keylet::account(holder);
+        let acct_bytes = ctx
+            .view
+            .read(&acct_key)
+            .ok_or(TransactionResult::TerNoAccount)?;
+        let mut account: serde_json::Value =
+            serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let bal = helpers::get_balance(&account);
+        helpers::set_balance(&mut account, bal + amount_out);
+        helpers::adjust_owner_count(&mut account, -1);
+        helpers::increment_sequence(&mut account);
+        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(acct_key, acct_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        Ok(TransactionResult::TesSuccess)
+    }
+}
+
+/// Subtract `tokens` LP from the holder's seeded LPToken trust line.
+fn debit_lp_line(
+    ctx: &mut ApplyContext<'_>,
+    holder: &rxrpl_primitives::AccountId,
+    amm_account: &rxrpl_primitives::AccountId,
+    lp_currency_hex: &str,
+    tokens: &rxrpl_amount::IOUAmount,
+) -> Result<(), TransactionResult> {
+    use rxrpl_amount::number::Number;
+
+    let cur_bytes: [u8; 20] = hex::decode(lp_currency_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or(TransactionResult::TefInternal)?;
+    let tl_key = keylet::trust_line(holder, amm_account, &cur_bytes);
+    let bytes = ctx
+        .view
+        .read(&tl_key)
+        .ok_or(TransactionResult::TecNoEntry)?;
+    let mut line: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+
+    let holder_is_low = holder.as_bytes() < amm_account.as_bytes();
+    let cur_str = line["Balance"]["value"].as_str().unwrap_or("0");
+    let neg = cur_str.starts_with('-');
+    let mag = cur_str.trim_start_matches('-');
+    let cur_iou =
+        rxrpl_amount::IOUAmount::from_decimal_string(mag).unwrap_or(rxrpl_amount::IOUAmount::ZERO);
+    let cur_num = if neg {
+        Number::from_iou(&cur_iou).negate()
+    } else {
+        Number::from_iou(&cur_iou)
+    };
+    let tokens_num = Number::from_iou(tokens);
+    let new_num = if holder_is_low {
+        cur_num.sub(&tokens_num)
+    } else {
+        cur_num.add(&tokens_num)
+    };
+    line["Balance"]["value"] = serde_json::Value::String(new_num.to_iou().to_decimal_string());
+    let data = serde_json::to_vec(&line).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(tl_key, data)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    Ok(())
 }
 
 fn asset_is_xrp(asset: Option<&serde_json::Value>) -> bool {

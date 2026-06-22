@@ -39,6 +39,55 @@ pub fn lp_tokens_out_single(
     Number::from_iou(&t_plus).sub(&t).to_iou()
 }
 
+/// Single-asset withdraw: LP tokens burned to withdraw `withdraw` of an asset
+/// with pool balance `pool`. Mirrors rippled `lpTokensIn` (eq 7) under
+/// fixAMMv1_3 (rounds tokens up), then `adjustLPTokens` (withdraw variant).
+pub fn lp_tokens_in_single(
+    pool: u64,
+    withdraw: u64,
+    total_lp: &rxrpl_amount::IOUAmount,
+    tfee: u16,
+) -> rxrpl_amount::IOUAmount {
+    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode, root2};
+    // fr, c and frac are computed under the default (to-nearest) mode; only the
+    // final multiply that mints tokens rounds upward.
+    let two = Number::from_int(2);
+    let fr = Number::from_int(withdraw as i64).div(&Number::from_int(pool as i64));
+    let f1 = Number::from_int(tfee as i64).div(&Number::from_int(100_000)); // getFee
+    let c = fr.mul(&f1).add(&two).sub(&f1);
+    let disc = root2(c.mul(&c).sub(&Number::from_int(4).mul(&fr)));
+    let frac = c.sub(&disc).div(&two);
+    let t = Number::from_iou(total_lp);
+
+    let raw = {
+        let _g = RoundModeGuard::new(RoundingMode::Upward);
+        t.mul(&frac).to_iou()
+    };
+    // adjustLPTokens (withdraw): (raw - T) + T under downward rounding.
+    let _g = RoundModeGuard::new(RoundingMode::Downward);
+    let minus = Number::from_iou(&raw).sub(&t).to_iou();
+    Number::from_iou(&minus).add(&t).to_iou()
+}
+
+/// `ammAssetOut` (eq 8): XRP drops paid out for burning `tokens` LP, minimised
+/// (rounded down).
+pub fn amm_asset_out_single_xrp(
+    pool: u64,
+    total_lp: &rxrpl_amount::IOUAmount,
+    tokens: &rxrpl_amount::IOUAmount,
+    tfee: u16,
+) -> u64 {
+    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode};
+    let t1 = Number::from_iou(tokens).div(&Number::from_iou(total_lp));
+    let f = Number::from_int(tfee as i64).div(&Number::from_int(100_000));
+    let two = Number::from_int(2);
+    let num = t1.mul(&t1).sub(&t1.mul(&two.sub(&f)));
+    let den = t1.mul(&f).sub(&Number::from_int(1));
+    let frac = num.div(&den);
+    let _g = RoundModeGuard::new(RoundingMode::Downward);
+    Number::from_int(pool as i64).mul(&frac).to_xrp_drops()
+}
+
 /// Parse an IOU `value` decimal string into an `IOUAmount`.
 pub fn parse_iou_value(s: &str) -> rxrpl_amount::IOUAmount {
     rxrpl_amount::IOUAmount::from_decimal_string(s).unwrap_or(rxrpl_amount::IOUAmount::ZERO)
