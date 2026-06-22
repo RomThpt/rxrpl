@@ -449,28 +449,76 @@ mod tests {
             }
         }
 
-        // Read-set = affected keys + the SLEs every apply reads: FeeSettings,
-        // Amendments (for Rules), and the tx's account / destination / issuer.
-        let acct_keylet = |a: &str| -> String {
-            let id = decode_account_id(a).unwrap();
-            keylet::account(&id).to_string().to_uppercase()
-        };
+        // Read-set = affected keys + FeeSettings + Amendments (for Rules) + every
+        // AccountRoot any apply might read. The latter is any account the tx or an
+        // affected entry references — Account/Destination, every issuer (Amount,
+        // TrustSet LimitAmount, NFToken Issuer), owners, authorized accounts, the
+        // HighLimit/LowLimit issuers of touched trust lines, etc. Collected by
+        // walking the tx JSON and the affected nodes' fields for r-addresses.
         let mut read_keys: std::collections::BTreeSet<String> =
             affected.iter().map(|(k, _)| k.clone()).collect();
         read_keys.insert(keylet::fee_settings().to_string().to_uppercase());
         read_keys.insert(keylet::amendments().to_string().to_uppercase());
-        if let Some(a) = tx_json.get("Account").and_then(|v| v.as_str()) {
-            read_keys.insert(acct_keylet(a));
+        let mut stack: Vec<&Value> = vec![&tx_json];
+        for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
+            for nt in ["CreatedNode", "ModifiedNode", "DeletedNode"] {
+                if let Some(e) = node.get(nt) {
+                    for f in ["FinalFields", "NewFields", "PreviousFields"] {
+                        if let Some(ff) = e.get(f) {
+                            stack.push(ff);
+                        }
+                    }
+                }
+            }
         }
-        if let Some(d) = tx_json.get("Destination").and_then(|v| v.as_str()) {
-            read_keys.insert(acct_keylet(d));
+        while let Some(v) = stack.pop() {
+            match v {
+                Value::String(s) => {
+                    if s.starts_with('r') && s.len() >= 25 {
+                        if let Ok(id) = decode_account_id(s) {
+                            read_keys.insert(keylet::account(&id).to_string().to_uppercase());
+                        }
+                    }
+                }
+                Value::Array(a) => stack.extend(a.iter()),
+                Value::Object(o) => stack.extend(o.values()),
+                _ => {}
+            }
         }
-        if let Some(iss) = tx_json
-            .get("Amount")
-            .and_then(|a| a.get("issuer"))
-            .and_then(|v| v.as_str())
-        {
-            read_keys.insert(acct_keylet(iss));
+
+        // A TrustSet may read a trust line it leaves unchanged (already in the
+        // requested state), so the line is absent from AffectedNodes and would
+        // not be seeded — the handler would then recreate it and over-count the
+        // owner reserve. Seed the line the LimitAmount names.
+        let currency_bytes = |c: &str| -> [u8; 20] {
+            let mut b = [0u8; 20];
+            if c.len() == 3 {
+                b[12..15].copy_from_slice(c.as_bytes());
+            } else if c.len() == 40 {
+                if let Ok(d) = hex::decode(c) {
+                    if d.len() == 20 {
+                        b.copy_from_slice(&d);
+                    }
+                }
+            }
+            b
+        };
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("TrustSet") {
+            if let Some(lim) = tx_json.get("LimitAmount") {
+                if let (Some(a), Some(iss), Some(cur)) = (
+                    tx_json.get("Account").and_then(|v| v.as_str()),
+                    lim.get("issuer").and_then(|v| v.as_str()),
+                    lim.get("currency").and_then(|v| v.as_str()),
+                ) {
+                    if let (Ok(aid), Ok(iid)) = (decode_account_id(a), decode_account_id(iss)) {
+                        read_keys.insert(
+                            keylet::trust_line(&aid, &iid, &currency_bytes(cur))
+                                .to_string()
+                                .to_uppercase(),
+                        );
+                    }
+                }
+            }
         }
 
         // Seed a partial state map from the parent ledger.

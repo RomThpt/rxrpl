@@ -30,13 +30,9 @@ impl Transactor for OfferCancelTransactor {
             return Err(TransactionResult::TerNoAccount);
         }
 
-        // Check the offer exists
-        let offer_seq = ctx.tx["OfferSequence"].as_u64().unwrap_or(0) as u32;
-        let offer_key = keylet::offer(&account_id, offer_seq);
-        if !ctx.view.exists(&offer_key) {
-            return Err(TransactionResult::TecNoEntry);
-        }
-
+        // A missing offer is not an error: rippled treats OfferCancel of an
+        // already-gone offer as a no-op success (fee and sequence still charged),
+        // so the apply simply finds nothing to delete.
         Ok(())
     }
 
@@ -49,9 +45,11 @@ impl Transactor for OfferCancelTransactor {
         let offer_seq = ctx.tx["OfferSequence"].as_u64().unwrap_or(0) as u32;
         let offer_key = keylet::offer(&account_id, offer_seq);
 
-        // Unlink from BOTH the owner directory and the order-book directory
-        // (the offer records its book root in BookDirectory), then delete it.
-        if let Some(bytes) = ctx.view.read(&offer_key) {
+        // Cancelling a missing offer is a no-op success (just sequence + fee).
+        // Only when the offer exists do we unlink it from BOTH the owner and the
+        // order-book directory (it records its book root in BookDirectory),
+        // erase it, and decrement the owner count.
+        let offer_existed = if let Some(bytes) = ctx.view.read(&offer_key) {
             if let Ok(offer) = serde_json::from_slice::<Value>(&bytes) {
                 if let Some(book_dir) = offer
                     .get("BookDirectory")
@@ -66,13 +64,17 @@ impl Transactor for OfferCancelTransactor {
                     )?;
                 }
             }
-        }
-        remove_from_owner_dir(ctx.view, &account_id, &offer_key)?;
-        ctx.view
-            .erase(&offer_key)
-            .map_err(|_| TransactionResult::TecNoEntry)?;
+            remove_from_owner_dir(ctx.view, &account_id, &offer_key)?;
+            ctx.view
+                .erase(&offer_key)
+                .map_err(|_| TransactionResult::TecNoEntry)?;
+            true
+        } else {
+            false
+        };
 
-        // Update account: increment sequence, decrement owner count
+        // Update account: increment sequence, decrement owner count (only if an
+        // offer was actually removed).
         let bytes = ctx
             .view
             .read(&acct_key)
@@ -81,7 +83,9 @@ impl Transactor for OfferCancelTransactor {
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
 
         helpers::increment_sequence(&mut acct);
-        helpers::adjust_owner_count(&mut acct, -1);
+        if offer_existed {
+            helpers::adjust_owner_count(&mut acct, -1);
+        }
 
         let new_bytes = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
         ctx.view
