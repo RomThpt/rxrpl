@@ -12,6 +12,12 @@ fn nft_hash(id_hex: &str) -> Result<Hash256, TransactionResult> {
     Hash256::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)
 }
 
+/// The issuer AccountID encoded in the NFTokenID (hex chars 8..48).
+fn issuer_from_id(nftoken_id: &str) -> Option<rxrpl_primitives::AccountId> {
+    let bytes = hex::decode(nftoken_id.get(8..48)?).ok()?;
+    rxrpl_primitives::AccountId::from_slice(&bytes).ok()
+}
+
 pub struct NFTokenBurnTransactor;
 
 impl Transactor for NFTokenBurnTransactor {
@@ -114,7 +120,8 @@ impl Transactor for NFTokenBurnTransactor {
 
         tokens.retain(|t| nftoken::entry_nftoken_id(t) != Some(nftoken_id));
 
-        if tokens.is_empty() {
+        let page_deleted = tokens.is_empty();
+        if page_deleted {
             ctx.view
                 .erase(&page_key)
                 .map_err(|_| TransactionResult::TefInternal)?;
@@ -127,23 +134,42 @@ impl Transactor for NFTokenBurnTransactor {
                 .map_err(|_| TransactionResult::TefInternal)?;
         }
 
-        // Update owner account
-        let owner_acct_key = keylet::account(&owner_id);
-        let owner_bytes = ctx
-            .view
-            .read(&owner_acct_key)
-            .ok_or(TransactionResult::TerNoAccount)?;
-        let mut owner_acct: Value =
-            serde_json::from_slice(&owner_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        helpers::adjust_owner_count(&mut owner_acct, -1);
+        // The issuer's BurnedNFTokens count rises (issuer encoded in the ID).
+        if let Some(issuer_id) = issuer_from_id(nftoken_id) {
+            let issuer_key = keylet::account(&issuer_id);
+            if let Some(b) = ctx.view.read(&issuer_key) {
+                let mut iss: Value =
+                    serde_json::from_slice(&b).map_err(|_| TransactionResult::TefInternal)?;
+                let burned = iss
+                    .get("BurnedNFTokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                iss["BurnedNFTokens"] = Value::from(burned + 1);
+                let d = serde_json::to_vec(&iss).map_err(|_| TransactionResult::TefInternal)?;
+                ctx.view
+                    .update(issuer_key, d)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+            }
+        }
 
-        let owner_data =
-            serde_json::to_vec(&owner_acct).map_err(|_| TransactionResult::TefInternal)?;
-        ctx.view
-            .update(owner_acct_key, owner_data)
-            .map_err(|_| TransactionResult::TefInternal)?;
+        // The owner's reserve drops by one only when an entire page was removed.
+        if page_deleted {
+            let owner_acct_key = keylet::account(&owner_id);
+            let owner_bytes = ctx
+                .view
+                .read(&owner_acct_key)
+                .ok_or(TransactionResult::TerNoAccount)?;
+            let mut owner_acct: Value =
+                serde_json::from_slice(&owner_bytes).map_err(|_| TransactionResult::TefInternal)?;
+            helpers::adjust_owner_count(&mut owner_acct, -1);
+            let owner_data =
+                serde_json::to_vec(&owner_acct).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(owner_acct_key, owner_data)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
 
-        // Update caller account (increment sequence)
+        // The caller consumes its sequence proxy.
         let caller_key = keylet::account(&account_id);
         let caller_bytes = ctx
             .view
@@ -151,30 +177,12 @@ impl Transactor for NFTokenBurnTransactor {
             .ok_or(TransactionResult::TerNoAccount)?;
         let mut caller: Value =
             serde_json::from_slice(&caller_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        helpers::increment_sequence(&mut caller);
-
-        // If caller is different from owner, update separately
-        if account_id != owner_id {
-            let caller_data =
-                serde_json::to_vec(&caller).map_err(|_| TransactionResult::TefInternal)?;
-            ctx.view
-                .update(caller_key, caller_data)
-                .map_err(|_| TransactionResult::TefInternal)?;
-        } else {
-            // Already updated owner, but need to re-read since we modified it
-            // Actually the owner_acct was already written, re-read and update sequence
-            let updated_bytes = ctx
-                .view
-                .read(&caller_key)
-                .ok_or(TransactionResult::TerNoAccount)?;
-            let mut updated: Value = serde_json::from_slice(&updated_bytes)
-                .map_err(|_| TransactionResult::TefInternal)?;
-            helpers::increment_sequence(&mut updated);
-            let data = serde_json::to_vec(&updated).map_err(|_| TransactionResult::TefInternal)?;
-            ctx.view
-                .update(caller_key, data)
-                .map_err(|_| TransactionResult::TefInternal)?;
-        }
+        crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, &mut caller, ctx.tx)?;
+        let caller_data =
+            serde_json::to_vec(&caller).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(caller_key, caller_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
 
         Ok(TransactionResult::TesSuccess)
     }
