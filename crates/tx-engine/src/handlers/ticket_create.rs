@@ -58,32 +58,45 @@ impl Transactor for TicketCreateTransactor {
         // reserved starting at `start_seq + 1`, matching rippled.
         let first_ticket_seq = start_seq + 1;
 
-        // Create tickets
+        // Create tickets. rippled's Ticket SLE carries OwnerNode and the
+        // threaded PreviousTxnID (placeholder here; the engine stamps it), and
+        // omits Flags when zero.
         for i in 0..count {
             let ticket_seq = first_ticket_seq + i;
             let ticket_key = keylet::ticket(&account_id, ticket_seq);
 
-            let ticket_obj = serde_json::json!({
+            let owner_node = crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &ticket_key)
+                .map_err(|_| TransactionResult::TemMalformed)?;
+
+            let mut ticket_obj = serde_json::json!({
                 "LedgerEntryType": "Ticket",
                 "Account": account_str,
                 "TicketSequence": ticket_seq,
-                "Flags": 0,
+                "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+                "PreviousTxnLgrSeq": 0,
             });
+            // OwnerNode is omitted when zero (rippled drops default U64 fields).
+            if owner_node != 0 {
+                ticket_obj["OwnerNode"] = Value::from(format!("{owner_node:016X}"));
+            }
 
             let ticket_bytes =
                 serde_json::to_vec(&ticket_obj).map_err(|_| TransactionResult::TemMalformed)?;
             ctx.view
                 .insert(ticket_key, ticket_bytes)
                 .map_err(|_| TransactionResult::TemMalformed)?;
-            crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &ticket_key)
-                .map_err(|_| TransactionResult::TemMalformed)?;
         }
 
         // Update account: advance sequence past the tx itself + all tickets,
-        // increase owner count.
+        // increase owner count, and track the live ticket count.
         let new_seq = first_ticket_seq + count;
         acct["Sequence"] = Value::from(new_seq);
         helpers::adjust_owner_count(&mut acct, count as i32);
+        let ticket_count = acct
+            .get("TicketCount")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        acct["TicketCount"] = Value::from(ticket_count + count);
 
         let new_bytes = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
         ctx.view
