@@ -138,8 +138,12 @@ impl Guard {
             if safe {
                 *mantissa += 1;
             } else {
+                // Incrementing would overflow the range; drop a digit and
+                // re-evaluate rounding with the updated guard (rippled recurses
+                // here, at most once).
                 self.drop_digit_u128(mantissa, exponent);
-                *mantissa += 1;
+                self.do_round_up(negative, mantissa, exponent);
+                return;
             }
         }
         self.bring_into_range(negative, mantissa, exponent);
@@ -458,6 +462,21 @@ impl Number {
             }
         }
         IOUAmount::from_parts(m as u64, e, self.negative).unwrap_or(IOUAmount::ZERO)
+    }
+
+    /// Convert to integer XRP drops, truncating toward zero (floor for the
+    /// non-negative values AMM payouts produce under downward rounding).
+    pub fn to_xrp_drops(&self) -> u64 {
+        if self.is_zero() {
+            return 0;
+        }
+        let m = self.mantissa as u128;
+        let v = if self.exponent >= 0 {
+            m.saturating_mul(10u128.pow(self.exponent as u32))
+        } else {
+            m / 10u128.pow((-self.exponent) as u32)
+        };
+        v.min(u64::MAX as u128) as u64
     }
 
     /// Decimal-string form (full 18-digit mantissa), for tests/debugging.
