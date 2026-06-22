@@ -644,7 +644,17 @@ pub(crate) fn cross_book_payment(
     );
 
     let mut remaining_out = out_tmpl.clone();
+    // The source cannot spend more of an IOU than it holds: cap the SendMax
+    // budget at the taker's available balance in the input asset (rippled's
+    // source-funds limit). XRP input is already guarded by `pay_in`.
     let mut remaining_in = in_tmpl.clone();
+    if !in_tmpl.is_xrp {
+        let funds = owner_funds_leg(ctx, taker, &in_tmpl);
+        if leg_ge(&remaining_in, &funds) {
+            remaining_in = funds;
+        }
+    }
+    let budget_start = remaining_in.clone();
     let book_prefix = inverse_book.as_bytes()[0..24].to_vec();
     let mut probe = book_dir_with_quality(&inverse_book, 0);
     'walk: while let Some(dir_key) = ctx.view.succ(&probe) {
@@ -756,7 +766,7 @@ pub(crate) fn cross_book_payment(
     }
 
     let delivered = leg_sub(&out_tmpl, &remaining_out);
-    let spent = leg_sub(&in_tmpl, &remaining_in);
+    let spent = leg_sub(&budget_start, &remaining_in);
     Ok((
         delivered.with_amount(&delivered.iou, delivered.drops),
         spent.with_amount(&spent.iou, spent.drops),

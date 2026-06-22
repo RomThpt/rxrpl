@@ -487,6 +487,58 @@ mod tests {
             }
         }
 
+        // Override affected entries with their exact PRE-tx state, reconstructed
+        // from metadata (FinalFields overlaid with PreviousFields). The
+        // parent-ledger value is stale whenever an account was already touched by
+        // an earlier transaction in the same ledger N — its Sequence and balances
+        // would differ, failing the sequence check or drifting amounts. The
+        // metadata captures the value the target tx actually saw.
+        for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
+            for nt in ["ModifiedNode", "DeletedNode"] {
+                let Some(e) = node.get(nt) else {
+                    continue;
+                };
+                let Some(let_type) = e.get("LedgerEntryType").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let mut pre = e
+                    .get("FinalFields")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let key = e["LedgerIndex"].as_str().unwrap().to_uppercase();
+                let kb: [u8; 32] = hex::decode(&key).unwrap().try_into().unwrap();
+                if let Some(obj) = pre.as_object_mut() {
+                    if let Some(prev) = e.get("PreviousFields").and_then(|v| v.as_object()) {
+                        for (k, v) in prev {
+                            obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                    obj.insert("LedgerEntryType".into(), Value::String(let_type.into()));
+                    // FinalFields omits the threaded PreviousTxnID/LgrSeq; carry
+                    // them over from the parent-ledger seed so the central
+                    // stamping has a field to overwrite (its value is irrelevant).
+                    if let Some(seed) = state
+                        .get(&Hash256::new(kb))
+                        .and_then(|b| rxrpl_codec::binary::decode(b).ok())
+                    {
+                        for f in ["PreviousTxnID", "PreviousTxnLgrSeq"] {
+                            if let Some(v) = seed.get(f) {
+                                obj.insert(f.into(), v.clone());
+                            }
+                        }
+                    }
+                }
+                let Ok(json_bytes) = serde_json::to_vec(&pre) else {
+                    continue;
+                };
+                let Ok(bin) = rxrpl_ledger::sle_codec::encode_sle(&json_bytes) else {
+                    continue;
+                };
+                let kb: [u8; 32] = hex::decode(&key).unwrap().try_into().unwrap();
+                state.put(Hash256::new(kb), bin).unwrap();
+            }
+        }
+
         // Order-book crossing reads the book directory pages to walk offers.
         // An offer that is only *modified* (partially filled) leaves its
         // directory untouched, so the page is absent from AffectedNodes and was
@@ -535,36 +587,55 @@ mod tests {
         let res = full_engine().apply(&tx_json, &mut open, &rules, &fees);
         eprintln!("apply result: {res:?}");
 
-        // Compare each affected SLE to rippled's stored bytes at ledger N.
+        // Compare each affected SLE to the state OUR tx produced, taken from the
+        // target tx's own metadata (FinalFields / NewFields), not ledger_entry@N.
+        // The on-chain value at N reflects every transaction in the ledger, so it
+        // is wrong for any SLE that a *later* tx in N also touched; the metadata
+        // records the value as our tx left it.
+        let non_threaded =
+            |t: &str| matches!(t, "DirectoryNode" | "LedgerHashes" | "Amendments" | "FeeSettings");
+        let txid_upper = txhash.to_uppercase();
         let mut mismatches = 0;
-        for (key, nt) in &affected {
-            let kb: [u8; 32] = hex::decode(key).unwrap().try_into().unwrap();
-            let ours = open.state_map.get(&Hash256::new(kb)).map(hex::encode_upper);
-            if nt == "DeletedNode" {
-                if ours.is_some() {
-                    eprintln!("  DELETE-MISS {key}: we still hold it");
-                    mismatches += 1;
-                }
+        for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
+            let (nt, e) = if let Some(e) = node.get("CreatedNode") {
+                ("CreatedNode", e)
+            } else if let Some(e) = node.get("ModifiedNode") {
+                ("ModifiedNode", e)
+            } else if let Some(e) = node.get("DeletedNode") {
+                ("DeletedNode", e)
+            } else {
                 continue;
-            }
-            let r = rpc(serde_json::json!({
-                "method":"ledger_entry","params":[{"index":key,"ledger_index":n,"binary":true}]
-            }));
-            let theirs = r["result"]["node_binary"]
-                .as_str()
-                .map(|s| s.to_uppercase());
+            };
+            let key = e["LedgerIndex"].as_str().unwrap().to_uppercase();
+            let kb: [u8; 32] = hex::decode(&key).unwrap().try_into().unwrap();
+            let ours = open.state_map.get(&Hash256::new(kb)).map(hex::encode_upper);
+            let let_type = e.get("LedgerEntryType").and_then(|v| v.as_str()).unwrap_or("");
+
+            let theirs = if nt == "DeletedNode" {
+                None
+            } else {
+                let fields = if nt == "CreatedNode" {
+                    "NewFields"
+                } else {
+                    "FinalFields"
+                };
+                let mut post = e.get(fields).cloned().unwrap_or_else(|| serde_json::json!({}));
+                if let Some(obj) = post.as_object_mut() {
+                    obj.insert("LedgerEntryType".into(), Value::String(let_type.into()));
+                    if !non_threaded(let_type) {
+                        obj.insert("PreviousTxnID".into(), Value::String(txid_upper.clone()));
+                        obj.insert("PreviousTxnLgrSeq".into(), Value::from(n));
+                    }
+                }
+                serde_json::to_vec(&post)
+                    .ok()
+                    .and_then(|b| rxrpl_ledger::sle_codec::encode_sle(&b).ok())
+                    .map(hex::encode_upper)
+            };
+
             if ours.as_deref() != theirs.as_deref() {
                 mismatches += 1;
-                let typ = ours
-                    .as_deref()
-                    .and_then(|h| hex::decode(h).ok())
-                    .and_then(|b| rxrpl_codec::binary::decode(&b).ok())
-                    .and_then(|j| {
-                        j.get("LedgerEntryType")
-                            .and_then(|t| t.as_str().map(String::from))
-                    })
-                    .unwrap_or_default();
-                eprintln!("  DIFF {key} ({nt} {typ})");
+                eprintln!("  DIFF {key} ({nt} {let_type})");
                 let dj = |h: Option<&str>| -> serde_json::Value {
                     h.and_then(|h| hex::decode(h).ok())
                         .and_then(|b| rxrpl_codec::binary::decode(&b).ok())
@@ -576,10 +647,8 @@ mod tests {
                     let mut keys: std::collections::BTreeSet<&String> = o.keys().collect();
                     keys.extend(t.keys());
                     for k in keys {
-                        let ov = o.get(k);
-                        let tv = t.get(k);
-                        if ov != tv {
-                            eprintln!("      {k}: ours={ov:?} theirs={tv:?}");
+                        if o.get(k) != t.get(k) {
+                            eprintln!("      {k}: ours={:?} theirs={:?}", o.get(k), t.get(k));
                         }
                     }
                 } else {
@@ -589,7 +658,7 @@ mod tests {
             }
         }
         eprintln!("affected={} mismatches={mismatches}", affected.len());
-        assert_eq!(mismatches, 0, "every affected SLE must match rippled");
+        assert_eq!(mismatches, 0, "every affected SLE must match its tx metadata");
     }
 
     fn payment(seq: u32, dest: AccountId, amount_drops: u64) -> (Hash256, Vec<u8>) {

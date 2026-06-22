@@ -2125,3 +2125,56 @@ fn conversion_send_max_binds_partial_delivery() {
     assert_eq!(read_xrp(ALICE), 90_000_000, "ALICE spends the full 10 XRP budget");
     assert_eq!(read_xrp(BOB), 110_000_000, "BOB receives 10 XRP");
 }
+
+#[test]
+fn conversion_iou_to_iou_caps_at_source_balance() {
+    // BOB sells 100 EUR for 50 USD (0.5 USD/EUR). ALICE holds only 10 USD and
+    // converts USD->EUR with SendMax 40 USD. The source-funds cap binds before
+    // SendMax: ALICE can spend at most her 10 USD, buying 20 EUR (not 80), and
+    // her USD line must not go negative.
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, ISSUER2, "100000000", None);
+    put_account(&mut ledger, BOB, "100000000", None);
+    put_account(&mut ledger, ALICE, "100000000", None);
+    put_trust_line(&mut ledger, BOB, ISSUER2, "EUR", 1000.0);
+    put_trust_line(&mut ledger, BOB, ISSUER, "USD", 0.0);
+    put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 10.0);
+    put_trust_line(&mut ledger, ALICE, ISSUER2, "EUR", 0.0);
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let offer_tx = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": BOB,
+        "TakerGets": iou("EUR", ISSUER2, "100"),
+        "TakerPays": iou("USD", ISSUER, "50"),
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext { tx: &offer_tx, view: &mut sandbox, rules: &rules, fees: &fees };
+    crate::handlers::offer_create::OfferCreateTransactor.apply(&mut octx).unwrap();
+
+    const TF_PARTIAL_PAYMENT: u64 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT as u64;
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": iou("EUR", ISSUER2, "100"),
+        "SendMax": iou("USD", ISSUER, "40"),
+        "Flags": TF_PARTIAL_PAYMENT,
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext { tx: &convert_tx, view: &mut sandbox, rules: &rules, fees: &fees };
+    let r = PaymentTransactor.apply(&mut pctx).unwrap();
+    assert_eq!(r, TransactionResult::TesSuccess);
+
+    assert!(holder_balance(&sandbox, ALICE, ISSUER, "USD").abs() < 1e-6, "ALICE USD drained, not negative");
+    assert!((holder_balance(&sandbox, ALICE, ISSUER2, "EUR") - 20.0).abs() < 1e-6);
+    assert!((holder_balance(&sandbox, BOB, ISSUER, "USD") - 10.0).abs() < 1e-6);
+    assert!((holder_balance(&sandbox, BOB, ISSUER2, "EUR") - 980.0).abs() < 1e-6);
+}
