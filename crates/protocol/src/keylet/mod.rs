@@ -210,15 +210,29 @@ pub fn escrow(id: &AccountId, seq: u32) -> Hash256 {
     )
 }
 
-/// Compute the keylet for an NFToken page.
-///
-/// The page key is the account ID (padded to 32 bytes) with the bottom 96 bits
-/// set from the token ID.
+/// First possible NFToken page for an owner: account ID in the high 160 bits,
+/// low 96 bits zero. NFToken page keys are constructed directly (not hashed):
+/// the high 160 bits are the owner and the low 96 bits sort the tokens.
 pub fn nftoken_page_min(id: &AccountId) -> Hash256 {
     let mut key = [0u8; 32];
     key[..20].copy_from_slice(id.as_bytes());
-    // Bottom 12 bytes are zero for the minimum page
-    index_hash(LedgerNamespace::NFTokenPage, &[&key])
+    Hash256::new(key)
+}
+
+/// Last possible NFToken page for an owner: low 96 bits all ones.
+pub fn nftoken_page_max(id: &AccountId) -> Hash256 {
+    let mut key = [0xffu8; 32];
+    key[..20].copy_from_slice(id.as_bytes());
+    Hash256::new(key)
+}
+
+/// The candidate NFToken page key for a token: the owner in the high 160 bits
+/// and the low 96 bits of the NFTokenID in the low 96 bits (rippled's pageMask).
+pub fn nftoken_page(id: &AccountId, nftoken_id: &Hash256) -> Hash256 {
+    let mut key = [0u8; 32];
+    key[..20].copy_from_slice(id.as_bytes());
+    key[20..32].copy_from_slice(&nftoken_id.as_bytes()[20..32]);
+    Hash256::new(key)
 }
 
 /// Compute the keylet for an NFToken offer.

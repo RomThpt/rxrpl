@@ -1,36 +1,134 @@
-use rxrpl_protocol::TransactionResult;
+use rxrpl_primitives::{AccountId, Hash256};
+use rxrpl_protocol::{TransactionResult, keylet};
+use serde_json::Value;
 
-/// Generate an NFTokenID from its components.
-///
-/// Format (64 hex chars = 32 bytes):
-/// flags(8) + transfer_fee(4) + reserved(4) + issuer(40) + seq(8)
-pub fn generate_nftoken_id(
-    flags: u32,
-    transfer_fee: u16,
-    issuer_hex: &str,
-    token_seq: u32,
-) -> String {
-    format!(
-        "{:08X}{:04X}{:04X}{}{:08X}",
-        flags, transfer_fee, 0u16, issuer_hex, token_seq
-    )
+use crate::view::apply_view::ApplyView;
+use crate::view::read_view::ReadView;
+
+const PREV_TXN_PLACEHOLDER: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Locate the existing NFToken page that should hold `nftoken_id` for `owner`:
+/// the lowest page key >= the token's candidate key, bounded by the owner's
+/// page range. `None` when the owner has no suitable page yet.
+pub fn find_owner_page(
+    view: &dyn ReadView,
+    owner: &AccountId,
+    nftoken_id: &Hash256,
+) -> Option<Hash256> {
+    let candidate = keylet::nftoken_page(owner, nftoken_id);
+    let max = keylet::nftoken_page_max(owner);
+    let key = if view.exists(&candidate) {
+        candidate
+    } else {
+        view.succ(&candidate)?
+    };
+    let same_owner = key.as_bytes()[..20] == owner.as_bytes()[..20];
+    if key <= max && same_owner {
+        Some(key)
+    } else {
+        None
+    }
 }
 
-/// Parse an NFTokenID string into (flags, transfer_fee, issuer_hex, token_seq).
-pub fn parse_nftoken_id(id: &str) -> Result<(u32, u16, String, u32), TransactionResult> {
+/// Insert an NFToken object into `owner`'s pages, keeping each page sorted by
+/// NFTokenID. Returns `true` when a brand-new page was created (so the caller
+/// adjusts the owner reserve). Page splitting at 32 entries is not yet modeled.
+pub fn insert_token(
+    view: &mut dyn ApplyView,
+    owner: &AccountId,
+    nftoken_id: &Hash256,
+    entry: Value,
+) -> Result<bool, TransactionResult> {
+    let id_hex = nftoken_id.to_string().to_uppercase();
+    match find_owner_page(view, owner, nftoken_id) {
+        Some(page_key) => {
+            let bytes = view.read(&page_key).ok_or(TransactionResult::TefInternal)?;
+            let mut page: Value =
+                serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+            let mut tokens: Vec<Value> = page
+                .get("NFTokens")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let pos = tokens
+                .iter()
+                .position(|t| nftoken_entry_id(t) > id_hex)
+                .unwrap_or(tokens.len());
+            tokens.insert(pos, entry);
+            page["NFTokens"] = Value::Array(tokens);
+            let nb = serde_json::to_vec(&page).map_err(|_| TransactionResult::TefInternal)?;
+            view.update(page_key, nb)
+                .map_err(|_| TransactionResult::TefInternal)?;
+            Ok(false)
+        }
+        None => {
+            let page_key = keylet::nftoken_page_max(owner);
+            let page = serde_json::json!({
+                "LedgerEntryType": "NFTokenPage",
+                "NFTokens": [entry],
+                "PreviousTxnID": PREV_TXN_PLACEHOLDER,
+                "PreviousTxnLgrSeq": 0,
+            });
+            let nb = serde_json::to_vec(&page).map_err(|_| TransactionResult::TefInternal)?;
+            view.insert(page_key, nb)
+                .map_err(|_| TransactionResult::TefInternal)?;
+            Ok(true)
+        }
+    }
+}
+
+/// The NFTokenID held by an sfNFToken page entry (`{"NFToken": {...}}`).
+pub fn entry_nftoken_id(entry: &Value) -> Option<&str> {
+    entry
+        .get("NFToken")
+        .and_then(|n| n.get("NFTokenID"))
+        .and_then(|v| v.as_str())
+}
+
+fn nftoken_entry_id(entry: &Value) -> String {
+    entry_nftoken_id(entry)
+        .map(|s| s.to_uppercase())
+        .unwrap_or_default()
+}
+
+/// Lightly mix the taxon with the token sequence so an issuer's NFTs spread
+/// across pages instead of clustering. rippled's cipher is its own inverse.
+pub fn cipher_taxon(taxon: u32, token_seq: u32) -> u32 {
+    taxon ^ token_seq.wrapping_mul(384_160_001).wrapping_add(2_459)
+}
+
+/// Generate an NFTokenID matching rippled's 32-byte layout:
+/// flags(2) + transfer_fee(2) + issuer(20) + scrambled_taxon(4) + token_seq(4).
+pub fn generate_nftoken_id(
+    flags: u16,
+    transfer_fee: u16,
+    issuer_hex: &str,
+    taxon: u32,
+    token_seq: u32,
+) -> String {
+    let scrambled = cipher_taxon(taxon, token_seq);
+    format!("{flags:04X}{transfer_fee:04X}{issuer_hex}{scrambled:08X}{token_seq:08X}")
+}
+
+/// Parse an NFTokenID into (flags, transfer_fee, issuer_hex, taxon, token_seq).
+/// The taxon is unscrambled to its original value.
+pub fn parse_nftoken_id(id: &str) -> Result<(u16, u16, String, u32, u32), TransactionResult> {
     if id.len() != 64 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(TransactionResult::TemMalformed);
     }
 
-    let flags = u32::from_str_radix(&id[0..8], 16).map_err(|_| TransactionResult::TemMalformed)?;
+    let flags = u16::from_str_radix(&id[0..4], 16).map_err(|_| TransactionResult::TemMalformed)?;
     let transfer_fee =
-        u16::from_str_radix(&id[8..12], 16).map_err(|_| TransactionResult::TemMalformed)?;
-    // bytes 12..16 are reserved
-    let issuer_hex = id[16..56].to_string();
+        u16::from_str_radix(&id[4..8], 16).map_err(|_| TransactionResult::TemMalformed)?;
+    let issuer_hex = id[8..48].to_string();
+    let scrambled_taxon =
+        u32::from_str_radix(&id[48..56], 16).map_err(|_| TransactionResult::TemMalformed)?;
     let token_seq =
         u32::from_str_radix(&id[56..64], 16).map_err(|_| TransactionResult::TemMalformed)?;
+    let taxon = cipher_taxon(scrambled_taxon, token_seq);
 
-    Ok((flags, transfer_fee, issuer_hex, token_seq))
+    Ok((flags, transfer_fee, issuer_hex, taxon, token_seq))
 }
 
 #[cfg(test)]
@@ -40,14 +138,31 @@ mod tests {
     #[test]
     fn generate_and_parse_roundtrip() {
         let issuer = "B5F762798A53D543A014CAF8B297CFF8F2F937E8";
-        let id = generate_nftoken_id(0x0008, 500, issuer, 1);
+        let id = generate_nftoken_id(0x0008, 500, issuer, 1337, 1);
         assert_eq!(id.len(), 64);
 
-        let (flags, fee, parsed_issuer, seq) = parse_nftoken_id(&id).unwrap();
+        let (flags, fee, parsed_issuer, taxon, seq) = parse_nftoken_id(&id).unwrap();
         assert_eq!(flags, 0x0008);
         assert_eq!(fee, 500);
         assert_eq!(parsed_issuer, issuer);
+        assert_eq!(taxon, 1337);
         assert_eq!(seq, 1);
+    }
+
+    #[test]
+    fn nftoken_id_matches_mainnet() {
+        // From mainnet ledger 105093054: issuer rJiohLVy, taxon 2, seq 0x0642D947.
+        let id = generate_nftoken_id(
+            0x0019,
+            0x0BB8,
+            "C3E4F7A333009F82AD6AC3B730E4F226CB216122",
+            2,
+            0x0642_D947,
+        );
+        assert_eq!(
+            id,
+            "00190BB8C3E4F7A333009F82AD6AC3B730E4F226CB2161221028D9E00642D947"
+        );
     }
 
     #[test]

@@ -41,9 +41,13 @@ impl InvariantCheck for NFTokenPageBounds {
                 ));
             }
 
-            // Each token entry must have an NFTokenID
+            // Each token entry is an sfNFToken wrapper holding the NFTokenID.
             for (i, entry) in tokens.iter().enumerate() {
-                if entry.get("NFTokenID").and_then(|v| v.as_str()).is_none() {
+                let id = entry
+                    .get("NFToken")
+                    .and_then(|n| n.get("NFTokenID"))
+                    .and_then(|v| v.as_str());
+                if id.is_none() {
                     return Err(format!("NFTokenPage at {key} entry {i} missing NFTokenID"));
                 }
             }
@@ -76,7 +80,7 @@ mod tests {
         let data = serde_json::to_vec(&json!({
             "LedgerEntryType": "NFTokenPage",
             "NFTokens": [
-                { "NFTokenID": "00080000A0C8B8C5D2F8A1B3E4D5F6A7B8C9D0E1F2A3B4C5D6E7F8091A2B3C" }
+                { "NFToken": { "NFTokenID": "00080000A0C8B8C5D2F8A1B3E4D5F6A7B8C9D0E1F2A3B4C5D6E7F8091A2B3C" } }
             ],
         }))
         .unwrap();

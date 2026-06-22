@@ -1,9 +1,16 @@
 use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
 use crate::helpers;
+use crate::nftoken;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
+
+fn nft_hash(id_hex: &str) -> Result<Hash256, TransactionResult> {
+    let bytes = hex::decode(id_hex).map_err(|_| TransactionResult::TemMalformed)?;
+    Hash256::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)
+}
 
 pub struct NFTokenBurnTransactor;
 
@@ -26,8 +33,13 @@ impl Transactor for NFTokenBurnTransactor {
         let owner_id =
             decode_account_id(owner_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        // Check token exists in owner's page
-        let page_key = keylet::nftoken_page_min(&owner_id);
+        let nftoken_id =
+            helpers::get_str_field(ctx.tx, "NFTokenID").ok_or(TransactionResult::TemMalformed)?;
+        let nft_hash = nft_hash(nftoken_id)?;
+
+        // Check the token exists in one of the owner's pages.
+        let page_key = nftoken::find_owner_page(ctx.view, &owner_id, &nft_hash)
+            .ok_or(TransactionResult::TecNoEntry)?;
         let page_bytes = ctx
             .view
             .read(&page_key)
@@ -35,32 +47,30 @@ impl Transactor for NFTokenBurnTransactor {
         let page: Value =
             serde_json::from_slice(&page_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        let nftoken_id = helpers::get_str_field(ctx.tx, "NFTokenID").unwrap();
         let tokens = page
             .get("NFTokens")
             .and_then(|v| v.as_array())
             .ok_or(TransactionResult::TecNoEntry)?;
 
-        let token = tokens.iter().find(|t| {
-            t.get("NFTokenID")
-                .and_then(|v| v.as_str())
-                .map(|s| s == nftoken_id)
-                .unwrap_or(false)
-        });
-        let token = token.ok_or(TransactionResult::TecNoEntry)?;
+        let exists = tokens
+            .iter()
+            .any(|t| nftoken::entry_nftoken_id(t) == Some(nftoken_id));
+        if !exists {
+            return Err(TransactionResult::TecNoEntry);
+        }
 
         // Permission: caller can always burn its own NFTs. If caller is
         // attempting to burn someone else's NFT (typical issuer flow), the
-        // NFT must have the lsfBurnable flag (0x0001) set.
+        // NFT must have the lsfBurnable flag (0x0001), encoded in the ID.
         if account_str != owner_str {
             const LSF_BURNABLE: u32 = 0x0001;
-            let nft_flags = token.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let nft_flags = u32::from_str_radix(&nftoken_id[0..4], 16).unwrap_or(0);
             if nft_flags & LSF_BURNABLE == 0 {
                 return Err(TransactionResult::TecNoPermission);
             }
-            // Only the original issuer (encoded in NFTokenID bytes 16..56)
-            // may invoke the burnable-by-issuer path.
-            let issuer_hex_in_id = &nftoken_id[16..56];
+            // Only the original issuer (encoded in NFTokenID bytes 4..24,
+            // i.e. hex 8..48) may invoke the burnable-by-issuer path.
+            let issuer_hex_in_id = &nftoken_id[8..48];
             let account_id_bytes = decode_account_id(account_str)
                 .map_err(|_| TransactionResult::TemInvalidAccountId)?;
             let account_hex = hex::encode_upper(account_id_bytes.as_bytes());
@@ -80,15 +90,20 @@ impl Transactor for NFTokenBurnTransactor {
         let owner_str = helpers::get_str_field(ctx.tx, "Owner").unwrap_or(account_str);
         let owner_id =
             decode_account_id(owner_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let nftoken_id = helpers::get_str_field(ctx.tx, "NFTokenID").unwrap();
+        let nftoken_id =
+            helpers::get_str_field(ctx.tx, "NFTokenID").ok_or(TransactionResult::TemMalformed)?;
+        let nft_hash = nft_hash(nftoken_id)?;
 
-        // Remove token from page
-        let page_key = keylet::nftoken_page_min(&owner_id);
+        // Remove the token from whichever owner page holds it; drop the page
+        // when it becomes empty. The rest of the page (and chain links) is
+        // preserved.
+        let page_key = nftoken::find_owner_page(ctx.view, &owner_id, &nft_hash)
+            .ok_or(TransactionResult::TecNoEntry)?;
         let page_bytes = ctx
             .view
             .read(&page_key)
             .ok_or(TransactionResult::TecNoEntry)?;
-        let page: Value =
+        let mut page: Value =
             serde_json::from_slice(&page_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
         let mut tokens: Vec<Value> = page
@@ -97,25 +112,16 @@ impl Transactor for NFTokenBurnTransactor {
             .cloned()
             .unwrap_or_default();
 
-        tokens.retain(|t| {
-            t.get("NFTokenID")
-                .and_then(|v| v.as_str())
-                .map(|s| s != nftoken_id)
-                .unwrap_or(true)
-        });
+        tokens.retain(|t| nftoken::entry_nftoken_id(t) != Some(nftoken_id));
 
         if tokens.is_empty() {
-            // Delete page if empty
             ctx.view
                 .erase(&page_key)
                 .map_err(|_| TransactionResult::TefInternal)?;
         } else {
-            let page_obj = serde_json::json!({
-                "LedgerEntryType": "NFTokenPage",
-                "NFTokens": tokens,
-            });
+            page["NFTokens"] = Value::Array(tokens);
             let page_data =
-                serde_json::to_vec(&page_obj).map_err(|_| TransactionResult::TefInternal)?;
+                serde_json::to_vec(&page).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
                 .update(page_key, page_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
@@ -225,10 +231,10 @@ mod tests {
         NFTokenMintTransactor.apply(&mut ctx).unwrap();
 
         // Get the token ID
-        let page_key = keylet::nftoken_page_min(&id);
+        let page_key = keylet::nftoken_page_max(&id);
         let page_bytes = sandbox.read(&page_key).unwrap();
         let page: Value = serde_json::from_slice(&page_bytes).unwrap();
-        let nftoken_id = page["NFTokens"][0]["NFTokenID"]
+        let nftoken_id = page["NFTokens"][0]["NFToken"]["NFTokenID"]
             .as_str()
             .unwrap()
             .to_string();
@@ -266,7 +272,7 @@ mod tests {
 
         // Page should be deleted (was the only token)
         let owner_id = decode_account_id(OWNER).unwrap();
-        let page_key = keylet::nftoken_page_min(&owner_id);
+        let page_key = keylet::nftoken_page_max(&owner_id);
         assert!(sandbox.read(&page_key).is_none());
     }
 
