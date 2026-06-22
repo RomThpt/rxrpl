@@ -543,6 +543,29 @@ mod tests {
             }
         }
 
+        // A sell NFTokenCreateOffer reads the seller's NFTokenPage to verify
+        // ownership, but creating an offer does not modify the page, so it is
+        // absent from AffectedNodes and would not be seeded — the ownership
+        // walk would then fail with tecNO_ENTRY. Seed the seller's full page
+        // chain from the parent ledger (account_objects), unchanged by the tx.
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("NFTokenCreateOffer")
+            && tx_json.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & 1 != 0
+        {
+            if let Some(acct) = tx_json.get("Account").and_then(|v| v.as_str()) {
+                let r = rpc(serde_json::json!({
+                    "method":"account_objects",
+                    "params":[{"account":acct,"type":"nft_page","ledger_index":parent}]
+                }));
+                if let Some(objs) = r["result"]["account_objects"].as_array() {
+                    for o in objs {
+                        if let Some(idx) = o.get("index").and_then(|v| v.as_str()) {
+                            read_keys.insert(idx.to_uppercase());
+                        }
+                    }
+                }
+            }
+        }
+
         // Seed a partial state map from the parent ledger.
         let mut state = rxrpl_shamap::SHAMap::account_state();
         for key in &read_keys {
