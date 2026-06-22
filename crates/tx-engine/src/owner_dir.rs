@@ -260,6 +260,29 @@ pub fn add_to_owner_dir(
     dir_insert(view, &root_key, entry_key, sorted, &describe)
 }
 
+/// Add an entry to a per-NFToken buy/sell offer directory. Unlike owner and
+/// book directories, a freshly created NFToken offer page carries Flags=1 and
+/// is threaded (records PreviousTxnID); the placeholder here is filled by the
+/// engine's central stamping. New pages also carry the NFTokenID. Pages follow
+/// the owner-directory sort discipline.
+pub fn add_to_nft_offer_dir(
+    view: &mut dyn ApplyView,
+    root_key: &Hash256,
+    nftoken_id_hex: &str,
+    entry_key: &Hash256,
+) -> Result<u64, TransactionResult> {
+    let describe = [
+        ("Flags", Value::from(1u32)),
+        ("NFTokenID", Value::from(nftoken_id_hex)),
+        (
+            "PreviousTxnID",
+            Value::from("0000000000000000000000000000000000000000000000000000000000000000"),
+        ),
+    ];
+    let sorted = view.sorted_directories();
+    dir_insert(view, root_key, entry_key, sorted, &describe)
+}
+
 /// Append an entry to a book directory page. `describe` carries the book's
 /// `ExchangeRate` / `TakerPays*` / `TakerGets*` fields for new pages. Returns
 /// the `BookNode` page the entry landed in.

@@ -25,7 +25,7 @@ pub enum LedgerNamespace {
     DepositPreauth = 0x0070,             // 'p'
     Escrow = 0x0075,                     // 'u'
     NFTokenPage = 0x0050,                // 'P'
-    NFTokenOffer = 0x0037,               // '7'
+    NFTokenOffer = 0x0071,               // 'q' (offer index; ltNFTOKEN_OFFER is 0x37)
     AMM = 0x0041,                        // 'A'
     Bridge = 0x0048,                     // 'H'
     XChainClaimId = 0x0051,              // 'Q'
@@ -48,7 +48,14 @@ pub enum LedgerNamespace {
 ///
 /// This is the core keylet computation used throughout XRPL.
 fn index_hash(space: LedgerNamespace, data: &[&[u8]]) -> Hash256 {
-    let space_bytes = (space as u16).to_be_bytes();
+    index_hash_raw(space as u16, data)
+}
+
+/// Same as [`index_hash`] but takes a raw namespace value, for the NFToken
+/// buy/sell offer directories whose spaces ('h'/'i') collide with other
+/// `LedgerNamespace` discriminants.
+fn index_hash_raw(space: u16, data: &[&[u8]]) -> Hash256 {
+    let space_bytes = space.to_be_bytes();
     let mut inputs: Vec<&[u8]> = Vec::with_capacity(data.len() + 1);
     inputs.push(&space_bytes);
     inputs.extend(data);
@@ -220,6 +227,16 @@ pub fn nftoken_offer(id: &AccountId, seq: u32) -> Hash256 {
         LedgerNamespace::NFTokenOffer,
         &[id.as_bytes(), &seq.to_be_bytes()],
     )
+}
+
+/// Compute the keylet for the directory of buy offers on an NFToken ('h').
+pub fn nft_buys(nftoken_id: &Hash256) -> Hash256 {
+    index_hash_raw(0x0068, &[nftoken_id.as_bytes()])
+}
+
+/// Compute the keylet for the directory of sell offers on an NFToken ('i').
+pub fn nft_sells(nftoken_id: &Hash256) -> Hash256 {
+    index_hash_raw(0x0069, &[nftoken_id.as_bytes()])
 }
 
 /// Compute the keylet for a DID.
