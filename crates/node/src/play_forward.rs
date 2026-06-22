@@ -486,6 +486,28 @@ mod tests {
             }
         }
 
+        // An entry created or removed on a non-root directory page touches only
+        // that page; the root (page 0) is left unchanged and so is absent from
+        // AffectedNodes. dirAdd needs the root to walk to the chain's last page,
+        // so seed the RootIndex of every affected directory.
+        for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
+            for nt in ["CreatedNode", "ModifiedNode", "DeletedNode"] {
+                let Some(e) = node.get(nt) else { continue };
+                if e.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("DirectoryNode") {
+                    continue;
+                }
+                for f in ["FinalFields", "NewFields"] {
+                    if let Some(root) = e
+                        .get(f)
+                        .and_then(|ff| ff.get("RootIndex"))
+                        .and_then(|v| v.as_str())
+                    {
+                        read_keys.insert(root.to_uppercase());
+                    }
+                }
+            }
+        }
+
         // A TrustSet may read a trust line it leaves unchanged (already in the
         // requested state), so the line is absent from AffectedNodes and would
         // not be seeded — the handler would then recreate it and over-count the
@@ -741,10 +763,24 @@ mod tests {
                 } else {
                     "FinalFields"
                 };
-                let mut post = e
+                // A ModifiedNode that only threads PreviousTxnID (a pure "touch")
+                // carries no FinalFields; reconstruct the full SLE from the pre-tx
+                // seed so it is not compared against a degenerate field set.
+                let non_empty = e
                     .get(fields)
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
+                    .and_then(|v| v.as_object())
+                    .map(|o| !o.is_empty())
+                    .unwrap_or(false);
+                let mut post = if non_empty {
+                    e.get(fields).cloned().unwrap()
+                } else if nt == "ModifiedNode" {
+                    base.state_map
+                        .get(&Hash256::new(kb))
+                        .and_then(|b| rxrpl_codec::binary::decode(b).ok())
+                        .unwrap_or_else(|| serde_json::json!({}))
+                } else {
+                    serde_json::json!({})
+                };
                 if let Some(obj) = post.as_object_mut() {
                     obj.insert("LedgerEntryType".into(), Value::String(let_type.into()));
                     if !non_threaded(let_type) {
