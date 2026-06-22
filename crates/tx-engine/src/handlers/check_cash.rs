@@ -4,7 +4,7 @@ use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::amount_helpers::{compute_holder_balance, compute_new_iou_balance};
 use crate::helpers;
-use crate::owner_dir::remove_from_owner_dir;
+use crate::owner_dir::{consume_seq_or_ticket, remove_from_owner_dir_page};
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct CheckCashTransactor;
@@ -147,7 +147,7 @@ impl Transactor for CheckCashTransactor {
                 .map_err(|_| TransactionResult::TefInternal)?;
             let dst_balance = helpers::get_balance(&account);
             helpers::set_balance(&mut account, dst_balance + cash_amount);
-            helpers::increment_sequence(&mut account);
+            consume_seq_or_ticket(ctx.view, &account_id, &mut account, ctx.tx)?;
             let account_data =
                 serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
@@ -289,7 +289,7 @@ impl Transactor for CheckCashTransactor {
                 .ok_or(TransactionResult::TerNoAccount)?;
             let mut dst_acct: serde_json::Value = serde_json::from_slice(&dst_acct_bytes)
                 .map_err(|_| TransactionResult::TefInternal)?;
-            helpers::increment_sequence(&mut dst_acct);
+            consume_seq_or_ticket(ctx.view, &account_id, &mut dst_acct, ctx.tx)?;
             let dst_acct_data =
                 serde_json::to_vec(&dst_acct).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
@@ -297,14 +297,27 @@ impl Transactor for CheckCashTransactor {
                 .map_err(|_| TransactionResult::TefInternal)?;
         }
 
-        // Unlink from owner directory then delete the check
-        remove_from_owner_dir(ctx.view, &check_src_id, &check_key)?;
+        // Unlink the check from both the creator's and the destination's owner
+        // directories using the page hints it recorded (OwnerNode points at the
+        // creator's page, DestinationNode at the destination's), then erase it.
+        let owner_page = page_hint(&check, "OwnerNode");
+        let dest_page = page_hint(&check, "DestinationNode");
+        remove_from_owner_dir_page(ctx.view, &check_src_id, owner_page, &check_key)?;
+        remove_from_owner_dir_page(ctx.view, &account_id, dest_page, &check_key)?;
         ctx.view
             .erase(&check_key)
             .map_err(|_| TransactionResult::TefInternal)?;
 
         Ok(TransactionResult::TesSuccess)
     }
+}
+
+fn page_hint(check: &serde_json::Value, field: &str) -> u64 {
+    check
+        .get(field)
+        .and_then(|v| v.as_str())
+        .and_then(|s| u64::from_str_radix(s, 16).ok())
+        .unwrap_or(0)
 }
 
 fn adjust_iou_balance(

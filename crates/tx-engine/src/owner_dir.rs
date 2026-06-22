@@ -150,48 +150,72 @@ pub fn dir_remove(
     entry_key: &Hash256,
 ) -> Result<(), TransactionResult> {
     let entry_hex = entry_key.to_string().to_uppercase();
-    let order_preserving = view.sorted_directories();
     let mut page = 0u64;
     loop {
         let page_key = keylet::dir_node(root_key, page);
         let Some(bytes) = view.read(&page_key) else {
             return Ok(());
         };
-        let mut node: Value =
+        let node: Value =
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
-        let mut indexes = dir_page(&node);
         let next = read_u64_field(&node, "IndexNext");
-        if let Some(pos) = indexes.iter().position(|h| h == &entry_hex) {
-            // SortedDirectories preserves relative order on removal; the legacy
-            // dirDelete swapped the entry with the last and popped. Gating on
-            // the amendment replays both eras' page ordering byte-for-byte.
-            if order_preserving {
-                indexes.remove(pos);
-            } else {
-                indexes.swap_remove(pos);
-            }
-            if indexes.is_empty() && page != 0 {
-                // Unlink this page from the chain, then erase it.
-                let prev = read_u64_field(&node, "IndexPrevious");
-                relink(view, root_key, prev, next)?;
-                view.erase(&page_key)
-                    .map_err(|_| TransactionResult::TefInternal)?;
-            } else if indexes.is_empty() && page == 0 && next == 0 {
-                view.erase(&page_key)
-                    .map_err(|_| TransactionResult::TefInternal)?;
-            } else {
-                node["Indexes"] = Value::Array(indexes.into_iter().map(Value::from).collect());
-                let nb = serde_json::to_vec(&node).map_err(|_| TransactionResult::TefInternal)?;
-                view.update(page_key, nb)
-                    .map_err(|_| TransactionResult::TefInternal)?;
-            }
-            return Ok(());
+        if dir_page(&node).iter().any(|h| h == &entry_hex) {
+            return dir_remove_page(view, root_key, page, entry_key);
         }
         if next == 0 {
             return Ok(());
         }
         page = next;
     }
+}
+
+/// Remove `entry_key` from a specific directory page located by its page number,
+/// mirroring rippled's hinted `dirRemove`. The owning SLE records the page it
+/// landed in (`OwnerNode` / `DestinationNode` / `BookNode`), so the chain need
+/// not be walked from the root — essential when only the touched page is loaded.
+pub fn dir_remove_page(
+    view: &mut dyn ApplyView,
+    root_key: &Hash256,
+    page: u64,
+    entry_key: &Hash256,
+) -> Result<(), TransactionResult> {
+    let entry_hex = entry_key.to_string().to_uppercase();
+    let order_preserving = view.sorted_directories();
+    let page_key = keylet::dir_node(root_key, page);
+    let Some(bytes) = view.read(&page_key) else {
+        return Ok(());
+    };
+    let mut node: Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let mut indexes = dir_page(&node);
+    let next = read_u64_field(&node, "IndexNext");
+    let Some(pos) = indexes.iter().position(|h| h == &entry_hex) else {
+        return Ok(());
+    };
+    // SortedDirectories preserves relative order on removal; the legacy
+    // dirDelete swapped the entry with the last and popped. Gating on the
+    // amendment replays both eras' page ordering byte-for-byte.
+    if order_preserving {
+        indexes.remove(pos);
+    } else {
+        indexes.swap_remove(pos);
+    }
+    if indexes.is_empty() && page != 0 {
+        // Unlink this page from the chain, then erase it.
+        let prev = read_u64_field(&node, "IndexPrevious");
+        relink(view, root_key, prev, next)?;
+        view.erase(&page_key)
+            .map_err(|_| TransactionResult::TefInternal)?;
+    } else if indexes.is_empty() && page == 0 && next == 0 {
+        view.erase(&page_key)
+            .map_err(|_| TransactionResult::TefInternal)?;
+    } else {
+        node["Indexes"] = Value::Array(indexes.into_iter().map(Value::from).collect());
+        let nb = serde_json::to_vec(&node).map_err(|_| TransactionResult::TefInternal)?;
+        view.update(page_key, nb)
+            .map_err(|_| TransactionResult::TefInternal)?;
+    }
+    Ok(())
 }
 
 /// Repair the `IndexNext`/`IndexPrevious` links around a removed page.
@@ -257,6 +281,17 @@ pub fn remove_from_owner_dir(
     dir_remove(view, &keylet::owner_dir(account_id), entry_key)
 }
 
+/// Remove an entry from a known page of the account's owner directory, using the
+/// page hint recorded on the owning SLE (`OwnerNode` / `DestinationNode`).
+pub fn remove_from_owner_dir_page(
+    view: &mut dyn ApplyView,
+    account_id: &AccountId,
+    page: u64,
+    entry_key: &Hash256,
+) -> Result<(), TransactionResult> {
+    dir_remove_page(view, &keylet::owner_dir(account_id), page, entry_key)
+}
+
 /// Consume the transaction's sequence proxy: either bump the account
 /// `Sequence`, or — when a `TicketSequence` is present — consume the Ticket
 /// SLE (remove it from the owner directory, erase it, and decrement
@@ -281,10 +316,27 @@ pub fn consume_seq_or_ticket(
             view.erase(&ticket_key)
                 .map_err(|_| TransactionResult::TefInternal)?;
             crate::helpers::adjust_owner_count(account_obj, -1);
+            decrement_ticket_count(account_obj);
         }
         None => crate::helpers::increment_sequence(account_obj),
     }
     Ok(())
+}
+
+/// Decrement `TicketCount` on an account root when a ticket is consumed,
+/// dropping the field entirely when the last ticket is burned (mirrors
+/// rippled's `makeFieldAbsent` on the final ticket).
+fn decrement_ticket_count(account_obj: &mut Value) {
+    let Some(count) = account_obj.get("TicketCount").and_then(|v| v.as_u64()) else {
+        return;
+    };
+    if count <= 1 {
+        if let Some(obj) = account_obj.as_object_mut() {
+            obj.remove("TicketCount");
+        }
+    } else {
+        account_obj["TicketCount"] = Value::from(count - 1);
+    }
 }
 
 #[cfg(test)]
@@ -484,6 +536,57 @@ mod tests {
         let mut sandbox = Sandbox::new(&view);
         sandbox.set_sorted_directories(true);
         assert!(sandbox.child().sorted_directories());
+    }
+
+    #[test]
+    fn hinted_remove_targets_the_named_page() {
+        let (ledger, fees) = fresh_sandbox();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let mut sandbox = Sandbox::new(&view);
+
+        let account = id();
+        for i in 0..MAX_ENTRIES_PER_PAGE {
+            add_to_owner_dir(&mut sandbox, &account, &entry(i as u8)).unwrap();
+        }
+        let spilled = entry(0xff);
+        assert_eq!(
+            add_to_owner_dir(&mut sandbox, &account, &spilled).unwrap(),
+            1
+        );
+
+        // Remove directly via the page hint; page 1 held a single entry so it
+        // unlinks without walking from the root.
+        remove_from_owner_dir_page(&mut sandbox, &account, 1, &spilled).unwrap();
+        let page1 = keylet::dir_node(&keylet::owner_dir(&account), 1);
+        assert!(sandbox.read(&page1).is_none());
+    }
+
+    #[test]
+    fn consume_ticket_decrements_ticket_count_and_drops_last() {
+        let (ledger, fees) = fresh_sandbox();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let mut sandbox = Sandbox::new(&view);
+
+        for seq in [3u32, 4] {
+            let key = keylet::ticket(&id(), seq);
+            let ticket = serde_json::json!({
+                "LedgerEntryType": "Ticket", "Account": ACCT, "TicketSequence": seq, "Flags": 0,
+            });
+            sandbox
+                .insert(key, serde_json::to_vec(&ticket).unwrap())
+                .unwrap();
+        }
+
+        let mut acct = account_obj(5, 2);
+        acct["TicketCount"] = Value::from(2u32);
+
+        let tx = serde_json::json!({ "Account": ACCT, "TicketSequence": 3 });
+        consume_seq_or_ticket(&mut sandbox, &id(), &mut acct, &tx).unwrap();
+        assert_eq!(acct["TicketCount"], serde_json::json!(1));
+
+        let tx = serde_json::json!({ "Account": ACCT, "TicketSequence": 4 });
+        consume_seq_or_ticket(&mut sandbox, &id(), &mut acct, &tx).unwrap();
+        assert!(acct.get("TicketCount").is_none());
     }
 
     fn account_obj(seq: u32, owner_count: u32) -> Value {
