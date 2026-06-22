@@ -617,6 +617,32 @@ mod tests {
                         obj.insert("PreviousTxnID".into(), Value::String("0".repeat(64)));
                         obj.insert("PreviousTxnLgrSeq".into(), Value::from(0u32));
                     }
+                    // A field in FinalFields that is absent from both
+                    // PreviousFields and the parent-ledger seed was *added* by
+                    // this tx, so it was not part of the pre-tx state — drop it
+                    // (e.g. an NFTokenPage's PreviousPageMin when a page splits).
+                    if let Some(seed_obj) = seed.as_ref().and_then(|s| s.as_object()) {
+                        let prev_keys: std::collections::BTreeSet<&String> = e
+                            .get("PreviousFields")
+                            .and_then(|v| v.as_object())
+                            .map(|o| o.keys().collect())
+                            .unwrap_or_default();
+                        let added: Vec<String> = obj
+                            .keys()
+                            .filter(|k| {
+                                !prev_keys.contains(k)
+                                    && !seed_obj.contains_key(k.as_str())
+                                    && !matches!(
+                                        k.as_str(),
+                                        "LedgerEntryType" | "PreviousTxnID" | "PreviousTxnLgrSeq"
+                                    )
+                            })
+                            .cloned()
+                            .collect();
+                        for k in added {
+                            obj.remove(&k);
+                        }
+                    }
                 }
                 let Ok(json_bytes) = serde_json::to_vec(&pre) else {
                     continue;
