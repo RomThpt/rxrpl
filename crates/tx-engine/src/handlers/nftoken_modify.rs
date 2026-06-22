@@ -1,9 +1,16 @@
 use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
 use crate::helpers;
+use crate::nftoken;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
+
+fn nft_hash(id_hex: &str) -> Result<Hash256, TransactionResult> {
+    let bytes = hex::decode(id_hex).map_err(|_| TransactionResult::TemMalformed)?;
+    Hash256::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)
+}
 
 pub struct NFTokenModifyTransactor;
 
@@ -27,10 +34,14 @@ impl Transactor for NFTokenModifyTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         helpers::read_account_by_address(ctx.view, account_str)?;
 
-        // Verify token exists in account's page
+        // Verify token exists in one of the account's pages.
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let page_key = keylet::nftoken_page_min(&account_id);
+        let nftoken_id =
+            helpers::get_str_field(ctx.tx, "NFTokenID").ok_or(TransactionResult::TemMalformed)?;
+        let nft_hash = nft_hash(nftoken_id)?;
+        let page_key = nftoken::find_owner_page(ctx.view, &account_id, &nft_hash)
+            .ok_or(TransactionResult::TecNoEntry)?;
         let page_bytes = ctx
             .view
             .read(&page_key)
@@ -38,18 +49,14 @@ impl Transactor for NFTokenModifyTransactor {
         let page: Value =
             serde_json::from_slice(&page_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        let nftoken_id = helpers::get_str_field(ctx.tx, "NFTokenID").unwrap();
         let tokens = page
             .get("NFTokens")
             .and_then(|v| v.as_array())
             .ok_or(TransactionResult::TecNoEntry)?;
 
-        let found = tokens.iter().any(|t| {
-            t.get("NFTokenID")
-                .and_then(|v| v.as_str())
-                .map(|s| s == nftoken_id)
-                .unwrap_or(false)
-        });
+        let found = tokens
+            .iter()
+            .any(|t| nftoken::entry_nftoken_id(t) == Some(nftoken_id));
         if !found {
             return Err(TransactionResult::TecNoEntry);
         }
@@ -61,15 +68,18 @@ impl Transactor for NFTokenModifyTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let nftoken_id = helpers::get_str_field(ctx.tx, "NFTokenID").unwrap();
+        let nftoken_id =
+            helpers::get_str_field(ctx.tx, "NFTokenID").ok_or(TransactionResult::TemMalformed)?;
+        let nft_hash = nft_hash(nftoken_id)?;
 
-        // Update token in page
-        let page_key = keylet::nftoken_page_min(&account_id);
+        // Update the token's URI in whichever page holds it.
+        let page_key = nftoken::find_owner_page(ctx.view, &account_id, &nft_hash)
+            .ok_or(TransactionResult::TecNoEntry)?;
         let page_bytes = ctx
             .view
             .read(&page_key)
             .ok_or(TransactionResult::TecNoEntry)?;
-        let page: Value =
+        let mut page: Value =
             serde_json::from_slice(&page_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
         let mut tokens: Vec<Value> = page
@@ -79,25 +89,23 @@ impl Transactor for NFTokenModifyTransactor {
             .unwrap_or_default();
 
         for token in &mut tokens {
-            if token
-                .get("NFTokenID")
-                .and_then(|v| v.as_str())
-                .map(|s| s == nftoken_id)
-                .unwrap_or(false)
-            {
-                if let Some(uri) = helpers::get_str_field(ctx.tx, "URI") {
-                    token["URI"] = Value::String(uri.to_string());
+            if nftoken::entry_nftoken_id(token) == Some(nftoken_id) {
+                if let Some(inner) = token.get_mut("NFToken") {
+                    match helpers::get_str_field(ctx.tx, "URI") {
+                        Some(uri) => inner["URI"] = Value::String(uri.to_string()),
+                        None => {
+                            if let Some(obj) = inner.as_object_mut() {
+                                obj.remove("URI");
+                            }
+                        }
+                    }
                 }
                 break;
             }
         }
 
-        let page_obj = serde_json::json!({
-            "LedgerEntryType": "NFTokenPage",
-            "NFTokens": tokens,
-        });
-        let page_data =
-            serde_json::to_vec(&page_obj).map_err(|_| TransactionResult::TefInternal)?;
+        page["NFTokens"] = Value::Array(tokens);
+        let page_data = serde_json::to_vec(&page).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(page_key, page_data)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -170,10 +178,10 @@ mod tests {
         };
         NFTokenMintTransactor.apply(&mut ctx).unwrap();
 
-        let page_key = keylet::nftoken_page_min(&id);
+        let page_key = keylet::nftoken_page_max(&id);
         let page_bytes = sandbox.read(&page_key).unwrap();
         let page: Value = serde_json::from_slice(&page_bytes).unwrap();
-        let nftoken_id = page["NFTokens"][0]["NFTokenID"]
+        let nftoken_id = page["NFTokens"][0]["NFToken"]["NFTokenID"]
             .as_str()
             .unwrap()
             .to_string();
@@ -210,11 +218,11 @@ mod tests {
 
         // Verify URI updated
         let owner_id = decode_account_id(OWNER).unwrap();
-        let page_key = keylet::nftoken_page_min(&owner_id);
+        let page_key = keylet::nftoken_page_max(&owner_id);
         let page_bytes = sandbox.read(&page_key).unwrap();
         let page: Value = serde_json::from_slice(&page_bytes).unwrap();
         assert_eq!(
-            page["NFTokens"][0]["URI"].as_str().unwrap(),
+            page["NFTokens"][0]["NFToken"]["URI"].as_str().unwrap(),
             "https://new-uri.com"
         );
     }

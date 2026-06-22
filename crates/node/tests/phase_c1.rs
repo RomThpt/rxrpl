@@ -91,10 +91,10 @@ fn nftoken_full_lifecycle() {
 
     // Get token ID from page
     let genesis_id = decode_account_id(&genesis_addr).unwrap();
-    let page_key = keylet::nftoken_page_min(&genesis_id);
+    let page_key = keylet::nftoken_page_max(&genesis_id);
     let page_data = ledger.get_state(&page_key).unwrap();
     let page: Value = rxrpl_ledger::sle_codec::decode_state(page_data).unwrap();
-    let nftoken_id = page["NFTokens"][0]["NFTokenID"]
+    let nftoken_id = page["NFTokens"][0]["NFToken"]["NFTokenID"]
         .as_str()
         .unwrap()
         .to_string();
@@ -130,12 +130,15 @@ fn nftoken_full_lifecycle() {
 
     // 4. Verify token moved to dest
     let dest_id = decode_account_id(&dest_addr).unwrap();
-    let dest_page_key = keylet::nftoken_page_min(&dest_id);
+    let dest_page_key = keylet::nftoken_page_max(&dest_id);
     let dest_page_data = ledger.get_state(&dest_page_key).unwrap();
     let dest_page: Value = rxrpl_ledger::sle_codec::decode_state(dest_page_data).unwrap();
     let dest_tokens = dest_page["NFTokens"].as_array().unwrap();
     assert_eq!(dest_tokens.len(), 1);
-    assert_eq!(dest_tokens[0]["NFTokenID"].as_str().unwrap(), nftoken_id);
+    assert_eq!(
+        dest_tokens[0]["NFToken"]["NFTokenID"].as_str().unwrap(),
+        nftoken_id
+    );
 
     // Verify genesis no longer has the token
     assert!(ledger.get_state(&page_key).is_none());
@@ -179,10 +182,10 @@ fn nftoken_cancel_offer_lifecycle() {
     assert_eq!(result, TransactionResult::TesSuccess);
 
     let genesis_id = decode_account_id(&genesis_addr).unwrap();
-    let page_key = keylet::nftoken_page_min(&genesis_id);
+    let page_key = keylet::nftoken_page_max(&genesis_id);
     let page_data = ledger.get_state(&page_key).unwrap();
     let page: Value = rxrpl_ledger::sle_codec::decode_state(page_data).unwrap();
-    let nftoken_id = page["NFTokens"][0]["NFTokenID"]
+    let nftoken_id = page["NFTokens"][0]["NFToken"]["NFTokenID"]
         .as_str()
         .unwrap()
         .to_string();

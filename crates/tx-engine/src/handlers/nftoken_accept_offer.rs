@@ -4,6 +4,7 @@ use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
 use crate::helpers;
+use crate::nftoken;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct NFTokenAcceptOfferTransactor;
@@ -128,102 +129,64 @@ impl NFTokenAcceptOfferTransactor {
         let to_id =
             decode_account_id(to_addr).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        // Remove from seller's page
-        let from_page_key = keylet::nftoken_page_min(&from_id);
-        if let Some(page_bytes) = ctx.view.read(&from_page_key) {
-            let page: Value =
-                serde_json::from_slice(&page_bytes).map_err(|_| TransactionResult::TefInternal)?;
-            let mut tokens: Vec<Value> = page
-                .get("NFTokens")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
+        let nft_hash = rxrpl_primitives::Hash256::from_slice(
+            &hex::decode(nftoken_id).map_err(|_| TransactionResult::TefInternal)?,
+        )
+        .map_err(|_| TransactionResult::TefInternal)?;
 
-            // Find and remove the token, saving it for the buyer
-            let token_obj = tokens
-                .iter()
-                .find(|t| {
-                    t.get("NFTokenID")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s == nftoken_id)
-                        .unwrap_or(false)
-                })
-                .cloned();
+        // Remove the token from whichever of the seller's pages holds it.
+        let Some(from_page_key) = nftoken::find_owner_page(ctx.view, &from_id, &nft_hash) else {
+            return Ok(());
+        };
+        let page_bytes = ctx
+            .view
+            .read(&from_page_key)
+            .ok_or(TransactionResult::TefInternal)?;
+        let mut page: Value =
+            serde_json::from_slice(&page_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let mut tokens: Vec<Value> = page
+            .get("NFTokens")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
 
-            tokens.retain(|t| {
-                t.get("NFTokenID")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s != nftoken_id)
-                    .unwrap_or(true)
-            });
+        let token_obj = tokens
+            .iter()
+            .find(|t| nftoken::entry_nftoken_id(t) == Some(nftoken_id))
+            .cloned();
+        tokens.retain(|t| nftoken::entry_nftoken_id(t) != Some(nftoken_id));
 
-            if tokens.is_empty() {
-                ctx.view
-                    .erase(&from_page_key)
-                    .map_err(|_| TransactionResult::TefInternal)?;
-            } else {
-                let page_obj = serde_json::json!({
-                    "LedgerEntryType": "NFTokenPage",
-                    "NFTokens": tokens,
-                });
-                let data =
-                    serde_json::to_vec(&page_obj).map_err(|_| TransactionResult::TefInternal)?;
-                ctx.view
-                    .update(from_page_key, data)
-                    .map_err(|_| TransactionResult::TefInternal)?;
-            }
-
-            // Adjust seller owner count
-            let from_acct_key = keylet::account(&from_id);
-            let from_acct_bytes = ctx
-                .view
-                .read(&from_acct_key)
-                .ok_or(TransactionResult::TerNoAccount)?;
-            let mut from_acct: Value = serde_json::from_slice(&from_acct_bytes)
-                .map_err(|_| TransactionResult::TefInternal)?;
-            helpers::adjust_owner_count(&mut from_acct, -1);
-            let from_data =
-                serde_json::to_vec(&from_acct).map_err(|_| TransactionResult::TefInternal)?;
+        if tokens.is_empty() {
             ctx.view
-                .update(from_acct_key, from_data)
+                .erase(&from_page_key)
                 .map_err(|_| TransactionResult::TefInternal)?;
+        } else {
+            page["NFTokens"] = Value::Array(tokens);
+            let data = serde_json::to_vec(&page).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(from_page_key, data)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
 
-            // Add to buyer's page
-            if let Some(token) = token_obj {
-                let to_page_key = keylet::nftoken_page_min(&to_id);
-                let mut to_tokens: Vec<Value> =
-                    if let Some(to_page_bytes) = ctx.view.read(&to_page_key) {
-                        let to_page: Value = serde_json::from_slice(&to_page_bytes)
-                            .map_err(|_| TransactionResult::TefInternal)?;
-                        to_page
-                            .get("NFTokens")
-                            .and_then(|v| v.as_array())
-                            .cloned()
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
+        // Adjust seller owner count.
+        let from_acct_key = keylet::account(&from_id);
+        let from_acct_bytes = ctx
+            .view
+            .read(&from_acct_key)
+            .ok_or(TransactionResult::TerNoAccount)?;
+        let mut from_acct: Value =
+            serde_json::from_slice(&from_acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        helpers::adjust_owner_count(&mut from_acct, -1);
+        let from_data =
+            serde_json::to_vec(&from_acct).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(from_acct_key, from_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
 
-                to_tokens.push(token);
-
-                let to_page_obj = serde_json::json!({
-                    "LedgerEntryType": "NFTokenPage",
-                    "NFTokens": to_tokens,
-                });
-                let to_data =
-                    serde_json::to_vec(&to_page_obj).map_err(|_| TransactionResult::TefInternal)?;
-
-                if ctx.view.exists(&to_page_key) {
-                    ctx.view
-                        .update(to_page_key, to_data)
-                        .map_err(|_| TransactionResult::TefInternal)?;
-                } else {
-                    ctx.view
-                        .insert(to_page_key, to_data)
-                        .map_err(|_| TransactionResult::TefInternal)?;
-                }
-
-                // Adjust buyer owner count
+        // Add the token to the buyer's pages (owner count rises on a new page).
+        if let Some(token) = token_obj {
+            let new_page = nftoken::insert_token(ctx.view, &to_id, &nft_hash, token)?;
+            if new_page {
                 let to_acct_key = keylet::account(&to_id);
                 let to_acct_bytes = ctx
                     .view
@@ -392,22 +355,19 @@ impl NFTokenAcceptOfferTransactor {
         // Verify by checking the seller's NFTokenPage contains the token.
         let seller_id =
             decode_account_id(seller_addr).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let page_key = keylet::nftoken_page_min(&seller_id);
-        let owns = ctx
-            .view
-            .read(&page_key)
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|page| page.get("NFTokens").cloned())
-            .and_then(|tokens| tokens.as_array().cloned())
-            .map(|toks| {
-                toks.iter().any(|t| {
-                    t.get("NFTokenID")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s == nftoken_id)
-                        .unwrap_or(false)
+        let owns =
+            rxrpl_primitives::Hash256::from_slice(&hex::decode(&nftoken_id).unwrap_or_default())
+                .ok()
+                .and_then(|h| nftoken::find_owner_page(ctx.view, &seller_id, &h))
+                .and_then(|pk| ctx.view.read(&pk))
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|page| page.get("NFTokens").cloned())
+                .and_then(|tokens| tokens.as_array().cloned())
+                .map(|toks| {
+                    toks.iter()
+                        .any(|t| nftoken::entry_nftoken_id(t) == Some(nftoken_id.as_str()))
                 })
-            })
-            .unwrap_or(false);
+                .unwrap_or(false);
         if !owns {
             return Err(TransactionResult::TecNoPermission);
         }
@@ -486,7 +446,7 @@ fn compute_transfer_split(nftoken_id: &str, seller_addr: &str, amount: u64) -> (
     if issuer == seller_addr {
         return (0, amount); // primary sale, no royalty
     }
-    let transfer_fee = u32::from_str_radix(&nftoken_id[8..12], 16).unwrap_or(0);
+    let transfer_fee = u32::from_str_radix(&nftoken_id[4..8], 16).unwrap_or(0);
     if transfer_fee == 0 {
         return (0, amount);
     }
@@ -496,13 +456,13 @@ fn compute_transfer_split(nftoken_id: &str, seller_addr: &str, amount: u64) -> (
     (issuer_cut, seller_take)
 }
 
-/// Decode the issuer AccountID from rxrpl's NFTokenID layout
-/// (flags(8) + transfer_fee(4) + reserved(4) + issuer(40) + seq(8)).
+/// Decode the issuer AccountID from the NFTokenID layout
+/// (flags(4) + transfer_fee(4) + issuer(40) + scrambled_taxon(8) + seq(8)).
 fn issuer_from_nftoken_id(nftoken_id: &str) -> Option<String> {
     if nftoken_id.len() != 64 {
         return None;
     }
-    let issuer_hex = &nftoken_id[16..56];
+    let issuer_hex = &nftoken_id[8..48];
     let bytes = hex::decode(issuer_hex).ok()?;
     if bytes.len() != 20 {
         return None;
@@ -583,10 +543,10 @@ mod tests {
         NFTokenMintTransactor.apply(&mut ctx).unwrap();
 
         // Get token ID
-        let page_key = keylet::nftoken_page_min(&seller_id);
+        let page_key = keylet::nftoken_page_max(&seller_id);
         let page_bytes = sandbox.read(&page_key).unwrap();
         let page: Value = serde_json::from_slice(&page_bytes).unwrap();
-        let nftoken_id = page["NFTokens"][0]["NFTokenID"]
+        let nftoken_id = page["NFTokens"][0]["NFToken"]["NFTokenID"]
             .as_str()
             .unwrap()
             .to_string();
@@ -651,14 +611,14 @@ mod tests {
 
         // Verify buyer has the token
         let buyer_id = decode_account_id(BUYER).unwrap();
-        let buyer_page_key = keylet::nftoken_page_min(&buyer_id);
+        let buyer_page_key = keylet::nftoken_page_max(&buyer_id);
         let buyer_page_bytes = sandbox.read(&buyer_page_key).unwrap();
         let buyer_page: Value = serde_json::from_slice(&buyer_page_bytes).unwrap();
         assert_eq!(buyer_page["NFTokens"].as_array().unwrap().len(), 1);
 
         // Verify seller no longer has the token
         let seller_id = decode_account_id(SELLER).unwrap();
-        let seller_page_key = keylet::nftoken_page_min(&seller_id);
+        let seller_page_key = keylet::nftoken_page_max(&seller_id);
         assert!(sandbox.read(&seller_page_key).is_none());
 
         // Verify XRP transferred

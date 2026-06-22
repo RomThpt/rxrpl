@@ -10,6 +10,11 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transac
 /// tfSellNFToken flag
 const TF_SELL_NFTOKEN: u32 = 0x0001;
 
+fn nft_hash(id_hex: &str) -> Result<Hash256, TransactionResult> {
+    let bytes = hex::decode(id_hex).map_err(|_| TransactionResult::TemMalformed)?;
+    Hash256::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)
+}
+
 pub struct NFTokenCreateOfferTransactor;
 
 impl Transactor for NFTokenCreateOfferTransactor {
@@ -32,16 +37,11 @@ impl Transactor for NFTokenCreateOfferTransactor {
             }
         }
 
-        // tfOnlyXRP flag is encoded in the first 32 bits of rxrpl's
-        // NFTokenID layout (flags(8 hex) + transfer_fee(4) + reserved(4) +
-        // issuer(40) + seq(8) = 64). When set, any offer Amount MUST be
-        // XRP — IOU offers are rejected with temBAD_AMOUNT (mirrors rippled
-        // checkAmount). Note: rippled's canonical layout uses 16-bit flags;
-        // the rxrpl extension widens to 32 bits but the bit value 0x0002
-        // (lsfOnlyXRP) is still in the low 16 bits, so checking the full
-        // 32-bit field is correct.
+        // tfOnlyXRP is encoded in the NFTokenID's 16-bit flags field (the first
+        // 4 hex chars). When set, any offer Amount MUST be XRP — IOU offers are
+        // rejected with temBAD_AMOUNT (mirrors rippled checkAmount).
         const NFT_FLAG_ONLY_XRP: u32 = 0x0002;
-        let nft_flags = u32::from_str_radix(&id[..8], 16).unwrap_or(0);
+        let nft_flags = u32::from_str_radix(&id[..4], 16).unwrap_or(0);
         if nft_flags & NFT_FLAG_ONLY_XRP != 0 {
             // If Amount is an IOU object (not a string), reject.
             if let Some(amt) = ctx.tx.get("Amount") {
@@ -65,20 +65,16 @@ impl Transactor for NFTokenCreateOfferTransactor {
 
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let page_key = keylet::nftoken_page_min(&account_id);
-        let owns = ctx
-            .view
-            .read(&page_key)
+        let owns = nft_hash(nftoken_id)
+            .ok()
+            .and_then(|h| crate::nftoken::find_owner_page(ctx.view, &account_id, &h))
+            .and_then(|pk| ctx.view.read(&pk))
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .and_then(|page| page.get("NFTokens").cloned())
             .and_then(|tokens| tokens.as_array().cloned())
             .map(|toks| {
-                toks.iter().any(|t| {
-                    t.get("NFTokenID")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s == nftoken_id)
-                        .unwrap_or(false)
-                })
+                toks.iter()
+                    .any(|t| crate::nftoken::entry_nftoken_id(t) == Some(nftoken_id))
             })
             .unwrap_or(false);
 

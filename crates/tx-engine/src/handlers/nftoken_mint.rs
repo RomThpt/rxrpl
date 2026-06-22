@@ -40,77 +40,87 @@ impl Transactor for NFTokenMintTransactor {
 
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let account_id =
+        let minter_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        // Read and update source account
-        let acct_key = keylet::account(&account_id);
-        let acct_bytes = ctx
+        // The NFT is owned by the minter (Account); its issuer is the Issuer
+        // field when minting on behalf of another account, else the minter.
+        let issuer_str = helpers::get_str_field(ctx.tx, "Issuer").unwrap_or(account_str);
+        let issuer_id =
+            decode_account_id(issuer_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let issuer_key = keylet::account(&issuer_id);
+        let issuer_bytes = ctx
             .view
-            .read(&acct_key)
+            .read(&issuer_key)
             .ok_or(TransactionResult::TerNoAccount)?;
-        let mut acct: Value =
-            serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let mut issuer_acct: Value =
+            serde_json::from_slice(&issuer_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        let token_seq = helpers::get_sequence(&acct);
-        let flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
-        let transfer_fee = helpers::get_u32_field(ctx.tx, "TransferFee").unwrap_or(0) as u16;
-        let issuer_hex = hex::encode(account_id.as_bytes()).to_uppercase();
-
-        let nftoken_id = nftoken::generate_nftoken_id(flags, transfer_fee, &issuer_hex, token_seq);
-
-        // Read or create NFTokenPage
-        let page_key = keylet::nftoken_page_min(&account_id);
-        let mut tokens: Vec<Value> = if let Some(page_bytes) = ctx.view.read(&page_key) {
-            let page: Value =
-                serde_json::from_slice(&page_bytes).map_err(|_| TransactionResult::TefInternal)?;
-            page.get("NFTokens")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default()
-        } else {
-            Vec::new()
+        // The token sequence is FirstNFTokenSequence + MintedNFTokens; the first
+        // ever mint stamps FirstNFTokenSequence with the ledger sequence.
+        let first_seq = match issuer_acct
+            .get("FirstNFTokenSequence")
+            .and_then(|v| v.as_u64())
+        {
+            Some(s) => s as u32,
+            None => {
+                let s = ctx.view.seq();
+                issuer_acct["FirstNFTokenSequence"] = Value::from(s);
+                s
+            }
         };
+        let minted = issuer_acct
+            .get("MintedNFTokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let token_seq = first_seq.wrapping_add(minted);
 
-        // Build token object
-        let mut token = serde_json::json!({
-            "NFTokenID": nftoken_id,
-            "Flags": flags,
-            "Issuer": account_str,
-            "NFTokenTaxon": helpers::get_u32_field(ctx.tx, "NFTokenTaxon").unwrap_or(0),
-            "TransferFee": transfer_fee,
-        });
+        let flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0) as u16;
+        let transfer_fee = helpers::get_u32_field(ctx.tx, "TransferFee").unwrap_or(0) as u16;
+        let taxon = helpers::get_u32_field(ctx.tx, "NFTokenTaxon").unwrap_or(0);
+        let issuer_hex = hex::encode_upper(issuer_id.as_bytes());
+        let nftoken_id =
+            nftoken::generate_nftoken_id(flags, transfer_fee, &issuer_hex, taxon, token_seq);
+        let nft_hash = rxrpl_primitives::Hash256::from_slice(
+            &hex::decode(&nftoken_id).map_err(|_| TransactionResult::TefInternal)?,
+        )
+        .map_err(|_| TransactionResult::TefInternal)?;
 
+        // The page NFToken object carries only NFTokenID and (optional) URI; all
+        // other attributes are encoded inside the NFTokenID.
+        let mut inner = serde_json::json!({ "NFTokenID": nftoken_id });
         if let Some(uri) = helpers::get_str_field(ctx.tx, "URI") {
-            token["URI"] = Value::String(uri.to_string());
+            inner["URI"] = Value::String(uri.to_string());
         }
+        let entry = serde_json::json!({ "NFToken": inner });
+        let new_page = nftoken::insert_token(ctx.view, &minter_id, &nft_hash, entry)?;
 
-        tokens.push(token);
-
-        let page_obj = serde_json::json!({
-            "LedgerEntryType": "NFTokenPage",
-            "NFTokens": tokens,
-        });
-        let page_data =
-            serde_json::to_vec(&page_obj).map_err(|_| TransactionResult::TefInternal)?;
-
-        if ctx.view.exists(&page_key) {
-            ctx.view
-                .update(page_key, page_data)
-                .map_err(|_| TransactionResult::TefInternal)?;
-        } else {
-            ctx.view
-                .insert(page_key, page_data)
-                .map_err(|_| TransactionResult::TefInternal)?;
-        }
-
-        // Update account
-        helpers::increment_sequence(&mut acct);
-        helpers::adjust_owner_count(&mut acct, 1);
-
-        let acct_data = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
+        // The issuer's mint count rises; persist before touching the minter so a
+        // self-mint (minter == issuer) sees the updated count.
+        issuer_acct["MintedNFTokens"] = Value::from(minted + 1);
+        let issuer_data =
+            serde_json::to_vec(&issuer_acct).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
-            .update(acct_key, acct_data)
+            .update(issuer_key, issuer_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        // The minter consumes its sequence proxy; its owner count rises only
+        // when a brand-new page had to be created.
+        let minter_key = keylet::account(&minter_id);
+        let minter_bytes = ctx
+            .view
+            .read(&minter_key)
+            .ok_or(TransactionResult::TerNoAccount)?;
+        let mut minter_acct: Value =
+            serde_json::from_slice(&minter_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        crate::owner_dir::consume_seq_or_ticket(ctx.view, &minter_id, &mut minter_acct, ctx.tx)?;
+        if new_page {
+            helpers::adjust_owner_count(&mut minter_acct, 1);
+        }
+        let minter_data =
+            serde_json::to_vec(&minter_acct).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(minter_key, minter_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
         Ok(TransactionResult::TesSuccess)
@@ -173,14 +183,17 @@ mod tests {
         let result = NFTokenMintTransactor.apply(&mut ctx).unwrap();
         assert_eq!(result, TransactionResult::TesSuccess);
 
-        // Verify NFTokenPage exists
+        // Verify NFTokenPage exists (a first mint creates the owner's last page)
         let minter_id = decode_account_id(MINTER).unwrap();
-        let page_key = keylet::nftoken_page_min(&minter_id);
+        let page_key = keylet::nftoken_page_max(&minter_id);
         let page_bytes = sandbox.read(&page_key).unwrap();
         let page: Value = serde_json::from_slice(&page_bytes).unwrap();
         let tokens = page["NFTokens"].as_array().unwrap();
         assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0]["NFTokenID"].as_str().unwrap().len(), 64);
+        assert_eq!(
+            tokens[0]["NFToken"]["NFTokenID"].as_str().unwrap().len(),
+            64
+        );
 
         // Verify owner count incremented
         let acct_key = keylet::account(&minter_id);
@@ -217,15 +230,14 @@ mod tests {
         assert_eq!(result, TransactionResult::TesSuccess);
 
         let minter_id = decode_account_id(MINTER).unwrap();
-        let page_key = keylet::nftoken_page_min(&minter_id);
+        let page_key = keylet::nftoken_page_max(&minter_id);
         let page_bytes = sandbox.read(&page_key).unwrap();
         let page: Value = serde_json::from_slice(&page_bytes).unwrap();
         let tokens = page["NFTokens"].as_array().unwrap();
         assert_eq!(
-            tokens[0]["URI"].as_str().unwrap(),
+            tokens[0]["NFToken"]["URI"].as_str().unwrap(),
             "https://example.com/nft/1"
         );
-        assert_eq!(tokens[0]["NFTokenTaxon"].as_u64().unwrap(), 42);
     }
 
     #[test]
