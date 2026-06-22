@@ -5,6 +5,7 @@
 pub mod amount;
 pub mod error;
 pub mod iou;
+pub mod number;
 pub mod quality;
 
 pub use amount::Amount;
