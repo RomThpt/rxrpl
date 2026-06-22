@@ -4,6 +4,7 @@ use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
 use crate::helpers;
+use crate::owner_dir::{dir_remove, remove_from_owner_dir_page};
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct NFTokenCancelOfferTransactor;
@@ -57,23 +58,64 @@ impl Transactor for NFTokenCancelOfferTransactor {
             let offer: Value =
                 serde_json::from_slice(&offer_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-            // Verify caller is the offer creator
+            // The offer's creator OR its named destination may cancel it.
             let owner = offer
                 .get("Owner")
                 .and_then(|v| v.as_str())
                 .ok_or(TransactionResult::TecNoPermission)?;
-            if owner != account_str {
+            let is_destination = offer
+                .get("Destination")
+                .and_then(|v| v.as_str())
+                .map(|d| d == account_str)
+                .unwrap_or(false);
+            if owner != account_str && !is_destination {
                 return Err(TransactionResult::TecNoPermission);
             }
 
-            // Erase the offer
+            let owner_id =
+                decode_account_id(owner).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+
+            // Unlink from the owner directory (page recorded as OwnerNode) and
+            // from the per-NFToken buy/sell offer book, then erase the offer.
+            let owner_node = offer
+                .get("OwnerNode")
+                .and_then(|v| v.as_str())
+                .and_then(|s| u64::from_str_radix(s, 16).ok())
+                .unwrap_or(0);
+            remove_from_owner_dir_page(ctx.view, &owner_id, owner_node, &offer_key)?;
+
+            let is_sell = offer.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & 1 != 0;
+            if let Some(nft_id_hex) = offer.get("NFTokenID").and_then(|v| v.as_str()) {
+                if let Ok(nft_bytes) = hex::decode(nft_id_hex) {
+                    if let Ok(nft_hash) = Hash256::from_slice(&nft_bytes) {
+                        let book = if is_sell {
+                            keylet::nft_sells(&nft_hash)
+                        } else {
+                            keylet::nft_buys(&nft_hash)
+                        };
+                        dir_remove(ctx.view, &book, &offer_key)?;
+                    }
+                }
+            }
+
             ctx.view
                 .erase(&offer_key)
                 .map_err(|_| TransactionResult::TefInternal)?;
 
+            // A Destination-restricted offer touches the destination AccountRoot
+            // (its PreviousTxnID is threaded though no field changes).
+            if let Some(dest) = offer.get("Destination").and_then(|v| v.as_str()) {
+                if let Ok(dest_id) = decode_account_id(dest) {
+                    let dest_key = keylet::account(&dest_id);
+                    if let Some(dest_bytes) = ctx.view.read(&dest_key) {
+                        ctx.view
+                            .update(dest_key, dest_bytes)
+                            .map_err(|_| TransactionResult::TefInternal)?;
+                    }
+                }
+            }
+
             // Adjust owner count for the offer creator
-            let owner_id =
-                decode_account_id(owner).map_err(|_| TransactionResult::TemInvalidAccountId)?;
             let owner_acct_key = keylet::account(&owner_id);
             let owner_bytes = ctx
                 .view

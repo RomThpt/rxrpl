@@ -206,6 +206,15 @@ pub fn dir_remove_page(
         relink(view, root_key, prev, next)?;
         view.erase(&page_key)
             .map_err(|_| TransactionResult::TefInternal)?;
+        // If that emptied the whole directory, drop the now-empty root too.
+        if let Some(b) = view.read(root_key) {
+            if let Ok(root) = serde_json::from_slice::<Value>(&b) {
+                if dir_page(&root).is_empty() && read_u64_field(&root, "IndexNext") == 0 {
+                    view.erase(root_key)
+                        .map_err(|_| TransactionResult::TefInternal)?;
+                }
+            }
+        }
     } else if indexes.is_empty() && page == 0 && next == 0 {
         view.erase(&page_key)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -229,7 +238,10 @@ fn relink(
         let key = keylet::dir_node(root_key, page);
         if let Some(b) = view.read(&key) {
             if let Ok(mut n) = serde_json::from_slice::<Value>(&b) {
-                if val == 0 {
+                // A non-root page always carries its links, so IndexPrevious=0
+                // (pointing back at the root) is kept; only the root page drops
+                // a zero link (single-page directory).
+                if val == 0 && page == 0 {
                     n.as_object_mut().map(|o| o.remove(field));
                 } else {
                     n[field] = u64_hex(val).into();
