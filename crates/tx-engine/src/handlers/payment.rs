@@ -33,7 +33,17 @@ impl Transactor for PaymentTransactor {
         let account = helpers::get_account(ctx.tx)?;
         let destination = helpers::get_destination(ctx.tx)?;
         if account == destination {
-            return Err(TransactionResult::TemBadSend);
+            // A payment to self is only valid as a cross-currency conversion:
+            // the Amount must name a different asset than SendMax. rippled
+            // rejects a same-asset self-send as redundant.
+            let conversion = ctx
+                .tx
+                .get("SendMax")
+                .map(|sm| cross_assets_differ(sm, &ctx.tx["Amount"]))
+                .unwrap_or(false);
+            if !conversion {
+                return Err(TransactionResult::TemBadSend);
+            }
         }
 
         // IOU payment: Amount is an object {currency, issuer, value}
@@ -127,6 +137,23 @@ impl Transactor for PaymentTransactor {
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let destination_str = helpers::get_destination(ctx.tx)?;
+
+        // Cross-currency conversion (Account == Destination, a SendMax in a
+        // different asset than Amount): cross the order book via the shared
+        // Taker engine. Scoped here to the single-taker conversion shape; other
+        // cross-currency Payments fall through to the IOU paths below.
+        if account_str == destination_str {
+            if let Some(send_max) = ctx.tx.get("SendMax") {
+                if cross_assets_differ(send_max, &ctx.tx["Amount"]) {
+                    return apply_conversion(
+                        ctx,
+                        account_str,
+                        ctx.tx["Amount"].clone(),
+                        send_max.clone(),
+                    );
+                }
+            }
+        }
 
         // IOU branch: dispatch to issuer-mint handler.
         if let Some((currency, issuer, value)) = helpers::get_iou_amount(ctx.tx) {
@@ -519,6 +546,76 @@ struct CrossOffer {
     owner: rxrpl_primitives::AccountId,
     taker_pays: f64,
     taker_gets: f64,
+}
+
+/// The (currency, issuer) asset identity of an Amount value. XRP (a bare drops
+/// string) maps to the sentinel `("XRP", "")`.
+fn asset_of(v: &serde_json::Value) -> (String, String) {
+    if v.is_string() {
+        return ("XRP".into(), String::new());
+    }
+    let cur = v.get("currency").and_then(|c| c.as_str()).unwrap_or("");
+    let iss = v.get("issuer").and_then(|c| c.as_str()).unwrap_or("");
+    (cur.to_string(), iss.to_string())
+}
+
+/// True when two Amount values name different assets (the payment must cross a
+/// book to convert one into the other).
+fn cross_assets_differ(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    asset_of(a) != asset_of(b)
+}
+
+/// Apply a cross-currency conversion Payment (`Account == Destination`): cross
+/// the order book with the shared Taker engine, delivering up to `amount` while
+/// spending at most `send_max`. The transaction fee is already charged on the
+/// account by the engine; this reads that working copy, consumes the sequence,
+/// applies the crossing mutations, and writes it back.
+fn apply_conversion(
+    ctx: &mut ApplyContext<'_>,
+    account_str: &str,
+    amount: serde_json::Value,
+    send_max: serde_json::Value,
+) -> Result<TransactionResult, TransactionResult> {
+    let src_id =
+        decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let src_key = keylet::account(&src_id);
+    let bytes = ctx
+        .view
+        .read(&src_key)
+        .ok_or(TransactionResult::TerNoAccount)?;
+    let mut acct: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut acct, ctx.tx)?;
+
+    let (delivered, _spent) =
+        crate::handlers::offer_create::cross_book_payment(ctx, &src_id, &mut acct, &amount, &send_max)?;
+
+    const TF_PARTIAL_PAYMENT: u32 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT;
+    let partial = helpers::get_flags(ctx.tx) & TF_PARTIAL_PAYMENT != 0;
+    if !partial && !delivered_meets_target(&delivered, &amount) {
+        return Err(TransactionResult::TecPathPartial);
+    }
+
+    let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(src_key, nb)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    Ok(TransactionResult::TesSuccess)
+}
+
+/// Whether `delivered` reaches `target` (gate only — f64 comparison is fine for
+/// a success/fail decision; the byte-exact amounts come from the Taker engine).
+fn delivered_meets_target(delivered: &serde_json::Value, target: &serde_json::Value) -> bool {
+    let val = |v: &serde_json::Value| -> f64 {
+        if let Some(s) = v.as_str() {
+            return s.parse().unwrap_or(0.0);
+        }
+        v.get("value")
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0)
+    };
+    val(delivered) + 1e-9 >= val(target)
 }
 
 /// Apply a cross-currency Payment: the source pays `send_max` (currency A)

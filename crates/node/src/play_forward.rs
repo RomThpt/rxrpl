@@ -393,17 +393,23 @@ mod tests {
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .unwrap();
+        // Public load-balanced RPC clusters intermittently return non-JSON
+        // (rate-limit / 503) on rapid sequential POSTs. Retry with backoff so a
+        // transient hiccup on any of the many per-tx calls doesn't fail the run.
         let rpc = |params: serde_json::Value| -> Value {
             rt.block_on(async {
-                client
-                    .post(&url)
-                    .json(&params)
-                    .send()
-                    .await
-                    .unwrap()
-                    .json()
-                    .await
-                    .unwrap()
+                for attempt in 0..8u32 {
+                    if let Ok(resp) = client.post(&url).json(&params).send().await {
+                        if let Ok(v) = resp.json::<Value>().await {
+                            return v;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        400 * u64::from(attempt + 1),
+                    ))
+                    .await;
+                }
+                panic!("rpc failed after retries: {params}");
             })
         };
 
@@ -481,6 +487,41 @@ mod tests {
             }
         }
 
+        // Order-book crossing reads the book directory pages to walk offers.
+        // An offer that is only *modified* (partially filled) leaves its
+        // directory untouched, so the page is absent from AffectedNodes and was
+        // not seeded above. Seed each seeded offer's `BookDirectory` page so the
+        // walk can find it.
+        let mut dir_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for key in &read_keys {
+            let kb: [u8; 32] = hex::decode(key).unwrap().try_into().unwrap();
+            let Some(node) = state.get(&Hash256::new(kb)) else {
+                continue;
+            };
+            let Ok(j) = rxrpl_codec::binary::decode(node) else {
+                continue;
+            };
+            if j.get("LedgerEntryType").and_then(|t| t.as_str()) == Some("Offer") {
+                if let Some(bd) = j.get("BookDirectory").and_then(|v| v.as_str()) {
+                    dir_keys.insert(bd.to_uppercase());
+                }
+            }
+        }
+        for key in &dir_keys {
+            if read_keys.contains(key) {
+                continue;
+            }
+            let r = rpc(serde_json::json!({
+                "method":"ledger_entry","params":[{"index":key,"ledger_index":parent,"binary":true}]
+            }));
+            if let Some(hex_node) = r["result"]["node_binary"].as_str() {
+                let kb: [u8; 32] = hex::decode(key).unwrap().try_into().unwrap();
+                state
+                    .put(Hash256::new(kb), hex::decode(hex_node).unwrap())
+                    .unwrap();
+            }
+        }
+
         let parent_hdr = rpc(serde_json::json!({
             "method":"ledger","params":[{"ledger_index":parent,"transactions":false,"expand":false}]
         }));
@@ -524,8 +565,27 @@ mod tests {
                     })
                     .unwrap_or_default();
                 eprintln!("  DIFF {key} ({nt} {typ})");
-                eprintln!("    ours:   {}", ours.as_deref().unwrap_or("<absent>"));
-                eprintln!("    theirs: {}", theirs.as_deref().unwrap_or("<absent>"));
+                let dj = |h: Option<&str>| -> serde_json::Value {
+                    h.and_then(|h| hex::decode(h).ok())
+                        .and_then(|b| rxrpl_codec::binary::decode(&b).ok())
+                        .unwrap_or(serde_json::Value::Null)
+                };
+                let oj = dj(ours.as_deref());
+                let tj = dj(theirs.as_deref());
+                if let (Some(o), Some(t)) = (oj.as_object(), tj.as_object()) {
+                    let mut keys: std::collections::BTreeSet<&String> = o.keys().collect();
+                    keys.extend(t.keys());
+                    for k in keys {
+                        let ov = o.get(k);
+                        let tv = t.get(k);
+                        if ov != tv {
+                            eprintln!("      {k}: ours={ov:?} theirs={tv:?}");
+                        }
+                    }
+                } else {
+                    eprintln!("    ours:   {}", ours.as_deref().unwrap_or("<absent>"));
+                    eprintln!("    theirs: {}", theirs.as_deref().unwrap_or("<absent>"));
+                }
             }
         }
         eprintln!("affected={} mismatches={mismatches}", affected.len());

@@ -2001,3 +2001,127 @@ fn apply_cross_currency_amm_partial_scales_to_send_max() {
     let new_gbp: u64 = amm["PoolBalance1"].as_str().unwrap().parse().unwrap();
     assert!((970..1000).contains(&new_gbp), "pool GBP {new_gbp}");
 }
+
+#[test]
+fn conversion_crosses_book_xrp_to_iou() {
+    // BOB rests an offer selling 100 USD for 50 XRP (rate 0.5 XRP/USD), then
+    // ALICE converts XRP -> USD on her own account (Account == Destination),
+    // wanting 40 USD with up to 30 XRP. The conversion crosses the book: ALICE
+    // pays 20 XRP for 40 USD, BOB's offer is reduced to 60 USD / 30 XRP.
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, BOB, "100000000", None);
+    put_account(&mut ledger, ALICE, "100000000", None);
+    put_trust_line(&mut ledger, BOB, ISSUER, "USD", 1000.0);
+    put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 0.0);
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let offer_tx = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": BOB,
+        "TakerGets": iou("USD", ISSUER, "100"),
+        "TakerPays": "50000000",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &offer_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    let r = crate::handlers::offer_create::OfferCreateTransactor
+        .apply(&mut octx)
+        .unwrap();
+    assert_eq!(r, TransactionResult::TesSuccess);
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": iou("USD", ISSUER, "40"),
+        "SendMax": "30000000",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    let r = PaymentTransactor.apply(&mut pctx).unwrap();
+    assert_eq!(r, TransactionResult::TesSuccess);
+
+    assert!((holder_balance(&sandbox, ALICE, ISSUER, "USD") - 40.0).abs() < 1e-6);
+    assert!((holder_balance(&sandbox, BOB, ISSUER, "USD") - 960.0).abs() < 1e-6);
+
+    let read_xrp = |addr: &str| -> u64 {
+        let id = decode_account_id(addr).unwrap();
+        let b = sandbox.read(&keylet::account(&id)).unwrap();
+        let a: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        helpers::get_balance(&a)
+    };
+    assert_eq!(read_xrp(ALICE), 80_000_000, "ALICE pays 20 XRP");
+    assert_eq!(read_xrp(BOB), 120_000_000, "BOB receives 20 XRP");
+}
+
+#[test]
+fn conversion_send_max_binds_partial_delivery() {
+    // Same 100 USD / 50 XRP offer (0.5 XRP/USD). ALICE wants 40 USD but caps
+    // spend at 10 XRP (tfPartialPayment). The budget binds: 10 XRP buys 20 USD,
+    // so delivery is partial. Offer reduces to 80 USD / 40 XRP.
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, BOB, "100000000", None);
+    put_account(&mut ledger, ALICE, "100000000", None);
+    put_trust_line(&mut ledger, BOB, ISSUER, "USD", 1000.0);
+    put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 0.0);
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let offer_tx = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": BOB,
+        "TakerGets": iou("USD", ISSUER, "100"),
+        "TakerPays": "50000000",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext { tx: &offer_tx, view: &mut sandbox, rules: &rules, fees: &fees };
+    crate::handlers::offer_create::OfferCreateTransactor.apply(&mut octx).unwrap();
+
+    const TF_PARTIAL_PAYMENT: u64 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT as u64;
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": iou("USD", ISSUER, "40"),
+        "SendMax": "10000000",
+        "Flags": TF_PARTIAL_PAYMENT,
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext { tx: &convert_tx, view: &mut sandbox, rules: &rules, fees: &fees };
+    let r = PaymentTransactor.apply(&mut pctx).unwrap();
+    assert_eq!(r, TransactionResult::TesSuccess);
+
+    assert!((holder_balance(&sandbox, ALICE, ISSUER, "USD") - 20.0).abs() < 1e-6);
+    assert!((holder_balance(&sandbox, BOB, ISSUER, "USD") - 980.0).abs() < 1e-6);
+
+    let read_xrp = |addr: &str| -> u64 {
+        let id = decode_account_id(addr).unwrap();
+        let b = sandbox.read(&keylet::account(&id)).unwrap();
+        let a: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        helpers::get_balance(&a)
+    };
+    assert_eq!(read_xrp(ALICE), 90_000_000, "ALICE spends the full 10 XRP budget");
+    assert_eq!(read_xrp(BOB), 110_000_000, "BOB receives 10 XRP");
+}

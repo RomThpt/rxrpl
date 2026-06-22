@@ -355,6 +355,7 @@ fn credit_line(
     issuer: &AccountId,
     currency: &[u8; 20],
     gain: &IOUAmount,
+    round: bool,
 ) -> Result<(), TransactionResult> {
     let key = keylet::trust_line(holder, issuer, currency);
     let bytes = ctx.view.read(&key).ok_or(TransactionResult::TecPathDry)?;
@@ -369,7 +370,14 @@ fn credit_line(
         IOUAmount::from_decimal_string(cur).map_err(|_| TransactionResult::TefInternal)?;
     let holder_is_high = holder.as_bytes() > issuer.as_bytes();
     let delta = if holder_is_high { gain.negate() } else { *gain };
-    let new = IOUAmount::add(&balance, &delta).map_err(|_| TransactionResult::TefInternal)?;
+    // Legacy crossing (pre-Number 2013 ledgers) truncates the smaller term;
+    // modern Flow conversions round to nearest. See [`IOUAmount::add_round`].
+    let new = if round {
+        IOUAmount::add_round(&balance, &delta)
+    } else {
+        IOUAmount::add(&balance, &delta)
+    }
+    .map_err(|_| TransactionResult::TefInternal)?;
     line["Balance"]["value"] = Value::String(new.to_decimal_string());
     let nb = serde_json::to_vec(&line).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view
@@ -525,8 +533,8 @@ fn cross_offers(
             };
 
             // Move funds: taker pays order_in (grossed), owner pays order_out.
-            pay_in(ctx, taker, taker_acct, &owner, &order_in)?;
-            pay_out(ctx, taker, taker_acct, &owner, &order_out)?;
+            pay_in(ctx, taker, taker_acct, &owner, &order_in, false)?;
+            pay_out(ctx, taker, taker_acct, &owner, &order_out, false)?;
 
             if full_take {
                 // Consume to zero (records the change in metadata) then delete,
@@ -564,6 +572,194 @@ fn cross_offers(
         remaining_out.with_amount(&remaining_out.iou, remaining_out.drops),
         remaining_in.with_amount(&remaining_in.iou, remaining_in.drops),
         crossed,
+    ))
+}
+
+/// Output deliverable for a given input at a resting offer's *exact* price:
+/// `out = in * offer_out / offer_in`. rippled's Flow prices the fill from the
+/// offer's full-precision amounts, not the bucketed book-directory quality.
+/// The ratio is taken in pure `IOUAmount` magnitudes (drops count as integers)
+/// to avoid the native/IOU normalisation hazard of mixed-asset multiply.
+fn out_for_in(in_amt: &Leg, offer_in: &Leg, offer_out: &Leg) -> Leg {
+    let in_iou = leg_as_quality_iou(in_amt);
+    let offer_out_iou = leg_as_quality_iou(offer_out);
+    let offer_in_iou = leg_as_quality_iou(offer_in);
+    let out_iou = IOUAmount::multiply(&in_iou, &offer_out_iou)
+        .and_then(|num| IOUAmount::divide(&num, &offer_in_iou))
+        .unwrap_or(IOUAmount::ZERO);
+    leg_from_magnitude(&out_iou, offer_out)
+}
+
+/// Build a leg in `template`'s asset carrying magnitude `mag`. For XRP the
+/// magnitude is floored to an integer drop count (rippled never delivers a
+/// fractional drop); for an IOU it is the value directly.
+fn leg_from_magnitude(mag: &IOUAmount, template: &Leg) -> Leg {
+    let mut out = template.clone();
+    if template.is_xrp {
+        let s = mag.to_decimal_string();
+        let whole = s.split('.').next().unwrap_or("0");
+        out.drops = whole.parse::<i64>().unwrap_or(0);
+    } else {
+        out.iou = *mag;
+    }
+    out
+}
+
+/// Input required for a given output at a book directory's quality rate,
+/// rounded up (`in = out * rate`, the taker pays at least the price).
+fn in_for_out(out_amt: &Leg, rate: &IOUAmount, in_template: &Leg) -> Leg {
+    let amt = rxrpl_amount::Amount::mul_round(
+        &leg_to_amount(out_amt),
+        &rxrpl_amount::Amount::Iou(*rate),
+        in_template.is_xrp,
+        true,
+    )
+    .unwrap_or(leg_to_amount(in_template));
+    amount_to_leg(&amt, in_template)
+}
+
+/// Cross-currency Payment book crossing under the single-taker conversion model
+/// (the taker both pays the input and receives the output — used for
+/// `Account == Destination` currency conversions). Walks the book of offers
+/// giving `target_out`'s asset for `budget_in`'s asset, best price first, with
+/// NO per-offer quality cap: rippled fills greedily until the target output is
+/// delivered or the `SendMax` input budget is spent. Unfunded offers are reaped;
+/// funded ones are fully or partially filled. The taker's XRP balance moves
+/// through `taker_acct` (the caller writes it back). Returns
+/// `(delivered_out, spent_in)`.
+pub(crate) fn cross_book_payment(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    target_out: &Value,
+    budget_in: &Value,
+) -> Result<(Value, Value), TransactionResult> {
+    let out_tmpl = Leg::parse(target_out).ok_or(TransactionResult::TemBadAmount)?;
+    let in_tmpl = Leg::parse(budget_in).ok_or(TransactionResult::TemBadAmount)?;
+    let inverse_book = keylet::book_dir(
+        &in_tmpl.currency,
+        &in_tmpl.issuer,
+        &out_tmpl.currency,
+        &out_tmpl.issuer,
+    );
+
+    let mut remaining_out = out_tmpl.clone();
+    let mut remaining_in = in_tmpl.clone();
+    let book_prefix = inverse_book.as_bytes()[0..24].to_vec();
+    let mut probe = book_dir_with_quality(&inverse_book, 0);
+    'walk: while let Some(dir_key) = ctx.view.succ(&probe) {
+        if dir_key.as_bytes()[0..24] != book_prefix[..] {
+            break;
+        }
+        probe = dir_key;
+        let dir_quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
+        let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
+        let Some(dir_bytes) = ctx.view.read(&dir_key) else {
+            continue;
+        };
+        let Ok(dir) = serde_json::from_slice::<Value>(&dir_bytes) else {
+            continue;
+        };
+        let offers: Vec<rxrpl_primitives::Hash256> = dir
+            .get("Indexes")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().and_then(|s| s.parse().ok()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for offer_key in offers {
+            if remaining_out.is_zero() || remaining_in.is_zero() {
+                break 'walk;
+            }
+            let Some(ob) = ctx.view.read(&offer_key) else {
+                continue;
+            };
+            let Ok(offer) = serde_json::from_slice::<Value>(&ob) else {
+                continue;
+            };
+            if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+                continue;
+            }
+            let owner_str = offer.get("Account").and_then(|v| v.as_str()).unwrap_or("");
+            let Ok(owner) = decode_account_id(owner_str) else {
+                continue;
+            };
+            if &owner == taker {
+                continue;
+            }
+            let Some(offer_out) = Leg::parse(&offer["TakerGets"]) else {
+                continue;
+            };
+            let Some(offer_in) = Leg::parse(&offer["TakerPays"]) else {
+                continue;
+            };
+            let funds = owner_funds_leg(ctx, &owner, &offer_out);
+            if funds.is_zero() {
+                reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                continue;
+            }
+            let avail_out = leg_min(&offer_out, &funds);
+
+            // Output capped by remaining demand, funded availability, and what
+            // the remaining input budget can buy at this offer's price.
+            let budget_out = out_for_in(&remaining_in, &offer_in, &offer_out);
+            let mut take_out = leg_min(&remaining_out, &avail_out);
+            let budget_binds = leg_ge(&take_out, &budget_out);
+            if budget_binds {
+                take_out = budget_out;
+            }
+
+            let full_take = leg_ge(&take_out, &offer_out);
+            let (order_out, order_in) = if full_take {
+                (offer_out.clone(), offer_in.clone())
+            } else if budget_binds {
+                // Input-limited: spend the whole remaining budget, deliver floor.
+                (take_out.clone(), remaining_in.clone())
+            } else {
+                // Demand-limited: pay the ceil price for the delivered output,
+                // never exceeding the resting offer or the remaining budget.
+                let priced = in_for_out(&take_out, &rate, &offer_in);
+                let order_in = leg_min(&leg_min(&priced, &offer_in), &remaining_in);
+                (take_out.clone(), order_in)
+            };
+
+            pay_in(ctx, taker, taker_acct, &owner, &order_in, true)?;
+            pay_out(ctx, taker, taker_acct, &owner, &order_out, true)?;
+
+            if full_take {
+                let mut consumed = offer.clone();
+                consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
+                consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
+                let cb = serde_json::to_vec(&consumed).map_err(|_| TransactionResult::TefInternal)?;
+                ctx.view
+                    .update(offer_key, cb)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+                reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+            } else {
+                let new_gets = leg_sub_round(&offer_out, &order_out);
+                let new_pays = leg_sub_round(&offer_in, &order_in);
+                let mut reduced = offer.clone();
+                reduced["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
+                reduced["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
+                let rb = serde_json::to_vec(&reduced).map_err(|_| TransactionResult::TefInternal)?;
+                ctx.view
+                    .update(offer_key, rb)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+            }
+
+            remaining_out = leg_sub_round(&remaining_out, &order_out);
+            remaining_in = leg_sub_round(&remaining_in, &order_in);
+        }
+    }
+
+    let delivered = leg_sub(&out_tmpl, &remaining_out);
+    let spent = leg_sub(&in_tmpl, &remaining_in);
+    Ok((
+        delivered.with_amount(&delivered.iou, delivered.drops),
+        spent.with_amount(&spent.iou, spent.drops),
     ))
 }
 
@@ -620,6 +816,19 @@ fn leg_sub(a: &Leg, b: &Leg) -> Leg {
     out
 }
 
+/// `a - b` for like-typed legs, rounding the IOU result to nearest (modern
+/// Flow / `Number` semantics) instead of the legacy truncating [`leg_sub`].
+/// XRP drops are exact integers, so the two agree on the native side.
+fn leg_sub_round(a: &Leg, b: &Leg) -> Leg {
+    let mut out = a.clone();
+    if a.is_xrp {
+        out.drops = a.drops - b.drops;
+    } else {
+        out.iou = IOUAmount::add_round(&a.iou, &b.iou.negate()).unwrap_or(IOUAmount::ZERO);
+    }
+    out
+}
+
 /// Move the taker's input to the offer owner: XRP via balances, IOU via the
 /// grossed trust-line debit / net credit.
 fn pay_in(
@@ -628,6 +837,7 @@ fn pay_in(
     taker_acct: &mut Value,
     owner: &AccountId,
     amount: &Leg,
+    round: bool,
 ) -> Result<(), TransactionResult> {
     if amount.is_xrp {
         let bal = helpers::get_balance(taker_acct) as i64 - amount.drops;
@@ -645,8 +855,9 @@ fn pay_in(
         &amount.issuer,
         &amount.currency,
         &gross.negate(),
+        round,
     )?;
-    credit_line(ctx, owner, &amount.issuer, &amount.currency, &amount.iou)
+    credit_line(ctx, owner, &amount.issuer, &amount.currency, &amount.iou, round)
 }
 
 /// Move the offer owner's output to the taker: XRP via balances, IOU via the
@@ -659,6 +870,7 @@ fn pay_out(
     taker_acct: &mut Value,
     owner: &AccountId,
     amount: &Leg,
+    round: bool,
 ) -> Result<(), TransactionResult> {
     if amount.is_xrp {
         credit_xrp(ctx, owner, -amount.drops)?;
@@ -676,8 +888,9 @@ fn pay_out(
         &amount.issuer,
         &amount.currency,
         &gross.negate(),
+        round,
     )?;
-    credit_line(ctx, taker, &amount.issuer, &amount.currency, &amount.iou)
+    credit_line(ctx, taker, &amount.issuer, &amount.currency, &amount.iou, round)
 }
 
 /// `amount * rate` using rippled's non-rounding STAmount multiply.
