@@ -138,16 +138,18 @@ impl Transactor for PaymentTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         let destination_str = helpers::get_destination(ctx.tx)?;
 
-        // Cross-currency conversion (Account == Destination, a SendMax in a
-        // different asset than Amount): cross the order book via the shared
-        // Taker engine. Scoped here to the single-taker conversion shape; other
-        // cross-currency Payments fall through to the IOU paths below.
-        if account_str == destination_str {
+        // Cross-currency Payment (a SendMax in a different asset than Amount):
+        // cross the order book via the shared Taker engine — for a conversion
+        // (Account == Destination) or a direct payment to another account. Only
+        // the single-book shape is handled here; multi-hop `Paths` falls through
+        // to the legacy path below.
+        if ctx.tx.get("Paths").is_none() {
             if let Some(send_max) = ctx.tx.get("SendMax") {
                 if cross_assets_differ(send_max, &ctx.tx["Amount"]) {
                     return apply_conversion(
                         ctx,
                         account_str,
+                        destination_str,
                         ctx.tx["Amount"].clone(),
                         send_max.clone(),
                     );
@@ -573,11 +575,14 @@ fn cross_assets_differ(a: &serde_json::Value, b: &serde_json::Value) -> bool {
 fn apply_conversion(
     ctx: &mut ApplyContext<'_>,
     account_str: &str,
+    destination_str: &str,
     amount: serde_json::Value,
     send_max: serde_json::Value,
 ) -> Result<TransactionResult, TransactionResult> {
     let src_id =
         decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let dst_id =
+        decode_account_id(destination_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
     let src_key = keylet::account(&src_id);
     let bytes = ctx
         .view
@@ -588,7 +593,7 @@ fn apply_conversion(
     crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut acct, ctx.tx)?;
 
     let (delivered, _spent) = crate::handlers::offer_create::cross_book_payment(
-        ctx, &src_id, &mut acct, &amount, &send_max,
+        ctx, &src_id, &mut acct, &dst_id, &amount, &send_max,
     )?;
 
     const TF_PARTIAL_PAYMENT: u32 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT;

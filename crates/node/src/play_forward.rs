@@ -517,15 +517,27 @@ mod tests {
                     // FinalFields omits the threaded PreviousTxnID/LgrSeq; carry
                     // them over from the parent-ledger seed so the central
                     // stamping has a field to overwrite (its value is irrelevant).
-                    if let Some(seed) = state
+                    // When the entry was created earlier in this same ledger
+                    // there is no parent seed — add a placeholder for threaded
+                    // types so stamping still fires (DirectoryNode et al. carry
+                    // no such field and must be left alone).
+                    let threaded = !matches!(
+                        let_type,
+                        "DirectoryNode" | "LedgerHashes" | "Amendments" | "FeeSettings"
+                    );
+                    let seed = state
                         .get(&Hash256::new(kb))
-                        .and_then(|b| rxrpl_codec::binary::decode(b).ok())
-                    {
+                        .and_then(|b| rxrpl_codec::binary::decode(b).ok());
+                    if let Some(seed) = &seed {
                         for f in ["PreviousTxnID", "PreviousTxnLgrSeq"] {
                             if let Some(v) = seed.get(f) {
                                 obj.insert(f.into(), v.clone());
                             }
                         }
+                    }
+                    if threaded && !obj.contains_key("PreviousTxnID") {
+                        obj.insert("PreviousTxnID".into(), Value::String("0".repeat(64)));
+                        obj.insert("PreviousTxnLgrSeq".into(), Value::from(0u32));
                     }
                 }
                 let Ok(json_bytes) = serde_json::to_vec(&pre) else {
@@ -539,12 +551,14 @@ mod tests {
             }
         }
 
-        // Order-book crossing reads the book directory pages to walk offers.
-        // An offer that is only *modified* (partially filled) leaves its
-        // directory untouched, so the page is absent from AffectedNodes and was
-        // not seeded above. Seed each seeded offer's `BookDirectory` page so the
-        // walk can find it.
-        let mut dir_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        // Order-book crossing walks the book directory pages to find offers.
+        // Map each seeded offer to its `BookDirectory` page and guarantee that
+        // page lists the offer's index. The parent-ledger page is stale when the
+        // offer was created or moved by another tx in this same ledger (it would
+        // omit the entry, so the walk would miss it); patch the page (or build a
+        // minimal one) so every affected offer is reachable.
+        let mut dir_offers: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
         for key in &read_keys {
             let kb: [u8; 32] = hex::decode(key).unwrap().try_into().unwrap();
             let Some(node) = state.get(&Hash256::new(kb)) else {
@@ -555,22 +569,41 @@ mod tests {
             };
             if j.get("LedgerEntryType").and_then(|t| t.as_str()) == Some("Offer") {
                 if let Some(bd) = j.get("BookDirectory").and_then(|v| v.as_str()) {
-                    dir_keys.insert(bd.to_uppercase());
+                    dir_offers
+                        .entry(bd.to_uppercase())
+                        .or_default()
+                        .push(key.clone());
                 }
             }
         }
-        for key in &dir_keys {
-            if read_keys.contains(key) {
-                continue;
-            }
+        for (key, offers) in &dir_offers {
             let r = rpc(serde_json::json!({
                 "method":"ledger_entry","params":[{"index":key,"ledger_index":parent,"binary":true}]
             }));
-            if let Some(hex_node) = r["result"]["node_binary"].as_str() {
-                let kb: [u8; 32] = hex::decode(key).unwrap().try_into().unwrap();
-                state
-                    .put(Hash256::new(kb), hex::decode(hex_node).unwrap())
-                    .unwrap();
+            let mut page = r["result"]["node_binary"]
+                .as_str()
+                .and_then(|h| hex::decode(h).ok())
+                .and_then(|b| rxrpl_codec::binary::decode(&b).ok())
+                .unwrap_or_else(|| {
+                    serde_json::json!({
+                        "LedgerEntryType": "DirectoryNode",
+                        "Flags": 0,
+                        "RootIndex": key,
+                        "Indexes": [],
+                    })
+                });
+            if let Some(arr) = page.get_mut("Indexes").and_then(|v| v.as_array_mut()) {
+                for off in offers {
+                    if !arr.iter().any(|x| x.as_str() == Some(off.as_str())) {
+                        arr.push(Value::String(off.clone()));
+                    }
+                }
+            }
+            if let Ok(b) = serde_json::to_vec(&page) {
+                if let Ok(bin) = rxrpl_ledger::sle_codec::encode_sle(&b) {
+                    let kb: [u8; 32] = hex::decode(key).unwrap().try_into().unwrap();
+                    state.put(Hash256::new(kb), bin).unwrap();
+                }
             }
         }
 

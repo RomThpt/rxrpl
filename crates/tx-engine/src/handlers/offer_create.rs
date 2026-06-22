@@ -534,7 +534,7 @@ fn cross_offers(
 
             // Move funds: taker pays order_in (grossed), owner pays order_out.
             pay_in(ctx, taker, taker_acct, &owner, &order_in, false)?;
-            pay_out(ctx, taker, taker_acct, &owner, &order_out, false)?;
+            pay_out(ctx, taker, taker_acct, &owner, taker, &order_out, false)?;
 
             if full_take {
                 // Consume to zero (records the change in metadata) then delete,
@@ -631,6 +631,7 @@ pub(crate) fn cross_book_payment(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
     taker_acct: &mut Value,
+    dest: &AccountId,
     target_out: &Value,
     budget_in: &Value,
 ) -> Result<(Value, Value), TransactionResult> {
@@ -737,7 +738,7 @@ pub(crate) fn cross_book_payment(
             };
 
             pay_in(ctx, taker, taker_acct, &owner, &order_in, true)?;
-            pay_out(ctx, taker, taker_acct, &owner, &order_out, true)?;
+            pay_out(ctx, taker, taker_acct, &owner, dest, &order_out, true)?;
 
             if full_take {
                 let mut consumed = offer.clone();
@@ -879,24 +880,31 @@ fn pay_in(
     )
 }
 
-/// Move the offer owner's output to the taker: XRP via balances, IOU via the
-/// grossed owner debit / net taker credit (the difference is the burned fee).
-/// The taker's XRP credit goes through `taker_acct` (the caller's working copy),
-/// not the view, so the apply's final account write does not clobber it.
+/// Move the offer owner's output to `recipient`: XRP via balances, IOU via the
+/// grossed owner debit / net recipient credit (the difference is the burned
+/// fee). When `recipient` is the taker, its XRP credit goes through `taker_acct`
+/// (the caller's working copy) so the apply's final account write does not
+/// clobber it; a distinct recipient (cross-currency payment to another account)
+/// is credited through the view instead.
 fn pay_out(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
     taker_acct: &mut Value,
     owner: &AccountId,
+    recipient: &AccountId,
     amount: &Leg,
     round: bool,
 ) -> Result<(), TransactionResult> {
     if amount.is_xrp {
         credit_xrp(ctx, owner, -amount.drops)?;
-        helpers::set_balance(
-            taker_acct,
-            helpers::get_balance(taker_acct) + amount.drops as u64,
-        );
+        if recipient == taker {
+            helpers::set_balance(
+                taker_acct,
+                helpers::get_balance(taker_acct) + amount.drops as u64,
+            );
+        } else {
+            credit_xrp(ctx, recipient, amount.drops)?;
+        }
         return Ok(());
     }
     let rate = transfer_rate(ctx, &amount.issuer);
@@ -911,7 +919,7 @@ fn pay_out(
     )?;
     credit_line(
         ctx,
-        taker,
+        recipient,
         &amount.issuer,
         &amount.currency,
         &amount.iou,
