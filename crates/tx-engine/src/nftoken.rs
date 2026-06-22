@@ -8,6 +8,9 @@ use crate::view::read_view::ReadView;
 const PREV_TXN_PLACEHOLDER: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// rippled's per-page cap (dirNodeMaxEntries); a fuller page is split.
+const MAX_PAGE_ENTRIES: usize = 32;
+
 /// Locate the existing NFToken page that should hold `nftoken_id` for `owner`:
 /// the lowest page key >= the token's candidate key, bounded by the owner's
 /// page range. `None` when the owner has no suitable page yet.
@@ -16,13 +19,12 @@ pub fn find_owner_page(
     owner: &AccountId,
     nftoken_id: &Hash256,
 ) -> Option<Hash256> {
+    // A page key is the exclusive upper bound of the low-96 sort keys it holds
+    // (the next page's first token), so a token belongs to the page with the
+    // smallest key strictly greater than its candidate.
     let candidate = keylet::nftoken_page(owner, nftoken_id);
     let max = keylet::nftoken_page_max(owner);
-    let key = if view.exists(&candidate) {
-        candidate
-    } else {
-        view.succ(&candidate)?
-    };
+    let key = view.succ(&candidate)?;
     let same_owner = key.as_bytes()[..20] == owner.as_bytes()[..20];
     if key <= max && same_owner {
         Some(key)
@@ -51,6 +53,11 @@ pub fn insert_token(
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
+
+            if tokens.len() >= MAX_PAGE_ENTRIES {
+                return split_page_and_insert(view, owner, &page_key, &mut page, tokens, entry);
+            }
+
             let pos = tokens
                 .iter()
                 .position(|t| nftoken_entry_id(t) > id_hex)
@@ -76,6 +83,89 @@ pub fn insert_token(
             Ok(true)
         }
     }
+}
+
+/// Split a full (32-entry) NFToken page in two and insert the new entry.
+/// rippled keeps the upper half in the original page and moves the lower half
+/// into a freshly created page keyed at the boundary (the low-96 bits of the
+/// first token of the upper half), then threads the doubly-linked page chain.
+fn split_page_and_insert(
+    view: &mut dyn ApplyView,
+    owner: &AccountId,
+    orig_key: &Hash256,
+    orig_page: &mut Value,
+    tokens: Vec<Value>,
+    entry: Value,
+) -> Result<bool, TransactionResult> {
+    let mid = MAX_PAGE_ENTRIES / 2;
+    let boundary_id = entry_nftoken_id(&tokens[mid])
+        .ok_or(TransactionResult::TefInternal)?
+        .to_string();
+    let boundary_bytes = hex::decode(&boundary_id).map_err(|_| TransactionResult::TefInternal)?;
+    let boundary_hash =
+        Hash256::from_slice(&boundary_bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let new_key = keylet::nftoken_page(owner, &boundary_hash);
+    let new_key_hex = new_key.to_string().to_uppercase();
+    let orig_key_hex = orig_key.to_string().to_uppercase();
+
+    let mut lower: Vec<Value> = tokens[..mid].to_vec();
+    let mut upper: Vec<Value> = tokens[mid..].to_vec();
+    let entry_id = nftoken_entry_id(&entry);
+    let target = if entry_id < boundary_id.to_uppercase() {
+        &mut lower
+    } else {
+        &mut upper
+    };
+    let pos = target
+        .iter()
+        .position(|t| nftoken_entry_id(t) > entry_id)
+        .unwrap_or(target.len());
+    target.insert(pos, entry);
+
+    let old_prev = orig_page
+        .get("PreviousPageMin")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // New lower page: links back to the old predecessor and forward to the
+    // original page, which now holds the upper half.
+    let mut new_page = serde_json::json!({
+        "LedgerEntryType": "NFTokenPage",
+        "NFTokens": lower,
+        "NextPageMin": orig_key_hex,
+        "PreviousTxnID": PREV_TXN_PLACEHOLDER,
+        "PreviousTxnLgrSeq": 0,
+    });
+    if let Some(p) = &old_prev {
+        new_page["PreviousPageMin"] = Value::String(p.clone());
+    }
+    let nb = serde_json::to_vec(&new_page).map_err(|_| TransactionResult::TefInternal)?;
+    view.insert(new_key, nb)
+        .map_err(|_| TransactionResult::TefInternal)?;
+
+    orig_page["NFTokens"] = Value::Array(upper);
+    orig_page["PreviousPageMin"] = Value::String(new_key_hex.clone());
+    let ob = serde_json::to_vec(orig_page).map_err(|_| TransactionResult::TefInternal)?;
+    view.update(*orig_key, ob)
+        .map_err(|_| TransactionResult::TefInternal)?;
+
+    if let Some(p) = old_prev {
+        if let Ok(pbytes) = hex::decode(&p) {
+            if let Ok(pk) = Hash256::from_slice(&pbytes) {
+                if let Some(pb) = view.read(&pk) {
+                    if let Ok(mut prev_page) = serde_json::from_slice::<Value>(&pb) {
+                        prev_page["NextPageMin"] = Value::String(new_key_hex);
+                        if let Ok(d) = serde_json::to_vec(&prev_page) {
+                            view.update(pk, d)
+                                .map_err(|_| TransactionResult::TefInternal)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(true)
 }
 
 /// The NFTokenID held by an sfNFToken page entry (`{"NFToken": {...}}`).
