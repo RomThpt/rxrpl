@@ -8,6 +8,42 @@ use crate::owner_dir::add_to_owner_dir;
 use crate::view::apply_view::ApplyView;
 use crate::view::read_view::ReadView;
 
+/// Single-asset deposit: LP tokens issued for depositing `deposit` of an asset
+/// whose pool balance is `pool`, against `total_lp` outstanding, with trading
+/// fee `tfee` (1/100000). Mirrors rippled `lpTokensOut` under fixAMMv1_3
+/// (rounds the issued tokens down).
+pub fn lp_tokens_out_single(
+    pool: u64,
+    deposit: u64,
+    total_lp: &rxrpl_amount::IOUAmount,
+    tfee: u16,
+) -> rxrpl_amount::IOUAmount {
+    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode, root2};
+    let one = Number::from_int(1);
+    let f1 = one.sub(&Number::from_int(tfee as i64).div(&Number::from_int(100_000)));
+    let f2 = one
+        .sub(&Number::from_int(tfee as i64).div(&Number::from_int(200_000)))
+        .div(&f1);
+    let r = Number::from_int(deposit as i64).div(&Number::from_int(pool as i64));
+    let c = root2(f2.mul(&f2).add(&r.div(&f1))).sub(&f2);
+    let frac = r.sub(&c).div(&one.add(&c));
+    let t = Number::from_iou(total_lp);
+
+    let _g = RoundModeGuard::new(RoundingMode::Downward);
+    // lpTokensOut: multiply(T, frac) rounded down.
+    let raw = t.mul(&frac).to_iou();
+    // adjustLPTokens (deposit): re-round tokens to T's precision via
+    // (T + raw) - T, all under downward rounding, so the credited tokens stay
+    // consistent with the updated LPTokenBalance.
+    let t_plus = t.add(&Number::from_iou(&raw)).to_iou();
+    Number::from_iou(&t_plus).sub(&t).to_iou()
+}
+
+/// Parse an IOU `value` decimal string into an `IOUAmount`.
+pub fn parse_iou_value(s: &str) -> rxrpl_amount::IOUAmount {
+    rxrpl_amount::IOUAmount::from_decimal_string(s).unwrap_or(rxrpl_amount::IOUAmount::ZERO)
+}
+
 /// Convert an Asset JSON value to (currency_bytes, issuer_bytes).
 ///
 /// XRP is represented as the string `"XRP"` and yields 20 zero bytes for both
