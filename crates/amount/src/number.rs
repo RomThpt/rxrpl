@@ -413,6 +413,53 @@ impl Number {
         self.add(&y.negate())
     }
 
+    /// Convert a 16-digit `IOUAmount` to a Number (exact: scales the mantissa
+    /// up into the 18-digit Large range).
+    pub fn from_iou(iou: &crate::iou::IOUAmount) -> Number {
+        if iou.is_zero() {
+            return Number::ZERO;
+        }
+        Number::new(iou.sign_bit(), iou.mantissa(), iou.exponent())
+    }
+
+    /// Reduce to a canonical 16-digit `IOUAmount` (STAmount IOU precision),
+    /// honouring the active rounding mode — matching rippled's `toSTAmount`,
+    /// whose 18→16 reduction goes through `Number` under the same mode guard.
+    pub fn to_iou(&self) -> crate::iou::IOUAmount {
+        use crate::iou::IOUAmount;
+        if self.is_zero() {
+            return IOUAmount::ZERO;
+        }
+        const IOU_MAX: u128 = 9_999_999_999_999_999; // 10^16 - 1
+        let mut m = self.mantissa as u128;
+        let mut e = self.exponent;
+        let mut drop = 0u32;
+        let mut probe = m;
+        while probe > IOU_MAX {
+            probe /= 10;
+            drop += 1;
+        }
+        if drop > 0 {
+            let div = 10u128.pow(drop);
+            let q = m / div;
+            let r = m % div;
+            let half = div / 2;
+            let round_up = match getround() {
+                RoundingMode::ToNearest => r > half || (r == half && (q & 1 == 1)),
+                RoundingMode::TowardsZero => false,
+                RoundingMode::Downward => self.negative && r != 0,
+                RoundingMode::Upward => !self.negative && r != 0,
+            };
+            m = if round_up { q + 1 } else { q };
+            e += drop as i32;
+            while m > IOU_MAX {
+                m /= 10;
+                e += 1;
+            }
+        }
+        IOUAmount::from_parts(m as u64, e, self.negative).unwrap_or(IOUAmount::ZERO)
+    }
+
     /// Decimal-string form (full 18-digit mantissa), for tests/debugging.
     pub fn to_decimal_string(&self) -> String {
         if self.is_zero() {
