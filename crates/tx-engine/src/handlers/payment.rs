@@ -112,6 +112,15 @@ impl Transactor for PaymentTransactor {
             }
         }
 
+        // Cross-currency payment: the source spends SendMax (a different asset),
+        // not Amount, so the Amount-vs-balance funding check below does not
+        // apply — the crossing in apply enforces source funds.
+        if let Some(sm) = ctx.tx.get("SendMax") {
+            if cross_assets_differ(sm, &ctx.tx["Amount"]) {
+                return Ok(());
+            }
+        }
+
         // IOU path: trust line existence is checked in apply; here we only
         // need the source account itself (for fee deduction by the engine).
         if helpers::get_iou_amount(ctx.tx).is_some() {

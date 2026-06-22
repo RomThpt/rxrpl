@@ -528,10 +528,12 @@ mod tests {
                     let seed = state
                         .get(&Hash256::new(kb))
                         .and_then(|b| rxrpl_codec::binary::decode(b).ok());
-                    if let Some(seed) = &seed {
-                        for f in ["PreviousTxnID", "PreviousTxnLgrSeq"] {
-                            if let Some(v) = seed.get(f) {
-                                obj.insert(f.into(), v.clone());
+                    if threaded {
+                        if let Some(seed) = &seed {
+                            for f in ["PreviousTxnID", "PreviousTxnLgrSeq"] {
+                                if let Some(v) = seed.get(f) {
+                                    obj.insert(f.into(), v.clone());
+                                }
                             }
                         }
                     }
