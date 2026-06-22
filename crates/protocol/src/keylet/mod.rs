@@ -398,9 +398,11 @@ pub fn amm(
             asset1_issuer.as_bytes().as_slice(),
         )
     };
+    // rippled sorts the two issues by (currency, account) but hashes each as
+    // account-then-currency.
     index_hash(
         LedgerNamespace::AMM,
-        &[low_cur, low_iss, high_cur, high_iss],
+        &[low_iss, low_cur, high_iss, high_cur],
     )
 }
 
