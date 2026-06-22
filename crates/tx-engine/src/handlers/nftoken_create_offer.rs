@@ -10,6 +10,24 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transac
 /// tfSellNFToken flag
 const TF_SELL_NFTOKEN: u32 = 0x0001;
 
+/// True when an offer amount is zero (XRP `"0"` drops or IOU value `0`).
+fn amount_is_zero(amount: &Value) -> bool {
+    match amount {
+        Value::String(s) => s.parse::<u128>().map(|n| n == 0).unwrap_or(false),
+        Value::Object(o) => o
+            .get("value")
+            .and_then(|v| v.as_str())
+            .map(|s| {
+                s.trim_start_matches('-')
+                    .trim_matches('0')
+                    .trim_matches('.')
+                    .is_empty()
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn nft_hash(id_hex: &str) -> Result<Hash256, TransactionResult> {
     let bytes = hex::decode(id_hex).map_err(|_| TransactionResult::TemMalformed)?;
     Hash256::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)
@@ -155,11 +173,18 @@ impl Transactor for NFTokenCreateOfferTransactor {
             "LedgerEntryType": "NFTokenOffer",
             "Owner": account_str,
             "NFTokenID": nftoken_id,
-            "Amount": amount_value,
-            "OwnerNode": format!("{owner_node:016X}"),
             "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
             "PreviousTxnLgrSeq": 0,
         });
+        // sfAmount is default-droppable: a zero-amount (gift) sell offer omits
+        // it, matching rippled's serialization.
+        if !amount_is_zero(&amount_value) {
+            offer["Amount"] = amount_value;
+        }
+        // OwnerNode is omitted on the directory's root page (node 0).
+        if owner_node != 0 {
+            offer["OwnerNode"] = Value::from(format!("{owner_node:016X}"));
+        }
         if flags != 0 {
             offer["Flags"] = Value::from(flags);
         }
