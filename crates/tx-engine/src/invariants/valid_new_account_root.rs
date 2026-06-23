@@ -4,8 +4,7 @@ use serde_json::Value;
 
 /// Invariant: newly inserted AccountRoot entries must have valid initial state.
 ///
-/// A new account must have: Account present, Balance parseable, Sequence > 0,
-/// and OwnerCount == 0 (no owned objects at creation time).
+/// A new account must have: Account present, Balance parseable, and Sequence > 0.
 pub struct ValidNewAccountRoot;
 
 impl InvariantCheck for ValidNewAccountRoot {
@@ -57,13 +56,9 @@ impl InvariantCheck for ValidNewAccountRoot {
                 return Err(format!("new AccountRoot at {key} has Sequence=0"));
             }
 
-            // OwnerCount must be 0
-            let owner_count = obj.get("OwnerCount").and_then(|v| v.as_u64()).unwrap_or(0);
-            if owner_count != 0 {
-                return Err(format!(
-                    "new AccountRoot at {key} has OwnerCount={owner_count}, expected 0"
-                ));
-            }
+            // OwnerCount is not constrained at creation: rippled's
+            // ValidNewAccountRoot allows a freshly created (pseudo-)account to
+            // own objects (e.g. an AMM account that holds its pool trust lines).
         }
         Ok(())
     }
@@ -108,14 +103,15 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_owner_count_fails() {
+    fn nonzero_owner_count_allowed() {
+        // A pseudo-account (e.g. an AMM) may own objects at creation.
         let check = ValidNewAccountRoot;
         let mut changes = empty_changes();
         changes.inserts.insert(
             Hash256::new([0x01; 32]),
             account_root("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh", "1000000", 1, 3),
         );
-        assert!(check.check(&changes, 100, 100, None).is_err());
+        assert!(check.check(&changes, 100, 100, None).is_ok());
     }
 
     #[test]

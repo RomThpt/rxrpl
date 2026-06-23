@@ -832,6 +832,16 @@ mod tests {
                 };
                 if let Some(obj) = post.as_object_mut() {
                     obj.insert("LedgerEntryType".into(), Value::String(let_type.into()));
+                    // A created AccountRoot always carries Balance, but the tx
+                    // metadata omits it when it is exactly zero (e.g. an AMM
+                    // pseudo-account funded only with IOU legs). Default it so the
+                    // reconstructed SLE matches the real on-chain entry.
+                    if nt == "CreatedNode"
+                        && let_type == "AccountRoot"
+                        && !obj.contains_key("Balance")
+                    {
+                        obj.insert("Balance".into(), Value::String("0".into()));
+                    }
                     if !non_threaded(let_type) {
                         obj.insert("PreviousTxnID".into(), Value::String(txid_upper.clone()));
                         obj.insert("PreviousTxnLgrSeq".into(), Value::from(n));

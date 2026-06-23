@@ -493,6 +493,34 @@ pub fn lp_currency_hex(amm_key: &Hash256) -> String {
     hex::encode_upper(lp_currency_bytes(amm_key))
 }
 
+/// The pool's LP-token currency (rippled `ammLPTCurrency`): `0x03` followed by
+/// the first 19 bytes of `sha512Half(minCurrency || maxCurrency)`, the two asset
+/// currencies ordered by byte value.
+pub fn lp_currency_from_assets(
+    asset1: &Value,
+    asset2: &Value,
+) -> Result<[u8; 20], TransactionResult> {
+    let (c1, _) = asset_to_bytes(asset1)?;
+    let (c2, _) = asset_to_bytes(asset2)?;
+    let (lo, hi) = if c1 <= c2 { (c1, c2) } else { (c2, c1) };
+    let h = rxrpl_crypto::sha512_half::sha512_half(&[&lo, &hi]);
+    let mut cur = [0u8; 20];
+    cur[0] = 0x03;
+    cur[1..].copy_from_slice(&h.as_bytes()[..19]);
+    Ok(cur)
+}
+
+/// Initial LP tokens for a new pool (rippled `ammLPTokens` under fixAMMv1_3):
+/// `root2(amount1 * amount2)` rounded down to the IOU grid.
+pub fn amm_lp_tokens(
+    amount1: &rxrpl_amount::number::Number,
+    amount2: &rxrpl_amount::number::Number,
+) -> rxrpl_amount::IOUAmount {
+    use rxrpl_amount::number::{RoundModeGuard, RoundingMode, root2};
+    let _g = RoundModeGuard::new(RoundingMode::Downward);
+    root2(amount1.mul(amount2)).to_iou()
+}
+
 /// Read the holder's current LP balance (0 if no line exists).
 pub fn lp_balance_of(view: &dyn ReadView, amm_key: &Hash256, holder: &AccountId) -> u64 {
     let pseudo = amm_pseudo_account(amm_key);
