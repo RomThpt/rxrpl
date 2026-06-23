@@ -479,6 +479,33 @@ impl Number {
         v.min(u64::MAX as u128) as u64
     }
 
+    /// Convert to integer XRP drops honouring the active rounding mode, matching
+    /// rippled's `toSTAmount` for an XRP asset (`operator rep()` rounds the
+    /// fractional part under the thread-local mode).
+    pub fn to_xrp_drops_mode(&self) -> u64 {
+        if self.is_zero() {
+            return 0;
+        }
+        let m = self.mantissa as u128;
+        if self.exponent >= 0 {
+            return m
+                .saturating_mul(10u128.pow(self.exponent as u32))
+                .min(u64::MAX as u128) as u64;
+        }
+        let div = 10u128.pow((-self.exponent) as u32);
+        let q = m / div;
+        let r = m % div;
+        let half = div / 2;
+        let round_up = match getround() {
+            RoundingMode::ToNearest => r > half || (r == half && (q & 1 == 1)),
+            RoundingMode::TowardsZero => false,
+            RoundingMode::Downward => self.negative && r != 0,
+            RoundingMode::Upward => !self.negative && r != 0,
+        };
+        let v = if round_up { q + 1 } else { q };
+        v.min(u64::MAX as u128) as u64
+    }
+
     /// Decimal-string form (full 18-digit mantissa), for tests/debugging.
     pub fn to_decimal_string(&self) -> String {
         if self.is_zero() {

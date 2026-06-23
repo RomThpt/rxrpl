@@ -43,17 +43,50 @@ pub fn lp_tokens_out_ratio(
     total_lp: &rxrpl_amount::IOUAmount,
     tfee: u16,
 ) -> rxrpl_amount::IOUAmount {
-    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode, root2};
+    use rxrpl_amount::number::{Number, root2};
     let one = Number::from_int(1);
     let (f1, f2) = fee_mults(tfee);
     let c = root2(f2.mul(&f2).add(&r.div(&f1))).sub(&f2);
     let frac = r.sub(&c).div(&one.add(&c));
-    let t = Number::from_iou(total_lp);
+    rounded_lp_tokens_deposit(total_lp, &frac)
+}
 
+/// `getRoundedLPTokens(T, frac, Deposit)`: `adjustLPTokens(T, multiply(T, frac,
+/// Downward), Deposit)`. The whole chain runs under Downward so the issued
+/// tokens stay consistent with the updated `LPTokenBalance`. Used by both the
+/// single-asset (`frac` from eq 3) and proportional two-asset deposits.
+pub fn rounded_lp_tokens_deposit(
+    total_lp: &rxrpl_amount::IOUAmount,
+    frac: &rxrpl_amount::number::Number,
+) -> rxrpl_amount::IOUAmount {
+    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode};
+    let t = Number::from_iou(total_lp);
     let _g = RoundModeGuard::new(RoundingMode::Downward);
-    let raw = t.mul(&frac).to_iou();
+    let raw = t.mul(frac).to_iou();
     let t_plus = t.add(&Number::from_iou(&raw)).to_iou();
     Number::from_iou(&t_plus).sub(&t).to_iou()
+}
+
+/// `getRoundedAsset(balance, frac, Deposit)` for an IOU leg: `multiply(balance,
+/// frac, Upward)` rounded onto the IOU grid (maximize the deposit).
+pub fn rounded_asset_up_iou(
+    balance: &rxrpl_amount::number::Number,
+    frac: &rxrpl_amount::number::Number,
+) -> rxrpl_amount::IOUAmount {
+    use rxrpl_amount::number::{RoundModeGuard, RoundingMode};
+    let _g = RoundModeGuard::new(RoundingMode::Upward);
+    balance.mul(frac).to_iou()
+}
+
+/// `getRoundedAsset(balance, frac, Deposit)` for an XRP leg: `multiply(balance,
+/// frac, Upward)` rounded to integer drops (maximize the deposit).
+pub fn rounded_asset_up_xrp(
+    balance: &rxrpl_amount::number::Number,
+    frac: &rxrpl_amount::number::Number,
+) -> u64 {
+    use rxrpl_amount::number::{RoundModeGuard, RoundingMode};
+    let _g = RoundModeGuard::new(RoundingMode::Upward);
+    balance.mul(frac).to_xrp_drops_mode()
 }
 
 /// Single-asset withdraw: LP tokens burned to withdraw `withdraw` of an asset
@@ -408,6 +441,18 @@ pub fn amount_value_drops_or_iou(amount: &Value) -> Option<u64> {
         return None;
     }
     Some(v as u64)
+}
+
+/// Whether an Amount field is strictly positive — works for fractional IOU
+/// values (`< 1`), unlike `amount_value_drops_or_iou` which truncates to drops.
+pub fn amount_is_positive(amount: &Value) -> bool {
+    if let Some(s) = amount.as_str() {
+        return s.parse::<u64>().map(|d| d > 0).unwrap_or(false);
+    }
+    match amount.get("value").and_then(|v| v.as_str()) {
+        Some(v) => !v.starts_with('-') && !parse_iou_value(v).is_zero(),
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
