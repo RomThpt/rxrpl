@@ -8,6 +8,19 @@ use crate::owner_dir::add_to_owner_dir;
 use crate::view::apply_view::ApplyView;
 use crate::view::read_view::ReadView;
 
+/// Fee multipliers `(f1, f2)` mirroring rippled `feeMult`/`feeMultHalf`:
+/// `getFee = tfee/100000`, `f1 = 1 - getFee`, `f2 = (1 - getFee/2) / f1`. The
+/// computation order matches rippled so the `Number` rounding is byte-faithful.
+fn fee_mults(tfee: u16) -> (rxrpl_amount::number::Number, rxrpl_amount::number::Number) {
+    use rxrpl_amount::number::Number;
+    let one = Number::from_int(1);
+    let two = Number::from_int(2);
+    let fee = Number::from_int(tfee as i64).div(&Number::from_int(100_000));
+    let f1 = one.sub(&fee);
+    let f2 = one.sub(&fee.div(&two)).div(&f1);
+    (f1, f2)
+}
+
 /// Single-asset deposit: LP tokens issued for depositing `deposit` of an asset
 /// whose pool balance is `pool`, against `total_lp` outstanding, with trading
 /// fee `tfee` (1/100000). Mirrors rippled `lpTokensOut` under fixAMMv1_3
@@ -18,23 +31,27 @@ pub fn lp_tokens_out_single(
     total_lp: &rxrpl_amount::IOUAmount,
     tfee: u16,
 ) -> rxrpl_amount::IOUAmount {
+    use rxrpl_amount::number::Number;
+    let r = Number::from_int(deposit as i64).div(&Number::from_int(pool as i64));
+    lp_tokens_out_ratio(&r, total_lp, tfee)
+}
+
+/// Single-asset deposit LP tokens given the deposit/pool ratio `r` (works for
+/// XRP or IOU legs). Mirrors rippled `lpTokensOut` + `adjustLPTokens`.
+pub fn lp_tokens_out_ratio(
+    r: &rxrpl_amount::number::Number,
+    total_lp: &rxrpl_amount::IOUAmount,
+    tfee: u16,
+) -> rxrpl_amount::IOUAmount {
     use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode, root2};
     let one = Number::from_int(1);
-    let f1 = one.sub(&Number::from_int(tfee as i64).div(&Number::from_int(100_000)));
-    let f2 = one
-        .sub(&Number::from_int(tfee as i64).div(&Number::from_int(200_000)))
-        .div(&f1);
-    let r = Number::from_int(deposit as i64).div(&Number::from_int(pool as i64));
+    let (f1, f2) = fee_mults(tfee);
     let c = root2(f2.mul(&f2).add(&r.div(&f1))).sub(&f2);
     let frac = r.sub(&c).div(&one.add(&c));
     let t = Number::from_iou(total_lp);
 
     let _g = RoundModeGuard::new(RoundingMode::Downward);
-    // lpTokensOut: multiply(T, frac) rounded down.
     let raw = t.mul(&frac).to_iou();
-    // adjustLPTokens (deposit): re-round tokens to T's precision via
-    // (T + raw) - T, all under downward rounding, so the credited tokens stay
-    // consistent with the updated LPTokenBalance.
     let t_plus = t.add(&Number::from_iou(&raw)).to_iou();
     Number::from_iou(&t_plus).sub(&t).to_iou()
 }
@@ -88,9 +105,97 @@ pub fn amm_asset_out_single_xrp(
     Number::from_int(pool as i64).mul(&frac).to_xrp_drops()
 }
 
+/// `ammAssetIn` (eq 4): the asset amount required to mint `tokens` LP, given a
+/// pool balance `pool` and outstanding `total_lp`. Mirrors rippled (maximize
+/// deposit → rounded up). Used by `adjustAssetInByTokens` to re-derive the
+/// actual deposit consistent with the issued tokens.
+pub fn amm_asset_in(
+    pool: &rxrpl_amount::number::Number,
+    total_lp: &rxrpl_amount::IOUAmount,
+    tokens: &rxrpl_amount::IOUAmount,
+    tfee: u16,
+) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode, root2};
+    let one = Number::from_int(1);
+    let (f1, f2) = fee_mults(tfee);
+    let t1 = Number::from_iou(tokens).div(&Number::from_iou(total_lp));
+    let t2 = one.add(&t1);
+    let d = f2.sub(&t1.div(&t2));
+    let a = one.div(&t2.mul(&t2));
+    let two = Number::from_int(2);
+    let b = two.mul(&d).div(&t2).sub(&one.div(&f1));
+    let c = d.mul(&d).sub(&f2.mul(&f2));
+    // solveQuadraticEq: (-b + root2(b*b - 4*a*c)) / (2*a)
+    let disc = root2(b.mul(&b).sub(&Number::from_int(4).mul(&a).mul(&c)));
+    let frac = b.negate().add(&disc).div(&two.mul(&a));
+    // rippled `ammAssetIn` returns `multiply(balance, frac, Upward)` =
+    // toSTAmount(asset, balance*frac, Upward): the result lands on the IOU
+    // grid rounded up, not at full Number precision.
+    let _g = RoundModeGuard::new(RoundingMode::Upward);
+    Number::from_iou(&pool.mul(&frac).to_iou())
+}
+
 /// Parse an IOU `value` decimal string into an `IOUAmount`.
 pub fn parse_iou_value(s: &str) -> rxrpl_amount::IOUAmount {
     rxrpl_amount::IOUAmount::from_decimal_string(s).unwrap_or(rxrpl_amount::IOUAmount::ZERO)
+}
+
+/// The account's signed holding of an IOU (its own perspective) as a `Number`,
+/// read from the `account`↔`issuer` trust line. A `RippleState` stores the
+/// balance from the low account's perspective, so the holding is the stored
+/// balance when the account is low and its negation when it is high.
+pub fn iou_holding_number(
+    view: &dyn ReadView,
+    account: &AccountId,
+    issuer: &AccountId,
+    currency: &[u8; 20],
+) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::Number;
+    let tl_key = keylet::trust_line(account, issuer, currency);
+    let Some(bytes) = view.read(&tl_key) else {
+        return Number::ZERO;
+    };
+    let Ok(line): Result<Value, _> = serde_json::from_slice(&bytes) else {
+        return Number::ZERO;
+    };
+    let bal_str = line["Balance"]["value"].as_str().unwrap_or("0");
+    let neg = bal_str.starts_with('-');
+    let mag = parse_iou_value(bal_str.trim_start_matches('-'));
+    let stored = if neg {
+        Number::from_iou(&mag).negate()
+    } else {
+        Number::from_iou(&mag)
+    };
+    if account.as_bytes() < issuer.as_bytes() {
+        stored
+    } else {
+        stored.negate()
+    }
+}
+
+/// Write the account's new holding of an IOU back to its trust line, restoring
+/// the low-account-perspective sign convention.
+pub fn set_iou_holding(
+    view: &mut dyn ApplyView,
+    account: &AccountId,
+    issuer: &AccountId,
+    currency: &[u8; 20],
+    new_holding: &rxrpl_amount::number::Number,
+) -> Result<(), TransactionResult> {
+    let tl_key = keylet::trust_line(account, issuer, currency);
+    let bytes = view.read(&tl_key).ok_or(TransactionResult::TecNoEntry)?;
+    let mut line: Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let stored = if account.as_bytes() < issuer.as_bytes() {
+        *new_holding
+    } else {
+        new_holding.negate()
+    };
+    line["Balance"]["value"] = Value::String(stored.to_iou().to_decimal_string());
+    let data = serde_json::to_vec(&line).map_err(|_| TransactionResult::TefInternal)?;
+    view.update(tl_key, data)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    Ok(())
 }
 
 /// Convert an Asset JSON value to (currency_bytes, issuer_bytes).
