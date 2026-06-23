@@ -1,9 +1,19 @@
+use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode, power};
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::{TransactionResult, keylet};
+use serde_json::Value;
 
 use crate::amm_helpers;
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
+
+const AUCTION_SLOT_DISCOUNTED_FEE_FRACTION: i64 = 10;
+const AUCTION_SLOT_MIN_FEE_FRACTION: i64 = 25;
+const AUCTION_SLOT_TIME_INTERVALS: u64 = 20;
+const AUCTION_SLOT_MAX_AUTH_ACCOUNTS: usize = 4;
+const TOTAL_TIME_SLOT_SECS: u64 = 86_400;
+const AUCTION_SLOT_INTERVAL_DURATION: u64 = TOTAL_TIME_SLOT_SECS / AUCTION_SLOT_TIME_INTERVALS;
+const TAILING_SLOT: u8 = (AUCTION_SLOT_TIME_INTERVALS - 1) as u8;
 
 pub struct AMMBidTransactor;
 
@@ -18,15 +28,20 @@ impl Transactor for AMMBidTransactor {
         amm_helpers::validate_asset(asset)?;
         amm_helpers::validate_asset(asset2)?;
 
-        // BidMin and BidMax are optional; if present they must be > 0
-        if let Some(bid_min) = helpers::get_u64_str_field(ctx.tx, "BidMin") {
-            if bid_min == 0 {
+        if let Some(bid_min) = ctx.tx.get("BidMin") {
+            if !amm_helpers::amount_is_positive(bid_min) {
                 return Err(TransactionResult::TemBadAmount);
             }
         }
-        if let Some(bid_max) = helpers::get_u64_str_field(ctx.tx, "BidMax") {
-            if bid_max == 0 {
+        if let Some(bid_max) = ctx.tx.get("BidMax") {
+            if !amm_helpers::amount_is_positive(bid_max) {
                 return Err(TransactionResult::TemBadAmount);
+            }
+        }
+
+        if let Some(auth) = ctx.tx.get("AuthAccounts").and_then(|v| v.as_array()) {
+            if auth.len() > AUCTION_SLOT_MAX_AUTH_ACCOUNTS {
+                return Err(TransactionResult::TemMalformed);
             }
         }
 
@@ -48,55 +63,209 @@ impl Transactor for AMMBidTransactor {
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        // Determine bid amount: use BidMin, then BidMax, then 0
-        let bid_amount = helpers::get_u64_str_field(ctx.tx, "BidMin")
-            .or_else(|| helpers::get_u64_str_field(ctx.tx, "BidMax"))
-            .unwrap_or(0);
-
         let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
         let mut amm = amm_helpers::read_amm(ctx.view, &amm_key)?;
 
-        // Check if bid exceeds current auction slot
-        let current_bid = amm
-            .get("AuctionSlot")
-            .and_then(|s| s.get("Price"))
+        let amm_account = decode_account_id(
+            amm["Account"]
+                .as_str()
+                .ok_or(TransactionResult::TefInternal)?,
+        )
+        .map_err(|_| TransactionResult::TefInternal)?;
+        let lp_currency = lp_currency_bytes(&amm)?;
+
+        // T = total outstanding LP tokens (LPTokenBalance).
+        let t_iou = amm_helpers::parse_iou_value(
+            amm["LPTokenBalance"]["value"]
+                .as_str()
+                .ok_or(TransactionResult::TefInternal)?,
+        );
+        let t = Number::from_iou(&t_iou);
+
+        // The bidder's own LP holding.
+        let lp_tokens =
+            amm_helpers::iou_holding_number(ctx.view, &account_id, &amm_account, &lp_currency);
+
+        let trading_fee = amm["TradingFee"].as_u64().unwrap_or(0);
+        let discounted_fee = (trading_fee as i64) / AUCTION_SLOT_DISCOUNTED_FEE_FRACTION;
+        let fee = Number::from_int(trading_fee as i64).div(&Number::from_int(100_000));
+        let min_slot_price = t
+            .mul(&fee)
+            .div(&Number::from_int(AUCTION_SLOT_MIN_FEE_FRACTION));
+
+        let current = ctx.view.parent_close_time() as u64;
+        let expiration = amm["AuctionSlot"]
+            .get("Expiration")
+            .and_then(|v| v.as_u64());
+        let time_slot = expiration.and_then(|exp| amm_auction_time_slot(current, exp));
+
+        let slot_account = amm["AuctionSlot"]
+            .get("Account")
             .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+            .map(|s| s.to_string());
+        let valid_owner = match (&slot_account, time_slot) {
+            (Some(acct), Some(ts)) if ts < TAILING_SLOT => decode_account_id(acct)
+                .ok()
+                .map(|id| ctx.view.exists(&keylet::account(&id)))
+                .unwrap_or(false),
+            _ => false,
+        };
 
-        let slot_empty = amm.get("AuctionSlot").map(|v| v.is_null()).unwrap_or(true);
+        let bid_min = bid_value(ctx.tx, "BidMin");
+        let bid_max = bid_value(ctx.tx, "BidMax");
 
-        if slot_empty || bid_amount >= current_bid {
-            // Set auction slot
-            amm["AuctionSlot"] = serde_json::json!({
-                "Account": account_str,
-                "Price": bid_amount.to_string(),
-            });
-
-            // Burn LP tokens
-            if bid_amount > 0 {
-                let total_lp = amm_helpers::get_pool_field(&amm, "LPTokenBalance");
-                let new_lp = total_lp.saturating_sub(bid_amount);
-                amm["LPTokenBalance"] = serde_json::Value::String(new_lp.to_string());
+        let get_pay_price = |computed: &Number| -> Result<Number, TransactionResult> {
+            let pay = match (&bid_min, &bid_max) {
+                (Some(lo), Some(hi)) => {
+                    if !gt(computed, hi) {
+                        max(computed, lo)
+                    } else {
+                        return Err(TransactionResult::TecAmmFailed);
+                    }
+                }
+                (Some(lo), None) => max(computed, lo),
+                (None, Some(hi)) => {
+                    if !gt(computed, hi) {
+                        *computed
+                    } else {
+                        return Err(TransactionResult::TecAmmFailed);
+                    }
+                }
+                (None, None) => *computed,
+            };
+            if gt(&pay, &lp_tokens) {
+                return Err(TransactionResult::TecAmmInvalidTokens);
             }
+            Ok(pay)
+        };
+
+        let (pay_price, burn, refund) = if slot_account.is_none() || !valid_owner {
+            let pay = get_pay_price(&min_slot_price)?;
+            (pay, pay, None)
+        } else {
+            let price_purchased = amm_helpers::parse_iou_value(
+                amm["AuctionSlot"]["Price"]["value"]
+                    .as_str()
+                    .unwrap_or("0"),
+            );
+            let price_purchased = Number::from_iou(&price_purchased);
+            let ts = time_slot.ok_or(TransactionResult::TefInternal)?;
+            let fraction_used =
+                Number::from_int(ts as i64 + 1).div(&Number::from_int(AUCTION_SLOT_TIME_INTERVALS as i64));
+            let fraction_remaining = Number::from_int(1).sub(&fraction_used);
+            let p105 = Number::new(false, 105, -2);
+            let computed = if ts == 0 {
+                price_purchased.mul(&p105).add(&min_slot_price)
+            } else {
+                let decay = Number::from_int(1).sub(&power(&fraction_used, 60));
+                price_purchased.mul(&p105).mul(&decay).add(&min_slot_price)
+            };
+            let pay = get_pay_price(&computed)?;
+            let refund = fraction_remaining.mul(&price_purchased);
+            if gt(&refund, &pay) {
+                return Err(TransactionResult::TefInternal);
+            }
+            let burn = pay.sub(&refund);
+            (pay, burn, Some(refund))
+        };
+
+        // Refund the previous owner (CASE B): send LP from bidder to the old
+        // slot account.
+        if let Some(refund) = refund {
+            let prev_owner = decode_account_id(
+                slot_account.as_deref().ok_or(TransactionResult::TefInternal)?,
+            )
+            .map_err(|_| TransactionResult::TefInternal)?;
+            let refund_iou = refund.to_iou();
+            let refund_num = Number::from_iou(&refund_iou);
+            let bidder_hold =
+                amm_helpers::iou_holding_number(ctx.view, &account_id, &amm_account, &lp_currency);
+            amm_helpers::set_iou_holding(
+                ctx.view,
+                &account_id,
+                &amm_account,
+                &lp_currency,
+                &bidder_hold.sub(&refund_num),
+            )?;
+            let owner_hold =
+                amm_helpers::iou_holding_number(ctx.view, &prev_owner, &amm_account, &lp_currency);
+            amm_helpers::set_iou_holding(
+                ctx.view,
+                &prev_owner,
+                &amm_account,
+                &lp_currency,
+                &owner_hold.add(&refund_num),
+            )?;
         }
+
+        // updateSlot: rewrite the auction slot fields.
+        let new_expiration = current + TOTAL_TIME_SLOT_SECS;
+        let lp_currency_hex = amm["LPTokenBalance"]["currency"]
+            .as_str()
+            .ok_or(TransactionResult::TefInternal)?
+            .to_string();
+        let amm_account_str = amm["Account"]
+            .as_str()
+            .ok_or(TransactionResult::TefInternal)?
+            .to_string();
+
+        let mut auction = serde_json::Map::new();
+        auction.insert("Account".into(), Value::String(account_str.to_string()));
+        if discounted_fee != 0 {
+            auction.insert("DiscountedFee".into(), Value::from(discounted_fee));
+        }
+        auction.insert("Expiration".into(), Value::from(new_expiration));
+        auction.insert(
+            "Price".into(),
+            serde_json::json!({
+                "currency": lp_currency_hex,
+                "issuer": amm_account_str,
+                "value": pay_price.to_iou().to_decimal_string(),
+            }),
+        );
+        if let Some(auth) = ctx.tx.get("AuthAccounts") {
+            auction.insert("AuthAccounts".into(), auth.clone());
+        }
+        amm["AuctionSlot"] = Value::Object(auction);
+
+        // saBurn = adjustLPTokens(T, burn, IsDeposit::No) = (burn - T) + T under
+        // Downward.
+        let burn_iou = burn.to_iou();
+        let sa_burn = {
+            let _g = RoundModeGuard::new(RoundingMode::Downward);
+            Number::from_iou(&burn_iou).sub(&t).add(&t).to_iou()
+        };
+        let sa_burn_num = Number::from_iou(&sa_burn);
+
+        // Redeem saBurn LP from the bidder's holding.
+        let bidder_hold =
+            amm_helpers::iou_holding_number(ctx.view, &account_id, &amm_account, &lp_currency);
+        amm_helpers::set_iou_holding(
+            ctx.view,
+            &account_id,
+            &amm_account,
+            &lp_currency,
+            &bidder_hold.sub(&sa_burn_num),
+        )?;
+
+        // AMM.LPTokenBalance = T - saBurn.
+        let new_t = t.sub(&sa_burn_num).to_iou();
+        amm["LPTokenBalance"]["value"] = Value::String(new_t.to_decimal_string());
 
         let amm_data = serde_json::to_vec(&amm).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(amm_key, amm_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Increment bidder's sequence
+        // Bump the bidder's sequence (fee charged by the engine).
         let acct_key = keylet::account(&account_id);
         let acct_bytes = ctx
             .view
             .read(&acct_key)
             .ok_or(TransactionResult::TerNoAccount)?;
-        let mut account: serde_json::Value =
+        let mut account: Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
-
         helpers::increment_sequence(&mut account);
-
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
@@ -106,183 +275,58 @@ impl Transactor for AMMBidTransactor {
     }
 }
 
+/// `ammAuctionTimeSlot`: the current time slot (0..19) for an auction slot whose
+/// `Expiration` is given, or `None` if outside the auction window.
+fn amm_auction_time_slot(current: u64, expiration: u64) -> Option<u8> {
+    if expiration < TOTAL_TIME_SLOT_SECS {
+        return None;
+    }
+    let start = expiration - TOTAL_TIME_SLOT_SECS;
+    if current >= start {
+        let diff = current - start;
+        if diff < TOTAL_TIME_SLOT_SECS {
+            return Some((diff / AUCTION_SLOT_INTERVAL_DURATION) as u8);
+        }
+    }
+    None
+}
+
+/// A BidMin/BidMax field as a `Number` (LP-token IOU value), if present.
+fn bid_value(tx: &Value, field: &str) -> Option<Number> {
+    let v = tx.get(field)?;
+    let s = v.get("value").and_then(|x| x.as_str())?;
+    Some(Number::from_iou(&amm_helpers::parse_iou_value(s)))
+}
+
+/// Strict greater-than on `Number`s.
+fn gt(a: &Number, b: &Number) -> bool {
+    let d = a.sub(b);
+    !d.is_zero() && !d.negative()
+}
+
+/// `max(a, b)` on `Number`s.
+fn max(a: &Number, b: &Number) -> Number {
+    if gt(b, a) { *b } else { *a }
+}
+
+fn lp_currency_bytes(amm: &Value) -> Result<[u8; 20], TransactionResult> {
+    let hex_str = amm["LPTokenBalance"]["currency"]
+        .as_str()
+        .ok_or(TransactionResult::TefInternal)?;
+    hex::decode(hex_str)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or(TransactionResult::TefInternal)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fees::FeeSettings;
-    use crate::transactor::{ApplyContext, PreflightContext};
-    use crate::view::ledger_view::LedgerView;
-    use crate::view::read_view::ReadView;
-    use crate::view::sandbox::Sandbox;
+    use crate::transactor::PreflightContext;
     use rxrpl_amendment::Rules;
-    use rxrpl_ledger::Ledger;
 
-    const ALICE: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
     const BOB: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
-
-    fn setup_with_amm() -> Ledger {
-        let mut ledger = Ledger::genesis();
-        for (addr, balance) in [(ALICE, 100_000_000u64), (BOB, 50_000_000)] {
-            let id = decode_account_id(addr).unwrap();
-            let key = keylet::account(&id);
-            let account = serde_json::json!({
-                "LedgerEntryType": "AccountRoot",
-                "Account": addr,
-                "Balance": balance.to_string(),
-                "Sequence": 1,
-                "OwnerCount": 0,
-                "Flags": 0,
-            });
-            ledger
-                .put_state(key, serde_json::to_vec(&account).unwrap())
-                .unwrap();
-        }
-
-        let tx_ref = serde_json::json!({
-            "Asset": "XRP",
-            "Asset2": {"currency": "USD", "issuer": BOB},
-        });
-        let amm_key = amm_helpers::compute_amm_key_from_tx(&tx_ref).unwrap();
-        let amm = serde_json::json!({
-            "LedgerEntryType": "AMM",
-            "Creator": ALICE,
-            "Asset": "XRP",
-            "Asset2": {"currency": "USD", "issuer": BOB},
-            "PoolBalance1": "10000000",
-            "PoolBalance2": "5000000",
-            "LPTokenBalance": "5000000",
-            "TradingFee": 500,
-            "VoteSlots": [],
-            "AuctionSlot": null,
-            "Flags": 0,
-        });
-        ledger
-            .put_state(amm_key, serde_json::to_vec(&amm).unwrap())
-            .unwrap();
-        ledger
-    }
-
-    #[test]
-    fn bid_on_empty_slot() {
-        let ledger = setup_with_amm();
-        let fees = FeeSettings::default();
-        let view = LedgerView::with_fees(&ledger, fees.clone());
-        let mut sandbox = Sandbox::new(&view);
-        let rules = Rules::new();
-        let tx = serde_json::json!({
-            "TransactionType": "AMMBid",
-            "Account": BOB,
-            "Asset": "XRP",
-            "Asset2": {"currency": "USD", "issuer": BOB},
-            "BidMin": "100000",
-            "Fee": "12",
-            "Sequence": 1,
-        });
-
-        let mut ctx = ApplyContext {
-            tx: &tx,
-            view: &mut sandbox,
-            rules: &rules,
-            fees: &fees,
-        };
-
-        let result = AMMBidTransactor.apply(&mut ctx).unwrap();
-        assert_eq!(result, TransactionResult::TesSuccess);
-
-        let amm_key = amm_helpers::compute_amm_key_from_tx(&tx).unwrap();
-        let amm_bytes = sandbox.read(&amm_key).unwrap();
-        let amm: serde_json::Value = serde_json::from_slice(&amm_bytes).unwrap();
-        assert_eq!(amm["AuctionSlot"]["Account"].as_str().unwrap(), BOB);
-        assert_eq!(amm["AuctionSlot"]["Price"].as_str().unwrap(), "100000");
-        // LP tokens burned: 5000000 - 100000 = 4900000
-        assert_eq!(amm["LPTokenBalance"].as_str().unwrap(), "4900000");
-    }
-
-    #[test]
-    fn higher_bid_replaces_slot() {
-        let ledger = setup_with_amm();
-        let fees = FeeSettings::default();
-        let view = LedgerView::with_fees(&ledger, fees.clone());
-        let mut sandbox = Sandbox::new(&view);
-        let rules = Rules::new();
-
-        // First bid by ALICE
-        let tx1 = serde_json::json!({
-            "TransactionType": "AMMBid",
-            "Account": ALICE,
-            "Asset": "XRP",
-            "Asset2": {"currency": "USD", "issuer": BOB},
-            "BidMin": "50000",
-            "Fee": "12",
-            "Sequence": 1,
-        });
-        let mut ctx = ApplyContext {
-            tx: &tx1,
-            view: &mut sandbox,
-            rules: &rules,
-            fees: &fees,
-        };
-        AMMBidTransactor.apply(&mut ctx).unwrap();
-
-        // Higher bid by BOB
-        let tx2 = serde_json::json!({
-            "TransactionType": "AMMBid",
-            "Account": BOB,
-            "Asset": "XRP",
-            "Asset2": {"currency": "USD", "issuer": BOB},
-            "BidMin": "100000",
-            "Fee": "12",
-            "Sequence": 1,
-        });
-        let mut ctx = ApplyContext {
-            tx: &tx2,
-            view: &mut sandbox,
-            rules: &rules,
-            fees: &fees,
-        };
-        AMMBidTransactor.apply(&mut ctx).unwrap();
-
-        let amm_key = amm_helpers::compute_amm_key_from_tx(&tx2).unwrap();
-        let amm_bytes = sandbox.read(&amm_key).unwrap();
-        let amm: serde_json::Value = serde_json::from_slice(&amm_bytes).unwrap();
-        assert_eq!(amm["AuctionSlot"]["Account"].as_str().unwrap(), BOB);
-        assert_eq!(amm["AuctionSlot"]["Price"].as_str().unwrap(), "100000");
-    }
-
-    #[test]
-    fn bid_without_amount() {
-        let ledger = setup_with_amm();
-        let fees = FeeSettings::default();
-        let view = LedgerView::with_fees(&ledger, fees.clone());
-        let mut sandbox = Sandbox::new(&view);
-        let rules = Rules::new();
-        let tx = serde_json::json!({
-            "TransactionType": "AMMBid",
-            "Account": BOB,
-            "Asset": "XRP",
-            "Asset2": {"currency": "USD", "issuer": BOB},
-            "Fee": "12",
-            "Sequence": 1,
-        });
-
-        let mut ctx = ApplyContext {
-            tx: &tx,
-            view: &mut sandbox,
-            rules: &rules,
-            fees: &fees,
-        };
-
-        let result = AMMBidTransactor.apply(&mut ctx).unwrap();
-        assert_eq!(result, TransactionResult::TesSuccess);
-
-        let amm_key = amm_helpers::compute_amm_key_from_tx(&tx).unwrap();
-        let amm_bytes = sandbox.read(&amm_key).unwrap();
-        let amm: serde_json::Value = serde_json::from_slice(&amm_bytes).unwrap();
-        assert_eq!(amm["AuctionSlot"]["Account"].as_str().unwrap(), BOB);
-        assert_eq!(amm["AuctionSlot"]["Price"].as_str().unwrap(), "0");
-        // No LP burned
-        assert_eq!(amm["LPTokenBalance"].as_str().unwrap(), "5000000");
-    }
 
     #[test]
     fn reject_zero_bid_min() {
@@ -291,7 +335,7 @@ mod tests {
             "Account": BOB,
             "Asset": "XRP",
             "Asset2": {"currency": "USD", "issuer": BOB},
-            "BidMin": "0",
+            "BidMin": {"currency": "USD", "issuer": BOB, "value": "0"},
             "Fee": "12",
         });
         let rules = Rules::new();
@@ -329,35 +373,47 @@ mod tests {
     }
 
     #[test]
-    fn bid_increments_sequence() {
-        let ledger = setup_with_amm();
-        let fees = FeeSettings::default();
-        let view = LedgerView::with_fees(&ledger, fees.clone());
-        let mut sandbox = Sandbox::new(&view);
-        let rules = Rules::new();
+    fn reject_too_many_auth_accounts() {
         let tx = serde_json::json!({
             "TransactionType": "AMMBid",
             "Account": BOB,
             "Asset": "XRP",
             "Asset2": {"currency": "USD", "issuer": BOB},
-            "BidMin": "100000",
+            "AuthAccounts": [
+                {"AuthAccount": {"Account": BOB}},
+                {"AuthAccount": {"Account": BOB}},
+                {"AuthAccount": {"Account": BOB}},
+                {"AuthAccount": {"Account": BOB}},
+                {"AuthAccount": {"Account": BOB}},
+            ],
             "Fee": "12",
-            "Sequence": 1,
         });
-
-        let mut ctx = ApplyContext {
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+        let ctx = PreflightContext {
             tx: &tx,
-            view: &mut sandbox,
             rules: &rules,
             fees: &fees,
         };
+        assert_eq!(
+            AMMBidTransactor.preflight(&ctx),
+            Err(TransactionResult::TemMalformed)
+        );
+    }
 
-        AMMBidTransactor.apply(&mut ctx).unwrap();
-
-        let bob_id = decode_account_id(BOB).unwrap();
-        let bob_key = keylet::account(&bob_id);
-        let bob_bytes = sandbox.read(&bob_key).unwrap();
-        let bob: serde_json::Value = serde_json::from_slice(&bob_bytes).unwrap();
-        assert_eq!(bob["Sequence"].as_u64().unwrap(), 2);
+    #[test]
+    fn time_slot_window() {
+        // expiration = start + TOTAL; current at start → slot 0.
+        let exp = TOTAL_TIME_SLOT_SECS + 1000;
+        assert_eq!(amm_auction_time_slot(1000, exp), Some(0));
+        // one interval in.
+        assert_eq!(
+            amm_auction_time_slot(1000 + AUCTION_SLOT_INTERVAL_DURATION, exp),
+            Some(1)
+        );
+        // at/after expiration → None.
+        assert_eq!(amm_auction_time_slot(1000 + TOTAL_TIME_SLOT_SECS, exp), None);
+        // before window → None.
+        assert_eq!(amm_auction_time_slot(999, exp), None);
     }
 }

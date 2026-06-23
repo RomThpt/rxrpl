@@ -576,6 +576,23 @@ impl PartialEq for Number {
 }
 impl Eq for Number {}
 
+/// `f^n` by square-and-multiply (`log2(n)` multiplications), matching rippled
+/// `power(Number f, unsigned n)`.
+pub fn power(f: &Number, n: u32) -> Number {
+    if n == 0 {
+        return Number::one();
+    }
+    if n == 1 {
+        return *f;
+    }
+    let mut r = power(f, n / 2);
+    r = r.mul(&r);
+    if n % 2 != 0 {
+        r = r.mul(f);
+    }
+    r
+}
+
 /// Square root via Newton-Raphson with a quadratic seed, matching rippled `root2`.
 pub fn root2(mut f: Number) -> Number {
     let one = Number::one();
