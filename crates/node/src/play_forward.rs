@@ -566,6 +566,77 @@ mod tests {
             }
         }
 
+        // AMMVote recomputes the trading fee as the LP-weighted average over
+        // every account already in the AMM's VoteSlots: applyVote calls
+        // ammLPHolds(entryAccount) for each one, reading that account's LP-token
+        // trust line. Those lines are read-only, so they are absent from the tx
+        // AffectedNodes and would not be seeded — every existing voter would then
+        // read 0 LP and be wrongly evicted. Seed each voter's (and the auction
+        // slot account's) LP trust line from the parent ledger so the average and
+        // eviction match the chain.
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("AMMVote") {
+            if let (Some(a1), Some(a2)) = (tx_json.get("Asset"), tx_json.get("Asset2")) {
+                if let Ok(amm_key) = rxrpl_tx_engine::amm_helpers::compute_amm_key(a1, a2) {
+                    let amm_idx = amm_key.to_string().to_uppercase();
+                    let r = rpc(serde_json::json!({
+                        "method":"ledger_entry","params":[{"index":amm_idx,"ledger_index":parent}]
+                    }));
+                    let amm = &r["result"]["node"];
+                    if let (Some(amm_acct), Some(lp_cur)) = (
+                        amm.get("Account").and_then(|v| v.as_str()),
+                        amm.get("LPTokenBalance")
+                            .and_then(|b| b.get("currency"))
+                            .and_then(|v| v.as_str()),
+                    ) {
+                        if let (Ok(amm_id), Ok(cur_bytes)) = (
+                            decode_account_id(amm_acct),
+                            hex::decode(lp_cur).map_err(|_| ()).and_then(|b| {
+                                <[u8; 20]>::try_from(b.as_slice()).map_err(|_| ())
+                            }),
+                        ) {
+                            let mut voters: Vec<String> = amm
+                                .get("VoteSlots")
+                                .and_then(|v| v.as_array())
+                                .map(|slots| {
+                                    slots
+                                        .iter()
+                                        .filter_map(|s| {
+                                            s.get("VoteEntry")
+                                                .unwrap_or(s)
+                                                .get("Account")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string())
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if let Some(a) = amm
+                                .get("AuctionSlot")
+                                .and_then(|au| au.get("Account"))
+                                .and_then(|v| v.as_str())
+                            {
+                                voters.push(a.to_string());
+                            }
+                            // applyVote also reads the voter's own LP line
+                            // (lpTokensNew) before it has a vote slot; seed it too.
+                            if let Some(a) = tx_json.get("Account").and_then(|v| v.as_str()) {
+                                voters.push(a.to_string());
+                            }
+                            for voter in voters {
+                                if let Ok(vid) = decode_account_id(&voter) {
+                                    read_keys.insert(
+                                        keylet::trust_line(&vid, &amm_id, &cur_bytes)
+                                            .to_string()
+                                            .to_uppercase(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Seed a partial state map from the parent ledger.
         let mut state = rxrpl_shamap::SHAMap::account_state();
         for key in &read_keys {

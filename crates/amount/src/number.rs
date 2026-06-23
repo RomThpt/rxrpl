@@ -464,6 +464,39 @@ impl Number {
         IOUAmount::from_parts(m as u64, e, self.negative).unwrap_or(IOUAmount::ZERO)
     }
 
+    /// Convert to an `i64` matching rippled's `Number::operator rep()`:
+    /// round to nearest, ties to even, using the active rounding mode for the
+    /// dropped fractional digits.
+    pub fn to_i64(&self) -> i64 {
+        if self.is_zero() {
+            return 0;
+        }
+        let mut drops = self.mantissa as i128;
+        let mut offset = self.exponent;
+        let mut g = Guard::default();
+        if self.negative {
+            g.set_negative();
+            drops = -drops;
+        }
+        while offset < 0 {
+            g.do_push((drops % 10).unsigned_abs() as u32);
+            drops /= 10;
+            offset += 1;
+        }
+        while offset > 0 {
+            drops = drops.saturating_mul(10);
+            offset -= 1;
+        }
+        let r = g.round();
+        if r == 1 || (r == 0 && (drops & 1) == 1) {
+            drops += 1;
+        }
+        if self.negative {
+            drops = -drops;
+        }
+        drops.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    }
+
     /// Convert to integer XRP drops, truncating toward zero (floor for the
     /// non-negative values AMM payouts produce under downward rounding).
     pub fn to_xrp_drops(&self) -> u64 {
