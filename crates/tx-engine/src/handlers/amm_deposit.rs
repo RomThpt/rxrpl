@@ -1,8 +1,10 @@
-use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_codec::address::classic::{decode_account_id, encode_account_id};
+use rxrpl_primitives::AccountId;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::amm_helpers;
 use crate::helpers;
+use crate::owner_dir::add_to_owner_dir;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct AMMDepositTransactor;
@@ -575,27 +577,119 @@ fn credit_lp_line(
         .and_then(|b| b.try_into().ok())
         .ok_or(TransactionResult::TefInternal)?;
     let tl_key = keylet::trust_line(holder, amm_account, &cur_bytes);
-    let bytes = ctx
-        .view
-        .read(&tl_key)
-        .ok_or(TransactionResult::TecNoEntry)?;
-    let mut line: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
-
     let holder_is_low = holder.as_bytes() < amm_account.as_bytes();
-    let cur_str = line["Balance"]["value"].as_str().unwrap_or("0");
-    let cur_num = parse_signed_iou(cur_str);
     let tokens_num = Number::from_iou(tokens);
-    let new_num = if holder_is_low {
-        cur_num.add(&tokens_num)
+
+    if let Some(bytes) = ctx.view.read(&tl_key) {
+        let mut line: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let cur_num = parse_signed_iou(line["Balance"]["value"].as_str().unwrap_or("0"));
+        let new_num = if holder_is_low {
+            cur_num.add(&tokens_num)
+        } else {
+            cur_num.sub(&tokens_num)
+        };
+        line["Balance"]["value"] = serde_json::Value::String(new_num.to_iou().to_decimal_string());
+        let data = serde_json::to_vec(&line).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(tl_key, data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+        return Ok(());
+    }
+
+    create_lp_line(ctx, holder, amm_account, lp_currency_hex, &tokens_num, holder_is_low, tl_key)
+}
+
+/// Create the depositor's LPToken trust line (`RippleState`) on a first deposit
+/// to an AMM. Mirrors rippled's `trustCreate` via `accountSend`: the line is
+/// linked into both owner directories, carries Reserve + NoRipple on the
+/// holder's side, and bumps only the holder's `OwnerCount` (the AMM, as issuer,
+/// takes no reserve).
+#[allow(clippy::too_many_arguments)]
+fn create_lp_line(
+    ctx: &mut ApplyContext<'_>,
+    holder: &AccountId,
+    amm_account: &AccountId,
+    lp_currency_hex: &str,
+    tokens_num: &rxrpl_amount::number::Number,
+    holder_is_low: bool,
+    tl_key: rxrpl_primitives::Hash256,
+) -> Result<(), TransactionResult> {
+    const LSF_LOW_RESERVE: u32 = 0x0001_0000;
+    const LSF_HIGH_RESERVE: u32 = 0x0002_0000;
+    const LSF_LOW_NO_RIPPLE: u32 = 0x0010_0000;
+    const LSF_HIGH_NO_RIPPLE: u32 = 0x0020_0000;
+
+    let balance = if holder_is_low {
+        *tokens_num
     } else {
-        cur_num.sub(&tokens_num)
+        tokens_num.negate()
     };
-    line["Balance"]["value"] = serde_json::Value::String(new_num.to_iou().to_decimal_string());
-    let data = serde_json::to_vec(&line).map_err(|_| TransactionResult::TefInternal)?;
+    let holder_limit = serde_json::json!({
+        "currency": lp_currency_hex,
+        "issuer": encode_account_id(holder),
+        "value": "0",
+    });
+    let amm_limit = serde_json::json!({
+        "currency": lp_currency_hex,
+        "issuer": encode_account_id(amm_account),
+        "value": "0",
+    });
+    let (low_limit, high_limit) = if holder_is_low {
+        (holder_limit, amm_limit)
+    } else {
+        (amm_limit, holder_limit)
+    };
+
+    let holder_page = add_to_owner_dir(ctx.view, holder, &tl_key)?;
+    let amm_page = add_to_owner_dir(ctx.view, amm_account, &tl_key)?;
+    let (low_node, high_node) = if holder_is_low {
+        (holder_page, amm_page)
+    } else {
+        (amm_page, holder_page)
+    };
+
+    let flags = if holder_is_low {
+        LSF_LOW_RESERVE | LSF_LOW_NO_RIPPLE
+    } else {
+        LSF_HIGH_RESERVE | LSF_HIGH_NO_RIPPLE
+    };
+
+    let mut account_one = [0u8; 20];
+    account_one[19] = 1;
+    let no_account = encode_account_id(&AccountId::from(account_one));
+    let mut tl_obj = serde_json::json!({
+        "LedgerEntryType": "RippleState",
+        "Balance": { "currency": lp_currency_hex, "issuer": no_account, "value": balance.to_iou().to_decimal_string() },
+        "LowLimit": low_limit,
+        "HighLimit": high_limit,
+        "Flags": flags,
+        "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+        "PreviousTxnLgrSeq": 0,
+    });
+    // LowNode/HighNode are soeDEFAULT(0): rippled omits them when the line lands
+    // on page 0 of an owner directory.
+    if low_node != 0 {
+        tl_obj["LowNode"] = serde_json::Value::String(format!("{low_node:016X}"));
+    }
+    if high_node != 0 {
+        tl_obj["HighNode"] = serde_json::Value::String(format!("{high_node:016X}"));
+    }
+    let bytes = serde_json::to_vec(&tl_obj).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view
-        .update(tl_key, data)
+        .insert(tl_key, bytes)
         .map_err(|_| TransactionResult::TefInternal)?;
+
+    let holder_key = keylet::account(holder);
+    if let Some(b) = ctx.view.read(&holder_key) {
+        let mut acct: serde_json::Value =
+            serde_json::from_slice(&b).map_err(|_| TransactionResult::TefInternal)?;
+        helpers::adjust_owner_count(&mut acct, 1);
+        let data = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(holder_key, data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+    }
     Ok(())
 }
 
