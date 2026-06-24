@@ -512,12 +512,8 @@ impl AMMWithdrawTransactor {
             amm_helpers::adjust_lp_tokens_withdraw(&ctx_amm.total_lp, &raw)
         };
 
-        let asset_out = amm_helpers::amm_asset_out_single_iou(
-            &pool,
-            &ctx_amm.total_lp,
-            &tokens,
-            ctx_amm.tfee,
-        );
+        let asset_out =
+            amm_helpers::amm_asset_out_single_iou(&pool, &ctx_amm.total_lp, &tokens, ctx_amm.tfee);
         // singleWithdraw applies min(amount, assetOut); withdraw_all takes the
         // full re-derived payout.
         let payout = if withdraw_all {
@@ -612,8 +608,22 @@ impl AMMWithdrawTransactor {
 
         let mut xrp_out = 0u64;
         self.burn_and_update_amm(ctx, amm_key, amm, &ctx_amm, &tokens)?;
-        leg1.pay_out(ctx, holder, &ctx_amm.account, &pool1, &payout1, &mut xrp_out)?;
-        leg2.pay_out(ctx, holder, &ctx_amm.account, &pool2, &payout2, &mut xrp_out)?;
+        leg1.pay_out(
+            ctx,
+            holder,
+            &ctx_amm.account,
+            &pool1,
+            &payout1,
+            &mut xrp_out,
+        )?;
+        leg2.pay_out(
+            ctx,
+            holder,
+            &ctx_amm.account,
+            &pool2,
+            &payout2,
+            &mut xrp_out,
+        )?;
         self.finish_withdraw(ctx, holder, &ctx_amm, &tokens, xrp_out)?;
         Ok(TransactionResult::TesSuccess)
     }
@@ -679,8 +689,7 @@ impl AMMWithdrawTransactor {
         let new_total = Number::from_iou(&ctx_amm.total_lp)
             .sub(&Number::from_iou(tokens))
             .to_iou();
-        amm["LPTokenBalance"]["value"] =
-            serde_json::Value::String(new_total.to_decimal_string());
+        amm["LPTokenBalance"]["value"] = serde_json::Value::String(new_total.to_decimal_string());
         let amm_data = serde_json::to_vec(&*amm).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(*amm_key, amm_data)
@@ -702,14 +711,22 @@ impl AMMWithdrawTransactor {
 
         let remaining = {
             let bal = holder_lp_balance(ctx, holder, ctx_amm)?;
-            Number::from_iou(&bal).sub(&Number::from_iou(tokens)).to_iou()
+            Number::from_iou(&bal)
+                .sub(&Number::from_iou(tokens))
+                .to_iou()
         };
         let drained = remaining.is_zero();
 
         if drained {
             delete_lp_line(ctx, holder, &ctx_amm.account, &ctx_amm.lp_currency_hex)?;
         } else {
-            debit_lp_line(ctx, holder, &ctx_amm.account, &ctx_amm.lp_currency_hex, tokens)?;
+            debit_lp_line(
+                ctx,
+                holder,
+                &ctx_amm.account,
+                &ctx_amm.lp_currency_hex,
+                tokens,
+            )?;
         }
 
         let acct_key = keylet::account(holder);
@@ -763,7 +780,10 @@ impl AmmContext {
         Ok(AmmContext {
             account,
             asset1: amm.get("Asset").cloned().unwrap_or(serde_json::Value::Null),
-            asset2: amm.get("Asset2").cloned().unwrap_or(serde_json::Value::Null),
+            asset2: amm
+                .get("Asset2")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
             tfee,
             lp_currency_hex,
             total_lp,
@@ -943,7 +963,10 @@ fn holder_lp_balance(
         .and_then(|b| b.try_into().ok())
         .ok_or(TransactionResult::TefInternal)?;
     let tl_key = keylet::trust_line(holder, &ctx_amm.account, &cur_bytes);
-    let bytes = ctx.view.read(&tl_key).ok_or(TransactionResult::TecNoEntry)?;
+    let bytes = ctx
+        .view
+        .read(&tl_key)
+        .ok_or(TransactionResult::TecNoEntry)?;
     let line: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
     Ok(amm_helpers::parse_iou_value(
@@ -981,7 +1004,10 @@ fn delete_lp_line(
         .and_then(|b| b.try_into().ok())
         .ok_or(TransactionResult::TefInternal)?;
     let tl_key = keylet::trust_line(holder, amm_account, &cur_bytes);
-    let line_bytes = ctx.view.read(&tl_key).ok_or(TransactionResult::TecNoEntry)?;
+    let line_bytes = ctx
+        .view
+        .read(&tl_key)
+        .ok_or(TransactionResult::TecNoEntry)?;
     let line: serde_json::Value =
         serde_json::from_slice(&line_bytes).map_err(|_| TransactionResult::TefInternal)?;
     let node_of = |field: &str| -> u64 {
@@ -992,12 +1018,11 @@ fn delete_lp_line(
     };
     let low_node = node_of("LowNode");
     let high_node = node_of("HighNode");
-    let (low_acct, low_page, high_acct, high_page) =
-        if holder.as_bytes() < amm_account.as_bytes() {
-            (holder, low_node, amm_account, high_node)
-        } else {
-            (amm_account, low_node, holder, high_node)
-        };
+    let (low_acct, low_page, high_acct, high_page) = if holder.as_bytes() < amm_account.as_bytes() {
+        (holder, low_node, amm_account, high_node)
+    } else {
+        (amm_account, low_node, holder, high_node)
+    };
     crate::owner_dir::remove_from_owner_dir_page(ctx.view, low_acct, low_page, &tl_key)?;
     crate::owner_dir::remove_from_owner_dir_page(ctx.view, high_acct, high_page, &tl_key)?;
     ctx.view
@@ -1194,5 +1219,4 @@ mod tests {
             Err(TransactionResult::TemBadAmount)
         );
     }
-
 }

@@ -26,7 +26,9 @@ impl Transactor for AMMDepositTransactor {
         let amount = ctx.tx.get("Amount");
         let amount2 = ctx.tx.get("Amount2");
         let pos1 = amount.map(amm_helpers::amount_is_positive).unwrap_or(false);
-        let pos2 = amount2.map(amm_helpers::amount_is_positive).unwrap_or(false);
+        let pos2 = amount2
+            .map(amm_helpers::amount_is_positive)
+            .unwrap_or(false);
         if amount.is_some() && !pos1 {
             return Err(TransactionResult::TemBadAmount);
         }
@@ -62,8 +64,12 @@ impl Transactor for AMMDepositTransactor {
         let deposit2 = amount2_field
             .and_then(amm_helpers::amount_value_drops_or_iou)
             .unwrap_or(0);
-        let pos1 = amount_field.map(amm_helpers::amount_is_positive).unwrap_or(false);
-        let pos2 = amount2_field.map(amm_helpers::amount_is_positive).unwrap_or(false);
+        let pos1 = amount_field
+            .map(amm_helpers::amount_is_positive)
+            .unwrap_or(false);
+        let pos2 = amount2_field
+            .map(amm_helpers::amount_is_positive)
+            .unwrap_or(false);
         if !pos1 && !pos2 {
             return Err(TransactionResult::TemBadAmount);
         }
@@ -85,7 +91,13 @@ impl Transactor for AMMDepositTransactor {
         // the AMM's trust line.
         if let Some(amount) = amount_field {
             if amount.is_object() && amount2_field.is_none() {
-                return self.single_iou_deposit(ctx, &account_id, &amm_key, &mut amm, amount.clone());
+                return self.single_iou_deposit(
+                    ctx,
+                    &account_id,
+                    &amm_key,
+                    &mut amm,
+                    amount.clone(),
+                );
             }
         }
 
@@ -384,8 +396,9 @@ impl AMMDepositTransactor {
             let d = a.sub(b);
             !d.negative() && !d.is_zero()
         };
-        let frac_by_tokens =
-            |tokens: &rxrpl_amount::IOUAmount| Number::from_iou(tokens).div(&Number::from_iou(&total_lp));
+        let frac_by_tokens = |tokens: &rxrpl_amount::IOUAmount| {
+            Number::from_iou(tokens).div(&Number::from_iou(&total_lp))
+        };
 
         // asset1 in full, asset2 proportional.
         let frac = amount1.div(&pool1);
@@ -416,8 +429,24 @@ impl AMMDepositTransactor {
 
         // Move each leg into the pool; accumulate the XRP leg to deduct once.
         let mut xrp_deposit = 0u64;
-        apply_leg(ctx, depositor, &amm_account, &leg1, &pool1, &dep1, &mut xrp_deposit)?;
-        apply_leg(ctx, depositor, &amm_account, &leg2, &pool2, &dep2, &mut xrp_deposit)?;
+        apply_leg(
+            ctx,
+            depositor,
+            &amm_account,
+            &leg1,
+            &pool1,
+            &dep1,
+            &mut xrp_deposit,
+        )?;
+        apply_leg(
+            ctx,
+            depositor,
+            &amm_account,
+            &leg2,
+            &pool2,
+            &dep2,
+            &mut xrp_deposit,
+        )?;
 
         // Credit the depositor's LPToken trust line.
         credit_lp_line(ctx, depositor, &amm_account, &lp_currency_hex, &tokens)?;
@@ -554,7 +583,13 @@ fn apply_leg(
         }
         DepositLeg::Iou { issuer, currency } => {
             let dep_hold = amm_helpers::iou_holding_number(ctx.view, depositor, issuer, currency);
-            amm_helpers::set_iou_holding(ctx.view, depositor, issuer, currency, &dep_hold.sub(dep))?;
+            amm_helpers::set_iou_holding(
+                ctx.view,
+                depositor,
+                issuer,
+                currency,
+                &dep_hold.sub(dep),
+            )?;
             amm_helpers::set_iou_holding(ctx.view, amm_account, issuer, currency, &pool.add(dep))?;
         }
     }
@@ -597,7 +632,15 @@ fn credit_lp_line(
         return Ok(());
     }
 
-    create_lp_line(ctx, holder, amm_account, lp_currency_hex, &tokens_num, holder_is_low, tl_key)
+    create_lp_line(
+        ctx,
+        holder,
+        amm_account,
+        lp_currency_hex,
+        &tokens_num,
+        holder_is_low,
+        tl_key,
+    )
 }
 
 /// Create the depositor's LPToken trust line (`RippleState`) on a first deposit

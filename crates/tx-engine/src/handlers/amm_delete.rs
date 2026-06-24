@@ -31,7 +31,8 @@ impl Transactor for AMMDeleteTransactor {
         helpers::read_account_by_address(ctx.view, account_str)?;
 
         let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
-        let amm = amm_helpers::read_amm(ctx.view, &amm_key).map_err(|_| TransactionResult::TerNoAmm)?;
+        let amm =
+            amm_helpers::read_amm(ctx.view, &amm_key).map_err(|_| TransactionResult::TerNoAmm)?;
 
         if !lp_token_balance_is_zero(&amm) {
             return Err(TransactionResult::TecAmmNotEmpty);
@@ -96,7 +97,8 @@ pub(crate) fn delete_amm_account(
         let Some(bytes) = ctx.view.read(&entry_key) else {
             continue;
         };
-        let sle: Value = serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TecInternalError)?;
+        let sle: Value =
+            serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TecInternalError)?;
         match sle.get("LedgerEntryType").and_then(|v| v.as_str()) {
             Some("RippleState") => {
                 delete_amm_trust_line(ctx, &entry_key, &sle, amm_account)?;
@@ -141,7 +143,8 @@ fn delete_amm_trust_line(
         .as_str()
         .ok_or(TransactionResult::TecInternalError)?;
     let low_id = decode_account_id(low_issuer).map_err(|_| TransactionResult::TecInternalError)?;
-    let high_id = decode_account_id(high_issuer).map_err(|_| TransactionResult::TecInternalError)?;
+    let high_id =
+        decode_account_id(high_issuer).map_err(|_| TransactionResult::TecInternalError)?;
     let (low, high) = if low_id.as_bytes() <= high_id.as_bytes() {
         (low_id, high_id)
     } else {
@@ -193,8 +196,12 @@ fn adjust_owner_count(
     delta: i32,
 ) -> Result<(), TransactionResult> {
     let key = keylet::account(account);
-    let bytes = ctx.view.read(&key).ok_or(TransactionResult::TecInternalError)?;
-    let mut acct: Value = serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TecInternalError)?;
+    let bytes = ctx
+        .view
+        .read(&key)
+        .ok_or(TransactionResult::TecInternalError)?;
+    let mut acct: Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TecInternalError)?;
     helpers::adjust_owner_count(&mut acct, delta);
     let data = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TecInternalError)?;
     ctx.view
@@ -208,7 +215,8 @@ fn bump_submitter_sequence(
 ) -> Result<(), TransactionResult> {
     let key = keylet::account(submitter);
     let bytes = ctx.view.read(&key).ok_or(TransactionResult::TerNoAccount)?;
-    let mut acct: Value = serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let mut acct: Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
     helpers::increment_sequence(&mut acct);
     let data = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view

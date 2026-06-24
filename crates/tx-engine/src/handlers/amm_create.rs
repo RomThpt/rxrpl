@@ -145,7 +145,10 @@ impl Transactor for AMMCreateTransactor {
             "PreviousTxnLgrSeq": 0,
         });
         ctx.view
-            .insert(amm_acct_key, serde_json::to_vec(&amm_acct).map_err(|_| TransactionResult::TefInternal)?)
+            .insert(
+                amm_acct_key,
+                serde_json::to_vec(&amm_acct).map_err(|_| TransactionResult::TefInternal)?,
+            )
             .map_err(|_| TransactionResult::TefInternal)?;
 
         // 2. Build the AMM entry, linked into the AMM account's owner directory.
@@ -198,7 +201,10 @@ impl Transactor for AMMCreateTransactor {
             amm["OwnerNode"] = serde_json::Value::String(format!("{amm_owner_node:016X}"));
         }
         ctx.view
-            .insert(amm_key, serde_json::to_vec(&amm).map_err(|_| TransactionResult::TefInternal)?)
+            .insert(
+                amm_key,
+                serde_json::to_vec(&amm).map_err(|_| TransactionResult::TefInternal)?,
+            )
             .map_err(|_| TransactionResult::TefInternal)?;
 
         // 3. Mint LP tokens to the creator: create the LP RippleState line.
@@ -215,8 +221,22 @@ impl Transactor for AMMCreateTransactor {
         // 4. Send each asset leg from the creator into the AMM pool.
         let mut xrp_legs: u64 = 0;
         let mut amm_owner_inc: i32 = 0;
-        send_leg(ctx, &creator, &amm_id, &amount_field, &mut xrp_legs, &mut amm_owner_inc)?;
-        send_leg(ctx, &creator, &amm_id, &amount2_field, &mut xrp_legs, &mut amm_owner_inc)?;
+        send_leg(
+            ctx,
+            &creator,
+            &amm_id,
+            &amount_field,
+            &mut xrp_legs,
+            &mut amm_owner_inc,
+        )?;
+        send_leg(
+            ctx,
+            &creator,
+            &amm_id,
+            &amount2_field,
+            &mut xrp_legs,
+            &mut amm_owner_inc,
+        )?;
 
         // Apply the accumulated XRP balance + owner count to the AMM account.
         if xrp_legs != 0 || amm_owner_inc != 0 {
@@ -231,7 +251,10 @@ impl Transactor for AMMCreateTransactor {
                 helpers::adjust_owner_count(&mut acct, amm_owner_inc);
             }
             ctx.view
-                .update(amm_acct_key, serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?)
+                .update(
+                    amm_acct_key,
+                    serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?,
+                )
                 .map_err(|_| TransactionResult::TefInternal)?;
         }
 
@@ -249,7 +272,10 @@ impl Transactor for AMMCreateTransactor {
         helpers::set_balance(&mut account, balance.saturating_sub(xrp_legs));
         helpers::increment_sequence(&mut account);
         ctx.view
-            .update(acct_key, serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?)
+            .update(
+                acct_key,
+                serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?,
+            )
             .map_err(|_| TransactionResult::TefInternal)?;
 
         Ok(TransactionResult::TesSuccess)
@@ -290,7 +316,13 @@ fn send_leg(
 
     // Debit the creator's existing IOU holding.
     let creator_hold = amm_helpers::iou_holding_number(ctx.view, creator, &issuer, &currency);
-    amm_helpers::set_iou_holding(ctx.view, creator, &issuer, &currency, &creator_hold.sub(&deposit))?;
+    amm_helpers::set_iou_holding(
+        ctx.view,
+        creator,
+        &issuer,
+        &currency,
+        &creator_hold.sub(&deposit),
+    )?;
 
     // Create the AMM↔issuer pool line holding +deposit on the AMM side.
     create_iou_line(
@@ -405,7 +437,10 @@ fn create_iou_line(
         tl_obj["HighNode"] = serde_json::Value::String(format!("{high_node:016X}"));
     }
     ctx.view
-        .insert(tl_key, serde_json::to_vec(&tl_obj).map_err(|_| TransactionResult::TefInternal)?)
+        .insert(
+            tl_key,
+            serde_json::to_vec(&tl_obj).map_err(|_| TransactionResult::TefInternal)?,
+        )
         .map_err(|_| TransactionResult::TefInternal)?;
 
     // Only the LP line bumps the holder's (creator's) owner count here; the AMM
@@ -418,7 +453,10 @@ fn create_iou_line(
                 serde_json::from_slice(&b).map_err(|_| TransactionResult::TefInternal)?;
             helpers::adjust_owner_count(&mut acct, 1);
             ctx.view
-                .update(holder_key, serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?)
+                .update(
+                    holder_key,
+                    serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?,
+                )
                 .map_err(|_| TransactionResult::TefInternal)?;
         }
     }
@@ -426,10 +464,7 @@ fn create_iou_line(
 }
 
 /// Re-write an account root unchanged so the harness threads its PreviousTxnID.
-fn touch_account(
-    ctx: &mut ApplyContext<'_>,
-    account: &AccountId,
-) -> Result<(), TransactionResult> {
+fn touch_account(ctx: &mut ApplyContext<'_>, account: &AccountId) -> Result<(), TransactionResult> {
     let key = keylet::account(account);
     if let Some(bytes) = ctx.view.read(&key) {
         ctx.view
@@ -449,11 +484,8 @@ fn derive_pseudo_account(
     let parent = ctx.view.parent_hash();
     for i in 0u16..256 {
         let ibe = i.to_be_bytes();
-        let hash = rxrpl_crypto::sha512_half::sha512_half(&[
-            &ibe,
-            parent.as_bytes(),
-            amm_key.as_bytes(),
-        ]);
+        let hash =
+            rxrpl_crypto::sha512_half::sha512_half(&[&ibe, parent.as_bytes(), amm_key.as_bytes()]);
         let id = rxrpl_codec::address::classic::account_id_from_public_key(hash.as_bytes());
         if !ctx.view.exists(&keylet::account(&id)) {
             return Ok(id);

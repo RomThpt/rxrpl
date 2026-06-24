@@ -590,9 +590,9 @@ mod tests {
                     ) {
                         if let (Ok(amm_id), Ok(cur_bytes)) = (
                             decode_account_id(amm_acct),
-                            hex::decode(lp_cur).map_err(|_| ()).and_then(|b| {
-                                <[u8; 20]>::try_from(b.as_slice()).map_err(|_| ())
-                            }),
+                            hex::decode(lp_cur)
+                                .map_err(|_| ())
+                                .and_then(|b| <[u8; 20]>::try_from(b.as_slice()).map_err(|_| ())),
                         ) {
                             let mut voters: Vec<String> = amm
                                 .get("VoteSlots")
@@ -643,14 +643,16 @@ mod tests {
         // absent from AffectedNodes and would not be seeded — the directSend
         // would then fail with tecNO_ENTRY. Seed the holder<->issuer line.
         if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("AMMClawback") {
-            if let (Some(holder), Some(asset)) =
-                (tx_json.get("Holder").and_then(|v| v.as_str()), tx_json.get("Asset"))
-            {
+            if let (Some(holder), Some(asset)) = (
+                tx_json.get("Holder").and_then(|v| v.as_str()),
+                tx_json.get("Asset"),
+            ) {
                 if let (Some(cur), Some(iss)) = (
                     asset.get("currency").and_then(|v| v.as_str()),
                     asset.get("issuer").and_then(|v| v.as_str()),
                 ) {
-                    if let (Ok(hid), Ok(iid)) = (decode_account_id(holder), decode_account_id(iss)) {
+                    if let (Ok(hid), Ok(iid)) = (decode_account_id(holder), decode_account_id(iss))
+                    {
                         read_keys.insert(
                             keylet::trust_line(&hid, &iid, &currency_bytes(cur))
                                 .to_string()

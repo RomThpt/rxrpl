@@ -144,14 +144,12 @@ impl Transactor for AMMBidTransactor {
             (pay, pay, None)
         } else {
             let price_purchased = amm_helpers::parse_iou_value(
-                amm["AuctionSlot"]["Price"]["value"]
-                    .as_str()
-                    .unwrap_or("0"),
+                amm["AuctionSlot"]["Price"]["value"].as_str().unwrap_or("0"),
             );
             let price_purchased = Number::from_iou(&price_purchased);
             let ts = time_slot.ok_or(TransactionResult::TefInternal)?;
-            let fraction_used =
-                Number::from_int(ts as i64 + 1).div(&Number::from_int(AUCTION_SLOT_TIME_INTERVALS as i64));
+            let fraction_used = Number::from_int(ts as i64 + 1)
+                .div(&Number::from_int(AUCTION_SLOT_TIME_INTERVALS as i64));
             let fraction_remaining = Number::from_int(1).sub(&fraction_used);
             let p105 = Number::new(false, 105, -2);
             let computed = if ts == 0 {
@@ -173,7 +171,9 @@ impl Transactor for AMMBidTransactor {
         // slot account.
         if let Some(refund) = refund {
             let prev_owner = decode_account_id(
-                slot_account.as_deref().ok_or(TransactionResult::TefInternal)?,
+                slot_account
+                    .as_deref()
+                    .ok_or(TransactionResult::TefInternal)?,
             )
             .map_err(|_| TransactionResult::TefInternal)?;
             let refund_iou = refund.to_iou();
@@ -412,7 +412,10 @@ mod tests {
             Some(1)
         );
         // at/after expiration → None.
-        assert_eq!(amm_auction_time_slot(1000 + TOTAL_TIME_SLOT_SECS, exp), None);
+        assert_eq!(
+            amm_auction_time_slot(1000 + TOTAL_TIME_SLOT_SECS, exp),
+            None
+        );
         // before window → None.
         assert_eq!(amm_auction_time_slot(999, exp), None);
     }

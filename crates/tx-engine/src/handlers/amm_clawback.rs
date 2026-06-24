@@ -365,7 +365,10 @@ fn holder_lp_balance(
         .and_then(|b| b.try_into().ok())
         .ok_or(TransactionResult::TefInternal)?;
     let tl_key = keylet::trust_line(holder, &ctx_amm.account, &cur_bytes);
-    let bytes = ctx.view.read(&tl_key).ok_or(TransactionResult::TecNoEntry)?;
+    let bytes = ctx
+        .view
+        .read(&tl_key)
+        .ok_or(TransactionResult::TecNoEntry)?;
     let line: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
     Ok(amm_helpers::parse_iou_value(
@@ -413,7 +416,13 @@ fn burn_holder_lp(
         delete_lp_line(ctx, holder, &ctx_amm.account, &ctx_amm.lp_currency_hex)?;
         Ok(true)
     } else {
-        debit_lp_line(ctx, holder, &ctx_amm.account, &ctx_amm.lp_currency_hex, tokens)?;
+        debit_lp_line(
+            ctx,
+            holder,
+            &ctx_amm.account,
+            &ctx_amm.lp_currency_hex,
+            tokens,
+        )?;
         Ok(false)
     }
 }
@@ -426,8 +435,7 @@ fn set_amm_lp_total(
     new_total: &rxrpl_amount::IOUAmount,
 ) -> Result<(), TransactionResult> {
     let mut amm = amm.clone();
-    amm["LPTokenBalance"]["value"] =
-        serde_json::Value::String(new_total.to_decimal_string());
+    amm["LPTokenBalance"]["value"] = serde_json::Value::String(new_total.to_decimal_string());
     let data = serde_json::to_vec(&amm).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view
         .update(*amm_key, data)
@@ -489,7 +497,10 @@ fn delete_lp_line(
         .and_then(|b| b.try_into().ok())
         .ok_or(TransactionResult::TefInternal)?;
     let tl_key = keylet::trust_line(holder, amm_account, &cur_bytes);
-    let line_bytes = ctx.view.read(&tl_key).ok_or(TransactionResult::TecNoEntry)?;
+    let line_bytes = ctx
+        .view
+        .read(&tl_key)
+        .ok_or(TransactionResult::TecNoEntry)?;
     let line: serde_json::Value =
         serde_json::from_slice(&line_bytes).map_err(|_| TransactionResult::TefInternal)?;
     let node_of = |field: &str| -> u64 {
@@ -500,12 +511,11 @@ fn delete_lp_line(
     };
     let low_node = node_of("LowNode");
     let high_node = node_of("HighNode");
-    let (low_acct, low_page, high_acct, high_page) =
-        if holder.as_bytes() < amm_account.as_bytes() {
-            (holder, low_node, amm_account, high_node)
-        } else {
-            (amm_account, low_node, holder, high_node)
-        };
+    let (low_acct, low_page, high_acct, high_page) = if holder.as_bytes() < amm_account.as_bytes() {
+        (holder, low_node, amm_account, high_node)
+    } else {
+        (amm_account, low_node, holder, high_node)
+    };
     crate::owner_dir::remove_from_owner_dir_page(ctx.view, low_acct, low_page, &tl_key)?;
     crate::owner_dir::remove_from_owner_dir_page(ctx.view, high_acct, high_page, &tl_key)?;
     ctx.view
@@ -528,7 +538,10 @@ fn debit_lp_line(
         .and_then(|b| b.try_into().ok())
         .ok_or(TransactionResult::TefInternal)?;
     let tl_key = keylet::trust_line(holder, amm_account, &cur_bytes);
-    let bytes = ctx.view.read(&tl_key).ok_or(TransactionResult::TecNoEntry)?;
+    let bytes = ctx
+        .view
+        .read(&tl_key)
+        .ok_or(TransactionResult::TecNoEntry)?;
     let mut line: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
     let holder_is_low = holder.as_bytes() < amm_account.as_bytes();

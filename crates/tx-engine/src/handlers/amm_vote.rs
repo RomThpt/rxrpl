@@ -91,8 +91,8 @@ impl Transactor for AMMVoteTransactor {
                 .get("Account")
                 .and_then(|v| v.as_str())
                 .ok_or(TransactionResult::TefInternal)?;
-            let entry_acct = decode_account_id(entry_acct_str)
-                .map_err(|_| TransactionResult::TefInternal)?;
+            let entry_acct =
+                decode_account_id(entry_acct_str).map_err(|_| TransactionResult::TefInternal)?;
 
             let mut lp = lp_holds(ctx.view, &entry_acct, &amm_account, &lp_currency);
             if lp.is_zero() {
@@ -139,9 +139,7 @@ impl Transactor for AMMVoteTransactor {
                 den = den.add(&lp_new);
                 updated.push(new_entry);
             } else if let Some((min_tokens, min_pos, _, min_fee)) = min {
-                if lp_lt(&min_tokens, &lp_new)
-                    || (lp_new == min_tokens && new_fee > min_fee)
-                {
+                if lp_lt(&min_tokens, &lp_new) || (lp_new == min_tokens && new_fee > min_fee) {
                     // Evict the least-token entry, then add the new voter.
                     num = num.sub(&Number::from_int(min_fee).mul(&min_tokens));
                     den = den.sub(&min_tokens);
@@ -367,10 +365,7 @@ mod tests {
 
         let slots = amm["VoteSlots"].as_array().unwrap();
         assert_eq!(slots.len(), 1);
-        assert_eq!(
-            slots[0]["VoteEntry"]["Account"].as_str().unwrap(),
-            BOB
-        );
+        assert_eq!(slots[0]["VoteEntry"]["Account"].as_str().unwrap(), BOB);
         assert_eq!(slots[0]["VoteEntry"]["TradingFee"].as_u64().unwrap(), 300);
         assert_eq!(
             slots[0]["VoteEntry"]["VoteWeight"].as_u64().unwrap(),
@@ -448,7 +443,12 @@ mod tests {
             "Asset": "XRP", "Asset2": {"currency": "USD", "issuer": BOB},
             "TradingFee": 100, "Fee": "12", "Sequence": 1,
         });
-        let mut ctx = ApplyContext { tx: &tx1, view: &mut sandbox, rules: &rules, fees: &fees };
+        let mut ctx = ApplyContext {
+            tx: &tx1,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
         AMMVoteTransactor.apply(&mut ctx).unwrap();
         // Now zero out ALICE's LP line.
         zero_lp_line(&mut sandbox, ALICE);
@@ -458,7 +458,12 @@ mod tests {
             "Asset": "XRP", "Asset2": {"currency": "USD", "issuer": BOB},
             "TradingFee": 800, "Fee": "12", "Sequence": 1,
         });
-        let mut ctx = ApplyContext { tx: &tx2, view: &mut sandbox, rules: &rules, fees: &fees };
+        let mut ctx = ApplyContext {
+            tx: &tx2,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
         AMMVoteTransactor.apply(&mut ctx).unwrap();
 
         let amm_key = amm_helpers::compute_amm_key_from_tx(&tx2).unwrap();
@@ -477,7 +482,11 @@ mod tests {
         let cur = lp_cur();
         let key = keylet::trust_line(&holder_id, &amm_id, &cur);
         let holder_low = holder_id.as_bytes() < amm_id.as_bytes();
-        let stored = if holder_low { value.to_string() } else { format!("-{value}") };
+        let stored = if holder_low {
+            value.to_string()
+        } else {
+            format!("-{value}")
+        };
         let cur_hex = hex::encode_upper(cur);
         let line = serde_json::json!({
             "LedgerEntryType": "RippleState",
@@ -486,7 +495,9 @@ mod tests {
             "HighLimit": {"currency": cur_hex, "issuer": if holder_low {AMM} else {holder}, "value": "0"},
             "Flags": 0,
         });
-        sandbox.insert(key, serde_json::to_vec(&line).unwrap()).unwrap();
+        sandbox
+            .insert(key, serde_json::to_vec(&line).unwrap())
+            .unwrap();
     }
 
     fn zero_lp_line(sandbox: &mut Sandbox, holder: &str) {
@@ -498,7 +509,9 @@ mod tests {
         let mut line: serde_json::Value =
             serde_json::from_slice(&sandbox.read(&key).unwrap()).unwrap();
         line["Balance"]["value"] = serde_json::Value::String("0".into());
-        sandbox.update(key, serde_json::to_vec(&line).unwrap()).unwrap();
+        sandbox
+            .update(key, serde_json::to_vec(&line).unwrap())
+            .unwrap();
     }
 
     #[test]
