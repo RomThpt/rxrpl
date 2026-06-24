@@ -335,7 +335,7 @@ pub fn remove_from_owner_dir_page(
 
 /// Collect every entry key listed in an account's owner directory, walking the
 /// page chain from the root. Entries are returned in directory order (page by
-/// page). Used by AMMDelete to enumerate the AMM account's holdings.
+/// page). Used by AMMDelete and AccountDelete to enumerate an account's holdings.
 pub fn collect_owner_dir_entries(
     view: &dyn crate::view::read_view::ReadView,
     account_id: &AccountId,

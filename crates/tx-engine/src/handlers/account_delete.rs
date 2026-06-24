@@ -1,14 +1,19 @@
 use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_primitives::{AccountId, Hash256};
 use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
 use crate::helpers;
+use crate::owner_dir::{
+    collect_owner_dir_entries, dir_remove, remove_from_owner_dir, remove_from_owner_dir_page,
+};
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 /// AccountDelete transaction handler.
 ///
-/// Deletes an account and transfers remaining XRP to a destination.
-/// Requires owner count == 0 and charges an elevated fee (5x reserve increment).
+/// Deletes an account and transfers remaining XRP to a destination. Any
+/// directly-deletable objects it owns are removed first; obligation-bearing
+/// objects block deletion. Charges an elevated fee (5x reserve increment).
 pub struct AccountDeleteTransactor;
 
 /// Ledger flag: destination requires deposit authorization.
@@ -44,25 +49,26 @@ impl Transactor for AccountDeleteTransactor {
         let src_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let src_key = keylet::account(&src_id);
-        let src_bytes = ctx
-            .view
-            .read(&src_key)
-            .ok_or(TransactionResult::TerNoAccount)?;
-        let src_obj: Value =
-            serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
-
-        // Source must have no owned objects. A TicketSequence the tx is using
-        // is consumed by the AccountDelete itself, so its Ticket SLE doesn't
-        // count toward outstanding obligations.
-        let mut owner_count = helpers::get_owner_count(&src_obj);
-        if let Some(ticket_seq) = helpers::get_u32_field(ctx.tx, "TicketSequence") {
-            let ticket_key = keylet::ticket(&src_id, ticket_seq);
-            if ctx.view.exists(&ticket_key) {
-                owner_count = owner_count.saturating_sub(1);
-            }
+        if !ctx.view.exists(&src_key) {
+            return Err(TransactionResult::TerNoAccount);
         }
-        if owner_count > 0 {
-            return Err(TransactionResult::TecHasObligations);
+
+        // The account may only be deleted if every object it owns is a
+        // directly-deletable (non-obligation) type. Anything else (trust lines,
+        // escrows, checks, paychannels, NFToken pages, ...) is an obligation
+        // that blocks deletion. Mirrors rippled's DeleteAccount deleter map.
+        for entry_hex in collect_owner_dir_entries(ctx.view, &src_id) {
+            let Some(entry_key) = parse_hash(&entry_hex) else {
+                continue;
+            };
+            let Some(bytes) = ctx.view.read(&entry_key) else {
+                continue;
+            };
+            let sle: Value =
+                serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+            if !is_deletable_type(sle.get("LedgerEntryType").and_then(|v| v.as_str())) {
+                return Err(TransactionResult::TecHasObligations);
+            }
         }
 
         // Destination must exist
@@ -104,17 +110,21 @@ impl Transactor for AccountDeleteTransactor {
         let src_key = keylet::account(&src_id);
         let dst_key = keylet::account(&dst_id);
 
-        // If the tx uses a TicketSequence, consume the matching Ticket SLE.
-        // Mirrors rippled's generic ticket consumption path.
-        if let Some(ticket_seq) = helpers::get_u32_field(ctx.tx, "TicketSequence") {
-            let ticket_key = keylet::ticket(&src_id, ticket_seq);
-            if ctx.view.exists(&ticket_key) {
-                crate::owner_dir::remove_from_owner_dir(ctx.view, &src_id, &ticket_key)
-                    .map_err(|_| TransactionResult::TefInternal)?;
-                ctx.view
-                    .erase(&ticket_key)
-                    .map_err(|_| TransactionResult::TefInternal)?;
-            }
+        // Delete every directly-deletable object the account owns (offers,
+        // tickets, signer lists, NFToken offers, DIDs, deposit preauths) before
+        // removing the account itself. The TicketSequence the tx consumes is one
+        // such owned Ticket and is erased here too. preclaim has already proven
+        // no obligation-bearing objects remain.
+        for entry_hex in collect_owner_dir_entries(ctx.view, &src_id) {
+            let Some(entry_key) = parse_hash(&entry_hex) else {
+                continue;
+            };
+            let Some(bytes) = ctx.view.read(&entry_key) else {
+                continue;
+            };
+            let sle: Value =
+                serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+            delete_owned_object(ctx, &src_id, &entry_key, &sle)?;
         }
 
         // Read source account
@@ -165,6 +175,94 @@ impl Transactor for AccountDeleteTransactor {
 
         Ok(TransactionResult::TesSuccess)
     }
+}
+
+/// Ledger entry types rippled deletes automatically as part of AccountDelete.
+/// Every other owned type is an obligation that blocks deletion.
+fn is_deletable_type(ty: Option<&str>) -> bool {
+    matches!(
+        ty,
+        Some("Offer")
+            | Some("SignerList")
+            | Some("Ticket")
+            | Some("NFTokenOffer")
+            | Some("DID")
+            | Some("DepositPreauth")
+    )
+}
+
+fn parse_hash(hex_str: &str) -> Option<Hash256> {
+    let bytes = hex::decode(hex_str).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    Some(Hash256::from(arr))
+}
+
+fn node_hint(sle: &Value, field: &str) -> u64 {
+    sle.get(field)
+        .and_then(|v| v.as_str())
+        .and_then(|s| u64::from_str_radix(s, 16).ok())
+        .unwrap_or(0)
+}
+
+/// Unlink an owned object from its directories and erase it. Mirrors the
+/// per-type deleters rippled invokes from DeleteAccount. The owning account is
+/// being erased, so its OwnerCount is not adjusted here.
+fn delete_owned_object(
+    ctx: &mut ApplyContext<'_>,
+    owner_id: &AccountId,
+    key: &Hash256,
+    sle: &Value,
+) -> Result<(), TransactionResult> {
+    match sle.get("LedgerEntryType").and_then(|v| v.as_str()) {
+        Some("NFTokenOffer") => {
+            remove_from_owner_dir_page(ctx.view, owner_id, node_hint(sle, "OwnerNode"), key)?;
+            let is_sell = sle.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & 1 != 0;
+            if let Some(nft_hash) = sle
+                .get("NFTokenID")
+                .and_then(|v| v.as_str())
+                .and_then(parse_hash)
+            {
+                let book = if is_sell {
+                    keylet::nft_sells(&nft_hash)
+                } else {
+                    keylet::nft_buys(&nft_hash)
+                };
+                dir_remove(ctx.view, &book, key)?;
+            }
+            // A destination-restricted offer threads its Destination's
+            // PreviousTxnID even though no field changes.
+            if let Some(dest_id) = sle
+                .get("Destination")
+                .and_then(|v| v.as_str())
+                .and_then(|d| decode_account_id(d).ok())
+            {
+                let dest_key = keylet::account(&dest_id);
+                if let Some(dest_bytes) = ctx.view.read(&dest_key) {
+                    ctx.view
+                        .update(dest_key, dest_bytes)
+                        .map_err(|_| TransactionResult::TefInternal)?;
+                }
+            }
+        }
+        Some("Offer") => {
+            if let Some(book) = sle
+                .get("BookDirectory")
+                .and_then(|v| v.as_str())
+                .and_then(parse_hash)
+            {
+                dir_remove(ctx.view, &book, key)?;
+            }
+            remove_from_owner_dir(ctx.view, owner_id, key)?;
+        }
+        Some("SignerList") | Some("Ticket") | Some("DID") | Some("DepositPreauth") => {
+            remove_from_owner_dir(ctx.view, owner_id, key)?;
+        }
+        _ => return Err(TransactionResult::TefInternal),
+    }
+    ctx.view
+        .erase(key)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -316,7 +414,8 @@ mod tests {
     #[test]
     fn preclaim_has_obligations() {
         let mut ledger = Ledger::genesis();
-        // Source with owner_count > 0
+        // Source owning a non-deletable object (an Escrow) linked into its owner
+        // directory: that is an obligation that blocks deletion.
         let src_id = decode_account_id(SRC_ADDRESS).unwrap();
         let src_key = keylet::account(&src_id);
         let src = serde_json::json!({
@@ -324,11 +423,35 @@ mod tests {
             "Account": SRC_ADDRESS,
             "Balance": "10000000",
             "Sequence": 1,
-            "OwnerCount": 2,
+            "OwnerCount": 1,
             "Flags": 0,
         });
         ledger
             .put_state(src_key, serde_json::to_vec(&src).unwrap())
+            .unwrap();
+
+        let escrow_key = keylet::escrow(&src_id, 1);
+        let escrow = serde_json::json!({
+            "LedgerEntryType": "Escrow",
+            "Account": SRC_ADDRESS,
+            "Destination": DST_ADDRESS,
+            "Amount": "1000000",
+        });
+        ledger
+            .put_state(escrow_key, serde_json::to_vec(&escrow).unwrap())
+            .unwrap();
+
+        let dir_root = keylet::owner_dir(&src_id);
+        let dir_page0 = keylet::dir_node(&dir_root, 0);
+        let dir = serde_json::json!({
+            "LedgerEntryType": "DirectoryNode",
+            "Owner": SRC_ADDRESS,
+            "Indexes": [escrow_key.to_string().to_uppercase()],
+            "IndexNext": "0",
+            "IndexPrevious": "0",
+        });
+        ledger
+            .put_state(dir_page0, serde_json::to_vec(&dir).unwrap())
             .unwrap();
         add_account(&mut ledger, DST_ADDRESS, 5_000_000);
 
@@ -496,5 +619,58 @@ mod tests {
 
         let result = AccountDeleteTransactor.apply(&mut ctx);
         assert_eq!(result, Err(TransactionResult::TerNoAccount));
+    }
+
+    #[test]
+    fn apply_deletes_owned_nftoken_offer() {
+        let mut ledger = setup_ledger_with_account(SRC_ADDRESS, 10_000_000);
+        add_account(&mut ledger, DST_ADDRESS, 5_000_000);
+
+        let src_id = decode_account_id(SRC_ADDRESS).unwrap();
+        let offer_key = keylet::nftoken_offer(&src_id, 1);
+        let nft_id = "00080000A1B2C3D4E5F60708090A0B0C0D0E0F1011121314000003E800000001";
+        let offer = serde_json::json!({
+            "LedgerEntryType": "NFTokenOffer",
+            "Owner": SRC_ADDRESS,
+            "NFTokenID": nft_id,
+            "Amount": "1000000",
+            "Flags": 1,
+            "OwnerNode": "0",
+        });
+        ledger
+            .put_state(offer_key, serde_json::to_vec(&offer).unwrap())
+            .unwrap();
+
+        let dir_root = keylet::owner_dir(&src_id);
+        let dir = serde_json::json!({
+            "LedgerEntryType": "DirectoryNode",
+            "Owner": SRC_ADDRESS,
+            "Indexes": [offer_key.to_string().to_uppercase()],
+            "IndexNext": "0",
+            "IndexPrevious": "0",
+        });
+        ledger
+            .put_state(
+                keylet::dir_node(&dir_root, 0),
+                serde_json::to_vec(&dir).unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = make_account_delete_tx(SRC_ADDRESS, DST_ADDRESS);
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+
+        let result = AccountDeleteTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+        assert!(sandbox.read(&offer_key).is_none());
+        assert!(sandbox.read(&keylet::account(&src_id)).is_none());
     }
 }
