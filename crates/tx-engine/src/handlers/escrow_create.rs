@@ -113,6 +113,9 @@ impl Transactor for EscrowCreateTransactor {
             // Originating tx Sequence; consumed by EscrowFinish/Cancel
             // via OfferSequence and surfaced through account_objects.
             "Sequence": tx_seq,
+            // Placeholder filled by the engine's central PreviousTxnID stamping.
+            "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+            "PreviousTxnLgrSeq": 0,
         });
 
         if let Some(finish_after) = helpers::get_u32_field(ctx.tx, "FinishAfter") {
@@ -138,6 +141,21 @@ impl Transactor for EscrowCreateTransactor {
             .map_err(|_| TransactionResult::TefInternal)?;
 
         add_to_owner_dir(ctx.view, &src_id, &escrow_key)?;
+
+        // When the destination differs from the owner, rippled also links the
+        // escrow into the destination's owner directory and threads the
+        // destination AccountRoot (no field change).
+        let dst_id = decode_account_id(destination_str)
+            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        if dst_id != src_id {
+            add_to_owner_dir(ctx.view, &dst_id, &escrow_key)?;
+            let dst_key = keylet::account(&dst_id);
+            if let Some(dst_bytes) = ctx.view.read(&dst_key) {
+                ctx.view
+                    .update(dst_key, dst_bytes)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+            }
+        }
 
         Ok(TransactionResult::TesSuccess)
     }

@@ -190,8 +190,9 @@ pub fn dir_remove_page(
 
 /// As `dir_remove_page`, but when the removal empties the whole directory the
 /// root page is kept (left with an empty `Indexes`) instead of erased. rippled
-/// chooses this per call site (`dirRemove` `keepRoot`); e.g. DIDDelete keeps the
-/// empty owner-directory root while OfferCancel deletes it.
+/// chooses this per call site (`dirRemove` `keepRoot`); e.g. DIDDelete and
+/// Escrow finish/cancel keep the empty owner/destination root while OfferCancel
+/// deletes it.
 fn dir_remove_page_impl(
     view: &mut dyn ApplyView,
     root_key: &Hash256,
@@ -341,7 +342,7 @@ pub fn remove_from_owner_dir(
 
 /// As `remove_from_owner_dir`, but keeps the owner-directory root page (empty)
 /// if the removal empties the directory. Matches rippled call sites that pass
-/// `keepRoot = true` (e.g. DIDDelete).
+/// `keepRoot = true` (e.g. DIDDelete, Escrow finish/cancel).
 pub fn remove_from_owner_dir_keep_root(
     view: &mut dyn ApplyView,
     account_id: &AccountId,
