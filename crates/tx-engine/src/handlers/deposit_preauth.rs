@@ -88,7 +88,9 @@ impl Transactor for DepositPreauthTransactor {
                 "LedgerEntryType": "DepositPreauth",
                 "Account": account_str,
                 "Authorize": authorize,
-                "Flags": 0,
+                // Placeholder filled by the engine's central PreviousTxnID stamping.
+                "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+                "PreviousTxnLgrSeq": 0,
             });
             let entry_data =
                 serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?;
