@@ -3,7 +3,7 @@ use rxrpl_protocol::ledger::AccountRoot;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
-use crate::owner_dir::remove_from_owner_dir;
+use crate::owner_dir::remove_from_owner_dir_keep_root;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct DIDDeleteTransactor;
@@ -43,7 +43,7 @@ impl Transactor for DIDDeleteTransactor {
         account.sequence += 1;
 
         let did_key = keylet::did(&account_id);
-        remove_from_owner_dir(ctx.view, &account_id, &did_key)?;
+        remove_from_owner_dir_keep_root(ctx.view, &account_id, &did_key)?;
         ctx.view
             .erase(&did_key)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -216,6 +216,51 @@ mod tests {
         let account: serde_json::Value = serde_json::from_slice(&account_bytes).unwrap();
         assert_eq!(account["OwnerCount"].as_u64().unwrap(), 0);
         assert_eq!(account["Sequence"].as_u64().unwrap(), 2);
+    }
+
+    #[test]
+    fn apply_keeps_empty_owner_dir_root() {
+        let mut ledger = setup_account_with_did();
+        let id = decode_account_id(ALICE).unwrap();
+        let did_key = keylet::did(&id);
+        let dir_root = keylet::owner_dir(&id);
+        let dir = serde_json::json!({
+            "LedgerEntryType": "DirectoryNode",
+            "Owner": ALICE,
+            "RootIndex": dir_root.to_string().to_uppercase(),
+            "Indexes": [did_key.to_string().to_uppercase()],
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::dir_node(&dir_root, 0),
+                serde_json::to_vec(&dir).unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "DIDDelete",
+            "Account": ALICE,
+            "Fee": "12",
+            "Sequence": 1,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        DIDDeleteTransactor.apply(&mut ctx).unwrap();
+
+        // rippled keeps the now-empty owner-directory root (keepRoot=true).
+        let root_bytes = sandbox.read(&keylet::dir_node(&dir_root, 0)).unwrap();
+        let root: serde_json::Value = serde_json::from_slice(&root_bytes).unwrap();
+        assert_eq!(root["Indexes"].as_array().unwrap().len(), 0);
+        assert!(!sandbox.exists(&did_key));
     }
 
     #[test]
