@@ -77,7 +77,7 @@ fn lp_token_balance_is_zero(amm: &Value) -> bool {
 /// Mirror of rippled `deleteAMMAccount`: erase every zero-balance pool trust
 /// line, then unlink the AMM entry from the AMM account's owner dir, drop the
 /// now-empty dir root, and erase the AMM entry and the AMM AccountRoot.
-fn delete_amm_account(
+pub(crate) fn delete_amm_account(
     ctx: &mut ApplyContext<'_>,
     amm_key: &Hash256,
     amm: &Value,
@@ -169,18 +169,22 @@ fn delete_amm_trust_line(
         .erase(line_key)
         .map_err(|_| TransactionResult::TecInternalError)?;
 
+    // Decrement the owner count of whichever side carries the trust-line
+    // reserve flag. Normally that is the non-AMM side, but when the AMM holds an
+    // externally issued pool asset the AMM (reserve-holding) side carries it.
     let flags = line.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
-    let reserve_flag = if amm_low {
-        LSF_HIGH_RESERVE
+    let reserve_side = if flags & LSF_LOW_RESERVE != 0 {
+        Some(&low)
+    } else if flags & LSF_HIGH_RESERVE != 0 {
+        Some(&high)
     } else {
-        LSF_LOW_RESERVE
+        None
     };
-    if flags & reserve_flag == 0 {
+    let Some(reserve_side) = reserve_side else {
         return Err(TransactionResult::TecInternalError);
-    }
-
-    let non_amm = if amm_low { &high } else { &low };
-    adjust_owner_count(ctx, non_amm, -1)
+    };
+    let _ = amm_low;
+    adjust_owner_count(ctx, reserve_side, -1)
 }
 
 fn adjust_owner_count(

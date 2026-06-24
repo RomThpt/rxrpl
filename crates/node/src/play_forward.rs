@@ -637,6 +637,30 @@ mod tests {
             }
         }
 
+        // AMMClawback withdraws the holder's full LP, then directSends the
+        // clawed `Asset` from holder to issuer. The holder's trust line for
+        // that Asset nets to zero change (withdrawn then clawed) so it is
+        // absent from AffectedNodes and would not be seeded — the directSend
+        // would then fail with tecNO_ENTRY. Seed the holder<->issuer line.
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("AMMClawback") {
+            if let (Some(holder), Some(asset)) =
+                (tx_json.get("Holder").and_then(|v| v.as_str()), tx_json.get("Asset"))
+            {
+                if let (Some(cur), Some(iss)) = (
+                    asset.get("currency").and_then(|v| v.as_str()),
+                    asset.get("issuer").and_then(|v| v.as_str()),
+                ) {
+                    if let (Ok(hid), Ok(iid)) = (decode_account_id(holder), decode_account_id(iss)) {
+                        read_keys.insert(
+                            keylet::trust_line(&hid, &iid, &currency_bytes(cur))
+                                .to_string()
+                                .to_uppercase(),
+                        );
+                    }
+                }
+            }
+        }
+
         // Seed a partial state map from the parent ledger.
         let mut state = rxrpl_shamap::SHAMap::account_state();
         for key in &read_keys {
