@@ -89,6 +89,26 @@ pub fn rounded_asset_up_xrp(
     balance.mul(frac).to_xrp_drops_mode()
 }
 
+/// `lpTokensIn` (eq 7): LP tokens burned to withdraw an asset, given the
+/// withdraw/pool ratio `fr` (works for XRP or IOU legs). Mirrors rippled under
+/// fixAMMv1_3: the final multiply rounds tokens up (maximise burn). The caller
+/// applies `adjust_lp_tokens_withdraw`.
+pub fn lp_tokens_in_ratio(
+    fr: &rxrpl_amount::number::Number,
+    total_lp: &rxrpl_amount::IOUAmount,
+    tfee: u16,
+) -> rxrpl_amount::IOUAmount {
+    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode, root2};
+    let two = Number::from_int(2);
+    let f1 = Number::from_int(tfee as i64).div(&Number::from_int(100_000)); // getFee
+    let c = fr.mul(&f1).add(&two).sub(&f1);
+    let disc = root2(c.mul(&c).sub(&Number::from_int(4).mul(fr)));
+    let frac = c.sub(&disc).div(&two);
+    let t = Number::from_iou(total_lp);
+    let _g = RoundModeGuard::new(RoundingMode::Upward);
+    t.mul(&frac).to_iou()
+}
+
 /// Single-asset withdraw: LP tokens burned to withdraw `withdraw` of an asset
 /// with pool balance `pool`. Mirrors rippled `lpTokensIn` (eq 7) under
 /// fixAMMv1_3 (rounds tokens up), then `adjustLPTokens` (withdraw variant).
@@ -98,25 +118,26 @@ pub fn lp_tokens_in_single(
     total_lp: &rxrpl_amount::IOUAmount,
     tfee: u16,
 ) -> rxrpl_amount::IOUAmount {
-    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode, root2};
-    // fr, c and frac are computed under the default (to-nearest) mode; only the
-    // final multiply that mints tokens rounds upward.
-    let two = Number::from_int(2);
+    use rxrpl_amount::number::Number;
     let fr = Number::from_int(withdraw as i64).div(&Number::from_int(pool as i64));
-    let f1 = Number::from_int(tfee as i64).div(&Number::from_int(100_000)); // getFee
-    let c = fr.mul(&f1).add(&two).sub(&f1);
-    let disc = root2(c.mul(&c).sub(&Number::from_int(4).mul(&fr)));
-    let frac = c.sub(&disc).div(&two);
-    let t = Number::from_iou(total_lp);
+    let raw = lp_tokens_in_ratio(&fr, total_lp, tfee);
+    adjust_lp_tokens_withdraw(total_lp, &raw)
+}
 
-    let raw = {
-        let _g = RoundModeGuard::new(RoundingMode::Upward);
-        t.mul(&frac).to_iou()
-    };
-    // adjustLPTokens (withdraw): (raw - T) + T under downward rounding.
-    let _g = RoundModeGuard::new(RoundingMode::Downward);
-    let minus = Number::from_iou(&raw).sub(&t).to_iou();
-    Number::from_iou(&minus).add(&t).to_iou()
+/// `ammAssetOut` (eq 8) fraction: `(t1*t1 - t1*(2-f)) / (t1*f - 1)` where
+/// `t1 = tokens/T`. Shared by the XRP and IOU output helpers.
+fn amm_asset_out_frac(
+    total_lp: &rxrpl_amount::IOUAmount,
+    tokens: &rxrpl_amount::IOUAmount,
+    tfee: u16,
+) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::Number;
+    let t1 = Number::from_iou(tokens).div(&Number::from_iou(total_lp));
+    let f = Number::from_int(tfee as i64).div(&Number::from_int(100_000));
+    let two = Number::from_int(2);
+    let num = t1.mul(&t1).sub(&t1.mul(&two.sub(&f)));
+    let den = t1.mul(&f).sub(&Number::from_int(1));
+    num.div(&den)
 }
 
 /// `ammAssetOut` (eq 8): XRP drops paid out for burning `tokens` LP, minimised
@@ -128,14 +149,76 @@ pub fn amm_asset_out_single_xrp(
     tfee: u16,
 ) -> u64 {
     use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode};
-    let t1 = Number::from_iou(tokens).div(&Number::from_iou(total_lp));
-    let f = Number::from_int(tfee as i64).div(&Number::from_int(100_000));
-    let two = Number::from_int(2);
-    let num = t1.mul(&t1).sub(&t1.mul(&two.sub(&f)));
-    let den = t1.mul(&f).sub(&Number::from_int(1));
-    let frac = num.div(&den);
+    let frac = amm_asset_out_frac(total_lp, tokens, tfee);
     let _g = RoundModeGuard::new(RoundingMode::Downward);
     Number::from_int(pool as i64).mul(&frac).to_xrp_drops()
+}
+
+/// `ammAssetOut` (eq 8): IOU value paid out for burning `tokens` LP, minimised
+/// (`multiply(balance, frac, Downward)` onto the IOU grid).
+pub fn amm_asset_out_single_iou(
+    pool: &rxrpl_amount::number::Number,
+    total_lp: &rxrpl_amount::IOUAmount,
+    tokens: &rxrpl_amount::IOUAmount,
+    tfee: u16,
+) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode};
+    let frac = amm_asset_out_frac(total_lp, tokens, tfee);
+    let _g = RoundModeGuard::new(RoundingMode::Downward);
+    Number::from_iou(&pool.mul(&frac).to_iou())
+}
+
+/// `getRoundedLPTokens(T, frac, Withdraw)`: `adjustLPTokens(T, multiply(T, frac,
+/// Upward), Withdraw)`. LP rounding maximises burn (Upward); the adjust step
+/// `(raw - T) + T` runs under Downward.
+pub fn rounded_lp_tokens_withdraw(
+    total_lp: &rxrpl_amount::IOUAmount,
+    frac: &rxrpl_amount::number::Number,
+) -> rxrpl_amount::IOUAmount {
+    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode};
+    let t = Number::from_iou(total_lp);
+    let raw = {
+        let _g = RoundModeGuard::new(RoundingMode::Upward);
+        t.mul(frac).to_iou()
+    };
+    let _g = RoundModeGuard::new(RoundingMode::Downward);
+    let minus = Number::from_iou(&raw).sub(&t).to_iou();
+    Number::from_iou(&minus).add(&t).to_iou()
+}
+
+/// `adjustLPTokens(T, tokens, Withdraw)`: `(tokens - T) + T` under Downward.
+/// Used after `lpTokensIn` already rounded `tokens` Upward.
+pub fn adjust_lp_tokens_withdraw(
+    total_lp: &rxrpl_amount::IOUAmount,
+    tokens: &rxrpl_amount::IOUAmount,
+) -> rxrpl_amount::IOUAmount {
+    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode};
+    let t = Number::from_iou(total_lp);
+    let _g = RoundModeGuard::new(RoundingMode::Downward);
+    let minus = Number::from_iou(tokens).sub(&t).to_iou();
+    Number::from_iou(&minus).add(&t).to_iou()
+}
+
+/// `getRoundedAsset(balance, frac, Withdraw)` for an IOU leg: `multiply(balance,
+/// frac, Downward)` rounded onto the IOU grid (minimise the payout).
+pub fn rounded_asset_down_iou(
+    balance: &rxrpl_amount::number::Number,
+    frac: &rxrpl_amount::number::Number,
+) -> rxrpl_amount::IOUAmount {
+    use rxrpl_amount::number::{RoundModeGuard, RoundingMode};
+    let _g = RoundModeGuard::new(RoundingMode::Downward);
+    balance.mul(frac).to_iou()
+}
+
+/// `getRoundedAsset(balance, frac, Withdraw)` for an XRP leg: `multiply(balance,
+/// frac, Downward)` rounded to integer drops (minimise the payout).
+pub fn rounded_asset_down_xrp(
+    balance: &rxrpl_amount::number::Number,
+    frac: &rxrpl_amount::number::Number,
+) -> u64 {
+    use rxrpl_amount::number::{RoundModeGuard, RoundingMode};
+    let _g = RoundModeGuard::new(RoundingMode::Downward);
+    balance.mul(frac).to_xrp_drops_mode()
 }
 
 /// `ammAssetIn` (eq 4): the asset amount required to mint `tokens` LP, given a
