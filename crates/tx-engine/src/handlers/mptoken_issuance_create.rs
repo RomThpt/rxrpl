@@ -56,8 +56,10 @@ impl Transactor for MPTokenIssuanceCreateTransactor {
             "Sequence": acct_seq,
             "TransferFee": transfer_fee,
             "AssetScale": asset_scale,
-            "OutstandingAmount": "0",
             "Flags": tx_flags,
+            // Placeholder filled by the engine's central PreviousTxnID stamping.
+            "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+            "PreviousTxnLgrSeq": 0,
         });
 
         if let Some(max_amount) = helpers::get_str_field(ctx.tx, "MaximumAmount") {
@@ -148,7 +150,8 @@ mod tests {
         let issuance_bytes = sandbox.read(&issuance_key).unwrap();
         let issuance: serde_json::Value = serde_json::from_slice(&issuance_bytes).unwrap();
         assert_eq!(issuance["Issuer"].as_str().unwrap(), ISSUER);
-        assert_eq!(issuance["OutstandingAmount"].as_str().unwrap(), "0");
+        // OutstandingAmount defaults to 0 and is omitted from a created issuance.
+        assert!(issuance.get("OutstandingAmount").is_none());
         assert_eq!(issuance["Sequence"].as_u64().unwrap(), 1);
 
         // Verify owner count incremented

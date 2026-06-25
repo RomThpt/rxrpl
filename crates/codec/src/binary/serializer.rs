@@ -96,7 +96,7 @@ impl BinarySerializer {
             "UInt16" => self.serialize_uint16(value, def)?,
             "UInt32" => self.serialize_uint32(value, def)?,
             "Int32" => self.serialize_int32(value)?,
-            "UInt64" => self.serialize_uint64(value)?,
+            "UInt64" => self.serialize_uint64(value, def)?,
             "Hash128" => self.serialize_hash(value, 16)?,
             "Hash160" => self.serialize_hash(value, 20)?,
             "Hash192" => self.serialize_hash(value, 24)?,
@@ -198,11 +198,17 @@ impl BinarySerializer {
         Ok(())
     }
 
-    fn serialize_uint64(&mut self, value: &Value) -> Result<(), CodecError> {
-        // UInt64 in XRPL JSON is typically a hex string
+    fn serialize_uint64(&mut self, value: &Value, def: &FieldDef) -> Result<(), CodecError> {
+        // UInt64 in XRPL JSON is a hex string, except the MPToken amount fields
+        // which rippled renders and parses as decimal.
+        let radix = if definitions::is_decimal_uint64(&def.name) {
+            10
+        } else {
+            16
+        };
         let v = if let Some(s) = value.as_str() {
-            u64::from_str_radix(s, 16)
-                .map_err(|_| CodecError::UnsupportedType("invalid u64 hex string".to_string()))?
+            u64::from_str_radix(s, radix)
+                .map_err(|_| CodecError::UnsupportedType("invalid u64 string".to_string()))?
         } else {
             value
                 .as_u64()

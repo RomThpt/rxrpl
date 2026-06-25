@@ -16,17 +16,9 @@ const LSFT_MPT_CAN_LOCK: u32 = 0x0002;
 
 pub struct MPTokenIssuanceSetTransactor;
 
-/// Parse MPTokenIssuanceID hex string into a Hash256 key.
+/// Resolve the MPTokenIssuance SLE key from the tx's 192-bit MPTokenIssuanceID.
 fn parse_issuance_id(tx: &Value) -> Result<Hash256, TransactionResult> {
-    let hex_str =
-        helpers::get_str_field(tx, "MPTokenIssuanceID").ok_or(TransactionResult::TemMalformed)?;
-    let bytes = hex::decode(hex_str).map_err(|_| TransactionResult::TemMalformed)?;
-    if bytes.len() != 32 {
-        return Err(TransactionResult::TemMalformed);
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(Hash256::new(arr))
+    super::mptoken_authorize::parse_issuance_id(tx).map(|(key, _)| key)
 }
 
 impl Transactor for MPTokenIssuanceSetTransactor {
@@ -207,8 +199,13 @@ mod tests {
         (ledger, issuance_key)
     }
 
-    fn issuance_id_hex(key: &Hash256) -> String {
-        hex::encode(key.as_bytes()).to_uppercase()
+    fn issuance_id_hex(_key: &Hash256) -> String {
+        // 192-bit MPTokenIssuanceID = sequence (4 BE) || issuer (20). The test
+        // fixtures all create the issuance at (ISSUER, seq=1).
+        let issuer = decode_account_id(ISSUER).unwrap();
+        let mut id = 1u32.to_be_bytes().to_vec();
+        id.extend_from_slice(issuer.as_bytes());
+        hex::encode(id).to_uppercase()
     }
 
     #[test]

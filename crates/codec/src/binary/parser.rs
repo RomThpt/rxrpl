@@ -275,7 +275,12 @@ impl<'a> BinaryParser<'a> {
             }
             "UInt64" => {
                 let v = self.read_u64()?;
-                Ok(Value::String(format!("{v:016X}")))
+                // MPToken amount fields render as decimal; every other UInt64 is hex.
+                if definitions::is_decimal_uint64(field_name) {
+                    Ok(Value::String(v.to_string()))
+                } else {
+                    Ok(Value::String(format!("{v:016X}")))
+                }
             }
             "Hash128" => {
                 let bytes = self.read_bytes(16)?;
