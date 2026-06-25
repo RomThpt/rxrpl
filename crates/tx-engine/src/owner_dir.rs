@@ -333,6 +333,34 @@ pub fn remove_from_owner_dir_page(
     dir_remove_page(view, &keylet::owner_dir(account_id), page, entry_key)
 }
 
+/// Collect every entry key listed in an account's owner directory, walking the
+/// page chain from the root. Entries are returned in directory order (page by
+/// page). Used by AMMDelete to enumerate the AMM account's holdings.
+pub fn collect_owner_dir_entries(
+    view: &dyn crate::view::read_view::ReadView,
+    account_id: &AccountId,
+) -> Vec<String> {
+    let root_key = keylet::owner_dir(account_id);
+    let mut out = Vec::new();
+    let mut page = 0u64;
+    loop {
+        let page_key = keylet::dir_node(&root_key, page);
+        let Some(bytes) = view.read(&page_key) else {
+            break;
+        };
+        let Ok(node) = serde_json::from_slice::<Value>(&bytes) else {
+            break;
+        };
+        out.extend(dir_page(&node));
+        let next = read_u64_field(&node, "IndexNext");
+        if next == 0 {
+            break;
+        }
+        page = next;
+    }
+    out
+}
+
 /// Consume the transaction's sequence proxy: either bump the account
 /// `Sequence`, or — when a `TicketSequence` is present — consume the Ticket
 /// SLE (remove it from the owner directory, erase it, and decrement

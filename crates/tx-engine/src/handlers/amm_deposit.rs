@@ -1,8 +1,10 @@
-use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_codec::address::classic::{decode_account_id, encode_account_id};
+use rxrpl_primitives::AccountId;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::amm_helpers;
 use crate::helpers;
+use crate::owner_dir::add_to_owner_dir;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct AMMDepositTransactor;
@@ -19,22 +21,24 @@ impl Transactor for AMMDepositTransactor {
         amm_helpers::validate_asset(asset2)?;
 
         // Two-asset deposit (default) requires both Amount + Amount2; the
-        // tfSingleAsset variant requires exactly one of them.
-        let amount = ctx
-            .tx
-            .get("Amount")
-            .and_then(amm_helpers::amount_value_drops_or_iou);
-        let amount2 = ctx
-            .tx
-            .get("Amount2")
-            .and_then(amm_helpers::amount_value_drops_or_iou);
-
-        match (amount, amount2) {
-            (Some(a), Some(b)) if a > 0 && b > 0 => Ok(()),
-            (Some(a), None) if a > 0 => Ok(()),
-            (None, Some(b)) if b > 0 => Ok(()),
-            _ => Err(TransactionResult::TemBadAmount),
+        // tfSingleAsset variant requires exactly one. Any present amount must be
+        // strictly positive (fractional IOU values included).
+        let amount = ctx.tx.get("Amount");
+        let amount2 = ctx.tx.get("Amount2");
+        let pos1 = amount.map(amm_helpers::amount_is_positive).unwrap_or(false);
+        let pos2 = amount2
+            .map(amm_helpers::amount_is_positive)
+            .unwrap_or(false);
+        if amount.is_some() && !pos1 {
+            return Err(TransactionResult::TemBadAmount);
         }
+        if amount2.is_some() && !pos2 {
+            return Err(TransactionResult::TemBadAmount);
+        }
+        if !pos1 && !pos2 {
+            return Err(TransactionResult::TemBadAmount);
+        }
+        Ok(())
     }
 
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
@@ -60,7 +64,13 @@ impl Transactor for AMMDepositTransactor {
         let deposit2 = amount2_field
             .and_then(amm_helpers::amount_value_drops_or_iou)
             .unwrap_or(0);
-        if deposit1 == 0 && deposit2 == 0 {
+        let pos1 = amount_field
+            .map(amm_helpers::amount_is_positive)
+            .unwrap_or(false);
+        let pos2 = amount2_field
+            .map(amm_helpers::amount_is_positive)
+            .unwrap_or(false);
+        if !pos1 && !pos2 {
             return Err(TransactionResult::TemBadAmount);
         }
 
@@ -76,8 +86,29 @@ impl Transactor for AMMDepositTransactor {
         if amount_is_xrp && amount2_field.is_none() {
             return self.single_xrp_deposit(ctx, &account_id, &amm_key, &mut amm, deposit1);
         }
+        // Single-asset IOU deposit: the pool balance is the AMM account's IOU
+        // trust-line holding; the deposited IOU moves from the depositor's to
+        // the AMM's trust line.
+        if let Some(amount) = amount_field {
+            if amount.is_object() && amount2_field.is_none() {
+                return self.single_iou_deposit(
+                    ctx,
+                    &account_id,
+                    &amm_key,
+                    &mut amm,
+                    amount.clone(),
+                );
+            }
+        }
 
-        // Fallback (two-asset / IOU legs): legacy approximate model.
+        // Two-asset (proportional) deposit on the real AMM model: both Amount
+        // and Amount2 present, each an XRP or IOU leg.
+        if let (Some(a1), Some(a2)) = (amount_field, amount2_field) {
+            let (a1, a2) = (a1.clone(), a2.clone());
+            return self.two_asset_deposit(ctx, &account_id, &amm_key, &mut amm, &a1, &a2);
+        }
+
+        // Fallback (unreachable for valid deposits): legacy approximate model.
         let pool1 = amm_helpers::get_pool_field(&amm, "PoolBalance1");
         let pool2 = amm_helpers::get_pool_field(&amm, "PoolBalance2");
         let total_lp = amm_helpers::get_pool_field(&amm, "LPTokenBalance");
@@ -198,6 +229,371 @@ impl AMMDepositTransactor {
 
         Ok(TransactionResult::TesSuccess)
     }
+
+    /// Single-asset IOU deposit on the real AMM model. The pool balance is the
+    /// AMM account's IOU trust-line holding; the deposited IOU moves from the
+    /// depositor's trust line to the AMM's.
+    fn single_iou_deposit(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+        depositor: &rxrpl_primitives::AccountId,
+        amm_key: &rxrpl_primitives::Hash256,
+        amm: &mut serde_json::Value,
+        amount: serde_json::Value,
+    ) -> Result<TransactionResult, TransactionResult> {
+        use rxrpl_amount::number::Number;
+
+        let amm_account = decode_account_id(
+            amm["Account"]
+                .as_str()
+                .ok_or(TransactionResult::TefInternal)?,
+        )
+        .map_err(|_| TransactionResult::TefInternal)?;
+        let tfee = amm["TradingFee"].as_u64().unwrap_or(0) as u16;
+        let lpt = amm
+            .get("LPTokenBalance")
+            .ok_or(TransactionResult::TefInternal)?;
+        let lp_currency_hex = lpt["currency"]
+            .as_str()
+            .ok_or(TransactionResult::TefInternal)?
+            .to_string();
+        let total_lp = amm_helpers::parse_iou_value(lpt["value"].as_str().unwrap_or("0"));
+
+        // Deposited asset (currency + issuer) and amount.
+        let asset_issuer = decode_account_id(
+            amount["issuer"]
+                .as_str()
+                .ok_or(TransactionResult::TemBadIssuer)?,
+        )
+        .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let asset_currency =
+            helpers::currency_to_bytes(amount["currency"].as_str().unwrap_or_default());
+        let deposit = Number::from_iou(&amm_helpers::parse_iou_value(
+            amount["value"].as_str().unwrap_or("0"),
+        ));
+
+        // Pool = AMM's holding of the deposited asset.
+        let pool =
+            amm_helpers::iou_holding_number(ctx.view, &amm_account, &asset_issuer, &asset_currency);
+
+        // LP tokens from the deposit/pool ratio, then adjustAssetInByTokens:
+        // re-derive tokens and the actual deposit so the rounding can't credit
+        // more than the deposit authorises.
+        let gt = |a: &Number, b: &Number| {
+            let d = a.sub(b);
+            !d.negative() && !d.is_zero()
+        };
+        // STAmount-style subtraction: round the difference onto the IOU grid
+        // (ToNearest), matching rippled's STAmount operator-.
+        let iou_sub = |a: &Number, b: &Number| Number::from_iou(&a.sub(b).to_iou());
+        let r = deposit.div(&pool);
+        let tokens0 = amm_helpers::lp_tokens_out_ratio(&r, &total_lp, tfee);
+        // adjustAssetInByTokens: re-derive the deposit (assetAdj, rounded up to
+        // the IOU grid) consistent with the issued tokens. singleDeposit always
+        // applies min(amount, assetAdj), even when no re-rounding is needed.
+        let asset_adj0 = amm_helpers::amm_asset_in(&pool, &total_lp, &tokens0, tfee);
+        let (tokens, asset_adj) = if gt(&asset_adj0, &deposit) {
+            let adj_amount = iou_sub(&deposit, &iou_sub(&asset_adj0, &deposit));
+            let r2 = adj_amount.div(&pool);
+            let t = amm_helpers::lp_tokens_out_ratio(&r2, &total_lp, tfee);
+            let asset_adj1 = amm_helpers::amm_asset_in(&pool, &total_lp, &t, tfee);
+            (t, asset_adj1)
+        } else {
+            (tokens0, asset_adj0)
+        };
+        let deposit = if gt(&deposit, &asset_adj) {
+            asset_adj
+        } else {
+            deposit
+        };
+
+        // AMM.LPTokenBalance += tokens.
+        let new_total = Number::from_iou(&total_lp)
+            .add(&Number::from_iou(&tokens))
+            .to_iou();
+        amm["LPTokenBalance"]["value"] = serde_json::Value::String(new_total.to_decimal_string());
+        let amm_data = serde_json::to_vec(&*amm).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(*amm_key, amm_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        // Move the deposited IOU: depositor -= deposit, AMM += deposit.
+        let dep_hold =
+            amm_helpers::iou_holding_number(ctx.view, depositor, &asset_issuer, &asset_currency);
+        amm_helpers::set_iou_holding(
+            ctx.view,
+            depositor,
+            &asset_issuer,
+            &asset_currency,
+            &dep_hold.sub(&deposit),
+        )?;
+        amm_helpers::set_iou_holding(
+            ctx.view,
+            &amm_account,
+            &asset_issuer,
+            &asset_currency,
+            &pool.add(&deposit),
+        )?;
+
+        // Credit the depositor's LPToken trust line.
+        credit_lp_line(ctx, depositor, &amm_account, &lp_currency_hex, &tokens)?;
+
+        // Bump the depositor's sequence (fee charged by the engine).
+        let acct_key = keylet::account(depositor);
+        let acct_bytes = ctx
+            .view
+            .read(&acct_key)
+            .ok_or(TransactionResult::TerNoAccount)?;
+        let mut account: serde_json::Value =
+            serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        helpers::increment_sequence(&mut account);
+        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(acct_key, acct_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        Ok(TransactionResult::TesSuccess)
+    }
+
+    /// Two-asset proportional deposit (`equalDepositLimit`): both Amount and
+    /// Amount2 present, each an XRP or IOU leg. Deposits asset1 in full and the
+    /// proportional asset2; if asset2 is the binding limit, deposits asset2 in
+    /// full and the proportional asset1.
+    fn two_asset_deposit(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+        depositor: &rxrpl_primitives::AccountId,
+        amm_key: &rxrpl_primitives::Hash256,
+        amm: &mut serde_json::Value,
+        amount1_field: &serde_json::Value,
+        amount2_field: &serde_json::Value,
+    ) -> Result<TransactionResult, TransactionResult> {
+        use rxrpl_amount::number::Number;
+
+        let amm_account = decode_account_id(
+            amm["Account"]
+                .as_str()
+                .ok_or(TransactionResult::TefInternal)?,
+        )
+        .map_err(|_| TransactionResult::TefInternal)?;
+        let lpt = amm
+            .get("LPTokenBalance")
+            .ok_or(TransactionResult::TefInternal)?;
+        let lp_currency_hex = lpt["currency"]
+            .as_str()
+            .ok_or(TransactionResult::TefInternal)?
+            .to_string();
+        let total_lp = amm_helpers::parse_iou_value(lpt["value"].as_str().unwrap_or("0"));
+
+        let leg1 = DepositLeg::parse(amount1_field)?;
+        let leg2 = DepositLeg::parse(amount2_field)?;
+        let amount1 = leg_requested_number(amount1_field, &leg1);
+        let amount2 = leg_requested_number(amount2_field, &leg2);
+        let pool1 = leg_pool_number(ctx, &amm_account, &leg1);
+        let pool2 = leg_pool_number(ctx, &amm_account, &leg2);
+
+        let gt = |a: &Number, b: &Number| {
+            let d = a.sub(b);
+            !d.negative() && !d.is_zero()
+        };
+        let frac_by_tokens = |tokens: &rxrpl_amount::IOUAmount| {
+            Number::from_iou(tokens).div(&Number::from_iou(&total_lp))
+        };
+
+        // asset1 in full, asset2 proportional.
+        let frac = amount1.div(&pool1);
+        let tokens = amm_helpers::rounded_lp_tokens_deposit(&total_lp, &frac);
+        let amount2_dep = leg_rounded_asset(&leg2, &pool2, &frac_by_tokens(&tokens));
+        let (dep1, dep2, tokens) = if !gt(&amount2_dep, &amount2) {
+            (amount1, amount2_dep, tokens)
+        } else {
+            // asset2 is the binding limit: asset2 in full, asset1 proportional.
+            let frac = amount2.div(&pool2);
+            let tokens = amm_helpers::rounded_lp_tokens_deposit(&total_lp, &frac);
+            let amount1_dep = leg_rounded_asset(&leg1, &pool1, &frac_by_tokens(&tokens));
+            if gt(&amount1_dep, &amount1) {
+                return Ok(TransactionResult::TecAmmFailed);
+            }
+            (amount1_dep, amount2, tokens)
+        };
+
+        // AMM.LPTokenBalance += tokens.
+        let new_total = Number::from_iou(&total_lp)
+            .add(&Number::from_iou(&tokens))
+            .to_iou();
+        amm["LPTokenBalance"]["value"] = serde_json::Value::String(new_total.to_decimal_string());
+        let amm_data = serde_json::to_vec(&*amm).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(*amm_key, amm_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        // Move each leg into the pool; accumulate the XRP leg to deduct once.
+        let mut xrp_deposit = 0u64;
+        apply_leg(
+            ctx,
+            depositor,
+            &amm_account,
+            &leg1,
+            &pool1,
+            &dep1,
+            &mut xrp_deposit,
+        )?;
+        apply_leg(
+            ctx,
+            depositor,
+            &amm_account,
+            &leg2,
+            &pool2,
+            &dep2,
+            &mut xrp_deposit,
+        )?;
+
+        // Credit the depositor's LPToken trust line.
+        credit_lp_line(ctx, depositor, &amm_account, &lp_currency_hex, &tokens)?;
+
+        // Depositor XRP -= xrp_deposit, bump sequence (fee charged by the engine).
+        let acct_key = keylet::account(depositor);
+        let acct_bytes = ctx
+            .view
+            .read(&acct_key)
+            .ok_or(TransactionResult::TerNoAccount)?;
+        let mut account: serde_json::Value =
+            serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let bal = helpers::get_balance(&account);
+        helpers::set_balance(&mut account, bal.saturating_sub(xrp_deposit));
+        helpers::increment_sequence(&mut account);
+        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(acct_key, acct_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        Ok(TransactionResult::TesSuccess)
+    }
+}
+
+/// One leg of an AMM deposit: an XRP balance or an IOU trust-line holding.
+enum DepositLeg {
+    Xrp,
+    Iou {
+        issuer: rxrpl_primitives::AccountId,
+        currency: [u8; 20],
+    },
+}
+
+impl DepositLeg {
+    fn parse(field: &serde_json::Value) -> Result<Self, TransactionResult> {
+        if field.is_string() {
+            return Ok(DepositLeg::Xrp);
+        }
+        let issuer = decode_account_id(
+            field["issuer"]
+                .as_str()
+                .ok_or(TransactionResult::TemBadIssuer)?,
+        )
+        .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let currency = helpers::currency_to_bytes(field["currency"].as_str().unwrap_or_default());
+        Ok(DepositLeg::Iou { issuer, currency })
+    }
+}
+
+/// The requested deposit amount of a leg as a `Number` (drops for XRP, IOU
+/// value otherwise).
+fn leg_requested_number(
+    field: &serde_json::Value,
+    leg: &DepositLeg,
+) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::Number;
+    match leg {
+        DepositLeg::Xrp => Number::from_int(
+            field
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0) as i64,
+        ),
+        DepositLeg::Iou { .. } => Number::from_iou(&amm_helpers::parse_iou_value(
+            field["value"].as_str().unwrap_or("0"),
+        )),
+    }
+}
+
+/// The AMM's pool balance for a leg as a `Number`.
+fn leg_pool_number(
+    ctx: &ApplyContext<'_>,
+    amm_account: &rxrpl_primitives::AccountId,
+    leg: &DepositLeg,
+) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::Number;
+    match leg {
+        DepositLeg::Xrp => {
+            let key = keylet::account(amm_account);
+            let bal = ctx
+                .view
+                .read(&key)
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .map(|a| helpers::get_balance(&a))
+                .unwrap_or(0);
+            Number::from_int(bal as i64)
+        }
+        DepositLeg::Iou { issuer, currency } => {
+            amm_helpers::iou_holding_number(ctx.view, amm_account, issuer, currency)
+        }
+    }
+}
+
+/// `getRoundedAsset(pool, frac, Deposit)` (Upward) for a leg, as a `Number` on
+/// the leg's grid (integer drops for XRP, IOU value otherwise).
+fn leg_rounded_asset(
+    leg: &DepositLeg,
+    pool: &rxrpl_amount::number::Number,
+    frac: &rxrpl_amount::number::Number,
+) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::Number;
+    match leg {
+        DepositLeg::Xrp => Number::from_int(amm_helpers::rounded_asset_up_xrp(pool, frac) as i64),
+        DepositLeg::Iou { .. } => Number::from_iou(&amm_helpers::rounded_asset_up_iou(pool, frac)),
+    }
+}
+
+/// Move `dep` of a leg from the depositor into the AMM pool. XRP legs add to the
+/// AMM account balance and accumulate `xrp_deposit` to deduct from the depositor
+/// once; IOU legs update both trust lines.
+fn apply_leg(
+    ctx: &mut ApplyContext<'_>,
+    depositor: &rxrpl_primitives::AccountId,
+    amm_account: &rxrpl_primitives::AccountId,
+    leg: &DepositLeg,
+    pool: &rxrpl_amount::number::Number,
+    dep: &rxrpl_amount::number::Number,
+    xrp_deposit: &mut u64,
+) -> Result<(), TransactionResult> {
+    match leg {
+        DepositLeg::Xrp => {
+            let drops = dep.to_xrp_drops();
+            *xrp_deposit = xrp_deposit.saturating_add(drops);
+            let key = keylet::account(amm_account);
+            let bytes = ctx.view.read(&key).ok_or(TransactionResult::TerNoAccount)?;
+            let mut acct: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+            let bal = helpers::get_balance(&acct);
+            helpers::set_balance(&mut acct, bal.saturating_add(drops));
+            let data = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(key, data)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
+        DepositLeg::Iou { issuer, currency } => {
+            let dep_hold = amm_helpers::iou_holding_number(ctx.view, depositor, issuer, currency);
+            amm_helpers::set_iou_holding(
+                ctx.view,
+                depositor,
+                issuer,
+                currency,
+                &dep_hold.sub(dep),
+            )?;
+            amm_helpers::set_iou_holding(ctx.view, amm_account, issuer, currency, &pool.add(dep))?;
+        }
+    }
+    Ok(())
 }
 
 /// Add `tokens` LP to the holder's seeded LPToken trust line (`RippleState`).
@@ -216,27 +612,127 @@ fn credit_lp_line(
         .and_then(|b| b.try_into().ok())
         .ok_or(TransactionResult::TefInternal)?;
     let tl_key = keylet::trust_line(holder, amm_account, &cur_bytes);
-    let bytes = ctx
-        .view
-        .read(&tl_key)
-        .ok_or(TransactionResult::TecNoEntry)?;
-    let mut line: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
-
     let holder_is_low = holder.as_bytes() < amm_account.as_bytes();
-    let cur_str = line["Balance"]["value"].as_str().unwrap_or("0");
-    let cur_num = parse_signed_iou(cur_str);
     let tokens_num = Number::from_iou(tokens);
-    let new_num = if holder_is_low {
-        cur_num.add(&tokens_num)
+
+    if let Some(bytes) = ctx.view.read(&tl_key) {
+        let mut line: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let cur_num = parse_signed_iou(line["Balance"]["value"].as_str().unwrap_or("0"));
+        let new_num = if holder_is_low {
+            cur_num.add(&tokens_num)
+        } else {
+            cur_num.sub(&tokens_num)
+        };
+        line["Balance"]["value"] = serde_json::Value::String(new_num.to_iou().to_decimal_string());
+        let data = serde_json::to_vec(&line).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(tl_key, data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+        return Ok(());
+    }
+
+    create_lp_line(
+        ctx,
+        holder,
+        amm_account,
+        lp_currency_hex,
+        &tokens_num,
+        holder_is_low,
+        tl_key,
+    )
+}
+
+/// Create the depositor's LPToken trust line (`RippleState`) on a first deposit
+/// to an AMM. Mirrors rippled's `trustCreate` via `accountSend`: the line is
+/// linked into both owner directories, carries Reserve + NoRipple on the
+/// holder's side, and bumps only the holder's `OwnerCount` (the AMM, as issuer,
+/// takes no reserve).
+#[allow(clippy::too_many_arguments)]
+fn create_lp_line(
+    ctx: &mut ApplyContext<'_>,
+    holder: &AccountId,
+    amm_account: &AccountId,
+    lp_currency_hex: &str,
+    tokens_num: &rxrpl_amount::number::Number,
+    holder_is_low: bool,
+    tl_key: rxrpl_primitives::Hash256,
+) -> Result<(), TransactionResult> {
+    const LSF_LOW_RESERVE: u32 = 0x0001_0000;
+    const LSF_HIGH_RESERVE: u32 = 0x0002_0000;
+    const LSF_LOW_NO_RIPPLE: u32 = 0x0010_0000;
+    const LSF_HIGH_NO_RIPPLE: u32 = 0x0020_0000;
+
+    let balance = if holder_is_low {
+        *tokens_num
     } else {
-        cur_num.sub(&tokens_num)
+        tokens_num.negate()
     };
-    line["Balance"]["value"] = serde_json::Value::String(new_num.to_iou().to_decimal_string());
-    let data = serde_json::to_vec(&line).map_err(|_| TransactionResult::TefInternal)?;
+    let holder_limit = serde_json::json!({
+        "currency": lp_currency_hex,
+        "issuer": encode_account_id(holder),
+        "value": "0",
+    });
+    let amm_limit = serde_json::json!({
+        "currency": lp_currency_hex,
+        "issuer": encode_account_id(amm_account),
+        "value": "0",
+    });
+    let (low_limit, high_limit) = if holder_is_low {
+        (holder_limit, amm_limit)
+    } else {
+        (amm_limit, holder_limit)
+    };
+
+    let holder_page = add_to_owner_dir(ctx.view, holder, &tl_key)?;
+    let amm_page = add_to_owner_dir(ctx.view, amm_account, &tl_key)?;
+    let (low_node, high_node) = if holder_is_low {
+        (holder_page, amm_page)
+    } else {
+        (amm_page, holder_page)
+    };
+
+    let flags = if holder_is_low {
+        LSF_LOW_RESERVE | LSF_LOW_NO_RIPPLE
+    } else {
+        LSF_HIGH_RESERVE | LSF_HIGH_NO_RIPPLE
+    };
+
+    let mut account_one = [0u8; 20];
+    account_one[19] = 1;
+    let no_account = encode_account_id(&AccountId::from(account_one));
+    let mut tl_obj = serde_json::json!({
+        "LedgerEntryType": "RippleState",
+        "Balance": { "currency": lp_currency_hex, "issuer": no_account, "value": balance.to_iou().to_decimal_string() },
+        "LowLimit": low_limit,
+        "HighLimit": high_limit,
+        "Flags": flags,
+        "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+        "PreviousTxnLgrSeq": 0,
+    });
+    // LowNode/HighNode are soeDEFAULT(0): rippled omits them when the line lands
+    // on page 0 of an owner directory.
+    if low_node != 0 {
+        tl_obj["LowNode"] = serde_json::Value::String(format!("{low_node:016X}"));
+    }
+    if high_node != 0 {
+        tl_obj["HighNode"] = serde_json::Value::String(format!("{high_node:016X}"));
+    }
+    let bytes = serde_json::to_vec(&tl_obj).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view
-        .update(tl_key, data)
+        .insert(tl_key, bytes)
         .map_err(|_| TransactionResult::TefInternal)?;
+
+    let holder_key = keylet::account(holder);
+    if let Some(b) = ctx.view.read(&holder_key) {
+        let mut acct: serde_json::Value =
+            serde_json::from_slice(&b).map_err(|_| TransactionResult::TefInternal)?;
+        helpers::adjust_owner_count(&mut acct, 1);
+        let data = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(holder_key, data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+    }
     Ok(())
 }
 
@@ -262,95 +758,12 @@ fn xrp_drops_from_amount_opt(amount: Option<&serde_json::Value>) -> u64 {
 mod tests {
     use super::*;
     use crate::fees::FeeSettings;
-    use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext};
+    use crate::transactor::{PreclaimContext, PreflightContext};
     use crate::view::ledger_view::LedgerView;
-    use crate::view::read_view::ReadView;
-    use crate::view::sandbox::Sandbox;
     use rxrpl_amendment::Rules;
     use rxrpl_ledger::Ledger;
 
-    const ALICE: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
     const BOB: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
-
-    fn setup_with_amm(pool1: u64, pool2: u64, lp: u64) -> Ledger {
-        let mut ledger = Ledger::genesis();
-        for (addr, balance) in [(ALICE, 100_000_000u64), (BOB, 50_000_000)] {
-            let id = decode_account_id(addr).unwrap();
-            let key = keylet::account(&id);
-            let account = serde_json::json!({
-                "LedgerEntryType": "AccountRoot",
-                "Account": addr,
-                "Balance": balance.to_string(),
-                "Sequence": 1,
-                "OwnerCount": 0,
-                "Flags": 0,
-            });
-            ledger
-                .put_state(key, serde_json::to_vec(&account).unwrap())
-                .unwrap();
-        }
-
-        let tx_ref = serde_json::json!({
-            "Asset": "XRP",
-            "Asset2": {"currency": "USD", "issuer": BOB},
-        });
-        let amm_key = amm_helpers::compute_amm_key_from_tx(&tx_ref).unwrap();
-        let amm = serde_json::json!({
-            "LedgerEntryType": "AMM",
-            "Creator": ALICE,
-            "Asset": "XRP",
-            "Asset2": {"currency": "USD", "issuer": BOB},
-            "PoolBalance1": pool1.to_string(),
-            "PoolBalance2": pool2.to_string(),
-            "LPTokenBalance": lp.to_string(),
-            "TradingFee": 500,
-            "VoteSlots": [],
-            "AuctionSlot": null,
-            "Flags": 0,
-        });
-        ledger
-            .put_state(amm_key, serde_json::to_vec(&amm).unwrap())
-            .unwrap();
-        ledger
-    }
-
-    #[test]
-    fn deposit_proportional() {
-        let ledger = setup_with_amm(10_000_000, 5_000_000, 5_000_000);
-        let fees = FeeSettings::default();
-        let view = LedgerView::with_fees(&ledger, fees.clone());
-        let mut sandbox = Sandbox::new(&view);
-        let rules = Rules::new();
-        let tx = serde_json::json!({
-            "TransactionType": "AMMDeposit",
-            "Account": BOB,
-            "Asset": "XRP",
-            "Asset2": {"currency": "USD", "issuer": BOB},
-            "Amount": "2000000",
-            "Amount2": "1000000",
-            "Fee": "12",
-            "Sequence": 1,
-        });
-
-        let mut ctx = ApplyContext {
-            tx: &tx,
-            view: &mut sandbox,
-            rules: &rules,
-            fees: &fees,
-        };
-
-        let result = AMMDepositTransactor.apply(&mut ctx).unwrap();
-        assert_eq!(result, TransactionResult::TesSuccess);
-
-        let amm_key = amm_helpers::compute_amm_key_from_tx(&tx).unwrap();
-        let amm_bytes = sandbox.read(&amm_key).unwrap();
-        let amm: serde_json::Value = serde_json::from_slice(&amm_bytes).unwrap();
-        assert_eq!(amm["PoolBalance1"].as_str().unwrap(), "12000000");
-        assert_eq!(amm["PoolBalance2"].as_str().unwrap(), "6000000");
-
-        // LP tokens: 2000000 * 5000000 / 10000000 = 1000000
-        assert_eq!(amm["LPTokenBalance"].as_str().unwrap(), "6000000");
-    }
 
     #[test]
     fn reject_zero_deposit() {
@@ -436,76 +849,6 @@ mod tests {
         assert_eq!(
             AMMDepositTransactor.preclaim(&ctx),
             Err(TransactionResult::TecNoEntry)
-        );
-    }
-
-    #[test]
-    fn deposit_updates_depositor_balance() {
-        let ledger = setup_with_amm(10_000_000, 5_000_000, 5_000_000);
-        let fees = FeeSettings::default();
-        let view = LedgerView::with_fees(&ledger, fees.clone());
-        let mut sandbox = Sandbox::new(&view);
-        let rules = Rules::new();
-        let tx = serde_json::json!({
-            "TransactionType": "AMMDeposit",
-            "Account": BOB,
-            "Asset": "XRP",
-            "Asset2": {"currency": "USD", "issuer": BOB},
-            "Amount": "2000000",
-            "Amount2": "1000000",
-            "Fee": "12",
-            "Sequence": 1,
-        });
-
-        let mut ctx = ApplyContext {
-            tx: &tx,
-            view: &mut sandbox,
-            rules: &rules,
-            fees: &fees,
-        };
-
-        AMMDepositTransactor.apply(&mut ctx).unwrap();
-
-        let bob_id = decode_account_id(BOB).unwrap();
-        let bob_key = keylet::account(&bob_id);
-        let bob_bytes = sandbox.read(&bob_key).unwrap();
-        let bob: serde_json::Value = serde_json::from_slice(&bob_bytes).unwrap();
-        assert_eq!(bob["Balance"].as_str().unwrap(), "47000000");
-        assert_eq!(bob["Sequence"].as_u64().unwrap(), 2);
-    }
-
-    #[test]
-    fn deposit_mints_lp_ripple_state() {
-        let ledger = setup_with_amm(10_000_000, 5_000_000, 5_000_000);
-        let fees = FeeSettings::default();
-        let view = LedgerView::with_fees(&ledger, fees.clone());
-        let mut sandbox = Sandbox::new(&view);
-        let rules = Rules::new();
-        let tx = serde_json::json!({
-            "TransactionType": "AMMDeposit",
-            "Account": BOB,
-            "Asset": "XRP",
-            "Asset2": {"currency": "USD", "issuer": BOB},
-            "Amount": "2000000",
-            "Amount2": "1000000",
-            "Fee": "12",
-            "Sequence": 1,
-        });
-
-        let mut ctx = ApplyContext {
-            tx: &tx,
-            view: &mut sandbox,
-            rules: &rules,
-            fees: &fees,
-        };
-        AMMDepositTransactor.apply(&mut ctx).unwrap();
-
-        let amm_key = amm_helpers::compute_amm_key_from_tx(&tx).unwrap();
-        let bob_id = decode_account_id(BOB).unwrap();
-        // 2_000_000 * 5_000_000 / 10_000_000 = 1_000_000 LP minted.
-        assert_eq!(
-            amm_helpers::lp_balance_of(&sandbox, &amm_key, &bob_id),
-            1_000_000
         );
     }
 

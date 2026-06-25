@@ -464,6 +464,39 @@ impl Number {
         IOUAmount::from_parts(m as u64, e, self.negative).unwrap_or(IOUAmount::ZERO)
     }
 
+    /// Convert to an `i64` matching rippled's `Number::operator rep()`:
+    /// round to nearest, ties to even, using the active rounding mode for the
+    /// dropped fractional digits.
+    pub fn to_i64(&self) -> i64 {
+        if self.is_zero() {
+            return 0;
+        }
+        let mut drops = self.mantissa as i128;
+        let mut offset = self.exponent;
+        let mut g = Guard::default();
+        if self.negative {
+            g.set_negative();
+            drops = -drops;
+        }
+        while offset < 0 {
+            g.do_push((drops % 10).unsigned_abs() as u32);
+            drops /= 10;
+            offset += 1;
+        }
+        while offset > 0 {
+            drops = drops.saturating_mul(10);
+            offset -= 1;
+        }
+        let r = g.round();
+        if r == 1 || (r == 0 && (drops & 1) == 1) {
+            drops += 1;
+        }
+        if self.negative {
+            drops = -drops;
+        }
+        drops.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    }
+
     /// Convert to integer XRP drops, truncating toward zero (floor for the
     /// non-negative values AMM payouts produce under downward rounding).
     pub fn to_xrp_drops(&self) -> u64 {
@@ -476,6 +509,33 @@ impl Number {
         } else {
             m / 10u128.pow((-self.exponent) as u32)
         };
+        v.min(u64::MAX as u128) as u64
+    }
+
+    /// Convert to integer XRP drops honouring the active rounding mode, matching
+    /// rippled's `toSTAmount` for an XRP asset (`operator rep()` rounds the
+    /// fractional part under the thread-local mode).
+    pub fn to_xrp_drops_mode(&self) -> u64 {
+        if self.is_zero() {
+            return 0;
+        }
+        let m = self.mantissa as u128;
+        if self.exponent >= 0 {
+            return m
+                .saturating_mul(10u128.pow(self.exponent as u32))
+                .min(u64::MAX as u128) as u64;
+        }
+        let div = 10u128.pow((-self.exponent) as u32);
+        let q = m / div;
+        let r = m % div;
+        let half = div / 2;
+        let round_up = match getround() {
+            RoundingMode::ToNearest => r > half || (r == half && (q & 1 == 1)),
+            RoundingMode::TowardsZero => false,
+            RoundingMode::Downward => self.negative && r != 0,
+            RoundingMode::Upward => !self.negative && r != 0,
+        };
+        let v = if round_up { q + 1 } else { q };
         v.min(u64::MAX as u128) as u64
     }
 
@@ -515,6 +575,23 @@ impl PartialEq for Number {
     }
 }
 impl Eq for Number {}
+
+/// `f^n` by square-and-multiply (`log2(n)` multiplications), matching rippled
+/// `power(Number f, unsigned n)`.
+pub fn power(f: &Number, n: u32) -> Number {
+    if n == 0 {
+        return Number::one();
+    }
+    if n == 1 {
+        return *f;
+    }
+    let mut r = power(f, n / 2);
+    r = r.mul(&r);
+    if n % 2 != 0 {
+        r = r.mul(f);
+    }
+    r
+}
 
 /// Square root via Newton-Raphson with a quadratic seed, matching rippled `root2`.
 pub fn root2(mut f: Number) -> Number {

@@ -33,4 +33,11 @@ pub trait ReadView {
 
     /// Get the parent ledger close time.
     fn parent_close_time(&self) -> u32;
+
+    /// Get the parent ledger hash (this ledger's `parentHash`). Used to derive
+    /// pseudo-account addresses (e.g. AMM accounts). Defaults to zero for views
+    /// without a header.
+    fn parent_hash(&self) -> Hash256 {
+        Hash256::ZERO
+    }
 }
