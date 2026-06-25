@@ -76,7 +76,8 @@ impl Transactor for PermissionedDomainSetTransactor {
                 "Owner": account_str,
                 "Sequence": seq,
                 "AcceptedCredentials": credentials,
-                "Flags": 0,
+                "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+                "PreviousTxnLgrSeq": 0,
             });
             let entry_data =
                 serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?;

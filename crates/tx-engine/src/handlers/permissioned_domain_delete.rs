@@ -1,4 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
@@ -6,11 +7,19 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transac
 
 pub struct PermissionedDomainDeleteTransactor;
 
+/// DomainID is the 32-byte ledger key of the PermissionedDomain.
+fn parse_domain_id(tx: &serde_json::Value) -> Result<Hash256, TransactionResult> {
+    let hex = helpers::get_str_field(tx, "DomainID").ok_or(TransactionResult::TemMalformed)?;
+    let bytes = hex::decode(hex).map_err(|_| TransactionResult::TemMalformed)?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| TransactionResult::TemMalformed)?;
+    Ok(Hash256::from(arr))
+}
+
 impl Transactor for PermissionedDomainDeleteTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
-        if helpers::get_u32_field(ctx.tx, "DomainID").is_none() {
-            return Err(TransactionResult::TemMalformed);
-        }
+        parse_domain_id(ctx.tx)?;
         Ok(())
     }
 
@@ -18,10 +27,7 @@ impl Transactor for PermissionedDomainDeleteTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         helpers::read_account_by_address(ctx.view, account_str)?;
 
-        let account_id =
-            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let seq = helpers::get_u32_field(ctx.tx, "DomainID").unwrap();
-        let domain_key = keylet::permissioned_domain(&account_id, seq);
+        let domain_key = parse_domain_id(ctx.tx)?;
         if !ctx.view.exists(&domain_key) {
             return Err(TransactionResult::TecNoEntry);
         }
@@ -44,8 +50,8 @@ impl Transactor for PermissionedDomainDeleteTransactor {
 
         helpers::increment_sequence(&mut account);
 
-        let seq = helpers::get_u32_field(ctx.tx, "DomainID").unwrap();
-        let domain_key = keylet::permissioned_domain(&account_id, seq);
+        let domain_key = parse_domain_id(ctx.tx)?;
+        crate::owner_dir::remove_from_owner_dir_keep_root(ctx.view, &account_id, &domain_key)?;
         ctx.view
             .erase(&domain_key)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -74,6 +80,11 @@ mod tests {
     use rxrpl_ledger::Ledger;
 
     const ALICE: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+
+    fn domain_id_hex() -> String {
+        let id = decode_account_id(ALICE).unwrap();
+        hex::encode(keylet::permissioned_domain(&id, 3).as_bytes()).to_uppercase()
+    }
 
     fn setup_account_with_domain() -> Ledger {
         let mut ledger = Ledger::genesis();
@@ -132,7 +143,7 @@ mod tests {
         let tx = serde_json::json!({
             "TransactionType": "PermissionedDomainDelete",
             "Account": ALICE,
-            "DomainID": 3,
+            "DomainID": domain_id_hex(),
             "Fee": "12",
         });
         let rules = Rules::new();
@@ -169,7 +180,7 @@ mod tests {
         let tx = serde_json::json!({
             "TransactionType": "PermissionedDomainDelete",
             "Account": ALICE,
-            "DomainID": 99,
+            "DomainID": domain_id_hex(),
             "Fee": "12",
         });
         let ctx = PreclaimContext {
@@ -194,7 +205,7 @@ mod tests {
         let tx = serde_json::json!({
             "TransactionType": "PermissionedDomainDelete",
             "Account": ALICE,
-            "DomainID": 3,
+            "DomainID": domain_id_hex(),
             "Fee": "12",
             "Sequence": 5,
         });
@@ -230,7 +241,7 @@ mod tests {
         let tx = serde_json::json!({
             "TransactionType": "PermissionedDomainDelete",
             "Account": ALICE,
-            "DomainID": 3,
+            "DomainID": domain_id_hex(),
             "Fee": "12",
         });
         let ctx = PreclaimContext {
