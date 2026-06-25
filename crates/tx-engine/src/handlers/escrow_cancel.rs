@@ -2,7 +2,7 @@ use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
-use crate::owner_dir::remove_from_owner_dir;
+use crate::owner_dir::remove_from_owner_dir_keep_root;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct EscrowCancelTransactor;
@@ -110,8 +110,19 @@ impl Transactor for EscrowCancelTransactor {
                 .map_err(|_| TransactionResult::TefInternal)?;
         }
 
-        // Unlink escrow from owner directory then delete it.
-        remove_from_owner_dir(ctx.view, &owner_id, &escrow_key)?;
+        // Unlink escrow from the owner directory (keeping an emptied root), and
+        // — when the destination differs from the owner — from the destination
+        // directory too, then delete it.
+        remove_from_owner_dir_keep_root(ctx.view, &owner_id, &escrow_key)?;
+        if let Some(dst_id) = escrow
+            .get("Destination")
+            .and_then(|v| v.as_str())
+            .and_then(|d| decode_account_id(d).ok())
+        {
+            if dst_id != owner_id {
+                remove_from_owner_dir_keep_root(ctx.view, &dst_id, &escrow_key)?;
+            }
+        }
         ctx.view
             .erase(&escrow_key)
             .map_err(|_| TransactionResult::TefInternal)?;

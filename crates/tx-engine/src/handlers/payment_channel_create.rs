@@ -111,10 +111,13 @@ impl Transactor for PaymentChannelCreateTransactor {
             "Account": account_str,
             "Destination": destination_str,
             "Amount": amount.to_string(),
-            "Balance": "0",
             "SettleDelay": helpers::get_u32_field(ctx.tx, "SettleDelay").unwrap(),
             "PublicKey": helpers::get_str_field(ctx.tx, "PublicKey").unwrap(),
-            "Flags": 0,
+            // Creating account's sequence; identifies the channel.
+            "Sequence": tx_seq,
+            // Placeholder filled by the engine's central PreviousTxnID stamping.
+            "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+            "PreviousTxnLgrSeq": 0,
         });
 
         if let Some(cancel_after) = helpers::get_u32_field(ctx.tx, "CancelAfter") {
@@ -134,6 +137,19 @@ impl Transactor for PaymentChannelCreateTransactor {
             .map_err(|_| TransactionResult::TefInternal)?;
 
         add_to_owner_dir(ctx.view, &src_id, &channel_key)?;
+
+        // When the destination differs from the owner, rippled also links the
+        // channel into the destination's owner directory and threads the
+        // destination AccountRoot (no field change).
+        if dst_id != src_id {
+            add_to_owner_dir(ctx.view, &dst_id, &channel_key)?;
+            let dst_key = keylet::account(&dst_id);
+            if let Some(dst_bytes) = ctx.view.read(&dst_key) {
+                ctx.view
+                    .update(dst_key, dst_bytes)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+            }
+        }
 
         Ok(TransactionResult::TesSuccess)
     }
@@ -239,6 +255,8 @@ mod tests {
         let ch_bytes = sandbox.read(&channel_key).unwrap();
         let ch: serde_json::Value = serde_json::from_slice(&ch_bytes).unwrap();
         assert_eq!(ch["Amount"].as_str().unwrap(), "10000000");
-        assert_eq!(ch["Balance"].as_str().unwrap(), "0");
+        // Balance defaults to 0 and is omitted from a freshly created channel.
+        assert!(ch.get("Balance").is_none());
+        assert_eq!(ch["Sequence"].as_u64().unwrap(), 1);
     }
 }

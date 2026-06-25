@@ -3,12 +3,12 @@ use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
-use crate::owner_dir::remove_from_owner_dir;
+use crate::owner_dir::remove_from_owner_dir_keep_root;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct PaymentChannelClaimTransactor;
 
-const TF_CLOSE: u32 = 0x0001_0000;
+const TF_CLOSE: u32 = 0x0002_0000;
 
 fn parse_channel(tx: &serde_json::Value) -> Result<Hash256, TransactionResult> {
     let hex_str = helpers::get_str_field(tx, "Channel").ok_or(TransactionResult::TemMalformed)?;
@@ -69,10 +69,12 @@ impl Transactor for PaymentChannelClaimTransactor {
             .as_str()
             .and_then(|s| s.parse().ok())
             .ok_or(TransactionResult::TefInternal)?;
-        let ch_balance: u64 = channel["Balance"]
-            .as_str()
+        // Balance defaults to 0 and is absent on a freshly created channel.
+        let ch_balance: u64 = channel
+            .get("Balance")
+            .and_then(|v| v.as_str())
             .and_then(|s| s.parse().ok())
-            .ok_or(TransactionResult::TefInternal)?;
+            .unwrap_or(0);
 
         let ch_src_str = channel["Account"]
             .as_str()
@@ -254,10 +256,17 @@ impl Transactor for PaymentChannelClaimTransactor {
                 }
             }
 
-            // Unlink from source's owner directory then delete the channel.
+            // Unlink the channel from the source's owner directory and — when
+            // the destination differs — from the destination directory too
+            // (keeping emptied roots), then delete it.
             let src_id_for_dir = decode_account_id(&ch_src_str)
                 .map_err(|_| TransactionResult::TemInvalidAccountId)?;
-            remove_from_owner_dir(ctx.view, &src_id_for_dir, &channel_key)?;
+            remove_from_owner_dir_keep_root(ctx.view, &src_id_for_dir, &channel_key)?;
+            let dst_id_for_dir = decode_account_id(&ch_dst_str)
+                .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+            if dst_id_for_dir != src_id_for_dir {
+                remove_from_owner_dir_keep_root(ctx.view, &dst_id_for_dir, &channel_key)?;
+            }
             ctx.view
                 .erase(&channel_key)
                 .map_err(|_| TransactionResult::TefInternal)?;
