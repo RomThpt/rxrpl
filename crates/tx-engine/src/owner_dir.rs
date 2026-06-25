@@ -185,6 +185,20 @@ pub fn dir_remove_page(
     page: u64,
     entry_key: &Hash256,
 ) -> Result<(), TransactionResult> {
+    dir_remove_page_impl(view, root_key, page, entry_key, false)
+}
+
+/// As `dir_remove_page`, but when the removal empties the whole directory the
+/// root page is kept (left with an empty `Indexes`) instead of erased. rippled
+/// chooses this per call site (`dirRemove` `keepRoot`); e.g. DIDDelete keeps the
+/// empty owner-directory root while OfferCancel deletes it.
+fn dir_remove_page_impl(
+    view: &mut dyn ApplyView,
+    root_key: &Hash256,
+    page: u64,
+    entry_key: &Hash256,
+    keep_root: bool,
+) -> Result<(), TransactionResult> {
     let entry_hex = entry_key.to_string().to_uppercase();
     let order_preserving = view.sorted_directories();
     let page_key = keylet::dir_node(root_key, page);
@@ -212,16 +226,19 @@ pub fn dir_remove_page(
         relink(view, root_key, prev, next)?;
         view.erase(&page_key)
             .map_err(|_| TransactionResult::TefInternal)?;
-        // If that emptied the whole directory, drop the now-empty root too.
-        if let Some(b) = view.read(root_key) {
-            if let Ok(root) = serde_json::from_slice::<Value>(&b) {
-                if dir_page(&root).is_empty() && read_u64_field(&root, "IndexNext") == 0 {
-                    view.erase(root_key)
-                        .map_err(|_| TransactionResult::TefInternal)?;
+        // If that emptied the whole directory, drop the now-empty root too
+        // (unless the caller asked to keep it).
+        if !keep_root {
+            if let Some(b) = view.read(root_key) {
+                if let Ok(root) = serde_json::from_slice::<Value>(&b) {
+                    if dir_page(&root).is_empty() && read_u64_field(&root, "IndexNext") == 0 {
+                        view.erase(root_key)
+                            .map_err(|_| TransactionResult::TefInternal)?;
+                    }
                 }
             }
         }
-    } else if indexes.is_empty() && page == 0 && next == 0 {
+    } else if indexes.is_empty() && page == 0 && next == 0 && !keep_root {
         view.erase(&page_key)
             .map_err(|_| TransactionResult::TefInternal)?;
     } else {
@@ -322,6 +339,35 @@ pub fn remove_from_owner_dir(
     dir_remove(view, &keylet::owner_dir(account_id), entry_key)
 }
 
+/// As `remove_from_owner_dir`, but keeps the owner-directory root page (empty)
+/// if the removal empties the directory. Matches rippled call sites that pass
+/// `keepRoot = true` (e.g. DIDDelete).
+pub fn remove_from_owner_dir_keep_root(
+    view: &mut dyn ApplyView,
+    account_id: &AccountId,
+    entry_key: &Hash256,
+) -> Result<(), TransactionResult> {
+    let root_key = keylet::owner_dir(account_id);
+    let entry_hex = entry_key.to_string().to_uppercase();
+    let mut page = 0u64;
+    loop {
+        let page_key = keylet::dir_node(&root_key, page);
+        let Some(bytes) = view.read(&page_key) else {
+            return Ok(());
+        };
+        let node: Value =
+            serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let next = read_u64_field(&node, "IndexNext");
+        if dir_page(&node).iter().any(|h| h == &entry_hex) {
+            return dir_remove_page_impl(view, &root_key, page, entry_key, true);
+        }
+        if next == 0 {
+            return Ok(());
+        }
+        page = next;
+    }
+}
+
 /// Remove an entry from a known page of the account's owner directory, using the
 /// page hint recorded on the owning SLE (`OwnerNode` / `DestinationNode`).
 pub fn remove_from_owner_dir_page(
@@ -335,7 +381,7 @@ pub fn remove_from_owner_dir_page(
 
 /// Collect every entry key listed in an account's owner directory, walking the
 /// page chain from the root. Entries are returned in directory order (page by
-/// page). Used by AMMDelete to enumerate the AMM account's holdings.
+/// page). Used by AMMDelete and AccountDelete to enumerate an account's holdings.
 pub fn collect_owner_dir_entries(
     view: &dyn crate::view::read_view::ReadView,
     account_id: &AccountId,
