@@ -30,7 +30,11 @@ impl Transactor for CredentialAcceptTransactor {
             decode_account_id(subject_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let issuer_id =
             decode_account_id(issuer_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let cred_key = keylet::credential(&subject_id, &issuer_id, credential_type.as_bytes());
+        let cred_key = keylet::credential(
+            &subject_id,
+            &issuer_id,
+            &hex::decode(credential_type).map_err(|_| TransactionResult::TemMalformed)?,
+        );
 
         let entry_bytes = ctx
             .view
@@ -80,7 +84,11 @@ impl Transactor for CredentialAcceptTransactor {
         let credential_type = helpers::get_str_field(ctx.tx, "CredentialType").unwrap();
         let issuer_id =
             decode_account_id(issuer_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let cred_key = keylet::credential(&subject_id, &issuer_id, credential_type.as_bytes());
+        let cred_key = keylet::credential(
+            &subject_id,
+            &issuer_id,
+            &hex::decode(credential_type).map_err(|_| TransactionResult::TemMalformed)?,
+        );
 
         let entry_bytes = ctx
             .view
@@ -89,9 +97,7 @@ impl Transactor for CredentialAcceptTransactor {
         let mut entry: serde_json::Value =
             serde_json::from_slice(&entry_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        entry["Accepted"] = serde_json::Value::Bool(true);
-        // Also set lsfAccepted flag (0x00010000) so account_objects responses
-        // expose the accepted status via the Flags field, matching rippled.
+        // Set lsfAccepted (0x00010000) on the credential.
         const LSF_ACCEPTED: u32 = 0x00010000;
         let prev_flags = entry.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         entry["Flags"] = serde_json::Value::from(prev_flags | LSF_ACCEPTED);
@@ -101,10 +107,27 @@ impl Transactor for CredentialAcceptTransactor {
             .update(cred_key, entry_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
+        // Accepting transfers the credential's reserve from the issuer to the
+        // subject: subject OwnerCount +1, issuer OwnerCount -1.
+        helpers::adjust_owner_count(&mut account, 1);
         let account_data =
             serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(account_key, account_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        let issuer_key = keylet::account(&issuer_id);
+        let issuer_bytes = ctx
+            .view
+            .read(&issuer_key)
+            .ok_or(TransactionResult::TerNoAccount)?;
+        let mut issuer_acct: serde_json::Value =
+            serde_json::from_slice(&issuer_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        helpers::adjust_owner_count(&mut issuer_acct, -1);
+        let issuer_data =
+            serde_json::to_vec(&issuer_acct).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(issuer_key, issuer_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
         Ok(TransactionResult::TesSuccess)
@@ -151,7 +174,7 @@ mod tests {
             "LedgerEntryType": "Credential",
             "Subject": BOB,
             "Issuer": ALICE,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Accepted": accepted,
             "Flags": 0,
         });
@@ -167,7 +190,7 @@ mod tests {
         let tx = serde_json::json!({
             "TransactionType": "CredentialAccept",
             "Account": BOB,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Fee": "12",
         });
         let rules = Rules::new();
@@ -229,7 +252,7 @@ mod tests {
             "TransactionType": "CredentialAccept",
             "Account": BOB,
             "Issuer": ALICE,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Fee": "12",
         });
         let ctx = PreclaimContext {
@@ -254,7 +277,7 @@ mod tests {
             "TransactionType": "CredentialAccept",
             "Account": BOB,
             "Issuer": ALICE,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Fee": "12",
         });
         let ctx = PreclaimContext {
@@ -297,7 +320,7 @@ mod tests {
             "LedgerEntryType": "Credential",
             "Subject": BOB,
             "Issuer": ALICE,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Flags": 0x00010000u32,
         });
         ledger
@@ -312,7 +335,7 @@ mod tests {
             "TransactionType": "CredentialAccept",
             "Account": BOB,
             "Issuer": ALICE,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Fee": "12",
         });
         let ctx = PreclaimContext {
@@ -338,7 +361,7 @@ mod tests {
             "TransactionType": "CredentialAccept",
             "Account": BOB,
             "Issuer": ALICE,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Fee": "12",
             "Sequence": 1,
         });
@@ -358,6 +381,6 @@ mod tests {
         let cred_key = keylet::credential(&bob_id, &alice_id, b"KYC");
         let entry_bytes = sandbox.read(&cred_key).unwrap();
         let entry: serde_json::Value = serde_json::from_slice(&entry_bytes).unwrap();
-        assert!(entry["Accepted"].as_bool().unwrap());
+        assert!(entry["Flags"].as_u64().unwrap() as u32 & 0x0001_0000 != 0);
     }
 }

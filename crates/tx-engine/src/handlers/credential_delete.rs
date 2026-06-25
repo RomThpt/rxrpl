@@ -8,12 +8,6 @@ pub struct CredentialDeleteTransactor;
 
 impl Transactor for CredentialDeleteTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
-        if helpers::get_str_field(ctx.tx, "Subject").is_none() {
-            return Err(TransactionResult::TemMalformed);
-        }
-        if helpers::get_str_field(ctx.tx, "Issuer").is_none() {
-            return Err(TransactionResult::TemMalformed);
-        }
         if helpers::get_str_field(ctx.tx, "CredentialType").is_none() {
             return Err(TransactionResult::TemMalformed);
         }
@@ -24,8 +18,9 @@ impl Transactor for CredentialDeleteTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         helpers::read_account_by_address(ctx.view, account_str)?;
 
-        let subject_str = helpers::get_str_field(ctx.tx, "Subject").unwrap();
-        let issuer_str = helpers::get_str_field(ctx.tx, "Issuer").unwrap();
+        // Subject and Issuer default to the submitting Account when absent.
+        let subject_str = helpers::get_str_field(ctx.tx, "Subject").unwrap_or(account_str);
+        let issuer_str = helpers::get_str_field(ctx.tx, "Issuer").unwrap_or(account_str);
 
         // Account must be either Subject or Issuer
         if account_str != subject_str && account_str != issuer_str {
@@ -37,7 +32,11 @@ impl Transactor for CredentialDeleteTransactor {
         let issuer_id =
             decode_account_id(issuer_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let credential_type = helpers::get_str_field(ctx.tx, "CredentialType").unwrap();
-        let cred_key = keylet::credential(&subject_id, &issuer_id, credential_type.as_bytes());
+        let cred_key = keylet::credential(
+            &subject_id,
+            &issuer_id,
+            &hex::decode(credential_type).map_err(|_| TransactionResult::TemMalformed)?,
+        );
 
         if !ctx.view.exists(&cred_key) {
             return Err(TransactionResult::TecNoEntry);
@@ -61,39 +60,57 @@ impl Transactor for CredentialDeleteTransactor {
 
         helpers::increment_sequence(&mut account);
 
-        let subject_str = helpers::get_str_field(ctx.tx, "Subject").unwrap();
-        let issuer_str = helpers::get_str_field(ctx.tx, "Issuer").unwrap();
+        let subject_str = helpers::get_str_field(ctx.tx, "Subject").unwrap_or(account_str);
+        let issuer_str = helpers::get_str_field(ctx.tx, "Issuer").unwrap_or(account_str);
         let credential_type = helpers::get_str_field(ctx.tx, "CredentialType").unwrap();
 
         let subject_id =
             decode_account_id(subject_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let issuer_id =
             decode_account_id(issuer_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let cred_key = keylet::credential(&subject_id, &issuer_id, credential_type.as_bytes());
+        let cred_key = keylet::credential(
+            &subject_id,
+            &issuer_id,
+            &hex::decode(credential_type).map_err(|_| TransactionResult::TemMalformed)?,
+        );
 
+        // The credential's reserve is held by the subject once accepted, else by
+        // the issuer.
+        const LSF_ACCEPTED: u32 = 0x00010000;
+        let cred_bytes = ctx
+            .view
+            .read(&cred_key)
+            .ok_or(TransactionResult::TecNoEntry)?;
+        let cred: serde_json::Value =
+            serde_json::from_slice(&cred_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let accepted = helpers::get_flags(&cred) & LSF_ACCEPTED != 0;
+        let reserve_holder = if accepted { subject_id } else { issuer_id };
+
+        // Unlink from both directories, then erase.
+        crate::owner_dir::remove_from_owner_dir(ctx.view, &issuer_id, &cred_key)?;
+        if subject_id != issuer_id {
+            crate::owner_dir::remove_from_owner_dir(ctx.view, &subject_id, &cred_key)?;
+        }
         ctx.view
             .erase(&cred_key)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Adjust owner count on the issuer
-        if account_str == issuer_str {
+        // Decrement the reserve holder's owner count.
+        if reserve_holder == account_id {
             helpers::adjust_owner_count(&mut account, -1);
         } else {
-            // Account is subject; decrement issuer's owner count separately
-            let issuer_account_key = keylet::account(&issuer_id);
-            let issuer_bytes = ctx
+            let holder_key = keylet::account(&reserve_holder);
+            let holder_bytes = ctx
                 .view
-                .read(&issuer_account_key)
+                .read(&holder_key)
                 .ok_or(TransactionResult::TerNoAccount)?;
-            let mut issuer_account: serde_json::Value = serde_json::from_slice(&issuer_bytes)
+            let mut holder: serde_json::Value = serde_json::from_slice(&holder_bytes)
                 .map_err(|_| TransactionResult::TefInternal)?;
-
-            helpers::adjust_owner_count(&mut issuer_account, -1);
-
-            let issuer_data =
-                serde_json::to_vec(&issuer_account).map_err(|_| TransactionResult::TefInternal)?;
+            helpers::adjust_owner_count(&mut holder, -1);
+            let holder_data =
+                serde_json::to_vec(&holder).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
-                .update(issuer_account_key, issuer_data)
+                .update(holder_key, holder_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
         }
 
@@ -147,7 +164,7 @@ mod tests {
             "LedgerEntryType": "Credential",
             "Subject": BOB,
             "Issuer": ALICE,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Accepted": true,
             "Flags": 0,
         });
@@ -206,7 +223,7 @@ mod tests {
             "Account": CHARLIE,
             "Subject": BOB,
             "Issuer": ALICE,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Fee": "12",
         });
         let ctx = PreclaimContext {
@@ -246,7 +263,7 @@ mod tests {
             "Account": ALICE,
             "Subject": BOB,
             "Issuer": ALICE,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Fee": "12",
         });
         let ctx = PreclaimContext {
@@ -273,7 +290,7 @@ mod tests {
             "Account": ALICE,
             "Subject": BOB,
             "Issuer": ALICE,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Fee": "12",
             "Sequence": 1,
         });
@@ -312,7 +329,7 @@ mod tests {
             "Account": BOB,
             "Subject": BOB,
             "Issuer": ALICE,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Fee": "12",
             "Sequence": 1,
         });
