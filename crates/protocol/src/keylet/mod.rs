@@ -313,9 +313,10 @@ pub fn vault(owner: &AccountId, seq: u32) -> Hash256 {
 
 /// Compute the keylet for a multi-purpose token issuance.
 pub fn mptoken_issuance(id: &AccountId, seq: u32) -> Hash256 {
+    // rippled hashes the sequence before the issuer (Indexes.cpp mptIssuance).
     index_hash(
         LedgerNamespace::MPTokenIssuance,
-        &[id.as_bytes(), &seq.to_be_bytes()],
+        &[&seq.to_be_bytes(), id.as_bytes()],
     )
 }
 
