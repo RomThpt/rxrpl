@@ -2,7 +2,7 @@ use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
-use crate::owner_dir::remove_from_owner_dir;
+use crate::owner_dir::{consume_seq_or_ticket, remove_from_owner_dir};
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct EscrowFinishTransactor;
@@ -115,7 +115,7 @@ impl Transactor for EscrowFinishTransactor {
             .erase(&escrow_key)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Decrement owner count on source
+        // Decrement owner count on the escrow owner (the escrow is removed).
         let owner_key = keylet::account(&owner_id);
         let owner_bytes = ctx
             .view
@@ -125,22 +125,26 @@ impl Transactor for EscrowFinishTransactor {
             serde_json::from_slice(&owner_bytes).map_err(|_| TransactionResult::TefInternal)?;
         helpers::adjust_owner_count(&mut owner_account, -1);
 
-        // Increment sequence on the transaction sender (not necessarily the owner)
+        // The transaction sender (not necessarily the owner) consumes its
+        // sequence proxy: a TicketSequence burns the Ticket SLE, otherwise the
+        // AccountRoot Sequence is bumped.
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         if account_id == owner_id {
-            helpers::increment_sequence(&mut owner_account);
-        }
+            consume_seq_or_ticket(ctx.view, &owner_id, &mut owner_account, ctx.tx)?;
+            let owner_data =
+                serde_json::to_vec(&owner_account).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(owner_key, owner_data)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        } else {
+            let owner_data =
+                serde_json::to_vec(&owner_account).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(owner_key, owner_data)
+                .map_err(|_| TransactionResult::TefInternal)?;
 
-        let owner_data =
-            serde_json::to_vec(&owner_account).map_err(|_| TransactionResult::TefInternal)?;
-        ctx.view
-            .update(owner_key, owner_data)
-            .map_err(|_| TransactionResult::TefInternal)?;
-
-        // If sender is different from owner, increment sender's sequence
-        if account_id != owner_id {
             let sender_key = keylet::account(&account_id);
             let sender_bytes = ctx
                 .view
@@ -148,7 +152,7 @@ impl Transactor for EscrowFinishTransactor {
                 .ok_or(TransactionResult::TerNoAccount)?;
             let mut sender_account: serde_json::Value = serde_json::from_slice(&sender_bytes)
                 .map_err(|_| TransactionResult::TefInternal)?;
-            helpers::increment_sequence(&mut sender_account);
+            consume_seq_or_ticket(ctx.view, &account_id, &mut sender_account, ctx.tx)?;
             let sender_data =
                 serde_json::to_vec(&sender_account).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view

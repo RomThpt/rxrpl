@@ -7,6 +7,10 @@ use crate::helpers;
 use crate::owner_dir::{add_to_owner_dir, remove_from_owner_dir};
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
+/// `lsfOneOwnerCount`: a SignerList created with MultiSignReserve active counts
+/// as a single owner-reserve item.
+const LSF_ONE_OWNER_COUNT: u32 = 0x0001_0000;
+
 /// SignerListSet transaction handler.
 ///
 /// Sets, updates, or removes the signer list for multi-signing.
@@ -109,18 +113,24 @@ impl Transactor for SignerListSetTransactor {
                 .update(acct_key, new_bytes)
                 .map_err(|_| TransactionResult::TemMalformed)?;
         } else {
-            // Create or update signer list
+            // The signer list carries lsfOneOwnerCount and counts as a single
+            // owner-reserve item (MultiSignReserve, retired/permanent).
+            let flags = LSF_ONE_OWNER_COUNT;
+            // Fields mirror rippled's created SignerList SLE: sfSignerListID and
+            // sfOwnerNode default to 0 and are not serialized.
             let sl_obj = serde_json::json!({
                 "LedgerEntryType": "SignerList",
+                "Owner": account_str,
                 "SignerQuorum": quorum,
                 "SignerEntries": ctx.tx.get("SignerEntries").cloned().unwrap_or(Value::Array(vec![])),
-                "SignerListID": 0,
-                "Flags": 0,
+                "Flags": flags,
+                // Placeholder filled by the engine's central PreviousTxnID stamping.
+                "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+                "PreviousTxnLgrSeq": 0,
             });
 
             let sl_bytes =
                 serde_json::to_vec(&sl_obj).map_err(|_| TransactionResult::TemMalformed)?;
-
             if existing {
                 ctx.view
                     .update(sl_key, sl_bytes)
