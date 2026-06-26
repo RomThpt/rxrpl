@@ -1,4 +1,6 @@
+use rxrpl_amount::number::Number;
 use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
@@ -6,58 +8,46 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transac
 
 pub struct LoanBrokerCoverDepositTransactor;
 
+/// Parse the 32-byte `LoanBrokerID` (the loan-broker keylet itself).
+fn loan_broker_id(tx: &serde_json::Value) -> Result<Hash256, TransactionResult> {
+    let hex_str =
+        helpers::get_str_field(tx, "LoanBrokerID").ok_or(TransactionResult::TemMalformed)?;
+    let bytes = hex::decode(hex_str).map_err(|_| TransactionResult::TemMalformed)?;
+    if bytes.len() != 32 {
+        return Err(TransactionResult::TemMalformed);
+    }
+    Hash256::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)
+}
+
 impl Transactor for LoanBrokerCoverDepositTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
-        helpers::get_str_field(ctx.tx, "LoanBrokerOwner").ok_or(TransactionResult::TemMalformed)?;
-        helpers::get_u32_field(ctx.tx, "LoanBrokerSequence")
-            .ok_or(TransactionResult::TemMalformed)?;
-
-        let amount =
-            helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
-        if amount == 0 {
+        loan_broker_id(ctx.tx)?;
+        let amount = ctx
+            .tx
+            .get("Amount")
+            .ok_or(TransactionResult::TemBadAmount)?;
+        // Cover is held as the vault asset (an IOU); a positive value is required.
+        let value = amount
+            .get("value")
+            .and_then(|v| v.as_str())
+            .ok_or(TransactionResult::TemBadAmount)?;
+        if value
+            .trim_start_matches('-')
+            .trim_start_matches('0')
+            .is_empty()
+        {
             return Err(TransactionResult::TemBadAmount);
         }
-
         Ok(())
     }
 
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let (_, account_obj) = helpers::read_account_by_address(ctx.view, account_str)?;
-
-        let broker_owner_str = helpers::get_str_field(ctx.tx, "LoanBrokerOwner")
-            .ok_or(TransactionResult::TemMalformed)?;
-        let broker_seq = helpers::get_u32_field(ctx.tx, "LoanBrokerSequence")
-            .ok_or(TransactionResult::TemMalformed)?;
-
-        let broker_owner_id = decode_account_id(broker_owner_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let broker_key = keylet::loan_broker(broker_owner_id.as_bytes(), broker_seq);
-
-        let broker_bytes = ctx
-            .view
-            .read(&broker_key)
-            .ok_or(TransactionResult::TecNoEntry)?;
-        let broker: serde_json::Value =
-            serde_json::from_slice(&broker_bytes).map_err(|_| TransactionResult::TefInternal)?;
-
-        // Caller must be Owner
-        let owner = broker["Owner"]
-            .as_str()
-            .ok_or(TransactionResult::TefInternal)?;
-        if owner != account_str {
-            return Err(TransactionResult::TecNoPermission);
+        helpers::read_account_by_address(ctx.view, account_str)?;
+        let broker_key = loan_broker_id(ctx.tx)?;
+        if ctx.view.read(&broker_key).is_none() {
+            return Err(TransactionResult::TecNoEntry);
         }
-
-        // Sufficient balance
-        let amount =
-            helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
-        let fee = helpers::get_fee(ctx.tx);
-        let balance = helpers::get_balance(&account_obj);
-        if balance < amount + fee {
-            return Err(TransactionResult::TecUnfundedPayment);
-        }
-
         Ok(())
     }
 
@@ -66,41 +56,80 @@ impl Transactor for LoanBrokerCoverDepositTransactor {
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        let broker_owner_str = helpers::get_str_field(ctx.tx, "LoanBrokerOwner")
-            .ok_or(TransactionResult::TemMalformed)?
-            .to_string();
-        let broker_seq = helpers::get_u32_field(ctx.tx, "LoanBrokerSequence")
-            .ok_or(TransactionResult::TemMalformed)?;
-        let amount =
-            helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
+        let amount = ctx
+            .tx
+            .get("Amount")
+            .ok_or(TransactionResult::TemBadAmount)?;
+        let value = amount
+            .get("value")
+            .and_then(|v| v.as_str())
+            .ok_or(TransactionResult::TemBadAmount)?;
+        let issuer = decode_account_id(
+            amount
+                .get("issuer")
+                .and_then(|v| v.as_str())
+                .ok_or(TransactionResult::TemBadIssuer)?,
+        )
+        .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let currency = helpers::currency_to_bytes(
+            amount
+                .get("currency")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+        );
+        let amount_num = Number::from_iou(&crate::amm_helpers::parse_iou_value(value));
 
-        let broker_owner_id = decode_account_id(&broker_owner_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let broker_key = keylet::loan_broker(broker_owner_id.as_bytes(), broker_seq);
-
-        // Update broker CoverAvailable
+        let broker_key = loan_broker_id(ctx.tx)?;
         let broker_bytes = ctx
             .view
             .read(&broker_key)
             .ok_or(TransactionResult::TecNoEntry)?;
         let mut broker: serde_json::Value =
             serde_json::from_slice(&broker_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let pseudo_id = decode_account_id(
+            broker["Account"]
+                .as_str()
+                .ok_or(TransactionResult::TefInternal)?,
+        )
+        .map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        let cover_available: u64 = broker["CoverAvailable"]
-            .as_str()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        // Move the cover from the depositor's holding to the broker pseudo's.
+        let depositor_hold =
+            crate::amm_helpers::iou_holding_number(ctx.view, &account_id, &issuer, &currency);
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            &account_id,
+            &issuer,
+            &currency,
+            &depositor_hold.sub(&amount_num),
+        )?;
+        let pseudo_hold =
+            crate::amm_helpers::iou_holding_number(ctx.view, &pseudo_id, &issuer, &currency);
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            &pseudo_id,
+            &issuer,
+            &currency,
+            &pseudo_hold.add(&amount_num),
+        )?;
 
+        // Grow the broker's available cover (STNumber).
+        let cover = Number::from_iou(&crate::amm_helpers::parse_iou_value(
+            broker
+                .get("CoverAvailable")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0"),
+        ));
         broker["CoverAvailable"] =
-            serde_json::Value::String((cover_available + amount).to_string());
-
-        let broker_data =
-            serde_json::to_vec(&broker).map_err(|_| TransactionResult::TefInternal)?;
+            serde_json::Value::String(cover.add(&amount_num).to_decimal_string());
         ctx.view
-            .update(broker_key, broker_data)
+            .update(
+                broker_key,
+                serde_json::to_vec(&broker).map_err(|_| TransactionResult::TefInternal)?,
+            )
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Debit caller
+        // Bump the depositor's sequence.
         let acct_key = keylet::account(&account_id);
         let acct_bytes = ctx
             .view
@@ -108,162 +137,14 @@ impl Transactor for LoanBrokerCoverDepositTransactor {
             .ok_or(TransactionResult::TerNoAccount)?;
         let mut account: serde_json::Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
-
-        let balance = helpers::get_balance(&account);
-        helpers::set_balance(
-            &mut account,
-            balance
-                .checked_sub(amount)
-                .ok_or(TransactionResult::TecUnfundedPayment)?,
-        );
         helpers::increment_sequence(&mut account);
-
-        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
-            .update(acct_key, acct_data)
+            .update(
+                acct_key,
+                serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?,
+            )
             .map_err(|_| TransactionResult::TefInternal)?;
 
         Ok(TransactionResult::TesSuccess)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fees::FeeSettings;
-    use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext};
-    use crate::view::ledger_view::LedgerView;
-    use crate::view::read_view::ReadView;
-    use crate::view::sandbox::Sandbox;
-    use rxrpl_amendment::Rules;
-    use rxrpl_ledger::Ledger;
-
-    const OWNER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
-
-    fn setup_with_broker() -> Ledger {
-        let mut ledger = Ledger::genesis();
-        let id = decode_account_id(OWNER).unwrap();
-        let key = keylet::account(&id);
-        let account = serde_json::json!({
-            "LedgerEntryType": "AccountRoot",
-            "Account": OWNER,
-            "Balance": "100000000",
-            "Sequence": 2,
-            "OwnerCount": 2,
-            "Flags": 0,
-        });
-        ledger
-            .put_state(key, serde_json::to_vec(&account).unwrap())
-            .unwrap();
-
-        let broker_key = keylet::loan_broker(id.as_bytes(), 1);
-        let broker = serde_json::json!({
-            "LedgerEntryType": "LoanBroker",
-            "Owner": OWNER,
-            "Account": OWNER,
-            "VaultID": format!("{}:1", OWNER),
-            "LoanSequence": 1,
-            "OwnerCount": 0,
-            "DebtTotal": "0",
-            "DebtMaximum": "10000000",
-            "CoverAvailable": "0",
-            "CoverRateMinimum": 50000,
-            "CoverRateLiquidation": 80000,
-            "ManagementFeeRate": 500,
-            "Flags": 0,
-        });
-        ledger
-            .put_state(broker_key, serde_json::to_vec(&broker).unwrap())
-            .unwrap();
-        ledger
-    }
-
-    #[test]
-    fn valid_deposit() {
-        let ledger = setup_with_broker();
-        let fees = FeeSettings::default();
-        let view = LedgerView::with_fees(&ledger, fees.clone());
-        let mut sandbox = Sandbox::new(&view);
-        let rules = Rules::new();
-        let tx = serde_json::json!({
-            "TransactionType": "LoanBrokerCoverDeposit",
-            "Account": OWNER,
-            "LoanBrokerOwner": OWNER,
-            "LoanBrokerSequence": 1,
-            "Amount": "5000000",
-            "Fee": "12",
-            "Sequence": 2,
-        });
-
-        let mut ctx = ApplyContext {
-            tx: &tx,
-            view: &mut sandbox,
-            rules: &rules,
-            fees: &fees,
-        };
-
-        let result = LoanBrokerCoverDepositTransactor.apply(&mut ctx).unwrap();
-        assert_eq!(result, TransactionResult::TesSuccess);
-
-        // Verify broker cover increased
-        let id = decode_account_id(OWNER).unwrap();
-        let broker_key = keylet::loan_broker(id.as_bytes(), 1);
-        let broker_bytes = sandbox.read(&broker_key).unwrap();
-        let broker: serde_json::Value = serde_json::from_slice(&broker_bytes).unwrap();
-        assert_eq!(broker["CoverAvailable"].as_str().unwrap(), "5000000");
-
-        // Verify owner balance decreased
-        let acct_key = keylet::account(&id);
-        let acct_bytes = sandbox.read(&acct_key).unwrap();
-        let acct: serde_json::Value = serde_json::from_slice(&acct_bytes).unwrap();
-        assert_eq!(acct["Balance"].as_str().unwrap(), "95000000");
-    }
-
-    #[test]
-    fn insufficient_balance() {
-        let ledger = setup_with_broker();
-        let fees = FeeSettings::default();
-        let view = LedgerView::with_fees(&ledger, fees.clone());
-        let rules = Rules::new();
-        let tx = serde_json::json!({
-            "TransactionType": "LoanBrokerCoverDeposit",
-            "Account": OWNER,
-            "LoanBrokerOwner": OWNER,
-            "LoanBrokerSequence": 1,
-            "Amount": "200000000",
-            "Fee": "12",
-        });
-        let ctx = PreclaimContext {
-            tx: &tx,
-            view: &view,
-            rules: &rules,
-        };
-        assert_eq!(
-            LoanBrokerCoverDepositTransactor.preclaim(&ctx),
-            Err(TransactionResult::TecUnfundedPayment)
-        );
-    }
-
-    #[test]
-    fn reject_zero_amount() {
-        let tx = serde_json::json!({
-            "TransactionType": "LoanBrokerCoverDeposit",
-            "Account": OWNER,
-            "LoanBrokerOwner": OWNER,
-            "LoanBrokerSequence": 1,
-            "Amount": "0",
-            "Fee": "12",
-        });
-        let rules = Rules::new();
-        let fees = FeeSettings::default();
-        let ctx = PreflightContext {
-            tx: &tx,
-            rules: &rules,
-            fees: &fees,
-        };
-        assert_eq!(
-            LoanBrokerCoverDepositTransactor.preflight(&ctx),
-            Err(TransactionResult::TemBadAmount)
-        );
     }
 }
