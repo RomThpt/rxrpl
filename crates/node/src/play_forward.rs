@@ -538,9 +538,20 @@ mod tests {
         }
 
         // LoanBroker/Vault transactors read the referenced Vault SLE (by its
-        // 32-byte VaultID keylet) without listing it in AffectedNodes.
+        // 32-byte VaultID keylet) without listing it in AffectedNodes. Seed it
+        // from the tx, and from any affected object that carries a VaultID
+        // (e.g. a LoanBroker referenced only by LoanBrokerID).
         if let Some(vid) = tx_json.get("VaultID").and_then(|v| v.as_str()) {
             read_keys.insert(vid.to_uppercase());
+        }
+        for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
+            for wrap in ["CreatedNode", "ModifiedNode", "DeletedNode"] {
+                for fields in ["FinalFields", "NewFields"] {
+                    if let Some(vid) = node[wrap][fields]["VaultID"].as_str() {
+                        read_keys.insert(vid.to_uppercase());
+                    }
+                }
+            }
         }
 
         // An entry created or removed on a non-root directory page touches only
