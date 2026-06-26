@@ -8,17 +8,9 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transac
 
 pub struct MPTokenIssuanceDestroyTransactor;
 
-/// Parse MPTokenIssuanceID hex string into a Hash256 key.
+/// Resolve the MPTokenIssuance SLE key from the tx's 192-bit MPTokenIssuanceID.
 fn parse_issuance_id(tx: &Value) -> Result<Hash256, TransactionResult> {
-    let hex_str =
-        helpers::get_str_field(tx, "MPTokenIssuanceID").ok_or(TransactionResult::TemMalformed)?;
-    let bytes = hex::decode(hex_str).map_err(|_| TransactionResult::TemMalformed)?;
-    if bytes.len() != 32 {
-        return Err(TransactionResult::TemMalformed);
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(Hash256::new(arr))
+    super::mptoken_authorize::parse_issuance_id(tx).map(|(key, _)| key)
 }
 
 impl Transactor for MPTokenIssuanceDestroyTransactor {
@@ -65,7 +57,8 @@ impl Transactor for MPTokenIssuanceDestroyTransactor {
 
         let issuance_key = parse_issuance_id(ctx.tx)?;
 
-        // Erase issuance
+        // Unlink from the issuer's owner directory, then erase the issuance.
+        crate::owner_dir::remove_from_owner_dir(ctx.view, &account_id, &issuance_key)?;
         ctx.view
             .erase(&issuance_key)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -145,8 +138,13 @@ mod tests {
         (ledger, issuance_key)
     }
 
-    fn issuance_id_hex(key: &Hash256) -> String {
-        hex::encode(key.as_bytes()).to_uppercase()
+    fn issuance_id_hex(_key: &Hash256) -> String {
+        // 192-bit MPTokenIssuanceID = sequence (4 BE) || issuer (20). The test
+        // fixtures all create the issuance at (ISSUER, seq=1).
+        let issuer = decode_account_id(ISSUER).unwrap();
+        let mut id = 1u32.to_be_bytes().to_vec();
+        id.extend_from_slice(issuer.as_bytes());
+        hex::encode(id).to_uppercase()
     }
 
     #[test]
@@ -273,7 +271,7 @@ mod tests {
         let tx = serde_json::json!({
             "TransactionType": "MPTokenIssuanceDestroy",
             "Account": ISSUER,
-            "MPTokenIssuanceID": "0000000000000000000000000000000000000000000000000000000000000000",
+            "MPTokenIssuanceID": "000000010000000000000000000000000000000000000000",
             "Fee": "12",
         });
         let ctx = PreclaimContext {

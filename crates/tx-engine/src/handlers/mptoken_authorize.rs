@@ -1,5 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_primitives::Hash256;
+use rxrpl_primitives::{AccountId, Hash256};
 use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
@@ -16,17 +16,21 @@ const LSFT_MPT_AUTHORIZED: u32 = 0x0002;
 
 pub struct MPTokenAuthorizeTransactor;
 
-/// Parse MPTokenIssuanceID hex string into a Hash256 key.
-fn parse_issuance_id(tx: &Value) -> Result<Hash256, TransactionResult> {
+/// The 192-bit MPTokenIssuanceID is `sequence (4 bytes BE) || issuer (20 bytes)`.
+/// It is NOT the issuance SLE key — that is derived by hashing (seq, issuer).
+/// Returns `(issuance_sle_key, raw 24-byte id)`. Both the issuance lookup and the
+/// MPToken keylet use the 32-byte SLE key, mirroring rippled.
+pub(crate) fn parse_issuance_id(tx: &Value) -> Result<(Hash256, Vec<u8>), TransactionResult> {
     let hex_str =
         helpers::get_str_field(tx, "MPTokenIssuanceID").ok_or(TransactionResult::TemMalformed)?;
     let bytes = hex::decode(hex_str).map_err(|_| TransactionResult::TemMalformed)?;
-    if bytes.len() != 32 {
+    if bytes.len() != 24 {
         return Err(TransactionResult::TemMalformed);
     }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(Hash256::new(arr))
+    let seq = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let issuer =
+        AccountId::from_slice(&bytes[4..24]).map_err(|_| TransactionResult::TemMalformed)?;
+    Ok((keylet::mptoken_issuance(&issuer, seq), bytes))
 }
 
 impl Transactor for MPTokenAuthorizeTransactor {
@@ -41,7 +45,7 @@ impl Transactor for MPTokenAuthorizeTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         helpers::read_account_by_address(ctx.view, account_str)?;
 
-        let issuance_key = parse_issuance_id(ctx.tx)?;
+        let (issuance_key, _raw_id) = parse_issuance_id(ctx.tx)?;
         let issuance_bytes = ctx
             .view
             .read(&issuance_key)
@@ -101,7 +105,7 @@ impl Transactor for MPTokenAuthorizeTransactor {
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        let issuance_key = parse_issuance_id(ctx.tx)?;
+        let (issuance_key, _raw_id) = parse_issuance_id(ctx.tx)?;
         let issuance_bytes = ctx
             .view
             .read(&issuance_key)
@@ -124,14 +128,15 @@ impl Transactor for MPTokenAuthorizeTransactor {
             let holder_id = &account_id;
 
             if tx_flags & TF_MPT_UNAUTHORIZE == 0 {
-                // Create MPToken entry (holder opt-in)
+                // Create MPToken entry (holder opt-in). MPTAmount and Flags
+                // default to 0 and are omitted; PreviousTxnID is stamped.
                 let mptoken_key = keylet::mptoken(issuance_key.as_bytes(), holder_id);
                 let mptoken = serde_json::json!({
                     "LedgerEntryType": "MPToken",
                     "Account": account_str,
                     "MPTokenIssuanceID": issuance_id_hex,
-                    "MPTAmount": "0",
-                    "Flags": 0,
+                    "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "PreviousTxnLgrSeq": 0,
                 });
                 let mptoken_data =
                     serde_json::to_vec(&mptoken).map_err(|_| TransactionResult::TefInternal)?;
@@ -285,8 +290,13 @@ mod tests {
         (ledger, issuance_key)
     }
 
-    fn issuance_id_hex(key: &Hash256) -> String {
-        hex::encode(key.as_bytes()).to_uppercase()
+    fn issuance_id_hex(_key: &Hash256) -> String {
+        // 192-bit MPTokenIssuanceID = sequence (4 BE) || issuer (20). The test
+        // fixtures all create the issuance at (ISSUER, seq=1).
+        let issuer = decode_account_id(ISSUER).unwrap();
+        let mut id = 1u32.to_be_bytes().to_vec();
+        id.extend_from_slice(issuer.as_bytes());
+        hex::encode(id).to_uppercase()
     }
 
     #[test]
@@ -320,7 +330,8 @@ mod tests {
         let mptoken_bytes = sandbox.read(&mptoken_key).unwrap();
         let mptoken: Value = serde_json::from_slice(&mptoken_bytes).unwrap();
         assert_eq!(mptoken["Account"].as_str().unwrap(), HOLDER);
-        assert_eq!(mptoken["MPTAmount"].as_str().unwrap(), "0");
+        // MPTAmount defaults to 0 and is omitted from a freshly created MPToken.
+        assert!(mptoken.get("MPTAmount").is_none());
         assert_eq!(mptoken["LedgerEntryType"].as_str().unwrap(), "MPToken");
 
         // Verify owner count incremented on holder

@@ -49,7 +49,11 @@ impl Transactor for CredentialCreateTransactor {
         let issuer_id =
             decode_account_id(issuer_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let credential_type = helpers::get_str_field(ctx.tx, "CredentialType").unwrap();
-        let cred_key = keylet::credential(&subject_id, &issuer_id, credential_type.as_bytes());
+        let cred_key = keylet::credential(
+            &subject_id,
+            &issuer_id,
+            &hex::decode(credential_type).map_err(|_| TransactionResult::TemMalformed)?,
+        );
         if ctx.view.exists(&cred_key) {
             return Err(TransactionResult::TecDuplicate);
         }
@@ -76,18 +80,24 @@ impl Transactor for CredentialCreateTransactor {
         let subject_id =
             decode_account_id(subject_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let credential_type = helpers::get_str_field(ctx.tx, "CredentialType").unwrap();
-        let cred_key = keylet::credential(&subject_id, &issuer_id, credential_type.as_bytes());
+        // The keylet hashes the decoded CredentialType bytes, not the hex string.
+        let ct_bytes = hex::decode(credential_type).map_err(|_| TransactionResult::TemMalformed)?;
+        let cred_key = keylet::credential(&subject_id, &issuer_id, &ct_bytes);
 
-        // Auto-accept when issuer == subject (rippled behavior).
+        // Auto-accept when issuer == subject (rippled behavior). lsfAccepted and
+        // other default-zero fields are omitted; PreviousTxnID is stamped.
         let auto_accept = subject_id == issuer_id;
         let mut entry = serde_json::json!({
             "LedgerEntryType": "Credential",
             "Subject": subject_str,
             "Issuer": issuer_str,
             "CredentialType": credential_type,
-            "Accepted": auto_accept,
-            "Flags": if auto_accept { LSF_ACCEPTED } else { 0 },
+            "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+            "PreviousTxnLgrSeq": 0,
         });
+        if auto_accept {
+            entry["Flags"] = serde_json::Value::from(LSF_ACCEPTED);
+        }
         if let Some(uri) = helpers::get_str_field(ctx.tx, "URI") {
             entry["URI"] = serde_json::Value::String(uri.to_string());
         }
@@ -99,9 +109,11 @@ impl Transactor for CredentialCreateTransactor {
             .insert(cred_key, entry_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Add credential to issuer's owner directory so account_objects can
-        // surface it via the ?type=credential filter.
+        // Credentials are linked into both the issuer and subject directories.
         add_to_owner_dir(ctx.view, &issuer_id, &cred_key)?;
+        if subject_id != issuer_id {
+            add_to_owner_dir(ctx.view, &subject_id, &cred_key)?;
+        }
 
         helpers::adjust_owner_count(&mut account, 1);
 
@@ -154,7 +166,7 @@ mod tests {
         let tx = serde_json::json!({
             "TransactionType": "CredentialCreate",
             "Account": ALICE,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Fee": "12",
         });
         let rules = Rules::new();
@@ -198,7 +210,7 @@ mod tests {
             "TransactionType": "CredentialCreate",
             "Account": ALICE,
             "Subject": BOB,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Fee": "12",
         });
         let rules = Rules::new();
@@ -221,7 +233,7 @@ mod tests {
             "LedgerEntryType": "Credential",
             "Subject": BOB,
             "Issuer": ALICE,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Accepted": false,
             "Flags": 0,
         });
@@ -237,7 +249,7 @@ mod tests {
             "TransactionType": "CredentialCreate",
             "Account": ALICE,
             "Subject": BOB,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Fee": "12",
         });
         let ctx = PreclaimContext {
@@ -263,7 +275,7 @@ mod tests {
             "TransactionType": "CredentialCreate",
             "Account": ALICE,
             "Subject": BOB,
-            "CredentialType": "KYC",
+            "CredentialType": "4B5943",
             "Fee": "12",
             "Sequence": 1,
         });
@@ -287,7 +299,7 @@ mod tests {
         let entry: serde_json::Value = serde_json::from_slice(&entry_bytes).unwrap();
         assert_eq!(entry["Issuer"].as_str().unwrap(), ALICE);
         assert_eq!(entry["Subject"].as_str().unwrap(), BOB);
-        assert!(!entry["Accepted"].as_bool().unwrap());
+        assert!(entry.get("Flags").is_none());
 
         let account_key = keylet::account(&alice_id);
         let account_bytes = sandbox.read(&account_key).unwrap();

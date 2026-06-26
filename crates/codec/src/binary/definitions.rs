@@ -51,6 +51,15 @@ impl FieldDef {
     }
 }
 
+/// MPToken amount fields are UInt64 but rippled renders/parses them as decimal
+/// strings (every other UInt64 is hex).
+pub fn is_decimal_uint64(field_name: &str) -> bool {
+    matches!(
+        field_name,
+        "MaximumAmount" | "OutstandingAmount" | "MPTAmount"
+    )
+}
+
 /// Global definitions loaded from the embedded JSON.
 pub struct Definitions {
     pub fields_by_name: HashMap<String, FieldDef>,

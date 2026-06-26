@@ -15,8 +15,10 @@ pub struct ValidPermissionedDomain;
 
 impl ValidPermissionedDomain {
     fn credential_key(entry: &Value) -> Option<(String, String)> {
-        let issuer = entry.get("Issuer").and_then(|v| v.as_str())?;
-        let cred_type = entry.get("CredentialType").and_then(|v| v.as_str())?;
+        // Each AcceptedCredentials element wraps the pair in a `Credential` object.
+        let inner = entry.get("Credential").unwrap_or(entry);
+        let issuer = inner.get("Issuer").and_then(|v| v.as_str())?;
+        let cred_type = inner.get("CredentialType").and_then(|v| v.as_str())?;
         Some((issuer.to_string(), cred_type.to_string()))
     }
 }

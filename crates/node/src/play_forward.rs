@@ -486,6 +486,25 @@ mod tests {
             }
         }
 
+        // MPToken transactors read the MPTokenIssuance (id = seq||issuer) without
+        // listing it in AffectedNodes; derive and seed its SLE key.
+        if let Some(idhex) = tx_json
+            .get("MPTokenIssuanceID")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.len() == 48)
+        {
+            if let Ok(b) = hex::decode(idhex) {
+                let seq = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+                if let Ok(iss) = rxrpl_primitives::AccountId::from_slice(&b[4..24]) {
+                    read_keys.insert(
+                        keylet::mptoken_issuance(&iss, seq)
+                            .to_string()
+                            .to_uppercase(),
+                    );
+                }
+            }
+        }
+
         // An entry created or removed on a non-root directory page touches only
         // that page; the root (page 0) is left unchanged and so is absent from
         // AffectedNodes. dirAdd needs the root to walk to the chain's last page,
