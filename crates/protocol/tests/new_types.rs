@@ -45,7 +45,7 @@ fn xchain_modify_bridge_roundtrip() {
 #[test]
 fn xchain_create_claim_id_roundtrip() {
     let json = serde_json::json!({
-        "TransactionType": "XChainCreateClaimId",
+        "TransactionType": "XChainCreateClaimID",
         "Account": "rN7n3473SaZBCG4dFL83w7p1W9cgZB6xkk",
         "Fee": "12",
         "XChainBridge": {
@@ -60,7 +60,7 @@ fn xchain_create_claim_id_roundtrip() {
     let tx = rxrpl_protocol::tx::XChainCreateClaimId::from_json(&json).unwrap();
     assert_eq!(tx.other_chain_source, "rPAnLYrY3M8PMoer2UHkNRPHPEtQVbVPma");
     let rt = tx.to_json().unwrap();
-    assert_eq!(rt["TransactionType"], "XChainCreateClaimId");
+    assert_eq!(rt["TransactionType"], "XChainCreateClaimID");
 }
 
 #[test]
@@ -771,7 +771,7 @@ fn new_transaction_type_codes_roundtrip() {
         (
             TransactionType::XChainCreateClaimId,
             41,
-            "XChainCreateClaimId",
+            "XChainCreateClaimID",
         ),
         (TransactionType::XChainCommit, 42, "XChainCommit"),
         (TransactionType::XChainClaim, 43, "XChainClaim"),

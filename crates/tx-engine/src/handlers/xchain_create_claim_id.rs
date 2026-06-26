@@ -27,16 +27,9 @@ impl Transactor for XChainCreateClaimIdTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         helpers::read_account_by_address(ctx.view, account_str)?;
 
-        // Bridge must exist -- look up by door account
+        // Bridge must exist (on either chain's door).
         let bridge = ctx.tx.get("XChainBridge").unwrap();
-        let bridge_data = bridge_helpers::serialize_bridge_spec(bridge)?;
-        let locking_door = bridge
-            .get("LockingChainDoor")
-            .and_then(|v| v.as_str())
-            .ok_or(TransactionResult::TemXChainBridge)?;
-        let door_id =
-            decode_account_id(locking_door).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let bridge_key = keylet::bridge(&door_id, &bridge_data);
+        let bridge_key = bridge_helpers::find_bridge_keylet(bridge, |k| ctx.view.exists(k))?;
         if !ctx.view.exists(&bridge_key) {
             return Err(TransactionResult::TecNoEntry);
         }
@@ -55,14 +48,8 @@ impl Transactor for XChainCreateClaimIdTransactor {
             .ok_or(TransactionResult::TemMalformed)?
             .to_string();
 
-        // Read bridge entry and increment XChainClaimID counter
-        let locking_door = bridge
-            .get("LockingChainDoor")
-            .and_then(|v| v.as_str())
-            .ok_or(TransactionResult::TemXChainBridge)?;
-        let door_id =
-            decode_account_id(locking_door).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let bridge_key = keylet::bridge(&door_id, &bridge_data);
+        // Read bridge entry and increment XChainClaimID counter.
+        let bridge_key = bridge_helpers::find_bridge_keylet(&bridge, |k| ctx.view.exists(k))?;
 
         let bridge_bytes = ctx
             .view
@@ -84,7 +71,10 @@ impl Transactor for XChainCreateClaimIdTransactor {
             .update(bridge_key, bridge_data_updated)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Create XChainOwnedClaimID entry
+        // Create XChainOwnedClaimID entry. The empty XChainClaimAttestations and
+        // Flags=0 are omitted; PreviousTxnID is stamped.
+        let signature_reward = helpers::get_u64_str_field(ctx.tx, "SignatureReward")
+            .ok_or(TransactionResult::TemMalformed)?;
         let claim_key = keylet::xchain_claim_id(&bridge_data, new_claim_id);
         let claim_entry = serde_json::json!({
             "LedgerEntryType": "XChainOwnedClaimID",
@@ -92,8 +82,9 @@ impl Transactor for XChainCreateClaimIdTransactor {
             "XChainBridge": bridge,
             "XChainClaimID": new_claim_id.to_string(),
             "OtherChainSource": other_chain_source,
-            "Attestations": [],
-            "Flags": 0,
+            "SignatureReward": signature_reward.to_string(),
+            "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+            "PreviousTxnLgrSeq": 0,
         });
 
         let claim_data =
@@ -101,6 +92,8 @@ impl Transactor for XChainCreateClaimIdTransactor {
         ctx.view
             .insert(claim_key, claim_data)
             .map_err(|_| TransactionResult::TefInternal)?;
+
+        crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &claim_key)?;
 
         // Update creator account: increment owner count and sequence
         let src_key = keylet::account(&account_id);
@@ -166,8 +159,10 @@ mod tests {
         }
 
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
-        let bridge_key = keylet::bridge(&door_id, &bridge_data);
+        let bridge_key = bridge_helpers::bridge_keylet_for_door(
+            &door_id,
+            bridge_spec().get("LockingChainIssue").unwrap(),
+        );
         let entry = serde_json::json!({
             "LedgerEntryType": "Bridge",
             "Account": DOOR,
@@ -276,6 +271,7 @@ mod tests {
             "Account": USER,
             "XChainBridge": bridge_spec(),
             "OtherChainSource": DOOR,
+            "SignatureReward": "100",
             "Fee": "12",
         });
 
@@ -303,7 +299,10 @@ mod tests {
 
         // Verify bridge counter incremented
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_key = keylet::bridge(&door_id, &bridge_data);
+        let bridge_key = bridge_helpers::bridge_keylet_for_door(
+            &door_id,
+            bridge_spec().get("LockingChainIssue").unwrap(),
+        );
         let bridge_bytes = sandbox.read(&bridge_key).unwrap();
         let bridge_entry: serde_json::Value = serde_json::from_slice(&bridge_bytes).unwrap();
         assert_eq!(bridge_entry["XChainClaimID"].as_str().unwrap(), "1");
@@ -329,6 +328,7 @@ mod tests {
             "Account": USER,
             "XChainBridge": bridge_spec(),
             "OtherChainSource": DOOR,
+            "SignatureReward": "100",
             "Fee": "12",
         });
 

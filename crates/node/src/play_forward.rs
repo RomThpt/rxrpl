@@ -505,6 +505,28 @@ mod tests {
             }
         }
 
+        // XChain transactors read the Bridge SLE (keyed per door) without listing
+        // it in AffectedNodes; derive and seed both candidate keylets.
+        if let Some(bridge) = tx_json.get("XChainBridge") {
+            for (door_f, issue_f) in [
+                ("LockingChainDoor", "LockingChainIssue"),
+                ("IssuingChainDoor", "IssuingChainIssue"),
+            ] {
+                if let (Some(d), Some(iss)) = (
+                    bridge.get(door_f).and_then(|v| v.as_str()),
+                    bridge.get(issue_f),
+                ) {
+                    if let Ok(did) = decode_account_id(d) {
+                        read_keys.insert(
+                            rxrpl_tx_engine::bridge_helpers::bridge_keylet_for_door(&did, iss)
+                                .to_string()
+                                .to_uppercase(),
+                        );
+                    }
+                }
+            }
+        }
+
         // An entry created or removed on a non-root directory page touches only
         // that page; the root (page 0) is left unchanged and so is absent from
         // AffectedNodes. dirAdd needs the root to walk to the chain's last page,

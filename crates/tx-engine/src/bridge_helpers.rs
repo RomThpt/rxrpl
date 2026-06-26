@@ -43,6 +43,43 @@ pub fn bridge_keylet_for_door(door: &AccountId, issue: &Value) -> Hash256 {
     keylet::bridge(door, &issue_currency(issue))
 }
 
+/// A bridge exists at one of two keylets (one per door). rippled looks up the
+/// locking-chain door first, then the issuing-chain door. Returns the existing
+/// keylet, or the issuing-side keylet if neither exists (the caller reports the
+/// missing entry).
+pub fn find_bridge_keylet(
+    bridge: &Value,
+    exists: impl Fn(&Hash256) -> bool,
+) -> Result<Hash256, TransactionResult> {
+    let locking_door = bridge
+        .get("LockingChainDoor")
+        .and_then(|v| v.as_str())
+        .ok_or(TransactionResult::TemXChainBridge)?;
+    let ld = rxrpl_codec::address::classic::decode_account_id(locking_door)
+        .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let lk = bridge_keylet_for_door(
+        &ld,
+        bridge
+            .get("LockingChainIssue")
+            .ok_or(TransactionResult::TemXChainBridge)?,
+    );
+    if exists(&lk) {
+        return Ok(lk);
+    }
+    let issuing_door = bridge
+        .get("IssuingChainDoor")
+        .and_then(|v| v.as_str())
+        .ok_or(TransactionResult::TemXChainBridge)?;
+    let id = rxrpl_codec::address::classic::decode_account_id(issuing_door)
+        .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    Ok(bridge_keylet_for_door(
+        &id,
+        bridge
+            .get("IssuingChainIssue")
+            .ok_or(TransactionResult::TemXChainBridge)?,
+    ))
+}
+
 /// Serialize a BridgeSpec to bytes for use in keylet computation.
 /// BridgeSpec contains: LockingChainDoor, LockingChainIssue, IssuingChainDoor, IssuingChainIssue
 pub fn serialize_bridge_spec(bridge: &Value) -> Result<Vec<u8>, TransactionResult> {
@@ -78,10 +115,12 @@ pub fn serialize_bridge_spec(bridge: &Value) -> Result<Vec<u8>, TransactionResul
 }
 
 fn serialize_issue(data: &mut Vec<u8>, issue: &Value) -> Result<(), TransactionResult> {
+    // The claim-ID keylet hashes an `Issue` (currency + account, 40 bytes) — XRP
+    // uses the zero account. This differs from the SLE's STIssue (20 bytes for XRP).
     if let Some(s) = issue.as_str() {
         if s == "XRP" {
             data.extend_from_slice(&[0u8; 20]); // currency
-            data.extend_from_slice(&[0u8; 20]); // issuer
+            data.extend_from_slice(&[0u8; 20]); // account (XRP)
             return Ok(());
         }
         return Err(TransactionResult::TemXChainBridge);
@@ -97,7 +136,7 @@ fn serialize_issue(data: &mut Vec<u8>, issue: &Value) -> Result<(), TransactionR
                 return Err(TransactionResult::TemXChainBridge);
             }
             data.extend_from_slice(&[0u8; 20]); // currency
-            data.extend_from_slice(&[0u8; 20]); // issuer
+            data.extend_from_slice(&[0u8; 20]); // account (XRP)
             return Ok(());
         }
         let iss = issue
