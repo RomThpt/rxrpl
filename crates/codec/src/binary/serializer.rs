@@ -515,10 +515,23 @@ impl BinarySerializer {
     }
 
     fn serialize_number(&mut self, value: &Value) -> Result<(), CodecError> {
+        // STNumber is `int64 mantissa || int32 exponent` (12 bytes), using
+        // rippled's large-mantissa Number normalization. Zero is all-zero.
         let value_str = value
             .as_str()
             .ok_or_else(|| CodecError::UnsupportedType("expected string for Number".to_string()))?;
-        self.serialize_iou_value(value_str)
+        let iou = rxrpl_amount::iou::IOUAmount::from_decimal_string(value_str)
+            .map_err(|_| CodecError::UnsupportedType("invalid Number value".to_string()))?;
+        let (mantissa, exponent) = if iou.is_zero() {
+            (0i64, 0i32)
+        } else {
+            let n = rxrpl_amount::number::Number::from_iou(&iou);
+            let m = n.mantissa() as i64;
+            (if n.negative() { -m } else { m }, n.exponent())
+        };
+        self.write_bytes(&mantissa.to_be_bytes());
+        self.write_bytes(&exponent.to_be_bytes());
+        Ok(())
     }
 
     fn serialize_currency(&mut self, value: &Value) -> Result<(), CodecError> {
@@ -630,11 +643,20 @@ mod tests {
         let mut s = BinarySerializer::new();
         s.serialize_number(&Value::String("0".to_string())).unwrap();
         let bytes = s.into_bytes();
-        assert_eq!(bytes.len(), 8);
-        // Zero IOU encoding
+        // STNumber zero = int64(0) || int32(0) = 12 zero bytes.
+        assert_eq!(bytes, vec![0u8; 12]);
+    }
+
+    #[test]
+    fn serialize_number_matches_rippled_stnumber() {
+        // rippled serializes 123000000 as mantissa 1230000000000000000 (0x1111D67BB1BB0000)
+        // exponent -10 (0xFFFFFFF6).
+        let mut s = BinarySerializer::new();
+        s.serialize_number(&Value::String("123000000".to_string()))
+            .unwrap();
         assert_eq!(
-            u64::from_be_bytes(bytes.try_into().unwrap()),
-            0x8000_0000_0000_0000
+            hex::encode_upper(s.into_bytes()),
+            "1111D67BB1BB0000FFFFFFF6"
         );
     }
 

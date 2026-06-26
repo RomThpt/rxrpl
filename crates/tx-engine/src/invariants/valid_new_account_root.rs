@@ -47,13 +47,19 @@ impl InvariantCheck for ValidNewAccountRoot {
                 format!("new AccountRoot at {key} has invalid Balance: {balance_str}")
             })?;
 
-            // Sequence must be > 0
-            let sequence = obj
-                .get("Sequence")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| format!("new AccountRoot at {key} missing Sequence field"))?;
-            if sequence == 0 {
-                return Err(format!("new AccountRoot at {key} has Sequence=0"));
+            // Pseudo-accounts (AMM / Vault) carry a designator field and, under
+            // featureSingleAssetVault, a Sequence of 0 (serialized as absent).
+            let is_pseudo = obj.get("AMMID").is_some() || obj.get("VaultID").is_some();
+
+            // A regular new account must have Sequence > 0; a pseudo-account may
+            // omit it (Sequence 0).
+            let sequence = obj.get("Sequence").and_then(|v| v.as_u64());
+            if !is_pseudo {
+                match sequence {
+                    Some(s) if s > 0 => {}
+                    Some(_) => return Err(format!("new AccountRoot at {key} has Sequence=0")),
+                    None => return Err(format!("new AccountRoot at {key} missing Sequence field")),
+                }
             }
 
             // OwnerCount is not constrained at creation: rippled's

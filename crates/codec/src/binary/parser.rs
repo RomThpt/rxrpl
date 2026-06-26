@@ -136,8 +136,8 @@ impl<'a> BinaryParser<'a> {
                 self.read_bytes(len)?;
             }
             9 => {
-                self.read_bytes(8)?;
-            } // Number (IOU value encoding)
+                self.read_bytes(12)?;
+            } // Number (int64 mantissa + int32 exponent)
             14 => {
                 // STObject: skip until ObjectEndMarker
                 loop {
@@ -500,8 +500,14 @@ impl<'a> BinaryParser<'a> {
     }
 
     pub(crate) fn parse_number(&mut self) -> Result<Value, CodecError> {
-        let raw = self.read_u64()?;
-        Ok(Value::String(decode_iou_value(raw)?))
+        // STNumber: int64 mantissa || int32 exponent (rippled large-mantissa).
+        let mantissa = i64::from_be_bytes(self.read_bytes(8)?.try_into().unwrap());
+        let exponent = i32::from_be_bytes(self.read_bytes(4)?.try_into().unwrap());
+        if mantissa == 0 {
+            return Ok(Value::String("0".to_string()));
+        }
+        let n = rxrpl_amount::number::Number::new(mantissa < 0, mantissa.unsigned_abs(), exponent);
+        Ok(Value::String(n.to_decimal_string()))
     }
 
     /// XChainBridge: door(VL AccountID) + issue, twice (rippled STXChainBridge::add).

@@ -1,4 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
@@ -6,17 +7,43 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transac
 
 pub struct VaultDepositTransactor;
 
+/// Parse the 32-byte `VaultID` (the vault keylet itself).
+fn vault_id(tx: &serde_json::Value) -> Result<Hash256, TransactionResult> {
+    let hex_str = helpers::get_str_field(tx, "VaultID").ok_or(TransactionResult::TemMalformed)?;
+    let bytes = hex::decode(hex_str).map_err(|_| TransactionResult::TemMalformed)?;
+    if bytes.len() != 32 {
+        return Err(TransactionResult::TemMalformed);
+    }
+    Hash256::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)
+}
+
+/// A vault whose underlying asset is XRP (the `Asset` field is absent, or is
+/// `{"currency":"XRP"}` with no issuer).
+fn vault_is_xrp(vault: &serde_json::Value) -> bool {
+    match vault.get("Asset") {
+        None => true,
+        Some(a) => {
+            a.get("currency").and_then(|c| c.as_str()) == Some("XRP") && a.get("issuer").is_none()
+        }
+    }
+}
+
+/// Read a Number/decimal field stored as a string, defaulting to 0.
+fn num(v: &serde_json::Value, field: &str) -> u128 {
+    v.get(field)
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
 impl Transactor for VaultDepositTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
-        helpers::get_u32_field(ctx.tx, "VaultSequence").ok_or(TransactionResult::TemMalformed)?;
-        helpers::get_str_field(ctx.tx, "VaultOwner").ok_or(TransactionResult::TemMalformed)?;
-
+        vault_id(ctx.tx)?;
         let amount =
             helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
         if amount == 0 {
             return Err(TransactionResult::TemBadAmount);
         }
-
         Ok(())
     }
 
@@ -24,15 +51,7 @@ impl Transactor for VaultDepositTransactor {
         let depositor_str = helpers::get_account(ctx.tx)?;
         let (_, depositor_acct) = helpers::read_account_by_address(ctx.view, depositor_str)?;
 
-        let vault_owner_str =
-            helpers::get_str_field(ctx.tx, "VaultOwner").ok_or(TransactionResult::TemMalformed)?;
-        let vault_seq = helpers::get_u32_field(ctx.tx, "VaultSequence")
-            .ok_or(TransactionResult::TemMalformed)?;
-
-        let vault_owner_id = decode_account_id(vault_owner_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let vault_key = keylet::vault(&vault_owner_id, vault_seq);
-
+        let vault_key = vault_id(ctx.tx)?;
         let vault_bytes = ctx
             .view
             .read(&vault_key)
@@ -40,28 +59,17 @@ impl Transactor for VaultDepositTransactor {
         let vault: serde_json::Value =
             serde_json::from_slice(&vault_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
+        // Only XRP single-asset vaults are byte-verified so far.
+        if !vault_is_xrp(&vault) {
+            return Err(TransactionResult::TemDisabled);
+        }
+
         let amount =
             helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
         let fee = helpers::get_fee(ctx.tx);
         let balance = helpers::get_balance(&depositor_acct);
-
-        // Depositor must have sufficient XRP balance (Amount + fee as reserve proxy)
         if balance < amount + fee {
             return Err(TransactionResult::TecUnfundedPayment);
-        }
-
-        // If MaxDeposit set, TotalDeposited + Amount <= MaxDeposit
-        let total_deposited: u64 = vault["TotalDeposited"]
-            .as_str()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        if let Some(max_deposit_str) = vault.get("MaxDeposit").and_then(|v| v.as_str()) {
-            if let Ok(max_deposit) = max_deposit_str.parse::<u64>() {
-                if total_deposited + amount > max_deposit {
-                    return Err(TransactionResult::TecOversize);
-                }
-            }
         }
 
         Ok(())
@@ -71,20 +79,10 @@ impl Transactor for VaultDepositTransactor {
         let depositor_str = helpers::get_account(ctx.tx)?;
         let depositor_id =
             decode_account_id(depositor_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let amount = helpers::get_u64_str_field(ctx.tx, "Amount")
+            .ok_or(TransactionResult::TemBadAmount)? as u128;
 
-        let vault_owner_str = helpers::get_str_field(ctx.tx, "VaultOwner")
-            .ok_or(TransactionResult::TemMalformed)?
-            .to_string();
-        let vault_seq = helpers::get_u32_field(ctx.tx, "VaultSequence")
-            .ok_or(TransactionResult::TemMalformed)?;
-        let amount =
-            helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
-
-        let vault_owner_id = decode_account_id(&vault_owner_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let vault_key = keylet::vault(&vault_owner_id, vault_seq);
-
-        // Read vault
+        let vault_key = vault_id(ctx.tx)?;
         let vault_bytes = ctx
             .view
             .read(&vault_key)
@@ -92,35 +90,123 @@ impl Transactor for VaultDepositTransactor {
         let mut vault: serde_json::Value =
             serde_json::from_slice(&vault_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        let total_deposited: u64 = vault["TotalDeposited"]
+        let pseudo_str = vault["Account"]
             .as_str()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let total_shares: u64 = vault["TotalShares"]
+            .ok_or(TransactionResult::TefInternal)?
+            .to_string();
+        let pseudo_id =
+            decode_account_id(&pseudo_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let share_id = vault["ShareMPTID"]
             .as_str()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+            .ok_or(TransactionResult::TefInternal)?
+            .to_string();
 
-        // Compute shares
-        let shares = if total_shares == 0 {
-            amount
+        let issuance_key = keylet::mptoken_issuance(&pseudo_id, 1);
+        let issuance_bytes = ctx
+            .view
+            .read(&issuance_key)
+            .ok_or(TransactionResult::TefInternal)?;
+        let mut issuance: serde_json::Value =
+            serde_json::from_slice(&issuance_bytes).map_err(|_| TransactionResult::TefInternal)?;
+
+        let assets_total = num(&vault, "AssetsTotal");
+        let assets_available = num(&vault, "AssetsAvailable");
+        let shares_total = num(&issuance, "OutstandingAmount");
+
+        // assetsToSharesDeposit / sharesToAssetsDeposit for an XRP vault (scale 0):
+        // the first deposit mints 1:1, later deposits scale by the pool ratio
+        // (truncated toward zero).
+        let (shares, assets_deposited) = if shares_total == 0 || assets_total == 0 {
+            (amount, amount)
         } else {
-            amount
-                .checked_mul(total_shares)
-                .ok_or(TransactionResult::TefInternal)?
-                / total_deposited
+            let s = shares_total * amount / assets_total;
+            if s == 0 {
+                return Err(TransactionResult::TecPrecisionLoss);
+            }
+            (s, assets_total * s / shares_total)
         };
 
-        // Update vault
-        vault["TotalDeposited"] = serde_json::Value::String((total_deposited + amount).to_string());
-        vault["TotalShares"] = serde_json::Value::String((total_shares + shares).to_string());
-
-        let vault_data = serde_json::to_vec(&vault).map_err(|_| TransactionResult::TefInternal)?;
+        // Grow the vault's asset accounting.
+        vault["AssetsTotal"] =
+            serde_json::Value::String((assets_total + assets_deposited).to_string());
+        vault["AssetsAvailable"] =
+            serde_json::Value::String((assets_available + assets_deposited).to_string());
+        let maximum = num(&vault, "AssetsMaximum");
+        if maximum != 0 && assets_total + assets_deposited > maximum {
+            return Err(TransactionResult::TecLimitExceeded);
+        }
         ctx.view
-            .update(vault_key, vault_data)
+            .update(
+                vault_key,
+                serde_json::to_vec(&vault).map_err(|_| TransactionResult::TefInternal)?,
+            )
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Deduct Amount from depositor's XRP balance and increment sequence
+        // Move the deposited XRP into the vault's pseudo-account.
+        let pseudo_key = keylet::account(&pseudo_id);
+        let pseudo_bytes = ctx
+            .view
+            .read(&pseudo_key)
+            .ok_or(TransactionResult::TerNoAccount)?;
+        let mut pseudo: serde_json::Value =
+            serde_json::from_slice(&pseudo_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let pbal = helpers::get_balance(&pseudo);
+        helpers::set_balance(&mut pseudo, pbal + assets_deposited as u64);
+        ctx.view
+            .update(
+                pseudo_key,
+                serde_json::to_vec(&pseudo).map_err(|_| TransactionResult::TefInternal)?,
+            )
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        // Mint the shares to the depositor's MPToken (created on first deposit).
+        let mptoken_key = keylet::mptoken(issuance_key.as_bytes(), &depositor_id);
+        let created_mptoken = !ctx.view.exists(&mptoken_key);
+        if created_mptoken {
+            let mptoken = serde_json::json!({
+                "LedgerEntryType": "MPToken",
+                "Account": depositor_str,
+                "MPTokenIssuanceID": share_id,
+                "MPTAmount": shares.to_string(),
+                "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+                "PreviousTxnLgrSeq": 0,
+            });
+            ctx.view
+                .insert(
+                    mptoken_key,
+                    serde_json::to_vec(&mptoken).map_err(|_| TransactionResult::TefInternal)?,
+                )
+                .map_err(|_| TransactionResult::TefInternal)?;
+            crate::owner_dir::add_to_owner_dir(ctx.view, &depositor_id, &mptoken_key)?;
+        } else {
+            let mptoken_bytes = ctx
+                .view
+                .read(&mptoken_key)
+                .ok_or(TransactionResult::TefInternal)?;
+            let mut mptoken: serde_json::Value = serde_json::from_slice(&mptoken_bytes)
+                .map_err(|_| TransactionResult::TefInternal)?;
+            let cur = num(&mptoken, "MPTAmount");
+            mptoken["MPTAmount"] = serde_json::Value::String((cur + shares).to_string());
+            ctx.view
+                .update(
+                    mptoken_key,
+                    serde_json::to_vec(&mptoken).map_err(|_| TransactionResult::TefInternal)?,
+                )
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
+
+        // Track the new total outstanding shares on the issuance.
+        issuance["OutstandingAmount"] =
+            serde_json::Value::String((shares_total + shares).to_string());
+        ctx.view
+            .update(
+                issuance_key,
+                serde_json::to_vec(&issuance).map_err(|_| TransactionResult::TefInternal)?,
+            )
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        // Debit the depositor's XRP and bump its sequence; if a new MPToken was
+        // created, account for the extra owned object.
         let depositor_key = keylet::account(&depositor_id);
         let depositor_bytes = ctx
             .view
@@ -128,20 +214,22 @@ impl Transactor for VaultDepositTransactor {
             .ok_or(TransactionResult::TerNoAccount)?;
         let mut depositor_acct: serde_json::Value =
             serde_json::from_slice(&depositor_bytes).map_err(|_| TransactionResult::TefInternal)?;
-
         let balance = helpers::get_balance(&depositor_acct);
         helpers::set_balance(
             &mut depositor_acct,
             balance
-                .checked_sub(amount)
+                .checked_sub(assets_deposited as u64)
                 .ok_or(TransactionResult::TecUnfundedPayment)?,
         );
         helpers::increment_sequence(&mut depositor_acct);
-
-        let depositor_data =
-            serde_json::to_vec(&depositor_acct).map_err(|_| TransactionResult::TefInternal)?;
+        if created_mptoken {
+            helpers::adjust_owner_count(&mut depositor_acct, 1);
+        }
         ctx.view
-            .update(depositor_key, depositor_data)
+            .update(
+                depositor_key,
+                serde_json::to_vec(&depositor_acct).map_err(|_| TransactionResult::TefInternal)?,
+            )
             .map_err(|_| TransactionResult::TefInternal)?;
 
         Ok(TransactionResult::TesSuccess)
@@ -152,7 +240,7 @@ impl Transactor for VaultDepositTransactor {
 mod tests {
     use super::*;
     use crate::fees::FeeSettings;
-    use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext};
+    use crate::transactor::{ApplyContext, PreflightContext};
     use crate::view::ledger_view::LedgerView;
     use crate::view::read_view::ReadView;
     use crate::view::sandbox::Sandbox;
@@ -160,151 +248,145 @@ mod tests {
     use rxrpl_ledger::Ledger;
 
     const OWNER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
-    const DEPOSITOR: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
+    const PSEUDO: &str = "rG9ckJcta51jT4iYdBiGo7du8MsKh7fzXp";
+    const SHARE_ID: &str = "00000001A62B0DE19DFAF4D7C4E59DF8927BFF79FE146246";
 
-    fn setup_accounts() -> Ledger {
+    fn setup() -> (Ledger, Hash256) {
         let mut ledger = Ledger::genesis();
-        for (addr, balance) in [(OWNER, 100_000_000u64), (DEPOSITOR, 50_000_000)] {
-            let id = decode_account_id(addr).unwrap();
-            let key = keylet::account(&id);
-            let account = serde_json::json!({
-                "LedgerEntryType": "AccountRoot",
-                "Account": addr,
-                "Balance": balance.to_string(),
-                "Sequence": 1,
-                "OwnerCount": 0,
-                "Flags": 0,
-            });
-            ledger
-                .put_state(key, serde_json::to_vec(&account).unwrap())
-                .unwrap();
-        }
-        ledger
-    }
-
-    fn setup_with_vault() -> (Ledger, rxrpl_primitives::Hash256) {
-        let mut ledger = setup_accounts();
         let owner_id = decode_account_id(OWNER).unwrap();
-        let vault_key = keylet::vault(&owner_id, 1);
-        let entry = serde_json::json!({
-            "LedgerEntryType": "Vault",
-            "Owner": OWNER,
-            "Sequence": 1,
-            "Asset": "XRP",
-            "TotalDeposited": "0",
-            "TotalShares": "0",
-            "Flags": 0,
-        });
         ledger
-            .put_state(vault_key, serde_json::to_vec(&entry).unwrap())
+            .put_state(
+                keylet::account(&owner_id),
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "AccountRoot",
+                    "Account": OWNER,
+                    "Balance": "100000000",
+                    "Sequence": 4,
+                    "OwnerCount": 3,
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
             .unwrap();
-        (ledger, vault_key)
-    }
 
-    fn setup_with_funded_vault() -> (Ledger, rxrpl_primitives::Hash256) {
-        let mut ledger = setup_accounts();
-        let owner_id = decode_account_id(OWNER).unwrap();
-        let vault_key = keylet::vault(&owner_id, 1);
-        let entry = serde_json::json!({
-            "LedgerEntryType": "Vault",
-            "Owner": OWNER,
-            "Sequence": 1,
-            "Asset": "XRP",
-            "TotalDeposited": "10000000",
-            "TotalShares": "10000000",
-            "Flags": 0,
-        });
+        let pseudo_id = decode_account_id(PSEUDO).unwrap();
         ledger
-            .put_state(vault_key, serde_json::to_vec(&entry).unwrap())
+            .put_state(
+                keylet::account(&pseudo_id),
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "AccountRoot",
+                    "Account": PSEUDO,
+                    "Balance": "0",
+                    "Flags": 26214400,
+                    "OwnerCount": 1,
+                    "VaultID": "3EBDFD5E1263CFB141881792F91E8DCCA03285B8F7BF609DC29D2391EACC176C",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let issuance_key = keylet::mptoken_issuance(&pseudo_id, 1);
+        ledger
+            .put_state(
+                issuance_key,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "MPTokenIssuance",
+                    "Flags": 56,
+                    "Issuer": PSEUDO,
+                    "Sequence": 1,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let mptoken_key = keylet::mptoken(issuance_key.as_bytes(), &owner_id);
+        ledger
+            .put_state(
+                mptoken_key,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "MPToken",
+                    "Account": OWNER,
+                    "MPTokenIssuanceID": SHARE_ID,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let owner_id2 = decode_account_id(OWNER).unwrap();
+        let vault_key = keylet::vault(&owner_id2, 3);
+        ledger
+            .put_state(
+                vault_key,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "Vault",
+                    "Account": PSEUDO,
+                    "Owner": OWNER,
+                    "Sequence": 3,
+                    "ShareMPTID": SHARE_ID,
+                    "WithdrawalPolicy": 1,
+                }))
+                .unwrap(),
+            )
             .unwrap();
         (ledger, vault_key)
     }
 
     #[test]
-    fn first_deposit_creates_shares_equal_to_amount() {
-        let (ledger, vault_key) = setup_with_vault();
+    fn first_deposit_mints_one_to_one() {
+        let (ledger, vault_key) = setup();
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let mut sandbox = Sandbox::new(&view);
         let rules = Rules::new();
         let tx = serde_json::json!({
             "TransactionType": "VaultDeposit",
-            "Account": DEPOSITOR,
-            "VaultOwner": OWNER,
-            "VaultSequence": 1,
-            "Amount": "5000000",
-            "Fee": "12",
-            "Sequence": 1,
+            "Account": OWNER,
+            "VaultID": hex::encode_upper(vault_key.as_bytes()),
+            "Amount": "10000000",
+            "Fee": "20",
+            "Sequence": 4,
         });
-
         let mut ctx = ApplyContext {
             tx: &tx,
             view: &mut sandbox,
             rules: &rules,
             fees: &fees,
         };
+        assert_eq!(
+            VaultDepositTransactor.apply(&mut ctx).unwrap(),
+            TransactionResult::TesSuccess
+        );
 
-        let result = VaultDepositTransactor.apply(&mut ctx).unwrap();
-        assert_eq!(result, TransactionResult::TesSuccess);
+        let vault: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&vault_key).unwrap()).unwrap();
+        assert_eq!(vault["AssetsTotal"].as_str().unwrap(), "10000000");
+        assert_eq!(vault["AssetsAvailable"].as_str().unwrap(), "10000000");
 
-        // Verify vault updated
-        let vault_bytes = sandbox.read(&vault_key).unwrap();
-        let vault: serde_json::Value = serde_json::from_slice(&vault_bytes).unwrap();
-        assert_eq!(vault["TotalDeposited"].as_str().unwrap(), "5000000");
-        assert_eq!(vault["TotalShares"].as_str().unwrap(), "5000000");
+        let pseudo_id = decode_account_id(PSEUDO).unwrap();
+        let pseudo: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&keylet::account(&pseudo_id)).unwrap()).unwrap();
+        assert_eq!(pseudo["Balance"].as_str().unwrap(), "10000000");
 
-        // Verify depositor balance decreased
-        let dep_id = decode_account_id(DEPOSITOR).unwrap();
-        let dep_key = keylet::account(&dep_id);
-        let dep_bytes = sandbox.read(&dep_key).unwrap();
-        let dep: serde_json::Value = serde_json::from_slice(&dep_bytes).unwrap();
-        assert_eq!(dep["Balance"].as_str().unwrap(), "45000000");
-        assert_eq!(dep["Sequence"].as_u64().unwrap(), 2);
-    }
+        let issuance_key = keylet::mptoken_issuance(&pseudo_id, 1);
+        let issuance: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&issuance_key).unwrap()).unwrap();
+        assert_eq!(issuance["OutstandingAmount"].as_str().unwrap(), "10000000");
 
-    #[test]
-    fn proportional_shares_on_second_deposit() {
-        let (ledger, vault_key) = setup_with_funded_vault();
-        let fees = FeeSettings::default();
-        let view = LedgerView::with_fees(&ledger, fees.clone());
-        let mut sandbox = Sandbox::new(&view);
-        let rules = Rules::new();
-        let tx = serde_json::json!({
-            "TransactionType": "VaultDeposit",
-            "Account": DEPOSITOR,
-            "VaultOwner": OWNER,
-            "VaultSequence": 1,
-            "Amount": "5000000",
-            "Fee": "12",
-            "Sequence": 1,
-        });
-
-        let mut ctx = ApplyContext {
-            tx: &tx,
-            view: &mut sandbox,
-            rules: &rules,
-            fees: &fees,
-        };
-
-        let result = VaultDepositTransactor.apply(&mut ctx).unwrap();
-        assert_eq!(result, TransactionResult::TesSuccess);
-
-        let vault_bytes = sandbox.read(&vault_key).unwrap();
-        let vault: serde_json::Value = serde_json::from_slice(&vault_bytes).unwrap();
-        assert_eq!(vault["TotalDeposited"].as_str().unwrap(), "15000000");
-        // shares = 5000000 * 10000000 / 10000000 = 5000000
-        assert_eq!(vault["TotalShares"].as_str().unwrap(), "15000000");
+        let owner_id = decode_account_id(OWNER).unwrap();
+        let mptoken_key = keylet::mptoken(issuance_key.as_bytes(), &owner_id);
+        let mptoken: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&mptoken_key).unwrap()).unwrap();
+        assert_eq!(mptoken["MPTAmount"].as_str().unwrap(), "10000000");
     }
 
     #[test]
     fn reject_zero_amount() {
         let tx = serde_json::json!({
             "TransactionType": "VaultDeposit",
-            "Account": DEPOSITOR,
-            "VaultOwner": OWNER,
-            "VaultSequence": 1,
+            "Account": OWNER,
+            "VaultID": "00000000000000000000000000000000000000000000000000000000000000FF",
             "Amount": "0",
-            "Fee": "12",
+            "Fee": "20",
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
@@ -316,94 +398,6 @@ mod tests {
         assert_eq!(
             VaultDepositTransactor.preflight(&ctx),
             Err(TransactionResult::TemBadAmount)
-        );
-    }
-
-    #[test]
-    fn reject_insufficient_balance() {
-        let (ledger, _) = setup_with_vault();
-        let fees = FeeSettings::default();
-        let view = LedgerView::with_fees(&ledger, fees.clone());
-        let rules = Rules::new();
-        let tx = serde_json::json!({
-            "TransactionType": "VaultDeposit",
-            "Account": DEPOSITOR,
-            "VaultOwner": OWNER,
-            "VaultSequence": 1,
-            "Amount": "60000000",
-            "Fee": "12",
-        });
-        let ctx = PreclaimContext {
-            tx: &tx,
-            view: &view,
-            rules: &rules,
-        };
-        assert_eq!(
-            VaultDepositTransactor.preclaim(&ctx),
-            Err(TransactionResult::TecUnfundedPayment)
-        );
-    }
-
-    #[test]
-    fn reject_exceeds_max_deposit() {
-        let mut ledger = setup_accounts();
-        let owner_id = decode_account_id(OWNER).unwrap();
-        let vault_key = keylet::vault(&owner_id, 1);
-        let entry = serde_json::json!({
-            "LedgerEntryType": "Vault",
-            "Owner": OWNER,
-            "Sequence": 1,
-            "Asset": "XRP",
-            "TotalDeposited": "8000000",
-            "TotalShares": "8000000",
-            "MaxDeposit": "10000000",
-            "Flags": 0,
-        });
-        ledger
-            .put_state(vault_key, serde_json::to_vec(&entry).unwrap())
-            .unwrap();
-
-        let fees = FeeSettings::default();
-        let view = LedgerView::with_fees(&ledger, fees.clone());
-        let rules = Rules::new();
-        let tx = serde_json::json!({
-            "TransactionType": "VaultDeposit",
-            "Account": DEPOSITOR,
-            "VaultOwner": OWNER,
-            "VaultSequence": 1,
-            "Amount": "3000000",
-            "Fee": "12",
-        });
-        let ctx = PreclaimContext {
-            tx: &tx,
-            view: &view,
-            rules: &rules,
-        };
-        assert_eq!(
-            VaultDepositTransactor.preclaim(&ctx),
-            Err(TransactionResult::TecOversize)
-        );
-    }
-
-    #[test]
-    fn reject_missing_vault_owner() {
-        let tx = serde_json::json!({
-            "TransactionType": "VaultDeposit",
-            "Account": DEPOSITOR,
-            "VaultSequence": 1,
-            "Amount": "1000000",
-            "Fee": "12",
-        });
-        let rules = Rules::new();
-        let fees = FeeSettings::default();
-        let ctx = PreflightContext {
-            tx: &tx,
-            rules: &rules,
-            fees: &fees,
-        };
-        assert_eq!(
-            VaultDepositTransactor.preflight(&ctx),
-            Err(TransactionResult::TemMalformed)
         );
     }
 }

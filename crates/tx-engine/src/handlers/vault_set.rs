@@ -1,4 +1,5 @@
 use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
@@ -6,9 +7,19 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transac
 
 pub struct VaultSetTransactor;
 
+/// Parse the 32-byte `VaultID` (the vault keylet itself).
+fn vault_id(tx: &serde_json::Value) -> Result<Hash256, TransactionResult> {
+    let hex_str = helpers::get_str_field(tx, "VaultID").ok_or(TransactionResult::TemMalformed)?;
+    let bytes = hex::decode(hex_str).map_err(|_| TransactionResult::TemMalformed)?;
+    if bytes.len() != 32 {
+        return Err(TransactionResult::TemMalformed);
+    }
+    Hash256::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)
+}
+
 impl Transactor for VaultSetTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
-        helpers::get_u32_field(ctx.tx, "VaultSequence").ok_or(TransactionResult::TemMalformed)?;
+        vault_id(ctx.tx)?;
         Ok(())
     }
 
@@ -16,13 +27,7 @@ impl Transactor for VaultSetTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         helpers::read_account_by_address(ctx.view, account_str)?;
 
-        let vault_seq = helpers::get_u32_field(ctx.tx, "VaultSequence")
-            .ok_or(TransactionResult::TemMalformed)?;
-
-        let account_id =
-            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let vault_key = keylet::vault(&account_id, vault_seq);
-
+        let vault_key = vault_id(ctx.tx)?;
         let vault_bytes = ctx
             .view
             .read(&vault_key)
@@ -30,7 +35,7 @@ impl Transactor for VaultSetTransactor {
         let vault: serde_json::Value =
             serde_json::from_slice(&vault_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        // Owner must match Account
+        // Only the vault owner may modify it.
         let owner = vault["Owner"]
             .as_str()
             .ok_or(TransactionResult::TefInternal)?;
@@ -46,10 +51,7 @@ impl Transactor for VaultSetTransactor {
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        let vault_seq = helpers::get_u32_field(ctx.tx, "VaultSequence")
-            .ok_or(TransactionResult::TemMalformed)?;
-        let vault_key = keylet::vault(&account_id, vault_seq);
-
+        let vault_key = vault_id(ctx.tx)?;
         let vault_bytes = ctx
             .view
             .read(&vault_key)
@@ -57,14 +59,23 @@ impl Transactor for VaultSetTransactor {
         let mut vault: serde_json::Value =
             serde_json::from_slice(&vault_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        // Update MaxDeposit if provided
-        if let Some(max_deposit) = helpers::get_u64_str_field(ctx.tx, "MaxDeposit") {
-            vault["MaxDeposit"] = serde_json::Value::String(max_deposit.to_string());
+        if let Some(data) = helpers::get_str_field(ctx.tx, "Data") {
+            vault["Data"] = serde_json::Value::String(data.to_string());
         }
 
-        // Update Flags if provided
-        if let Some(flags) = helpers::get_u32_field(ctx.tx, "Flags") {
-            vault["Flags"] = serde_json::Value::from(flags);
+        if let Some(max) = helpers::get_u64_str_field(ctx.tx, "AssetsMaximum") {
+            // A non-zero cap below the assets already held is rejected.
+            if max != 0 {
+                let total: u128 = vault
+                    .get("AssetsTotal")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                if (max as u128) < total {
+                    return Err(TransactionResult::TecLimitExceeded);
+                }
+            }
+            vault["AssetsMaximum"] = serde_json::Value::String(max.to_string());
         }
 
         let vault_data = serde_json::to_vec(&vault).map_err(|_| TransactionResult::TefInternal)?;
@@ -72,7 +83,7 @@ impl Transactor for VaultSetTransactor {
             .update(vault_key, vault_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Increment account sequence
+        // Bump the owner's sequence.
         let acct_key = keylet::account(&account_id);
         let acct_bytes = ctx
             .view
@@ -124,12 +135,11 @@ mod tests {
         let vault_key = keylet::vault(&owner_id, 1);
         let entry = serde_json::json!({
             "LedgerEntryType": "Vault",
+            "Account": OTHER,
             "Owner": OWNER,
             "Sequence": 1,
-            "Asset": "XRP",
-            "TotalDeposited": "0",
-            "TotalShares": "0",
-            "Flags": 0,
+            "ShareMPTID": "00000001A62B0DE19DFAF4D7C4E59DF8927BFF79FE146246",
+            "WithdrawalPolicy": 1,
         });
         ledger
             .put_state(vault_key, serde_json::to_vec(&entry).unwrap())
@@ -137,8 +147,12 @@ mod tests {
         (ledger, vault_key)
     }
 
+    fn vault_id_hex(vault_key: &rxrpl_primitives::Hash256) -> String {
+        hex::encode_upper(vault_key.as_bytes())
+    }
+
     #[test]
-    fn update_max_deposit() {
+    fn update_assets_maximum() {
         let (ledger, vault_key) = setup_with_vault();
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
@@ -147,8 +161,8 @@ mod tests {
         let tx = serde_json::json!({
             "TransactionType": "VaultSet",
             "Account": OWNER,
-            "VaultSequence": 1,
-            "MaxDeposit": "75000000",
+            "VaultID": vault_id_hex(&vault_key),
+            "AssetsMaximum": "75000000",
             "Fee": "12",
             "Sequence": 2,
         });
@@ -165,11 +179,11 @@ mod tests {
 
         let vault_bytes = sandbox.read(&vault_key).unwrap();
         let vault: serde_json::Value = serde_json::from_slice(&vault_bytes).unwrap();
-        assert_eq!(vault["MaxDeposit"].as_str().unwrap(), "75000000");
+        assert_eq!(vault["AssetsMaximum"].as_str().unwrap(), "75000000");
     }
 
     #[test]
-    fn update_flags() {
+    fn update_data() {
         let (ledger, vault_key) = setup_with_vault();
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
@@ -178,8 +192,8 @@ mod tests {
         let tx = serde_json::json!({
             "TransactionType": "VaultSet",
             "Account": OWNER,
-            "VaultSequence": 1,
-            "Flags": 1,
+            "VaultID": vault_id_hex(&vault_key),
+            "Data": "DEADBEEF",
             "Fee": "12",
             "Sequence": 2,
         });
@@ -196,11 +210,11 @@ mod tests {
 
         let vault_bytes = sandbox.read(&vault_key).unwrap();
         let vault: serde_json::Value = serde_json::from_slice(&vault_bytes).unwrap();
-        assert_eq!(vault["Flags"].as_u64().unwrap(), 1);
+        assert_eq!(vault["Data"].as_str().unwrap(), "DEADBEEF");
     }
 
     #[test]
-    fn reject_missing_vault_sequence() {
+    fn reject_missing_vault_id() {
         let tx = serde_json::json!({
             "TransactionType": "VaultSet",
             "Account": OWNER,
@@ -242,7 +256,7 @@ mod tests {
         let tx = serde_json::json!({
             "TransactionType": "VaultSet",
             "Account": OWNER,
-            "VaultSequence": 99,
+            "VaultID": "00000000000000000000000000000000000000000000000000000000000000FF",
             "Fee": "12",
         });
         let ctx = PreclaimContext {
@@ -258,8 +272,7 @@ mod tests {
 
     #[test]
     fn reject_non_owner() {
-        let (mut ledger, _) = setup_with_vault();
-        // Add OTHER account
+        let (mut ledger, vault_key) = setup_with_vault();
         let other_id = decode_account_id(OTHER).unwrap();
         let other_key = keylet::account(&other_id);
         let other_acct = serde_json::json!({
@@ -277,13 +290,10 @@ mod tests {
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let rules = Rules::new();
-        // OTHER tries to modify OWNER's vault -- uses OWNER's vault_seq but keyed on OTHER
-        // Actually, vault is keyed by owner+seq, so OTHER can't even find it via their own id.
-        // The preclaim looks up vault by Account (OTHER) + VaultSequence, which won't exist.
         let tx = serde_json::json!({
             "TransactionType": "VaultSet",
             "Account": OTHER,
-            "VaultSequence": 1,
+            "VaultID": vault_id_hex(&vault_key),
             "Fee": "12",
         });
         let ctx = PreclaimContext {
@@ -293,13 +303,13 @@ mod tests {
         };
         assert_eq!(
             VaultSetTransactor.preclaim(&ctx),
-            Err(TransactionResult::TecNoEntry)
+            Err(TransactionResult::TecNoPermission)
         );
     }
 
     #[test]
     fn increments_account_sequence() {
-        let (ledger, _) = setup_with_vault();
+        let (ledger, vault_key) = setup_with_vault();
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let mut sandbox = Sandbox::new(&view);
@@ -307,8 +317,8 @@ mod tests {
         let tx = serde_json::json!({
             "TransactionType": "VaultSet",
             "Account": OWNER,
-            "VaultSequence": 1,
-            "MaxDeposit": "100000000",
+            "VaultID": vault_id_hex(&vault_key),
+            "AssetsMaximum": "100000000",
             "Fee": "12",
             "Sequence": 2,
         });
