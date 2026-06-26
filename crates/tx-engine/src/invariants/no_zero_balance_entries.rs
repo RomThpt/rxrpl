@@ -50,7 +50,13 @@ impl InvariantCheck for NoZeroBalanceEntries {
                     .map(Self::is_zero_value)
                     .unwrap_or(false);
 
-                if balance_zero && low_zero && high_zero {
+                // A line that a side deliberately reserves (lsfLowReserve /
+                // lsfHighReserve) is a real holding -- e.g. a vault's empty
+                // underlying trust line -- and is not a zombie.
+                let flags = obj.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
+                let reserved = flags & (0x0001_0000 | 0x0002_0000) != 0;
+
+                if balance_zero && low_zero && high_zero && !reserved {
                     return Err(format!(
                         "RippleState at {key} has zero balance and zero limits -- should be deleted"
                     ));

@@ -20,8 +20,121 @@ const TF_VAULT_PRIVATE: u32 = 0x0001_0000;
 const TF_VAULT_SHARE_NON_TRANSFERABLE: u32 = 0x0002_0000;
 
 const VAULT_STRATEGY_FIRST_COME_FIRST_SERVE: u32 = 1;
+const VAULT_DEFAULT_IOU_SCALE: u32 = 6;
+
+const LSF_LOW_RESERVE: u32 = 0x0001_0000;
+const LSF_HIGH_RESERVE: u32 = 0x0002_0000;
+const LSF_LOW_NO_RIPPLE: u32 = 0x0010_0000;
+const LSF_HIGH_NO_RIPPLE: u32 = 0x0020_0000;
 
 pub struct VaultCreateTransactor;
+
+/// The (currency, issuer) of an IOU asset object.
+fn asset_currency_issuer(
+    asset: &serde_json::Value,
+) -> Result<([u8; 20], AccountId), TransactionResult> {
+    let currency = asset
+        .get("currency")
+        .and_then(|c| c.as_str())
+        .ok_or(TransactionResult::TemBadCurrency)?;
+    let issuer_str = asset
+        .get("issuer")
+        .and_then(|i| i.as_str())
+        .ok_or(TransactionResult::TemBadIssuer)?;
+    let issuer_id =
+        decode_account_id(issuer_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    Ok((helpers::currency_to_bytes(currency), issuer_id))
+}
+
+/// The RippleState keylet for the pseudo-account's holding of an IOU asset
+/// (the share issuance's `ReferenceHolding`).
+fn iou_line_keylet(
+    pseudo_id: &AccountId,
+    asset: &serde_json::Value,
+) -> Result<String, TransactionResult> {
+    let (cur_bytes, issuer_id) = asset_currency_issuer(asset)?;
+    Ok(hex::encode_upper(
+        keylet::trust_line(pseudo_id, &issuer_id, &cur_bytes).as_bytes(),
+    ))
+}
+
+/// Create the pseudo-account's empty trust line to the IOU issuer (rippled's
+/// addEmptyHolding for an `Issue`), threading it into both the pseudo and issuer
+/// owner directories and stamping the issuer's account. The reserve and NoRipple
+/// flags fall on the pseudo side.
+fn create_empty_iou_line(
+    ctx: &mut ApplyContext<'_>,
+    pseudo_id: &AccountId,
+    asset: &serde_json::Value,
+) -> Result<(), TransactionResult> {
+    let (cur_bytes, issuer_id) = asset_currency_issuer(asset)?;
+    let issuer_str = encode_account_id(&issuer_id);
+    let currency_hex = hex::encode_upper(cur_bytes);
+
+    let tl_key = keylet::trust_line(pseudo_id, &issuer_id, &cur_bytes);
+    let pseudo_is_low = pseudo_id.as_bytes() < issuer_id.as_bytes();
+
+    let pseudo_limit = serde_json::json!({
+        "currency": currency_hex, "issuer": encode_account_id(pseudo_id), "value": "0",
+    });
+    let issuer_limit = serde_json::json!({
+        "currency": currency_hex, "issuer": issuer_str, "value": "0",
+    });
+    let (low_limit, high_limit) = if pseudo_is_low {
+        (pseudo_limit, issuer_limit)
+    } else {
+        (issuer_limit, pseudo_limit)
+    };
+    let flags = if pseudo_is_low {
+        LSF_LOW_RESERVE | LSF_LOW_NO_RIPPLE
+    } else {
+        LSF_HIGH_RESERVE | LSF_HIGH_NO_RIPPLE
+    };
+
+    let pseudo_page = crate::owner_dir::add_to_owner_dir(ctx.view, pseudo_id, &tl_key)?;
+    let issuer_page = crate::owner_dir::add_to_owner_dir(ctx.view, &issuer_id, &tl_key)?;
+    let (low_node, high_node) = if pseudo_is_low {
+        (pseudo_page, issuer_page)
+    } else {
+        (issuer_page, pseudo_page)
+    };
+
+    let mut account_one = [0u8; 20];
+    account_one[19] = 1;
+    let no_account = encode_account_id(&AccountId::from(account_one));
+    let mut tl_obj = serde_json::json!({
+        "LedgerEntryType": "RippleState",
+        "Balance": { "currency": currency_hex, "issuer": no_account, "value": "0" },
+        "LowLimit": low_limit,
+        "HighLimit": high_limit,
+        "Flags": flags,
+        "PreviousTxnID": ZERO_TXID,
+        "PreviousTxnLgrSeq": 0,
+    });
+    if low_node != 0 {
+        tl_obj["LowNode"] = serde_json::Value::String(format!("{low_node:016X}"));
+    }
+    if high_node != 0 {
+        tl_obj["HighNode"] = serde_json::Value::String(format!("{high_node:016X}"));
+    }
+    ctx.view
+        .insert(
+            tl_key,
+            serde_json::to_vec(&tl_obj).map_err(|_| TransactionResult::TefInternal)?,
+        )
+        .map_err(|_| TransactionResult::TefInternal)?;
+
+    // Threading the line into the issuer's directory restamps the issuer's
+    // account (rippled emits it as a metadata-only ModifiedNode).
+    let issuer_key = keylet::account(&issuer_id);
+    if let Some(bytes) = ctx.view.read(&issuer_key) {
+        ctx.view
+            .update(issuer_key, bytes.to_vec())
+            .map_err(|_| TransactionResult::TefInternal)?;
+    }
+
+    Ok(())
+}
 
 /// The 192-bit share MPTokenIssuanceID is `sequence (4 bytes BE) || issuer (20
 /// bytes)`, with sequence 1 (the pseudo-account's first and only issuance).
@@ -114,11 +227,12 @@ impl Transactor for VaultCreateTransactor {
         let asset = ctx.tx.get("Asset").unwrap().clone();
         let tx_flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
 
-        if !is_xrp_asset(&asset) {
-            // IOU/MPT vaults additionally need the pseudo-account's underlying
-            // holding (RippleState/MPToken). Not yet byte-verified.
-            return Err(TransactionResult::TemDisabled);
-        }
+        let is_iou = !is_xrp_asset(&asset);
+        // IOU vaults price shares with the default 6-decimal scale.
+        let scale: u32 = if is_iou { VAULT_DEFAULT_IOU_SCALE } else { 0 };
+        // The pseudo-account owns the share issuance plus, for an IOU vault, its
+        // underlying trust line.
+        let pseudo_owner_count = if is_iou { 2 } else { 1 };
 
         // 1. Vault keylet + pseudo-account derivation.
         let vault_key = keylet::vault(&account_id, seq);
@@ -132,7 +246,7 @@ impl Transactor for VaultCreateTransactor {
             "Account": pseudo_str,
             "Balance": "0",
             "Flags": LSF_DISABLE_MASTER | LSF_DEFAULT_RIPPLE | LSF_DEPOSIT_AUTH,
-            "OwnerCount": 1,
+            "OwnerCount": pseudo_owner_count,
             "VaultID": vault_id_hex,
             "PreviousTxnID": ZERO_TXID,
             "PreviousTxnLgrSeq": 0,
@@ -144,7 +258,15 @@ impl Transactor for VaultCreateTransactor {
             )
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // 3. Share MPTokenIssuance, issued by the pseudo-account (Sequence 1).
+        // For an IOU vault the share issuance references the pseudo-account's
+        // underlying trust line; compute that keylet up front.
+        let reference_holding = if is_iou {
+            Some(iou_line_keylet(&pseudo_id, &asset)?)
+        } else {
+            None
+        };
+
+        // 4. Share MPTokenIssuance, issued by the pseudo-account (Sequence 1).
         let mut mpt_flags = 0u32;
         if tx_flags & TF_VAULT_SHARE_NON_TRANSFERABLE == 0 {
             mpt_flags |= LSF_MPT_CAN_ESCROW | LSF_MPT_CAN_TRADE | LSF_MPT_CAN_TRANSFER;
@@ -153,7 +275,7 @@ impl Transactor for VaultCreateTransactor {
             mpt_flags |= LSF_MPT_REQUIRE_AUTH;
         }
         let issuance_key = keylet::mptoken_issuance(&pseudo_id, 1);
-        let issuance = serde_json::json!({
+        let mut issuance = serde_json::json!({
             "LedgerEntryType": "MPTokenIssuance",
             "Flags": mpt_flags,
             "Issuer": pseudo_str,
@@ -161,6 +283,12 @@ impl Transactor for VaultCreateTransactor {
             "PreviousTxnID": ZERO_TXID,
             "PreviousTxnLgrSeq": 0,
         });
+        if scale != 0 {
+            issuance["AssetScale"] = serde_json::Value::from(scale);
+        }
+        if let Some(ref holding) = reference_holding {
+            issuance["ReferenceHolding"] = serde_json::Value::String(holding.clone());
+        }
         ctx.view
             .insert(
                 issuance_key,
@@ -168,6 +296,12 @@ impl Transactor for VaultCreateTransactor {
             )
             .map_err(|_| TransactionResult::TefInternal)?;
         crate::owner_dir::add_to_owner_dir(ctx.view, &pseudo_id, &issuance_key)?;
+
+        // 5. For an IOU vault, create the pseudo-account's empty trust line to the
+        //    issuer (added to the pseudo directory after the share issuance).
+        if is_iou {
+            create_empty_iou_line(ctx, &pseudo_id, &asset)?;
+        }
 
         let share_id = share_mptid(&pseudo_id);
 
@@ -185,6 +319,10 @@ impl Transactor for VaultCreateTransactor {
             "PreviousTxnID": ZERO_TXID,
             "PreviousTxnLgrSeq": 0,
         });
+        if is_iou {
+            vault["Asset"] = asset.clone();
+            vault["Scale"] = serde_json::Value::from(scale);
+        }
         if tx_flags & TF_VAULT_PRIVATE != 0 {
             vault["Flags"] = serde_json::Value::from(TF_VAULT_PRIVATE);
         }
