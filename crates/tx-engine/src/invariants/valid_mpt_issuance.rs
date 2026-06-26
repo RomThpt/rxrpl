@@ -59,15 +59,23 @@ impl InvariantCheck for ValidMptIssuance {
             if let Ok(obj) = serde_json::from_slice::<Value>(data) {
                 let entry_type = obj.get("LedgerEntryType").and_then(|v| v.as_str());
 
-                if entry_type == Some("MPTokenIssuance") && tx_type != "MPTokenIssuanceDestroy" {
+                // VaultDelete tears down a vault's share issuance.
+                if entry_type == Some("MPTokenIssuance")
+                    && tx_type != "MPTokenIssuanceDestroy"
+                    && tx_type != "VaultDelete"
+                {
                     return Err(format!(
                         "MPTokenIssuance deleted at {key} by {tx_type} (expected MPTokenIssuanceDestroy)"
                     ));
                 }
 
+                // A vault's share holding is removed by VaultDelete and, for a
+                // non-owner, when VaultWithdraw empties it.
                 if entry_type == Some("MPToken")
                     && tx_type != "MPTokenAuthorize"
                     && tx_type != "Clawback"
+                    && tx_type != "VaultDelete"
+                    && tx_type != "VaultWithdraw"
                 {
                     return Err(format!(
                         "MPToken deleted at {key} by {tx_type} (expected MPTokenAuthorize or Clawback)"
