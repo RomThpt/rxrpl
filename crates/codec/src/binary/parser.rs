@@ -331,7 +331,7 @@ impl<'a> BinaryParser<'a> {
                 let bytes = self.read_bytes(20)?;
                 Ok(Value::String(decode_currency_code(bytes)))
             }
-            "XChainBridge" => self.parse_object(),
+            "XChainBridge" => self.parse_xchain_bridge(),
             "Number" => self.parse_number(),
             "UInt96" => {
                 let bytes = self.read_bytes(12)?;
@@ -502,6 +502,26 @@ impl<'a> BinaryParser<'a> {
     pub(crate) fn parse_number(&mut self) -> Result<Value, CodecError> {
         let raw = self.read_u64()?;
         Ok(Value::String(decode_iou_value(raw)?))
+    }
+
+    /// XChainBridge: door(VL AccountID) + issue, twice (rippled STXChainBridge::add).
+    fn parse_xchain_bridge(&mut self) -> Result<Value, CodecError> {
+        let mut map = Map::new();
+        for (door, issue) in [
+            ("LockingChainDoor", "LockingChainIssue"),
+            ("IssuingChainDoor", "IssuingChainIssue"),
+        ] {
+            let len = self.read_vl_length()?;
+            let bytes = self.read_bytes(len)?;
+            let account_id = rxrpl_primitives::AccountId::from_slice(bytes)
+                .map_err(|e| CodecError::InvalidAddress(e.to_string()))?;
+            map.insert(
+                door.to_string(),
+                Value::String(crate::address::encode_account_id(&account_id)),
+            );
+            map.insert(issue.to_string(), self.parse_issue()?);
+        }
+        Ok(Value::Object(map))
     }
 
     fn parse_issue(&mut self) -> Result<Value, CodecError> {
