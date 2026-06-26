@@ -17,6 +17,8 @@ const KNOWN_ENTRY_TYPES: &[&str] = &[
     "Escrow",
     "FeeSettings",
     "LedgerHashes",
+    "Loan",
+    "LoanBroker",
     "MPToken",
     "MPTokenIssuance",
     "NFTokenOffer",

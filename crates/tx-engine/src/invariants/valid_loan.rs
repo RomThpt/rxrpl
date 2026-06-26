@@ -57,28 +57,15 @@ impl InvariantCheck for ValidLoan {
                     }
                 }
                 Some("LoanBroker") => {
-                    // OwnerCount must be non-negative
-                    let owner_count = obj.get("OwnerCount").and_then(|v| v.as_i64());
-                    match owner_count {
-                        Some(c) if c >= 0 => {}
-                        _ => {
+                    // DebtTotal is optional (default 0); if present it must parse
+                    // to a non-negative integer.
+                    if let Some(s) = obj.get("DebtTotal").and_then(|v| v.as_str()) {
+                        let debt_total: i64 = s.parse().unwrap_or(-1);
+                        if debt_total < 0 {
                             return Err(format!(
-                                "LoanBroker at {key} has invalid OwnerCount: {:?}",
-                                obj.get("OwnerCount")
+                                "LoanBroker at {key} has invalid DebtTotal: {debt_total}"
                             ));
                         }
-                    }
-
-                    // DebtTotal must parse to a valid non-negative integer
-                    let debt_total: i64 = obj
-                        .get("DebtTotal")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(-1);
-                    if debt_total < 0 {
-                        return Err(format!(
-                            "LoanBroker at {key} has invalid DebtTotal: {debt_total}"
-                        ));
                     }
                 }
                 _ => continue,
@@ -115,10 +102,9 @@ mod tests {
         .unwrap()
     }
 
-    fn broker_entry(owner_count: i64, debt_total: &str) -> Vec<u8> {
+    fn broker_entry(debt_total: &str) -> Vec<u8> {
         serde_json::to_vec(&json!({
             "LedgerEntryType": "LoanBroker",
-            "OwnerCount": owner_count,
             "DebtTotal": debt_total,
         }))
         .unwrap()
@@ -160,18 +146,18 @@ mod tests {
         let mut changes = empty_changes();
         changes
             .inserts
-            .insert(Hash256::new([0x01; 32]), broker_entry(2, "1000000"));
+            .insert(Hash256::new([0x01; 32]), broker_entry("1000000"));
         assert!(check.check(&changes, 100, 100, None).is_ok());
     }
 
     #[test]
-    fn negative_broker_owner_count_fails() {
+    fn broker_without_debt_total_passes() {
+        // DebtTotal defaults to 0 and is omitted from a freshly created broker.
         let check = ValidLoan;
         let mut changes = empty_changes();
-        changes
-            .updates
-            .insert(Hash256::new([0x01; 32]), broker_entry(-1, "1000000"));
-        assert!(check.check(&changes, 100, 100, None).is_err());
+        let data = serde_json::to_vec(&json!({"LedgerEntryType": "LoanBroker"})).unwrap();
+        changes.inserts.insert(Hash256::new([0x01; 32]), data);
+        assert!(check.check(&changes, 100, 100, None).is_ok());
     }
 
     #[test]
@@ -180,7 +166,7 @@ mod tests {
         let mut changes = empty_changes();
         changes
             .updates
-            .insert(Hash256::new([0x01; 32]), broker_entry(0, "-100"));
+            .insert(Hash256::new([0x01; 32]), broker_entry("-100"));
         assert!(check.check(&changes, 100, 100, None).is_err());
     }
 }

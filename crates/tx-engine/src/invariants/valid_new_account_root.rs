@@ -49,7 +49,9 @@ impl InvariantCheck for ValidNewAccountRoot {
 
             // Pseudo-accounts (AMM / Vault) carry a designator field and, under
             // featureSingleAssetVault, a Sequence of 0 (serialized as absent).
-            let is_pseudo = obj.get("AMMID").is_some() || obj.get("VaultID").is_some();
+            let is_pseudo = obj.get("AMMID").is_some()
+                || obj.get("VaultID").is_some()
+                || obj.get("LoanBrokerID").is_some();
 
             // A regular new account must have Sequence > 0; a pseudo-account may
             // omit it (Sequence 0).
