@@ -120,11 +120,7 @@ impl BinarySerializer {
             "PathSet" => self.serialize_pathset(value)?,
             "Issue" => self.serialize_issue(value)?,
             "Currency" => self.serialize_currency(value)?,
-            "XChainBridge" => {
-                self.serialize_object(value, true)?;
-                let end = field_id::encode_field_id(14, 1);
-                self.write_bytes(&end);
-            }
+            "XChainBridge" => self.serialize_xchain_bridge(value)?,
             "Number" => self.serialize_number(value)?,
             other => {
                 return Err(CodecError::UnsupportedType(format!(
@@ -472,6 +468,28 @@ impl BinarySerializer {
             }
         }
         self.write_u8(0x00); // PathSet end
+        Ok(())
+    }
+
+    /// XChainBridge serializes inline as door(VL AccountID) + issue, twice, with
+    /// no field IDs or end marker (rippled STXChainBridge::add).
+    fn serialize_xchain_bridge(&mut self, value: &Value) -> Result<(), CodecError> {
+        let o = value.as_object().ok_or_else(|| {
+            CodecError::UnsupportedType("expected object for XChainBridge".to_string())
+        })?;
+        for (door, issue) in [
+            ("LockingChainDoor", "LockingChainIssue"),
+            ("IssuingChainDoor", "IssuingChainIssue"),
+        ] {
+            let d = o.get(door).ok_or_else(|| {
+                CodecError::UnsupportedType(format!("XChainBridge missing {door}"))
+            })?;
+            self.serialize_account_id(d)?;
+            let i = o.get(issue).ok_or_else(|| {
+                CodecError::UnsupportedType(format!("XChainBridge missing {issue}"))
+            })?;
+            self.serialize_issue(i)?;
+        }
         Ok(())
     }
 

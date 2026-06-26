@@ -48,10 +48,7 @@ impl Transactor for XChainCreateBridgeTransactor {
         }
 
         // Bridge must not already exist
-        let bridge_data = bridge_helpers::serialize_bridge_spec(bridge)?;
-        let account_id =
-            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let bridge_key = keylet::bridge(&account_id, &bridge_data);
+        let bridge_key = bridge_helpers::bridge_keylet(account_str, bridge)?;
         if ctx.view.exists(&bridge_key) {
             return Err(TransactionResult::TecDuplicate);
         }
@@ -65,21 +62,21 @@ impl Transactor for XChainCreateBridgeTransactor {
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
         let bridge = ctx.tx.get("XChainBridge").unwrap().clone();
-        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge)?;
-        let bridge_key = keylet::bridge(&account_id, &bridge_data);
+        let bridge_key = bridge_helpers::bridge_keylet(account_str, &bridge)?;
 
         let signature_reward = helpers::get_u64_str_field(ctx.tx, "SignatureReward")
             .ok_or(TransactionResult::TemMalformed)?;
 
         // Build the Bridge ledger entry
+        // The XChainClaimID / account-create / account-claim counters default to
+        // 0 and are omitted; Flags=0 is omitted; PreviousTxnID is stamped.
         let mut entry = serde_json::json!({
             "LedgerEntryType": "Bridge",
             "Account": account_str,
             "XChainBridge": bridge,
             "SignatureReward": signature_reward.to_string(),
-            "XChainClaimID": "0",
-            "XChainAccountCreateCount": "0",
-            "Flags": 0,
+            "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+            "PreviousTxnLgrSeq": 0,
         });
 
         if let Some(min_create) = helpers::get_u64_str_field(ctx.tx, "MinAccountCreateAmount") {
@@ -291,13 +288,12 @@ mod tests {
 
         // Verify bridge entry exists
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
-        let bridge_key = keylet::bridge(&door_id, &bridge_data);
+        let bridge_key = bridge_helpers::bridge_keylet(DOOR, &bridge_spec()).unwrap();
         let entry_bytes = sandbox.read(&bridge_key).unwrap();
         let entry: serde_json::Value = serde_json::from_slice(&entry_bytes).unwrap();
         assert_eq!(entry["LedgerEntryType"].as_str().unwrap(), "Bridge");
         assert_eq!(entry["SignatureReward"].as_str().unwrap(), "100");
-        assert_eq!(entry["XChainClaimID"].as_str().unwrap(), "0");
+        assert!(entry.get("XChainClaimID").is_none());
 
         // Verify owner count incremented
         let src_key = keylet::account(&door_id);
@@ -310,16 +306,12 @@ mod tests {
     fn preclaim_duplicate_bridge() {
         let mut ledger = setup_ledger();
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
-        let bridge_key = keylet::bridge(&door_id, &bridge_data);
+        let bridge_key = bridge_helpers::bridge_keylet(DOOR, &bridge_spec()).unwrap();
         let entry = serde_json::json!({
             "LedgerEntryType": "Bridge",
             "Account": DOOR,
             "XChainBridge": bridge_spec(),
             "SignatureReward": "100",
-            "XChainClaimID": "0",
-            "XChainAccountCreateCount": "0",
-            "Flags": 0,
         });
         ledger
             .put_state(bridge_key, serde_json::to_vec(&entry).unwrap())
