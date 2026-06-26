@@ -305,7 +305,6 @@ mod tests {
     #[test]
     fn preclaim_duplicate_bridge() {
         let mut ledger = setup_ledger();
-        let door_id = decode_account_id(DOOR).unwrap();
         let bridge_key = bridge_helpers::bridge_keylet(DOOR, &bridge_spec()).unwrap();
         let entry = serde_json::json!({
             "LedgerEntryType": "Bridge",
