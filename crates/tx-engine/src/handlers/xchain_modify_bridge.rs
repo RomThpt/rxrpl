@@ -45,11 +45,8 @@ impl Transactor for XChainModifyBridgeTransactor {
             return Err(TransactionResult::TecXChainBadDest);
         }
 
-        // Bridge must exist
-        let bridge_data = bridge_helpers::serialize_bridge_spec(bridge)?;
-        let account_id =
-            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let bridge_key = keylet::bridge(&account_id, &bridge_data);
+        // Bridge must exist (Account is one of the doors).
+        let bridge_key = bridge_helpers::bridge_keylet(account_str, bridge)?;
         if !ctx.view.exists(&bridge_key) {
             return Err(TransactionResult::TecNoEntry);
         }
@@ -63,8 +60,7 @@ impl Transactor for XChainModifyBridgeTransactor {
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
         let bridge = ctx.tx.get("XChainBridge").unwrap();
-        let bridge_data = bridge_helpers::serialize_bridge_spec(bridge)?;
-        let bridge_key = keylet::bridge(&account_id, &bridge_data);
+        let bridge_key = bridge_helpers::bridge_keylet(account_str, bridge)?;
 
         // Read existing bridge entry
         let entry_bytes = ctx
@@ -149,8 +145,10 @@ mod tests {
         }
 
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
-        let bridge_key = keylet::bridge(&door_id, &bridge_data);
+        let bridge_key = bridge_helpers::bridge_keylet_for_door(
+            &door_id,
+            bridge_spec().get("LockingChainIssue").unwrap(),
+        );
         let entry = serde_json::json!({
             "LedgerEntryType": "Bridge",
             "Account": DOOR,
@@ -274,8 +272,10 @@ mod tests {
 
         // Verify updated
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
-        let bridge_key = keylet::bridge(&door_id, &bridge_data);
+        let bridge_key = bridge_helpers::bridge_keylet_for_door(
+            &door_id,
+            bridge_spec().get("LockingChainIssue").unwrap(),
+        );
         let entry_bytes = sandbox.read(&bridge_key).unwrap();
         let entry: serde_json::Value = serde_json::from_slice(&entry_bytes).unwrap();
         assert_eq!(entry["SignatureReward"].as_str().unwrap(), "500");
@@ -308,8 +308,10 @@ mod tests {
         assert_eq!(result, TransactionResult::TesSuccess);
 
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
-        let bridge_key = keylet::bridge(&door_id, &bridge_data);
+        let bridge_key = bridge_helpers::bridge_keylet_for_door(
+            &door_id,
+            bridge_spec().get("LockingChainIssue").unwrap(),
+        );
         let entry_bytes = sandbox.read(&bridge_key).unwrap();
         let entry: serde_json::Value = serde_json::from_slice(&entry_bytes).unwrap();
         assert_eq!(

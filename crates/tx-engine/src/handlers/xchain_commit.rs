@@ -34,7 +34,6 @@ impl Transactor for XChainCommitTransactor {
         let (_, src_account) = helpers::read_account_by_address(ctx.view, account_str)?;
 
         let bridge = ctx.tx.get("XChainBridge").unwrap();
-        let bridge_data = bridge_helpers::serialize_bridge_spec(bridge)?;
 
         // Account must not be a door account (no self-commit)
         let locking_door = bridge
@@ -49,20 +48,14 @@ impl Transactor for XChainCommitTransactor {
             return Err(TransactionResult::TecXChainSelfCommit);
         }
 
-        // Bridge must exist
-        let door_id =
-            decode_account_id(locking_door).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let bridge_key = keylet::bridge(&door_id, &bridge_data);
+        // Bridge must exist (on either chain's door).
+        let bridge_key = bridge_helpers::find_bridge_keylet(bridge, |k| ctx.view.exists(k))?;
         if !ctx.view.exists(&bridge_key) {
             return Err(TransactionResult::TecNoEntry);
         }
 
-        // Claim ID entry must exist
-        let claim_id = helpers::get_u64_str_field(ctx.tx, "XChainClaimID").unwrap();
-        let claim_key = keylet::xchain_claim_id(&bridge_data, claim_id);
-        if !ctx.view.exists(&claim_key) {
-            return Err(TransactionResult::TecXChainNoClaimId);
-        }
+        // XChainClaimID references a claim on the OTHER chain; it is not checked
+        // here (Commit only locks funds on this chain).
 
         // Check sufficient balance
         let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
@@ -82,8 +75,6 @@ impl Transactor for XChainCommitTransactor {
         let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
 
         let bridge = ctx.tx.get("XChainBridge").unwrap().clone();
-        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge)?;
-        let claim_id = helpers::get_u64_str_field(ctx.tx, "XChainClaimID").unwrap();
 
         // Deduct Amount from sender's XRP balance
         let src_key = keylet::account(&account_id);
@@ -109,26 +100,33 @@ impl Transactor for XChainCommitTransactor {
             .update(src_key, src_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Update claim ID entry with commitment
-        let claim_key = keylet::xchain_claim_id(&bridge_data, claim_id);
-        let claim_bytes = ctx
+        // The committed Amount is locked in this chain's door account (the
+        // bridge owner), not recorded on the claim.
+        let bridge_key = bridge_helpers::find_bridge_keylet(&bridge, |k| ctx.view.exists(k))?;
+        let bridge_bytes = ctx
             .view
-            .read(&claim_key)
-            .ok_or(TransactionResult::TecXChainNoClaimId)?;
-        let mut claim_entry: serde_json::Value =
-            serde_json::from_slice(&claim_bytes).map_err(|_| TransactionResult::TefInternal)?;
-
-        claim_entry["CommitAmount"] = serde_json::Value::String(amount.to_string());
-        claim_entry["SendingAccount"] = serde_json::Value::String(account_str.to_string());
-
-        if let Some(dest) = helpers::get_str_field(ctx.tx, "OtherChainDestination") {
-            claim_entry["OtherChainDestination"] = serde_json::Value::String(dest.to_string());
-        }
-
-        let claim_data =
-            serde_json::to_vec(&claim_entry).map_err(|_| TransactionResult::TefInternal)?;
+            .read(&bridge_key)
+            .ok_or(TransactionResult::TecNoEntry)?;
+        let bridge_entry: serde_json::Value =
+            serde_json::from_slice(&bridge_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let door_str = bridge_entry["Account"]
+            .as_str()
+            .ok_or(TransactionResult::TefInternal)?;
+        let door_id =
+            decode_account_id(door_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let door_key = keylet::account(&door_id);
+        let door_bytes = ctx
+            .view
+            .read(&door_key)
+            .ok_or(TransactionResult::TerNoAccount)?;
+        let mut door_account: serde_json::Value =
+            serde_json::from_slice(&door_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let door_balance = helpers::get_balance(&door_account);
+        helpers::set_balance(&mut door_account, door_balance + amount);
+        let door_data =
+            serde_json::to_vec(&door_account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
-            .update(claim_key, claim_data)
+            .update(door_key, door_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
         Ok(TransactionResult::TesSuccess)
@@ -182,8 +180,10 @@ mod tests {
         }
 
         let door_id = decode_account_id(DOOR).unwrap();
-        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
-        let bridge_key = keylet::bridge(&door_id, &bridge_data);
+        let bridge_key = bridge_helpers::bridge_keylet_for_door(
+            &door_id,
+            bridge_spec().get("LockingChainIssue").unwrap(),
+        );
         let bridge_entry = serde_json::json!({
             "LedgerEntryType": "Bridge",
             "Account": DOOR,
@@ -198,6 +198,7 @@ mod tests {
             .unwrap();
 
         // Create claim ID entry
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
         let claim_key = keylet::xchain_claim_id(&bridge_data, 1);
         let claim_entry = serde_json::json!({
             "LedgerEntryType": "XChainOwnedClaimID",
@@ -286,31 +287,6 @@ mod tests {
     }
 
     #[test]
-    fn preclaim_no_claim_id() {
-        let ledger = setup_with_bridge_and_claim();
-        let view = LedgerView::with_fees(&ledger, FeeSettings::default());
-        let rules = Rules::new();
-
-        let tx = serde_json::json!({
-            "TransactionType": "XChainCommit",
-            "Account": SENDER,
-            "XChainBridge": bridge_spec(),
-            "XChainClaimID": "999",
-            "Amount": "1000000",
-            "Fee": "12",
-        });
-        let ctx = PreclaimContext {
-            tx: &tx,
-            view: &view,
-            rules: &rules,
-        };
-        assert_eq!(
-            XChainCommitTransactor.preclaim(&ctx),
-            Err(TransactionResult::TecXChainNoClaimId)
-        );
-    }
-
-    #[test]
     fn apply_commits_funds() {
         let ledger = setup_with_bridge_and_claim();
         let fees = FeeSettings::default();
@@ -345,14 +321,12 @@ mod tests {
         let src: serde_json::Value = serde_json::from_slice(&src_bytes).unwrap();
         assert_eq!(src["Balance"].as_str().unwrap(), "45000000");
 
-        // Verify claim ID entry updated with commitment
-        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
-        let claim_key = keylet::xchain_claim_id(&bridge_data, 1);
-        let claim_bytes = sandbox.read(&claim_key).unwrap();
-        let claim: serde_json::Value = serde_json::from_slice(&claim_bytes).unwrap();
-        assert_eq!(claim["CommitAmount"].as_str().unwrap(), "5000000");
-        assert_eq!(claim["SendingAccount"].as_str().unwrap(), SENDER);
-        assert_eq!(claim["OtherChainDestination"].as_str().unwrap(), USER);
+        // Verify the door account was credited with the committed Amount
+        let door_id = decode_account_id(DOOR).unwrap();
+        let door_key = keylet::account(&door_id);
+        let door_bytes = sandbox.read(&door_key).unwrap();
+        let door: serde_json::Value = serde_json::from_slice(&door_bytes).unwrap();
+        assert_eq!(door["Balance"].as_str().unwrap(), "105000000"); // 100M + 5M
     }
 
     #[test]
