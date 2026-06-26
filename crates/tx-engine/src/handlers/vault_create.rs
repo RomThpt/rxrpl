@@ -41,8 +41,11 @@ fn derive_pseudo_account(
     let parent = ctx.view.parent_hash();
     for i in 0u16..256 {
         let ibe = i.to_be_bytes();
-        let hash =
-            rxrpl_crypto::sha512_half::sha512_half(&[&ibe, parent.as_bytes(), vault_key.as_bytes()]);
+        let hash = rxrpl_crypto::sha512_half::sha512_half(&[
+            &ibe,
+            parent.as_bytes(),
+            vault_key.as_bytes(),
+        ]);
         let id = rxrpl_codec::address::classic::account_id_from_public_key(hash.as_bytes());
         if !ctx.view.exists(&keylet::account(&id)) {
             return Ok(id);
@@ -315,7 +318,10 @@ mod tests {
         assert_eq!(issuance["Flags"].as_u64().unwrap(), 56);
         assert_eq!(issuance["Issuer"].as_str().unwrap(), pseudo_str);
         assert_eq!(issuance["Sequence"].as_u64().unwrap(), 1);
-        assert_eq!(vault["ShareMPTID"].as_str().unwrap(), share_mptid(&pseudo_id));
+        assert_eq!(
+            vault["ShareMPTID"].as_str().unwrap(),
+            share_mptid(&pseudo_id)
+        );
 
         // Owner holds an MPToken for the shares.
         let owner_mpt_key = keylet::mptoken(issuance_key.as_bytes(), &owner_id);
