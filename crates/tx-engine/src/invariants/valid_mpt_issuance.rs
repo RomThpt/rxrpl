@@ -32,13 +32,21 @@ impl InvariantCheck for ValidMptIssuance {
             if let Ok(obj) = serde_json::from_slice::<Value>(data) {
                 let entry_type = obj.get("LedgerEntryType").and_then(|v| v.as_str());
 
-                if entry_type == Some("MPTokenIssuance") && tx_type != "MPTokenIssuanceCreate" {
+                // A vault's share issuance and the owner's share holding are
+                // created as a side effect of VaultCreate.
+                if entry_type == Some("MPTokenIssuance")
+                    && tx_type != "MPTokenIssuanceCreate"
+                    && tx_type != "VaultCreate"
+                {
                     return Err(format!(
                         "MPTokenIssuance created at {key} by {tx_type} (expected MPTokenIssuanceCreate)"
                     ));
                 }
 
-                if entry_type == Some("MPToken") && tx_type != "MPTokenAuthorize" {
+                if entry_type == Some("MPToken")
+                    && tx_type != "MPTokenAuthorize"
+                    && tx_type != "VaultCreate"
+                {
                     return Err(format!(
                         "MPToken created at {key} by {tx_type} (expected MPTokenAuthorize)"
                     ));
