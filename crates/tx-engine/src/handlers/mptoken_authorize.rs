@@ -18,7 +18,8 @@ pub struct MPTokenAuthorizeTransactor;
 
 /// The 192-bit MPTokenIssuanceID is `sequence (4 bytes BE) || issuer (20 bytes)`.
 /// It is NOT the issuance SLE key — that is derived by hashing (seq, issuer).
-/// Returns `(issuance_sle_key, raw 24-byte id)`. The MPToken keylet uses the raw id.
+/// Returns `(issuance_sle_key, raw 24-byte id)`. Both the issuance lookup and the
+/// MPToken keylet use the 32-byte SLE key, mirroring rippled.
 pub(crate) fn parse_issuance_id(tx: &Value) -> Result<(Hash256, Vec<u8>), TransactionResult> {
     let hex_str =
         helpers::get_str_field(tx, "MPTokenIssuanceID").ok_or(TransactionResult::TemMalformed)?;
