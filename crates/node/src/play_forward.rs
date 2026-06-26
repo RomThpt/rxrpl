@@ -119,6 +119,16 @@ pub fn rules_for_ledger(ledger: &Ledger) -> Rules {
             })
         })
         .unwrap_or_default();
+    let mut enabled = enabled;
+    // SortedDirectories was retired (permanently baked in) by the time of the
+    // modern lending/vault amendments, so it is no longer listed in the
+    // Amendments object even though directories are kept sorted. Re-enable it
+    // whenever a clearly post-retirement amendment is active.
+    let single_asset_vault = rxrpl_amendment::feature::feature_id("SingleAssetVault");
+    let sorted_directories = rxrpl_amendment::feature::feature_id("SortedDirectories");
+    if enabled.contains(&single_asset_vault) && !enabled.contains(&sorted_directories) {
+        enabled.push(sorted_directories);
+    }
     Rules::from_enabled(enabled)
 }
 
@@ -525,6 +535,12 @@ mod tests {
                     }
                 }
             }
+        }
+
+        // LoanBroker/Vault transactors read the referenced Vault SLE (by its
+        // 32-byte VaultID keylet) without listing it in AffectedNodes.
+        if let Some(vid) = tx_json.get("VaultID").and_then(|v| v.as_str()) {
+            read_keys.insert(vid.to_uppercase());
         }
 
         // An entry created or removed on a non-root directory page touches only

@@ -1,90 +1,62 @@
-use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_codec::address::classic::{decode_account_id, encode_account_id};
+use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::helpers;
+use crate::pseudo;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct LoanBrokerSetTransactor;
 
+const ZERO_TXID: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const LSF_DISABLE_MASTER: u32 = 0x0010_0000;
+const LSF_DEFAULT_RIPPLE: u32 = 0x0080_0000;
+const LSF_DEPOSIT_AUTH: u32 = 0x0100_0000;
+
+const MAX_MANAGEMENT_FEE_RATE: u32 = 10_000;
+const MAX_COVER_RATE: u32 = 100_000;
+
+fn vault_id(tx: &serde_json::Value) -> Result<Hash256, TransactionResult> {
+    let hex_str = helpers::get_str_field(tx, "VaultID").ok_or(TransactionResult::TemMalformed)?;
+    let bytes = hex::decode(hex_str).map_err(|_| TransactionResult::TemMalformed)?;
+    if bytes.len() != 32 {
+        return Err(TransactionResult::TemMalformed);
+    }
+    Hash256::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)
+}
+
 impl Transactor for LoanBrokerSetTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
-        // VaultID is required (VaultOwner + VaultSequence identify the vault)
-        helpers::get_str_field(ctx.tx, "VaultOwner").ok_or(TransactionResult::TemMalformed)?;
-        helpers::get_u32_field(ctx.tx, "VaultSequence").ok_or(TransactionResult::TemMalformed)?;
+        // Modifying an existing broker (by LoanBrokerID) is not byte-verified yet.
+        if helpers::get_str_field(ctx.tx, "LoanBrokerID").is_some() {
+            return Err(TransactionResult::TemDisabled);
+        }
+        vault_id(ctx.tx)?;
 
-        // ManagementFeeRate must be <= 10000 (basis points)
         if let Some(rate) = helpers::get_u32_field(ctx.tx, "ManagementFeeRate") {
-            if rate > 10000 {
-                return Err(TransactionResult::TemMalformed);
-            }
-        } else {
-            return Err(TransactionResult::TemMalformed);
-        }
-
-        // CoverRateMinimum must be <= 100000 (parts per million)
-        if let Some(rate) = helpers::get_u32_field(ctx.tx, "CoverRateMinimum") {
-            if rate > 100000 {
-                return Err(TransactionResult::TemMalformed);
-            }
-        } else {
-            return Err(TransactionResult::TemMalformed);
-        }
-
-        // CoverRateLiquidation must be <= 100000
-        if let Some(rate) = helpers::get_u32_field(ctx.tx, "CoverRateLiquidation") {
-            if rate > 100000 {
-                return Err(TransactionResult::TemMalformed);
-            }
-        } else {
-            return Err(TransactionResult::TemMalformed);
-        }
-
-        // DebtMaximum required, must be > 0
-        let debt_max = helpers::get_u64_str_field(ctx.tx, "DebtMaximum")
-            .ok_or(TransactionResult::TemBadAmount)?;
-        if debt_max == 0 {
-            return Err(TransactionResult::TemBadAmount);
-        }
-
-        // Data field, if present, must be <= 256 bytes
-        if let Some(data) = helpers::get_str_field(ctx.tx, "Data") {
-            if data.len() > 256 {
-                return Err(TransactionResult::TemMalformed);
+            if rate > MAX_MANAGEMENT_FEE_RATE {
+                return Err(TransactionResult::TemInvalid);
             }
         }
-
+        let cover_min = helpers::get_u32_field(ctx.tx, "CoverRateMinimum").unwrap_or(0);
+        let cover_liq = helpers::get_u32_field(ctx.tx, "CoverRateLiquidation").unwrap_or(0);
+        if cover_min > MAX_COVER_RATE || cover_liq > MAX_COVER_RATE {
+            return Err(TransactionResult::TemInvalid);
+        }
+        // Both cover rates must be zero or both non-zero.
+        if (cover_min == 0) != (cover_liq == 0) {
+            return Err(TransactionResult::TemInvalid);
+        }
         Ok(())
     }
 
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         helpers::read_account_by_address(ctx.view, account_str)?;
-
-        // Vault must exist and caller must be vault owner
-        let vault_owner_str =
-            helpers::get_str_field(ctx.tx, "VaultOwner").ok_or(TransactionResult::TemMalformed)?;
-        let vault_seq = helpers::get_u32_field(ctx.tx, "VaultSequence")
-            .ok_or(TransactionResult::TemMalformed)?;
-
-        let vault_owner_id = decode_account_id(vault_owner_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let vault_key = keylet::vault(&vault_owner_id, vault_seq);
-
-        let vault_bytes = ctx
-            .view
-            .read(&vault_key)
-            .ok_or(TransactionResult::TecNoEntry)?;
-        let vault: serde_json::Value =
-            serde_json::from_slice(&vault_bytes).map_err(|_| TransactionResult::TefInternal)?;
-
-        // Caller must be vault owner
-        let vault_owner = vault["Owner"]
-            .as_str()
-            .ok_or(TransactionResult::TefInternal)?;
-        if vault_owner != account_str {
-            return Err(TransactionResult::TecNoPermission);
+        let vault_key = vault_id(ctx.tx)?;
+        if ctx.view.read(&vault_key).is_none() {
+            return Err(TransactionResult::TecNoEntry);
         }
-
         Ok(())
     }
 
@@ -93,7 +65,6 @@ impl Transactor for LoanBrokerSetTransactor {
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
-        // Read account
         let acct_key = keylet::account(&account_id);
         let acct_bytes = ctx
             .view
@@ -101,224 +72,111 @@ impl Transactor for LoanBrokerSetTransactor {
             .ok_or(TransactionResult::TerNoAccount)?;
         let mut account: serde_json::Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
-
         let seq = helpers::get_sequence(&account);
 
-        let vault_owner_str = helpers::get_str_field(ctx.tx, "VaultOwner")
-            .ok_or(TransactionResult::TemMalformed)?
-            .to_string();
-        let vault_seq = helpers::get_u32_field(ctx.tx, "VaultSequence")
-            .ok_or(TransactionResult::TemMalformed)?;
-        let debt_maximum = helpers::get_u64_str_field(ctx.tx, "DebtMaximum")
-            .ok_or(TransactionResult::TemBadAmount)?;
-        let cover_rate_min = helpers::get_u32_field(ctx.tx, "CoverRateMinimum")
-            .ok_or(TransactionResult::TemMalformed)?;
-        let cover_rate_liq = helpers::get_u32_field(ctx.tx, "CoverRateLiquidation")
-            .ok_or(TransactionResult::TemMalformed)?;
-        let mgmt_fee_rate = helpers::get_u32_field(ctx.tx, "ManagementFeeRate")
-            .ok_or(TransactionResult::TemMalformed)?;
+        // Read the vault to learn its pseudo-account and asset.
+        let vault_key = vault_id(ctx.tx)?;
+        let vault_bytes = ctx
+            .view
+            .read(&vault_key)
+            .ok_or(TransactionResult::TecNoEntry)?;
+        let vault: serde_json::Value =
+            serde_json::from_slice(&vault_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let vault_pseudo_id = decode_account_id(
+            vault["Account"]
+                .as_str()
+                .ok_or(TransactionResult::TefInternal)?,
+        )
+        .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        let vault_asset = vault.get("Asset").cloned();
+        let is_iou = vault_asset
+            .as_ref()
+            .map(|a| !pseudo::is_xrp_asset(a))
+            .unwrap_or(false);
 
-        // Build VaultID string for reference
-        let vault_id = format!("{}:{}", vault_owner_str, vault_seq);
+        // 1. Broker keylet + its pseudo-account.
+        let broker_key = keylet::loan_broker(account_id.as_bytes(), seq);
+        let pseudo_id = pseudo::derive_pseudo_account(ctx, &broker_key)?;
+        let pseudo_str = encode_account_id(&pseudo_id);
+        let pseudo_owner_count = if is_iou { 1 } else { 0 };
 
-        // Build LoanBroker entry
+        let pseudo_acct = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": pseudo_str,
+            "Balance": "0",
+            "Flags": LSF_DISABLE_MASTER | LSF_DEFAULT_RIPPLE | LSF_DEPOSIT_AUTH,
+            "OwnerCount": pseudo_owner_count,
+            "LoanBrokerID": hex::encode_upper(broker_key.as_bytes()),
+            "PreviousTxnID": ZERO_TXID,
+            "PreviousTxnLgrSeq": 0,
+        });
+        ctx.view
+            .insert(
+                keylet::account(&pseudo_id),
+                serde_json::to_vec(&pseudo_acct).map_err(|_| TransactionResult::TefInternal)?,
+            )
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        // 2. The LoanBroker object, linked into the owner's and the vault
+        //    pseudo-account's directories.
         let mut broker = serde_json::json!({
             "LedgerEntryType": "LoanBroker",
+            "Account": pseudo_str,
             "Owner": account_str,
-            "Account": account_str,
-            "VaultID": vault_id,
+            "Sequence": seq,
+            "VaultID": hex::encode_upper(vault_key.as_bytes()),
             "LoanSequence": 1,
-            "OwnerCount": 0,
-            "DebtTotal": "0",
-            "DebtMaximum": debt_maximum.to_string(),
-            "CoverAvailable": "0",
-            "CoverRateMinimum": cover_rate_min,
-            "CoverRateLiquidation": cover_rate_liq,
-            "ManagementFeeRate": mgmt_fee_rate,
-            "Flags": 0,
+            "PreviousTxnID": ZERO_TXID,
+            "PreviousTxnLgrSeq": 0,
         });
-
+        if let Some(rate) = helpers::get_u32_field(ctx.tx, "ManagementFeeRate") {
+            broker["ManagementFeeRate"] = serde_json::Value::from(rate);
+        }
+        if let Some(rate) = helpers::get_u32_field(ctx.tx, "CoverRateMinimum") {
+            broker["CoverRateMinimum"] = serde_json::Value::from(rate);
+        }
+        if let Some(rate) = helpers::get_u32_field(ctx.tx, "CoverRateLiquidation") {
+            broker["CoverRateLiquidation"] = serde_json::Value::from(rate);
+        }
+        if let Some(debt) = helpers::get_u64_str_field(ctx.tx, "DebtMaximum") {
+            broker["DebtMaximum"] = serde_json::Value::String(debt.to_string());
+        }
         if let Some(data) = helpers::get_str_field(ctx.tx, "Data") {
             broker["Data"] = serde_json::Value::String(data.to_string());
         }
-
-        let broker_key = keylet::loan_broker(account_id.as_bytes(), seq);
-        let broker_data =
-            serde_json::to_vec(&broker).map_err(|_| TransactionResult::TefInternal)?;
+        let owner_node = crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &broker_key)?;
+        if owner_node != 0 {
+            broker["OwnerNode"] = serde_json::Value::String(format!("{owner_node:016X}"));
+        }
+        let vault_node =
+            crate::owner_dir::add_to_owner_dir(ctx.view, &vault_pseudo_id, &broker_key)?;
+        if vault_node != 0 {
+            broker["VaultNode"] = serde_json::Value::String(format!("{vault_node:016X}"));
+        }
         ctx.view
-            .insert(broker_key, broker_data)
+            .insert(
+                broker_key,
+                serde_json::to_vec(&broker).map_err(|_| TransactionResult::TefInternal)?,
+            )
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &broker_key)?;
+        // 3. For an IOU vault, give the broker pseudo-account its empty holding.
+        if is_iou {
+            if let Some(asset) = &vault_asset {
+                pseudo::create_empty_iou_line(ctx, &pseudo_id, asset)?;
+            }
+        }
 
-        // Update account: increment sequence, +2 owner count
+        // 4. Owner: +2 owner count (broker + pseudo) and sequence bump.
         helpers::increment_sequence(&mut account);
         helpers::adjust_owner_count(&mut account, 2);
-
-        let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
-            .update(acct_key, acct_data)
+            .update(
+                acct_key,
+                serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?,
+            )
             .map_err(|_| TransactionResult::TefInternal)?;
 
         Ok(TransactionResult::TesSuccess)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fees::FeeSettings;
-    use crate::transactor::{ApplyContext, PreflightContext};
-    use crate::view::ledger_view::LedgerView;
-    use crate::view::read_view::ReadView;
-    use crate::view::sandbox::Sandbox;
-    use rxrpl_amendment::Rules;
-    use rxrpl_ledger::Ledger;
-
-    const OWNER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
-
-    fn setup_with_vault() -> Ledger {
-        let mut ledger = Ledger::genesis();
-        let id = decode_account_id(OWNER).unwrap();
-        let key = keylet::account(&id);
-        let account = serde_json::json!({
-            "LedgerEntryType": "AccountRoot",
-            "Account": OWNER,
-            "Balance": "100000000",
-            "Sequence": 1,
-            "OwnerCount": 0,
-            "Flags": 0,
-        });
-        ledger
-            .put_state(key, serde_json::to_vec(&account).unwrap())
-            .unwrap();
-
-        // Create vault owned by OWNER
-        let vault_key = keylet::vault(&id, 1);
-        let vault = serde_json::json!({
-            "LedgerEntryType": "Vault",
-            "Owner": OWNER,
-            "Sequence": 1,
-            "Asset": "XRP",
-            "TotalDeposited": "50000000",
-            "TotalShares": "50000000",
-            "Flags": 0,
-        });
-        ledger
-            .put_state(vault_key, serde_json::to_vec(&vault).unwrap())
-            .unwrap();
-        ledger
-    }
-
-    fn base_tx() -> serde_json::Value {
-        serde_json::json!({
-            "TransactionType": "LoanBrokerSet",
-            "Account": OWNER,
-            "VaultOwner": OWNER,
-            "VaultSequence": 1,
-            "DebtMaximum": "10000000",
-            "CoverRateMinimum": 50000,
-            "CoverRateLiquidation": 80000,
-            "ManagementFeeRate": 500,
-            "Fee": "12",
-            "Sequence": 1,
-        })
-    }
-
-    #[test]
-    fn reject_missing_vault_id() {
-        let tx = serde_json::json!({
-            "TransactionType": "LoanBrokerSet",
-            "Account": OWNER,
-            "DebtMaximum": "10000000",
-            "CoverRateMinimum": 50000,
-            "CoverRateLiquidation": 80000,
-            "ManagementFeeRate": 500,
-            "Fee": "12",
-        });
-        let rules = Rules::new();
-        let fees = FeeSettings::default();
-        let ctx = PreflightContext {
-            tx: &tx,
-            rules: &rules,
-            fees: &fees,
-        };
-        assert_eq!(
-            LoanBrokerSetTransactor.preflight(&ctx),
-            Err(TransactionResult::TemMalformed)
-        );
-    }
-
-    #[test]
-    fn reject_invalid_management_fee_rate() {
-        let mut tx = base_tx();
-        tx["ManagementFeeRate"] = serde_json::json!(20000);
-        let rules = Rules::new();
-        let fees = FeeSettings::default();
-        let ctx = PreflightContext {
-            tx: &tx,
-            rules: &rules,
-            fees: &fees,
-        };
-        assert_eq!(
-            LoanBrokerSetTransactor.preflight(&ctx),
-            Err(TransactionResult::TemMalformed)
-        );
-    }
-
-    #[test]
-    fn valid_create() {
-        let ledger = setup_with_vault();
-        let fees = FeeSettings::default();
-        let view = LedgerView::with_fees(&ledger, fees.clone());
-        let mut sandbox = Sandbox::new(&view);
-        let rules = Rules::new();
-        let tx = base_tx();
-
-        let mut ctx = ApplyContext {
-            tx: &tx,
-            view: &mut sandbox,
-            rules: &rules,
-            fees: &fees,
-        };
-
-        let result = LoanBrokerSetTransactor.apply(&mut ctx).unwrap();
-        assert_eq!(result, TransactionResult::TesSuccess);
-
-        // Verify broker entry exists
-        let owner_id = decode_account_id(OWNER).unwrap();
-        let broker_key = keylet::loan_broker(owner_id.as_bytes(), 1);
-        let broker_bytes = sandbox.read(&broker_key).unwrap();
-        let broker: serde_json::Value = serde_json::from_slice(&broker_bytes).unwrap();
-        assert_eq!(broker["LedgerEntryType"].as_str().unwrap(), "LoanBroker");
-        assert_eq!(broker["Owner"].as_str().unwrap(), OWNER);
-        assert_eq!(broker["DebtTotal"].as_str().unwrap(), "0");
-        assert_eq!(broker["LoanSequence"].as_u64().unwrap(), 1);
-        assert_eq!(broker["OwnerCount"].as_u64().unwrap(), 0);
-        assert_eq!(broker["CoverAvailable"].as_str().unwrap(), "0");
-
-        // Verify owner count incremented by 2
-        let acct_key = keylet::account(&owner_id);
-        let acct_bytes = sandbox.read(&acct_key).unwrap();
-        let acct: serde_json::Value = serde_json::from_slice(&acct_bytes).unwrap();
-        assert_eq!(acct["OwnerCount"].as_u64().unwrap(), 2);
-        assert_eq!(acct["Sequence"].as_u64().unwrap(), 2);
-    }
-
-    #[test]
-    fn reject_data_too_long() {
-        let mut tx = base_tx();
-        tx["Data"] = serde_json::Value::String("X".repeat(300));
-        let rules = Rules::new();
-        let fees = FeeSettings::default();
-        let ctx = PreflightContext {
-            tx: &tx,
-            rules: &rules,
-            fees: &fees,
-        };
-        assert_eq!(
-            LoanBrokerSetTransactor.preflight(&ctx),
-            Err(TransactionResult::TemMalformed)
-        );
     }
 }

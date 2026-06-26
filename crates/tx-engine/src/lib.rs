@@ -19,6 +19,7 @@ pub mod invariants;
 pub mod metadata;
 pub mod nftoken;
 pub mod owner_dir;
+pub mod pseudo;
 pub mod registry;
 pub mod transactor;
 pub mod view;
