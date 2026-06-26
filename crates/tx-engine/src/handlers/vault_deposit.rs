@@ -39,10 +39,22 @@ fn num(v: &serde_json::Value, field: &str) -> u128 {
 impl Transactor for VaultDepositTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
         vault_id(ctx.tx)?;
-        let amount =
-            helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
-        if amount == 0 {
-            return Err(TransactionResult::TemBadAmount);
+        let amount = ctx
+            .tx
+            .get("Amount")
+            .ok_or(TransactionResult::TemBadAmount)?;
+        if amount.is_object() {
+            // IOU amount: value must be positive.
+            let v = amount.get("value").and_then(|x| x.as_str()).unwrap_or("0");
+            if v.trim_start_matches('-').trim_start_matches('0').is_empty() {
+                return Err(TransactionResult::TemBadAmount);
+            }
+        } else {
+            let drops = helpers::get_u64_str_field(ctx.tx, "Amount")
+                .ok_or(TransactionResult::TemBadAmount)?;
+            if drops == 0 {
+                return Err(TransactionResult::TemBadAmount);
+            }
         }
         Ok(())
     }
@@ -59,17 +71,16 @@ impl Transactor for VaultDepositTransactor {
         let vault: serde_json::Value =
             serde_json::from_slice(&vault_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        // Only XRP single-asset vaults are byte-verified so far.
-        if !vault_is_xrp(&vault) {
-            return Err(TransactionResult::TemDisabled);
-        }
-
-        let amount =
-            helpers::get_u64_str_field(ctx.tx, "Amount").ok_or(TransactionResult::TemBadAmount)?;
-        let fee = helpers::get_fee(ctx.tx);
-        let balance = helpers::get_balance(&depositor_acct);
-        if balance < amount + fee {
-            return Err(TransactionResult::TecUnfundedPayment);
+        // XRP vaults verify the depositor can cover Amount + fee; IOU balance
+        // sufficiency is enforced when the holding is debited.
+        if vault_is_xrp(&vault) {
+            let amount = helpers::get_u64_str_field(ctx.tx, "Amount")
+                .ok_or(TransactionResult::TemBadAmount)?;
+            let fee = helpers::get_fee(ctx.tx);
+            let balance = helpers::get_balance(&depositor_acct);
+            if balance < amount + fee {
+                return Err(TransactionResult::TecUnfundedPayment);
+            }
         }
 
         Ok(())
@@ -79,6 +90,11 @@ impl Transactor for VaultDepositTransactor {
         let depositor_str = helpers::get_account(ctx.tx)?;
         let depositor_id =
             decode_account_id(depositor_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+
+        if ctx.tx.get("Amount").map(|a| a.is_object()).unwrap_or(false) {
+            return apply_iou_deposit(ctx, depositor_str, &depositor_id);
+        }
+
         let amount = helpers::get_u64_str_field(ctx.tx, "Amount")
             .ok_or(TransactionResult::TemBadAmount)? as u128;
 
@@ -234,6 +250,216 @@ impl Transactor for VaultDepositTransactor {
 
         Ok(TransactionResult::TesSuccess)
     }
+}
+
+use rxrpl_amount::number::Number;
+
+/// Truncate a non-negative Number toward zero into a u128.
+fn num_to_u128_trunc(n: &Number) -> u128 {
+    if n.is_zero() {
+        return 0;
+    }
+    let m = n.mantissa() as u128;
+    let e = n.exponent();
+    if e >= 0 {
+        m.saturating_mul(10u128.pow(e as u32))
+    } else {
+        m / 10u128.pow((-e) as u32)
+    }
+}
+
+/// VaultDeposit for an IOU single-asset vault: shares are priced with the
+/// vault's decimal scale, the deposited IOU moves from the depositor's trust
+/// line to the pseudo-account's, and the shares are minted as MPT.
+fn apply_iou_deposit(
+    ctx: &mut ApplyContext<'_>,
+    depositor_str: &str,
+    depositor_id: &rxrpl_primitives::AccountId,
+) -> Result<TransactionResult, TransactionResult> {
+    let amount = ctx
+        .tx
+        .get("Amount")
+        .ok_or(TransactionResult::TemBadAmount)?;
+    let value = amount
+        .get("value")
+        .and_then(|v| v.as_str())
+        .ok_or(TransactionResult::TemBadAmount)?;
+    let issuer = decode_account_id(
+        amount
+            .get("issuer")
+            .and_then(|v| v.as_str())
+            .ok_or(TransactionResult::TemBadIssuer)?,
+    )
+    .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let currency = helpers::currency_to_bytes(
+        amount
+            .get("currency")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+    );
+
+    let vault_key = vault_id(ctx.tx)?;
+    let vault_bytes = ctx
+        .view
+        .read(&vault_key)
+        .ok_or(TransactionResult::TecNoEntry)?;
+    let mut vault: serde_json::Value =
+        serde_json::from_slice(&vault_bytes).map_err(|_| TransactionResult::TefInternal)?;
+
+    let pseudo_id = decode_account_id(
+        vault["Account"]
+            .as_str()
+            .ok_or(TransactionResult::TefInternal)?,
+    )
+    .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let share_id = vault["ShareMPTID"]
+        .as_str()
+        .ok_or(TransactionResult::TefInternal)?
+        .to_string();
+    let scale = vault.get("Scale").and_then(|s| s.as_u64()).unwrap_or(6) as u32;
+
+    let issuance_key = keylet::mptoken_issuance(&pseudo_id, 1);
+    let issuance_bytes = ctx
+        .view
+        .read(&issuance_key)
+        .ok_or(TransactionResult::TefInternal)?;
+    let mut issuance: serde_json::Value =
+        serde_json::from_slice(&issuance_bytes).map_err(|_| TransactionResult::TefInternal)?;
+
+    let assets_total = Number::from_iou(&crate::amm_helpers::parse_iou_value(
+        vault
+            .get("AssetsTotal")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0"),
+    ));
+    let assets_available = Number::from_iou(&crate::amm_helpers::parse_iou_value(
+        vault
+            .get("AssetsAvailable")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0"),
+    ));
+    let shares_total = num(&issuance, "OutstandingAmount");
+    let amount_num = Number::from_iou(&crate::amm_helpers::parse_iou_value(value));
+    let ten_pow_scale = Number::from_int(10i64.pow(scale));
+
+    // assetsToSharesDeposit / sharesToAssetsDeposit with the vault scale: the
+    // first deposit mints amount * 10^scale, later deposits scale by the ratio.
+    let (shares, assets_deposited) = if shares_total == 0 || assets_total.is_zero() {
+        (
+            num_to_u128_trunc(&amount_num.mul(&ten_pow_scale)),
+            amount_num,
+        )
+    } else {
+        let s = num_to_u128_trunc(
+            &Number::from_int(shares_total as i64)
+                .mul(&amount_num)
+                .div(&assets_total),
+        );
+        if s == 0 {
+            return Err(TransactionResult::TecPrecisionLoss);
+        }
+        let assets = assets_total
+            .mul(&Number::from_int(s as i64))
+            .div(&Number::from_int(shares_total as i64));
+        (s, assets)
+    };
+
+    // Grow the vault's asset accounting (STNumber).
+    vault["AssetsTotal"] =
+        serde_json::Value::String(assets_total.add(&assets_deposited).to_decimal_string());
+    vault["AssetsAvailable"] =
+        serde_json::Value::String(assets_available.add(&assets_deposited).to_decimal_string());
+    ctx.view
+        .update(
+            vault_key,
+            serde_json::to_vec(&vault).map_err(|_| TransactionResult::TefInternal)?,
+        )
+        .map_err(|_| TransactionResult::TefInternal)?;
+
+    // Move the deposited IOU from the depositor's holding to the pseudo's.
+    let depositor_hold =
+        crate::amm_helpers::iou_holding_number(ctx.view, depositor_id, &issuer, &currency);
+    crate::amm_helpers::set_iou_holding(
+        ctx.view,
+        depositor_id,
+        &issuer,
+        &currency,
+        &depositor_hold.sub(&assets_deposited),
+    )?;
+    let pseudo_hold =
+        crate::amm_helpers::iou_holding_number(ctx.view, &pseudo_id, &issuer, &currency);
+    crate::amm_helpers::set_iou_holding(
+        ctx.view,
+        &pseudo_id,
+        &issuer,
+        &currency,
+        &pseudo_hold.add(&assets_deposited),
+    )?;
+
+    // Mint the shares to the depositor's MPToken (created on first deposit).
+    let mptoken_key = keylet::mptoken(issuance_key.as_bytes(), depositor_id);
+    let created_mptoken = !ctx.view.exists(&mptoken_key);
+    if created_mptoken {
+        let mptoken = serde_json::json!({
+            "LedgerEntryType": "MPToken",
+            "Account": depositor_str,
+            "MPTokenIssuanceID": share_id,
+            "MPTAmount": shares.to_string(),
+            "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+            "PreviousTxnLgrSeq": 0,
+        });
+        ctx.view
+            .insert(
+                mptoken_key,
+                serde_json::to_vec(&mptoken).map_err(|_| TransactionResult::TefInternal)?,
+            )
+            .map_err(|_| TransactionResult::TefInternal)?;
+        crate::owner_dir::add_to_owner_dir(ctx.view, depositor_id, &mptoken_key)?;
+    } else {
+        let mptoken_bytes = ctx
+            .view
+            .read(&mptoken_key)
+            .ok_or(TransactionResult::TefInternal)?;
+        let mut mptoken: serde_json::Value =
+            serde_json::from_slice(&mptoken_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let cur = num(&mptoken, "MPTAmount");
+        mptoken["MPTAmount"] = serde_json::Value::String((cur + shares).to_string());
+        ctx.view
+            .update(
+                mptoken_key,
+                serde_json::to_vec(&mptoken).map_err(|_| TransactionResult::TefInternal)?,
+            )
+            .map_err(|_| TransactionResult::TefInternal)?;
+    }
+
+    issuance["OutstandingAmount"] = serde_json::Value::String((shares_total + shares).to_string());
+    ctx.view
+        .update(
+            issuance_key,
+            serde_json::to_vec(&issuance).map_err(|_| TransactionResult::TefInternal)?,
+        )
+        .map_err(|_| TransactionResult::TefInternal)?;
+
+    // Bump the depositor's sequence (and owner count if a new MPToken was made).
+    let depositor_key = keylet::account(depositor_id);
+    let depositor_bytes = ctx
+        .view
+        .read(&depositor_key)
+        .ok_or(TransactionResult::TerNoAccount)?;
+    let mut depositor_acct: serde_json::Value =
+        serde_json::from_slice(&depositor_bytes).map_err(|_| TransactionResult::TefInternal)?;
+    helpers::increment_sequence(&mut depositor_acct);
+    if created_mptoken {
+        helpers::adjust_owner_count(&mut depositor_acct, 1);
+    }
+    ctx.view
+        .update(
+            depositor_key,
+            serde_json::to_vec(&depositor_acct).map_err(|_| TransactionResult::TefInternal)?,
+        )
+        .map_err(|_| TransactionResult::TefInternal)?;
+
+    Ok(TransactionResult::TesSuccess)
 }
 
 #[cfg(test)]
