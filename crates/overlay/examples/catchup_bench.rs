@@ -38,19 +38,6 @@ fn build_server(count: usize, item_bytes: usize) -> (SHAMap, Hash256) {
     (map, root)
 }
 
-/// Child SHAMapNodeID for `branch`, mirroring `SHAMap::collect_missing`.
-fn child_node_id(parent: NodeId, branch: u8) -> NodeId {
-    let depth = parent.depth();
-    let mut path = *parent.id().as_bytes();
-    let bi = (depth / 2) as usize;
-    if depth & 1 == 0 {
-        path[bi] = (path[bi] & 0x0F) | (branch << 4);
-    } else {
-        path[bi] = (path[bi] & 0xF0) | branch;
-    }
-    NodeId::new(depth + 1, &Hash256::new(path))
-}
-
 /// rippled TMLedgerNode wire form: inner = content||0x02, leaf = data||key||0x01.
 fn wire_of(bytes: &[u8], is_inner: bool) -> Vec<u8> {
     let mut w = Vec::with_capacity(bytes.len() + 1);
@@ -65,44 +52,10 @@ fn wire_of(bytes: &[u8], is_inner: bool) -> Vec<u8> {
     w
 }
 
-/// Collect a fat subtree rooted at `id` down `depth` levels into `out`, stopping
-/// at `cap` total nodes (models `getNodeFat`).
-fn collect_fat(
-    server: &SHAMap,
-    id: NodeId,
-    depth: u8,
-    cap: usize,
-    horizon: Option<u8>,
-    out: &mut Vec<(Vec<u8>, Vec<u8>)>,
-) {
-    if out.len() >= cap {
-        return;
-    }
-    // Models an aged target: rippled keeps recent ledgers fully in memory but
-    // flushes deeper nodes of older ones, so deep requests return nothing.
-    if let Some(h) = horizon {
-        if id.depth() > h {
-            return;
-        }
-    }
-    let Some((_h, bytes, is_inner)) = server.node_at(id) else {
-        return;
-    };
-    out.push((id.to_wire_bytes(), wire_of(&bytes, is_inner)));
-    if is_inner && depth > 0 {
-        for b in 0..16u8 {
-            let off = b as usize * 32;
-            if bytes[off..off + 32] != [0u8; 32] {
-                collect_fat(server, child_node_id(id, b), depth - 1, cap, horizon, out);
-                if out.len() >= cap {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-/// Serve one peer request: fat subtrees for each requested id, capped overall.
+/// Serve one peer request by driving the real `SHAMap::get_node_fat` -- the same
+/// function `handle_get_ledger` serves with -- so the benchmark measures the
+/// production server path, not a model. `horizon` post-filters nodes deeper than
+/// an aged target would still hold, reproducing the mainnet plateau in-process.
 fn serve(
     server: &SHAMap,
     ids: &[NodeId],
@@ -115,7 +68,15 @@ fn serve(
         if out.len() >= resp_cap {
             break;
         }
-        collect_fat(server, id, depth, resp_cap, horizon, &mut out);
+        let budget = resp_cap - out.len();
+        for (fat_id, raw, is_inner) in server.get_node_fat(id, true, depth, budget) {
+            if let Some(h) = horizon {
+                if fat_id.depth() > h {
+                    continue;
+                }
+            }
+            out.push((fat_id.to_wire_bytes(), wire_of(&raw, is_inner)));
+        }
     }
     out
 }
@@ -223,40 +184,44 @@ fn main() {
     println!("built in {:?}, root={}", t.elapsed(), root);
 
     let configs = [
+        // Pre-PR server: one node per requested id (depth 0) under the old
+        // 256KB reply cap (~480 nodes). This is the catchup rxrpl shipped with.
         Cfg {
-            label: "baseline   p3 b512 d3",
+            label: "OLD  d0 cap480 p3",
+            peers: 3,
+            batch: 512,
+            node_cap: 128,
+            depth: 0,
+            resp_cap: 480,
+            horizon: None,
+        },
+        // This PR: getNodeFat with query_depth honored and rippled's node-count
+        // reply caps (soft 8192). Isolates depth vs reply-cap.
+        Cfg {
+            label: "NEW  d1 cap8192 p3",
+            peers: 3,
+            batch: 512,
+            node_cap: 128,
+            depth: 1,
+            resp_cap: 8192,
+            horizon: None,
+        },
+        Cfg {
+            label: "NEW  d3 cap8192 p3",
             peers: 3,
             batch: 512,
             node_cap: 128,
             depth: 3,
-            resp_cap: 500,
+            resp_cap: 8192,
             horizon: None,
         },
         Cfg {
-            label: "morepeers  p8 b1024 d3",
+            label: "NEW  d3 cap8192 p8",
             peers: 8,
             batch: 1024,
             node_cap: 128,
             depth: 3,
-            resp_cap: 500,
-            horizon: None,
-        },
-        Cfg {
-            label: "deeper     p3 b512 d4",
-            peers: 3,
-            batch: 512,
-            node_cap: 128,
-            depth: 4,
-            resp_cap: 500,
-            horizon: None,
-        },
-        Cfg {
-            label: "bigresp    resp_cap=2000",
-            peers: 8,
-            batch: 1024,
-            node_cap: 128,
-            depth: 4,
-            resp_cap: 2000,
+            resp_cap: 8192,
             horizon: None,
         },
         // Aged target: server only serves down to a shallow depth -> the deep
@@ -268,16 +233,7 @@ fn main() {
             batch: 1024,
             node_cap: 128,
             depth: 4,
-            resp_cap: 2000,
-            horizon: Some(4),
-        },
-        Cfg {
-            label: "AGED horizon<=4 p3",
-            peers: 3,
-            batch: 512,
-            node_cap: 128,
-            depth: 3,
-            resp_cap: 500,
+            resp_cap: 8192,
             horizon: Some(4),
         },
     ];
