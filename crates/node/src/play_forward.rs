@@ -906,6 +906,11 @@ mod tests {
         let mut base = Ledger::from_catchup(parent, parent_header.hash, state);
         base.header = parent_header;
         let mut open = Ledger::new_open(&base);
+        // The open ledger's close time (the standalone advances by one
+        // resolution per ledger_accept); transactors that stamp the current
+        // time (e.g. LoanSet StartDate) read this.
+        open.header.close_time =
+            base.header.close_time + base.header.close_time_resolution.max(1) as u32;
         let rules = rules_for_ledger(&open);
         let fees = fees_for_ledger(&base);
 

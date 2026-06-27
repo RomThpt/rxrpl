@@ -56,6 +56,10 @@ impl ReadView for LedgerView<'_> {
         self.ledger.header.parent_close_time
     }
 
+    fn close_time(&self) -> u32 {
+        self.ledger.header.close_time
+    }
+
     fn parent_hash(&self) -> Hash256 {
         self.ledger.header.parent_hash
     }
