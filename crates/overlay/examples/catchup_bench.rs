@@ -136,11 +136,13 @@ fn run(server: &SHAMap, root: Hash256, cfg: &Cfg) -> Stats {
         }
         missing.truncate(cfg.batch);
 
-        // Fan out across up to `peers` parallel requests of <= node_cap ids each.
+        // Scheduler window: issue the whole truncated frontier this round in
+        // node_cap-sized requests, round-robin across `peers` (so each peer can
+        // carry several outstanding requests -- pipelining), instead of one
+        // request per peer. `batch` is the in-flight window size.
         let mut all: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut chunk_start = 0;
-        let mut peer = 0;
-        while chunk_start < missing.len() && peer < cfg.peers {
+        while chunk_start < missing.len() {
             let end = (chunk_start + cfg.node_cap).min(missing.len());
             let ids: Vec<NodeId> = missing[chunk_start..end]
                 .iter()
@@ -151,8 +153,8 @@ fn run(server: &SHAMap, root: Hash256, cfg: &Cfg) -> Stats {
             served += resp.len() as u64;
             all.extend(resp);
             chunk_start = end;
-            peer += 1;
         }
+        let _ = cfg.peers;
 
         if let FeedResult::Complete(l) = syncer.feed_nodes(seq, &all) {
             completed = true;
@@ -219,6 +221,29 @@ fn main() {
             label: "NEW  d3 cap8192 p8",
             peers: 8,
             batch: 1024,
+            node_cap: 128,
+            depth: 3,
+            resp_cap: 8192,
+            horizon: None,
+        },
+        // Scheduler window: same fat serving and fan-out, but the in-flight
+        // frontier window grows from one request per peer (1024) to several
+        // (4096 = 4 per peer). On a wide tree this is the dominant lever -- same
+        // request count, fewer serialized round-trips; on a narrow one it is a
+        // no-op (run with a large leaf count to see it, e.g. `... 500000`).
+        Cfg {
+            label: "WIN  d3 win1024 p8",
+            peers: 8,
+            batch: 1024,
+            node_cap: 128,
+            depth: 3,
+            resp_cap: 8192,
+            horizon: None,
+        },
+        Cfg {
+            label: "WIN  d3 win4096 p8",
+            peers: 8,
+            batch: 4096,
             node_cap: 128,
             depth: 3,
             resp_cap: 8192,

@@ -2040,44 +2040,42 @@ impl PeerManager {
             .max()
             .unwrap_or(0);
 
-        // Split requests across multiple peers so each gets a different subset.
+        // Split the frontier window into server-cap-sized requests (the server
+        // truncates each GetLedger to MAX_GET_LEDGER_NODES=128 ids) and
+        // round-robin them across the best peers, so each peer carries several
+        // outstanding requests. This keeps the request pipeline full across
+        // reply latency instead of issuing one request per peer per round --
+        // the dominant lever once the frontier is wider than the fan-out.
+        const REQUEST_NODE_CAP: usize = 128;
         let best = self.peer_set.best_peers_for_ledger(seq, DELTA_SYNC_FANOUT);
         let num_peers = best.len();
         if num_peers == 0 {
             return;
         }
-        let chunk_size = node_ids.len().div_ceil(num_peers);
-        let mut peers_used = 0;
-        for (i, node_id) in best.iter().enumerate() {
-            let chunk: Vec<Vec<u8>> = node_ids
-                .iter()
-                .skip(i * chunk_size)
-                .take(chunk_size)
-                .cloned()
-                .collect();
-            if chunk.is_empty() {
-                break;
-            }
+        let mut requests_sent = 0usize;
+        for (req_idx, chunk) in node_ids.chunks(REQUEST_NODE_CAP).enumerate() {
+            let node_id = &best[req_idx % num_peers];
             let payload = proto_convert::encode_get_ledger_with_nodes(
                 LI_AS_NODE,
                 Some(&ledger_hash),
                 seq,
                 0,
-                chunk,
+                chunk.to_vec(),
             );
             if let Some(handle) = self.peer_handles.get(node_id) {
                 let _ = handle.tx.try_send(PeerMessage {
                     msg_type: MessageType::GetLedger,
                     payload,
                 });
-                peers_used += 1;
+                requests_sent += 1;
             }
         }
         tracing::debug!(
-            "sent GetLedger seq={} delta ({} node_ids across {} peers, depth={}-{})",
+            "sent GetLedger seq={} delta ({} node_ids in {} requests across {} peers, depth={}-{})",
             seq,
             num_ids,
-            peers_used,
+            requests_sent,
+            num_peers,
             min_depth,
             max_depth
         );
