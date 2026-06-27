@@ -167,6 +167,10 @@ impl ReadView for Sandbox<'_> {
         self.parent.parent_close_time()
     }
 
+    fn close_time(&self) -> u32 {
+        self.parent.close_time()
+    }
+
     fn parent_hash(&self) -> rxrpl_primitives::Hash256 {
         self.parent.parent_hash()
     }

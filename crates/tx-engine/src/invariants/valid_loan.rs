@@ -44,10 +44,10 @@ impl InvariantCheck for ValidLoan {
                         ));
                     }
 
-                    // Status must be 0 (Active) or 1 (Closed)
-                    let status = obj.get("Status").and_then(|v| v.as_u64());
-                    match status {
-                        Some(0) | Some(1) => {}
+                    // Status is optional (absent = 0 Active); if present it must
+                    // be 0 (Active) or 1 (Closed).
+                    match obj.get("Status").and_then(|v| v.as_u64()) {
+                        None | Some(0) | Some(1) => {}
                         _ => {
                             return Err(format!(
                                 "Loan at {key} has invalid Status: {:?}",
