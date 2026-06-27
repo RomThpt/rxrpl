@@ -23,6 +23,7 @@ pub mod pseudo;
 pub mod registry;
 pub mod transactor;
 pub mod view;
+pub mod xchain_attestation;
 
 pub use engine::TxEngine;
 pub use error::TxEngineError;
