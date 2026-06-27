@@ -532,6 +532,9 @@ mod tests {
                                 .to_string()
                                 .to_uppercase(),
                         );
+                        // The attestation transactors read the door's SignerList
+                        // SLE (witnesses + quorum); it is not in AffectedNodes.
+                        read_keys.insert(keylet::signer_list(&did).to_string().to_uppercase());
                     }
                 }
             }
