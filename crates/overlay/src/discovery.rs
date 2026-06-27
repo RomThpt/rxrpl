@@ -164,6 +164,8 @@ mod tests {
             node_id: rxrpl_primitives::Hash256::new([0x01; 32]),
             address: "127.0.0.1:9999".to_string(),
             inbound: false,
+            public_key: vec![0x03; 33],
+            connected_at: std::time::Instant::now(),
             ledger_seq: std::sync::atomic::AtomicU32::new(0),
             reputation: crate::reputation::PeerReputation::new(),
             scoring: crate::peer_score::PeerScore::new(),

@@ -1061,6 +1061,14 @@ impl Node {
         }
         let event_tx = ctx.event_sender().clone();
 
+        // Feed the overlay's `/crawl` endpoint the same server-info snapshot so
+        // this node is discoverable on network explorers. Cloned after the last
+        // `ctx` mutation (attach_* rely on Arc::get_mut) and before `serve`
+        // takes ownership of `ctx`.
+        let crawl_ctx: Arc<ServerContext> = Arc::clone(&ctx);
+        let crawl_info: Arc<dyn rxrpl_overlay::CrawlInfo> = crawl_ctx;
+        peer_mgr.set_crawl_info(crawl_info);
+
         // Clone ctx for gRPC before moving into RPC router
         #[cfg(feature = "grpc")]
         let grpc_ctx = Arc::clone(&ctx);

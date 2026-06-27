@@ -12,16 +12,19 @@ use rxrpl_p2p_proto::MessageType;
 use rxrpl_p2p_proto::codec::{PeerCodec, PeerMessage};
 use rxrpl_primitives::Hash256;
 use rxrpl_shamap::NodeId as ShamapNodeId;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
 use tokio_util::codec::Framed;
 
 use crate::cluster::ClusterManager;
 use crate::command::OverlayCommand;
+use crate::crawl::{self, CrawlInfo};
 use crate::discovery::PeerDiscovery;
 use crate::error::OverlayError;
 use crate::event::PeerEvent;
 use crate::handshake;
+use crate::http;
 use crate::identity::NodeIdentity;
 use crate::ledger_provider::LedgerProvider;
 use crate::ledger_sync::LedgerSyncer;
@@ -155,6 +158,9 @@ pub struct PeerManager {
     /// this bound a remote attacker could open thousands of half-open
     /// TCP connections and saturate the runtime (audit finding H5).
     inbound_handshake_permits: Arc<Semaphore>,
+    /// Supplies the server-level fields of the `/crawl` response. `None` keeps
+    /// the crawl limited to overlay-known data (used in tests).
+    crawl_info: Option<Arc<dyn CrawlInfo>>,
 }
 
 impl PeerManager {
@@ -221,6 +227,7 @@ impl PeerManager {
             // simply cause new TCP connections to wait, which Linux's accept
             // queue absorbs naturally.
             inbound_handshake_permits: Arc::new(Semaphore::new(64)),
+            crawl_info: None,
         };
 
         (mgr, cmd_tx, consensus_rx)
@@ -261,6 +268,12 @@ impl PeerManager {
     /// Set the shared tx-set cache (typically from NetworkConsensusAdapter).
     pub fn set_tx_sets(&mut self, tx_sets: Arc<std::sync::RwLock<HashMap<Hash256, TxSet>>>) {
         self.tx_sets = Some(tx_sets);
+    }
+
+    /// Provide the server-info source for the peer `/crawl` endpoint so the
+    /// crawl response carries the same build/ledger/uptime data as `server_info`.
+    pub fn set_crawl_info(&mut self, info: Arc<dyn CrawlInfo>) {
+        self.crawl_info = Some(info);
     }
 
     /// Register the **local** validator manifest (this node's own,
@@ -484,12 +497,12 @@ impl PeerManager {
     fn spawn_inbound_handler(&self, stream: TcpStream, addr: String) {
         let identity = Arc::clone(&self.identity);
         let network_id = self.config.network_id;
-        let ledger_seq = Arc::clone(&self.ledger_seq);
         let ledger_hash = Arc::clone(&self.ledger_hash);
         let event_tx = self.event_tx.clone();
         let peer_set = Arc::clone(&self.peer_set);
         let tls_server = self.config.tls_server.clone();
         let permits = Arc::clone(&self.inbound_handshake_permits);
+        let crawl_info = self.crawl_info.clone();
 
         tokio::spawn(async move {
             // Hold a permit for the lifetime of the handshake. When the
@@ -504,11 +517,11 @@ impl PeerManager {
                 &addr,
                 &identity,
                 network_id,
-                &ledger_seq,
                 &ledger_hash,
                 &event_tx,
                 &peer_set,
                 &tls_server,
+                crawl_info.as_ref(),
             )
             .await
             {
@@ -2887,7 +2900,7 @@ async fn try_connect_outbound(
     let seq = ledger_seq.load(Ordering::Relaxed);
     let hash = *ledger_hash.read().await;
 
-    let (peer_node_id, software, framed) =
+    let (peer_node_id, software, public_key, framed) =
         handshake::handshake_outbound_http(stream, identity, network_id, seq, &hash).await?;
 
     if peer_set.get(&peer_node_id).is_some() {
@@ -2898,6 +2911,8 @@ async fn try_connect_outbound(
         node_id: peer_node_id,
         address: addr.to_string(),
         inbound: false,
+        public_key,
+        connected_at: std::time::Instant::now(),
         ledger_seq: AtomicU32::new(0),
         reputation: PeerReputation::new(),
         scoring: PeerScore::new(),
@@ -2921,28 +2936,62 @@ async fn try_connect_outbound(
     Ok(peer_node_id)
 }
 
-/// Accept an inbound peer, perform handshake, and spawn read/write loops.
+/// Accept an inbound connection, then either serve a `/crawl` request or
+/// complete the peer upgrade and spawn read/write loops.
+///
+/// Returns `Ok(Some(node_id))` for an established peer and `Ok(None)` when the
+/// connection was a crawl request (no peer registered).
 #[allow(clippy::too_many_arguments)]
 async fn try_accept_inbound(
     tcp: TcpStream,
     addr: &str,
     identity: &NodeIdentity,
     network_id: u32,
-    ledger_seq: &AtomicU32,
     ledger_hash: &RwLock<Hash256>,
     event_tx: &mpsc::Sender<PeerEvent>,
     peer_set: &PeerSet,
     tls_server: &Arc<SslAcceptor>,
-) -> Result<Hash256, OverlayError> {
-    let stream = tls::accept_tls(tcp, tls_server)
+    crawl_info: Option<&Arc<dyn CrawlInfo>>,
+) -> Result<Option<Hash256>, OverlayError> {
+    let mut stream = tls::accept_tls(tcp, tls_server)
         .await
         .map_err(|e| OverlayError::Connection(format!("TLS accept {addr}: {e}")))?;
 
-    let seq = ledger_seq.load(Ordering::Relaxed);
+    let request_buf = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handshake::read_until_header_end(&mut stream),
+    )
+    .await
+    .map_err(|_| OverlayError::Handshake("receive HTTP request timeout".into()))??;
+
+    let (target, req_headers) = http::parse_http_request(&request_buf)
+        .map_err(|e| OverlayError::Handshake(format!("parse HTTP request: {e}")))?;
+
+    if crawl::is_crawl_request(&target) {
+        let snapshot = crawl_info.map(|c| c.crawl_snapshot());
+        let doc = crawl::build_crawl_json(
+            identity,
+            network_id,
+            &peer_set.all_peers(),
+            snapshot.as_ref(),
+        );
+        let response = crawl::build_response_bytes(&doc);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            stream.write_all(&response).await?;
+            stream.flush().await
+        })
+        .await
+        .map_err(|_| OverlayError::Handshake("send crawl response timeout".into()))?
+        .map_err(|e| OverlayError::Handshake(format!("send crawl response: {e}")))?;
+        tracing::debug!("served /crawl to {}", addr);
+        return Ok(None);
+    }
+
     let hash = *ledger_hash.read().await;
 
-    let (peer_node_id, software, framed) =
-        handshake::handshake_inbound_http(stream, identity, network_id, seq, &hash).await?;
+    let (peer_node_id, software, public_key, framed) =
+        handshake::respond_inbound_upgrade(stream, &req_headers, identity, network_id, &hash)
+            .await?;
 
     if peer_set.get(&peer_node_id).is_some() {
         return Err(OverlayError::Handshake("already connected".into()));
@@ -2952,6 +3001,8 @@ async fn try_accept_inbound(
         node_id: peer_node_id,
         address: addr.to_string(),
         inbound: true,
+        public_key,
+        connected_at: std::time::Instant::now(),
         ledger_seq: AtomicU32::new(0),
         reputation: PeerReputation::new(),
         scoring: PeerScore::new(),
@@ -2972,7 +3023,7 @@ async fn try_accept_inbound(
         })
         .await;
 
-    Ok(peer_node_id)
+    Ok(Some(peer_node_id))
 }
 
 /// Convert a SHAMap storage-format node into the rippled `TMLedgerNode.nodedata`

@@ -24,7 +24,7 @@ const MAX_HTTP_HEADER_SIZE: usize = 16 * 1024;
 const NODE_PUBLIC_KEY_PREFIX: &[u8] = &[0x1C];
 
 /// Encode a node public key to base58 (nXXXX format used by rippled).
-fn encode_node_public_key(pubkey_bytes: &[u8]) -> String {
+pub(crate) fn encode_node_public_key(pubkey_bytes: &[u8]) -> String {
     rxrpl_codec::address::base58::base58check_encode(pubkey_bytes, NODE_PUBLIC_KEY_PREFIX)
 }
 
@@ -77,7 +77,9 @@ fn build_upgrade_headers(
 }
 
 /// Read from the stream until we find the `\r\n\r\n` HTTP header terminator.
-async fn read_until_header_end(stream: &mut PeerStream) -> Result<Vec<u8>, OverlayError> {
+pub(crate) async fn read_until_header_end(
+    stream: &mut PeerStream,
+) -> Result<Vec<u8>, OverlayError> {
     let mut buf = Vec::with_capacity(1024);
     let mut single = [0u8; 1];
 
@@ -105,14 +107,16 @@ async fn read_until_header_end(stream: &mut PeerStream) -> Result<Vec<u8>, Overl
 
 /// Verify a peer's identity from HTTP upgrade headers against the TLS session cookie.
 ///
-/// Returns `(peer_node_id, peer_software)` where `peer_software` is parsed from
-/// the `User-Agent` header (if present, otherwise [`PeerSoftware::Unknown`]).
+/// Returns `(peer_node_id, peer_software, peer_public_key)` where `peer_software`
+/// is parsed from the `User-Agent` header (if present, otherwise
+/// [`PeerSoftware::Unknown`]) and `peer_public_key` is the decoded 33-byte node
+/// key (used to advertise the peer in the crawl response).
 fn verify_peer_http_headers(
     headers: &[(String, String)],
     cookie: &Hash256,
     our_identity: &NodeIdentity,
     expected_network_id: u32,
-) -> Result<(Hash256, PeerSoftware), OverlayError> {
+) -> Result<(Hash256, PeerSoftware, Vec<u8>), OverlayError> {
     // Extract required headers
     let peer_pubkey_hex = http::get_header(headers, "Public-Key")
         .ok_or_else(|| OverlayError::Handshake("missing Public-Key header".into()))?;
@@ -163,7 +167,7 @@ fn verify_peer_http_headers(
         .map(PeerSoftware::parse)
         .unwrap_or(PeerSoftware::Unknown);
 
-    Ok((peer_node_id, software))
+    Ok((peer_node_id, software, peer_pubkey))
 }
 
 /// Perform outbound HTTP upgrade handshake (rippled-compatible).
@@ -177,7 +181,15 @@ pub async fn handshake_outbound_http(
     network_id: u32,
     _ledger_seq: u32,
     ledger_hash: &Hash256,
-) -> Result<(Hash256, PeerSoftware, Framed<PeerStream, PeerCodec>), OverlayError> {
+) -> Result<
+    (
+        Hash256,
+        PeerSoftware,
+        Vec<u8>,
+        Framed<PeerStream, PeerCodec>,
+    ),
+    OverlayError,
+> {
     let cookie = tls::extract_session_cookie(&stream)?;
     let headers = build_upgrade_headers(identity, &cookie, network_id, ledger_hash);
     let request = http::format_http_request(&headers);
@@ -213,11 +225,11 @@ pub async fn handshake_outbound_http(
     }
 
     // Verify peer identity from response headers
-    let (peer_node_id, software) =
+    let (peer_node_id, software, public_key) =
         verify_peer_http_headers(&resp_headers, &cookie, identity, network_id)?;
 
     let framed = Framed::new(stream, PeerCodec);
-    Ok((peer_node_id, software, framed))
+    Ok((peer_node_id, software, public_key, framed))
 }
 
 /// Perform inbound HTTP upgrade handshake (rippled-compatible).
@@ -231,20 +243,50 @@ pub async fn handshake_inbound_http(
     network_id: u32,
     _ledger_seq: u32,
     ledger_hash: &Hash256,
-) -> Result<(Hash256, PeerSoftware, Framed<PeerStream, PeerCodec>), OverlayError> {
-    let cookie = tls::extract_session_cookie(&stream)?;
-
-    // Read HTTP upgrade request
+) -> Result<
+    (
+        Hash256,
+        PeerSoftware,
+        Vec<u8>,
+        Framed<PeerStream, PeerCodec>,
+    ),
+    OverlayError,
+> {
     let request_buf = timeout(HANDSHAKE_TIMEOUT, read_until_header_end(&mut stream))
         .await
         .map_err(|_| OverlayError::Handshake("receive HTTP request timeout".into()))??;
 
-    let req_headers = http::parse_http_request(&request_buf)
+    let (_target, req_headers) = http::parse_http_request(&request_buf)
         .map_err(|e| OverlayError::Handshake(format!("parse HTTP request: {e}")))?;
 
+    respond_inbound_upgrade(stream, &req_headers, identity, network_id, ledger_hash).await
+}
+
+/// Complete an inbound peer upgrade from already-read request headers.
+///
+/// Split out from [`handshake_inbound_http`] so the accept loop can inspect the
+/// request target first and divert `/crawl` requests, then resume the upgrade
+/// for ordinary `GET /` peers without re-reading the stream.
+pub async fn respond_inbound_upgrade(
+    mut stream: PeerStream,
+    req_headers: &[(String, String)],
+    identity: &NodeIdentity,
+    network_id: u32,
+    ledger_hash: &Hash256,
+) -> Result<
+    (
+        Hash256,
+        PeerSoftware,
+        Vec<u8>,
+        Framed<PeerStream, PeerCodec>,
+    ),
+    OverlayError,
+> {
+    let cookie = tls::extract_session_cookie(&stream)?;
+
     // Verify peer identity from request headers
-    let (peer_node_id, software) =
-        verify_peer_http_headers(&req_headers, &cookie, identity, network_id)?;
+    let (peer_node_id, software, public_key) =
+        verify_peer_http_headers(req_headers, &cookie, identity, network_id)?;
 
     // Send HTTP 101 response with our identity
     let headers = build_upgrade_headers(identity, &cookie, network_id, ledger_hash);
@@ -261,7 +303,7 @@ pub async fn handshake_inbound_http(
         .map_err(|e| OverlayError::Handshake(format!("flush HTTP response: {e}")))?;
 
     let framed = Framed::new(stream, PeerCodec);
-    Ok((peer_node_id, software, framed))
+    Ok((peer_node_id, software, public_key, framed))
 }
 
 #[cfg(test)]
@@ -298,7 +340,8 @@ mod tests {
         let result = handshake_outbound_http(stream, &id_a, network_id, 1, &ledger_hash).await;
         assert!(result.is_ok(), "outbound failed: {:?}", result.err());
 
-        let (peer_id_from_client, client_seen_software, _framed_client) = result.unwrap();
+        let (peer_id_from_client, client_seen_software, _pubkey_client, _framed_client) =
+            result.unwrap();
 
         let inbound_result = handle.await.unwrap();
         assert!(
@@ -306,7 +349,8 @@ mod tests {
             "inbound failed: {:?}",
             inbound_result.err()
         );
-        let (peer_id_from_server, server_seen_software, _framed_server) = inbound_result.unwrap();
+        let (peer_id_from_server, server_seen_software, _pubkey_server, _framed_server) =
+            inbound_result.unwrap();
 
         assert_eq!(
             peer_id_from_client,
