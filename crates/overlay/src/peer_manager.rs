@@ -2041,9 +2041,7 @@ impl PeerManager {
             .unwrap_or(0);
 
         // Split requests across multiple peers so each gets a different subset.
-        let best = self
-            .peer_set
-            .best_peers_for_ledger(seq, DELTA_SYNC_FANOUT);
+        let best = self.peer_set.best_peers_for_ledger(seq, DELTA_SYNC_FANOUT);
         let num_peers = best.len();
         if num_peers == 0 {
             return;
