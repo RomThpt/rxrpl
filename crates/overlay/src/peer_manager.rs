@@ -2537,6 +2537,14 @@ impl PeerManager {
         // SHAMap path-walk; without this bound a single peer can pin the
         // request handler with O(n × 64) disk I/O per message.
         const MAX_GET_LEDGER_NODES: usize = 128;
+        // Match rippled's TMLedgerData reply caps (overlay Tuning.h): stop
+        // pulling new requested ids once the reply reaches the soft cap, and
+        // never emit past the hard cap within a single fat expansion.
+        const SOFT_MAX_REPLY_NODES: usize = 8192;
+        const HARD_MAX_REPLY_NODES: usize = 12288;
+        // Bound fat-subtree recursion. The node caps already limit work, but a
+        // hostile query_depth shouldn't drive needless deep walks.
+        const MAX_QUERY_DEPTH: u8 = 10;
 
         // Parse requested node_ids from the request as rippled wire format
         // (33 bytes: path[32] + depth[1]). The pre-PR-#14 32-byte content-hash
@@ -2602,34 +2610,40 @@ impl PeerManager {
         };
 
         if !request_node_ids.is_empty() {
-            // Delta sync: serve specific nodes by walking the SHAMap to the
-            // requested (path, depth). Outgoing nodedata is in rippled
-            // TMLedgerNode wire format: payload || wireType byte.
+            // Delta sync: for each requested node serve a fat subtree (the node
+            // plus descendants down `query_depth` levels), mirroring rippled's
+            // getNodeFat. Returning a connected chunk per round-trip instead of a
+            // single node is the dominant catchup-throughput lever. Outgoing
+            // nodedata is rippled TMLedgerNode wire format (payload || wireType):
+            //   inner -> 16*32 child hashes + wireType 2
+            //   leaf  -> reorder key||data to data||key + tree leaf wireType.
             //
-            // - Inner (16*32 bytes in storage): payload as-is + wireType 2.
-            // - Leaf (key || data in storage): reorder to data || key + the
-            //   tree-specific leaf wireType byte selected above.
+            // query_depth defaults to rippled's low-latency default of 1; the
+            // state/tx maps are always served with fat leaves.
+            let query_depth = req.query_depth.unwrap_or(1).min(MAX_QUERY_DEPTH as u32) as u8;
             for node_id in &request_node_ids {
-                let Some((_content_hash, raw, is_inner)) = map.node_at(*node_id) else {
-                    continue;
-                };
-                let wire = encode_shamap_wire_node(&raw, is_inner, leaf_wire_type);
-                let id_bytes = node_id.to_wire_bytes();
-                let entry_size = id_bytes.len() + wire.len();
-                if total_size + entry_size <= MAX_RESPONSE_SIZE {
-                    nodes.push((id_bytes, wire));
-                    total_size += entry_size;
-                } else {
-                    truncated = true;
+                if nodes.len() >= SOFT_MAX_REPLY_NODES {
+                    break;
+                }
+                let budget = HARD_MAX_REPLY_NODES - nodes.len();
+                for (fat_id, raw, is_inner) in map.get_node_fat(*node_id, true, query_depth, budget)
+                {
+                    if nodes.len() >= HARD_MAX_REPLY_NODES {
+                        truncated = true;
+                        break;
+                    }
+                    let wire = encode_shamap_wire_node(&raw, is_inner, leaf_wire_type);
+                    nodes.push((fat_id.to_wire_bytes(), wire));
+                }
+                if truncated {
                     break;
                 }
             }
 
             if truncated {
                 tracing::warn!(
-                    "GetLedger delta response truncated at 256KB: sent {} of {} requested nodes for seq={}",
-                    nodes.len(),
-                    request_node_ids.len(),
+                    "GetLedger delta response capped at {} nodes for seq={}",
+                    HARD_MAX_REPLY_NODES,
                     ledger.header.sequence
                 );
             }
