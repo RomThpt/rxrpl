@@ -7,8 +7,10 @@ use rxrpl_shamap::{LeafNode, MissingNode, NodeStore, SHAMap};
 
 const MAX_CONCURRENT_REQUESTS: usize = 5;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Maximum number of missing node hashes to request in a single delta sync round.
-const MAX_DELTA_NODES_PER_REQUEST: usize = 512;
+/// Maximum number of missing node hashes to request in a single delta sync
+/// round. Sized to fill the delta-sync fan-out: DELTA_SYNC_FANOUT peers x the
+/// server's 128-id request cap = 1024 ids issued per round.
+const MAX_DELTA_NODES_PER_REQUEST: usize = 1024;
 /// Maximum number of sync rounds before giving up on incremental sync.
 const MAX_INCREMENTAL_ROUNDS: u32 = 50;
 /// Number of consecutive zero-add rounds before falling back to hash-based fetch.
