@@ -61,19 +61,25 @@ pub fn parse_http_response(buf: &[u8]) -> Result<(u16, Vec<(String, String)>), S
     Ok((status, headers))
 }
 
-/// Parse an HTTP/1.1 request, returning headers.
+/// Parse an HTTP/1.1 request, returning `(request_target, headers)`.
 ///
-/// Expects the full request up to and including the `\r\n\r\n` terminator.
-pub fn parse_http_request(buf: &[u8]) -> Result<Vec<(String, String)>, String> {
+/// Expects the full request up to and including the `\r\n\r\n` terminator. The
+/// request target (e.g. `/` for the peer upgrade, `/crawl` for the crawler) is
+/// needed to route the peer port between the protobuf upgrade and the crawl
+/// endpoint.
+pub fn parse_http_request(buf: &[u8]) -> Result<(String, Vec<(String, String)>), String> {
     let text = std::str::from_utf8(buf).map_err(|e| format!("invalid UTF-8: {e}"))?;
 
     let mut lines = text.split("\r\n");
 
     let request_line = lines.next().ok_or("empty request")?;
-    // Verify it looks like "GET / HTTP/1.1"
-    if !request_line.starts_with("GET ") {
+    // "GET /crawl HTTP/1.1"
+    let mut parts = request_line.split(' ');
+    let method = parts.next().ok_or("empty request")?;
+    if method != "GET" {
         return Err(format!("unexpected request line: {request_line}"));
     }
+    let target = parts.next().unwrap_or("/").to_string();
 
     let mut headers = Vec::new();
     for line in lines {
@@ -85,7 +91,7 @@ pub fn parse_http_request(buf: &[u8]) -> Result<Vec<(String, String)>, String> {
         }
     }
 
-    Ok(headers)
+    Ok((target, headers))
 }
 
 /// Look up a header value by name (case-insensitive).
@@ -114,7 +120,8 @@ mod tests {
         assert!(text.contains("Upgrade: XRPL/2.2\r\n"));
         assert!(text.ends_with("\r\n\r\n"));
 
-        let parsed = parse_http_request(&raw).unwrap();
+        let (target, parsed) = parse_http_request(&raw).unwrap();
+        assert_eq!(target, "/");
         assert_eq!(parsed.len(), 3);
         assert_eq!(get_header(&parsed, "upgrade"), Some("XRPL/2.2"));
         assert_eq!(get_header(&parsed, "Public-Key"), Some("ED0000"));
@@ -146,6 +153,12 @@ mod tests {
     #[test]
     fn parse_request_error_cases() {
         assert!(parse_http_request(b"POST / HTTP/1.1\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn parse_request_extracts_target() {
+        let (target, _) = parse_http_request(b"GET /crawl HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        assert_eq!(target, "/crawl");
     }
 
     #[test]

@@ -219,6 +219,36 @@ pub async fn server_state(
     }))
 }
 
+/// Feeds the overlay's peer `/crawl` endpoint the same server-level data that
+/// `server_info` reports. Kept sync (the crawl is served from the accept path),
+/// so the ledger window is read non-blocking via `try_read`.
+impl rxrpl_overlay::crawl::CrawlInfo for ServerContext {
+    fn crawl_snapshot(&self) -> rxrpl_overlay::crawl::CrawlServerSnapshot {
+        let server_state = if self.local_manifest().is_some() {
+            "proposing"
+        } else {
+            "full"
+        };
+        let complete_ledgers = self
+            .closed_ledgers
+            .as_ref()
+            .and_then(|cl| cl.try_read().ok())
+            .map(|guard| {
+                let mut seqs: Vec<u32> = guard.iter().map(|l| l.header.sequence).collect();
+                seqs.sort_unstable();
+                format_ledger_ranges(&seqs)
+            })
+            .unwrap_or_else(|| "empty".to_string());
+
+        rxrpl_overlay::crawl::CrawlServerSnapshot {
+            build_version: env!("CARGO_PKG_VERSION").to_string(),
+            server_state: server_state.to_string(),
+            complete_ledgers,
+            uptime_secs: self.uptime_seconds(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

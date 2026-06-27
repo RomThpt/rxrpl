@@ -62,6 +62,10 @@ pub struct PeerInfo {
     pub address: String,
     /// Whether this is an inbound or outbound connection.
     pub inbound: bool,
+    /// The peer's 33-byte node public key, advertised in the crawl response.
+    pub public_key: Vec<u8>,
+    /// When the connection was established, used for crawl `uptime`.
+    pub connected_at: std::time::Instant,
     /// Last known ledger sequence from this peer.
     pub ledger_seq: std::sync::atomic::AtomicU32,
     /// Reputation score tracking.
@@ -243,6 +247,8 @@ mod tests {
             node_id: Hash256::new([id_byte; 32]),
             address: format!("127.0.0.1:{}", 51235 + id_byte as u16),
             inbound,
+            public_key: vec![0x03; 33],
+            connected_at: std::time::Instant::now(),
             ledger_seq: std::sync::atomic::AtomicU32::new(0),
             reputation: PeerReputation::new(),
             scoring: PeerScore::new(),

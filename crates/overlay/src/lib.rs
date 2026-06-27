@@ -5,6 +5,7 @@
 pub mod cluster;
 pub mod command;
 pub mod consensus_bridge;
+pub mod crawl;
 pub mod discovery;
 pub mod domain_attestation;
 pub mod error;
@@ -36,6 +37,7 @@ pub mod vl_fetcher;
 pub use cluster::ClusterManager;
 pub use command::OverlayCommand;
 pub use consensus_bridge::NetworkConsensusAdapter;
+pub use crawl::{CrawlInfo, CrawlServerSnapshot};
 pub use discovery::PeerDiscovery;
 pub use error::OverlayError;
 pub use identity::NodeIdentity;
