@@ -547,8 +547,14 @@ mod tests {
         for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
             for wrap in ["CreatedNode", "ModifiedNode", "DeletedNode"] {
                 for fields in ["FinalFields", "NewFields"] {
+                    // The referenced Vault, and the LoanBroker referenced by a
+                    // Loan (which carries only LoanBrokerID), are read but not
+                    // always listed in AffectedNodes.
                     if let Some(vid) = node[wrap][fields]["VaultID"].as_str() {
                         read_keys.insert(vid.to_uppercase());
+                    }
+                    if let Some(bid) = node[wrap][fields]["LoanBrokerID"].as_str() {
+                        read_keys.insert(bid.to_uppercase());
                     }
                 }
             }
