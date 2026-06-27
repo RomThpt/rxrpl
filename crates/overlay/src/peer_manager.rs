@@ -2613,7 +2613,8 @@ impl PeerManager {
                     break;
                 }
                 let budget = HARD_MAX_REPLY_NODES - nodes.len();
-                for (fat_id, raw, is_inner) in map.get_node_fat(*node_id, true, query_depth, budget) {
+                for (fat_id, raw, is_inner) in map.get_node_fat(*node_id, true, query_depth, budget)
+                {
                     if nodes.len() >= HARD_MAX_REPLY_NODES {
                         truncated = true;
                         break;

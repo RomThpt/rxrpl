@@ -984,7 +984,14 @@ impl SHAMap {
             }
         }
 
-        self.fat_descend(current, wanted, depth as i32, fat_leaves, max_nodes, &mut out);
+        self.fat_descend(
+            current,
+            wanted,
+            depth as i32,
+            fat_leaves,
+            max_nodes,
+            &mut out,
+        );
         out
     }
 
@@ -1023,8 +1030,10 @@ impl SHAMap {
                 Ok(Some(c)) => c,
                 _ => continue,
             };
-            let child_id =
-                NodeId::new(node_id.depth() + 1, &Self::child_key(*node_id.id(), node_id.depth(), branch));
+            let child_id = NodeId::new(
+                node_id.depth() + 1,
+                &Self::child_key(*node_id.id(), node_id.depth(), branch),
+            );
             let child_is_inner = matches!(child.as_ref(), SHAMapNode::Inner(_));
 
             if child_is_inner && (depth > 1 || bc == 1) {
