@@ -32,16 +32,15 @@ impl InvariantCheck for ValidLoan {
 
             match entry_type {
                 Some("Loan") => {
-                    // PrincipalOutstanding must parse to a valid non-negative integer
-                    let principal: i64 = obj
-                        .get("PrincipalOutstanding")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(-1);
-                    if principal < 0 {
-                        return Err(format!(
-                            "Loan at {key} has invalid PrincipalOutstanding: {principal}"
-                        ));
+                    // PrincipalOutstanding is optional (absent = 0, a fully-paid
+                    // loan); if present it must be a non-negative integer.
+                    if let Some(s) = obj.get("PrincipalOutstanding").and_then(|v| v.as_str()) {
+                        let principal: i64 = s.parse().unwrap_or(-1);
+                        if principal < 0 {
+                            return Err(format!(
+                                "Loan at {key} has invalid PrincipalOutstanding: {principal}"
+                            ));
+                        }
                     }
 
                     // Status is optional (absent = 0 Active); if present it must
