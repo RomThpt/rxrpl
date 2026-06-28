@@ -1229,4 +1229,91 @@ mod tests {
             );
         }
     }
+
+    /// Cold-start catchup against an aging target: a peer keeps the full state
+    /// of recent ledgers in memory but flushes the deep nodes of older ones, so
+    /// a target stops serving its deep frontier once it ages. With a FIXED
+    /// target this strands the deep frontier forever (the mainnet "aged target"
+    /// wall). Re-targeting to a fresh tip -- same content-addressed state, higher
+    /// seq -- restores deep service and lets the shared store finish. This is the
+    /// dynamic the cold-start tip-targeting wiring relies on, so prove both arms:
+    /// fixed target never completes, re-targeting does.
+    fn run_aged_target(retarget: bool) -> bool {
+        const COUNT: usize = 8192;
+        const AGED_HORIZON: u8 = 2; // an aged target serves only depth <= 2
+        const AGE_LIMIT: u32 = 4; // a target serves deep for its first 4 rounds
+
+        let (server, root) = build_server_map(COUNT);
+        let store = Arc::new(rxrpl_shamap::InMemoryNodeStore::new());
+        let mut syncer = LedgerSyncer::new();
+        let mut tip_seq = 100u32;
+        let mut missing = syncer.start_incremental_sync(tip_seq, root, store.clone());
+        assert!(!missing.is_empty());
+        let mut target_age = 0u32;
+
+        for _round in 0..5000 {
+            let active = match syncer.active_incremental_seq() {
+                Some(s) => s,
+                None => break,
+            };
+            if missing.is_empty() {
+                if let Some(_l) = syncer.try_complete_sync(active) {
+                    return true;
+                }
+                break;
+            }
+
+            // Serve the frontier; an aged target withholds deep nodes.
+            let aged = target_age >= AGE_LIMIT;
+            let mut served = Vec::new();
+            for mn in &missing {
+                if aged && mn.node_id.depth() > AGED_HORIZON {
+                    continue;
+                }
+                if let Some((_h, wire)) = serve_node_inner(&server, mn.node_id, false) {
+                    served.push((mn.node_id.to_wire_bytes(), wire));
+                }
+            }
+
+            let before = syncer.lifetime_added();
+            if let FeedResult::Complete(_) = syncer.feed_nodes(active, &served) {
+                return true;
+            }
+            target_age += 1;
+
+            // No progress this round -> the target has aged out its deep frontier.
+            // Re-target to a fresh tip (same state, higher seq); start_incremental_sync
+            // only replaces once the current target has drained, so a fresh tip that
+            // serves the deep nodes again takes over and the shared store advances.
+            if retarget && syncer.lifetime_added() == before {
+                tip_seq += 1;
+                let m = syncer.start_incremental_sync(tip_seq, root, store.clone());
+                if !m.is_empty() {
+                    target_age = 0;
+                }
+            }
+
+            missing = match syncer.active_incremental_seq() {
+                Some(s) => syncer.get_missing_node_ids(s),
+                None => break,
+            };
+        }
+        false
+    }
+
+    #[test]
+    fn aged_target_strands_fixed_catchup() {
+        assert!(
+            !run_aged_target(false),
+            "a fixed aged target must NOT complete -- this is the mainnet wall"
+        );
+    }
+
+    #[test]
+    fn retargeting_completes_catchup_past_aged_wall() {
+        assert!(
+            run_aged_target(true),
+            "re-targeting to a fresh tip must complete despite the aged-target wall"
+        );
+    }
 }
