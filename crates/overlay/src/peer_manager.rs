@@ -839,16 +839,24 @@ impl PeerManager {
                             }
 
                             // Relay validation to peers, respecting inbound squelch.
-                            for (id, handle) in &self.peer_handles {
-                                if *id != from
-                                    && !self
-                                        .squelch_manager
-                                        .is_relay_squelched(id, &validation.public_key)
-                                {
-                                    let _ = handle.tx.try_send(PeerMessage {
-                                        msg_type: MessageType::Validation,
-                                        payload: payload.to_vec(),
-                                    });
+                            // A node still acquiring its base state is not a useful
+                            // relay, and this loop is O(validators x peers) per
+                            // message on the single event loop that must drive the
+                            // state sync, so skip it during initial catchup. We
+                            // still verify (above) and forward to the node loop
+                            // (below) so the quorum-validated tip is learned.
+                            if !self.ledger_syncer.in_initial_catchup() {
+                                for (id, handle) in &self.peer_handles {
+                                    if *id != from
+                                        && !self
+                                            .squelch_manager
+                                            .is_relay_squelched(id, &validation.public_key)
+                                    {
+                                        let _ = handle.tx.try_send(PeerMessage {
+                                            msg_type: MessageType::Validation,
+                                            payload: payload.to_vec(),
+                                        });
+                                    }
                                 }
                             }
 
