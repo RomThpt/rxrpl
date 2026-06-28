@@ -720,6 +720,17 @@ impl PeerManager {
             }
         }
 
+        // Shed transaction gossip during initial state catchup: with no base
+        // ledger a cold node cannot apply or usefully relay transactions, and
+        // the mainnet tx flood (~21k/25s) plus its per-peer rebroadcast loop
+        // otherwise starves the SHAMap state sync that shares this single event
+        // loop. Proposals are NOT shed: between rxrpl nodes the peer tip is
+        // announced via proposals (not StatusChange), so they are load-bearing
+        // for the node loop entering sync mode and adopting the acquired state.
+        if matches!(msg_type, MessageType::Transaction) && self.ledger_syncer.in_initial_catchup() {
+            return;
+        }
+
         match msg_type {
             MessageType::Hello => {
                 // Hello is already handled during handshake; ignore late arrivals.
