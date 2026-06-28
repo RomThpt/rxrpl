@@ -37,6 +37,16 @@ const CATCHUP_PREEMPT_ZERO_ROUNDS: u32 = 6;
 /// tip is available to adopt.
 const STUCK_REMOVE_ZERO_ROUNDS: u32 = 20;
 const CATCHUP_STUCK_REMOVE_ZERO_ROUNDS: u32 = 16;
+/// During initial catchup, re-target to a fresher tip once the active target is
+/// this many ledgers behind the network -- even if it is not drained. The
+/// zero-add ("drained") trigger alone never fires on live mainnet: peers keep
+/// serving the aged target's SHALLOW nodes, so a thin trickle of additions holds
+/// `zero_rounds` at 0 while the DEEP frontier (flushed by every peer) never
+/// arrives, plateauing forever. An over-aged target is flushed deep regardless,
+/// so jump to a fresh tip the peers still serve in depth; the content-addressed
+/// store reuses everything already fetched (state barely changes between nearby
+/// ledgers), so re-targeting is cheap and only the small delta is re-walked.
+const STALE_TARGET_LEDGERS: u32 = 16;
 /// How long a requested node hash is considered in-flight before it may be
 /// requested again. Long enough to outlast a normal round-trip so duplicate
 /// requests are suppressed, short enough that a lost request is retried soon.
@@ -408,13 +418,20 @@ impl LedgerSyncer {
                     } else {
                         TIP_PREEMPT_ZERO_ROUNDS
                     };
-                    if zero_rounds < preempt_threshold {
+                    // An initial-catchup target that has fallen too far behind the
+                    // network is flushed deep by peers no matter how many shallow
+                    // nodes still trickle in, so re-target by age even when the
+                    // zero-add trigger never fires (the live-mainnet plateau).
+                    let aged_out =
+                        initial_catchup && seq.saturating_sub(active_seq) >= STALE_TARGET_LEDGERS;
+                    if zero_rounds < preempt_threshold && !aged_out {
                         return Vec::new();
                     }
                     tracing::info!(
-                        "replacing stale sync #{} (round {}) with #{}",
+                        "replacing stale sync #{} (round {}, {} behind) with #{}",
                         active_seq,
                         zero_rounds,
+                        seq.saturating_sub(active_seq),
                         seq
                     );
                 } else {
@@ -1083,6 +1100,39 @@ mod tests {
             "a drained target re-targets to the fresher tip"
         );
         assert!(syncer.has_incremental_sync(106));
+        assert!(!syncer.has_incremental_sync(100));
+    }
+
+    #[test]
+    fn initial_catchup_retargets_by_age_even_when_not_drained() {
+        // The live-mainnet plateau: a target keeps getting a thin trickle of
+        // shallow nodes (zero_rounds never reaches the drain threshold) while its
+        // deep frontier is flushed by every peer. A target that has fallen
+        // STALE_TARGET_LEDGERS behind must re-target by age regardless.
+        let store = Arc::new(rxrpl_shamap::InMemoryNodeStore::new());
+        let mut syncer = LedgerSyncer::new();
+        let _ = syncer.start_incremental_sync(100, Hash256::new([0x11; 32]), store.clone());
+
+        // Never drained (zero_rounds stays 0). A tip only a few ledgers ahead is held.
+        let held = syncer.start_incremental_sync(
+            100 + STALE_TARGET_LEDGERS - 1,
+            Hash256::new([0x22; 32]),
+            store.clone(),
+        );
+        assert!(held.is_empty(), "a young, non-drained target is held");
+        assert!(syncer.has_incremental_sync(100));
+
+        // A tip STALE_TARGET_LEDGERS ahead re-targets even without any drain.
+        let retarget = syncer.start_incremental_sync(
+            100 + STALE_TARGET_LEDGERS,
+            Hash256::new([0x33; 32]),
+            store,
+        );
+        assert!(
+            !retarget.is_empty(),
+            "an over-aged target re-targets by age despite no zero-add rounds"
+        );
+        assert!(syncer.has_incremental_sync(100 + STALE_TARGET_LEDGERS));
         assert!(!syncer.has_incremental_sync(100));
     }
 
