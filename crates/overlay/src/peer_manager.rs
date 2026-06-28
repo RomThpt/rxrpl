@@ -864,9 +864,26 @@ impl PeerManager {
                         // Trigger sync if peer is ahead
                         let our_seq = self.ledger_seq.load(Ordering::Relaxed);
                         if self.ledger_syncer.needs_sync(our_seq, ledger_seq) {
-                            let requests = self.ledger_syncer.request_missing(our_seq, ledger_seq);
-                            for (seq, hash) in requests {
-                                self.send_get_ledger(seq, hash);
+                            if self.ledger_syncer.in_initial_catchup() {
+                                // Cold start: do NOT play forward seq-by-seq from
+                                // genesis. That ascending march hits the aged-target
+                                // wall before ever reaching the tip on mainnet's
+                                // ~19M-entry state -- peers flush the deep nodes of
+                                // old ledgers, so the deep frontier of an old target
+                                // can never be fetched. Instead target the validated
+                                // tip's state map directly and let the drain/re-target
+                                // loop (start_incremental_sync) chase fresher tips.
+                                // Kick the tip now so we don't wait for the next
+                                // check_sync tick; check_sync re-targets to max_peer_seq.
+                                if !self.ledger_syncer.has_any_incremental_sync() {
+                                    self.send_get_ledger(ledger_seq, None);
+                                }
+                            } else {
+                                let requests =
+                                    self.ledger_syncer.request_missing(our_seq, ledger_seq);
+                                for (seq, hash) in requests {
+                                    self.send_get_ledger(seq, hash);
+                                }
                             }
                         }
 
