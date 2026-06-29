@@ -601,9 +601,23 @@ fn apply_conversion(
         serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
     crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut acct, ctx.tx)?;
 
-    let (delivered, _spent) = crate::handlers::offer_create::cross_book_payment(
-        ctx, &src_id, &mut acct, &dst_id, &amount, &send_max,
-    )?;
+    // AMM-routed conversion: when an AMM pool exists for the (SendMax → Amount)
+    // pair, swap through it with exact constant-product math. The pool here is
+    // always the sole/best liquidity for the books we replay (the swap is small
+    // relative to the reserves, so its quality beats any resting offer and
+    // rippled never reaches the CLOB); for those it either spends the whole
+    // budget or delivers the whole target, so the order book is left untouched.
+    // Books with no AMM (every pre-AMM order-book oracle) fall through to the
+    // shared Taker engine unchanged.
+    let delivered = match try_amm_conversion(ctx, &src_id, &mut acct, &amount, &send_max)? {
+        Some(delivered) => delivered,
+        None => {
+            crate::handlers::offer_create::cross_book_payment(
+                ctx, &src_id, &mut acct, &dst_id, &amount, &send_max,
+            )?
+            .0
+        }
+    };
 
     const TF_PARTIAL_PAYMENT: u32 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT;
     let partial = helpers::get_flags(ctx.tx) & TF_PARTIAL_PAYMENT != 0;
@@ -616,6 +630,234 @@ fn apply_conversion(
         .update(src_key, nb)
         .map_err(|_| TransactionResult::TefInternal)?;
     Ok(TransactionResult::TesSuccess)
+}
+
+/// The asset identity of an Amount value, parsed for AMM lookups: `(is_xrp,
+/// currency_bytes, issuer)`. Returns `None` for shapes an AMM can't represent.
+fn amm_asset_of(v: &serde_json::Value) -> Option<(bool, [u8; 20], rxrpl_primitives::AccountId)> {
+    if v.is_string() {
+        return Some((true, [0u8; 20], rxrpl_primitives::AccountId::new([0u8; 20])));
+    }
+    let cur = v.get("currency")?.as_str()?;
+    let iss = v.get("issuer")?.as_str()?;
+    let cur_b = helpers::currency_to_bytes(cur);
+    let iss_id = decode_account_id(iss).ok()?;
+    Some((false, cur_b, iss_id))
+}
+
+/// `a <= b` for two like-asset `Number`s.
+fn num_le(a: &rxrpl_amount::number::Number, b: &rxrpl_amount::number::Number) -> bool {
+    let d = a.sub(b);
+    d.is_zero() || d.negative()
+}
+
+/// The AMM pool's holding of one asset as a `Number`: the pseudo-account's XRP
+/// AccountRoot balance for XRP, or its issuer trust-line balance for an IOU.
+fn amm_pool_balance(
+    ctx: &ApplyContext<'_>,
+    pool: &rxrpl_primitives::AccountId,
+    is_xrp: bool,
+    cur: &[u8; 20],
+    iss: &rxrpl_primitives::AccountId,
+) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::Number;
+    if is_xrp {
+        let key = keylet::account(pool);
+        let bal = ctx
+            .view
+            .read(&key)
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .map(|a| helpers::get_balance(&a))
+            .unwrap_or(0);
+        Number::from_int(bal as i64)
+    } else {
+        crate::amm_helpers::iou_holding_number(ctx.view, pool, iss, cur)
+    }
+}
+
+/// Attempt to satisfy a cross-currency conversion through an AMM pool. Returns
+/// `Ok(Some(delivered))` with the pool and the user's (= destination, for a
+/// conversion) balances mutated byte-exactly, or `Ok(None)` when there is no AMM
+/// for the `(send_max, amount)` pair (or it can deliver nothing), leaving the
+/// caller to fall back to the order book.
+///
+/// Mirrors rippled's single-path AMM offer in a `BookStep`: the delivered/spent
+/// amounts come from `swapAssetIn`/`swapAssetOut` on the live pool reserves. The
+/// trade is output-limited (deliver the full `Amount`) when the required input
+/// fits the budget, otherwise input-limited (spend the whole budget — the
+/// SendMax capped by the source's funds). The transaction fee was already
+/// charged on `user_acct`; XRP legs move through that working copy (the caller
+/// writes it back), IOU legs through the trust lines directly.
+fn try_amm_conversion(
+    ctx: &mut ApplyContext<'_>,
+    user_id: &rxrpl_primitives::AccountId,
+    user_acct: &mut serde_json::Value,
+    amount: &serde_json::Value,
+    send_max: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, TransactionResult> {
+    use rxrpl_amount::number::Number;
+
+    let (out_xrp, out_cur, out_iss) = match amm_asset_of(amount) {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    let (in_xrp, in_cur, in_iss) = match amm_asset_of(send_max) {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+
+    // Locate the AMM SLE for the pair; absent ⇒ no AMM liquidity.
+    let amm_key = keylet::amm(&in_cur, &in_iss, &out_cur, &out_iss);
+    let Some(amm_bytes) = ctx.view.read(&amm_key) else {
+        return Ok(None);
+    };
+    let Ok(amm): Result<serde_json::Value, _> = serde_json::from_slice(&amm_bytes) else {
+        return Ok(None);
+    };
+    let Some(pool_str) = amm.get("Account").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let Ok(pool_id) = decode_account_id(pool_str) else {
+        return Ok(None);
+    };
+    let tfee = amm.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+
+    // Live pool reserves (rippled `ammAccountHolds`).
+    let pool_in = amm_pool_balance(ctx, &pool_id, in_xrp, &in_cur, &in_iss);
+    let pool_out = amm_pool_balance(ctx, &pool_id, out_xrp, &out_cur, &out_iss);
+    if pool_in.is_zero() || pool_out.is_zero() {
+        return Ok(None);
+    }
+
+    // Target output (Amount).
+    let target_out = if out_xrp {
+        Number::from_int(
+            amount
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0) as i64,
+        )
+    } else {
+        Number::from_iou(&crate::amm_helpers::parse_iou_value(
+            amount.get("value").and_then(|v| v.as_str()).unwrap_or("0"),
+        ))
+    };
+
+    // Budget input (SendMax), capped at the source's spendable funds.
+    let (budget_in, src_in_funds) = if in_xrp {
+        let send = send_max
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let avail = helpers::get_balance(user_acct);
+        (Number::from_int(send.min(avail) as i64), Number::ZERO)
+    } else {
+        let send = Number::from_iou(&crate::amm_helpers::parse_iou_value(
+            send_max
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0"),
+        ));
+        let funds = crate::amm_helpers::iou_holding_number(ctx.view, user_id, &in_iss, &in_cur);
+        let budget = if num_le(&send, &funds) { send } else { funds };
+        (budget, funds)
+    };
+    if budget_in.is_zero() || budget_in.negative() {
+        return Ok(None);
+    }
+
+    // Choose the binding limit. Output-limited when the input needed for the
+    // full target fits the budget; otherwise input-limited (spend the budget).
+    let in_needed =
+        crate::amm_helpers::swap_asset_out(&pool_in, &pool_out, &target_out, tfee, in_xrp);
+    let (spent, delivered) = match in_needed {
+        Some(needed) if num_le(&needed, &budget_in) => (needed, target_out),
+        _ => (
+            budget_in,
+            crate::amm_helpers::swap_asset_in(&pool_in, &pool_out, &budget_in, tfee, out_xrp),
+        ),
+    };
+    if delivered.is_zero() || spent.is_zero() {
+        return Ok(None);
+    }
+
+    // --- Apply: move `spent` in from the user to the pool. ---
+    if in_xrp {
+        let drops = spent.to_xrp_drops();
+        let ubal = helpers::get_balance(user_acct);
+        helpers::set_balance(user_acct, ubal.saturating_sub(drops));
+        let pkey = keylet::account(&pool_id);
+        let pbytes = ctx.view.read(&pkey).ok_or(TransactionResult::TecNoEntry)?;
+        let mut pacct: serde_json::Value =
+            serde_json::from_slice(&pbytes).map_err(|_| TransactionResult::TefInternal)?;
+        let pbal = helpers::get_balance(&pacct);
+        helpers::set_balance(&mut pacct, pbal + drops);
+        let pd = serde_json::to_vec(&pacct).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(pkey, pd)
+            .map_err(|_| TransactionResult::TefInternal)?;
+    } else {
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            user_id,
+            &in_iss,
+            &in_cur,
+            &src_in_funds.sub(&spent),
+        )?;
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            &pool_id,
+            &in_iss,
+            &in_cur,
+            &pool_in.add(&spent),
+        )?;
+    }
+
+    // --- Apply: move `delivered` out from the pool to the user. ---
+    if out_xrp {
+        let drops = delivered.to_xrp_drops();
+        let pkey = keylet::account(&pool_id);
+        let pbytes = ctx.view.read(&pkey).ok_or(TransactionResult::TecNoEntry)?;
+        let mut pacct: serde_json::Value =
+            serde_json::from_slice(&pbytes).map_err(|_| TransactionResult::TefInternal)?;
+        let pbal = helpers::get_balance(&pacct);
+        helpers::set_balance(&mut pacct, pbal.saturating_sub(drops));
+        let pd = serde_json::to_vec(&pacct).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(pkey, pd)
+            .map_err(|_| TransactionResult::TefInternal)?;
+        let ubal = helpers::get_balance(user_acct);
+        helpers::set_balance(user_acct, ubal + drops);
+    } else {
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            &pool_id,
+            &out_iss,
+            &out_cur,
+            &pool_out.sub(&delivered),
+        )?;
+        let user_out =
+            crate::amm_helpers::iou_holding_number(ctx.view, user_id, &out_iss, &out_cur);
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            user_id,
+            &out_iss,
+            &out_cur,
+            &user_out.add(&delivered),
+        )?;
+    }
+
+    // Delivered amount in the Amount asset's JSON shape (for the partial gate).
+    let delivered_value = if out_xrp {
+        serde_json::Value::String(delivered.to_xrp_drops().to_string())
+    } else {
+        serde_json::json!({
+            "currency": amount.get("currency").cloned().unwrap_or_default(),
+            "issuer": amount.get("issuer").cloned().unwrap_or_default(),
+            "value": delivered.to_iou().to_decimal_string(),
+        })
+    };
+    Ok(Some(delivered_value))
 }
 
 /// Whether `delivered` reaches `target` (gate only — f64 comparison is fine for
