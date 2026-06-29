@@ -16,7 +16,7 @@ fn u64_hex(n: u64) -> String {
 
 /// The order-book directory index for a given quality: the book base with its
 /// low 64 bits replaced by the quality (rate).
-fn book_dir_with_quality(book_base: &Hash256, quality: u64) -> Hash256 {
+pub(crate) fn book_dir_with_quality(book_base: &Hash256, quality: u64) -> Hash256 {
     let mut bytes = *book_base.as_bytes();
     bytes[24..32].copy_from_slice(&quality.to_be_bytes());
     Hash256::new(bytes)
@@ -742,7 +742,7 @@ fn cross_offers(
             // Legacy Taker semantics: `order_out` is the NET the taker receives;
             // the owner's debit is grossed up by the output issuer's transfer
             // fee inside `pay_out`.
-            pay_in(ctx, taker, taker_acct, &owner, &order_in, false)?;
+            pay_in(ctx, taker, taker_acct, &owner, &order_in, false, false)?;
             pay_out(ctx, taker, taker_acct, &owner, taker, &order_out, false)?;
 
             if full_take {
@@ -848,27 +848,73 @@ pub(crate) fn cross_book_payment(
     target_out: &Value,
     budget_in: &Value,
 ) -> Result<(Value, Value), TransactionResult> {
-    let out_tmpl = Leg::parse(target_out).ok_or(TransactionResult::TemBadAmount)?;
+    let demand_out = Leg::parse(target_out).ok_or(TransactionResult::TemBadAmount)?;
     let in_tmpl = Leg::parse(budget_in).ok_or(TransactionResult::TemBadAmount)?;
-    let inverse_book = keylet::book_dir(
-        &in_tmpl.currency,
-        &in_tmpl.issuer,
-        &out_tmpl.currency,
-        &out_tmpl.issuer,
-    );
 
-    let mut remaining_out = out_tmpl.clone();
     // The source cannot spend more of an IOU than it holds: cap the SendMax
     // budget at the taker's available balance in the input asset (rippled's
     // source-funds limit). XRP input is already guarded by `pay_in`.
-    let mut remaining_in = in_tmpl.clone();
+    let mut budget = in_tmpl.clone();
     if !in_tmpl.is_xrp {
         let funds = owner_funds_leg(ctx, taker, &in_tmpl);
-        if leg_ge(&remaining_in, &funds) {
-            remaining_in = funds;
+        if leg_ge(&budget, &funds) {
+            budget = funds;
         }
     }
-    let budget_start = remaining_in.clone();
+
+    let (delivered, spent) = cross_book_hop(
+        ctx,
+        taker,
+        taker_acct,
+        dest,
+        &demand_out,
+        &budget,
+        /*skip_input_debit=*/ false,
+        /*skip_output_credit=*/ false,
+    )?;
+    Ok((
+        delivered.with_amount(&delivered.iou, delivered.drops),
+        spent.with_amount(&spent.iou, spent.drops),
+    ))
+}
+
+/// Cross a SINGLE order book, delivering up to `demand_out` (its magnitude is
+/// the demand cap) while spending up to `budget_in` (its magnitude is the
+/// budget). Best price first via `succ()` over the book's quality
+/// sub-directories. Returns `(delivered_out, spent_in)` as `Leg`s in the
+/// demand/budget assets. This is the byte-exact `BookStep` primitive shared by
+/// the single-book conversion ([`cross_book_payment`]) and the multi-hop
+/// path-payment chain ([`cross_path_payment`]).
+///
+/// `skip_input_debit` / `skip_output_credit` exist for INTERMEDIATE hops of a
+/// multi-hop strand, where the input came from the previous book's offer owners
+/// (so the taker is not debited again) and the output feeds the next book's
+/// offer owners (so no account is credited the delivery). For those hops the
+/// counter-party leg of the move is realised by the adjacent hop touching the
+/// SAME issuer's trust lines, keeping the intermediate issuer's obligations
+/// balanced. The first hop debits the taker; the last hop credits `dest`.
+#[allow(clippy::too_many_arguments)]
+fn cross_book_hop(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    demand_out: &Leg,
+    budget_in: &Leg,
+    skip_input_debit: bool,
+    skip_output_credit: bool,
+) -> Result<(Leg, Leg), TransactionResult> {
+    let inverse_book = keylet::book_dir(
+        &budget_in.currency,
+        &budget_in.issuer,
+        &demand_out.currency,
+        &demand_out.issuer,
+    );
+
+    let out_start = demand_out.clone();
+    let budget_start = budget_in.clone();
+    let mut remaining_out = demand_out.clone();
+    let mut remaining_in = budget_in.clone();
     let book_prefix = inverse_book.as_bytes()[0..24].to_vec();
     let mut probe = book_dir_with_quality(&inverse_book, 0);
     'walk: while let Some(dir_key) = ctx.view.succ(&probe) {
@@ -950,12 +996,29 @@ pub(crate) fn cross_book_payment(
                 (take_out.clone(), order_in)
             };
 
-            pay_in(ctx, taker, taker_acct, &owner, &order_in, true)?;
+            pay_in(
+                ctx,
+                taker,
+                taker_acct,
+                &owner,
+                &order_in,
+                true,
+                skip_input_debit,
+            )?;
             // `order_out` is the GROSS the offer/owner gives (the TakerGets it
             // reduces by); `net_out` is what `dest` actually receives after the
             // output issuer's transfer fee. The book demand (`remaining_out`) is
             // tracked in NET terms, so it decrements by `net_out`, not the gross.
-            let net_out = pay_out_gross(ctx, taker, taker_acct, &owner, dest, &order_out, true)?;
+            let net_out = pay_out_gross(
+                ctx,
+                taker,
+                taker_acct,
+                &owner,
+                dest,
+                &order_out,
+                true,
+                skip_output_credit,
+            )?;
 
             if full_take {
                 let mut consumed = offer.clone();
@@ -985,12 +1048,387 @@ pub(crate) fn cross_book_payment(
         }
     }
 
-    let delivered = leg_sub(&out_tmpl, &remaining_out);
+    let delivered = leg_sub(&out_start, &remaining_out);
     let spent = leg_sub(&budget_start, &remaining_in);
+    Ok((delivered, spent))
+}
+
+/// Cross a chain of order books (a single resolved path), forwarding each
+/// book's output as the next book's input budget. `boundaries[0]` is the
+/// source asset (carrying the `SendMax`/budget magnitude on entry), each
+/// interior boundary is an intermediate currency, and `boundaries[last]` is the
+/// delivered asset (the `Amount`). Returns `(delivered_out, spent_in)` in the
+/// last/first boundary assets respectively.
+///
+/// This is the input-limited forward flow of rippled's `StrandFlow`: the source
+/// pushes its budget through hop 0, the realised output funds hop 1, and so on.
+/// It is byte-exact for partial payments whose `SendMax` is the binding limit
+/// (the validated repro shape). Each interior hop must consume the entirety of
+/// the previous hop's delivery — otherwise the intermediate issuer's
+/// obligations would not balance — which is enforced by returning
+/// `TecPathPartial` (discarding the sandbox) when a downstream book cannot
+/// absorb the upstream delivery.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cross_path_payment(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    boundaries: &[Value],
+    target_out: &Value,
+    budget_in: &Value,
+) -> Result<(Value, Value), TransactionResult> {
+    let n = boundaries.len();
+    if n < 2 {
+        return Err(TransactionResult::TecPathDry);
+    }
+
+    // First hop budget = SendMax, capped at the source's funds for an IOU leg.
+    let mut carry = Leg::parse(budget_in).ok_or(TransactionResult::TemBadAmount)?;
+    if !carry.is_xrp {
+        let funds = owner_funds_leg(ctx, taker, &carry);
+        if leg_ge(&carry, &funds) {
+            carry = funds;
+        }
+    }
+    let final_demand = Leg::parse(target_out).ok_or(TransactionResult::TemBadAmount)?;
+    let mut delivered = final_demand.clone();
+    let mut source_spent = carry.clone();
+    for hop in 0..(n - 1) {
+        let in_tmpl = Leg::parse(&boundaries[hop]).ok_or(TransactionResult::TemBadAmount)?;
+        let out_tmpl = Leg::parse(&boundaries[hop + 1]).ok_or(TransactionResult::TemBadAmount)?;
+        let is_first = hop == 0;
+        let is_last = hop == n - 2;
+
+        // Carry the realised magnitude into this hop's budget, keeping the
+        // boundary's currency/issuer/kind.
+        let mut budget = in_tmpl.clone();
+        if budget.is_xrp {
+            budget.drops = carry.drops;
+        } else {
+            budget.iou = carry.iou;
+        }
+
+        // Demand: the final hop is capped by the requested Amount; interior hops
+        // deliver as much as the budget can buy (unbounded demand).
+        let demand = if is_last {
+            let mut d = out_tmpl.clone();
+            if d.is_xrp {
+                d.drops = final_demand.drops;
+            } else {
+                d.iou = final_demand.iou;
+            }
+            d
+        } else {
+            unbounded_leg(&out_tmpl)
+        };
+
+        let (clob_out, clob_spent) = cross_book_hop(
+            ctx, taker, taker_acct, dest, &demand, &budget, /*skip_input_debit=*/ !is_first,
+            /*skip_output_credit=*/ !is_last,
+        )?;
+
+        // Residual liquidity from the AMM pool for this pair, on the budget not
+        // yet spent on the order book and the demand not yet met. For a
+        // pure-AMM hop the book delivers nothing and the swap handles the whole
+        // budget. (Strict quality interleaving of coexisting AMM + CLOB is not
+        // yet modelled — pure-AMM and pure-CLOB hops are exact.)
+        let mut got = clob_out.clone();
+        let mut spent = clob_spent.clone();
+        let residual_budget = leg_sub(&budget, &clob_spent);
+        let residual_demand = leg_sub(&demand, &clob_out);
+        if !residual_budget.is_zero() && !residual_demand.is_zero() {
+            if let Some((amm_out, amm_spent)) = amm_hop(
+                ctx,
+                taker,
+                taker_acct,
+                dest,
+                &residual_demand,
+                &residual_budget,
+                /*skip_input_debit=*/ !is_first,
+                /*skip_output_credit=*/ !is_last,
+            )? {
+                got = leg_add(&got, &amm_out);
+                spent = leg_add(&spent, &amm_spent);
+            }
+        }
+
+        // An interior hop must fully consume what the previous hop delivered, or
+        // the intermediate currency does not balance across the two books.
+        if !is_first && !legs_eq(&spent, &carry) {
+            return Err(TransactionResult::TecPathPartial);
+        }
+        if is_first {
+            source_spent = spent;
+        }
+        carry = got.clone();
+        delivered = got;
+    }
+
     Ok((
         delivered.with_amount(&delivered.iou, delivered.drops),
-        spent.with_amount(&spent.iou, spent.drops),
+        source_spent.with_amount(&source_spent.iou, source_spent.drops),
     ))
+}
+
+/// Equality of two like-typed legs (exact drops, exact IOU magnitude).
+fn legs_eq(a: &Leg, b: &Leg) -> bool {
+    if a.is_xrp {
+        a.drops == b.drops
+    } else {
+        a.iou == b.iou
+    }
+}
+
+/// A `Leg` in `template`'s asset carrying an effectively unbounded magnitude,
+/// used as the demand cap for an interior hop (the budget is the real limit).
+fn unbounded_leg(template: &Leg) -> Leg {
+    let mut out = template.clone();
+    if template.is_xrp {
+        out.drops = i64::MAX;
+    } else {
+        // rippled's STAmount max mantissa/exponent — far above any book size.
+        out.iou =
+            IOUAmount::from_parts(9_999_999_999_999_999, 80, false).unwrap_or(IOUAmount::ZERO);
+    }
+    out
+}
+
+/// A `Leg`'s magnitude as a `Number` (drops as an integer; IOU as its value).
+fn leg_to_number(leg: &Leg) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::Number;
+    if leg.is_xrp {
+        Number::from_int(leg.drops)
+    } else {
+        Number::from_iou(&leg.iou)
+    }
+}
+
+/// Build a `Leg` carrying `mag`, keeping `template`'s currency/issuer/kind. XRP
+/// magnitudes floor to an integer drop count.
+fn number_to_leg(mag: &rxrpl_amount::number::Number, template: &Leg) -> Leg {
+    let mut out = template.clone();
+    if template.is_xrp {
+        out.drops = mag.to_xrp_drops() as i64;
+    } else {
+        out.iou = mag.to_iou();
+    }
+    out
+}
+
+/// `a <= b` for two `Number`s.
+fn num_le(a: &rxrpl_amount::number::Number, b: &rxrpl_amount::number::Number) -> bool {
+    let d = a.sub(b);
+    d.is_zero() || d.negative()
+}
+
+/// The AMM pool's holding of one asset as a `Number`: the pseudo-account's XRP
+/// `Balance` for native, or its issuer trust-line balance for an IOU.
+fn pool_balance_number(
+    ctx: &ApplyContext<'_>,
+    pool: &AccountId,
+    is_xrp: bool,
+    cur: &[u8; 20],
+    iss: &AccountId,
+) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::Number;
+    if is_xrp {
+        let key = keylet::account(pool);
+        let bal = ctx
+            .view
+            .read(&key)
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .map(|a| helpers::get_balance(&a))
+            .unwrap_or(0);
+        Number::from_int(bal as i64)
+    } else {
+        crate::amm_helpers::iou_holding_number(ctx.view, pool, iss, cur)
+    }
+}
+
+/// Swap one hop through an AMM pool for the `(budget_in -> demand_out)` pair,
+/// delivering up to `demand_out` while spending up to `budget_in`. Returns
+/// `Some((delivered, spent))` or `None` when no AMM SLE exists for the pair (the
+/// caller then treats the hop as order-book-only).
+///
+/// Mirrors [`super::payment`]'s `try_amm_conversion` (byte-exact `swapAssetIn` /
+/// `swapAssetOut` on the live pool reserves), with the multi-hop skip flags: an
+/// interior input is not debited from the taker (the previous pool's out-holding
+/// already fell by the same amount), and an interior output is not credited to
+/// `dest` (it becomes the next pool's input).
+#[allow(clippy::too_many_arguments)]
+fn amm_hop(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    demand_out: &Leg,
+    budget_in: &Leg,
+    skip_input_debit: bool,
+    skip_output_credit: bool,
+) -> Result<Option<(Leg, Leg)>, TransactionResult> {
+    let in_xrp = budget_in.is_xrp;
+    let out_xrp = demand_out.is_xrp;
+
+    let amm_key = keylet::amm(
+        &budget_in.currency,
+        &budget_in.issuer,
+        &demand_out.currency,
+        &demand_out.issuer,
+    );
+    let Some(amm_bytes) = ctx.view.read(&amm_key) else {
+        return Ok(None);
+    };
+    let Ok(amm): Result<Value, _> = serde_json::from_slice(&amm_bytes) else {
+        return Ok(None);
+    };
+    let Some(pool_str) = amm.get("Account").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let Ok(pool_id) = decode_account_id(pool_str) else {
+        return Ok(None);
+    };
+    let tfee = amm.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+
+    let pool_in = pool_balance_number(
+        ctx,
+        &pool_id,
+        in_xrp,
+        &budget_in.currency,
+        &budget_in.issuer,
+    );
+    let pool_out = pool_balance_number(
+        ctx,
+        &pool_id,
+        out_xrp,
+        &demand_out.currency,
+        &demand_out.issuer,
+    );
+    if pool_in.is_zero() || pool_out.is_zero() {
+        return Ok(None);
+    }
+
+    let budget_num = leg_to_number(budget_in);
+    let demand_num = leg_to_number(demand_out);
+    if budget_num.is_zero() || budget_num.negative() {
+        return Ok(None);
+    }
+
+    // Output-limited (deliver the demand) when the input required fits the
+    // budget; otherwise input-limited (spend the whole budget).
+    let out_full =
+        crate::amm_helpers::swap_asset_in(&pool_in, &pool_out, &budget_num, tfee, out_xrp);
+    let (spent_num, deliver_num) = if num_le(&out_full, &demand_num) {
+        (budget_num, out_full)
+    } else {
+        match crate::amm_helpers::swap_asset_out(&pool_in, &pool_out, &demand_num, tfee, in_xrp) {
+            Some(needed) if num_le(&needed, &budget_num) => (needed, demand_num),
+            _ => (budget_num, out_full),
+        }
+    };
+    if deliver_num.is_zero() || spent_num.is_zero() {
+        return Ok(None);
+    }
+
+    // --- Apply the input: move `spent` from the source into the pool. ---
+    if in_xrp {
+        let drops = spent_num.to_xrp_drops() as i64;
+        if !skip_input_debit {
+            let bal = helpers::get_balance(taker_acct) as i64 - drops;
+            if bal < 0 {
+                return Err(TransactionResult::TecUnfundedPayment);
+            }
+            helpers::set_balance(taker_acct, bal as u64);
+        }
+        credit_xrp(ctx, &pool_id, drops)?;
+    } else {
+        if !skip_input_debit {
+            let funds = crate::amm_helpers::iou_holding_number(
+                ctx.view,
+                taker,
+                &budget_in.issuer,
+                &budget_in.currency,
+            );
+            crate::amm_helpers::set_iou_holding(
+                ctx.view,
+                taker,
+                &budget_in.issuer,
+                &budget_in.currency,
+                &funds.sub(&spent_num),
+            )?;
+        }
+        let pool_h = crate::amm_helpers::iou_holding_number(
+            ctx.view,
+            &pool_id,
+            &budget_in.issuer,
+            &budget_in.currency,
+        );
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            &pool_id,
+            &budget_in.issuer,
+            &budget_in.currency,
+            &pool_h.add(&spent_num),
+        )?;
+    }
+
+    // --- Apply the output: move `delivered` from the pool to the recipient. ---
+    if out_xrp {
+        let drops = deliver_num.to_xrp_drops() as i64;
+        credit_xrp(ctx, &pool_id, -drops)?;
+        if !skip_output_credit {
+            if dest == taker {
+                helpers::set_balance(taker_acct, helpers::get_balance(taker_acct) + drops as u64);
+            } else {
+                credit_xrp(ctx, dest, drops)?;
+            }
+        }
+    } else {
+        let pool_h = crate::amm_helpers::iou_holding_number(
+            ctx.view,
+            &pool_id,
+            &demand_out.issuer,
+            &demand_out.currency,
+        );
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            &pool_id,
+            &demand_out.issuer,
+            &demand_out.currency,
+            &pool_h.sub(&deliver_num),
+        )?;
+        if !skip_output_credit {
+            let dest_h = crate::amm_helpers::iou_holding_number(
+                ctx.view,
+                dest,
+                &demand_out.issuer,
+                &demand_out.currency,
+            );
+            crate::amm_helpers::set_iou_holding(
+                ctx.view,
+                dest,
+                &demand_out.issuer,
+                &demand_out.currency,
+                &dest_h.add(&deliver_num),
+            )?;
+        }
+    }
+
+    Ok(Some((
+        number_to_leg(&deliver_num, demand_out),
+        number_to_leg(&spent_num, budget_in),
+    )))
+}
+
+/// `a + b` for like-typed legs (same asset).
+fn leg_add(a: &Leg, b: &Leg) -> Leg {
+    let mut out = a.clone();
+    if a.is_xrp {
+        out.drops = a.drops + b.drops;
+    } else {
+        out.iou = IOUAmount::add(&a.iou, &b.iou).unwrap_or(a.iou);
+    }
+    out
 }
 
 /// A leg's magnitude as an IOUAmount for quality math (drops become an integer).
@@ -1068,25 +1506,30 @@ fn pay_in(
     owner: &AccountId,
     amount: &Leg,
     round: bool,
+    skip_taker_debit: bool,
 ) -> Result<(), TransactionResult> {
     if amount.is_xrp {
-        let bal = helpers::get_balance(taker_acct) as i64 - amount.drops;
-        if bal < 0 {
-            return Err(TransactionResult::TecUnfundedOffer);
+        if !skip_taker_debit {
+            let bal = helpers::get_balance(taker_acct) as i64 - amount.drops;
+            if bal < 0 {
+                return Err(TransactionResult::TecUnfundedOffer);
+            }
+            helpers::set_balance(taker_acct, bal as u64);
         }
-        helpers::set_balance(taker_acct, bal as u64);
         return credit_xrp(ctx, owner, amount.drops);
     }
-    let rate = transfer_rate(ctx, &amount.issuer);
-    let gross = grossed(&amount.iou, &rate);
-    credit_line(
-        ctx,
-        taker,
-        &amount.issuer,
-        &amount.currency,
-        &gross.negate(),
-        round,
-    )?;
+    if !skip_taker_debit {
+        let rate = transfer_rate(ctx, &amount.issuer);
+        let gross = grossed(&amount.iou, &rate);
+        credit_line(
+            ctx,
+            taker,
+            &amount.issuer,
+            &amount.currency,
+            &gross.negate(),
+            round,
+        )?;
+    }
     credit_line(
         ctx,
         owner,
@@ -1162,6 +1605,7 @@ fn pay_out(
 /// through `taker_acct` (the caller's working copy) so the apply's final account
 /// write does not clobber it; a distinct recipient (cross-currency payment to
 /// another account) is credited through the view instead.
+#[allow(clippy::too_many_arguments)]
 fn pay_out_gross(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
@@ -1170,23 +1614,29 @@ fn pay_out_gross(
     recipient: &AccountId,
     amount: &Leg,
     round: bool,
+    skip_recipient_credit: bool,
 ) -> Result<Leg, TransactionResult> {
     if amount.is_xrp {
         credit_xrp(ctx, owner, -amount.drops)?;
-        if recipient == taker {
-            helpers::set_balance(
-                taker_acct,
-                helpers::get_balance(taker_acct) + amount.drops as u64,
-            );
-        } else {
-            credit_xrp(ctx, recipient, amount.drops)?;
+        if !skip_recipient_credit {
+            if recipient == taker {
+                helpers::set_balance(
+                    taker_acct,
+                    helpers::get_balance(taker_acct) + amount.drops as u64,
+                );
+            } else {
+                credit_xrp(ctx, recipient, amount.drops)?;
+            }
         }
         return Ok(amount.clone());
     }
     // The fee applies only when neither party is the issuer (rippled charges no
     // transfer fee on issuance/redemption). When it applies, the recipient nets
-    // `gross / rate` rounded down; otherwise net == gross.
-    let fee_applies = amount.issuer != *owner && amount.issuer != *recipient;
+    // `gross / rate` rounded down; otherwise net == gross. For an intermediate
+    // hop (`skip_recipient_credit`) the output funds the next book directly, so
+    // there is no fee-charged recipient and the net carried forward is the gross.
+    let fee_applies =
+        !skip_recipient_credit && amount.issuer != *owner && amount.issuer != *recipient;
     let net = if fee_applies {
         let rate = transfer_rate(ctx, &amount.issuer);
         IOUAmount::div_round(&amount.iou, &rate, /*round_up*/ false).unwrap_or(amount.iou)
@@ -1202,14 +1652,16 @@ fn pay_out_gross(
         &amount.iou.negate(),
         round,
     )?;
-    credit_line(
-        ctx,
-        recipient,
-        &amount.issuer,
-        &amount.currency,
-        &net,
-        round,
-    )?;
+    if !skip_recipient_credit {
+        credit_line(
+            ctx,
+            recipient,
+            &amount.issuer,
+            &amount.currency,
+            &net,
+            round,
+        )?;
+    }
     let mut net_leg = amount.clone();
     net_leg.iou = net;
     Ok(net_leg)

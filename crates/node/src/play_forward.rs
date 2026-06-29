@@ -848,6 +848,66 @@ mod tests {
             }
         }
 
+        // A multi-hop (Paths) cross-currency Payment routes through one AMM SLE
+        // per consecutive boundary along each path (e.g. XRP -> BCHAMP -> FAMILY
+        // reads the XRP/BCHAMP and BCHAMP/FAMILY pools). Like the direct pair,
+        // these intermediate AMM SLEs are read for the pool account + TradingFee
+        // but never modified, so they are absent from AffectedNodes. Walk each
+        // path's boundary chain and seed every consecutive pool's AMM key.
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("Payment") {
+            if let (Some(amt), Some(sm), Some(paths)) = (
+                tx_json.get("Amount"),
+                tx_json.get("SendMax"),
+                tx_json.get("Paths").and_then(|v| v.as_array()),
+            ) {
+                if let (Some(src_spec), Some(dst_spec)) = (
+                    rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(sm),
+                    rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(amt),
+                ) {
+                    for path in paths {
+                        let Some(steps) = path.as_array() else {
+                            continue;
+                        };
+                        // Boundary asset-spec chain: source, each currency/issuer
+                        // step, then the destination asset.
+                        let mut specs: Vec<Value> = vec![src_spec.clone()];
+                        let (mut cur, mut iss) = match &src_spec {
+                            Value::String(_) => (None, None),
+                            v => (
+                                v.get("currency").and_then(|c| c.as_str()).map(String::from),
+                                v.get("issuer").and_then(|c| c.as_str()).map(String::from),
+                            ),
+                        };
+                        for step in steps {
+                            if step.get("account").and_then(|v| v.as_str()).is_some() {
+                                continue; // account-ripple step: no book/pool
+                            }
+                            if let Some(c) = step.get("currency").and_then(|v| v.as_str()) {
+                                cur = Some(c.to_string());
+                            }
+                            if let Some(i) = step.get("issuer").and_then(|v| v.as_str()) {
+                                iss = Some(i.to_string());
+                            }
+                            if let (Some(c), Some(i)) = (&cur, &iss) {
+                                specs.push(serde_json::json!({"currency": c, "issuer": i}));
+                            }
+                        }
+                        specs.push(dst_spec.clone());
+                        for pair in specs.windows(2) {
+                            if pair[0] == pair[1] {
+                                continue;
+                            }
+                            if let Ok(amm_key) =
+                                rxrpl_tx_engine::amm_helpers::compute_amm_key(&pair[0], &pair[1])
+                            {
+                                read_keys.insert(amm_key.to_string().to_uppercase());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Keys our tx creates must start ABSENT. Usually a CreatedNode is simply
         // missing from the parent, but a deterministic key (a book/owner
         // DirectoryNode page) can have been deleted *and re-created* within this

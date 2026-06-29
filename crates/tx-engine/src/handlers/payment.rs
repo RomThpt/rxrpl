@@ -163,13 +163,26 @@ impl Transactor for PaymentTransactor {
 
         // Cross-currency Payment (a SendMax in a different asset than Amount):
         // cross the order book via the shared Taker engine — for a conversion
-        // (Account == Destination) or a direct payment to another account. Only
-        // the single-book shape is handled here; multi-hop `Paths` falls through
-        // to the legacy path below.
-        if ctx.tx.get("Paths").is_none() {
-            if let Some(send_max) = ctx.tx.get("SendMax") {
-                if cross_assets_differ(send_max, &ctx.tx["Amount"]) {
+        // (Account == Destination) or a direct payment to another account.
+        if let Some(send_max) = ctx.tx.get("SendMax") {
+            if cross_assets_differ(send_max, &ctx.tx["Amount"]) {
+                if ctx.tx.get("Paths").is_none() {
+                    // Single-book shape.
                     return apply_conversion(
+                        ctx,
+                        account_str,
+                        destination_str,
+                        ctx.tx["Amount"].clone(),
+                        send_max.clone(),
+                    );
+                }
+                // Multi-hop `Paths` with a native (XRP) source or destination
+                // leg: the legacy IOU-only back-solve below cannot represent the
+                // native leg, so route to the byte-exact book-chain crossing
+                // built on the shared Taker engine. IOU<->IOU multi-hop keeps its
+                // existing dispatch (apply_cross_currency) further down.
+                if send_max.is_string() || ctx.tx["Amount"].is_string() {
+                    return apply_paths_payment(
                         ctx,
                         account_str,
                         destination_str,
@@ -606,6 +619,158 @@ fn apply_conversion(
     let partial = helpers::get_flags(ctx.tx) & TF_PARTIAL_PAYMENT != 0;
     if !partial && !delivered_meets_target(&delivered, &amount) {
         return Err(TransactionResult::TecPathPartial);
+    }
+
+    let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(src_key, nb)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    Ok(TransactionResult::TesSuccess)
+}
+
+/// Build the boundary chain of a single resolved path: `[source asset,
+/// intermediate1, intermediate2, ..., destination asset]`. Each interior
+/// boundary is an IOU object `{currency, issuer, value:"0"}` (the magnitude is
+/// supplied by the crossing). Returns `None` for any path step that is not a
+/// pure book step (an account-ripple `0x01` step or a step that names neither a
+/// currency nor an issuer), so the caller can fall back to another path.
+fn build_path_boundaries(
+    path: &[serde_json::Value],
+    send_max: &serde_json::Value,
+    amount: &serde_json::Value,
+) -> Option<Vec<serde_json::Value>> {
+    let boundary_asset = |v: &serde_json::Value| -> (String, String) { asset_of(v) };
+
+    let mut out = vec![send_max.clone()];
+    let (mut cur, mut iss) = boundary_asset(send_max);
+    for step in path {
+        // rippled serializes a PathStep as the present subset of
+        // account/currency/issuer (the `type` bitmap is derived from which
+        // fields appear and is NOT emitted by the binary decoder). Infer the
+        // step kind from field presence:
+        //   * an `account` step is account-rippling (not a pure book step) and
+        //     is not modelled by this handler — fall back to another path.
+        //   * a `currency`/`issuer` step changes the book boundary; the omitted
+        //     side is inherited from the previous hop.
+        let has_account = step.get("account").and_then(|v| v.as_str()).is_some();
+        let step_cur = step.get("currency").and_then(|v| v.as_str());
+        let step_iss = step.get("issuer").and_then(|v| v.as_str());
+        if has_account {
+            return None;
+        }
+        if step_cur.is_none() && step_iss.is_none() {
+            return None;
+        }
+        if let Some(c) = step_cur {
+            cur = c.to_string();
+        }
+        if let Some(i) = step_iss {
+            iss = i.to_string();
+        }
+        out.push(serde_json::json!({
+            "currency": cur,
+            "issuer": iss,
+            "value": "0",
+        }));
+    }
+    // Append the destination asset (Amount) unless the last step already lands
+    // on it.
+    let (amt_cur, amt_iss) = boundary_asset(amount);
+    if (cur, iss) != (amt_cur, amt_iss) {
+        out.push(amount.clone());
+    } else {
+        // Replace the trailing interior boundary with the real Amount object so
+        // the final hop's output template carries Amount's issuer/currency.
+        *out.last_mut().unwrap() = amount.clone();
+    }
+    Some(out)
+}
+
+/// Apply a cross-currency Payment that carries `Paths` and a native (XRP)
+/// source or destination leg. Resolves the first viable path into a book chain
+/// and crosses it forward via the shared byte-exact Taker engine
+/// (`cross_path_payment`), spending up to `send_max` to deliver as much of
+/// `amount` as the path's liquidity allows.
+///
+/// The transaction fee is already charged on the account by the engine; this
+/// reads that working copy (the source's AccountRoot, which carries any native
+/// leg), crosses the chain, enforces the partial-payment gate, then writes the
+/// working copy back.
+fn apply_paths_payment(
+    ctx: &mut ApplyContext<'_>,
+    account_str: &str,
+    destination_str: &str,
+    amount: serde_json::Value,
+    send_max: serde_json::Value,
+) -> Result<TransactionResult, TransactionResult> {
+    let src_id =
+        decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let dst_id =
+        decode_account_id(destination_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let src_key = keylet::account(&src_id);
+    let bytes = ctx
+        .view
+        .read(&src_key)
+        .ok_or(TransactionResult::TerNoAccount)?;
+    let mut acct: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+
+    let paths = ctx
+        .tx
+        .get("Paths")
+        .and_then(|v| v.as_array())
+        .ok_or(TransactionResult::TemBadPath)?;
+
+    // Try each alternative path in order; the first that resolves to a pure
+    // book chain and crosses is used. (Multi-path blending — rippled's greedy
+    // quality-ranked pass — is not yet modelled; a single path covers the
+    // validated repro shape.)
+    let mut delivered: Option<serde_json::Value> = None;
+    for path in paths {
+        let Some(path) = path.as_array() else {
+            continue;
+        };
+        let Some(boundaries) = build_path_boundaries(path, &send_max, &amount) else {
+            continue;
+        };
+        match crate::handlers::offer_create::cross_path_payment(
+            ctx,
+            &src_id,
+            &mut acct,
+            &dst_id,
+            &boundaries,
+            &amount,
+            &send_max,
+        ) {
+            Ok((got, _spent)) => {
+                delivered = Some(got);
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+    let Some(delivered) = delivered else {
+        return Err(TransactionResult::TecPathPartial);
+    };
+
+    // Partial-payment gate. Without tfPartialPayment the full Amount must be
+    // delivered; with it, the delivery must reach DeliverMin (when present),
+    // else the requested Amount.
+    const TF_PARTIAL_PAYMENT: u32 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT;
+    let partial = helpers::get_flags(ctx.tx) & TF_PARTIAL_PAYMENT != 0;
+    if !partial {
+        if !delivered_meets_target(&delivered, &amount) {
+            return Err(TransactionResult::TecPathPartial);
+        }
+    } else if let Some((dm_cur, dm_iss, dm_val)) = get_deliver_min_iou(ctx.tx) {
+        let (d_cur, d_iss) = asset_of(&delivered);
+        let target = serde_json::json!({
+            "currency": dm_cur, "issuer": dm_iss, "value": dm_val,
+        });
+        let _ = (d_cur, d_iss);
+        if !delivered_meets_target(&delivered, &target) {
+            return Err(TransactionResult::TecPathPartial);
+        }
     }
 
     let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
@@ -1577,56 +1742,66 @@ fn commit_n_hop_plan(
     Ok(TransactionResult::TesSuccess)
 }
 
-/// Walk a book directory and collect its offers with parsed IOU amounts.
+/// Walk a book and collect its offers with parsed IOU amounts, best price
+/// (lowest quality) first.
+///
+/// An XRPL order book is NOT a single paginated directory keyed off the book
+/// base: it is a family of quality sub-directories, one per distinct offer
+/// rate, each keyed `book_dir_with_quality(book_base, quality)` (the base with
+/// its low 64 bits replaced by the rate). They sort by quality, so walking the
+/// keyspace via `succ()` from the base — exactly as `cross_offers` /
+/// `cross_book_payment` do — visits offers in ascending price. The previous
+/// `keylet::dir_node(book_base, page)` pagination read the (usually empty) base
+/// index itself, so the book was invisible to the back-solve and the strand
+/// never crossed.
 fn collect_book_offers(
     ctx: &mut ApplyContext<'_>,
     book_root: &rxrpl_primitives::Hash256,
 ) -> Vec<CrossOffer> {
     let mut out = Vec::new();
-    let mut page = 0u64;
-    loop {
-        let page_key = keylet::dir_node(book_root, page);
-        let page_bytes = match ctx.view.read(&page_key) {
-            Some(b) => b,
-            None => break,
-        };
-        let page_json: serde_json::Value = match serde_json::from_slice(&page_bytes) {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-        if let Some(indexes) = page_json.get("Indexes").and_then(|v| v.as_array()) {
-            for idx in indexes {
-                let Some(s) = idx.as_str() else { continue };
-                let Ok(h) = s.parse::<rxrpl_primitives::Hash256>() else {
-                    continue;
-                };
-                let Some(eb) = ctx.view.read(&h) else {
-                    continue;
-                };
-                let Ok(entry) = serde_json::from_slice::<serde_json::Value>(&eb) else {
-                    continue;
-                };
-                if entry.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
-                    continue;
-                }
-                let owner = entry
-                    .get("Account")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| decode_account_id(s).ok());
-                let Some(owner) = owner else { continue };
-                let taker_pays = iou_value(entry.get("TakerPays"));
-                let taker_gets = iou_value(entry.get("TakerGets"));
-                out.push(CrossOffer {
-                    key: h,
-                    owner,
-                    taker_pays,
-                    taker_gets,
-                });
-            }
+    let book_prefix = book_root.as_bytes()[0..24].to_vec();
+    let mut probe = crate::handlers::offer_create::book_dir_with_quality(book_root, 0);
+    while let Some(dir_key) = ctx.view.succ(&probe) {
+        if dir_key.as_bytes()[0..24] != book_prefix[..] {
+            break; // left this book
         }
-        match page_json.get("IndexNext").and_then(|v| v.as_u64()) {
-            Some(next) if next != 0 => page = next,
-            _ => break,
+        probe = dir_key;
+        let Some(dir_bytes) = ctx.view.read(&dir_key) else {
+            continue;
+        };
+        let Ok(dir) = serde_json::from_slice::<serde_json::Value>(&dir_bytes) else {
+            continue;
+        };
+        let Some(indexes) = dir.get("Indexes").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for idx in indexes {
+            let Some(s) = idx.as_str() else { continue };
+            let Ok(h) = s.parse::<rxrpl_primitives::Hash256>() else {
+                continue;
+            };
+            let Some(eb) = ctx.view.read(&h) else {
+                continue;
+            };
+            let Ok(entry) = serde_json::from_slice::<serde_json::Value>(&eb) else {
+                continue;
+            };
+            if entry.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+                continue;
+            }
+            let owner = entry
+                .get("Account")
+                .and_then(|v| v.as_str())
+                .and_then(|s| decode_account_id(s).ok());
+            let Some(owner) = owner else { continue };
+            let taker_pays = iou_value(entry.get("TakerPays"));
+            let taker_gets = iou_value(entry.get("TakerGets"));
+            out.push(CrossOffer {
+                key: h,
+                owner,
+                taker_pays,
+                taker_gets,
+            });
         }
     }
     out
