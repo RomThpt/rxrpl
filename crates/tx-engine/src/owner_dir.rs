@@ -297,7 +297,9 @@ pub fn add_to_owner_dir(
 }
 
 /// Add an entry to a per-NFToken buy/sell offer directory. Unlike owner and
-/// book directories, a freshly created NFToken offer page carries Flags=1 and
+/// book directories, a freshly created NFToken offer page is tagged with the
+/// directory kind in sfFlags — `lsfNFTokenSellOffers` (2) for sell books and
+/// `lsfNFTokenBuyOffers` (1) for buy books (mirrors rippled NFTokenUtils) — and
 /// is threaded (records PreviousTxnID); the placeholder here is filled by the
 /// engine's central stamping. New pages also carry the NFTokenID. Pages follow
 /// the owner-directory sort discipline.
@@ -306,9 +308,11 @@ pub fn add_to_nft_offer_dir(
     root_key: &Hash256,
     nftoken_id_hex: &str,
     entry_key: &Hash256,
+    is_sell: bool,
 ) -> Result<u64, TransactionResult> {
+    let dir_flags: u32 = if is_sell { 2 } else { 1 };
     let describe = [
-        ("Flags", Value::from(1u32)),
+        ("Flags", Value::from(dir_flags)),
         ("NFTokenID", Value::from(nftoken_id_hex)),
         (
             "PreviousTxnID",
