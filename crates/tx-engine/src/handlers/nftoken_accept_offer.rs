@@ -1,3 +1,4 @@
+use rxrpl_amendment::feature::feature_id;
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
@@ -135,44 +136,17 @@ impl NFTokenAcceptOfferTransactor {
         )
         .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Remove the token from whichever of the seller's pages holds it.
-        let Some(from_page_key) = nftoken::find_owner_page(ctx.view, &from_id, &nft_hash) else {
+        // Remove the token from the seller's pages, consolidating the page
+        // chain exactly as rippled's nft::removeToken does (merging adjacent
+        // pages, erasing emptied ones, fixing links). The owner-count delta
+        // reflects how many pages the removal dropped.
+        let fix_page_links = ctx.rules.enabled(&feature_id("fixNFTokenPageLinks"));
+        let Some((token, owner_delta)) =
+            nftoken::remove_token(ctx.view, &from_id, &nft_hash, fix_page_links)?
+        else {
             return Ok(());
         };
-        let page_bytes = ctx
-            .view
-            .read(&from_page_key)
-            .ok_or(TransactionResult::TefInternal)?;
-        let mut page: Value =
-            serde_json::from_slice(&page_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        let mut tokens: Vec<Value> = page
-            .get("NFTokens")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        let token_obj = tokens
-            .iter()
-            .find(|t| nftoken::entry_nftoken_id(t) == Some(nftoken_id))
-            .cloned();
-        tokens.retain(|t| nftoken::entry_nftoken_id(t) != Some(nftoken_id));
-
-        let from_page_deleted = tokens.is_empty();
-        if from_page_deleted {
-            ctx.view
-                .erase(&from_page_key)
-                .map_err(|_| TransactionResult::TefInternal)?;
-        } else {
-            page["NFTokens"] = Value::Array(tokens);
-            let data = serde_json::to_vec(&page).map_err(|_| TransactionResult::TefInternal)?;
-            ctx.view
-                .update(from_page_key, data)
-                .map_err(|_| TransactionResult::TefInternal)?;
-        }
-
-        // Moving a token only changes the seller's reserve when its page is
-        // emptied and removed.
-        if from_page_deleted {
+        if owner_delta != 0 {
             let from_acct_key = keylet::account(&from_id);
             let from_acct_bytes = ctx
                 .view
@@ -180,7 +154,7 @@ impl NFTokenAcceptOfferTransactor {
                 .ok_or(TransactionResult::TerNoAccount)?;
             let mut from_acct: Value = serde_json::from_slice(&from_acct_bytes)
                 .map_err(|_| TransactionResult::TefInternal)?;
-            helpers::adjust_owner_count(&mut from_acct, -1);
+            helpers::adjust_owner_count(&mut from_acct, owner_delta as i32);
             let from_data =
                 serde_json::to_vec(&from_acct).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
@@ -189,23 +163,21 @@ impl NFTokenAcceptOfferTransactor {
         }
 
         // Add the token to the buyer's pages (owner count rises on a new page).
-        if let Some(token) = token_obj {
-            let new_page = nftoken::insert_token(ctx.view, &to_id, &nft_hash, token)?;
-            if new_page {
-                let to_acct_key = keylet::account(&to_id);
-                let to_acct_bytes = ctx
-                    .view
-                    .read(&to_acct_key)
-                    .ok_or(TransactionResult::TerNoAccount)?;
-                let mut to_acct: Value = serde_json::from_slice(&to_acct_bytes)
-                    .map_err(|_| TransactionResult::TefInternal)?;
-                helpers::adjust_owner_count(&mut to_acct, 1);
-                let to_acct_data =
-                    serde_json::to_vec(&to_acct).map_err(|_| TransactionResult::TefInternal)?;
-                ctx.view
-                    .update(to_acct_key, to_acct_data)
-                    .map_err(|_| TransactionResult::TefInternal)?;
-            }
+        let new_page = nftoken::insert_token(ctx.view, &to_id, &nft_hash, token)?;
+        if new_page {
+            let to_acct_key = keylet::account(&to_id);
+            let to_acct_bytes = ctx
+                .view
+                .read(&to_acct_key)
+                .ok_or(TransactionResult::TerNoAccount)?;
+            let mut to_acct: Value = serde_json::from_slice(&to_acct_bytes)
+                .map_err(|_| TransactionResult::TefInternal)?;
+            helpers::adjust_owner_count(&mut to_acct, 1);
+            let to_acct_data =
+                serde_json::to_vec(&to_acct).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(to_acct_key, to_acct_data)
+                .map_err(|_| TransactionResult::TefInternal)?;
         }
 
         Ok(())

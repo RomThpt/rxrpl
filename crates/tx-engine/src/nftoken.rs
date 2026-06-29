@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use rxrpl_primitives::{AccountId, Hash256};
 use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
@@ -60,7 +62,7 @@ pub fn insert_token(
 
             let pos = tokens
                 .iter()
-                .position(|t| nftoken_entry_id(t) > id_hex)
+                .position(|t| compare_token_ids(&nftoken_entry_id(t), &id_hex) == Ordering::Greater)
                 .unwrap_or(tokens.len());
             tokens.insert(pos, entry);
             page["NFTokens"] = Value::Array(tokens);
@@ -111,14 +113,14 @@ fn split_page_and_insert(
     let mut lower: Vec<Value> = tokens[..mid].to_vec();
     let mut upper: Vec<Value> = tokens[mid..].to_vec();
     let entry_id = nftoken_entry_id(&entry);
-    let target = if entry_id < boundary_id.to_uppercase() {
+    let target = if compare_token_ids(&entry_id, &boundary_id.to_uppercase()) == Ordering::Less {
         &mut lower
     } else {
         &mut upper
     };
     let pos = target
         .iter()
-        .position(|t| nftoken_entry_id(t) > entry_id)
+        .position(|t| compare_token_ids(&nftoken_entry_id(t), &entry_id) == Ordering::Greater)
         .unwrap_or(target.len());
     target.insert(pos, entry);
 
@@ -166,6 +168,220 @@ fn split_page_and_insert(
     }
 
     Ok(true)
+}
+
+/// Read an NFTokenPage SLE as JSON.
+fn read_page(view: &dyn ApplyView, key: &Hash256) -> Result<Value, TransactionResult> {
+    let bytes = view.read(key).ok_or(TransactionResult::TefInternal)?;
+    serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)
+}
+
+/// Write an NFTokenPage SLE back.
+fn write_page(
+    view: &mut dyn ApplyView,
+    key: &Hash256,
+    page: &Value,
+) -> Result<(), TransactionResult> {
+    let data = serde_json::to_vec(page).map_err(|_| TransactionResult::TefInternal)?;
+    view.update(*key, data)
+        .map_err(|_| TransactionResult::TefInternal)
+}
+
+/// The NFTokens array of a page (empty when absent).
+fn page_tokens(page: &Value) -> Vec<Value> {
+    page.get("NFTokens")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Parse a page-chain link field (`PreviousPageMin`/`NextPageMin`) — stored as
+/// 64-char uppercase hex — into a page key.
+fn page_link(page: &Value, field: &str) -> Option<Hash256> {
+    let s = page.get(field).and_then(|v| v.as_str())?;
+    Hash256::from_slice(&hex::decode(s).ok()?).ok()
+}
+
+fn page_key_hex(key: &Hash256) -> String {
+    key.to_string().to_uppercase()
+}
+
+/// rippled `nft::mergePages`: if the linked pages `lo` (lower key) and `hi`
+/// (higher key) hold few enough tokens combined to fit one page, merge `lo`'s
+/// tokens into `hi`, rethread the chain around `lo`, and erase `lo`. Returns
+/// whether the merge actually happened.
+fn merge_pages(
+    view: &mut dyn ApplyView,
+    lo_key: &Hash256,
+    hi_key: &Hash256,
+) -> Result<bool, TransactionResult> {
+    // Either neighbour may be absent: rippled inspects the full directory, but
+    // here only the SLEs this tx actually touches are available. A merge that
+    // would have happened leaves both pages in the tx metadata (one modified,
+    // one deleted); so if a neighbour can't be read, rippled didn't merge it
+    // and neither do we.
+    let (Some(lo_bytes), Some(hi_bytes)) = (view.read(lo_key), view.read(hi_key)) else {
+        return Ok(false);
+    };
+    let lo: Value =
+        serde_json::from_slice(&lo_bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let mut hi: Value =
+        serde_json::from_slice(&hi_bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let mut tokens = page_tokens(&lo);
+    let hi_tokens = page_tokens(&hi);
+    if tokens.len() + hi_tokens.len() > MAX_PAGE_ENTRIES {
+        return Ok(false);
+    }
+    tokens.extend(hi_tokens);
+    tokens.sort_by(|a, b| compare_token_ids(&nftoken_entry_id(a), &nftoken_entry_id(b)));
+    hi["NFTokens"] = Value::Array(tokens);
+
+    // `hi` loses its back-link to `lo`; rethread it to `lo`'s predecessor.
+    if let Some(p0_key) = page_link(&lo, "PreviousPageMin") {
+        let mut p0 = read_page(view, &p0_key)?;
+        p0["NextPageMin"] = Value::String(page_key_hex(hi_key));
+        write_page(view, &p0_key, &p0)?;
+        hi["PreviousPageMin"] = Value::String(page_key_hex(&p0_key));
+    } else if let Some(obj) = hi.as_object_mut() {
+        obj.remove("PreviousPageMin");
+    }
+    write_page(view, hi_key, &hi)?;
+    view.erase(lo_key)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    Ok(true)
+}
+
+/// Remove `nftoken_id` from `owner`'s NFToken pages, mirroring rippled's
+/// `nft::removeToken`: drop the token from its page, then consolidate the
+/// doubly linked page chain (merging adjacent pages whose combined size fits in
+/// one page, erasing emptied pages and fixing `PreviousPageMin`/`NextPageMin`
+/// links). `fix_page_links` enables the fixNFTokenPageLinks last-page handling.
+/// Returns the removed `{"NFToken": {...}}` object plus the owner-count delta
+/// (0, -1 or -2) the caller must apply, or `None` when `owner` doesn't hold it.
+pub fn remove_token(
+    view: &mut dyn ApplyView,
+    owner: &AccountId,
+    nftoken_id: &Hash256,
+    fix_page_links: bool,
+) -> Result<Option<(Value, i64)>, TransactionResult> {
+    let Some(curr_key) = find_owner_page(view, owner, nftoken_id) else {
+        return Ok(None);
+    };
+    let id_hex = nftoken_id.to_string().to_uppercase();
+
+    let mut curr = read_page(view, &curr_key)?;
+    let mut tokens = page_tokens(&curr);
+    let Some(pos) = tokens.iter().position(|t| nftoken_entry_id(t) == id_hex) else {
+        return Ok(None);
+    };
+    let removed = tokens.remove(pos);
+
+    let prev_key = page_link(&curr, "PreviousPageMin");
+    let next_key = page_link(&curr, "NextPageMin");
+
+    // The page still holds tokens: write it back, then try to consolidate it
+    // with either neighbour (a merge may absorb a whole page).
+    if !tokens.is_empty() {
+        curr["NFTokens"] = Value::Array(tokens);
+        write_page(view, &curr_key, &curr)?;
+
+        let mut delta: i64 = 0;
+        if let Some(pk) = &prev_key {
+            if merge_pages(view, pk, &curr_key)? {
+                delta -= 1;
+            }
+        }
+        if let Some(nk) = &next_key {
+            if merge_pages(view, &curr_key, nk)? {
+                delta -= 1;
+            }
+        }
+        return Ok(Some((removed, delta)));
+    }
+
+    // The page is now empty.
+    if let Some(pk) = &prev_key {
+        // fixNFTokenPageLinks: an emptied *last* page is refilled from its
+        // predecessor (whose slot is then erased) instead of being removed, so
+        // the directory always keeps its max-key page.
+        if fix_page_links && curr_key == keylet::nftoken_page_max(owner) {
+            let prev = read_page(view, pk)?;
+            curr["NFTokens"] = Value::Array(page_tokens(&prev));
+            match page_link(&prev, "PreviousPageMin") {
+                Some(p0_key) => {
+                    curr["PreviousPageMin"] = Value::String(page_key_hex(&p0_key));
+                    let mut p0 = read_page(view, &p0_key)?;
+                    p0["NextPageMin"] = Value::String(page_key_hex(&curr_key));
+                    write_page(view, &p0_key, &p0)?;
+                }
+                None => {
+                    if let Some(obj) = curr.as_object_mut() {
+                        obj.remove("PreviousPageMin");
+                    }
+                }
+            }
+            write_page(view, &curr_key, &curr)?;
+            view.erase(pk).map_err(|_| TransactionResult::TefInternal)?;
+            return Ok(Some((removed, -1)));
+        }
+
+        // Otherwise unlink the empty page from its predecessor.
+        let mut prev = read_page(view, pk)?;
+        match &next_key {
+            Some(nk) => prev["NextPageMin"] = Value::String(page_key_hex(nk)),
+            None => {
+                if let Some(obj) = prev.as_object_mut() {
+                    obj.remove("NextPageMin");
+                }
+            }
+        }
+        write_page(view, pk, &prev)?;
+    }
+
+    if let Some(nk) = &next_key {
+        let mut next = read_page(view, nk)?;
+        match &prev_key {
+            Some(pk) => next["PreviousPageMin"] = Value::String(page_key_hex(pk)),
+            None => {
+                if let Some(obj) = next.as_object_mut() {
+                    obj.remove("PreviousPageMin");
+                }
+            }
+        }
+        write_page(view, nk, &next)?;
+    }
+
+    view.erase(&curr_key)
+        .map_err(|_| TransactionResult::TefInternal)?;
+
+    // One page went away; a follow-up merge of the now-adjacent neighbours may
+    // remove a second.
+    let mut cnt: i64 = 1;
+    if let (Some(pk), Some(nk)) = (&prev_key, &next_key) {
+        if merge_pages(view, pk, nk)? {
+            cnt += 1;
+        }
+    }
+    Ok(Some((removed, -cnt)))
+}
+
+/// Order two NFTokenIDs the way rippled's `nft::compareTokens` does: by the
+/// low 96 bits (the last 12 bytes, `kPageMask`) first, falling back to the full
+/// 256-bit value when those collide. NFT pages keep `sfNFTokens` in exactly
+/// this order — note this differs from a plain lexicographic compare because
+/// the flags/transfer-fee/issuer bytes that lead the id are ignored by the
+/// primary key. Inputs are 64-char uppercase hex; malformed inputs fall back to
+/// a full-string compare.
+pub fn compare_token_ids(a: &str, b: &str) -> Ordering {
+    if a.len() == 64 && b.len() == 64 {
+        // Low 96 bits = last 24 hex chars (12 bytes).
+        match a[40..].cmp(&b[40..]) {
+            Ordering::Equal => a.cmp(b),
+            ord => ord,
+        }
+    } else {
+        a.cmp(b)
+    }
 }
 
 /// The NFTokenID held by an sfNFToken page entry (`{"NFToken": {...}}`).

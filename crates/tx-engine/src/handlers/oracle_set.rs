@@ -107,36 +107,90 @@ impl Transactor for OracleSetTransactor {
             entry["LastUpdateTime"] = serde_json::Value::from(last_update_time);
         }
         if let Some(tx_series) = ctx.tx.get("PriceDataSeries").and_then(|v| v.as_array()) {
-            // rippled merges the update into the existing series: each tx entry
-            // updates the matching (BaseAsset, QuoteAsset) pair in place, keeping
-            // the existing order, and new pairs are appended. A replacement would
-            // reorder the array and diverge byte-for-byte.
-            let asset_key = |p: &serde_json::Value| -> (String, String) {
-                let pd = p.get("PriceData").unwrap_or(p);
-                (
-                    pd.get("BaseAsset")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    pd.get("QuoteAsset")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                )
+            // Mirror rippled SetOracle::doApply: rebuild the series from a map
+            // keyed by (BaseAsset, QuoteAsset). Existing pairs are seeded with
+            // ONLY their asset codes — their prior AssetPrice/Scale are dropped.
+            // Each tx pair then either (a) sets a price when AssetPrice is
+            // present, (b) deletes the pair when AssetPrice is absent, or (c)
+            // adds a brand-new priced pair. The result is emitted in ascending
+            // (BaseAsset, QuoteAsset) currency order — the std::map iteration
+            // order — so a pair that was priced before but is left untouched by
+            // this tx ends up with no price at all.
+            use std::collections::BTreeMap;
+
+            // Encode a currency code to its canonical 20-byte form, matching the
+            // codec, so the BTreeMap orders pairs exactly like rippled's
+            // std::pair<Currency, Currency>.
+            let currency_key = |c: &str| -> [u8; 20] {
+                let mut b = [0u8; 20];
+                if c == "XRP" {
+                    // 20 zero bytes.
+                } else if c.len() == 3 {
+                    let s = c.as_bytes();
+                    b[12] = s[0];
+                    b[13] = s[1];
+                    b[14] = s[2];
+                } else if c.len() == 40 {
+                    if let Ok(d) = hex::decode(c) {
+                        if d.len() == 20 {
+                            b.copy_from_slice(&d);
+                        }
+                    }
+                }
+                b
             };
-            let mut merged: Vec<serde_json::Value> = entry
-                .get("PriceDataSeries")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            for tx_pd in tx_series {
-                let k = asset_key(tx_pd);
-                if let Some(pos) = merged.iter().position(|e| asset_key(e) == k) {
-                    merged[pos] = tx_pd.clone();
-                } else {
-                    merged.push(tx_pd.clone());
+            let asset_str = |pd: &serde_json::Value, field: &str| -> String {
+                pd.get(field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+
+            let mut pairs: BTreeMap<([u8; 20], [u8; 20]), serde_json::Value> = BTreeMap::new();
+
+            // Seed the existing pairs carrying ONLY their asset codes.
+            if let Some(existing) = entry.get("PriceDataSeries").and_then(|v| v.as_array()) {
+                for e in existing {
+                    let pd = e.get("PriceData").unwrap_or(e);
+                    let base = asset_str(pd, "BaseAsset");
+                    let quote = asset_str(pd, "QuoteAsset");
+                    let key = (currency_key(&base), currency_key(&quote));
+                    pairs.insert(
+                        key,
+                        serde_json::json!({
+                            "PriceData": { "BaseAsset": base, "QuoteAsset": quote }
+                        }),
+                    );
                 }
             }
+
+            // Apply the tx's update/add/delete operations.
+            for tx_pd in tx_series {
+                let pd = tx_pd.get("PriceData").unwrap_or(tx_pd);
+                let base = asset_str(pd, "BaseAsset");
+                let quote = asset_str(pd, "QuoteAsset");
+                let key = (currency_key(&base), currency_key(&quote));
+                match pd.get("AssetPrice") {
+                    None => {
+                        // Token pair carried without a price is deleted.
+                        pairs.remove(&key);
+                    }
+                    Some(price) => {
+                        let slot = pairs.entry(key).or_insert_with(|| {
+                            serde_json::json!({
+                                "PriceData": { "BaseAsset": base, "QuoteAsset": quote }
+                            })
+                        });
+                        let inner = &mut slot["PriceData"];
+                        inner["AssetPrice"] = price.clone();
+                        if let Some(scale) = pd.get("Scale") {
+                            inner["Scale"] = scale.clone();
+                        }
+                    }
+                }
+            }
+
+            let merged: Vec<serde_json::Value> = pairs.into_values().collect();
             entry["PriceDataSeries"] = serde_json::Value::Array(merged);
         }
 
