@@ -551,13 +551,22 @@ fn apply_cross_currency_consumes_offer() {
     let eur = helpers::currency_to_bytes("EUR");
     let issuer_id = decode_account_id(ISSUER).unwrap();
     let book_root = keylet::book_dir(&usd, &issuer_id, &eur, &issuer_id);
+    // Place the offer in its quality sub-directory (rippled keys book pages by
+    // the offer's quality = TakerPays/TakerGets), so the book step prices the
+    // fill off the directory quality rather than a base page with no quality.
+    let quality = rxrpl_amount::get_rate(
+        &rxrpl_amount::IOUAmount::from_decimal_string("50").unwrap(),
+        &rxrpl_amount::IOUAmount::from_decimal_string("50").unwrap(),
+    )
+    .unwrap();
+    let book_dir_key = crate::handlers::offer_create::book_dir_with_quality(&book_root, quality);
     let dir = serde_json::json!({
         "LedgerEntryType": "DirectoryNode",
         "Indexes": [offer_key.to_string()],
         "IndexNext": 0,
     });
     ledger
-        .put_state(book_root, serde_json::to_vec(&dir).unwrap())
+        .put_state(book_dir_key, serde_json::to_vec(&dir).unwrap())
         .unwrap();
 
     let fees = FeeSettings::default();
