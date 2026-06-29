@@ -684,6 +684,29 @@ mod tests {
             }
         }
 
+        // A ticketed tx (`TicketSequence` set, `Sequence` 0) consumes the
+        // sender's Ticket SLE: the engine reads it to authorize the tx and then
+        // deletes it (decrementing OwnerCount/TicketCount). rippled records the
+        // Ticket as a DeletedNode, but with no `PreviousFields` (it is removed,
+        // not modified), so the metadata-driven reconstruction never seeds it —
+        // the engine would then fail to find the ticket, skip the consume, and
+        // wrongly bump the account Sequence. Seed the Ticket keylet from the
+        // parent ledger so the consume path runs (mirrors the SignerList seeding
+        // above).
+        if let Some(ticket_seq) = tx_json.get("TicketSequence").and_then(|v| v.as_u64()) {
+            if let Some(aid) = tx_json
+                .get("Account")
+                .and_then(|v| v.as_str())
+                .and_then(|a| decode_account_id(a).ok())
+            {
+                read_keys.insert(
+                    keylet::ticket(&aid, ticket_seq as u32)
+                        .to_string()
+                        .to_uppercase(),
+                );
+            }
+        }
+
         // A sell NFTokenCreateOffer reads the seller's NFTokenPage to verify
         // ownership, but creating an offer does not modify the page, so it is
         // absent from AffectedNodes and would not be seeded — the ownership
