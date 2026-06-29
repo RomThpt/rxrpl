@@ -543,57 +543,73 @@ impl BinarySerializer {
 }
 
 /// Parse a decimal string into (mantissa, exponent) where value = mantissa * 10^exponent.
-/// The mantissa has up to 16 significant digits.
+/// The mantissa is normalized to 16 significant digits (`[10^15, 10^16)`).
+///
+/// Handled forms, all yielding the SAME canonical pair for equal values:
+///   - plain integer / fixed-point: `"100"`, `"100.50"`, `"0.000001"`
+///   - scientific notation:        `"9999999999999999e79"`, `"1e-10"`
+///   - fully-expanded large ints:  `"9999999999999999" + 79 zeros`
+///
+/// The parse is purely string-based (no `f64`), so it is exact and never
+/// overflows on long inputs. This matters because our IOU binary decoder emits
+/// large positive-exponent values in expanded form while rippled's metadata
+/// emits the equivalent value in scientific form (`STAmount::getText`); both must
+/// re-encode to byte-identical wire bytes.
 fn parse_decimal(s: &str) -> Result<(u64, i32), CodecError> {
-    let parts: Vec<&str> = s.split('.').collect();
-    let (integer_part, decimal_part) = match parts.len() {
-        1 => (parts[0], ""),
-        2 => (parts[0], parts[1]),
-        _ => return Err(CodecError::UnsupportedType(format!("invalid decimal: {s}"))),
+    let bad = || CodecError::UnsupportedType(format!("invalid decimal: {s}"));
+
+    // Split off a scientific exponent suffix, if any.
+    let (num, sci_exp): (&str, i32) = match s.find(['e', 'E']) {
+        Some(pos) => (&s[..pos], s[pos + 1..].parse::<i32>().map_err(|_| bad())?),
+        None => (s, 0),
     };
 
-    // Check for scientific notation
-    if s.contains('e') || s.contains('E') {
-        let val: f64 = s
-            .parse()
-            .map_err(|_| CodecError::UnsupportedType(format!("invalid decimal: {s}")))?;
-        if val == 0.0 {
-            return Ok((0, 0));
-        }
-        let abs_val = val.abs();
-        let mut exponent = (abs_val.log10().floor()) as i32 - 15;
-        let mut mantissa = (abs_val / 10f64.powi(exponent)).round() as u64;
-
-        // Normalize: mantissa should be between 10^15 and 10^16-1
-        while mantissa < 1_000_000_000_000_000 && mantissa > 0 {
-            mantissa *= 10;
-            exponent -= 1;
-        }
-        while mantissa >= 10_000_000_000_000_000 {
-            mantissa /= 10;
-            exponent += 1;
-        }
-
-        return Ok((mantissa, exponent));
+    // Split the integer and fractional parts.
+    let mut parts = num.splitn(2, '.');
+    let integer_part = parts.next().unwrap_or("");
+    let decimal_part = parts.next().unwrap_or("");
+    if num.matches('.').count() > 1 {
+        return Err(bad());
+    }
+    if !integer_part.bytes().all(|b| b.is_ascii_digit())
+        || !decimal_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(bad());
     }
 
-    // Combine into a single integer string
-    let combined = format!("{integer_part}{decimal_part}");
-    let trimmed = combined.trim_start_matches('0');
-    if trimmed.is_empty() {
-        return Ok((0, 0));
+    // value = digits * 10^(sci_exp - decimal_len)
+    let mut digits = format!("{integer_part}{decimal_part}");
+    let mut e = sci_exp - decimal_part.len() as i32;
+
+    // Drop leading zeros (do not change the value).
+    let lead = digits.len() - digits.trim_start_matches('0').len();
+    digits.drain(..lead);
+    if digits.is_empty() {
+        return Ok((0, 0)); // value is zero
     }
 
-    let mantissa: u64 = trimmed
+    // Move trailing zeros into the exponent so the mantissa stays short and the
+    // u64 parse below never overflows on an expanded large integer.
+    while digits.len() > 1 && digits.ends_with('0') {
+        digits.pop();
+        e += 1;
+    }
+
+    // Keep at most 16 significant digits (rippled's canonicalize divides toward
+    // zero when the value exceeds the max mantissa); bump the exponent for any
+    // dropped low-order digits.
+    const SIG_DIGITS: usize = 16;
+    if digits.len() > SIG_DIGITS {
+        e += (digits.len() - SIG_DIGITS) as i32;
+        digits.truncate(SIG_DIGITS);
+    }
+
+    let mut m: u64 = digits
         .parse()
-        .map_err(|_| CodecError::UnsupportedType(format!("invalid mantissa: {trimmed}")))?;
+        .map_err(|_| CodecError::UnsupportedType(format!("invalid mantissa: {digits}")))?;
 
-    let exponent = -(decimal_part.len() as i32);
-
-    // Normalize mantissa to 16 significant digits
-    let mut m = mantissa;
-    let mut e = exponent;
-    while m < 1_000_000_000_000_000 && m > 0 {
+    // Normalize the mantissa into [10^15, 10^16).
+    while m < 1_000_000_000_000_000 {
         m *= 10;
         e -= 1;
     }
@@ -625,6 +641,50 @@ mod tests {
         let (m, _e) = parse_decimal("100.50").unwrap();
         assert!(m >= 1_000_000_000_000_000);
         assert!(m < 10_000_000_000_000_000);
+    }
+
+    #[test]
+    fn parse_decimal_large_value_scientific_and_expanded_agree() {
+        // A near-max IOU limit. Our binary decoder emits it fully expanded while
+        // rippled's STAmount::getText emits scientific notation; both must parse
+        // to the identical canonical (mantissa, exponent) so they re-encode to
+        // byte-identical wire bytes. The expanded form is 95 digits and must not
+        // overflow the parse.
+        let scientific = "9999999999999999e79";
+        let expanded = format!("9999999999999999{}", "0".repeat(79));
+        let a = parse_decimal(scientific).unwrap();
+        let b = parse_decimal(&expanded).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, (9_999_999_999_999_999u64, 79));
+    }
+
+    #[test]
+    fn parse_decimal_large_value_serializes_without_error() {
+        // Regression: encoding a large IOU limit used to abort the whole tx with
+        // "invalid mantissa" because the expanded integer string overflowed u64.
+        for v in [
+            "9999999999999999e79",
+            &format!("9999999999999999{}", "0".repeat(79)),
+        ] {
+            let mut s = BinarySerializer::new();
+            s.serialize_iou_value(v)
+                .unwrap_or_else(|e| panic!("serialize {v} failed: {e:?}"));
+            assert_eq!(s.into_bytes().len(), 8);
+        }
+    }
+
+    #[test]
+    fn parse_decimal_negative_exponent_scientific() {
+        // value = 1e-10 -> mantissa 10^15, exponent -25.
+        assert_eq!(
+            parse_decimal("1e-10").unwrap(),
+            (1_000_000_000_000_000u64, -25)
+        );
+        // equivalent fixed-point form must agree.
+        assert_eq!(
+            parse_decimal("0.0000000001").unwrap(),
+            (1_000_000_000_000_000u64, -25)
+        );
     }
 
     #[test]

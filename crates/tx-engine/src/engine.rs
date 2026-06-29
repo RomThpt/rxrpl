@@ -430,6 +430,20 @@ impl TxEngine {
                 ledger.header.sequence,
             );
 
+            // Thread the sender's sfAccountTxnID to this tx id (rippled base
+            // Transactor) when the account opted in. Pseudo-transactions have no
+            // sender account and never carry the field.
+            if !is_pseudo {
+                if let Ok(account_str) = helpers::get_account(tx) {
+                    if let Ok(account_id) = decode_account_id(account_str) {
+                        changes.thread_account_txn_id(
+                            &keylet::account(&account_id),
+                            &hex::encode_upper(tx_hash.as_bytes()),
+                        );
+                    }
+                }
+            }
+
             // Build metadata before consuming changes, then store the
             // transaction SHAMap leaf in rippled's canonical form,
             // `VL(tx) || VL(meta)`, so the transaction tree root (tx_hash)
