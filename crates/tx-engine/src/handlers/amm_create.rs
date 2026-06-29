@@ -90,6 +90,7 @@ impl Transactor for AMMCreateTransactor {
     }
 
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
+        let _scale = amm_helpers::amm_number_scale_guard(ctx.rules);
         use rxrpl_amount::number::Number;
 
         let account_str = helpers::get_account(ctx.tx)?;

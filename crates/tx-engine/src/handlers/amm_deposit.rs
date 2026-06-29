@@ -52,6 +52,10 @@ impl Transactor for AMMDepositTransactor {
     }
 
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
+        // Run AMM Number math at the mantissa scale this ledger's amendments
+        // select (Small on mainnet, where SingleAssetVault/LendingProtocol are
+        // disabled). See `amm_number_scale_guard`.
+        let _scale = amm_helpers::amm_number_scale_guard(ctx.rules);
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -187,7 +191,29 @@ impl AMMDepositTransactor {
             serde_json::from_slice(&amm_acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
         let pool = helpers::get_balance(&amm_acct);
 
-        let tokens = amm_helpers::lp_tokens_out_single(pool, deposit, &total_lp, tfee);
+        // rippled `AMMDeposit::singleDeposit` (fixAMMv1_3): mint
+        // tokens = adjustLPTokensOut(lpTokensOut(pool, deposit, T, tfee)) Downward,
+        // then `adjustAssetInByTokens` re-derives the deposit (assetAdj =
+        // ammAssetIn(pool, T, tokens, tfee) Upward, on the XRP drops grid) so the
+        // rounding can never credit more LP than the deposit authorises. The
+        // actual deposit is min(deposit, assetAdj); when assetAdj exceeds the
+        // request the tokens are recomputed from the trimmed amount.
+        let pool_n = Number::from_int(pool as i64);
+        let r = Number::from_int(deposit as i64).div(&pool_n);
+        let tokens0 = amm_helpers::lp_tokens_out_ratio(&r, &total_lp, tfee);
+        let asset_adj0 = amm_helpers::amm_asset_in_xrp(pool, &total_lp, &tokens0, tfee);
+        let (tokens, asset_adj) = if asset_adj0 > deposit {
+            // adjAmount = amount - (assetAdj - amount) (STAmount XRP subtraction =
+            // exact integer drops), then re-derive tokens and assetAdj.
+            let adj_amount = (deposit as i64 - (asset_adj0 as i64 - deposit as i64)).max(0) as u64;
+            let r2 = Number::from_int(adj_amount as i64).div(&pool_n);
+            let t = amm_helpers::lp_tokens_out_ratio(&r2, &total_lp, tfee);
+            let asset_adj1 = amm_helpers::amm_asset_in_xrp(pool, &total_lp, &t, tfee);
+            (t, asset_adj1)
+        } else {
+            (tokens0, asset_adj0)
+        };
+        let deposit = deposit.min(asset_adj);
 
         // AMM.LPTokenBalance += tokens.
         let new_total = Number::from_iou(&total_lp)

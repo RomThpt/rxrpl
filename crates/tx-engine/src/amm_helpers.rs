@@ -8,6 +8,37 @@ use crate::owner_dir::add_to_owner_dir;
 use crate::view::apply_view::ApplyView;
 use crate::view::read_view::ReadView;
 
+/// Install the `Number` mantissa scale rippled uses for this ledger's AMM math.
+///
+/// rippled `setCurrentTransactionRules` (Rules.cpp) selects the mantissa scale
+/// per transaction: the 19-digit `Large`/`LargeLegacy` scale ONLY when
+/// `featureSingleAssetVault` OR `featureLendingProtocol` is enabled; otherwise
+/// the original 16-digit `Small` scale (STAmount-IOU precision). All AMM pool
+/// math (`lpTokensOut`, `ammAssetIn`, `adjustLPTokens`, swaps, ...) runs under
+/// that scale, so to replay mainnet byte-for-byte each AMM transactor installs
+/// the matching guard. On mainnet (mid-2026) both features are DISABLED, so AMM
+/// math runs at `Small` (16 significant digits) — the default `Large` over-keeps
+/// precision and diverges by ~1-2 ULP, amplified by the catastrophic
+/// cancellation in `(r - c)` and the 1e-9 `LPTokenBalance` grid.
+///
+/// The returned guard restores the previous scale on drop; hold it for the whole
+/// `apply`.
+#[must_use]
+pub fn amm_number_scale_guard(
+    rules: &rxrpl_amendment::Rules,
+) -> rxrpl_amount::number::MantissaScaleGuard {
+    use rxrpl_amendment::feature::feature_id;
+    use rxrpl_amount::number::{MantissaScale, MantissaScaleGuard};
+    let large = rules.enabled(&feature_id("SingleAssetVault"))
+        || rules.enabled(&feature_id("LendingProtocol"));
+    let scale = if large {
+        MantissaScale::Large
+    } else {
+        MantissaScale::Small
+    };
+    MantissaScaleGuard::new(scale)
+}
+
 /// Fee multipliers `(f1, f2)` mirroring rippled `feeMult`/`feeMultHalf`:
 /// `getFee = tfee/100000`, `f1 = 1 - getFee`, `f2 = (1 - getFee/2) / f1`. The
 /// computation order matches rippled so the `Number` rounding is byte-faithful.
@@ -351,7 +382,43 @@ pub fn amm_asset_in(
     tokens: &rxrpl_amount::IOUAmount,
     tfee: u16,
 ) -> rxrpl_amount::number::Number {
-    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode, root2};
+    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode};
+    let frac = amm_asset_in_frac(total_lp, tokens, tfee);
+    // rippled `ammAssetIn` returns `multiply(balance, frac, Upward)` =
+    // toSTAmount(asset, balance*frac, Upward): the result lands on the IOU
+    // grid rounded up, not at full Number precision.
+    let _g = RoundModeGuard::new(RoundingMode::Upward);
+    Number::from_iou(&pool.mul(&frac).to_iou())
+}
+
+/// `ammAssetIn` (eq 4) for an XRP leg: same quadratic solve as [`amm_asset_in`]
+/// but the final `multiply(balance, frac, Upward)` lands on the XRP drops grid
+/// (rippled `toSTAmount` for an XRP asset). Returns integer drops. Used by the
+/// single-asset XRP deposit `adjustAssetInByTokens` round-trip.
+pub fn amm_asset_in_xrp(
+    pool_drops: u64,
+    total_lp: &rxrpl_amount::IOUAmount,
+    tokens: &rxrpl_amount::IOUAmount,
+    tfee: u16,
+) -> u64 {
+    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode};
+    let frac = amm_asset_in_frac(total_lp, tokens, tfee);
+    let _g = RoundModeGuard::new(RoundingMode::Upward);
+    Number::from_int(pool_drops as i64)
+        .mul(&frac)
+        .to_xrp_drops_mode()
+}
+
+/// `ammAssetIn` (eq 4) fraction `b/B` solving the deposit quadratic. The whole
+/// solve runs under the ambient (ToNearest) mode; only the caller's final
+/// `multiply(balance, frac, Upward)` applies directed rounding. Shared by the
+/// XRP and IOU `ammAssetIn` helpers.
+fn amm_asset_in_frac(
+    total_lp: &rxrpl_amount::IOUAmount,
+    tokens: &rxrpl_amount::IOUAmount,
+    tfee: u16,
+) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::{Number, root2};
     let one = Number::from_int(1);
     let (f1, f2) = fee_mults(tfee);
     let t1 = Number::from_iou(tokens).div(&Number::from_iou(total_lp));
@@ -363,12 +430,7 @@ pub fn amm_asset_in(
     let c = d.mul(&d).sub(&f2.mul(&f2));
     // solveQuadraticEq: (-b + root2(b*b - 4*a*c)) / (2*a)
     let disc = root2(b.mul(&b).sub(&Number::from_int(4).mul(&a).mul(&c)));
-    let frac = b.negate().add(&disc).div(&two.mul(&a));
-    // rippled `ammAssetIn` returns `multiply(balance, frac, Upward)` =
-    // toSTAmount(asset, balance*frac, Upward): the result lands on the IOU
-    // grid rounded up, not at full Number precision.
-    let _g = RoundModeGuard::new(RoundingMode::Upward);
-    Number::from_iou(&pool.mul(&frac).to_iou())
+    b.negate().add(&disc).div(&two.mul(&a))
 }
 
 /// Parse an IOU `value` decimal string into an `IOUAmount`.
