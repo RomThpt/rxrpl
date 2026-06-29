@@ -641,9 +641,21 @@ fn cross_offers(
     };
 
     // Taker's quality limit in the inverse book = TakerGets / TakerPays.
+    // The threshold must be computed with the SAME divide canonicalisation
+    // used to store the offers' BookDirectory qualities (`offer_book_quality`):
+    // once `fixUniversalNumber` is active rippled's getRate rounds half-to-even,
+    // otherwise it truncates. Using the truncating `get_rate` here while the
+    // dir qualities are round-even left the threshold 1 ULP low, so the walk
+    // broke before an exactly-equal-priced resting offer and crossed nothing.
     let pays_iou = leg_as_quality_iou(&out_leg);
     let gets_iou = leg_as_quality_iou(&in_leg);
-    let threshold = rxrpl_amount::get_rate(&gets_iou, &pays_iou).unwrap_or(0);
+    let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+    let threshold = if number_switchover {
+        rxrpl_amount::get_rate_round_even(&gets_iou, &pays_iou)
+    } else {
+        rxrpl_amount::get_rate(&gets_iou, &pays_iou)
+    }
+    .unwrap_or(0);
     if threshold == 0 {
         return Ok((taker_pays.clone(), taker_gets.clone(), false));
     }
@@ -745,12 +757,26 @@ fn cross_offers(
             pay_in(ctx, taker, taker_acct, &owner, &order_in, false, false)?;
             pay_out(ctx, taker, taker_acct, &owner, taker, &order_out, false)?;
 
-            if full_take {
-                // Consume to zero (records the change in metadata) then delete,
-                // as rippled consumes before BookTip drops the offer.
+            // The offer's available liquidity is exhausted when the take
+            // consumes all of `avail_out` — either the whole offer (`full_take`)
+            // or, when the owner is underfunded, all of the owner's funds.
+            // rippled deletes such an offer (the owner can no longer fund the
+            // remainder) rather than leaving an unfunded husk in the book.
+            let exhausted = leg_ge(&take_out, &avail_out);
+            if exhausted {
+                // Record the metadata delta (zero for a full take, the unfunded
+                // remainder for a depleted owner) then delete, as rippled
+                // consumes before BookTip / offerDelete drops the offer.
                 let mut consumed = offer.clone();
-                consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
-                consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
+                if full_take {
+                    consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
+                    consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
+                } else {
+                    let new_gets = leg_sub(&offer_out, &order_out);
+                    let new_pays = leg_sub(&offer_in, &order_in);
+                    consumed["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
+                    consumed["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
+                }
                 let cb =
                     serde_json::to_vec(&consumed).map_err(|_| TransactionResult::TefInternal)?;
                 ctx.view
