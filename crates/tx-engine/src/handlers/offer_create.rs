@@ -619,6 +619,9 @@ fn cross_offers(
             };
 
             // Move funds: taker pays order_in (grossed), owner pays order_out.
+            // Legacy Taker semantics: `order_out` is the NET the taker receives;
+            // the owner's debit is grossed up by the output issuer's transfer
+            // fee inside `pay_out`.
             pay_in(ctx, taker, taker_acct, &owner, &order_in, false)?;
             pay_out(ctx, taker, taker_acct, &owner, taker, &order_out, false)?;
 
@@ -661,18 +664,22 @@ fn cross_offers(
     ))
 }
 
-/// Output deliverable for a given input at a resting offer's *exact* price:
-/// `out = in * offer_out / offer_in`. rippled's Flow prices the fill from the
-/// offer's full-precision amounts, not the bucketed book-directory quality.
-/// The ratio is taken in pure `IOUAmount` magnitudes (drops count as integers)
-/// to avoid the native/IOU normalisation hazard of mixed-asset multiply.
+/// Output deliverable for a given input at a resting offer's price. This mirrors
+/// rippled's `Quality::ceilInStrict` (the input-limited path in `BookStep`):
+/// the offer quality is first *quantized* into a rate `q = offer_in / offer_out`
+/// (`getRate`'s 16-digit `divide`), then `out = in / q` rounded DOWN
+/// (`divRoundStrict`). Pricing from the bucketed rate rather than the
+/// full-precision `in * offer_out / offer_in` is what makes the consumed/owner
+/// amounts byte-exact (e.g. mainnet SOLO fills land on `…2747`, not `…2750`).
+/// Magnitudes are pure `IOUAmount` (drops count as integers) to avoid the
+/// native/IOU normalisation hazard of mixed-asset multiply.
 fn out_for_in(in_amt: &Leg, offer_in: &Leg, offer_out: &Leg) -> Leg {
     let in_iou = leg_as_quality_iou(in_amt);
     let offer_out_iou = leg_as_quality_iou(offer_out);
     let offer_in_iou = leg_as_quality_iou(offer_in);
-    let out_iou = IOUAmount::multiply(&in_iou, &offer_out_iou)
-        .and_then(|num| IOUAmount::divide(&num, &offer_in_iou))
-        .unwrap_or(IOUAmount::ZERO);
+    let qrate = IOUAmount::divide(&offer_in_iou, &offer_out_iou).unwrap_or(IOUAmount::ZERO);
+    let out_iou =
+        IOUAmount::div_round(&in_iou, &qrate, /*round_up*/ false).unwrap_or(IOUAmount::ZERO);
     leg_from_magnitude(&out_iou, offer_out)
 }
 
@@ -824,7 +831,11 @@ pub(crate) fn cross_book_payment(
             };
 
             pay_in(ctx, taker, taker_acct, &owner, &order_in, true)?;
-            pay_out(ctx, taker, taker_acct, &owner, dest, &order_out, true)?;
+            // `order_out` is the GROSS the offer/owner gives (the TakerGets it
+            // reduces by); `net_out` is what `dest` actually receives after the
+            // output issuer's transfer fee. The book demand (`remaining_out`) is
+            // tracked in NET terms, so it decrements by `net_out`, not the gross.
+            let net_out = pay_out_gross(ctx, taker, taker_acct, &owner, dest, &order_out, true)?;
 
             if full_take {
                 let mut consumed = offer.clone();
@@ -849,7 +860,7 @@ pub(crate) fn cross_book_payment(
                     .map_err(|_| TransactionResult::TefInternal)?;
             }
 
-            remaining_out = leg_sub_round(&remaining_out, &order_out);
+            remaining_out = leg_sub_round(&remaining_out, &net_out);
             remaining_in = leg_sub_round(&remaining_in, &order_in);
         }
     }
@@ -972,6 +983,12 @@ fn pay_in(
 /// (the caller's working copy) so the apply's final account write does not
 /// clobber it; a distinct recipient (cross-currency payment to another account)
 /// is credited through the view instead.
+///
+/// This is the legacy Taker (OfferCreate crossing) path: `amount` is the NET
+/// the recipient receives and the offer's TakerGets reduction, while the owner
+/// is unconditionally debited the grossed-up amount (`amount * transfer_rate`).
+/// The cross-currency Payment path uses [`pay_out_gross`] instead, where the
+/// fee is charged out of a gross input and skipped when the issuer is a party.
 fn pay_out(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
@@ -1011,6 +1028,71 @@ fn pay_out(
         &amount.iou,
         round,
     )
+}
+
+/// Move the offer owner's output to `recipient` and return the NET delivered
+/// (what `recipient` actually receives). Used by the cross-currency Payment
+/// path, where `amount` is the GROSS the offer provides — exactly the offer's
+/// TakerGets reduction and the owner's debit. The output issuer's transfer fee
+/// is charged out of that gross: the recipient receives `amount / transfer_rate`
+/// rounded DOWN (rippled never delivers more), and the difference is the burned
+/// fee. rippled skips the fee whenever the issuer is itself a party (owner or
+/// recipient), so the net then equals the gross. XRP carries no transfer fee, so
+/// net == gross there. When `recipient` is the taker, its XRP credit goes
+/// through `taker_acct` (the caller's working copy) so the apply's final account
+/// write does not clobber it; a distinct recipient (cross-currency payment to
+/// another account) is credited through the view instead.
+fn pay_out_gross(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    owner: &AccountId,
+    recipient: &AccountId,
+    amount: &Leg,
+    round: bool,
+) -> Result<Leg, TransactionResult> {
+    if amount.is_xrp {
+        credit_xrp(ctx, owner, -amount.drops)?;
+        if recipient == taker {
+            helpers::set_balance(
+                taker_acct,
+                helpers::get_balance(taker_acct) + amount.drops as u64,
+            );
+        } else {
+            credit_xrp(ctx, recipient, amount.drops)?;
+        }
+        return Ok(amount.clone());
+    }
+    // The fee applies only when neither party is the issuer (rippled charges no
+    // transfer fee on issuance/redemption). When it applies, the recipient nets
+    // `gross / rate` rounded down; otherwise net == gross.
+    let fee_applies = amount.issuer != *owner && amount.issuer != *recipient;
+    let net = if fee_applies {
+        let rate = transfer_rate(ctx, &amount.issuer);
+        IOUAmount::div_round(&amount.iou, &rate, /*round_up*/ false).unwrap_or(amount.iou)
+    } else {
+        amount.iou
+    };
+    // Debit the owner the full gross it provides (the offer's TakerGets move).
+    credit_line(
+        ctx,
+        owner,
+        &amount.issuer,
+        &amount.currency,
+        &amount.iou.negate(),
+        round,
+    )?;
+    credit_line(
+        ctx,
+        recipient,
+        &amount.issuer,
+        &amount.currency,
+        &net,
+        round,
+    )?;
+    let mut net_leg = amount.clone();
+    net_leg.iou = net;
+    Ok(net_leg)
 }
 
 /// `amount * rate` using rippled's non-rounding STAmount multiply.
