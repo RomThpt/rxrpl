@@ -874,6 +874,20 @@ mod tests {
                 if let_type == "DirectoryNode" {
                     continue;
                 }
+                // A ModifiedNode that only threads PreviousTxnID (a pure "touch",
+                // e.g. the counterparty of a created/deleted trust line) carries
+                // empty FinalFields and changed no field values. Reconstructing
+                // from it would wipe the real account (Flags, OwnerCount, …) that
+                // was correctly seeded from the parent ledger above. Keep that
+                // seed; central stamping re-threads its PreviousTxnID.
+                if nt == "ModifiedNode"
+                    && e.get("FinalFields")
+                        .and_then(|v| v.as_object())
+                        .map(|o| o.is_empty())
+                        .unwrap_or(true)
+                {
+                    continue;
+                }
                 let mut pre = e
                     .get("FinalFields")
                     .cloned()
@@ -1011,6 +1025,70 @@ mod tests {
             }
         }
 
+        // A trust line deleted by this tx is unlinked from each owner's directory
+        // page named by the line's Low/HighNode hint (rippled `trustDelete` ->
+        // `dirRemove`). When a sibling tx earlier in THIS same ledger N *created*
+        // that same line, the parent-ledger page predates the insertion and omits
+        // the entry, so our hinted removal would no-op and never re-thread the
+        // page (its PreviousTxnID would stay stale). Reconstruct the pre-deletion
+        // membership by adding the line's index to each named page in the seed —
+        // the same mid-ledger reconstruction the book-directory patch above does
+        // for offers. The page is itself a ModifiedNode (re-threaded) and was thus
+        // already fetched from the parent into `state`.
+        for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
+            let Some(e) = node.get("DeletedNode") else {
+                continue;
+            };
+            if e.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("RippleState") {
+                continue;
+            }
+            let Some(ff) = e.get("FinalFields") else {
+                continue;
+            };
+            let line_idx = e["LedgerIndex"].as_str().unwrap().to_uppercase();
+            for (limit_f, node_f) in [("LowLimit", "LowNode"), ("HighLimit", "HighNode")] {
+                let Some(acct) = ff
+                    .get(limit_f)
+                    .and_then(|l| l.get("issuer"))
+                    .and_then(|v| v.as_str())
+                else {
+                    continue;
+                };
+                let Ok(aid) = decode_account_id(acct) else {
+                    continue;
+                };
+                let page_no = ff
+                    .get(node_f)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| u64::from_str_radix(s, 16).ok())
+                    .unwrap_or(0);
+                let page_key = keylet::dir_node(&keylet::owner_dir(&aid), page_no)
+                    .to_string()
+                    .to_uppercase();
+                let kb: [u8; 32] = hex::decode(&page_key).unwrap().try_into().unwrap();
+                let Some(bin) = state.get(&Hash256::new(kb)) else {
+                    continue; // page not seeded (not affected) — leave it alone
+                };
+                let Ok(mut page) = rxrpl_codec::binary::decode(bin) else {
+                    continue;
+                };
+                let mut changed = false;
+                if let Some(arr) = page.get_mut("Indexes").and_then(|v| v.as_array_mut()) {
+                    if !arr.iter().any(|x| x.as_str() == Some(line_idx.as_str())) {
+                        arr.push(Value::String(line_idx.clone()));
+                        changed = true;
+                    }
+                }
+                if changed {
+                    if let Ok(b) = serde_json::to_vec(&page) {
+                        if let Ok(newbin) = rxrpl_ledger::sle_codec::encode_sle(&b) {
+                            state.put(Hash256::new(kb), newbin).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+
         let parent_hdr = rpc(serde_json::json!({
             "method":"ledger","params":[{"ledger_index":parent,"transactions":false,"expand":false}]
         }));
@@ -1123,6 +1201,16 @@ mod tests {
                         && !obj.contains_key("Balance")
                     {
                         obj.insert("Balance".into(), Value::String("0".into()));
+                    }
+                    // A created RippleState always serializes both LowNode and
+                    // HighNode, but the metadata NewFields omits whichever equals
+                    // the default value 0. Add them so the reconstructed SLE
+                    // matches the real on-chain entry (same class as Balance).
+                    if nt == "CreatedNode" && let_type == "RippleState" {
+                        for f in ["LowNode", "HighNode"] {
+                            obj.entry(f.to_string())
+                                .or_insert_with(|| Value::String("0".into()));
+                        }
                     }
                     if !non_threaded(let_type) {
                         obj.insert("PreviousTxnID".into(), Value::String(txid_upper.clone()));

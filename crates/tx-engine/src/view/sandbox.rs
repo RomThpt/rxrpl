@@ -286,6 +286,44 @@ impl SandboxChanges {
         }
     }
 
+    /// Thread `sfAccountTxnID` on the sender's account root to the id of the
+    /// transaction being applied, mirroring rippled's base `Transactor::apply`:
+    ///
+    /// ```text
+    /// if (sle->isFieldPresent(sfAccountTxnID))
+    ///     sle->setFieldH256(sfAccountTxnID, ctx_.tx.getTransactionID());
+    /// ```
+    ///
+    /// rippled updates the field ONLY when it is already present (the account
+    /// opted in via `asfAccountTxnID`); accounts that never enabled it are left
+    /// untouched. The sender root is always in the change set (its sequence was
+    /// consumed), so we patch it in place here.
+    pub fn thread_account_txn_id(&mut self, account_key: &Hash256, tx_id_hex: &str) {
+        let Some(data) = self
+            .updates
+            .get_mut(account_key)
+            .or_else(|| self.inserts.get_mut(account_key))
+        else {
+            return;
+        };
+        let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(data) else {
+            return;
+        };
+        let Some(obj) = v.as_object_mut() else {
+            return;
+        };
+        if !obj.contains_key("AccountTxnID") {
+            return;
+        }
+        obj.insert(
+            "AccountTxnID".to_string(),
+            serde_json::Value::String(tx_id_hex.to_string()),
+        );
+        if let Ok(bytes) = serde_json::to_vec(&v) {
+            *data = bytes;
+        }
+    }
+
     /// Apply these changes to a ledger.
     ///
     /// JSON data from handlers is encoded to XRPL binary before storage
