@@ -190,6 +190,21 @@ impl Transactor for PaymentTransactor {
                         send_max.clone(),
                     );
                 }
+                // IOU<->IOU multi-hop `Paths`: when at least one path resolves to
+                // a pure book/AMM chain (no genuine cross-issuer DirectStep), route
+                // it through the same byte-exact engine as the native-leg case.
+                // Paths that need a genuine DirectStep or multi-path blend the
+                // book/AMM chain cannot represent fall through to the legacy
+                // back-solve (`apply_cross_currency`) below.
+                if paths_resolve_to_chain(ctx.tx, send_max, &ctx.tx["Amount"]) {
+                    return apply_paths_payment(
+                        ctx,
+                        account_str,
+                        destination_str,
+                        ctx.tx["Amount"].clone(),
+                        send_max.clone(),
+                    );
+                }
             }
         }
 
@@ -628,6 +643,40 @@ fn apply_conversion(
     Ok(TransactionResult::TesSuccess)
 }
 
+/// Whether at least one of the transaction's `Paths` is a real
+/// pathfinder-shaped pure book/AMM chain that the byte-exact engine can serve.
+///
+/// rippled's pathfinder threads every interior book step with an account-ripple
+/// step (`type` 0x01) through that book's output issuer (e.g. `book RPR/I`,
+/// `account I`, `book FUZZY/J`, `account J`); `build_path_boundaries` folds those
+/// no-op ripple steps away to a book/AMM boundary chain. Requiring such a step
+/// keeps the byte-exact engine to the mainnet path shape (Gap 2) and leaves the
+/// legacy back-solve to serve the bare-book synthetic shapes and any path that
+/// needs a genuine cross-issuer `DirectStep` or multi-path quality blend.
+fn paths_resolve_to_chain(
+    tx: &serde_json::Value,
+    send_max: &serde_json::Value,
+    amount: &serde_json::Value,
+) -> bool {
+    tx.get("Paths")
+        .and_then(|v| v.as_array())
+        .map(|paths| {
+            paths.iter().any(|p| {
+                let Some(steps) = p.as_array() else {
+                    return false;
+                };
+                let has_ripple_step = steps
+                    .iter()
+                    .any(|s| s.get("account").and_then(|v| v.as_str()).is_some());
+                has_ripple_step
+                    && build_path_boundaries(steps, send_max, amount)
+                        .map(|b| b.len() >= 2)
+                        .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Build the boundary chain of a single resolved path: `[source asset,
 /// intermediate1, intermediate2, ..., destination asset]`. Each interior
 /// boundary is an IOU object `{currency, issuer, value:"0"}` (the magnitude is
@@ -652,10 +701,21 @@ fn build_path_boundaries(
         //     is not modelled by this handler — fall back to another path.
         //   * a `currency`/`issuer` step changes the book boundary; the omitted
         //     side is inherited from the previous hop.
-        let has_account = step.get("account").and_then(|v| v.as_str()).is_some();
+        let step_account = step.get("account").and_then(|v| v.as_str());
         let step_cur = step.get("currency").and_then(|v| v.as_str());
         let step_iss = step.get("issuer").and_then(|v| v.as_str());
-        if has_account {
+        if let Some(account) = step_account {
+            // A pure account-rippling step (`type` 0x01) through the issuer of
+            // the asset the previous book step just produced (`account == iss`)
+            // is a no-op on the asset boundary: it lands the book output on the
+            // issuer's own books before the next book step, leaving currency and
+            // issuer unchanged. Skip it. Genuine cross-issuer rippling (a
+            // DirectStep to a different issuer) and mixed account+currency/issuer
+            // steps are not modelled by this book/AMM-chain engine — fall back to
+            // another path (or the legacy back-solve for IOU<->IOU).
+            if step_cur.is_none() && step_iss.is_none() && account == iss {
+                continue;
+            }
             return None;
         }
         if step_cur.is_none() && step_iss.is_none() {
