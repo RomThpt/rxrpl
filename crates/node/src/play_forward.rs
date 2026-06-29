@@ -662,6 +662,28 @@ mod tests {
             }
         }
 
+        // A multi-signed tx (carrying a `Signers` array) reads the sender's
+        // SignerList SLE to validate the signers against the registered quorum
+        // (Transactor::checkMultiSign). A successful apply does not modify the
+        // SignerList, so it is absent from AffectedNodes and would not be seeded
+        // — the engine's stateful multi-sign gate would then read no list and
+        // return tefNOT_MULTI_SIGNING. Seed the sender's SignerList keylet from
+        // the parent ledger so the gate sees the real list (oracle faithfulness,
+        // mirrors the OfferCreate trust-line seeding above).
+        if tx_json
+            .get("Signers")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty())
+        {
+            if let Some(aid) = tx_json
+                .get("Account")
+                .and_then(|v| v.as_str())
+                .and_then(|a| decode_account_id(a).ok())
+            {
+                read_keys.insert(keylet::signer_list(&aid).to_string().to_uppercase());
+            }
+        }
+
         // A sell NFTokenCreateOffer reads the seller's NFTokenPage to verify
         // ownership, but creating an offer does not modify the page, so it is
         // absent from AffectedNodes and would not be seeded — the ownership
