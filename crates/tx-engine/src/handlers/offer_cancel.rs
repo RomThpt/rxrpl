@@ -73,8 +73,10 @@ impl Transactor for OfferCancelTransactor {
             false
         };
 
-        // Update account: increment sequence, decrement owner count (only if an
-        // offer was actually removed).
+        // Update account: consume the Sequence or Ticket (rippled
+        // Transactor::consumeSeqProxy — a ticketed OfferCancel must spend its
+        // Ticket SLE and leave the account Sequence unchanged, not bump it), and
+        // decrement owner count (only if an offer was actually removed).
         let bytes = ctx
             .view
             .read(&acct_key)
@@ -82,7 +84,7 @@ impl Transactor for OfferCancelTransactor {
         let mut acct: Value =
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
 
-        helpers::increment_sequence(&mut acct);
+        crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, &mut acct, ctx.tx)?;
         if offer_existed {
             helpers::adjust_owner_count(&mut acct, -1);
         }
