@@ -136,23 +136,39 @@ pub fn rules_for_ledger(ledger: &Ledger) -> Rules {
 /// SLE. Early ledgers (pre-2014) predate that object, where reserves were the
 /// protocol constants (200 XRP base, 50 XRP per owner).
 pub fn fees_for_ledger(ledger: &Ledger) -> FeeSettings {
+    // XRPFees (2024) stores fees directly in drops as XRP `Amount` fields, which
+    // rxrpl decodes to decimal strings (e.g. ReserveBaseDrops "1000000").
+    fn drops(v: &Value) -> Option<u64> {
+        v.as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| v.as_u64())
+    }
     ledger
         .state_map
         .get(&rxrpl_protocol::keylet::fee_settings())
         .and_then(|b| rxrpl_codec::binary::decode(b).ok())
         .map(|fs| FeeSettings {
+            // Post-XRPFees: BaseFeeDrops (drops). Pre-amendment: BaseFee (UInt64 hex).
             base_fee: fs
-                .get("BaseFee")
-                .and_then(|v| v.as_str())
-                .and_then(|s| u64::from_str_radix(s, 16).ok())
+                .get("BaseFeeDrops")
+                .and_then(drops)
+                .or_else(|| {
+                    fs.get("BaseFee")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| u64::from_str_radix(s, 16).ok())
+                })
                 .unwrap_or(10),
+            // Post-XRPFees: ReserveBaseDrops. Pre-amendment: ReserveBase (UInt32 drops).
             reserve_base: fs
-                .get("ReserveBase")
-                .and_then(|v| v.as_u64())
+                .get("ReserveBaseDrops")
+                .and_then(drops)
+                .or_else(|| fs.get("ReserveBase").and_then(|v| v.as_u64()))
                 .unwrap_or(10_000_000),
+            // Post-XRPFees: ReserveIncrementDrops. Pre-amendment: ReserveIncrement.
             reserve_increment: fs
-                .get("ReserveIncrement")
-                .and_then(|v| v.as_u64())
+                .get("ReserveIncrementDrops")
+                .and_then(drops)
+                .or_else(|| fs.get("ReserveIncrement").and_then(|v| v.as_u64()))
                 .unwrap_or(50_000_000),
         })
         .unwrap_or(FeeSettings {
@@ -617,6 +633,35 @@ mod tests {
             }
         }
 
+        // An OfferCreate reads the creator's own trust lines for the offer's
+        // TakerPays / TakerGets currencies — the unfunded check (accountFunds on
+        // TakerGets) and the owner-funds clamp — even when crossing leaves them
+        // unchanged. A non-crossing or fully-funded offer therefore omits them
+        // from AffectedNodes; seed both lines from the parent ledger so
+        // accountFunds reflects the chain rather than a missing line (== 0).
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("OfferCreate") {
+            if let Some(aid) = tx_json
+                .get("Account")
+                .and_then(|v| v.as_str())
+                .and_then(|a| decode_account_id(a).ok())
+            {
+                for side in ["TakerPays", "TakerGets"] {
+                    if let (Some(iss), Some(cur)) = (
+                        tx_json[side].get("issuer").and_then(|v| v.as_str()),
+                        tx_json[side].get("currency").and_then(|v| v.as_str()),
+                    ) {
+                        if let Ok(iid) = decode_account_id(iss) {
+                            read_keys.insert(
+                                keylet::trust_line(&aid, &iid, &currency_bytes(cur))
+                                    .to_string()
+                                    .to_uppercase(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // A sell NFTokenCreateOffer reads the seller's NFTokenPage to verify
         // ownership, but creating an offer does not modify the page, so it is
         // absent from AffectedNodes and would not be seeded — the ownership
@@ -737,9 +782,24 @@ mod tests {
             }
         }
 
+        // Keys our tx creates must start ABSENT. Usually a CreatedNode is simply
+        // missing from the parent, but a deterministic key (a book/owner
+        // DirectoryNode page) can have been deleted *and re-created* within this
+        // same ledger N: the parent then still holds its stale pre-deletion
+        // content, which would pollute the freshly created entry. Never seed a
+        // CreatedNode from the parent.
+        let created_keys: std::collections::BTreeSet<String> = affected
+            .iter()
+            .filter(|(_, nt)| nt == "CreatedNode")
+            .map(|(k, _)| k.clone())
+            .collect();
+
         // Seed a partial state map from the parent ledger.
         let mut state = rxrpl_shamap::SHAMap::account_state();
         for key in &read_keys {
+            if created_keys.contains(key) {
+                continue;
+            }
             let r = rpc(serde_json::json!({
                 "method":"ledger_entry","params":[{"index":key,"ledger_index":parent,"binary":true}]
             }));
@@ -875,6 +935,9 @@ mod tests {
             }
         }
         for (key, offers) in &dir_offers {
+            if created_keys.contains(key) {
+                continue; // a re-created page must not inherit stale parent entries
+            }
             let r = rpc(serde_json::json!({
                 "method":"ledger_entry","params":[{"index":key,"ledger_index":parent,"binary":true}]
             }));

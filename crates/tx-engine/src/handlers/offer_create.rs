@@ -64,8 +64,18 @@ fn offer_book_quality(taker_pays: &Value, taker_gets: &Value) -> u64 {
     }
 }
 
+/// OfferCreate transaction flags.
+const TF_PASSIVE: u64 = 0x0001_0000;
+const TF_IMMEDIATE_OR_CANCEL: u64 = 0x0002_0000;
+const TF_FILL_OR_KILL: u64 = 0x0004_0000;
 /// tfSell flag: the offer is a sell, so TakerGets is the exact amount.
 const TF_SELL: u64 = 0x0008_0000;
+
+/// Offer ledger-entry flags. rippled translates the transaction `tfPassive` /
+/// `tfSell` flags into these (note `lsfSell` differs from `tfSell`); no other
+/// transaction flag is persisted on the Offer SLE.
+const LSF_PASSIVE: u64 = 0x0001_0000;
+const LSF_SELL: u64 = 0x0002_0000;
 
 /// rippled's `Quality::kMaxTickSize` — no rounding at or above 16 digits.
 const MAX_TICK_SIZE: u8 = 16;
@@ -216,7 +226,14 @@ impl Transactor for OfferCreateTransactor {
         let mut acct: Value =
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
 
-        let sequence = helpers::get_sequence(&acct);
+        // The offer's Sequence (and its keylet) is rippled's `getSeqValue()`:
+        // the TicketSequence when the transaction spends a ticket, otherwise the
+        // account Sequence. Using the account Sequence for a ticketed offer would
+        // mis-key the created Offer SLE.
+        let sequence = match ctx.tx.get("TicketSequence").and_then(|v| v.as_u64()) {
+            Some(ticket) => ticket as u32,
+            None => helpers::get_sequence(&acct),
+        };
 
         let (pays_currency, pays_issuer) = currency_and_issuer(&ctx.tx["TakerPays"]);
         let (gets_currency, gets_issuer) = currency_and_issuer(&ctx.tx["TakerGets"]);
@@ -231,6 +248,57 @@ impl Transactor for OfferCreateTransactor {
         // Consume the sequence up front: rippled charges it (and the fee) even
         // when the transaction ends in a tec claim below.
         crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, &mut acct, ctx.tx)?;
+
+        // Unfunded check (rippled preclaim): an offer must be at least partially
+        // funded in the asset it sells (TakerGets), else tecUNFUNDED_OFFER — fee
+        // and sequence charged, no offer placed, no crossing. accountFunds: an
+        // IOU side is the holder's trust-line balance (the issuer of its own
+        // currency is always funded); an XRP side is the liquid balance above the
+        // owner reserve (`xrpLiquid`).
+        let owner_count = acct.get("OwnerCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let funded = match Leg::parse(&taker_gets) {
+            Some(g) if g.is_xrp => {
+                // preclaim runs before the fee is taken; add it back to the
+                // post-fee balance the parent sandbox left us.
+                let pre_fee = helpers::get_balance(&acct).saturating_add(helpers::get_fee(ctx.tx));
+                pre_fee > ctx.fees.account_reserve(owner_count)
+            }
+            Some(g) => !owner_funds_leg(ctx, &account_id, &g).is_zero(),
+            None => true,
+        };
+        if !funded {
+            let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
+            ctx.view
+                .update(acct_key, nb)
+                .map_err(|_| TransactionResult::TemMalformed)?;
+            return Ok(TransactionResult::TecUnfundedOffer);
+        }
+
+        // OfferSequence (cancel-and-replace): rippled deletes the account's own
+        // offer at that sequence before crossing — removed from its book and
+        // owner directories with the owner reserve released. It is not an error
+        // if the offer is already gone. The OwnerCount decrement lands on `acct`
+        // (written back below), not the view copy a generic reap would clobber.
+        if let Some(cancel_seq) = ctx.tx.get("OfferSequence").and_then(|v| v.as_u64()) {
+            let cancel_key = keylet::offer(&account_id, cancel_seq as u32);
+            if let Some(old) = ctx
+                .view
+                .read(&cancel_key)
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .filter(|o| o.get("LedgerEntryType").and_then(|v| v.as_str()) == Some("Offer"))
+            {
+                if let Some(book_dir) = old
+                    .get("BookDirectory")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<Hash256>().ok())
+                {
+                    remove_from_book_dir(ctx.view, &book_dir, &cancel_key)?;
+                }
+                crate::owner_dir::remove_from_owner_dir(ctx.view, &account_id, &cancel_key)?;
+                let _ = ctx.view.erase(&cancel_key);
+                helpers::adjust_owner_count(&mut acct, -1);
+            }
+        }
 
         // Cross against the inverse book — existing offers where someone pays
         // our `TakerGets` to receive our `TakerPays` (book keyed by `(gets,
@@ -249,20 +317,45 @@ impl Transactor for OfferCreateTransactor {
 
         // Nothing left to place when either side is exhausted (fully crossed):
         // rippled places no resting offer. Commit the taker's mutations.
+        let commit_acct =
+            |ctx: &mut ApplyContext<'_>, acct: &Value| -> Result<(), TransactionResult> {
+                let nb = serde_json::to_vec(acct).map_err(|_| TransactionResult::TemMalformed)?;
+                ctx.view
+                    .update(acct_key, nb)
+                    .map_err(|_| TransactionResult::TemMalformed)?;
+                Ok(())
+            };
         if value_is_zero(&remaining_pays) || value_is_zero(&remaining_gets) {
-            let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
-            ctx.view
-                .update(acct_key, nb)
-                .map_err(|_| TransactionResult::TemMalformed)?;
+            commit_acct(ctx, &acct)?;
             return Ok(TransactionResult::TesSuccess);
+        }
+
+        // A remainder survives crossing. Time-in-force flags decide its fate
+        // before any resting offer is placed.
+        let tx_flags = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
+        if tx_flags & TF_FILL_OR_KILL != 0 {
+            // FillOrKill: failure to fully cross kills the whole operation.
+            commit_acct(ctx, &acct)?;
+            return Ok(TransactionResult::TecKilled);
+        }
+        if tx_flags & TF_IMMEDIATE_OR_CANCEL != 0 {
+            // ImmediateOrCancel: the remainder is cancelled, not placed. An offer
+            // that transferred nothing returns tecKILLED; otherwise tesSUCCESS.
+            commit_acct(ctx, &acct)?;
+            return Ok(if crossed {
+                TransactionResult::TesSuccess
+            } else {
+                TransactionResult::TecKilled
+            });
         }
 
         // Owner reserve: a resting offer needs reserve for one more owned
         // object. rippled returns tecINSUF_RESERVE_OFFER — fee and sequence
         // charged, no offer placed — when the account cannot afford it AND
-        // nothing crossed (a crossing offer may still place below reserve).
-        let owner_count = acct.get("OwnerCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        if !crossed && helpers::get_balance(&acct) < ctx.fees.account_reserve(owner_count + 1) {
+        // nothing crossed (a crossing offer may still place below reserve). Read
+        // the count fresh: a cancelled OfferSequence has already decremented it.
+        let reserve_count = acct.get("OwnerCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        if !crossed && helpers::get_balance(&acct) < ctx.fees.account_reserve(reserve_count + 1) {
             let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
             ctx.view
                 .update(acct_key, nb)
@@ -313,11 +406,22 @@ impl Transactor for OfferCreateTransactor {
             "0000000000000000000000000000000000000000000000000000000000000000".into(),
         );
         offer.insert("PreviousTxnLgrSeq".into(), Value::from(0u32));
+        // An offer carries its own Expiration (a hard ledger-time deadline) when
+        // the transaction sets one; rippled copies it onto the Offer SLE.
+        if let Some(exp) = ctx.tx.get("Expiration").and_then(|v| v.as_u64()) {
+            offer.insert("Expiration".into(), Value::from(exp));
+        }
         // Flags, BookNode and OwnerNode are default-droppable: rippled omits
-        // them when zero (offer on the root page of each directory).
-        let flags = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
-        if flags != 0 {
-            offer.insert("Flags".into(), Value::from(flags));
+        // them when zero (offer on the root page of each directory). Only the
+        // transaction's tfPassive/tfSell map onto the Offer SLE, and tfSell
+        // (0x80000) becomes lsfSell (0x20000) — they are not the same bit.
+        let offer_flags = (if tx_flags & TF_PASSIVE != 0 {
+            LSF_PASSIVE
+        } else {
+            0
+        }) | (if tx_flags & TF_SELL != 0 { LSF_SELL } else { 0 });
+        if offer_flags != 0 {
+            offer.insert("Flags".into(), Value::from(offer_flags));
         }
         if book_node != 0 {
             offer.insert("BookNode".into(), u64_hex(book_node).into());
