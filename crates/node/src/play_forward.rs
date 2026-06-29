@@ -782,6 +782,27 @@ mod tests {
             }
         }
 
+        // A cross-currency Payment that routes through an AMM reads the pool's
+        // AMM SLE (for the TradingFee and the pseudo-account) but never modifies
+        // it, so it is absent from AffectedNodes and would not be seeded — the
+        // swap would then find no pool and deliver nothing. Derive the AMM key
+        // for the (SendMax → Amount) pair and seed it from the parent ledger.
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("Payment") {
+            if let (Some(amt), Some(sm)) = (tx_json.get("Amount"), tx_json.get("SendMax")) {
+                if let (Some(a1), Some(a2)) = (
+                    rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(amt),
+                    rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(sm),
+                ) {
+                    if a1 != a2 {
+                        if let Ok(amm_key) = rxrpl_tx_engine::amm_helpers::compute_amm_key(&a1, &a2)
+                        {
+                            read_keys.insert(amm_key.to_string().to_uppercase());
+                        }
+                    }
+                }
+            }
+        }
+
         // Keys our tx creates must start ABSENT. Usually a CreatedNode is simply
         // missing from the parent, but a deterministic key (a book/owner
         // DirectoryNode page) can have been deleted *and re-created* within this

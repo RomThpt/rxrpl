@@ -8,13 +8,86 @@
 
 use std::cell::Cell;
 
-const MIN_MANTISSA: u64 = 1_000_000_000_000_000_000; // 10^18
-const MAX_MANTISSA: u64 = 9_999_999_999_999_999_999; // 10^19 - 1
+// rippled's `Number` supports two mantissa scales (see `MantissaRange` in
+// rippled's Number.h):
+//   * "Large" (10^18..10^19-1, 19 digits) — used post-LendingProtocol and the
+//     default here; this is what AMM deposit/withdraw/vote/bid replay against.
+//   * "Small" (10^15..10^16-1, 16 digits) — the original STAmount-IOU precision
+//     that mainnet AMM swap math used at the ledgers we replay (the `Large`
+//     scale was introduced later for the Vault/Lending features). AMM swap-in/
+//     swap-out must run at this scale to be byte-exact: the intermediate
+//     `pool.in * pool.out` product rounds to 16 significant digits, which shifts
+//     the delivered amount by ~1e-7 relative versus the 19-digit product.
+const LARGE_MIN_MANTISSA: u64 = 1_000_000_000_000_000_000; // 10^18
+const LARGE_MAX_MANTISSA: u64 = 9_999_999_999_999_999_999; // 10^19 - 1
+const LARGE_MANTISSA_LOG: i32 = 18;
+const SMALL_MIN_MANTISSA: u64 = 1_000_000_000_000_000; // 10^15
+const SMALL_MAX_MANTISSA: u64 = 9_999_999_999_999_999; // 10^16 - 1
+const SMALL_MANTISSA_LOG: i32 = 15;
 const MAX_REP: u64 = 9_223_372_036_854_775_807; // i64::MAX
 const MIN_EXPONENT: i32 = -32768;
 const MAX_EXPONENT: i32 = 32768;
-const MANTISSA_LOG: i32 = 18;
 const ZERO_EXPONENT: i32 = i32::MIN;
+
+/// Mantissa scale (rippled `MantissaRange::MantissaScale`). `Large` is the
+/// default; AMM swap helpers switch to `Small` via [`MantissaScaleGuard`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MantissaScale {
+    Small,
+    Large,
+}
+
+thread_local! {
+    static SCALE: Cell<MantissaScale> = const { Cell::new(MantissaScale::Large) };
+}
+
+fn scale() -> MantissaScale {
+    SCALE.with(|s| s.get())
+}
+
+fn set_scale(s: MantissaScale) -> MantissaScale {
+    SCALE.with(|c| c.replace(s))
+}
+
+#[inline]
+fn min_mantissa() -> u128 {
+    match scale() {
+        MantissaScale::Small => SMALL_MIN_MANTISSA as u128,
+        MantissaScale::Large => LARGE_MIN_MANTISSA as u128,
+    }
+}
+
+#[inline]
+fn max_mantissa() -> u128 {
+    match scale() {
+        MantissaScale::Small => SMALL_MAX_MANTISSA as u128,
+        MantissaScale::Large => LARGE_MAX_MANTISSA as u128,
+    }
+}
+
+#[inline]
+fn mantissa_log() -> i32 {
+    match scale() {
+        MantissaScale::Small => SMALL_MANTISSA_LOG,
+        MantissaScale::Large => LARGE_MANTISSA_LOG,
+    }
+}
+
+/// RAII guard switching the active mantissa scale, restoring it on drop
+/// (rippled's `NumberMantissaScaleGuard`).
+pub struct MantissaScaleGuard(MantissaScale);
+
+impl MantissaScaleGuard {
+    pub fn new(s: MantissaScale) -> Self {
+        MantissaScaleGuard(set_scale(s))
+    }
+}
+
+impl Drop for MantissaScaleGuard {
+    fn drop(&mut self) {
+        set_scale(self.0);
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RoundingMode {
@@ -120,7 +193,7 @@ impl Guard {
     }
 
     fn bring_into_range(&self, _negative: &mut bool, mantissa: &mut u128, exponent: &mut i32) {
-        if *mantissa < MIN_MANTISSA as u128 {
+        if *mantissa < min_mantissa() {
             *mantissa *= 10;
             *exponent -= 1;
         }
@@ -134,7 +207,7 @@ impl Guard {
     fn do_round_up(&mut self, negative: &mut bool, mantissa: &mut u128, exponent: &mut i32) {
         let r = self.round();
         if r == 1 || (r == 0 && (*mantissa & 1) == 1) {
-            let safe = *mantissa < MAX_MANTISSA as u128 && *mantissa < MAX_REP as u128;
+            let safe = *mantissa < max_mantissa() && *mantissa < MAX_REP as u128;
             if safe {
                 *mantissa += 1;
             } else {
@@ -153,7 +226,7 @@ impl Guard {
         let r = self.round();
         if r == 1 || (r == 0 && (*mantissa & 1) == 1) {
             *mantissa -= 1;
-            if *mantissa < MIN_MANTISSA as u128 {
+            if *mantissa < min_mantissa() {
                 *mantissa *= 10;
                 *exponent -= 1;
             }
@@ -170,7 +243,7 @@ fn do_normalize(negative: &mut bool, mantissa: &mut u128, exponent: &mut i32, dr
         return;
     }
     let mut m = *mantissa;
-    while m < MIN_MANTISSA as u128 && *exponent > MIN_EXPONENT {
+    while m < min_mantissa() && *exponent > MIN_EXPONENT {
         m *= 10;
         *exponent -= 1;
     }
@@ -181,10 +254,10 @@ fn do_normalize(negative: &mut bool, mantissa: &mut u128, exponent: &mut i32, dr
     if dropped {
         g.set_dropped();
     }
-    while m > MAX_MANTISSA as u128 {
+    while m > max_mantissa() {
         g.drop_digit_u128(&mut m, exponent);
     }
-    if *exponent < MIN_EXPONENT || m < MIN_MANTISSA as u128 {
+    if *exponent < MIN_EXPONENT || m < min_mantissa() {
         *mantissa = 0;
         *exponent = ZERO_EXPONENT;
         *negative = false;
@@ -234,8 +307,8 @@ impl Number {
     pub fn one() -> Number {
         Number {
             negative: false,
-            mantissa: MIN_MANTISSA,
-            exponent: -MANTISSA_LOG,
+            mantissa: min_mantissa() as u64,
+            exponent: -mantissa_log(),
         }
     }
 
@@ -291,7 +364,7 @@ impl Number {
         if zn {
             g.set_negative();
         }
-        while zm > MAX_MANTISSA as u128 || zm > MAX_REP as u128 {
+        while zm > max_mantissa() || zm > MAX_REP as u128 {
             g.drop_digit_u128(&mut zm, &mut ze);
         }
         g.do_round_up(&mut zn, &mut zm, &mut ze);
@@ -315,6 +388,9 @@ impl Number {
         let de = y.exponent;
         let zp = self.negative != y.negative;
 
+        // Stage 1: single division with a factor of 10^17. This is the only
+        // stage the Small scale runs (legacy STAmount-IOU division behaviour);
+        // the remainder is discarded and `dropped` stays false.
         const FACTOR_EXP: i32 = 17;
         let f: u128 = 10u128.pow(FACTOR_EXP as u32);
         let numerator = nm * f;
@@ -322,20 +398,24 @@ impl Number {
         let mut ze = ne - de - FACTOR_EXP;
         let mut dropped = false;
 
-        // Stage 2 (Large scale always): correction factor 10^5.
-        const CORRECTION_EXP: i32 = 5;
-        let correction_factor: u128 = 10u128.pow(CORRECTION_EXP as u32);
-        let remainder = numerator % dm;
-        if remainder != 0 {
-            let partial_numerator = remainder * correction_factor;
-            let correction = partial_numerator / dm;
-            if correction != 0 {
-                zm *= correction_factor;
-                ze -= CORRECTION_EXP;
-                zm += correction;
+        // Stage 2 + 3 are Large-scale only (rippled gates them on
+        // `range.scale != Small`): refine with a 10^5 correction factor and the
+        // cusp rounding fix.
+        if scale() != MantissaScale::Small {
+            const CORRECTION_EXP: i32 = 5;
+            let correction_factor: u128 = 10u128.pow(CORRECTION_EXP as u32);
+            let remainder = numerator % dm;
+            if remainder != 0 {
+                let partial_numerator = remainder * correction_factor;
+                let correction = partial_numerator / dm;
+                if correction != 0 {
+                    zm *= correction_factor;
+                    ze -= CORRECTION_EXP;
+                    zm += correction;
+                }
+                // Stage 3: cusp rounding fix is enabled for Large.
+                dropped = partial_numerator % dm != 0;
             }
-            // Stage 3: cusp rounding fix is enabled for Large.
-            dropped = partial_numerator % dm != 0;
         }
 
         let mut neg = zp;
@@ -384,7 +464,7 @@ impl Number {
 
         if xn == yn {
             xm += ym;
-            if xm > MAX_MANTISSA as u128 || xm > MAX_REP as u128 {
+            if xm > max_mantissa() || xm > MAX_REP as u128 {
                 g.drop_digit_u128(&mut xm, &mut xe);
             }
             g.do_round_up(&mut xn, &mut xm, &mut xe);
@@ -396,7 +476,7 @@ impl Number {
                 xe = ye;
                 xn = yn;
             }
-            while xm < MIN_MANTISSA as u128 && xm * 10 <= MAX_REP as u128 {
+            while xm < min_mantissa() && xm * 10 <= MAX_REP as u128 {
                 xm *= 10;
                 xm -= g.pop() as u128;
                 xe -= 1;
@@ -604,7 +684,7 @@ pub fn root2(mut f: Number) -> Number {
         return f;
     }
 
-    let mut e = f.exponent + MANTISSA_LOG + 1;
+    let mut e = f.exponent + mantissa_log() + 1;
     if e % 2 != 0 {
         e += 1;
     }

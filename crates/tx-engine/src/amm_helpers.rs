@@ -21,6 +21,126 @@ fn fee_mults(tfee: u16) -> (rxrpl_amount::number::Number, rxrpl_amount::number::
     (f1, f2)
 }
 
+/// Swap `asset_in` into the pool and return how much of the other asset swaps
+/// out (rippled `swapAssetIn`, fixAMMv1_1 path). Constant-product with the
+/// trading fee taken from the input:
+///
+/// ```text
+/// out = pool_out - (pool_in * pool_out) / (pool_in + asset_in * (1 - tfee/100000))
+/// ```
+///
+/// Each sub-step uses the directed rounding mode that favours the AMM (output
+/// minimised), and the whole computation runs at the 16-digit "Small" mantissa
+/// scale that mainnet AMM swap math used at the replayed ledgers. The result is
+/// rounded DOWN onto the output asset's grid (drops for XRP, the IOU mantissa
+/// otherwise) so the AMM never over-delivers.
+pub fn swap_asset_in(
+    pool_in: &rxrpl_amount::number::Number,
+    pool_out: &rxrpl_amount::number::Number,
+    asset_in: &rxrpl_amount::number::Number,
+    tfee: u16,
+    out_is_xrp: bool,
+) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::{
+        MantissaScale, MantissaScaleGuard, Number, RoundModeGuard, RoundingMode,
+    };
+    let _scale = MantissaScaleGuard::new(MantissaScale::Small);
+
+    // Upward: numerator = pool_in * pool_out, fee = tfee/100000.
+    let (numerator, fee) = {
+        let _g = RoundModeGuard::new(RoundingMode::Upward);
+        let numerator = pool_in.mul(pool_out);
+        let fee = Number::from_int(tfee as i64).div(&Number::from_int(100_000));
+        (numerator, fee)
+    };
+    // Downward: denom = pool_in + asset_in * (1 - fee).
+    let denom = {
+        let _g = RoundModeGuard::new(RoundingMode::Downward);
+        let one_minus_fee = Number::from_int(1).sub(&fee);
+        pool_in.add(&asset_in.mul(&one_minus_fee))
+    };
+    if denom.is_zero() || denom.negative() {
+        return Number::ZERO;
+    }
+    // Upward: ratio = numerator / denom.
+    let ratio = {
+        let _g = RoundModeGuard::new(RoundingMode::Upward);
+        numerator.div(&denom)
+    };
+    // Downward: swap_out = pool_out - ratio (and the final grid conversion).
+    let _g = RoundModeGuard::new(RoundingMode::Downward);
+    let swap_out = pool_out.sub(&ratio);
+    if swap_out.negative() {
+        return Number::ZERO;
+    }
+    if out_is_xrp {
+        Number::from_int(swap_out.to_xrp_drops_mode() as i64)
+    } else {
+        Number::from_iou(&swap_out.to_iou())
+    }
+}
+
+/// How much `asset_in` must swap in to swap `asset_out` out of the pool
+/// (rippled `swapAssetOut`, fixAMMv1_1 path), grossed up by the trading fee:
+///
+/// ```text
+/// in = ((pool_in * pool_out) / (pool_out - asset_out) - pool_in) / (1 - tfee/100000)
+/// ```
+///
+/// Returns `None` when `asset_out >= pool_out` (the pool can't be drained — the
+/// caller treats this as "needs more input than available"). The result is
+/// rounded UP onto the input asset's grid so the AMM is never short-changed.
+pub fn swap_asset_out(
+    pool_in: &rxrpl_amount::number::Number,
+    pool_out: &rxrpl_amount::number::Number,
+    asset_out: &rxrpl_amount::number::Number,
+    tfee: u16,
+    in_is_xrp: bool,
+) -> Option<rxrpl_amount::number::Number> {
+    use rxrpl_amount::number::{
+        MantissaScale, MantissaScaleGuard, Number, RoundModeGuard, RoundingMode,
+    };
+    let _scale = MantissaScaleGuard::new(MantissaScale::Small);
+
+    // Upward: numerator = pool_in * pool_out.
+    let numerator = {
+        let _g = RoundModeGuard::new(RoundingMode::Upward);
+        pool_in.mul(pool_out)
+    };
+    // Downward: denom = pool_out - asset_out.
+    let denom = {
+        let _g = RoundModeGuard::new(RoundingMode::Downward);
+        pool_out.sub(asset_out)
+    };
+    if denom.is_zero() || denom.negative() {
+        return None;
+    }
+    // Upward: ratio = numerator / denom; numerator2 = ratio - pool_in; fee.
+    let (numerator2, fee) = {
+        let _g = RoundModeGuard::new(RoundingMode::Upward);
+        let ratio = numerator.div(&denom);
+        let numerator2 = ratio.sub(pool_in);
+        let fee = Number::from_int(tfee as i64).div(&Number::from_int(100_000));
+        (numerator2, fee)
+    };
+    // Downward: fee_mult = 1 - fee.
+    let fee_mult = {
+        let _g = RoundModeGuard::new(RoundingMode::Downward);
+        Number::from_int(1).sub(&fee)
+    };
+    // Upward: swap_in = numerator2 / fee_mult (and the final grid conversion).
+    let _g = RoundModeGuard::new(RoundingMode::Upward);
+    let swap_in = numerator2.div(&fee_mult);
+    if swap_in.negative() {
+        return Some(Number::ZERO);
+    }
+    if in_is_xrp {
+        Some(Number::from_int(swap_in.to_xrp_drops_mode() as i64))
+    } else {
+        Some(Number::from_iou(&swap_in.to_iou()))
+    }
+}
+
 /// Single-asset deposit: LP tokens issued for depositing `deposit` of an asset
 /// whose pool balance is `pool`, against `total_lp` outstanding, with trading
 /// fee `tfee` (1/100000). Mirrors rippled `lpTokensOut` under fixAMMv1_3
@@ -752,6 +872,48 @@ pub fn adjust_lp_balance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rxrpl_amount::number::Number;
+
+    // Mainnet tx 90BC32E8… (ledger 105255844): XRP->BEAR AMM swap, SendMax 100
+    // drops, tfee 967. rippled delivers exactly 0.03775571 BEAR. The 19-digit
+    // "Large" scale would give 0.0377557229938542 (wrong); the 16-digit Small
+    // scale baked into swap_asset_in reproduces the chain value byte-for-byte.
+    #[test]
+    fn swap_asset_in_xrp_bear_byte_exact() {
+        let pool_in = Number::from_int(116_014_735_240); // pool XRP drops
+        let pool_out = Number::from_iou(&parse_iou_value("44229905.29082063")); // pool BEAR
+        let asset_in = Number::from_int(100);
+        let out = swap_asset_in(&pool_in, &pool_out, &asset_in, 967, false);
+        assert_eq!(out.to_iou().to_decimal_string(), "0.03775571");
+    }
+
+    // Mainnet tx 1BC01A56… (ledger 105255851): PLX->586D65 IOU/IOU swap, input
+    // capped at the user's 937.1421911856 PLX holding, tfee 250. rippled
+    // delivers 932.437210367.
+    #[test]
+    fn swap_asset_in_iou_iou_byte_exact() {
+        let pool_in = Number::from_iou(&parse_iou_value("531398.9622417301"));
+        let pool_out = Number::from_iou(&parse_iou_value("530988.6182725912"));
+        let asset_in = Number::from_iou(&parse_iou_value("937.1421911856"));
+        let out = swap_asset_in(&pool_in, &pool_out, &asset_in, 250, false);
+        assert_eq!(out.to_iou().to_decimal_string(), "932.437210367");
+    }
+
+    // A Large-scale computation (deposit/withdraw default) must be unaffected by
+    // the Small-scale guard living and dying inside swap_asset_in.
+    #[test]
+    fn swap_does_not_leak_small_scale() {
+        let before = Number::from_int(123_456_789).mul(&Number::from_int(987_654_321));
+        let _ = swap_asset_in(
+            &Number::from_int(116_014_735_240),
+            &Number::from_iou(&parse_iou_value("44229905.29082063")),
+            &Number::from_int(100),
+            967,
+            false,
+        );
+        let after = Number::from_int(123_456_789).mul(&Number::from_int(987_654_321));
+        assert_eq!(before, after);
+    }
 
     #[test]
     fn xrp_asset_to_bytes() {
