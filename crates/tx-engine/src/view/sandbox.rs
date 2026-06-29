@@ -22,6 +22,9 @@ pub struct Sandbox<'a> {
     destroyed_drops: u64,
     /// Whether the `SortedDirectories` amendment is active for this apply.
     sorted_directories: bool,
+    /// Whether the `fixPreviousTxnID` amendment is active for this apply. Gates
+    /// whether newly created directory-node pages are threaded.
+    thread_directories: bool,
 }
 
 impl<'a> Sandbox<'a> {
@@ -35,6 +38,7 @@ impl<'a> Sandbox<'a> {
             originals: HashMap::new(),
             destroyed_drops: 0,
             sorted_directories: false,
+            thread_directories: true,
         }
     }
 
@@ -44,10 +48,17 @@ impl<'a> Sandbox<'a> {
         self.sorted_directories = enabled;
     }
 
+    /// Record whether the `fixPreviousTxnID` amendment is active. Set once per
+    /// apply from the engine's `Rules`; inherited by child sandboxes.
+    pub fn set_thread_directories(&mut self, enabled: bool) {
+        self.thread_directories = enabled;
+    }
+
     /// Create a nested sandbox for speculative execution.
     pub fn child(&self) -> Sandbox<'_> {
         let mut c = Sandbox::new(self);
         c.sorted_directories = self.sorted_directories;
+        c.thread_directories = self.thread_directories;
         c
     }
 
@@ -235,6 +246,9 @@ impl ApplyView for Sandbox<'_> {
     }
     fn sorted_directories(&self) -> bool {
         self.sorted_directories
+    }
+    fn thread_directories(&self) -> bool {
+        self.thread_directories
     }
 }
 

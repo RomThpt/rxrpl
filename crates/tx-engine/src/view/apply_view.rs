@@ -26,6 +26,16 @@ pub trait ApplyView: ReadView {
     fn sorted_directories(&self) -> bool {
         false
     }
+
+    /// Whether the `fixPreviousTxnID` amendment is active. Gates directory-node
+    /// threading: when enabled, freshly created `DirectoryNode` pages carry
+    /// `sfPreviousTxnID` / `sfPreviousTxnLgrSeq` (filled by central stamping);
+    /// before the amendment rippled left directory nodes unthreaded, so
+    /// replaying pre-amendment ledgers must omit those fields. Defaults to
+    /// `true` (modern behaviour) for views that do not set it.
+    fn thread_directories(&self) -> bool {
+        true
+    }
 }
 
 /// Errors from apply view operations.

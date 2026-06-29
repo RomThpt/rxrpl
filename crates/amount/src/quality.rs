@@ -11,11 +11,34 @@ use crate::iou::MIN_MANTISSA;
 /// The exponent is biased by +100 so negative exponents become positive.
 /// This allows lexicographic sorting: lower quality = better rate.
 pub fn get_rate(offer_in: &IOUAmount, offer_out: &IOUAmount) -> Result<u64, AmountError> {
+    get_rate_impl(offer_in, offer_out, false)
+}
+
+/// Like [`get_rate`], but reduces the quotient with the post-`fixUniversalNumber`
+/// round-half-to-even canonicalisation (`IOUAmount::divide_round_even`). Callers
+/// gate on the amendment so the order-book directory of a modern offer matches
+/// rippled byte-for-byte (e.g. `…7EA4` instead of the truncating `…7EA3`).
+pub fn get_rate_round_even(
+    offer_in: &IOUAmount,
+    offer_out: &IOUAmount,
+) -> Result<u64, AmountError> {
+    get_rate_impl(offer_in, offer_out, true)
+}
+
+fn get_rate_impl(
+    offer_in: &IOUAmount,
+    offer_out: &IOUAmount,
+    round_even: bool,
+) -> Result<u64, AmountError> {
     if offer_out.is_zero() {
         return Ok(0); // Worthless offer
     }
 
-    let rate = IOUAmount::divide(offer_in, offer_out)?;
+    let rate = if round_even {
+        IOUAmount::divide_round_even(offer_in, offer_out)?
+    } else {
+        IOUAmount::divide(offer_in, offer_out)?
+    };
     if rate.is_zero() {
         return Ok(0); // Offer too good to represent
     }
@@ -96,6 +119,15 @@ pub fn is_better_quality(a: u64, b: u64) -> bool {
 /// Quality = taker_pays / taker_gets. Lower is better for the taker.
 pub fn offer_quality(taker_pays: &IOUAmount, taker_gets: &IOUAmount) -> Result<u64, AmountError> {
     get_rate(taker_pays, taker_gets)
+}
+
+/// [`offer_quality`] using the post-`fixUniversalNumber` round-half-even divide.
+/// Gated by the OfferCreate handler on the amendment's activation.
+pub fn offer_quality_round_even(
+    taker_pays: &IOUAmount,
+    taker_gets: &IOUAmount,
+) -> Result<u64, AmountError> {
+    get_rate_round_even(taker_pays, taker_gets)
 }
 
 #[cfg(test)]

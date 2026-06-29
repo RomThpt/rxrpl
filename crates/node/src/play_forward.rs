@@ -1246,16 +1246,59 @@ mod tests {
                     .map(hex::encode_upper)
             };
 
-            if ours.as_deref() != theirs.as_deref() {
+            let dj = |h: Option<&str>| -> serde_json::Value {
+                h.and_then(|h| hex::decode(h).ok())
+                    .and_then(|b| rxrpl_codec::binary::decode(&b).ok())
+                    .unwrap_or(serde_json::Value::Null)
+            };
+            let oj = dj(ours.as_deref());
+            let tj = dj(theirs.as_deref());
+
+            // A field equals its serialization default: UInt 0, an all-zero
+            // Hash/UInt64 string, an empty blob/array/object.
+            fn is_default_field(v: &Value) -> bool {
+                match v {
+                    Value::Number(n) => {
+                        n.as_u64() == Some(0) || n.as_i64() == Some(0) || n.as_f64() == Some(0.0)
+                    }
+                    Value::String(s) => s.is_empty() || s.bytes().all(|b| b == b'0'),
+                    Value::Array(a) => a.is_empty(),
+                    Value::Object(o) => o.is_empty(),
+                    Value::Bool(b) => !*b,
+                    Value::Null => true,
+                }
+            }
+
+            // rippled's metadata `NewFields` for a CreatedNode OMITS fields equal
+            // to their default, whereas the real ledger SLE (hashed into
+            // account_hash) and our reconstruction serialize them (e.g. an
+            // Offer's sfFlags=0 / sfBookNode=0). So for a created node, treat a
+            // field that is present-and-default on one side but absent on the
+            // other as a MATCH — mirroring that omission — instead of flagging
+            // every created Offer on Flags/BookNode.
+            let differs = if ours.as_deref() == theirs.as_deref() {
+                false
+            } else if nt == "CreatedNode" {
+                match (oj.as_object(), tj.as_object()) {
+                    (Some(o), Some(t)) => {
+                        let mut keys: std::collections::BTreeSet<&String> = o.keys().collect();
+                        keys.extend(t.keys());
+                        keys.iter().any(|k| match (o.get(*k), t.get(*k)) {
+                            (Some(a), Some(b)) => a != b,
+                            (Some(a), None) => !is_default_field(a),
+                            (None, Some(b)) => !is_default_field(b),
+                            (None, None) => false,
+                        })
+                    }
+                    _ => true,
+                }
+            } else {
+                true
+            };
+
+            if differs {
                 mismatches += 1;
                 eprintln!("  DIFF {key} ({nt} {let_type})");
-                let dj = |h: Option<&str>| -> serde_json::Value {
-                    h.and_then(|h| hex::decode(h).ok())
-                        .and_then(|b| rxrpl_codec::binary::decode(&b).ok())
-                        .unwrap_or(serde_json::Value::Null)
-                };
-                let oj = dj(ours.as_deref());
-                let tj = dj(theirs.as_deref());
                 if let (Some(o), Some(t)) = (oj.as_object(), tj.as_object()) {
                     let mut keys: std::collections::BTreeSet<&String> = o.keys().collect();
                     keys.extend(t.keys());

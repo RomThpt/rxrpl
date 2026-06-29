@@ -56,17 +56,23 @@ pub fn dir_insert(
 ) -> Result<u64, TransactionResult> {
     let entry_hex = entry_key.to_string().to_uppercase();
 
+    // With the `fixPreviousTxnID` amendment a freshly created directory page is
+    // threaded (records `sfPreviousTxnID` / `sfPreviousTxnLgrSeq`, filled by
+    // central stamping). Pre-amendment ledgers leave directory nodes unthreaded,
+    // so the field must be omitted entirely when replaying them.
+    let thread_dirs = view.thread_directories();
+
     let make_page = |indexes: Vec<String>, extra: &[(&str, Value)]| -> Value {
         let mut m = serde_json::Map::new();
         m.insert("LedgerEntryType".into(), "DirectoryNode".into());
         m.insert("Flags".into(), Value::from(0u32));
         m.insert("RootIndex".into(), root_key.to_string().into());
-        // Directory pages are threaded; the placeholder is filled by central
-        // stamping after apply.
-        m.insert(
-            "PreviousTxnID".into(),
-            "0000000000000000000000000000000000000000000000000000000000000000".into(),
-        );
+        if thread_dirs {
+            m.insert(
+                "PreviousTxnID".into(),
+                "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            );
+        }
         for (k, v) in describe {
             m.insert((*k).to_string(), v.clone());
         }
