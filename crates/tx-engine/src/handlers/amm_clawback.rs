@@ -84,6 +84,7 @@ impl Transactor for AMMClawbackTransactor {
     }
 
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
+        let _scale = amm_helpers::amm_number_scale_guard(ctx.rules);
         if ctx.tx.get("Amount").is_some() {
             return self.apply_claw_partial(ctx);
         }

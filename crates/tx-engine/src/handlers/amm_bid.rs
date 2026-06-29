@@ -59,6 +59,7 @@ impl Transactor for AMMBidTransactor {
     }
 
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
+        let _scale = amm_helpers::amm_number_scale_guard(ctx.rules);
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;

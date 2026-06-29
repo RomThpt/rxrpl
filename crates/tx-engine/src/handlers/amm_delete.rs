@@ -42,6 +42,7 @@ impl Transactor for AMMDeleteTransactor {
     }
 
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
+        let _scale = amm_helpers::amm_number_scale_guard(ctx.rules);
         let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
         let amm = amm_helpers::read_amm(ctx.view, &amm_key)?;
         let amm_account_str = amm["Account"]
