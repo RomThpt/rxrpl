@@ -1118,6 +1118,27 @@ pub(crate) fn cross_path_payment(
         }
     }
     let final_demand = Leg::parse(target_out).ok_or(TransactionResult::TemBadAmount)?;
+
+    // rippled `StrandFlow` output-limited case: for a pure-AMM multi-hop strand
+    // whose required input fits the budget, reverse-price from the demanded
+    // output back to the source input and apply the exact (reverse-rounded)
+    // per-hop amounts, delivering the full `target_out`. The forward-only flow
+    // below cannot: it pushes the whole budget through hop 0 (unbounded interior
+    // demand), over-produces the intermediate asset, and fails the interior
+    // consume invariant. Returns `Ok(None)` (no mutation) for input-limited or
+    // CLOB-bearing strands, which fall through to the forward flow.
+    if let Some(res) = reverse_amm_strand(
+        ctx,
+        taker,
+        taker_acct,
+        dest,
+        boundaries,
+        &final_demand,
+        &carry,
+    )? {
+        return Ok(res);
+    }
+
     let mut delivered = final_demand.clone();
     let mut source_spent = carry.clone();
     for hop in 0..(n - 1) {
@@ -1443,6 +1464,283 @@ fn amm_hop(
     Ok(Some((
         number_to_leg(&deliver_num, demand_out),
         number_to_leg(&spent_num, budget_in),
+    )))
+}
+
+/// Per-hop AMM pool snapshot for the reverse-then-forward strand flow.
+struct AmmHop {
+    pool_id: AccountId,
+    in_xrp: bool,
+    out_xrp: bool,
+    in_cur: [u8; 20],
+    in_iss: AccountId,
+    out_cur: [u8; 20],
+    out_iss: AccountId,
+    tfee: u16,
+    pool_in: rxrpl_amount::number::Number,
+    pool_out: rxrpl_amount::number::Number,
+}
+
+/// Whether the order book identified by `inverse_book` holds at least one
+/// resting offer directory page — i.e. the hop carries CLOB liquidity and is not
+/// a pure-AMM hop. (succ from quality 0 returns the best-price page; a key that
+/// shares the 24-byte book prefix means a page exists.)
+fn book_has_resting_offer(ctx: &ApplyContext<'_>, inverse_book: &Hash256) -> bool {
+    let probe = book_dir_with_quality(inverse_book, 0);
+    match ctx.view.succ(&probe) {
+        Some(dir_key) => dir_key.as_bytes()[0..24] == inverse_book.as_bytes()[0..24],
+        None => false,
+    }
+}
+
+/// Move a single AMM hop's exact reverse-computed `(in, out)`: the input flows
+/// from the source (or, for an interior hop with `skip_input_debit`, simply
+/// lands in this pool — the previous pool already shed the shared intermediate
+/// asset) into the pool; the output flows from the pool to `dest` (or, for an
+/// interior hop with `skip_output_credit`, stays as the next pool's input).
+/// Mirrors the application half of [`amm_hop`] with caller-supplied amounts.
+#[allow(clippy::too_many_arguments)]
+fn apply_amm_move(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    hop: &AmmHop,
+    in_num: &rxrpl_amount::number::Number,
+    out_num: &rxrpl_amount::number::Number,
+    skip_input_debit: bool,
+    skip_output_credit: bool,
+) -> Result<(), TransactionResult> {
+    // Input: source / previous-pool -> this pool.
+    if hop.in_xrp {
+        let drops = in_num.to_xrp_drops() as i64;
+        if !skip_input_debit {
+            let bal = helpers::get_balance(taker_acct) as i64 - drops;
+            if bal < 0 {
+                return Err(TransactionResult::TecUnfundedPayment);
+            }
+            helpers::set_balance(taker_acct, bal as u64);
+        }
+        credit_xrp(ctx, &hop.pool_id, drops)?;
+    } else {
+        if !skip_input_debit {
+            let funds =
+                crate::amm_helpers::iou_holding_number(ctx.view, taker, &hop.in_iss, &hop.in_cur);
+            crate::amm_helpers::set_iou_holding(
+                ctx.view,
+                taker,
+                &hop.in_iss,
+                &hop.in_cur,
+                &funds.sub(in_num),
+            )?;
+        }
+        let pool_h = crate::amm_helpers::iou_holding_number(
+            ctx.view,
+            &hop.pool_id,
+            &hop.in_iss,
+            &hop.in_cur,
+        );
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            &hop.pool_id,
+            &hop.in_iss,
+            &hop.in_cur,
+            &pool_h.add(in_num),
+        )?;
+    }
+    // Output: this pool -> dest / next pool.
+    if hop.out_xrp {
+        let drops = out_num.to_xrp_drops() as i64;
+        credit_xrp(ctx, &hop.pool_id, -drops)?;
+        if !skip_output_credit {
+            if dest == taker {
+                helpers::set_balance(taker_acct, helpers::get_balance(taker_acct) + drops as u64);
+            } else {
+                credit_xrp(ctx, dest, drops)?;
+            }
+        }
+    } else {
+        let pool_h = crate::amm_helpers::iou_holding_number(
+            ctx.view,
+            &hop.pool_id,
+            &hop.out_iss,
+            &hop.out_cur,
+        );
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            &hop.pool_id,
+            &hop.out_iss,
+            &hop.out_cur,
+            &pool_h.sub(out_num),
+        )?;
+        if !skip_output_credit {
+            let dest_h =
+                crate::amm_helpers::iou_holding_number(ctx.view, dest, &hop.out_iss, &hop.out_cur);
+            crate::amm_helpers::set_iou_holding(
+                ctx.view,
+                dest,
+                &hop.out_iss,
+                &hop.out_cur,
+                &dest_h.add(out_num),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// rippled `StrandFlow` output-limited case for a pure-AMM strand: reverse-price
+/// the chain from the demanded output back to the required source input
+/// (`swapAssetOut`, round IN up — rippled `DirectStep`/`BookStep` reverse pass),
+/// and — when that input fits `budget` — apply the exact per-hop amounts so the
+/// full `target_out` is delivered (`tesSUCCESS`). The intermediate amounts thread
+/// exactly (each hop's input equals the previous hop's output), reproducing
+/// rippled's reverse-rounded intermediates rather than the forward flow's
+/// (which round the other way and would over-produce, then strand `TecPathPartial`).
+///
+/// Returns `Ok(Some((delivered, spent)))` after mutating the ledger, or
+/// `Ok(None)` (no mutation) when any hop is not pure-AMM (a resting CLOB offer is
+/// present or no AMM pool exists), the pool cannot meet the demand, or the
+/// required input exceeds `budget` (input-limited). The caller's forward-only
+/// flow then handles those cases.
+fn reverse_amm_strand(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    boundaries: &[Value],
+    target_out: &Leg,
+    budget: &Leg,
+) -> Result<Option<(Value, Value)>, TransactionResult> {
+    use rxrpl_amount::number::Number;
+    let n = boundaries.len();
+    // Only multi-hop strands need the reverse pass: a single AMM hop already
+    // delivers byte-exactly through the forward `amm_hop` (output-limited per
+    // hop). Leave single-hop and degenerate chains to the forward flow.
+    if n < 3 {
+        return Ok(None);
+    }
+
+    // Gather a pure-AMM snapshot of every hop; bail to the forward flow on the
+    // first hop carrying a resting CLOB offer or lacking an AMM pool.
+    let mut hops: Vec<AmmHop> = Vec::with_capacity(n - 1);
+    for h in 0..(n - 1) {
+        let in_leg = Leg::parse(&boundaries[h]).ok_or(TransactionResult::TemBadAmount)?;
+        let out_leg = Leg::parse(&boundaries[h + 1]).ok_or(TransactionResult::TemBadAmount)?;
+        let inverse_book = keylet::book_dir(
+            &in_leg.currency,
+            &in_leg.issuer,
+            &out_leg.currency,
+            &out_leg.issuer,
+        );
+        if book_has_resting_offer(ctx, &inverse_book) {
+            return Ok(None);
+        }
+        let amm_key = keylet::amm(
+            &in_leg.currency,
+            &in_leg.issuer,
+            &out_leg.currency,
+            &out_leg.issuer,
+        );
+        let Some(amm_bytes) = ctx.view.read(&amm_key) else {
+            return Ok(None);
+        };
+        let Ok(amm): Result<Value, _> = serde_json::from_slice(&amm_bytes) else {
+            return Ok(None);
+        };
+        let Some(pool_str) = amm.get("Account").and_then(|v| v.as_str()) else {
+            return Ok(None);
+        };
+        let Ok(pool_id) = decode_account_id(pool_str) else {
+            return Ok(None);
+        };
+        let tfee = amm.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+        let pool_in = pool_balance_number(
+            ctx,
+            &pool_id,
+            in_leg.is_xrp,
+            &in_leg.currency,
+            &in_leg.issuer,
+        );
+        let pool_out = pool_balance_number(
+            ctx,
+            &pool_id,
+            out_leg.is_xrp,
+            &out_leg.currency,
+            &out_leg.issuer,
+        );
+        if pool_in.is_zero() || pool_out.is_zero() {
+            return Ok(None);
+        }
+        hops.push(AmmHop {
+            pool_id,
+            in_xrp: in_leg.is_xrp,
+            out_xrp: out_leg.is_xrp,
+            in_cur: in_leg.currency,
+            in_iss: in_leg.issuer,
+            out_cur: out_leg.currency,
+            out_iss: out_leg.issuer,
+            tfee,
+            pool_in,
+            pool_out,
+        });
+    }
+
+    // Reverse pass: thread the demanded output back to the source input. Each
+    // hop's required input becomes the previous hop's demanded output.
+    let mut ins: Vec<Number> = vec![Number::ZERO; n - 1];
+    let mut outs: Vec<Number> = vec![Number::ZERO; n - 1];
+    let mut out_num = leg_to_number(target_out);
+    for h in (0..(n - 1)).rev() {
+        let hop = &hops[h];
+        let in_num = match crate::amm_helpers::swap_asset_out(
+            &hop.pool_in,
+            &hop.pool_out,
+            &out_num,
+            hop.tfee,
+            hop.in_xrp,
+        ) {
+            Some(v) if !v.is_zero() && !v.negative() => v,
+            // Pool can't deliver the demand -> not output-limited; the forward
+            // flow handles the (partial) input-limited case.
+            _ => return Ok(None),
+        };
+        outs[h] = out_num;
+        ins[h] = in_num;
+        out_num = in_num;
+    }
+
+    // Output binds only when the required source input fits the budget; a larger
+    // requirement means the strand is input-limited (forward flow handles it).
+    // Compare at the Leg grid (drops / IOU mantissa) rather than via `Number`
+    // subtraction, which panics on an exact-zero difference (in == budget).
+    let in0_leg = number_to_leg(&ins[0], budget);
+    if !leg_ge(budget, &in0_leg) {
+        return Ok(None);
+    }
+
+    // Apply each hop with its exact reverse-computed (in, out): the first hop
+    // debits the source, the last credits `dest`, interior hops move the shared
+    // intermediate asset between adjacent pools.
+    for h in 0..(n - 1) {
+        let hop = &hops[h];
+        apply_amm_move(
+            ctx,
+            taker,
+            taker_acct,
+            dest,
+            hop,
+            &ins[h],
+            &outs[h],
+            /*skip_input_debit=*/ h != 0,
+            /*skip_output_credit=*/ h != n - 2,
+        )?;
+    }
+
+    let spent_leg = number_to_leg(&ins[0], budget);
+    let delivered_leg = number_to_leg(&outs[n - 2], target_out);
+    Ok(Some((
+        delivered_leg.with_amount(&delivered_leg.iou, delivered_leg.drops),
+        spent_leg.with_amount(&spent_leg.iou, spent_leg.drops),
     )))
 }
 
