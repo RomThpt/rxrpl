@@ -72,7 +72,9 @@ impl Transactor for LoanBrokerSetTransactor {
             .ok_or(TransactionResult::TerNoAccount)?;
         let mut account: serde_json::Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        let seq = helpers::get_sequence(&account);
+        // The loan-broker keylet/Sequence is the TX seq-proxy value (the engine
+        // already consumed the sender's Sequence/Ticket centrally).
+        let seq = helpers::tx_seq_proxy_value(ctx.tx);
 
         // Read the vault to learn its pseudo-account and asset.
         let vault_key = vault_id(ctx.tx)?;
@@ -168,7 +170,6 @@ impl Transactor for LoanBrokerSetTransactor {
         }
 
         // 4. Owner: +2 owner count (broker + pseudo) and sequence bump.
-        helpers::increment_sequence(&mut account);
         helpers::adjust_owner_count(&mut account, 2);
         ctx.view
             .update(

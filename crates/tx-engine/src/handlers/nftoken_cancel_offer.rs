@@ -137,9 +137,8 @@ impl Transactor for NFTokenCancelOfferTransactor {
             .view
             .read(&caller_key)
             .ok_or(TransactionResult::TerNoAccount)?;
-        let mut caller: Value =
+        let caller: Value =
             serde_json::from_slice(&caller_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        helpers::increment_sequence(&mut caller);
         let caller_data =
             serde_json::to_vec(&caller).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view

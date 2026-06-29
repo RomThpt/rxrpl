@@ -273,7 +273,6 @@ impl Transactor for AMMWithdrawTransactor {
         };
         let balance = helpers::get_balance(&account);
         helpers::set_balance(&mut account, balance.saturating_add(xrp_payout));
-        helpers::increment_sequence(&mut account);
 
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
@@ -358,7 +357,6 @@ impl AMMWithdrawTransactor {
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
         let bal = helpers::get_balance(&account);
         helpers::set_balance(&mut account, bal + amount_out);
-        helpers::increment_sequence(&mut account);
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
@@ -478,7 +476,6 @@ impl AMMWithdrawTransactor {
         let bal = helpers::get_balance(&account);
         helpers::set_balance(&mut account, bal + amount_out);
         helpers::adjust_owner_count(&mut account, -1);
-        helpers::increment_sequence(&mut account);
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
@@ -741,7 +738,6 @@ impl AMMWithdrawTransactor {
         if drained {
             helpers::adjust_owner_count(&mut account, -1);
         }
-        helpers::increment_sequence(&mut account);
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)

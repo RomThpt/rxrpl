@@ -105,7 +105,6 @@ impl Transactor for XChainCreateClaimIdTransactor {
             serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
         helpers::adjust_owner_count(&mut src_account, 1);
-        helpers::increment_sequence(&mut src_account);
 
         let src_data =
             serde_json::to_vec(&src_account).map_err(|_| TransactionResult::TefInternal)?;

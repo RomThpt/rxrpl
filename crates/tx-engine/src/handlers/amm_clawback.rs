@@ -171,7 +171,8 @@ impl AMMClawbackTransactor {
             crate::handlers::amm_delete::delete_amm_account(ctx, &amm_key, &amm, &ctx_amm.account)?;
         }
 
-        bump_sequence(ctx, &issuer)?;
+        // The issuer's Sequence/Ticket and fee are consumed centrally by the
+        // engine before doApply.
         Ok(TransactionResult::TesSuccess)
     }
 
@@ -459,21 +460,6 @@ fn credit_holder(
     if lp_line_deleted {
         helpers::adjust_owner_count(&mut acct, -1);
     }
-    let data = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
-    ctx.view
-        .update(key, data)
-        .map_err(|_| TransactionResult::TefInternal)
-}
-
-fn bump_sequence(
-    ctx: &mut ApplyContext<'_>,
-    account: &rxrpl_primitives::AccountId,
-) -> Result<(), TransactionResult> {
-    let key = keylet::account(account);
-    let bytes = ctx.view.read(&key).ok_or(TransactionResult::TerNoAccount)?;
-    let mut acct: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
-    helpers::increment_sequence(&mut acct);
     let data = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view
         .update(key, data)

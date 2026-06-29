@@ -91,6 +91,20 @@ pub fn increment_sequence(account_obj: &mut Value) {
     account_obj["Sequence"] = Value::from(seq + 1);
 }
 
+/// The transaction's sequence-proxy value used to key owned objects it creates
+/// (rippled `tx.getSeqProxy().value()`): the `TicketSequence` when the
+/// transaction spends a ticket (its own `Sequence` is then 0), otherwise the
+/// transaction's `Sequence`. The engine now consumes the sender's
+/// Sequence/Ticket centrally *before* doApply, so handlers must derive object
+/// keylets from this TX value rather than the (already-incremented) account
+/// Sequence.
+pub fn tx_seq_proxy_value(tx: &Value) -> u32 {
+    match tx.get("TicketSequence").and_then(|v| v.as_u64()) {
+        Some(ticket) => ticket as u32,
+        None => tx.get("Sequence").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+    }
+}
+
 /// Get the flags from a ledger object.
 pub fn get_flags(obj: &Value) -> u32 {
     obj["Flags"].as_u64().unwrap_or(0) as u32

@@ -40,10 +40,6 @@ impl Transactor for LoanDeleteTransactor {
     }
 
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
-        let account_str = helpers::get_account(ctx.tx)?;
-        let account_id =
-            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-
         let loan_key = loan_id(ctx.tx)?;
         let loan_bytes = ctx
             .view
@@ -108,34 +104,14 @@ impl Transactor for LoanDeleteTransactor {
         let mut borrower_acct: serde_json::Value =
             serde_json::from_slice(&bb).map_err(|_| TransactionResult::TefInternal)?;
         helpers::adjust_owner_count(&mut borrower_acct, -1);
-        // The borrower bumps its own sequence when it is the submitter.
-        if borrower_id == account_id {
-            helpers::increment_sequence(&mut borrower_acct);
-        }
+        // The submitter's Sequence/Ticket (and fee) are consumed centrally by the
+        // engine before doApply — whether the submitter is the borrower or not.
         ctx.view
             .update(
                 borrower_key,
                 serde_json::to_vec(&borrower_acct).map_err(|_| TransactionResult::TefInternal)?,
             )
             .map_err(|_| TransactionResult::TefInternal)?;
-
-        // Bump the submitter's sequence (if not already done as borrower).
-        if borrower_id != account_id {
-            let acct_key = keylet::account(&account_id);
-            let ab = ctx
-                .view
-                .read(&acct_key)
-                .ok_or(TransactionResult::TerNoAccount)?;
-            let mut account: serde_json::Value =
-                serde_json::from_slice(&ab).map_err(|_| TransactionResult::TefInternal)?;
-            helpers::increment_sequence(&mut account);
-            ctx.view
-                .update(
-                    acct_key,
-                    serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?,
-                )
-                .map_err(|_| TransactionResult::TefInternal)?;
-        }
 
         Ok(TransactionResult::TesSuccess)
     }

@@ -42,10 +42,6 @@ impl Transactor for AMMDeleteTransactor {
     }
 
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
-        let account_str = helpers::get_account(ctx.tx)?;
-        let submitter =
-            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-
         let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
         let amm = amm_helpers::read_amm(ctx.view, &amm_key)?;
         let amm_account_str = amm["Account"]
@@ -55,9 +51,9 @@ impl Transactor for AMMDeleteTransactor {
         let amm_account =
             decode_account_id(&amm_account_str).map_err(|_| TransactionResult::TecInternalError)?;
 
+        // The submitter's Sequence/Ticket and fee are consumed centrally by the
+        // engine before doApply.
         delete_amm_account(ctx, &amm_key, &amm, &amm_account)?;
-
-        bump_submitter_sequence(ctx, &submitter)?;
 
         Ok(TransactionResult::TesSuccess)
     }
@@ -207,21 +203,6 @@ fn adjust_owner_count(
     ctx.view
         .update(key, data)
         .map_err(|_| TransactionResult::TecInternalError)
-}
-
-fn bump_submitter_sequence(
-    ctx: &mut ApplyContext<'_>,
-    submitter: &AccountId,
-) -> Result<(), TransactionResult> {
-    let key = keylet::account(submitter);
-    let bytes = ctx.view.read(&key).ok_or(TransactionResult::TerNoAccount)?;
-    let mut acct: Value =
-        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
-    helpers::increment_sequence(&mut acct);
-    let data = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
-    ctx.view
-        .update(key, data)
-        .map_err(|_| TransactionResult::TefInternal)
 }
 
 fn parse_hash(hex_str: &str) -> Option<Hash256> {
@@ -409,6 +390,8 @@ mod tests {
         let rules = Rules::new();
         let tx = delete_tx();
 
+        // Engine consumes the sender's Sequence/Ticket centrally before doApply.
+        crate::handlers::central_consume_for_test(&mut sandbox, &tx);
         let mut ctx = ApplyContext {
             tx: &tx,
             view: &mut sandbox,

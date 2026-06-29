@@ -416,18 +416,9 @@ impl Transactor for TrustSetTransactor {
             }
             obj["Flags"] = serde_json::json!(flags_out);
 
-            // Bump the sender's sequence (rippled consumes the seq proxy for
-            // every TrustSet, including modifications of an existing line).
-            {
-                let sender_acct = if is_low {
-                    low_acct.as_mut()
-                } else {
-                    high_acct.as_mut()
-                };
-                if let Some(a) = sender_acct {
-                    crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, a, ctx.tx)?;
-                }
-            }
+            // The sender's Sequence/Ticket is consumed centrally by the engine
+            // (parent sandbox) before doApply; the sender's account (low or high)
+            // inherits that bump and is written back via the dirty path below.
             if is_low {
                 low_dirty = true;
             } else {
@@ -632,13 +623,13 @@ impl Transactor for TrustSetTransactor {
                 .map_err(|_| TransactionResult::TemMalformed)?;
 
             // The creator always takes the reserve on create: increment its
-            // OwnerCount and consume its sequence.
+            // OwnerCount. Its Sequence/Ticket is consumed centrally by the engine
+            // before doApply.
             let acct_key = keylet::account(&account_id);
             if let Some(acct_bytes) = ctx.view.read(&acct_key) {
                 let mut acct: Value = serde_json::from_slice(&acct_bytes)
                     .map_err(|_| TransactionResult::TemMalformed)?;
                 helpers::adjust_owner_count(&mut acct, 1);
-                crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, &mut acct, ctx.tx)?;
                 let new_bytes =
                     serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
                 ctx.view

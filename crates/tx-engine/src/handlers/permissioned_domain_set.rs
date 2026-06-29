@@ -38,8 +38,6 @@ impl Transactor for PermissionedDomainSetTransactor {
         let mut account: serde_json::Value =
             serde_json::from_slice(&account_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        helpers::increment_sequence(&mut account);
-
         // Try to find an existing domain using the DomainID field (sequence number)
         let domain_seq = helpers::get_u32_field(ctx.tx, "DomainID");
 
@@ -52,8 +50,10 @@ impl Transactor for PermissionedDomainSetTransactor {
                 (key, true)
             }
         } else {
-            // No DomainID: create new domain using account sequence
-            let seq = helpers::get_sequence(&account) - 1; // sequence was already incremented
+            // No DomainID: create a new domain keyed by the TX seq-proxy value
+            // (the engine already consumed the sender's Sequence/Ticket centrally,
+            // so the account Sequence must not be used here).
+            let seq = helpers::tx_seq_proxy_value(ctx.tx);
             let key = keylet::permissioned_domain(&account_id, seq);
             (key, true)
         };
@@ -68,7 +68,7 @@ impl Transactor for PermissionedDomainSetTransactor {
             let seq = if let Some(s) = domain_seq {
                 s
             } else {
-                helpers::get_sequence(&account) - 1
+                helpers::tx_seq_proxy_value(ctx.tx)
             };
 
             let entry = serde_json::json!({
@@ -223,6 +223,8 @@ mod tests {
             "Sequence": 5,
         });
 
+        // Engine consumes the sender's Sequence/Ticket centrally before doApply.
+        crate::handlers::central_consume_for_test(&mut sandbox, &tx);
         let mut ctx = ApplyContext {
             tx: &tx,
             view: &mut sandbox,
@@ -233,8 +235,8 @@ mod tests {
         let result = PermissionedDomainSetTransactor.apply(&mut ctx).unwrap();
         assert_eq!(result, TransactionResult::TesSuccess);
 
-        // Domain created with sequence 5 (account seq before increment was 5,
-        // after increment is 6, domain seq = 6 - 1 = 5)
+        // Domain created keyed by the TX seq-proxy value (Sequence 5); the
+        // central consume then advances the account Sequence to 6.
         let id = decode_account_id(ALICE).unwrap();
         let domain_key = keylet::permissioned_domain(&id, 5);
         assert!(sandbox.exists(&domain_key));

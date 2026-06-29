@@ -48,8 +48,6 @@ impl Transactor for PermissionedDomainDeleteTransactor {
         let mut account: serde_json::Value =
             serde_json::from_slice(&account_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        helpers::increment_sequence(&mut account);
-
         let domain_key = parse_domain_id(ctx.tx)?;
         crate::owner_dir::remove_from_owner_dir_keep_root(ctx.view, &account_id, &domain_key)?;
         ctx.view
@@ -210,6 +208,8 @@ mod tests {
             "Sequence": 5,
         });
 
+        // Engine consumes the sender's Sequence/Ticket centrally before doApply.
+        crate::handlers::central_consume_for_test(&mut sandbox, &tx);
         let mut ctx = ApplyContext {
             tx: &tx,
             view: &mut sandbox,

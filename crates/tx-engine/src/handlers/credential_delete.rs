@@ -58,8 +58,6 @@ impl Transactor for CredentialDeleteTransactor {
         let mut account: serde_json::Value =
             serde_json::from_slice(&account_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        helpers::increment_sequence(&mut account);
-
         let subject_str = helpers::get_str_field(ctx.tx, "Subject").unwrap_or(account_str);
         let issuer_str = helpers::get_str_field(ctx.tx, "Issuer").unwrap_or(account_str);
         let credential_type = helpers::get_str_field(ctx.tx, "CredentialType").unwrap();

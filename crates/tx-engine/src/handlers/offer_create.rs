@@ -247,14 +247,12 @@ impl Transactor for OfferCreateTransactor {
         let mut acct: Value =
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
 
-        // The offer's Sequence (and its keylet) is rippled's `getSeqValue()`:
-        // the TicketSequence when the transaction spends a ticket, otherwise the
-        // account Sequence. Using the account Sequence for a ticketed offer would
-        // mis-key the created Offer SLE.
-        let sequence = match ctx.tx.get("TicketSequence").and_then(|v| v.as_u64()) {
-            Some(ticket) => ticket as u32,
-            None => helpers::get_sequence(&acct),
-        };
+        // The offer's Sequence (and its keylet) is rippled's `getSeqProxy()`
+        // value: the TicketSequence when the transaction spends a ticket,
+        // otherwise the transaction's Sequence. It must come from the TX, not the
+        // account Sequence — the engine already consumed the sender's
+        // Sequence/Ticket centrally, so the account Sequence is one ahead.
+        let sequence = helpers::tx_seq_proxy_value(ctx.tx);
 
         let (pays_currency, pays_issuer) = currency_and_issuer(&ctx.tx["TakerPays"]);
         let (gets_currency, gets_issuer) = currency_and_issuer(&ctx.tx["TakerGets"]);
@@ -266,9 +264,9 @@ impl Transactor for OfferCreateTransactor {
         let (taker_pays, taker_gets) =
             tick_round_amounts(ctx, &ctx.tx["TakerPays"], &ctx.tx["TakerGets"], is_sell);
 
-        // Consume the sequence up front: rippled charges it (and the fee) even
-        // when the transaction ends in a tec claim below.
-        crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, &mut acct, ctx.tx)?;
+        // The sender's Sequence/Ticket and fee are consumed centrally by the
+        // engine (parent sandbox) before doApply, so they are charged even when
+        // this transaction ends in a tec claim below.
 
         // Unfunded check (rippled preclaim): an offer must be at least partially
         // funded in the asset it sells (TakerGets), else tecUNFUNDED_OFFER — fee

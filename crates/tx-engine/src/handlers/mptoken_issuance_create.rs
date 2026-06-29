@@ -43,7 +43,9 @@ impl Transactor for MPTokenIssuanceCreateTransactor {
         let mut acct: serde_json::Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        let acct_seq = helpers::get_sequence(&acct);
+        // The issuance keylet/Sequence is the TX seq-proxy value (the engine
+        // already consumed the sender's Sequence/Ticket centrally).
+        let acct_seq = helpers::tx_seq_proxy_value(ctx.tx);
 
         // Build issuance entry
         let tx_flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
@@ -77,7 +79,6 @@ impl Transactor for MPTokenIssuanceCreateTransactor {
         crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &issuance_key)?;
 
         // Update account
-        helpers::increment_sequence(&mut acct);
         helpers::adjust_owner_count(&mut acct, 1);
 
         let acct_data = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
@@ -134,6 +135,8 @@ mod tests {
             "Sequence": 1,
         });
 
+        // Engine consumes the sender's Sequence/Ticket centrally before doApply.
+        crate::handlers::central_consume_for_test(&mut sandbox, &tx);
         let mut ctx = ApplyContext {
             tx: &tx,
             view: &mut sandbox,

@@ -187,9 +187,8 @@ impl Transactor for AMMVoteTransactor {
             .view
             .read(&acct_key)
             .ok_or(TransactionResult::TerNoAccount)?;
-        let mut account: Value =
+        let account: Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        helpers::increment_sequence(&mut account);
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
@@ -577,6 +576,8 @@ mod tests {
             "Sequence": 1,
         });
 
+        // Engine consumes the sender's Sequence/Ticket centrally before doApply.
+        crate::handlers::central_consume_for_test(&mut sandbox, &tx);
         let mut ctx = ApplyContext {
             tx: &tx,
             view: &mut sandbox,

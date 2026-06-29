@@ -113,7 +113,6 @@ impl Transactor for NFTokenMintTransactor {
             .ok_or(TransactionResult::TerNoAccount)?;
         let mut minter_acct: Value =
             serde_json::from_slice(&minter_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        crate::owner_dir::consume_seq_or_ticket(ctx.view, &minter_id, &mut minter_acct, ctx.tx)?;
         if new_page {
             helpers::adjust_owner_count(&mut minter_acct, 1);
         }
@@ -173,6 +172,8 @@ mod tests {
             "Sequence": 1,
         });
 
+        // Engine consumes the sender's Sequence/Ticket centrally before doApply.
+        crate::handlers::central_consume_for_test(&mut sandbox, &tx);
         let mut ctx = ApplyContext {
             tx: &tx,
             view: &mut sandbox,

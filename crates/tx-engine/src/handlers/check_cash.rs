@@ -4,7 +4,7 @@ use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::amount_helpers::{compute_holder_balance, compute_new_iou_balance};
 use crate::helpers;
-use crate::owner_dir::{consume_seq_or_ticket, remove_from_owner_dir_page};
+use crate::owner_dir::remove_from_owner_dir_page;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct CheckCashTransactor;
@@ -147,7 +147,6 @@ impl Transactor for CheckCashTransactor {
                 .map_err(|_| TransactionResult::TefInternal)?;
             let dst_balance = helpers::get_balance(&account);
             helpers::set_balance(&mut account, dst_balance + cash_amount);
-            consume_seq_or_ticket(ctx.view, &account_id, &mut account, ctx.tx)?;
             let account_data =
                 serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
@@ -287,9 +286,8 @@ impl Transactor for CheckCashTransactor {
                 .view
                 .read(&account_key)
                 .ok_or(TransactionResult::TerNoAccount)?;
-            let mut dst_acct: serde_json::Value = serde_json::from_slice(&dst_acct_bytes)
+            let dst_acct: serde_json::Value = serde_json::from_slice(&dst_acct_bytes)
                 .map_err(|_| TransactionResult::TefInternal)?;
-            consume_seq_or_ticket(ctx.view, &account_id, &mut dst_acct, ctx.tx)?;
             let dst_acct_data =
                 serde_json::to_vec(&dst_acct).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view

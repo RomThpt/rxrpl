@@ -210,6 +210,8 @@ fn apply_transfer_to_existing_account() {
     let tx = make_payment_tx(SRC_ADDRESS, DST_ADDRESS, "1000000", "10");
     let rules = Rules::new();
 
+    // Engine consumes the sender's Sequence/Ticket centrally before doApply.
+    crate::handlers::central_consume_for_test(&mut sandbox, &tx);
     let mut ctx = ApplyContext {
         tx: &tx,
         view: &mut sandbox,
@@ -274,6 +276,8 @@ fn apply_xrp_payment_with_ticket_consumes_ticket_not_sequence() {
     tx["TicketSequence"] = serde_json::json!(ticket_seq);
     let rules = Rules::new();
 
+    // Engine consumes the sender's Sequence/Ticket centrally before doApply.
+    crate::handlers::central_consume_for_test(&mut sandbox, &tx);
     let mut ctx = ApplyContext {
         tx: &tx,
         view: &mut sandbox,

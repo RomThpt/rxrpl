@@ -92,7 +92,6 @@ impl Transactor for EscrowCreateTransactor {
                 .checked_sub(amount)
                 .ok_or(TransactionResult::TecUnfundedPayment)?,
         );
-        helpers::increment_sequence(&mut src_account);
         helpers::adjust_owner_count(&mut src_account, 1);
 
         let src_data =
@@ -101,8 +100,10 @@ impl Transactor for EscrowCreateTransactor {
             .update(src_key, src_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Create Escrow ledger entry
-        let tx_seq = helpers::get_sequence(&src_account) - 1; // sequence was already incremented
+        // Create Escrow ledger entry. The Escrow's keylet/Sequence is the TX
+        // seq-proxy value (the engine already consumed the sender's
+        // Sequence/Ticket centrally).
+        let tx_seq = helpers::tx_seq_proxy_value(ctx.tx);
         let escrow_key = keylet::escrow(&src_id, tx_seq);
 
         let mut escrow = serde_json::json!({

@@ -140,7 +140,6 @@ impl Transactor for AMMDepositTransactor {
             .saturating_add(xrp_drops_from_amount_opt(amount2_field));
         let balance = helpers::get_balance(&account);
         helpers::set_balance(&mut account, balance.saturating_sub(xrp_deducted));
-        helpers::increment_sequence(&mut account);
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
@@ -221,7 +220,6 @@ impl AMMDepositTransactor {
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
         let bal = helpers::get_balance(&account);
         helpers::set_balance(&mut account, bal.saturating_sub(deposit));
-        helpers::increment_sequence(&mut account);
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
@@ -344,9 +342,8 @@ impl AMMDepositTransactor {
             .view
             .read(&acct_key)
             .ok_or(TransactionResult::TerNoAccount)?;
-        let mut account: serde_json::Value =
+        let account: serde_json::Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        helpers::increment_sequence(&mut account);
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
@@ -461,7 +458,6 @@ impl AMMDepositTransactor {
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
         let bal = helpers::get_balance(&account);
         helpers::set_balance(&mut account, bal.saturating_sub(xrp_deposit));
-        helpers::increment_sequence(&mut account);
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)

@@ -77,8 +77,6 @@ impl Transactor for DepositPreauthTransactor {
         let mut account: serde_json::Value =
             serde_json::from_slice(&account_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        helpers::increment_sequence(&mut account);
-
         if let Some(authorize) = helpers::get_str_field(ctx.tx, "Authorize") {
             let auth_id =
                 decode_account_id(authorize).map_err(|_| TransactionResult::TemInvalidAccountId)?;

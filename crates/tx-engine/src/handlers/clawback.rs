@@ -140,37 +140,8 @@ impl Transactor for ClawbackTransactor {
             .update(tl_key, tl_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Advance the issuer's sequence proxy: consume the Ticket SLE when the
-        // tx uses a TicketSequence, otherwise increment the AccountRoot
-        // Sequence. Mirrors rippled's Transactor::consumeSeqProxy.
-        let issuer_acct_key = keylet::account(&issuer_id);
-        let issuer_bytes = ctx
-            .view
-            .read(&issuer_acct_key)
-            .ok_or(TransactionResult::TerNoAccount)?;
-        let mut issuer_acct: Value =
-            serde_json::from_slice(&issuer_bytes).map_err(|_| TransactionResult::TefInternal)?;
-
-        if let Some(ticket_seq) = helpers::get_u32_field(ctx.tx, "TicketSequence") {
-            let ticket_key = keylet::ticket(&issuer_id, ticket_seq);
-            if !ctx.view.exists(&ticket_key) {
-                return Err(TransactionResult::TefInternal);
-            }
-            crate::owner_dir::remove_from_owner_dir(ctx.view, &issuer_id, &ticket_key)
-                .map_err(|_| TransactionResult::TefInternal)?;
-            ctx.view
-                .erase(&ticket_key)
-                .map_err(|_| TransactionResult::TefInternal)?;
-            helpers::adjust_owner_count(&mut issuer_acct, -1);
-        } else {
-            helpers::increment_sequence(&mut issuer_acct);
-        }
-
-        let issuer_data =
-            serde_json::to_vec(&issuer_acct).map_err(|_| TransactionResult::TefInternal)?;
-        ctx.view
-            .update(issuer_acct_key, issuer_data)
-            .map_err(|_| TransactionResult::TefInternal)?;
+        // The issuer's Sequence/Ticket (and fee) are consumed centrally by the
+        // engine (parent sandbox) before doApply.
 
         Ok(TransactionResult::TesSuccess)
     }
@@ -340,6 +311,8 @@ mod tests {
             "TicketSequence": ticket_seq,
         });
 
+        // Engine consumes the sender's Sequence/Ticket centrally before doApply.
+        crate::handlers::central_consume_for_test(&mut sandbox, &tx);
         let mut ctx = ApplyContext {
             tx: &tx,
             view: &mut sandbox,
