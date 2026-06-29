@@ -207,8 +207,37 @@ impl IOUAmount {
         IOUAmount::from_parts(result as u64, result_exponent, result_negative)
     }
 
-    /// Divide two IOU amounts.
+    /// Divide two IOU amounts with the **pre-`fixUniversalNumber`**
+    /// canonicalisation: the `muldiv + 5` quotient is reduced to the canonical
+    /// 16-digit mantissa by *truncation* (the divide-by-10 loop `from_parts`
+    /// runs). This is the rounding mainnet used for order-book quality before
+    /// the `Number`-switchover amendment, so e.g. ledger #316000's GBP/BTC offer
+    /// lands on a `…200D` book directory rather than `…200E`.
     pub fn divide(num: &IOUAmount, den: &IOUAmount) -> Result<IOUAmount, AmountError> {
+        Self::divide_canonical(num, den, false)
+    }
+
+    /// Divide two IOU amounts with the **post-`fixUniversalNumber`**
+    /// canonicalisation: the same `muldiv + 5` quotient is reduced to 16 digits
+    /// with round-half-to-**even**, exactly as rippled's `Number` does once the
+    /// switchover amendment routes the `STAmount` constructor through `Number`.
+    ///
+    /// Both rules start from the identical `floor(num·10¹⁷/den) + 5`; they differ
+    /// only in how the 17–18 digit pre-canonical mantissa is reduced to 16. A
+    /// single fixed rule cannot reproduce both eras — the modern XRP/USD offer
+    /// `04F5F33…` needs the half-even reduction to reach a `…7EA4` book
+    /// directory (truncation lands one ULP low at `…7EA3`), while #316000 needs
+    /// truncation. The choice is therefore amendment-gated by the caller, exactly
+    /// as rippled gates it on `getSTNumberSwitchover()`.
+    pub fn divide_round_even(num: &IOUAmount, den: &IOUAmount) -> Result<IOUAmount, AmountError> {
+        Self::divide_canonical(num, den, true)
+    }
+
+    fn divide_canonical(
+        num: &IOUAmount,
+        den: &IOUAmount,
+        round_even: bool,
+    ) -> Result<IOUAmount, AmountError> {
         if den.is_zero() {
             return Err(AmountError::DivisionByZero);
         }
@@ -231,22 +260,32 @@ impl IOUAmount {
             e2 -= 1;
         }
 
-        // 128-bit intermediate: (m1 * 10^17) / m2 + 5
+        // rippled STAmount::divide: `muldiv(numVal, 10^17, denVal) + 5` — a floor
+        // division plus a constant `+ 5` bias — then the STAmount constructor
+        // canonicalizes the 17–18 digit product down to a 16-digit mantissa.
         let scaled = (m1 as u128) * TEN_TO_17;
         let result = scaled / (m2 as u128) + 5;
 
         let result_negative = num.negative != den.negative;
         let result_exponent = e1 - e2 - 17;
 
-        // rippled reduces the quotient to canonical precision through `Number`,
-        // which rounds half-to-even — not the truncation `from_parts` uses. The
-        // `+ 5` bias above mirrors rippled's `divide`; pairing it with the same
-        // rounding makes the last digit byte-exact (e.g. issuer TickSize offers).
-        Self::from_parts_round_half_even(result, result_exponent, result_negative)
+        if round_even {
+            // Post-switchover: the ctor goes through `Number`, which reduces with
+            // round-half-to-even.
+            Self::from_parts_round_half_even(result, result_exponent, result_negative)
+        } else {
+            // Pre-switchover: the ctor truncates (the `from_parts` divide loop).
+            if result > u64::MAX as u128 {
+                return Err(AmountError::Overflow);
+            }
+            IOUAmount::from_parts(result as u64, result_exponent, result_negative)
+        }
     }
 
     /// Build an IOU from a possibly over-precise mantissa, reducing to canonical
-    /// 16-digit precision with round-half-to-even (rippled `Number` semantics).
+    /// 16-digit precision with round-half-to-even (rippled `Number` semantics:
+    /// the discarded low digits are weighed against half, ties go to the even
+    /// last digit). Used by the post-`fixUniversalNumber` divide path.
     fn from_parts_round_half_even(
         mut mantissa: u128,
         mut exponent: i32,
@@ -256,13 +295,13 @@ impl IOUAmount {
             return Ok(IOUAmount::ZERO);
         }
         let max = MAX_MANTISSA as u128;
-        let mut drop = 0u32;
-        let mut probe = mantissa;
-        while probe > max {
-            probe /= 10;
-            drop += 1;
-        }
-        if drop > 0 {
+        if mantissa > max {
+            let mut drop = 0u32;
+            let mut probe = mantissa;
+            while probe > max {
+                probe /= 10;
+                drop += 1;
+            }
             let div = 10u128.pow(drop);
             let q = mantissa / div;
             let r = mantissa % div;
@@ -948,11 +987,41 @@ mod tests {
         let one = IOUAmount::new(1_000_000_000_000_000, -15).unwrap();
         let three = IOUAmount::new(3_000_000_000_000_000, -15).unwrap();
         let result = IOUAmount::divide(&one, &three).unwrap();
-        // 0.3333... reduces to 16 digits with round-half-to-even, matching
-        // rippled's Number: the floor quotient + 5 bias yields ...338, which
-        // rounds up to ...334.
-        assert_eq!(result.mantissa(), 3_333_333_333_333_334);
+        // 0.3333... reduces to 16 digits via rippled's directed rounding: the
+        // floor quotient + 5 bias yields ...338, which the *truncating*
+        // canonicalize drops to ...333 (round-half-up of the true 0.3333...3,
+        // whose 17th digit is below the half point).
+        assert_eq!(result.mantissa(), 3_333_333_333_333_333);
         assert_eq!(result.exponent(), -16);
+    }
+
+    #[test]
+    fn divide_truncates_pre_switchover_316000() {
+        // Ledger #316000 OfferCreate (pre-fixUniversalNumber): the book quality
+        // GBP 277.167203027 / BTC 9.982465241 must reduce by TRUNCATION to the
+        // mantissa rippled stored (rate byte tail …200D), not the half-even
+        // value (…200E).
+        let gbp = IOUAmount::from_parts(2_771_672_030_270_000, -13, false).unwrap();
+        let btc = IOUAmount::from_parts(9_982_465_241_000_000, -15, false).unwrap();
+        let q = IOUAmount::divide(&gbp, &btc).unwrap();
+        assert_eq!(q.mantissa(), 2_776_540_627_345_421);
+        assert_eq!(q.exponent(), -14);
+    }
+
+    #[test]
+    fn divide_round_even_post_switchover_modern() {
+        // Modern OfferCreate 04F5F33… (post-fixUniversalNumber): the book quality
+        // XRP 1000000000000 drops / USD 1025720 must reduce with round-half-to-
+        // even to the mantissa rippled stored (rate byte tail …7EA4); truncation
+        // would land one ULP low at …7EA3.
+        let xrp = IOUAmount::from_parts(1_000_000_000_000_000, -3, false).unwrap();
+        let usd = IOUAmount::from_parts(1_025_720_000_000_000, -9, false).unwrap();
+        let q = IOUAmount::divide_round_even(&xrp, &usd).unwrap();
+        assert_eq!(q.mantissa(), 9_749_249_307_803_300);
+        assert_eq!(q.exponent(), -10);
+        // The truncating divide lands one ULP low.
+        let qt = IOUAmount::divide(&xrp, &usd).unwrap();
+        assert_eq!(qt.mantissa(), 9_749_249_307_803_299);
     }
 
     #[test]

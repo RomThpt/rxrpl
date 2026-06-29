@@ -1,5 +1,5 @@
 use rxrpl_amendment::feature::feature_id;
-use rxrpl_amount::{IOUAmount, from_rate, offer_quality, round_quality};
+use rxrpl_amount::{IOUAmount, from_rate, offer_quality, offer_quality_round_even, round_quality};
 use rxrpl_codec::address::classic::{decode_account_id, encode_account_id};
 use rxrpl_primitives::{AccountId, Hash256};
 use rxrpl_protocol::TransactionResult;
@@ -57,9 +57,22 @@ fn amount_to_iou(amount: &Value) -> Option<IOUAmount> {
 
 /// The offer's quality (rate) = TakerPays / TakerGets, encoded as rippled's
 /// 64-bit rate. Returns 0 if either side cannot be parsed.
-fn offer_book_quality(taker_pays: &Value, taker_gets: &Value) -> u64 {
+///
+/// `number_switchover` selects rippled's `STAmount::divide` canonicalisation:
+/// once `fixUniversalNumber` is active the quotient is reduced round-half-to-
+/// even (`offer_quality_round_even`); before it, by truncation (`offer_quality`).
+/// The book directory of a modern offer (e.g. `04F5F33…` landing on `…7EA4`)
+/// only matches rippled under the even reduction.
+fn offer_book_quality(taker_pays: &Value, taker_gets: &Value, number_switchover: bool) -> u64 {
     match (amount_to_iou(taker_pays), amount_to_iou(taker_gets)) {
-        (Some(p), Some(g)) => offer_quality(&p, &g).unwrap_or(0),
+        (Some(p), Some(g)) => {
+            let q = if number_switchover {
+                offer_quality_round_even(&p, &g)
+            } else {
+                offer_quality(&p, &g)
+            };
+            q.unwrap_or(0)
+        }
         _ => 0,
     }
 }
@@ -124,7 +137,15 @@ fn tick_round_amounts(
     let (Some(p_iou), Some(g_iou)) = (amount_to_iou(taker_pays), amount_to_iou(taker_gets)) else {
         return (taker_pays.clone(), taker_gets.clone());
     };
-    let Ok(quality) = offer_quality(&p_iou, &g_iou) else {
+    // The tick grid snaps the offer's quality, so it must be computed with the
+    // same (amendment-gated) divide canonicalisation as the placed book rate.
+    let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+    let quality = if number_switchover {
+        offer_quality_round_even(&p_iou, &g_iou)
+    } else {
+        offer_quality(&p_iou, &g_iou)
+    };
+    let Ok(quality) = quality else {
         return (taker_pays.clone(), taker_gets.clone());
     };
     let Ok(rate) = from_rate(round_quality(quality, tick)) else {
@@ -369,7 +390,8 @@ impl Transactor for OfferCreateTransactor {
         // issuers) with its low 64 bits replaced by the offer's quality (rate),
         // so offers sort by price. rippled stores this as the offer's
         // BookDirectory and tags the directory with the rate + book assets.
-        let quality = offer_book_quality(&taker_pays, &taker_gets);
+        let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+        let quality = offer_book_quality(&taker_pays, &taker_gets, number_switchover);
         let book_base =
             keylet::book_dir(&pays_currency, &pays_issuer, &gets_currency, &gets_issuer);
         let book_dir_key = book_dir_with_quality(&book_base, quality);
@@ -389,8 +411,9 @@ impl Transactor for OfferCreateTransactor {
         let book_node = add_to_book_dir(ctx.view, &book_dir_key, &offer_key, &book_describe)?;
         let owner_node = add_to_owner_dir(ctx.view, &account_id, &offer_key)?;
 
-        // Build the Offer SLE. U64 page fields and Flags are omitted when zero,
-        // matching rippled's serialization.
+        // Build the Offer SLE. sfFlags, sfBookNode and sfOwnerNode are REQUIRED
+        // in rippled's Offer ledger format, so they always serialize (even at
+        // zero); only sfExpiration is optional.
         let mut offer = serde_json::Map::new();
         offer.insert("LedgerEntryType".into(), "Offer".into());
         offer.insert("Account".into(), account_str.into());
@@ -411,24 +434,19 @@ impl Transactor for OfferCreateTransactor {
         if let Some(exp) = ctx.tx.get("Expiration").and_then(|v| v.as_u64()) {
             offer.insert("Expiration".into(), Value::from(exp));
         }
-        // Flags, BookNode and OwnerNode are default-droppable: rippled omits
-        // them when zero (offer on the root page of each directory). Only the
-        // transaction's tfPassive/tfSell map onto the Offer SLE, and tfSell
-        // (0x80000) becomes lsfSell (0x20000) — they are not the same bit.
+        // sfFlags, sfBookNode and sfOwnerNode are REQUIRED fields on the Offer
+        // SLE — rippled writes all three unconditionally, so they serialize even
+        // when zero (a root-page offer carrying no flags). Only the
+        // transaction's tfPassive/tfSell map onto the SLE, and tfSell (0x80000)
+        // becomes lsfSell (0x20000) — they are not the same bit.
         let offer_flags = (if tx_flags & TF_PASSIVE != 0 {
             LSF_PASSIVE
         } else {
             0
         }) | (if tx_flags & TF_SELL != 0 { LSF_SELL } else { 0 });
-        if offer_flags != 0 {
-            offer.insert("Flags".into(), Value::from(offer_flags));
-        }
-        if book_node != 0 {
-            offer.insert("BookNode".into(), u64_hex(book_node).into());
-        }
-        if owner_node != 0 {
-            offer.insert("OwnerNode".into(), u64_hex(owner_node).into());
-        }
+        offer.insert("Flags".into(), Value::from(offer_flags));
+        offer.insert("BookNode".into(), u64_hex(book_node).into());
+        offer.insert("OwnerNode".into(), u64_hex(owner_node).into());
         let offer_bytes = serde_json::to_vec(&Value::Object(offer))
             .map_err(|_| TransactionResult::TemMalformed)?;
         ctx.view

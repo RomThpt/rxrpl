@@ -318,6 +318,7 @@ impl TxEngine {
         let view = LedgerView::with_fees(ledger, fees.clone());
         let mut sandbox = Sandbox::new(&view);
         sandbox.set_sorted_directories(rules.enabled(&feature_id("SortedDirectories")));
+        sandbox.set_thread_directories(rules.enabled(&feature_id("fixPreviousTxnID")));
 
         if !is_pseudo {
             let fee_drops = helpers::get_fee(tx);
