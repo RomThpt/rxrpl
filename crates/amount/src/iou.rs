@@ -622,8 +622,9 @@ impl IOUAmount {
         Self::add(a, &b.negate())
     }
 
-    /// Add with round-to-nearest (half-up) to the 16-digit mantissa, matching
-    /// rippled's `Number`/post-amendment STAmount addition. Unlike [`add`],
+    /// Add with round-to-nearest (half-to-even) to the 16-digit mantissa,
+    /// matching rippled's `Number`/post-amendment STAmount addition (modern
+    /// `operator+` routes IOU through `Number + Number`). Unlike [`add`],
     /// which aligns by truncating the smaller term (the pre-`Number` behavior),
     /// this adds at the lower exponent — losing no digit before the sum — then
     /// rounds. Used for IOU balance updates outside the legacy crossing path.
@@ -661,7 +662,12 @@ impl IOUAmount {
             let div = 10u128.pow(digits_over);
             let rem = mag % div;
             let mut rounded = mag / div;
-            if rem * 2 >= div {
+            // Round half-to-even, matching rippled's `Number` addition (modern
+            // STAmount `operator+` routes IOU through `Number + Number`, whose
+            // Guard ties to the even last digit). Half-up here left interior
+            // trust-line balances 1 ULP high on exact-half sums.
+            let half = div / 2;
+            if rem > half || (rem == half && (rounded & 1 == 1)) {
                 rounded += 1;
             }
             exp += digits_over as i32;

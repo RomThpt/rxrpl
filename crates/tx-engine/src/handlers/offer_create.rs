@@ -812,20 +812,22 @@ fn cross_offers(
 
 /// Output deliverable for a given input at a resting offer's price. This mirrors
 /// rippled's `Quality::ceilInStrict` (the input-limited path in `BookStep`):
-/// the offer quality is first *quantized* into a rate `q = offer_in / offer_out`
-/// (`getRate`'s 16-digit `divide`), then `out = in / q` rounded DOWN
-/// (`divRoundStrict`). Pricing from the bucketed rate rather than the
-/// full-precision `in * offer_out / offer_in` is what makes the consumed/owner
+/// `out = in / q` rounded DOWN (`divRoundStrict`), where `q` is the offer's
+/// book-directory quality rate (`rate = in/out`) — the fixed quality bucket the
+/// offer lives in, NOT the offer's drifted post-partial-fill `TakerPays/TakerGets`
+/// ratio. Pricing from the bucketed dir rate is what makes the consumed/owner
 /// amounts byte-exact (e.g. mainnet SOLO fills land on `…2747`, not `…2750`).
 /// Magnitudes are pure `IOUAmount` (drops count as integers) to avoid the
 /// native/IOU normalisation hazard of mixed-asset multiply.
-fn out_for_in(in_amt: &Leg, offer_in: &Leg, offer_out: &Leg) -> Leg {
+fn out_for_in(in_amt: &Leg, rate: &IOUAmount, offer_out: &Leg) -> Leg {
     let in_iou = leg_as_quality_iou(in_amt);
-    let offer_out_iou = leg_as_quality_iou(offer_out);
-    let offer_in_iou = leg_as_quality_iou(offer_in);
-    let qrate = IOUAmount::divide(&offer_in_iou, &offer_out_iou).unwrap_or(IOUAmount::ZERO);
+    // Price the fill off the book directory's quality (`rate = in/out`, the fixed
+    // quality bucket the offer lives in), exactly as rippled's `BookStep` uses
+    // `offer.quality().rate()` rather than the offer's current (post-partial-fill)
+    // `TakerPays/TakerGets` ratio. Re-deriving the rate from the drifted current
+    // amounts left interior book-hop outputs 1-2 ULP off `divRoundStrict`.
     let out_iou =
-        IOUAmount::div_round(&in_iou, &qrate, /*round_up*/ false).unwrap_or(IOUAmount::ZERO);
+        IOUAmount::div_round(&in_iou, rate, /*round_up*/ false).unwrap_or(IOUAmount::ZERO);
     leg_from_magnitude(&out_iou, offer_out)
 }
 
@@ -937,10 +939,16 @@ fn cross_book_hop(
         &demand_out.issuer,
     );
 
-    let out_start = demand_out.clone();
-    let budget_start = budget_in.clone();
     let mut remaining_out = demand_out.clone();
     let mut remaining_in = budget_in.clone();
+    // Accumulate the realised delivery / spend directly from each fill. Computing
+    // them as `start - remaining` underflows for an interior hop, whose demand cap
+    // is the huge `unbounded_leg` sentinel (~1e96): a real ~0.2 delivery is below
+    // its ULP, so the subtraction would round to 0 and starve the next hop.
+    let mut delivered = leg_from_magnitude(&IOUAmount::ZERO, demand_out);
+    delivered.drops = 0;
+    let mut spent = leg_from_magnitude(&IOUAmount::ZERO, budget_in);
+    spent.drops = 0;
     let book_prefix = inverse_book.as_bytes()[0..24].to_vec();
     let mut probe = book_dir_with_quality(&inverse_book, 0);
     'walk: while let Some(dir_key) = ctx.view.succ(&probe) {
@@ -999,9 +1007,24 @@ fn cross_book_hop(
             }
             let avail_out = leg_min(&offer_out, &funds);
 
+            // Pricing rate: the offer's book-directory quality (`in/out`). A
+            // degenerate page quality of zero only arises in synthetic ledgers
+            // whose offer sits at the book base rather than a quality sub-dir;
+            // there, fall back to the offer's current amounts so those fixtures
+            // still price. Real mainnet book pages always carry a valid quality.
+            let eff_rate = if rate.is_zero() {
+                IOUAmount::divide(
+                    &leg_as_quality_iou(&offer_in),
+                    &leg_as_quality_iou(&offer_out),
+                )
+                .unwrap_or(IOUAmount::ZERO)
+            } else {
+                rate
+            };
+
             // Output capped by remaining demand, funded availability, and what
             // the remaining input budget can buy at this offer's price.
-            let budget_out = out_for_in(&remaining_in, &offer_in, &offer_out);
+            let budget_out = out_for_in(&remaining_in, &eff_rate, &offer_out);
             let mut take_out = leg_min(&remaining_out, &avail_out);
             let budget_binds = leg_ge(&take_out, &budget_out);
             if budget_binds {
@@ -1017,7 +1040,7 @@ fn cross_book_hop(
             } else {
                 // Demand-limited: pay the ceil price for the delivered output,
                 // never exceeding the resting offer or the remaining budget.
-                let priced = in_for_out(&take_out, &rate, &offer_in);
+                let priced = in_for_out(&take_out, &eff_rate, &offer_in);
                 let order_in = leg_min(&leg_min(&priced, &offer_in), &remaining_in);
                 (take_out.clone(), order_in)
             };
@@ -1071,11 +1094,11 @@ fn cross_book_hop(
 
             remaining_out = leg_sub_round(&remaining_out, &net_out);
             remaining_in = leg_sub_round(&remaining_in, &order_in);
+            delivered = leg_add(&delivered, &net_out);
+            spent = leg_add(&spent, &order_in);
         }
     }
 
-    let delivered = leg_sub(&out_start, &remaining_out);
-    let spent = leg_sub(&budget_start, &remaining_in);
     Ok((delivered, spent))
 }
 
