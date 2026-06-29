@@ -78,8 +78,6 @@ impl Transactor for CredentialAcceptTransactor {
         let mut account: serde_json::Value =
             serde_json::from_slice(&account_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        helpers::increment_sequence(&mut account);
-
         let issuer_str = helpers::get_str_field(ctx.tx, "Issuer").unwrap();
         let credential_type = helpers::get_str_field(ctx.tx, "CredentialType").unwrap();
         let issuer_id =

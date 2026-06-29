@@ -85,32 +85,12 @@ impl Transactor for PaymentTransactor {
         let dst_bytes = ctx.view.read(&dst_key);
         let _dst_exists = dst_bytes.is_some();
 
-        // DepositAuth: if destination has lsfDepositAuth set, the source must
-        // either be the destination itself OR be pre-authorized via a
-        // DepositPreauth ledger entry. Self-payments are always allowed.
-        // RequireDestTag: if destination has lsfRequireDestTag set, the tx
-        // must include a DestinationTag.
-        if let Some(bytes) = &dst_bytes {
-            if let Ok(dst_account) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                let dst_flags = dst_account
-                    .get("Flags")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-                const LSF_DEPOSIT_AUTH: u32 = 0x01000000;
-                const LSF_REQUIRE_DEST_TAG: u32 = 0x00020000;
-                if dst_flags & LSF_DEPOSIT_AUTH != 0 && account_str != destination_str {
-                    let preauth_key = keylet::deposit_preauth(&dst_id, &src_id);
-                    if !ctx.view.exists(&preauth_key) {
-                        return Err(TransactionResult::TecNoPermission);
-                    }
-                }
-                if dst_flags & LSF_REQUIRE_DEST_TAG != 0
-                    && helpers::get_u32_field(ctx.tx, "DestinationTag").is_none()
-                {
-                    return Err(TransactionResult::TecDstTagNeeded);
-                }
-            }
-        }
+        // NOTE: DepositAuth (tecNO_PERMISSION) and RequireDestTag
+        // (tecDST_TAG_NEEDED) are tec-returning checks; rippled claims a tec
+        // (fee + seq charged). Since the engine now consumes fee + seq centrally
+        // in the parent sandbox *before* doApply, these checks were moved to the
+        // start of `Payment::apply` so they land as apply-tecs (kept on tec)
+        // rather than free preclaim returns.
 
         // Cross-currency payment: the source spends SendMax (a different asset),
         // not Amount, so the Amount-vs-balance funding check below does not
@@ -146,6 +126,40 @@ impl Transactor for PaymentTransactor {
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let destination_str = helpers::get_destination(ctx.tx)?;
+
+        // DepositAuth / RequireDestTag: these return a `tec` that rippled claims
+        // (fee + seq charged). The engine consumes fee + seq centrally in the
+        // parent sandbox *before* doApply, so these checks run here at the start
+        // of apply (instead of preclaim) to land as apply-tecs that survive on
+        // tec. Mirrors rippled checking them in preclaim while still claiming.
+        {
+            let dst_id = decode_account_id(destination_str)
+                .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+            let dst_key = keylet::account(&dst_id);
+            if let Some(bytes) = ctx.view.read(&dst_key) {
+                if let Ok(dst_account) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    let dst_flags = dst_account
+                        .get("Flags")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    const LSF_DEPOSIT_AUTH: u32 = 0x01000000;
+                    const LSF_REQUIRE_DEST_TAG: u32 = 0x00020000;
+                    if dst_flags & LSF_DEPOSIT_AUTH != 0 && account_str != destination_str {
+                        let src_id = decode_account_id(account_str)
+                            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+                        let preauth_key = keylet::deposit_preauth(&dst_id, &src_id);
+                        if !ctx.view.exists(&preauth_key) {
+                            return Err(TransactionResult::TecNoPermission);
+                        }
+                    }
+                    if dst_flags & LSF_REQUIRE_DEST_TAG != 0
+                        && helpers::get_u32_field(ctx.tx, "DestinationTag").is_none()
+                    {
+                        return Err(TransactionResult::TecDstTagNeeded);
+                    }
+                }
+            }
+        }
 
         // Cross-currency Payment (a SendMax in a different asset than Amount):
         // cross the order book via the shared Taker engine — for a conversion
@@ -212,7 +226,6 @@ impl Transactor for PaymentTransactor {
             .ok_or(TransactionResult::TecUnfundedPayment)?;
 
         helpers::set_balance(&mut src_account, new_src_balance);
-        crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut src_account, ctx.tx)?;
 
         let src_data =
             serde_json::to_vec(&src_account).map_err(|_| TransactionResult::TefInternal)?;
@@ -343,20 +356,6 @@ fn apply_iou(
             .update(trust_key, trust_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        let issuer_key = keylet::account(&issuer_id);
-        let issuer_bytes = ctx
-            .view
-            .read(&issuer_key)
-            .ok_or(TransactionResult::TerNoAccount)?;
-        let mut issuer_acct: serde_json::Value =
-            serde_json::from_slice(&issuer_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        helpers::increment_sequence(&mut issuer_acct);
-        let issuer_data =
-            serde_json::to_vec(&issuer_acct).map_err(|_| TransactionResult::TefInternal)?;
-        ctx.view
-            .update(issuer_key, issuer_data)
-            .map_err(|_| TransactionResult::TefInternal)?;
-
         return Ok(TransactionResult::TesSuccess);
     }
 
@@ -433,21 +432,6 @@ fn apply_iou(
             .update(dst_trust_key, dst_trust_data)
             .map_err(|_| TransactionResult::TefInternal)?;
     }
-
-    // Bump source Sequence.
-    let src_key = keylet::account(&src_id);
-    let src_bytes = ctx
-        .view
-        .read(&src_key)
-        .ok_or(TransactionResult::TerNoAccount)?;
-    let mut src_acct: serde_json::Value =
-        serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
-    crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut src_acct, ctx.tx)?;
-    let src_acct_data =
-        serde_json::to_vec(&src_acct).map_err(|_| TransactionResult::TefInternal)?;
-    ctx.view
-        .update(src_key, src_acct_data)
-        .map_err(|_| TransactionResult::TefInternal)?;
 
     Ok(TransactionResult::TesSuccess)
 }
@@ -599,7 +583,6 @@ fn apply_conversion(
         .ok_or(TransactionResult::TerNoAccount)?;
     let mut acct: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
-    crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut acct, ctx.tx)?;
 
     // AMM-routed conversion: when an AMM pool exists for the (SendMax → Amount)
     // pair, swap through it with exact constant-product math. The pool here is
@@ -1037,21 +1020,6 @@ fn apply_cross_currency(
 
     // Credit destination's dst-currency trust line.
     apply_trust_delta(ctx, &dest_id, &dst_issuer_id, &dst_cur_bytes, target)?;
-
-    // Bump source Sequence.
-    let src_key = keylet::account(&src_id);
-    let src_bytes = ctx
-        .view
-        .read(&src_key)
-        .ok_or(TransactionResult::TerNoAccount)?;
-    let mut src_acct: serde_json::Value =
-        serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
-    crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut src_acct, ctx.tx)?;
-    let src_acct_data =
-        serde_json::to_vec(&src_acct).map_err(|_| TransactionResult::TefInternal)?;
-    ctx.view
-        .update(src_key, src_acct_data)
-        .map_err(|_| TransactionResult::TefInternal)?;
 
     Ok(TransactionResult::TesSuccess)
 }
@@ -1605,20 +1573,6 @@ fn commit_n_hop_plan(
 
     let (last_cur, last_iss) = &chain[chain.len() - 1];
     apply_trust_delta(ctx, &dest_id, last_iss, last_cur, target)?;
-
-    let src_key = keylet::account(&src_id);
-    let src_bytes = ctx
-        .view
-        .read(&src_key)
-        .ok_or(TransactionResult::TerNoAccount)?;
-    let mut src_acct: serde_json::Value =
-        serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
-    crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut src_acct, ctx.tx)?;
-    let src_acct_data =
-        serde_json::to_vec(&src_acct).map_err(|_| TransactionResult::TefInternal)?;
-    ctx.view
-        .update(src_key, src_acct_data)
-        .map_err(|_| TransactionResult::TefInternal)?;
 
     Ok(TransactionResult::TesSuccess)
 }

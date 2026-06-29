@@ -74,8 +74,10 @@ impl Transactor for CheckCreateTransactor {
         let mut src_account: serde_json::Value =
             serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        let tx_seq = helpers::get_sequence(&src_account);
-        helpers::increment_sequence(&mut src_account);
+        // The Check's keylet/Sequence is the TX seq-proxy value (the engine
+        // already consumed the sender's Sequence/Ticket centrally, so the
+        // account Sequence is one ahead and must not be used here).
+        let tx_seq = helpers::tx_seq_proxy_value(ctx.tx);
         helpers::adjust_owner_count(&mut src_account, 1);
 
         let src_data =

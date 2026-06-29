@@ -74,8 +74,6 @@ impl Transactor for CredentialCreateTransactor {
         let mut account: serde_json::Value =
             serde_json::from_slice(&account_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        helpers::increment_sequence(&mut account);
-
         let subject_str = helpers::get_str_field(ctx.tx, "Subject").unwrap();
         let subject_id =
             decode_account_id(subject_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;

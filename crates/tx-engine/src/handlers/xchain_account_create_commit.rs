@@ -82,7 +82,6 @@ impl Transactor for XChainAccountCreateCommitTransactor {
                 .checked_sub(total_deduct)
                 .ok_or(TransactionResult::TecUnfundedPayment)?,
         );
-        helpers::increment_sequence(&mut src_account);
 
         let src_data =
             serde_json::to_vec(&src_account).map_err(|_| TransactionResult::TefInternal)?;

@@ -93,8 +93,9 @@ impl Transactor for PaymentChannelCreateTransactor {
                 .checked_sub(amount)
                 .ok_or(TransactionResult::TecUnfundedPayment)?,
         );
-        let tx_seq = helpers::get_sequence(&src_account);
-        helpers::increment_sequence(&mut src_account);
+        // The channel's keylet/Sequence is the TX seq-proxy value (the engine
+        // already consumed the sender's Sequence/Ticket centrally).
+        let tx_seq = helpers::tx_seq_proxy_value(ctx.tx);
         helpers::adjust_owner_count(&mut src_account, 1);
 
         let src_data =

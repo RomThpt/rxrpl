@@ -189,8 +189,6 @@ impl Transactor for SetHookTransactor {
             }
         }
 
-        helpers::increment_sequence(&mut src_account);
-
         let src_data =
             serde_json::to_vec(&src_account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view

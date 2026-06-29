@@ -84,7 +84,6 @@ impl Transactor for OfferCancelTransactor {
         let mut acct: Value =
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
 
-        crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, &mut acct, ctx.tx)?;
         if offer_existed {
             helpers::adjust_owner_count(&mut acct, -1);
         }

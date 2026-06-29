@@ -150,9 +150,8 @@ impl Transactor for XChainClaimTransactor {
             .view
             .read(&src_key)
             .ok_or(TransactionResult::TerNoAccount)?;
-        let mut src_account: serde_json::Value =
+        let src_account: serde_json::Value =
             serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        helpers::increment_sequence(&mut src_account);
 
         let src_data =
             serde_json::to_vec(&src_account).map_err(|_| TransactionResult::TefInternal)?;

@@ -129,8 +129,9 @@ impl Transactor for NFTokenCreateOfferTransactor {
         let mut acct: Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        let tx_seq = helpers::get_sequence(&acct);
-        helpers::increment_sequence(&mut acct);
+        // The NFTokenOffer's keylet/Sequence is the TX seq-proxy value (the
+        // engine already consumed the sender's Sequence/Ticket centrally).
+        let tx_seq = helpers::tx_seq_proxy_value(ctx.tx);
         helpers::adjust_owner_count(&mut acct, 1);
 
         let acct_data = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;

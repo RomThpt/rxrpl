@@ -393,3 +393,25 @@ pub fn register_pseudo(registry: &mut TransactorRegistry) {
     registry.register(TransactionType::SetFee, set_fee::SetFeeTransactor);
     registry.register(TransactionType::UNLModify, unl_modify::UNLModifyTransactor);
 }
+
+/// Test helper: mirror the engine's central Sequence/Ticket consume.
+///
+/// `TxEngine::apply` runs `owner_dir::consume_seq_or_ticket` on the sender's
+/// AccountRoot in the parent sandbox *before* `doApply`. Handler unit tests
+/// that invoke `Transactor::apply` directly bypass the engine, so they call this
+/// first to reproduce that central consume (bumping the account Sequence, or
+/// burning the referenced Ticket SLE for a ticketed transaction).
+#[cfg(test)]
+pub(crate) fn central_consume_for_test(
+    view: &mut dyn crate::view::ApplyView,
+    tx: &serde_json::Value,
+) {
+    use rxrpl_codec::address::classic::decode_account_id;
+    use rxrpl_protocol::keylet;
+    let id = decode_account_id(tx["Account"].as_str().unwrap()).unwrap();
+    let key = keylet::account(&id);
+    let mut acct: serde_json::Value = serde_json::from_slice(&view.read(&key).unwrap()).unwrap();
+    crate::owner_dir::consume_seq_or_ticket(view, &id, &mut acct, tx).unwrap();
+    view.update(key, serde_json::to_vec(&acct).unwrap())
+        .unwrap();
+}

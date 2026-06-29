@@ -320,40 +320,55 @@ impl TxEngine {
         sandbox.set_sorted_directories(rules.enabled(&feature_id("SortedDirectories")));
         sandbox.set_thread_directories(rules.enabled(&feature_id("fixPreviousTxnID")));
 
+        // Mirror rippled Transactor::apply: in the PARENT sandbox, deduct the
+        // sender's fee AND consume its Sequence/Ticket centrally (before
+        // doApply). Reading the AccountRoot once, both mutations are written
+        // back together, so on a `tec` result — where the child sandbox is
+        // discarded — the fee charge and the seq/ticket consume both survive.
         if !is_pseudo {
+            let account_str = helpers::get_account(tx).map_err(TxEngineError::TransactionFailed)?;
+            let account_id = decode_account_id(account_str).map_err(|_| {
+                TxEngineError::TransactionFailed(TransactionResult::TemInvalidAccountId)
+            })?;
+            let account_key = keylet::account(&account_id);
+
+            let account_bytes =
+                sandbox
+                    .read(&account_key)
+                    .ok_or(TxEngineError::TransactionFailed(
+                        TransactionResult::TerNoAccount,
+                    ))?;
+            let mut account_obj: Value = serde_json::from_slice(&account_bytes)
+                .map_err(|_| TxEngineError::TransactionFailed(TransactionResult::TefInternal))?;
+
             let fee_drops = helpers::get_fee(tx);
             if fee_drops > 0 {
-                let account_str =
-                    helpers::get_account(tx).map_err(TxEngineError::TransactionFailed)?;
-                let account_id = decode_account_id(account_str).map_err(|_| {
-                    TxEngineError::TransactionFailed(TransactionResult::TemInvalidAccountId)
-                })?;
-                let account_key = keylet::account(&account_id);
-
-                let account_bytes =
-                    sandbox
-                        .read(&account_key)
-                        .ok_or(TxEngineError::TransactionFailed(
-                            TransactionResult::TerNoAccount,
-                        ))?;
-                let mut account_obj: Value =
-                    serde_json::from_slice(&account_bytes).map_err(|_| {
-                        TxEngineError::TransactionFailed(TransactionResult::TefInternal)
-                    })?;
-
                 let balance = helpers::get_balance(&account_obj);
                 if balance < fee_drops {
                     return Ok(TransactionResult::TerInsufFee);
                 }
                 helpers::set_balance(&mut account_obj, balance - fee_drops);
+            }
 
-                let updated = serde_json::to_vec(&account_obj).map_err(|_| {
-                    TxEngineError::TransactionFailed(TransactionResult::TefInternal)
-                })?;
-                sandbox.update(account_key, updated).map_err(|_| {
-                    TxEngineError::TransactionFailed(TransactionResult::TefInternal)
-                })?;
+            // Central Sequence/Ticket consume (rippled consumeSeqProxy). Each
+            // handler no longer touches the sender's own sequence; object
+            // keylets still derive from the TX seq-proxy, not this post-bump
+            // account Sequence.
+            crate::owner_dir::consume_seq_or_ticket(
+                &mut sandbox,
+                &account_id,
+                &mut account_obj,
+                tx,
+            )
+            .map_err(TxEngineError::TransactionFailed)?;
 
+            let updated = serde_json::to_vec(&account_obj)
+                .map_err(|_| TxEngineError::TransactionFailed(TransactionResult::TefInternal))?;
+            sandbox
+                .update(account_key, updated)
+                .map_err(|_| TxEngineError::TransactionFailed(TransactionResult::TefInternal))?;
+
+            if fee_drops > 0 {
                 sandbox.destroy_drops(fee_drops);
             }
         }

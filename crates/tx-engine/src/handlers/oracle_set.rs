@@ -76,8 +76,6 @@ impl Transactor for OracleSetTransactor {
         let mut account: serde_json::Value =
             serde_json::from_slice(&account_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        helpers::increment_sequence(&mut account);
-
         let doc_id = helpers::get_u32_field(ctx.tx, "OracleDocumentID").unwrap();
         let oracle_key = keylet::oracle(&account_id, doc_id);
         let is_create = !ctx.view.exists(&oracle_key);

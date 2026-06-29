@@ -237,7 +237,6 @@ impl Transactor for VaultDepositTransactor {
                 .checked_sub(assets_deposited as u64)
                 .ok_or(TransactionResult::TecUnfundedPayment)?,
         );
-        helpers::increment_sequence(&mut depositor_acct);
         if created_mptoken {
             helpers::adjust_owner_count(&mut depositor_acct, 1);
         }
@@ -448,7 +447,6 @@ fn apply_iou_deposit(
         .ok_or(TransactionResult::TerNoAccount)?;
     let mut depositor_acct: serde_json::Value =
         serde_json::from_slice(&depositor_bytes).map_err(|_| TransactionResult::TefInternal)?;
-    helpers::increment_sequence(&mut depositor_acct);
     if created_mptoken {
         helpers::adjust_owner_count(&mut depositor_acct, 1);
     }

@@ -247,9 +247,8 @@ impl Transactor for LoanSetTransactor {
             .view
             .read(&acct_key)
             .ok_or(TransactionResult::TerNoAccount)?;
-        let mut account: serde_json::Value =
+        let account: serde_json::Value =
             serde_json::from_slice(&ab).map_err(|_| TransactionResult::TefInternal)?;
-        helpers::increment_sequence(&mut account);
         ctx.view
             .update(
                 acct_key,

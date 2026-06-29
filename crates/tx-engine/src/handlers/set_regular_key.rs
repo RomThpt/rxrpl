@@ -49,8 +49,6 @@ impl Transactor for SetRegularKeyTransactor {
             obj.as_object_mut().unwrap().remove("RegularKey");
         }
 
-        helpers::increment_sequence(&mut obj);
-
         let new_bytes = serde_json::to_vec(&obj).map_err(|_| TransactionResult::TemMalformed)?;
         ctx.view
             .update(key, new_bytes)

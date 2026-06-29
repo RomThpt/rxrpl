@@ -53,10 +53,13 @@ impl Transactor for TicketCreateTransactor {
         let mut acct: Value =
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
 
-        let start_seq = helpers::get_sequence(&acct);
-        // The TicketCreate tx itself consumes `start_seq`; tickets are
-        // reserved starting at `start_seq + 1`, matching rippled.
-        let first_ticket_seq = start_seq + 1;
+        // The engine already consumed the tx's own Sequence/Ticket centrally
+        // (parent sandbox). rippled's `firstTicketSeq` is the AccountRoot
+        // Sequence *after* that consume: for a sequence-based tx it is the
+        // bumped value (tx Sequence + 1), and for a ticketed tx it is the
+        // unchanged account Sequence. Reading it here from the post-consume
+        // account mirrors both cases.
+        let first_ticket_seq = helpers::get_sequence(&acct);
 
         // Create tickets. rippled's Ticket SLE carries OwnerNode and the
         // threaded PreviousTxnID (placeholder here; the engine stamps it), and

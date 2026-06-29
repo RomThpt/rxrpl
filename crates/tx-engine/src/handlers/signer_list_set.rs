@@ -106,7 +106,6 @@ impl Transactor for SignerListSetTransactor {
             let mut acct: Value =
                 serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
             helpers::adjust_owner_count(&mut acct, -1);
-            helpers::increment_sequence(&mut acct);
             let new_bytes =
                 serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
             ctx.view
@@ -152,7 +151,6 @@ impl Transactor for SignerListSetTransactor {
             if !existing {
                 helpers::adjust_owner_count(&mut acct, 1);
             }
-            helpers::increment_sequence(&mut acct);
             let new_bytes =
                 serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
             ctx.view

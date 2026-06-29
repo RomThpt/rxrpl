@@ -144,23 +144,8 @@ impl Transactor for PaymentChannelClaimTransactor {
                 .update(channel_key, ch_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
 
-            // Bump source's sequence (caller).
-            let src_id = decode_account_id(&ch_src_str)
-                .map_err(|_| TransactionResult::TemInvalidAccountId)?;
-            let src_key = keylet::account(&src_id);
-            let src_bytes = ctx
-                .view
-                .read(&src_key)
-                .ok_or(TransactionResult::TerNoAccount)?;
-            let mut src_account: serde_json::Value =
-                serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
-            helpers::increment_sequence(&mut src_account);
-            let src_data =
-                serde_json::to_vec(&src_account).map_err(|_| TransactionResult::TefInternal)?;
-            ctx.view
-                .update(src_key, src_data)
-                .map_err(|_| TransactionResult::TefInternal)?;
-
+            // The caller's Sequence/Ticket (and fee) are consumed centrally by
+            // the engine (parent sandbox) before doApply.
             return Ok(TransactionResult::TesSuccess);
         }
 
@@ -186,34 +171,11 @@ impl Transactor for PaymentChannelClaimTransactor {
                 helpers::set_balance(&mut src_account, src_balance + remaining);
                 helpers::adjust_owner_count(&mut src_account, -1);
 
-                let account_id = decode_account_id(account_str)
-                    .map_err(|_| TransactionResult::TemInvalidAccountId)?;
-                if account_id == src_id {
-                    helpers::increment_sequence(&mut src_account);
-                }
-
                 let src_data =
                     serde_json::to_vec(&src_account).map_err(|_| TransactionResult::TefInternal)?;
                 ctx.view
                     .update(src_key, src_data)
                     .map_err(|_| TransactionResult::TefInternal)?;
-
-                // If sender is destination, increment their sequence
-                if account_id != src_id {
-                    let sender_key = keylet::account(&account_id);
-                    let sender_bytes = ctx
-                        .view
-                        .read(&sender_key)
-                        .ok_or(TransactionResult::TerNoAccount)?;
-                    let mut sender: serde_json::Value = serde_json::from_slice(&sender_bytes)
-                        .map_err(|_| TransactionResult::TefInternal)?;
-                    helpers::increment_sequence(&mut sender);
-                    let sender_data =
-                        serde_json::to_vec(&sender).map_err(|_| TransactionResult::TefInternal)?;
-                    ctx.view
-                        .update(sender_key, sender_data)
-                        .map_err(|_| TransactionResult::TefInternal)?;
-                }
             } else {
                 // No remaining, but still decrement owner count and increment sequence
                 let src_id = decode_account_id(&ch_src_str)
@@ -227,33 +189,11 @@ impl Transactor for PaymentChannelClaimTransactor {
                     .map_err(|_| TransactionResult::TefInternal)?;
                 helpers::adjust_owner_count(&mut src_account, -1);
 
-                let account_id = decode_account_id(account_str)
-                    .map_err(|_| TransactionResult::TemInvalidAccountId)?;
-                if account_id == src_id {
-                    helpers::increment_sequence(&mut src_account);
-                }
-
                 let src_data =
                     serde_json::to_vec(&src_account).map_err(|_| TransactionResult::TefInternal)?;
                 ctx.view
                     .update(src_key, src_data)
                     .map_err(|_| TransactionResult::TefInternal)?;
-
-                if account_id != src_id {
-                    let sender_key = keylet::account(&account_id);
-                    let sender_bytes = ctx
-                        .view
-                        .read(&sender_key)
-                        .ok_or(TransactionResult::TerNoAccount)?;
-                    let mut sender: serde_json::Value = serde_json::from_slice(&sender_bytes)
-                        .map_err(|_| TransactionResult::TefInternal)?;
-                    helpers::increment_sequence(&mut sender);
-                    let sender_data =
-                        serde_json::to_vec(&sender).map_err(|_| TransactionResult::TefInternal)?;
-                    ctx.view
-                        .update(sender_key, sender_data)
-                        .map_err(|_| TransactionResult::TefInternal)?;
-                }
             }
 
             // Unlink the channel from the source's owner directory and — when
@@ -271,27 +211,12 @@ impl Transactor for PaymentChannelClaimTransactor {
                 .erase(&channel_key)
                 .map_err(|_| TransactionResult::TefInternal)?;
         } else {
-            // Just update channel state and increment sender sequence
+            // Just update channel state; the sender's Sequence/Ticket (and fee)
+            // are consumed centrally by the engine before doApply.
             let ch_data =
                 serde_json::to_vec(&channel).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
                 .update(channel_key, ch_data)
-                .map_err(|_| TransactionResult::TefInternal)?;
-
-            let account_id = decode_account_id(account_str)
-                .map_err(|_| TransactionResult::TemInvalidAccountId)?;
-            let account_key = keylet::account(&account_id);
-            let account_bytes = ctx
-                .view
-                .read(&account_key)
-                .ok_or(TransactionResult::TerNoAccount)?;
-            let mut account: serde_json::Value = serde_json::from_slice(&account_bytes)
-                .map_err(|_| TransactionResult::TefInternal)?;
-            helpers::increment_sequence(&mut account);
-            let account_data =
-                serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
-            ctx.view
-                .update(account_key, account_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
         }
 

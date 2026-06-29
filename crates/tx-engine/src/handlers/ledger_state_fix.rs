@@ -1,5 +1,4 @@
-use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_protocol::{TransactionResult, keylet};
+use rxrpl_protocol::TransactionResult;
 
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
@@ -17,27 +16,10 @@ impl Transactor for LedgerStateFixTransactor {
         Ok(())
     }
 
-    fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
-        let account_str = helpers::get_account(ctx.tx)?;
-        let account_id =
-            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-
-        let account_key = keylet::account(&account_id);
-        let account_bytes = ctx
-            .view
-            .read(&account_key)
-            .ok_or(TransactionResult::TerNoAccount)?;
-        let mut account: serde_json::Value =
-            serde_json::from_slice(&account_bytes).map_err(|_| TransactionResult::TefInternal)?;
-
-        helpers::increment_sequence(&mut account);
-
-        let account_data =
-            serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
-        ctx.view
-            .update(account_key, account_data)
-            .map_err(|_| TransactionResult::TefInternal)?;
-
+    fn apply(&self, _ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
+        // The sender's fee and Sequence/Ticket are consumed centrally by the
+        // engine (parent sandbox) before doApply; this transactor has no other
+        // ledger effect in the currently-supported scope.
         Ok(TransactionResult::TesSuccess)
     }
 }
@@ -51,7 +33,9 @@ mod tests {
     use crate::view::read_view::ReadView;
     use crate::view::sandbox::Sandbox;
     use rxrpl_amendment::Rules;
+    use rxrpl_codec::address::classic::decode_account_id;
     use rxrpl_ledger::Ledger;
+    use rxrpl_protocol::keylet;
 
     const ALICE: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
 
@@ -148,6 +132,8 @@ mod tests {
             "Sequence": 1,
         });
 
+        // Engine consumes the sender's Sequence/Ticket centrally before doApply.
+        crate::handlers::central_consume_for_test(&mut sandbox, &tx);
         let mut ctx = ApplyContext {
             tx: &tx,
             view: &mut sandbox,

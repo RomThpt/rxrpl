@@ -223,7 +223,9 @@ impl Transactor for VaultCreateTransactor {
         let mut account: serde_json::Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        let seq = helpers::get_sequence(&account);
+        // The vault keylet/Sequence is the TX seq-proxy value (the engine already
+        // consumed the sender's Sequence/Ticket centrally).
+        let seq = helpers::tx_seq_proxy_value(ctx.tx);
         let asset = ctx.tx.get("Asset").unwrap().clone();
         let tx_flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
 
@@ -359,7 +361,6 @@ impl Transactor for VaultCreateTransactor {
 
         // 6. Owner account: bump sequence and OwnerCount by 3 (vault + pseudo +
         //    the share MPToken holding).
-        helpers::increment_sequence(&mut account);
         helpers::adjust_owner_count(&mut account, 3);
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
@@ -416,6 +417,8 @@ mod tests {
             "Sequence": 1,
         });
 
+        // Engine consumes the sender's Sequence/Ticket centrally before doApply.
+        crate::handlers::central_consume_for_test(&mut sandbox, &tx);
         let mut ctx = ApplyContext {
             tx: &tx,
             view: &mut sandbox,

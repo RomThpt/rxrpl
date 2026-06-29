@@ -270,7 +270,6 @@ impl Transactor for AMMCreateTransactor {
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
         let balance = helpers::get_balance(&account);
         helpers::set_balance(&mut account, balance.saturating_sub(xrp_legs));
-        helpers::increment_sequence(&mut account);
         ctx.view
             .update(
                 acct_key,
@@ -631,6 +630,8 @@ mod tests {
             "Sequence": 1,
         });
 
+        // Engine consumes the sender's Sequence/Ticket centrally before doApply.
+        crate::handlers::central_consume_for_test(&mut sandbox, &tx);
         let mut ctx = ApplyContext {
             tx: &tx,
             view: &mut sandbox,
