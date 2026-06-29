@@ -476,6 +476,15 @@ impl Number {
                 xe = ye;
                 xn = yn;
             }
+            // Equal-magnitude operands of opposite sign cancel to exactly zero.
+            // (The struct-equality fast path at the top only catches operands
+            // in identical mantissa/exponent representation; values equal after
+            // exponent alignment land here.) Guard before the normalisation
+            // loop, which would otherwise do `xm -= g.pop()` on xm == 0 and
+            // underflow the u128 mantissa.
+            if xm == 0 {
+                return Number::ZERO;
+            }
             while xm < min_mantissa() && xm * 10 <= MAX_REP as u128 {
                 xm *= 10;
                 xm -= g.pop() as u128;
@@ -747,6 +756,25 @@ mod tests {
         let b = Number::from_int(5);
         assert_eq!(a.add(&b), Number::from_int(12));
         assert_eq!(a.sub(&b), Number::from_int(2));
+    }
+
+    #[test]
+    fn sub_equal_magnitude_cancels_to_zero() {
+        // Subtracting equal magnitudes must yield exactly zero without panicking.
+        // The opposite-sign branch can drive the mantissa to 0 after exponent
+        // alignment; the normalisation loop would then do `xm -= g.pop()` on
+        // xm == 0 and underflow the u128 mantissa (a latent panic surfaced by
+        // cross-currency AMM reverse-pricing where the required input equalled
+        // the source budget). Both the struct-equal fast path and the post-
+        // subtraction guard must return ZERO.
+        let a = Number::new(false, 6_293_200, -1); // 629320.0
+        assert_eq!(a.sub(&a), Number::ZERO);
+        let from_div = Number::from_int(1).div(&Number::from_int(3));
+        assert_eq!(from_div.sub(&from_div), Number::ZERO);
+        // Mixed-exponent equal values (normalised to the same canonical form).
+        let b = Number::new(false, 62_932, 1); // 629320.0
+        assert_eq!(a.sub(&b), Number::ZERO);
+        assert_eq!(b.add(&a.negate()), Number::ZERO);
     }
 
     // AMM single-asset deposit (oracle 105093427): deposit 10000 drops XRP into
