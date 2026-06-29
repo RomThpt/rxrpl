@@ -159,7 +159,7 @@ impl Transactor for NFTokenCreateOfferTransactor {
         } else {
             keylet::nft_buys(&nft_id_hash)
         };
-        add_to_nft_offer_dir(ctx.view, &book_key, &nftoken_id, &offer_key)?;
+        add_to_nft_offer_dir(ctx.view, &book_key, &nftoken_id, &offer_key, is_sell)?;
 
         // Amount passes through in its original shape (XRP drops string or IOU
         // object). rippled stores no Sequence on the offer, and sfFlags only
