@@ -145,7 +145,8 @@ impl Node {
 
         // Initialize amendment registry
         let registry = FeatureRegistry::with_known_amendments();
-        let mut amendment_table = AmendmentTable::new(&registry, 14 * 24 * 60 * 4); // ~14 days at 4s/ledger
+        // Majority window in close-time SECONDS (rippled's two-week window).
+        let mut amendment_table = AmendmentTable::new(&registry, 1_209_600); // 14 days in seconds
         config
             .amendments
             .apply(&registry, &mut amendment_table)
@@ -223,7 +224,8 @@ impl Node {
         let node_store = Self::create_node_store(&config)?;
 
         let registry = FeatureRegistry::with_known_amendments();
-        let mut amendment_table = AmendmentTable::new(&registry, 14 * 24 * 60 * 4);
+        // Majority window in close-time SECONDS (rippled's two-week window).
+        let mut amendment_table = AmendmentTable::new(&registry, 1_209_600); // 14 days in seconds
         config
             .amendments
             .apply(&registry, &mut amendment_table)
@@ -1573,7 +1575,14 @@ impl Node {
             // Collect amendment votes from received validations for the current round.
             // Reset after each ledger close.
             let mut amendment_votes: Vec<Vec<Hash256>> = Vec::new();
+            // Denominator for amendment voting: the number of DISTINCT trusted
+            // validators that sent a FULL validation this voting window. An
+            // empty amendment list is a "no" vote that still counts toward the
+            // denominator, so we count voters here independently of whether they
+            // listed any amendments. `seen_amendment_voters` dedups by node id
+            // so a validator that re-validates within the window is counted once.
             let mut trusted_validator_count: usize = 0;
+            let mut seen_amendment_voters: HashSet<NodeId> = HashSet::new();
 
             // Cooldown for wrong-prev-ledger recovery to prevent flip-flopping.
             // At most one switch per 10 seconds.
@@ -1888,6 +1897,7 @@ impl Node {
                                         stall_metrics.reset_consecutive();
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
+                                        seen_amendment_voters.clear();
                                         // Start new open phase
                                         timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
                                     } else {
@@ -2045,6 +2055,7 @@ impl Node {
                                         consensus.start_round(reset_prev, 0);
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
+                                        seen_amendment_voters.clear();
                                         round_started_at = None;
                                         continue;
                                     }
@@ -2080,6 +2091,7 @@ impl Node {
                                         stall_metrics.reset_consecutive();
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
+                                        seen_amendment_voters.clear();
                                         // Start new open phase
                                         timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
                                     }
@@ -2112,6 +2124,7 @@ impl Node {
                                             timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
                                             amendment_votes.clear();
                                             trusted_validator_count = 0;
+                                            seen_amendment_voters.clear();
                                         }
                                         rxrpl_consensus::StallAction::Resync => {
                                             // Escalate: request latest ledger from peers
@@ -2128,6 +2141,7 @@ impl Node {
                                             );
                                             amendment_votes.clear();
                                             trusted_validator_count = 0;
+                                            seen_amendment_voters.clear();
                                         }
                                     }
                                 }
@@ -2227,6 +2241,7 @@ impl Node {
                                         consensus.start_round(detected.preferred_ledger, 0);
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
+                                        seen_amendment_voters.clear();
                                     }
                                 }
                             }
@@ -2251,13 +2266,26 @@ impl Node {
                                     full: validation.full,
                                 });
 
-                                // Collect amendment votes from this validator
-                                if validation.full && !validation.amendments.is_empty() {
-                                    amendment_votes.push(validation.amendments.clone());
+                                // Collect amendment votes from this validator.
+                                //
+                                // The denominator for the 80% majority is the
+                                // number of DISTINCT TRUSTED validators that sent
+                                // a FULL validation this window — matching rippled,
+                                // where a validator with no amendments listed still
+                                // counts as a "no" voter in the denominator. Gate on
+                                // trust using the resolved master key (handles
+                                // ephemeral->master via the manifest), and dedup by
+                                // node id so a re-validation in the same window is
+                                // counted once.
+                                if validation.full
+                                    && val_aggregator.is_trusted(validation.trusted_key())
+                                    && seen_amendment_voters.insert(validation.node_id)
+                                {
+                                    trusted_validator_count += 1;
+                                    if !validation.amendments.is_empty() {
+                                        amendment_votes.push(validation.amendments.clone());
+                                    }
                                 }
-                                trusted_validator_count = trusted_validator_count.max(
-                                    amendment_votes.len(),
-                                );
 
                                 // Feed into the checkpoint anchor first (if active). On
                                 // resolution we directly request the agreed ledger and

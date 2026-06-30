@@ -52,14 +52,18 @@ pub enum AmendmentAction {
 /// * `table` - The amendment table (mutated in place for majority/activation tracking)
 /// * `trusted_count` - Number of trusted validators in the UNL
 /// * `votes` - Map from amendment ID to the number of validators voting for it
-/// * `close_time` - The close time of the current flag ledger
-/// * `ledger_seq` - The current flag ledger sequence
+/// * `close_time` - The close time (seconds) of the current flag ledger; this
+///   is the time reference for both majority recording and the activation
+///   window (rippled measures the two-week window in close-time seconds).
+/// * `_ledger_seq` - The current flag ledger sequence. Retained for call-site
+///   symmetry with the consensus loop; the activation window is now measured in
+///   close-time seconds, so the sequence is no longer used inside the tally.
 pub fn tally_votes(
     table: &mut AmendmentTable,
     trusted_count: usize,
     votes: &HashMap<Hash256, usize>,
     close_time: u32,
-    ledger_seq: u32,
+    _ledger_seq: u32,
 ) -> Vec<AmendmentAction> {
     if trusted_count == 0 {
         return vec![];
@@ -79,8 +83,10 @@ pub fn tally_votes(
 
     let mut actions = Vec::new();
 
-    // First check for activations (amendments that have held majority long enough).
-    let activated = table.check_activations(ledger_seq);
+    // First check for activations (amendments that have held majority long
+    // enough). The activation window is measured in close-time seconds, so we
+    // pass `close_time` here (not the ledger sequence).
+    let activated = table.check_activations(close_time);
     for id in activated {
         actions.push(AmendmentAction::Activate { amendment_id: id });
     }
@@ -100,6 +106,13 @@ pub fn tally_votes(
         s
     };
 
+    // Iterate in deterministic id order: HashSet iteration is unordered, so
+    // emitting GotMajority/LostMajority actions in id-sorted order keeps the
+    // resulting pseudo-transaction sequence (and ledger hash) identical across
+    // implementations.
+    let mut all_tracked: Vec<Hash256> = all_tracked.into_iter().collect();
+    all_tracked.sort();
+
     for id in all_tracked {
         if table.is_enabled(&id) {
             continue;
@@ -113,9 +126,10 @@ pub fn tally_votes(
         };
 
         if has_majority_now {
-            // Record majority (no-op if already recorded)
+            // Record majority (no-op if already recorded). Majority is anchored
+            // to the close time, which drives the close-time activation window.
             let had_majority = table.has_majority(&id);
-            table.set_majority(&id, ledger_seq);
+            table.set_majority(&id, close_time);
             if !had_majority {
                 actions.push(AmendmentAction::GotMajority {
                     amendment_id: id,
@@ -250,11 +264,12 @@ mod tests {
     #[test]
     fn tally_votes_activation_after_majority_window() {
         let reg = test_registry();
-        let majority_time = 100;
+        // majority_time is now in close-time SECONDS, not ledgers.
+        let majority_time: u32 = 100;
         let mut table = AmendmentTable::new(&reg, majority_time);
         let id_a = reg.id_for_name("FeatureA").unwrap();
 
-        // Gain majority at seq 256
+        // Gain majority at close_time = 1000.
         let mut votes = HashMap::new();
         votes.insert(id_a, 9);
         let actions = tally_votes(&mut table, 10, &votes, 1000, 256);
@@ -263,8 +278,8 @@ mod tests {
             AmendmentAction::GotMajority { amendment_id, .. } if *amendment_id == id_a
         )));
 
-        // After majority_time ledgers, should activate
-        let actions2 = tally_votes(&mut table, 10, &votes, 2000, 256 + majority_time);
+        // Exactly `majority_time` SECONDS of close-time later, it activates.
+        let actions2 = tally_votes(&mut table, 10, &votes, 1000 + majority_time, 512);
         assert!(actions2.iter().any(|a| matches!(
             a,
             AmendmentAction::Activate { amendment_id } if *amendment_id == id_a
@@ -320,6 +335,89 @@ mod tests {
                 AmendmentAction::GotMajority { amendment_id, .. } if *amendment_id == id_a
             )));
         }
+    }
+
+    #[test]
+    fn tally_votes_threshold_lock_in_across_unl_sizes() {
+        // Lock the rippled threshold formula so a future edit cannot silently
+        // weaken it. For each trusted-validator count N > 1, the threshold is
+        // `max(1, floor(N * 80 / 100))` with a strict `>`, so:
+        //   * exactly `floor(0.8 * N)` yes-votes is NOT majority, and
+        //   * `floor(0.8 * N) + 1` yes-votes IS majority.
+        let reg = test_registry();
+        for n in [2usize, 3, 5, 8, 10, 20, 28, 100] {
+            let floor80 = n * 80 / 100;
+
+            // floor(0.8 * N) votes -> below threshold, no majority.
+            {
+                let mut table = AmendmentTable::new(&reg, 100);
+                let id_a = reg.id_for_name("FeatureA").unwrap();
+                let mut votes = HashMap::new();
+                votes.insert(id_a, floor80);
+                let actions = tally_votes(&mut table, n, &votes, 1000, 256);
+                assert!(
+                    !actions.iter().any(|a| matches!(
+                        a,
+                        AmendmentAction::GotMajority { amendment_id, .. } if *amendment_id == id_a
+                    )),
+                    "N={n}: {floor80} votes (exactly floor(0.8N)) must NOT reach majority"
+                );
+            }
+
+            // floor(0.8 * N) + 1 votes -> above threshold, majority.
+            {
+                let mut table = AmendmentTable::new(&reg, 100);
+                let id_a = reg.id_for_name("FeatureA").unwrap();
+                let mut votes = HashMap::new();
+                votes.insert(id_a, floor80 + 1);
+                let actions = tally_votes(&mut table, n, &votes, 1000, 256);
+                assert!(
+                    actions.iter().any(|a| matches!(
+                        a,
+                        AmendmentAction::GotMajority { amendment_id, .. } if *amendment_id == id_a
+                    )),
+                    "N={n}: {} votes (floor(0.8N)+1) must reach majority",
+                    floor80 + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tally_votes_activation_requires_full_close_time_window() {
+        // The 2-week window is measured in close-time SECONDS: an amendment must
+        // hold majority for at least `majority_time` seconds before it activates.
+        let reg = test_registry();
+        let majority_time: u32 = 1000;
+        let mut table = AmendmentTable::new(&reg, majority_time);
+        let id_a = reg.id_for_name("FeatureA").unwrap();
+
+        let mut votes = HashMap::new();
+        votes.insert(id_a, 9);
+
+        // Gain majority at close_time = 5000.
+        tally_votes(&mut table, 10, &votes, 5000, 256);
+
+        // One second short of the window -> still NOT activated.
+        let almost = tally_votes(&mut table, 10, &votes, 5000 + majority_time - 1, 512);
+        assert!(
+            !almost
+                .iter()
+                .any(|a| matches!(a, AmendmentAction::Activate { .. })),
+            "activation must not fire before the full close-time window elapses"
+        );
+        assert!(!table.is_enabled(&id_a));
+
+        // Exactly at the window -> activates.
+        let at = tally_votes(&mut table, 10, &votes, 5000 + majority_time, 768);
+        assert!(
+            at.iter().any(|a| matches!(
+                a,
+                AmendmentAction::Activate { amendment_id } if *amendment_id == id_a
+            )),
+            "activation must fire once the full close-time window has elapsed"
+        );
+        assert!(table.is_enabled(&id_a));
     }
 
     #[test]
