@@ -2257,6 +2257,18 @@ impl Node {
                                     continue;
                                 }
 
+                                // Feed the trusted full validation into the
+                                // validations-trie under its resolved master
+                                // identity, so get_preferred / wrong-prev-ledger
+                                // detection can follow the trusted-majority
+                                // branch. Gated on a dynamic VL so static-config
+                                // nodes (e.g. hive clusters) are unaffected and
+                                // cross-impl convergence is untouched.
+                                if vl_dynamic && validation.full {
+                                    consensus
+                                        .record_trusted_validation(validation.to_trie_identity());
+                                }
+
                                 // Aggregate validation and check for quorum
                                 if let Some(validated) = val_aggregator.add_validation(validation) {
                                     tracing::info!(
