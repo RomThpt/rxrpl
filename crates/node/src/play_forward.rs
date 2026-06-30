@@ -707,6 +707,63 @@ mod tests {
             }
         }
 
+        // A CheckCash / CheckCancel reads the Check SLE named by `CheckID`: the
+        // engine looks it up to authorize the cash (and, on success, delete it).
+        // The Check is not always an AffectedNode — a `tec` result (e.g.
+        // tecPATH_PARTIAL when the writer cannot fund the amount) leaves it
+        // untouched, so the metadata-driven seed misses it entirely and the engine
+        // returns tecNO_ENTRY instead of the real verdict (skipping the fee/ticket
+        // effects). Seed the Check from the parent ledger (its 32-byte key IS the
+        // CheckID), plus the writer's AccountRoot (the funding source the cash
+        // prices) and, for an IOU SendMax, the issuer + the writer/casher trust
+        // lines the path reads — none of which appear in the tx JSON.
+        if let Some(check_id) = tx_json.get("CheckID").and_then(|v| v.as_str()) {
+            let cid = check_id.to_uppercase();
+            read_keys.insert(cid.clone());
+            let r = rpc(serde_json::json!({
+                "method":"ledger_entry","params":[{"index":cid,"ledger_index":parent}]
+            }));
+            let check = &r["result"]["node"];
+            if let Some(writer) = check
+                .get("Account")
+                .and_then(|v| v.as_str())
+                .and_then(|a| decode_account_id(a).ok())
+            {
+                read_keys.insert(keylet::account(&writer).to_string().to_uppercase());
+                if let (Some(cur), Some(iss)) = (
+                    check
+                        .get("SendMax")
+                        .and_then(|s| s.get("currency"))
+                        .and_then(|v| v.as_str()),
+                    check
+                        .get("SendMax")
+                        .and_then(|s| s.get("issuer"))
+                        .and_then(|v| v.as_str()),
+                ) {
+                    if let Ok(iid) = decode_account_id(iss) {
+                        let cb = currency_bytes(cur);
+                        read_keys.insert(keylet::account(&iid).to_string().to_uppercase());
+                        read_keys.insert(
+                            keylet::trust_line(&writer, &iid, &cb)
+                                .to_string()
+                                .to_uppercase(),
+                        );
+                        if let Some(casher) = tx_json
+                            .get("Account")
+                            .and_then(|v| v.as_str())
+                            .and_then(|a| decode_account_id(a).ok())
+                        {
+                            read_keys.insert(
+                                keylet::trust_line(&casher, &iid, &cb)
+                                    .to_string()
+                                    .to_uppercase(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // An NFTokenCreateOffer reads the token holder's NFTokenPage chain to
         // verify ownership (rippled preclaim `findToken`), but creating an offer
         // does not modify the page, so it is absent from AffectedNodes and would
@@ -1080,6 +1137,128 @@ mod tests {
             }
         }
 
+        // Owner-directory pages our tx touches are stale in the parent seed when
+        // an EARLIER sibling tx in this same ledger N added/removed entries to the
+        // same page (or split/merged its page chain). rippled's metadata OMITS the
+        // `Indexes` array, so we cannot read the per-tx delta. But when OUR tx is
+        // the page's LAST toucher in ledger N, the validated on-chain page at N is
+        // authoritative: it equals the faithful pre-tx page with OUR tx's own
+        // owned-object additions/removals already applied. Reconstruct the pre-tx
+        // page by taking the on-chain page at N and reversing only OUR delta — drop
+        // the owned objects our tx CREATED (the engine re-adds them) and restore
+        // the owned objects our tx DELETED (the engine re-removes them). For a page
+        // no sibling touched this yields exactly the parent-ledger page, so passing
+        // repros are unchanged; for an interfered page it supplies the
+        // sibling-updated membership and page-chain pointers the parent seed lacks.
+        // Index the deltas here; the reconstruction runs inside the override loop.
+        let this_txid = txhash.to_uppercase();
+        // Indexes of every owned object our tx CREATED (offers, trust lines, …) —
+        // present in the on-chain page only because our tx added them.
+        let mut created_members: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        // Owner-directory ROOT keys of accounts our tx ADDS an owned object to.
+        // Such a directory is grown via `dir_insert`, which follows the root's
+        // `IndexPrevious` to the last page and may split it. The validated on-chain
+        // page at N already records the POST-split structure (its `IndexPrevious`
+        // can point at a page our tx newly created, which is NOT seeded), so
+        // reconstructing the page's structural links from N would break the add
+        // walk. For these directories the reconstruction keeps the PARENT page's
+        // structure and lets the engine redo the split; only pure-removal
+        // directories take the on-chain structure (the engine never relinks them).
+        let mut add_owner_roots: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        // Owner-directory page key -> indexes of owned objects our tx DELETED that
+        // were linked into that page (mapped via the object's Account/Owner +
+        // OwnerNode hint). RippleState lines (no OwnerNode) are restored by the
+        // trust-line patch further below, so they are skipped here.
+        let mut deleted_owner_members: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        // Owner-directory ROOT key -> the non-zero page numbers our tx removes an
+        // object from. The OfferCancel / crossing-OfferCreate removal path
+        // (`dir_remove`) walks the owner directory FROM the root following
+        // `IndexNext`; in a partial-state replay the deep intermediate pages are
+        // unseeded, so a busy account's root walk stops early and the removal
+        // silently no-ops, leaving the entry stranded. We seed the root below with
+        // an `IndexNext` jump straight to the removed object's page so the walk
+        // reaches it (the add path reads `IndexPrevious`, so this is invisible to
+        // dirAdd). Keyed by the root index, which is also the ledger_entry key.
+        let mut owner_remove_targets: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeSet<u64>,
+        > = std::collections::BTreeMap::new();
+        for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
+            if let Some(e) = node.get("CreatedNode") {
+                if e.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("DirectoryNode") {
+                    if let Some(idx) = e.get("LedgerIndex").and_then(|v| v.as_str()) {
+                        created_members.insert(idx.to_uppercase());
+                    }
+                    // Record every owner directory this creation grows. Most owned
+                    // objects name their owner via Account/Owner; a created
+                    // RippleState links into both the Low/High issuers' directories.
+                    let nf = e.get("NewFields");
+                    let mut owners: Vec<&str> = Vec::new();
+                    if let Some(a) = nf
+                        .and_then(|f| f.get("Account").or_else(|| f.get("Owner")))
+                        .and_then(|v| v.as_str())
+                    {
+                        owners.push(a);
+                    }
+                    for side in ["LowLimit", "HighLimit"] {
+                        if let Some(a) = nf
+                            .and_then(|f| f.get(side))
+                            .and_then(|l| l.get("issuer"))
+                            .and_then(|v| v.as_str())
+                        {
+                            owners.push(a);
+                        }
+                    }
+                    for a in owners {
+                        if let Ok(aid) = decode_account_id(a) {
+                            add_owner_roots
+                                .insert(keylet::owner_dir(&aid).to_string().to_uppercase());
+                        }
+                    }
+                }
+            }
+            if let Some(e) = node.get("DeletedNode") {
+                let lt = e.get("LedgerEntryType").and_then(|v| v.as_str());
+                if lt == Some("DirectoryNode") {
+                    continue;
+                }
+                let ff = e.get("FinalFields");
+                let Some(idx) = e.get("LedgerIndex").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let owner = ff
+                    .and_then(|f| f.get("Account").or_else(|| f.get("Owner")))
+                    .and_then(|v| v.as_str())
+                    .and_then(|a| decode_account_id(a).ok());
+                let node_no = ff
+                    .and_then(|f| f.get("OwnerNode"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| u64::from_str_radix(s, 16).ok());
+                if let (Some(owner), Some(node_no)) = (owner, node_no) {
+                    let root = keylet::owner_dir(&owner);
+                    let page = keylet::dir_node(&root, node_no).to_string().to_uppercase();
+                    deleted_owner_members
+                        .entry(page)
+                        .or_default()
+                        .push(idx.to_uppercase());
+                    // Only the Offer removal path (`dir_remove`) walks from the
+                    // root and so needs the jump; Tickets and other owned objects
+                    // are removed via their recorded page hint and reach their page
+                    // directly. Restrict the jump target to deleted Offers so a
+                    // sibling object on a different page does not misdirect it.
+                    if node_no != 0 && lt == Some("Offer") {
+                        owner_remove_targets
+                            .entry(root.to_string().to_uppercase())
+                            .or_default()
+                            .insert(node_no);
+                    }
+                }
+            }
+        }
+
         // Override affected entries with their exact PRE-tx state, reconstructed
         // from metadata (FinalFields overlaid with PreviousFields). The
         // parent-ledger value is stale whenever an account was already touched by
@@ -1094,10 +1273,127 @@ mod tests {
                 let Some(let_type) = e.get("LedgerEntryType").and_then(|v| v.as_str()) else {
                     continue;
                 };
-                // DirectoryNode metadata omits the `Indexes` array; reconstructing
-                // from it would wipe the directory's existing entries. Keep the
-                // parent-ledger seed (fetched above) which carries full Indexes.
+                // DirectoryNode metadata omits the `Indexes` array. Book
+                // directories (no `Owner` field) are left to the crossing-walk seed
+                // below, which keeps the pre-tx offers the engine must cross. Owner
+                // directories that OUR tx is the last toucher of are reconstructed
+                // faithfully from the validated on-chain page at N with our own
+                // owned-object create/delete reversed (see the delta index above);
+                // a non-interfered page reduces to the parent seed, an interfered
+                // one gains the sibling-updated membership and page-chain pointers.
+                // Pages a LATER sibling touches last keep the parent seed and are
+                // skipped in the comparison.
                 if let_type == "DirectoryNode" {
+                    let key = e["LedgerIndex"].as_str().unwrap().to_uppercase();
+                    let kb: [u8; 32] = hex::decode(&key).unwrap().try_into().unwrap();
+                    let is_owner_dir = e.get("FinalFields").and_then(|f| f.get("Owner")).is_some();
+                    if !is_owner_dir {
+                        continue;
+                    }
+                    if nt == "ModifiedNode" {
+                        // Fetch the validated on-chain page at N and only
+                        // reconstruct when OUR tx threaded it last; otherwise a
+                        // later sibling owns the on-chain membership/pointers and
+                        // the single-tx replay genuinely cannot reproduce it (the
+                        // comparison skips it).
+                        let r = rpc(serde_json::json!({
+                            "method":"ledger_entry","params":[{"index":key,"ledger_index":n,"binary":true}]
+                        }));
+                        let Some(on_chain) = r["result"]["node_binary"]
+                            .as_str()
+                            .and_then(|h| hex::decode(h).ok())
+                            .and_then(|b| rxrpl_codec::binary::decode(&b).ok())
+                        else {
+                            continue;
+                        };
+                        let last = on_chain
+                            .get("PreviousTxnID")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_uppercase());
+                        if last.as_deref() != Some(this_txid.as_str()) {
+                            continue;
+                        }
+                        // Faithful pre-tx membership: the on-chain page with OUR
+                        // delta reversed (drop our creations, restore our deletions).
+                        let mut members: Vec<Value> = on_chain
+                            .get("Indexes")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter(|x| {
+                                        x.as_str()
+                                            .map(|s| !created_members.contains(&s.to_uppercase()))
+                                            .unwrap_or(true)
+                                    })
+                                    .cloned()
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if let Some(add) = deleted_owner_members.get(&key) {
+                            for idx in add {
+                                if !members.iter().any(|x| x.as_str() == Some(idx.as_str())) {
+                                    members.push(Value::String(idx.clone()));
+                                }
+                            }
+                        }
+                        // Structure source: for a directory our tx GROWS, the engine
+                        // re-derives the page-chain links (and may split) from the
+                        // PARENT page, whose `IndexPrevious` still points at a seeded
+                        // last page — so keep the parent structure. A pure-removal
+                        // directory keeps the on-chain structure (the engine never
+                        // relinks it, but a sibling may have).
+                        let root_idx = on_chain
+                            .get("RootIndex")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_uppercase());
+                        let grows = root_idx
+                            .as_deref()
+                            .map(|r| add_owner_roots.contains(r))
+                            .unwrap_or(false);
+                        let mut page = if grows {
+                            state
+                                .get(&Hash256::new(kb))
+                                .and_then(|b| rxrpl_codec::binary::decode(b).ok())
+                                .unwrap_or(on_chain)
+                        } else {
+                            on_chain
+                        };
+                        if let Some(obj) = page.as_object_mut() {
+                            obj.insert("Indexes".into(), Value::Array(members));
+                        }
+                        if let Ok(b) = serde_json::to_vec(&page) {
+                            if let Ok(bin) = rxrpl_ledger::sle_codec::encode_sle(&b) {
+                                state.put(Hash256::new(kb), bin).unwrap();
+                            }
+                        }
+                    } else if let Some(add) = deleted_owner_members.get(&key) {
+                        // Our tx emptied and removed this owner page. Pre-tx it held
+                        // exactly the owned objects our tx removed from it; seed them
+                        // (with the page's structural fields from the DeletedNode's
+                        // FinalFields) so the engine re-removes them and deletes the
+                        // now-empty page (matching theirs == absent).
+                        if let Some(ff) = e.get("FinalFields").and_then(|v| v.as_object()) {
+                            let mut page = serde_json::Map::new();
+                            page.insert(
+                                "LedgerEntryType".into(),
+                                Value::String("DirectoryNode".into()),
+                            );
+                            for f in ["Flags", "RootIndex", "Owner", "IndexNext", "IndexPrevious"] {
+                                if let Some(v) = ff.get(f) {
+                                    page.insert(f.into(), v.clone());
+                                }
+                            }
+                            page.insert(
+                                "Indexes".into(),
+                                Value::Array(add.iter().cloned().map(Value::String).collect()),
+                            );
+                            if let Ok(b) = serde_json::to_vec(&Value::Object(page)) {
+                                if let Ok(bin) = rxrpl_ledger::sle_codec::encode_sle(&b) {
+                                    state.put(Hash256::new(kb), bin).unwrap();
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
                 // A ModifiedNode that only threads PreviousTxnID (a pure "touch",
@@ -1311,6 +1607,54 @@ mod tests {
                             state.put(Hash256::new(kb), newbin).unwrap();
                         }
                     }
+                }
+            }
+        }
+
+        // Seed each owner-directory ROOT that our tx removes an object from on a
+        // non-root page, with an `IndexNext` jump straight to the removed object's
+        // page. `dir_remove` walks the owner directory from the root following
+        // `IndexNext`; the deep intermediate pages of a busy account are unseeded
+        // in this partial-state replay, so without the jump the walk stops early
+        // and the removal no-ops (the entry stays stranded on its high page). The
+        // jump lets the walk land directly on the touched page (already seeded with
+        // the entry by the reconstruction above), where the engine performs the
+        // genuine removal/relink. The add path reads `IndexPrevious`, untouched
+        // here, so dirAdd is unaffected. Roots that are themselves AffectedNodes
+        // (and thus compared) are left alone.
+        let affected_keys: std::collections::BTreeSet<&str> =
+            affected.iter().map(|(k, _)| k.as_str()).collect();
+        for (root_hex, pages) in &owner_remove_targets {
+            if affected_keys.contains(root_hex.as_str()) {
+                continue;
+            }
+            let Some(target) = pages.iter().next().copied() else {
+                continue;
+            };
+            let kb: [u8; 32] = hex::decode(root_hex).unwrap().try_into().unwrap();
+            // Prefer a root already in the seed; else fetch the real one.
+            let mut root = state
+                .get(&Hash256::new(kb))
+                .and_then(|b| rxrpl_codec::binary::decode(b).ok());
+            if root.is_none() {
+                let r = rpc(serde_json::json!({
+                    "method":"ledger_entry",
+                    "params":[{"index":root_hex,"ledger_index":parent,"binary":true}]
+                }));
+                root = r["result"]["node_binary"]
+                    .as_str()
+                    .and_then(|h| hex::decode(h).ok())
+                    .and_then(|b| rxrpl_codec::binary::decode(&b).ok());
+            }
+            // A brand-new owner directory (no root at parent) cannot need a deep
+            // walk; skip. Otherwise point IndexNext straight at the touched page.
+            let Some(mut root) = root else { continue };
+            if let Some(obj) = root.as_object_mut() {
+                obj.insert("IndexNext".into(), Value::String(format!("{target:016X}")));
+            }
+            if let Ok(b) = serde_json::to_vec(&root) {
+                if let Ok(bin) = rxrpl_ledger::sle_codec::encode_sle(&b) {
+                    state.put(Hash256::new(kb), bin).unwrap();
                 }
             }
         }
