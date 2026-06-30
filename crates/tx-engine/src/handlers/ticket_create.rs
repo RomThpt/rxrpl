@@ -53,6 +53,20 @@ impl Transactor for TicketCreateTransactor {
         let mut acct: Value =
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
 
+        // Owner reserve (rippled CreateTicket::doApply): each of the `count`
+        // tickets adds 1 to OwnerCount, so the account must fund the reserve for
+        // the new owner count. rippled compares its `mPriorBalance` (the XRP
+        // balance *before* the fee) against `accountReserve(OwnerCount + count)`
+        // and returns tecINSUFFICIENT_RESERVE — fee and sequence charged, no
+        // tickets created — when it falls short. The engine consumed the fee
+        // centrally before doApply, so reconstruct mPriorBalance by adding it
+        // back; the post-consume OwnerCount already reflects a spent Ticket.
+        let owner_count = helpers::get_owner_count(&acct);
+        let prior_balance = helpers::get_balance(&acct).saturating_add(helpers::get_fee(ctx.tx));
+        if prior_balance < ctx.fees.account_reserve(owner_count + count) {
+            return Err(TransactionResult::TecInsufficientReserve);
+        }
+
         // The engine already consumed the tx's own Sequence/Ticket centrally
         // (parent sandbox). rippled's `firstTicketSeq` is the AccountRoot
         // Sequence *after* that consume: for a sequence-based tx it is the

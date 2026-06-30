@@ -73,45 +73,14 @@ impl Transactor for NFTokenCreateOfferTransactor {
     }
 
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
+        // The sender account must exist. The NFToken ownership check
+        // (tecNO_ENTRY) and the owner-reserve check (tecINSUFFICIENT_RESERVE)
+        // are CLAIMED tecs — they must charge the fee and sequence — so they run
+        // in `apply`, which routes through the engine's central fee/sequence
+        // consume. A tec returned from preclaim short-circuits before that
+        // consume and would wrongly charge nothing.
         let account_str = helpers::get_account(ctx.tx)?;
         helpers::read_account_by_address(ctx.view, account_str)?;
-
-        let nftoken_id =
-            helpers::get_str_field(ctx.tx, "NFTokenID").ok_or(TransactionResult::TemMalformed)?;
-        let flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
-        let is_sell = flags & TF_SELL_NFTOKEN != 0;
-
-        let account_id =
-            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        let owns = nft_hash(nftoken_id)
-            .ok()
-            .and_then(|h| crate::nftoken::find_owner_page(ctx.view, &account_id, &h))
-            .and_then(|pk| ctx.view.read(&pk))
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|page| page.get("NFTokens").cloned())
-            .and_then(|tokens| tokens.as_array().cloned())
-            .map(|toks| {
-                toks.iter()
-                    .any(|t| crate::nftoken::entry_nftoken_id(t) == Some(nftoken_id))
-            })
-            .unwrap_or(false);
-
-        if is_sell {
-            // Sell offer: caller must own the NFT.
-            if !owns {
-                return Err(TransactionResult::TecNoEntry);
-            }
-        } else {
-            // Buy offer: caller must NOT own the NFT (can't buy own).
-            if owns {
-                return Err(TransactionResult::TemMalformed);
-            }
-            // Buy offer also requires the NFT to actually exist somewhere.
-            // We can't easily walk all pages without account context, so
-            // skip the existence check for buy offers — accept_buy verifies
-            // ownership when the offer is matched.
-        }
-
         Ok(())
     }
 
@@ -129,6 +98,55 @@ impl Transactor for NFTokenCreateOfferTransactor {
         let mut acct: Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
+        let flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
+        let is_sell = flags & TF_SELL_NFTOKEN != 0;
+        let nftoken_id = helpers::get_str_field(ctx.tx, "NFTokenID")
+            .ok_or(TransactionResult::TemMalformed)?
+            .to_string();
+
+        // NFToken ownership (rippled NFTokenCreateOffer::preclaim findToken): the
+        // token must exist in its holder's page chain — the seller (sfAccount)
+        // for a sell offer, the named sfOwner for a buy offer — else tecNO_ENTRY.
+        // A buy offer's sfOwner is required. This is a CLAIMED tec (fee and
+        // sequence charged, no offer); it runs in apply so the engine's central
+        // fee/sequence consume applies, and precedes the reserve check exactly as
+        // preclaim precedes doApply in rippled.
+        let token_owner = if is_sell {
+            account_id
+        } else {
+            let owner_str =
+                helpers::get_str_field(ctx.tx, "Owner").ok_or(TransactionResult::TemMalformed)?;
+            decode_account_id(owner_str).map_err(|_| TransactionResult::TemMalformed)?
+        };
+        let owns = nft_hash(&nftoken_id)
+            .ok()
+            .and_then(|h| crate::nftoken::find_owner_page(ctx.view, &token_owner, &h))
+            .and_then(|pk| ctx.view.read(&pk))
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|page| page.get("NFTokens").cloned())
+            .and_then(|tokens| tokens.as_array().cloned())
+            .map(|toks| {
+                toks.iter()
+                    .any(|t| crate::nftoken::entry_nftoken_id(t) == Some(nftoken_id.as_str()))
+            })
+            .unwrap_or(false);
+        if !owns {
+            return Err(TransactionResult::TecNoEntry);
+        }
+
+        // Owner reserve (rippled nft::tokenOfferCreateApply): a new NFTokenOffer
+        // adds 1 owned object, so the creator must fund the reserve for one more
+        // entry. rippled compares its `mPriorBalance` (the XRP balance *before*
+        // the fee) against `accountReserve(OwnerCount + 1)` and returns
+        // tecINSUFFICIENT_RESERVE — fee and sequence charged, no offer — when it
+        // falls short. The engine consumed the fee centrally before doApply, so
+        // reconstruct mPriorBalance by adding it back.
+        let owner_count = helpers::get_owner_count(&acct);
+        let prior_balance = helpers::get_balance(&acct).saturating_add(helpers::get_fee(ctx.tx));
+        if prior_balance < ctx.fees.account_reserve(owner_count + 1) {
+            return Err(TransactionResult::TecInsufficientReserve);
+        }
+
         // The NFTokenOffer's keylet/Sequence is the TX seq-proxy value (the
         // engine already consumed the sender's Sequence/Ticket centrally).
         let tx_seq = helpers::tx_seq_proxy_value(ctx.tx);
@@ -141,11 +159,6 @@ impl Transactor for NFTokenCreateOfferTransactor {
 
         // Create NFTokenOffer entry
         let offer_key = keylet::nftoken_offer(&account_id, tx_seq);
-        let flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
-        let is_sell = flags & TF_SELL_NFTOKEN != 0;
-        let nftoken_id = helpers::get_str_field(ctx.tx, "NFTokenID")
-            .ok_or(TransactionResult::TemMalformed)?
-            .to_string();
 
         // Link into the creator's owner directory and the per-NFToken offer
         // book (buy or sell), recording the owner-directory page as OwnerNode.
@@ -231,24 +244,38 @@ mod tests {
     use rxrpl_ledger::Ledger;
 
     const ACCOUNT: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    const OWNER: &str = "rLNaPoKeeBjZe2qs6x52yVPZpZ8td4dc6w";
     const NFTOKEN_ID: &str = "00000000000000000000000000000000B5F762798A53D543A014CAF8B297CFF8";
 
-    fn setup_ledger() -> Ledger {
-        let mut ledger = Ledger::genesis();
-        let id = decode_account_id(ACCOUNT).unwrap();
+    fn put_account(ledger: &mut Ledger, account: &str, balance: &str) {
+        let id = decode_account_id(account).unwrap();
         let key = keylet::account(&id);
-        let account = serde_json::json!({
+        let obj = serde_json::json!({
             "LedgerEntryType": "AccountRoot",
-            "Account": ACCOUNT,
-            "Balance": "100000000",
+            "Account": account,
+            "Balance": balance,
             "Sequence": 1,
             "OwnerCount": 0,
             "Flags": 0,
         });
         ledger
-            .put_state(key, serde_json::to_vec(&account).unwrap())
+            .put_state(key, serde_json::to_vec(&obj).unwrap())
             .unwrap();
+    }
+
+    fn setup_ledger() -> Ledger {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ACCOUNT, "100000000");
         ledger
+    }
+
+    /// Seed `holder`'s NFTokenPage chain so it owns NFTOKEN_ID, mirroring the
+    /// on-chain state that NFTokenCreateOffer::preclaim `findToken` requires.
+    fn seed_nft(sandbox: &mut Sandbox, holder: &str) {
+        let id = decode_account_id(holder).unwrap();
+        let nft: Hash256 = NFTOKEN_ID.parse().unwrap();
+        let entry = serde_json::json!({ "NFToken": { "NFTokenID": NFTOKEN_ID } });
+        crate::nftoken::insert_token(sandbox, &id, &nft, entry).unwrap();
     }
 
     #[test]
@@ -257,6 +284,7 @@ mod tests {
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let mut sandbox = Sandbox::new(&view);
+        seed_nft(&mut sandbox, ACCOUNT);
         let rules = Rules::new();
         let tx = serde_json::json!({
             "TransactionType": "NFTokenCreateOffer",
@@ -289,14 +317,18 @@ mod tests {
 
     #[test]
     fn create_buy_offer() {
-        let ledger = setup_ledger();
+        let mut ledger = setup_ledger();
+        put_account(&mut ledger, OWNER, "100000000");
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let mut sandbox = Sandbox::new(&view);
+        // The named Owner must hold the NFT for the buy offer to be placed.
+        seed_nft(&mut sandbox, OWNER);
         let rules = Rules::new();
         let tx = serde_json::json!({
             "TransactionType": "NFTokenCreateOffer",
             "Account": ACCOUNT,
+            "Owner": OWNER,
             "NFTokenID": NFTOKEN_ID,
             "Amount": "5000000",
             "Fee": "12",
@@ -312,6 +344,67 @@ mod tests {
 
         let result = NFTokenCreateOfferTransactor.apply(&mut ctx).unwrap();
         assert_eq!(result, TransactionResult::TesSuccess);
+    }
+
+    #[test]
+    fn buy_offer_unknown_owner_token_is_no_entry() {
+        let mut ledger = setup_ledger();
+        put_account(&mut ledger, OWNER, "100000000");
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        // Owner does NOT hold the NFT — no page seeded.
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenCreateOffer",
+            "Account": ACCOUNT,
+            "Owner": OWNER,
+            "NFTokenID": NFTOKEN_ID,
+            "Amount": "5000000",
+            "Fee": "12",
+            "Sequence": 1,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            NFTokenCreateOfferTransactor.apply(&mut ctx),
+            Err(TransactionResult::TecNoEntry)
+        );
+    }
+
+    #[test]
+    fn sell_offer_below_reserve_is_insufficient_reserve() {
+        let mut ledger = Ledger::genesis();
+        // Balance under the single-object reserve (account_reserve(1)).
+        put_account(&mut ledger, ACCOUNT, "11000000");
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        seed_nft(&mut sandbox, ACCOUNT);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenCreateOffer",
+            "Account": ACCOUNT,
+            "NFTokenID": NFTOKEN_ID,
+            "Amount": "1000000",
+            "Flags": TF_SELL_NFTOKEN,
+            "Fee": "12",
+            "Sequence": 1,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            NFTokenCreateOfferTransactor.apply(&mut ctx),
+            Err(TransactionResult::TecInsufficientReserve)
+        );
     }
 
     #[test]

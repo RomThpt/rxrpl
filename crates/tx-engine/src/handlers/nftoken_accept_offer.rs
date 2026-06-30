@@ -663,6 +663,7 @@ mod tests {
         let buy_tx = serde_json::json!({
             "TransactionType": "NFTokenCreateOffer",
             "Account": BUYER,
+            "Owner": SELLER,
             "NFTokenID": nftoken_id,
             "Amount": "3000000",
             "Fee": "12",
