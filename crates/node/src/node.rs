@@ -452,6 +452,14 @@ impl Node {
                     );
                 }
 
+                // Deferred negative-UNL move: process any pending
+                // ValidatorToDisable/ReEnable set at the PREVIOUS flag ledger
+                // BEFORE generating this flag ledger's pseudo-txs. Mirrors
+                // rippled's buildLedgerImpl, where updateNegativeUNL() runs
+                // before the UNLModify txs are applied (no-op off a flag
+                // ledger or with nothing pending).
+                Node::update_negative_unl(&mut l, ledger_seq);
+
                 // Apply negative-UNL pseudo-transactions on flag ledgers
                 // (no-op otherwise). Mirrors apply_amendment_voting:
                 // pseudo-txs land before the ledger's final hash is
@@ -3133,6 +3141,11 @@ impl Node {
 
         // Apply negative-UNL pseudo-transactions on flag ledgers.
         let nunl_seq = l.header.sequence;
+        // Deferred move first (mirrors rippled buildLedgerImpl:
+        // updateNegativeUNL() precedes the UNLModify pseudo-txs), so a
+        // disable requested at the previous flag ledger is moved into
+        // DisabledValidators before this flag ledger sets new pending fields.
+        Node::update_negative_unl(&mut l, nunl_seq);
         let _nunl_results = Node::apply_negative_unl(consensus, &mut l, tx_engine, fees, nunl_seq);
         consensus.on_ledger_close_for_tracker();
 
@@ -3789,6 +3802,118 @@ impl Node {
             }
         }
         results
+    }
+
+    /// Deferred negative-UNL move at a flag-ledger build.
+    ///
+    /// Mirrors rippled's [`Ledger::updateNegativeUNL`]. The `UNLModify`
+    /// pseudo-transaction (`Node::apply_negative_unl` ->
+    /// `UNLModifyTransactor`) only records the *pending*
+    /// `ValidatorToDisable` / `ValidatorToReEnable` field on the
+    /// `NegativeUNL` singleton. The actual move into / out of
+    /// `DisabledValidators` is deferred to the build of the NEXT flag
+    /// ledger, which is what this function performs:
+    ///
+    /// - `ValidatorToDisable` present: append a
+    ///   `{"DisabledValidator": {"PublicKey", "FirstLedgerSequence"}}`
+    ///   entry (stamping `flag_ledger_seq`), then drop the pending field.
+    /// - `ValidatorToReEnable` present: remove the matching `PublicKey`
+    ///   entry, then drop the pending field.
+    ///
+    /// Entries are appended to the back exactly as rippled's `pushBack`
+    /// (no re-sort). If the resulting array is empty the object is erased,
+    /// matching rippled's `rawErase`.
+    ///
+    /// IMPORTANT: this MUST be invoked BEFORE [`Self::apply_negative_unl`]
+    /// at a flag-ledger build, mirroring `buildLedgerImpl` where
+    /// `updateNegativeUNL()` runs before the `UNLModify` pseudo-txs are
+    /// applied. Running it after would (a) immediately move a freshly
+    /// requested disable instead of deferring it and (b) let a new
+    /// `ValidatorToDisable` overwrite a still-pending one. Off a flag
+    /// ledger (or when the object is absent / has no pending field) this is
+    /// a no-op.
+    pub fn update_negative_unl(ledger: &mut Ledger, flag_ledger_seq: u32) {
+        if !rxrpl_amendment::is_flag_ledger(flag_ledger_seq) {
+            return;
+        }
+
+        let key = keylet::negative_unl();
+        let Some(raw) = ledger.get_state(&key) else {
+            return; // no NegativeUNL object yet
+        };
+        let Ok(mut obj) = rxrpl_ledger::sle_codec::decode_state(raw) else {
+            tracing::warn!("update_negative_unl: failed to decode NegativeUNL object");
+            return;
+        };
+
+        let to_disable = obj
+            .get("ValidatorToDisable")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let to_reenable = obj
+            .get("ValidatorToReEnable")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        if to_disable.is_none() && to_reenable.is_none() {
+            return; // nothing pending
+        }
+
+        // Rebuild DisabledValidators: carry forward existing entries (minus
+        // the re-enabled one), then append the newly disabled validator.
+        let mut new_disabled: Vec<Value> = Vec::new();
+        if let Some(arr) = obj.get("DisabledValidators").and_then(|v| v.as_array()) {
+            for entry in arr {
+                if let Some(reenable) = &to_reenable {
+                    let pk = entry
+                        .get("DisabledValidator")
+                        .and_then(|d| d.get("PublicKey"))
+                        .and_then(|p| p.as_str());
+                    if pk == Some(reenable.as_str()) {
+                        continue; // drop the re-enabled validator
+                    }
+                }
+                new_disabled.push(entry.clone());
+            }
+        }
+
+        if let Some(disable) = &to_disable {
+            new_disabled.push(serde_json::json!({
+                "DisabledValidator": {
+                    "PublicKey": disable,
+                    "FirstLedgerSequence": flag_ledger_seq,
+                }
+            }));
+        }
+
+        if new_disabled.is_empty() {
+            // rippled erases the whole object when nothing remains.
+            if let Err(e) = ledger.delete_state(&key) {
+                tracing::error!("update_negative_unl: failed to erase NegativeUNL: {}", e);
+            }
+            return;
+        }
+
+        if let Some(map) = obj.as_object_mut() {
+            map.insert("DisabledValidators".to_string(), Value::Array(new_disabled));
+            map.remove("ValidatorToDisable");
+            map.remove("ValidatorToReEnable");
+        }
+
+        let Ok(json_bytes) = serde_json::to_vec(&obj) else {
+            tracing::error!("update_negative_unl: failed to serialize NegativeUNL");
+            return;
+        };
+        let binary = match rxrpl_ledger::sle_codec::encode_sle(&json_bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("update_negative_unl: failed to encode NegativeUNL: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = ledger.put_state(key, binary) {
+            tracing::error!("update_negative_unl: failed to write NegativeUNL: {}", e);
+        }
     }
 
     /// Close the current ledger and return a new open ledger derived from it.
