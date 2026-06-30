@@ -3,8 +3,20 @@ use std::collections::HashMap;
 use rxrpl_primitives::Hash256;
 
 use crate::fees::FeeSettings;
-use crate::view::apply_view::{ApplyError, ApplyView};
+use crate::view::apply_view::{ApplyCheckpoint, ApplyError, ApplyView};
 use crate::view::read_view::ReadView;
+
+/// Type-erased snapshot of a [`Sandbox`]'s mutation maps, carried inside an
+/// [`ApplyCheckpoint`]. Cloned by `Sandbox::checkpoint` and restored by
+/// `Sandbox::rollback`. Payment sandboxes hold only a few dozen SLEs, so the
+/// clone is cheap.
+struct SandboxSnapshot {
+    inserts: HashMap<Hash256, Vec<u8>>,
+    updates: HashMap<Hash256, Vec<u8>>,
+    deletes: HashMap<Hash256, Vec<u8>>,
+    originals: HashMap<Hash256, Vec<u8>>,
+    destroyed_drops: u64,
+}
 
 /// A copy-on-write mutation layer over a `ReadView`.
 ///
@@ -249,6 +261,29 @@ impl ApplyView for Sandbox<'_> {
     }
     fn thread_directories(&self) -> bool {
         self.thread_directories
+    }
+
+    fn checkpoint(&self) -> ApplyCheckpoint {
+        ApplyCheckpoint(Some(Box::new(SandboxSnapshot {
+            inserts: self.inserts.clone(),
+            updates: self.updates.clone(),
+            deletes: self.deletes.clone(),
+            originals: self.originals.clone(),
+            destroyed_drops: self.destroyed_drops,
+        })))
+    }
+
+    fn rollback(&mut self, cp: ApplyCheckpoint) {
+        let Some(any) = cp.0 else { return };
+        let Ok(snap) = any.downcast::<SandboxSnapshot>() else {
+            return;
+        };
+        let snap = *snap;
+        self.inserts = snap.inserts;
+        self.updates = snap.updates;
+        self.deletes = snap.deletes;
+        self.originals = snap.originals;
+        self.destroyed_drops = snap.destroyed_drops;
     }
 }
 
@@ -500,6 +535,60 @@ mod tests {
 
         assert_eq!(ledger.get_state(&k1), Some(&[10][..]));
         assert!(!ledger.has_state(&k2));
+    }
+
+    #[test]
+    fn checkpoint_rollback_restores_state() {
+        let (mut ledger, _) = genesis_view();
+        let existing = Hash256::new([0x10; 32]);
+        ledger.put_state(existing, vec![1]).unwrap();
+
+        let view = LedgerView::new(&ledger);
+        let mut sandbox = Sandbox::new(&view);
+        sandbox.update(existing, vec![2]).unwrap();
+
+        // Checkpoint, then mutate further (insert + update + erase + destroy).
+        let cp = sandbox.checkpoint();
+        let inserted = Hash256::new([0x11; 32]);
+        sandbox.insert(inserted, vec![9]).unwrap();
+        sandbox.update(existing, vec![3]).unwrap();
+        sandbox.erase(&existing).unwrap();
+        sandbox.destroy_drops(123);
+        assert!(!sandbox.exists(&existing));
+        assert!(sandbox.exists(&inserted));
+        assert_eq!(sandbox.destroyed_drops(), 123);
+
+        // Rollback restores exactly the checkpointed state.
+        sandbox.rollback(cp);
+        assert_eq!(sandbox.read(&existing), Some(vec![2]));
+        assert!(!sandbox.exists(&inserted));
+        assert_eq!(sandbox.destroyed_drops(), 0);
+    }
+
+    #[test]
+    fn reap_side_channel_survives_rollback() {
+        // The reap pattern: a deletion threaded out as a side-channel is
+        // re-applied AFTER rollback, so an unfunded-offer removal survives a
+        // discarded speculative trial (matches rippled's ofrsToRm -> accumSandbox).
+        let (mut ledger, _) = genesis_view();
+        let offer = Hash256::new([0x20; 32]);
+        ledger.put_state(offer, vec![1]).unwrap();
+
+        let view = LedgerView::new(&ledger);
+        let mut sandbox = Sandbox::new(&view);
+        let cp = sandbox.checkpoint();
+        // Speculative mutation that will be discarded.
+        sandbox.update(offer, vec![7]).unwrap();
+        // Side-channel reap recorded out of band.
+        let reap = vec![offer];
+        sandbox.rollback(cp);
+        // The trial's mutation is gone...
+        assert_eq!(sandbox.read(&offer), Some(vec![1]));
+        // ...but the reap is re-applied permanently.
+        for k in &reap {
+            sandbox.erase(k).unwrap();
+        }
+        assert!(!sandbox.exists(&offer));
     }
 
     #[test]

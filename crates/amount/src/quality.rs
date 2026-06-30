@@ -99,6 +99,34 @@ pub fn round_quality(rate: u64, digits: u8) -> u64 {
     (exponent << 56) | mantissa
 }
 
+/// Whether the relative distance between two packed qualities is within `1e-7`
+/// (rippled `withinRelativeDistance(Quality, Quality, Number{1,-7})`,
+/// `AMMHelpers.h:112`). Used by `AMMLiquidity::getOffer`'s spot-price gate: the
+/// AMM declines to undercut a CLOB tip it is already this close to, preventing a
+/// many-iteration approach to the same quality.
+///
+/// rippled computes `(min_q.rate() - max_q.rate()) / min_q.rate()` where the
+/// "min" quality is the worse one (the larger rate). In rate terms that is
+/// `(maxRate - minRate) / maxRate`, evaluated in `Number` precision.
+pub fn within_relative_distance(rate_a: u64, rate_b: u64) -> bool {
+    use crate::number::Number;
+    if rate_a == rate_b {
+        return true;
+    }
+    let na = Number::from_iou(&from_rate(rate_a).unwrap_or(IOUAmount::ZERO));
+    let nb = Number::from_iou(&from_rate(rate_b).unwrap_or(IOUAmount::ZERO));
+    // max/min by rate magnitude (packed-u64 order is monotonic in magnitude).
+    let (min, max) = if rate_a < rate_b { (na, nb) } else { (nb, na) };
+    if max.is_zero() {
+        return true;
+    }
+    let dist = Number::from_int(1).div(&Number::from_int(10_000_000)); // 1e-7
+    let rel = max.sub(&min).div(&max);
+    // rel < dist
+    let d = rel.sub(&dist);
+    d.negative()
+}
+
 /// Compare two quality values.
 ///
 /// Returns true if quality `a` represents a better (lower) rate than `b`.
@@ -251,6 +279,25 @@ mod tests {
         assert!(!is_better_quality(0, 0));
         assert!(!is_better_quality(0, 100));
         assert!(is_better_quality(100, 0));
+    }
+
+    #[test]
+    fn within_relative_distance_identity_and_threshold() {
+        let one = IOUAmount::new(1_000_000_000_000_000, -15).unwrap();
+        let r = get_rate(&one, &one).unwrap();
+        // Identical rates are trivially within distance.
+        assert!(within_relative_distance(r, r));
+
+        // Two rates differing by ~1e-9 (well under 1e-7) are within distance.
+        let near = IOUAmount::new(1_000_000_001_000_000, -15).unwrap();
+        let rn = get_rate(&near, &one).unwrap();
+        assert!(within_relative_distance(r, rn));
+        assert!(within_relative_distance(rn, r), "symmetric");
+
+        // Two rates differing by ~1e-3 (well over 1e-7) are NOT within distance.
+        let far = IOUAmount::new(1_001_000_000_000_000, -15).unwrap();
+        let rf = get_rate(&far, &one).unwrap();
+        assert!(!within_relative_distance(r, rf));
     }
 
     #[test]

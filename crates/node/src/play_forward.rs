@@ -982,6 +982,21 @@ mod tests {
                             }
                         }
                         specs.push(dst_spec.clone());
+                        // A genuinely multi-path Payment (>= 2 alternative Paths)
+                        // runs through the multi-pass Flow loop, which prices EVERY
+                        // boundary AMM along EVERY path — not just the first /
+                        // metadata-touched pool. The downstream pools (e.g. the
+                        // XRP/RLUSD and RLUSD/USDC AMMs of an XJOY->XRP->RLUSD->USDC
+                        // strand) read their pseudo-account AccountRoot (pool XRP
+                        // balance) and each pool asset's IOU trust line (pool IOU
+                        // balance), none of which appear in this tx's AffectedNodes
+                        // (only the metadata-touched first pool does). Seed them so
+                        // `build_flow_strand` reads real pool balances at every hop
+                        // instead of zeroing the downstream AMMs (which collapses
+                        // the multi-strand competition to a single full swap). Gated
+                        // on Paths.len() > 1 so the 18 single-path cross-currency
+                        // and 8 single-path AMM-routed repros are untouched.
+                        let seed_pools = paths.len() > 1;
                         for pair in specs.windows(2) {
                             if pair[0] == pair[1] {
                                 continue;
@@ -989,7 +1004,46 @@ mod tests {
                             if let Ok(amm_key) =
                                 rxrpl_tx_engine::amm_helpers::compute_amm_key(&pair[0], &pair[1])
                             {
-                                read_keys.insert(amm_key.to_string().to_uppercase());
+                                let amm_idx = amm_key.to_string().to_uppercase();
+                                read_keys.insert(amm_idx.clone());
+                                if !seed_pools {
+                                    continue;
+                                }
+                                // Fetch the pool SLE to learn the pseudo-account,
+                                // then seed its AccountRoot + each pool asset's
+                                // trust line so the pool balances are readable.
+                                let r = rpc(serde_json::json!({
+                                    "method":"ledger_entry",
+                                    "params":[{"index":amm_idx,"ledger_index":parent}]
+                                }));
+                                let amm = &r["result"]["node"];
+                                let Some(amm_id) = amm
+                                    .get("Account")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|s| decode_account_id(s).ok())
+                                else {
+                                    continue;
+                                };
+                                read_keys
+                                    .insert(keylet::account(&amm_id).to_string().to_uppercase());
+                                for asset in [&pair[0], &pair[1]] {
+                                    if let (Some(cur), Some(iss)) = (
+                                        asset.get("currency").and_then(|v| v.as_str()),
+                                        asset.get("issuer").and_then(|v| v.as_str()),
+                                    ) {
+                                        if let Ok(iss_id) = decode_account_id(iss) {
+                                            read_keys.insert(
+                                                keylet::trust_line(
+                                                    &amm_id,
+                                                    &iss_id,
+                                                    &currency_bytes(cur),
+                                                )
+                                                .to_string()
+                                                .to_uppercase(),
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
