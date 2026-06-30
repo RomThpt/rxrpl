@@ -1,6 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 #[cfg(feature = "grpc")]
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -111,6 +112,88 @@ impl Node {
     #[allow(dead_code)]
     pub(crate) fn validation_seed(&self) -> Option<&Seed> {
         self.validation_seed.as_ref()
+    }
+
+    /// Directory for the resume-from-disk pointer, when a *persistent* node
+    /// store is configured. Returns `None` for in-memory / store-less
+    /// backends: their SHAMap nodes do not survive a restart, so a resume
+    /// pointer would be useless (it would just fail `from_header` and fall
+    /// through to RPC/genesis). Mirrors the `flush()` gating, which is a
+    /// no-op without a persistent store.
+    fn resume_dir(&self) -> Option<PathBuf> {
+        if self.node_store.is_some() && self.config.database.backend != "memory" {
+            Some(self.config.database.path.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Best-effort resume from a previously persisted validated ledger.
+    ///
+    /// On a prior run, every validated close wrote the 118-byte header to
+    /// `<db_dir>/resume_ledger.bin` immediately after flushing its SHAMap
+    /// nodes to the persistent node store. Here we read that pointer and
+    /// reconstruct the validated ledger lazily from the store
+    /// (`Ledger::from_header`, which fetches the state/tx root nodes — a
+    /// cheap probe that the subtree is actually present), then install it
+    /// as the base ledger exactly like the RPC-bootstrap path.
+    ///
+    /// Returns `true` when the validated ledger was reconstructed and
+    /// installed (so the caller skips the ~32-minute RPC bootstrap), `false`
+    /// on any failure (no store, no pointer, decode fail, or missing SHAMap
+    /// nodes), leaving the genesis ledger in place. Never blocks startup.
+    async fn resume_from_disk(&self) -> bool {
+        let Some(store) = self.node_store.as_ref() else {
+            return false;
+        };
+        let db_dir = &self.config.database.path;
+        let Some(header) = crate::resume_ledger_store::load(db_dir) else {
+            return false;
+        };
+        let seq = header.sequence;
+        let expected_hash = header.hash;
+
+        // `from_header` fetches the state/tx root nodes from the store; an
+        // error means the validated subtree is not (fully) present, so we
+        // cannot trust the resume and fall back to RPC/genesis.
+        let validated = match Ledger::from_header(header, Arc::clone(store)) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(
+                    "resume-from-disk: validated ledger #{} pointer found but state not \
+                     reconstructable from store ({}); falling back to RPC/genesis",
+                    seq,
+                    e,
+                );
+                return false;
+            }
+        };
+
+        // Sanity: the reconstructed header must hash to the persisted hash.
+        if validated.header.hash != expected_hash {
+            tracing::warn!(
+                "resume-from-disk: reconstructed ledger #{} hash {} != persisted {}; ignoring",
+                seq,
+                validated.header.hash,
+                expected_hash,
+            );
+            return false;
+        }
+
+        let hash = validated.header.hash;
+        // Mirror `bootstrap_from_rpc`'s install: the open ledger becomes
+        // validated+1 and the validated ledger is pushed onto
+        // `closed_ledgers`. The shared `ledger_seq`/`ledger_hash` atomics are
+        // derived from the installed open ledger immediately afterwards.
+        *self.ledger.write().await = Ledger::new_open(&validated);
+        self.closed_ledgers.write().await.push_back(validated);
+        tracing::info!(
+            "resumed from disk: validated ledger #{} hash={}, open ledger #{}",
+            seq,
+            hash,
+            seq + 1,
+        );
+        true
     }
 
     /// Load the validator signing seed if configured, enforcing strict
@@ -368,6 +451,9 @@ impl Node {
         let interval_duration = Duration::from_secs(close_interval_secs);
         let pruner = Arc::clone(&self.pruner);
         let node_store_prune = self.node_store.clone();
+        // Resume pointer dir: Some only for a persistent backend (no-op for
+        // the in-memory standalone default).
+        let resume_dir = self.resume_dir();
 
         tokio::spawn(async move {
             let adapter = NodeConsensusAdapter::new();
@@ -478,9 +564,17 @@ impl Node {
                     continue;
                 }
 
-                // Flush closed ledger to node store
-                if let Err(e) = l.flush() {
-                    tracing::warn!("failed to flush ledger: {}", e);
+                // Flush closed ledger to node store, then persist the
+                // resume pointer so a restart skips the RPC re-bootstrap.
+                match l.flush() {
+                    Ok(_) => {
+                        if let Some(ref dir) = resume_dir {
+                            if let Err(e) = crate::resume_ledger_store::save(dir, &l.header) {
+                                tracing::warn!("failed to persist resume pointer: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("failed to flush ledger: {}", e),
                 }
 
                 let hash = l.header.hash;
@@ -813,72 +907,83 @@ impl Node {
             None => None,
         };
 
-        // 2. Bootstrap from RPC: fetch latest validated ledger to set our starting point
-        if let Some(rpc_url) = sync_rpc_url {
-            match Self::bootstrap_from_rpc(rpc_url).await {
-                Ok((seq, hash)) => {
-                    let mut l = self.ledger.write().await;
-                    l.header.sequence = seq + 1; // open ledger = validated + 1
-                    l.header.parent_hash = hash;
-                    drop(l);
-                    tracing::info!(
-                        "bootstrapped from RPC: validated ledger #{} hash={}, open ledger #{}",
-                        seq,
-                        hash,
-                        seq + 1
-                    );
+        // 2a. Resume from disk (best-effort): if a prior run persisted its
+        // latest validated ledger AND that ledger's SHAMap nodes are still in
+        // the node store, reconstruct it lazily and install it as the base
+        // ledger — skipping the ~32-minute RPC re-bootstrap below. Any failure
+        // (no pointer, decode fail, missing nodes) falls through to the
+        // existing RPC/genesis path unchanged.
+        let resumed = self.resume_from_disk().await;
 
-                    // Bulk-download and VERIFY the full validated state via RPC,
-                    // then install it as our base ledger -- the fast, completing
-                    // alternative to node-by-node P2P SHAMap sync.
-                    if let Some(ref store) = self.node_store {
-                        let hash_hex = hex::encode(hash.as_bytes());
-                        match Self::fetch_validated_header(rpc_url, &hash_hex).await {
-                            Ok(header) => {
-                                match Self::download_state_via_rpc(
-                                    rpc_url,
-                                    &hash_hex,
-                                    header.account_hash,
-                                    Arc::clone(store),
-                                )
-                                .await
-                                {
-                                    Ok(state_map) => {
-                                        let mut validated = Ledger::from_catchup_with_store(
-                                            seq,
-                                            hash,
-                                            state_map,
-                                            Arc::clone(store),
-                                        );
-                                        // Apply the trusted validated header so the
-                                        // next local close agrees with the chain.
-                                        validated.header = header;
-                                        *self.ledger.write().await = Ledger::new_open(&validated);
-                                        self.closed_ledgers.write().await.push_back(validated);
-                                        tracing::info!(
-                                            "installed RPC-bootstrapped validated state for ledger #{}",
-                                            seq
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "RPC state download failed (P2P sync will be used): {}",
-                                            e
-                                        );
+        // 2. Bootstrap from RPC: fetch latest validated ledger to set our starting point
+        if !resumed {
+            if let Some(rpc_url) = sync_rpc_url {
+                match Self::bootstrap_from_rpc(rpc_url).await {
+                    Ok((seq, hash)) => {
+                        let mut l = self.ledger.write().await;
+                        l.header.sequence = seq + 1; // open ledger = validated + 1
+                        l.header.parent_hash = hash;
+                        drop(l);
+                        tracing::info!(
+                            "bootstrapped from RPC: validated ledger #{} hash={}, open ledger #{}",
+                            seq,
+                            hash,
+                            seq + 1
+                        );
+
+                        // Bulk-download and VERIFY the full validated state via RPC,
+                        // then install it as our base ledger -- the fast, completing
+                        // alternative to node-by-node P2P SHAMap sync.
+                        if let Some(ref store) = self.node_store {
+                            let hash_hex = hex::encode(hash.as_bytes());
+                            match Self::fetch_validated_header(rpc_url, &hash_hex).await {
+                                Ok(header) => {
+                                    match Self::download_state_via_rpc(
+                                        rpc_url,
+                                        &hash_hex,
+                                        header.account_hash,
+                                        Arc::clone(store),
+                                    )
+                                    .await
+                                    {
+                                        Ok(state_map) => {
+                                            let mut validated = Ledger::from_catchup_with_store(
+                                                seq,
+                                                hash,
+                                                state_map,
+                                                Arc::clone(store),
+                                            );
+                                            // Apply the trusted validated header so the
+                                            // next local close agrees with the chain.
+                                            validated.header = header;
+                                            *self.ledger.write().await =
+                                                Ledger::new_open(&validated);
+                                            self.closed_ledgers.write().await.push_back(validated);
+                                            tracing::info!(
+                                                "installed RPC-bootstrapped validated state for ledger #{}",
+                                                seq
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "RPC state download failed (P2P sync will be used): {}",
+                                                e
+                                            );
+                                        }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "could not fetch validated header for RPC bootstrap: {}",
-                                    e
-                                );
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "could not fetch validated header for RPC bootstrap: {}",
+                                        e
+                                    );
+                                }
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!("RPC bootstrap failed (starting from genesis): {}", e);
+                    Err(e) => {
+                        tracing::warn!("RPC bootstrap failed (starting from genesis): {}", e);
+                    }
                 }
             }
         }
@@ -1286,6 +1391,9 @@ impl Node {
         let tx_queue = Arc::clone(&self.tx_queue);
         let amendment_table = Arc::clone(&self.amendment_table);
         let node_store = self.node_store.clone();
+        // Resume pointer dir: Some only for a persistent backend. Captured by
+        // the consensus loop so each validated close updates the pointer.
+        let resume_dir_for_loop = self.resume_dir();
         let tx_store = self.tx_store.as_ref().map(Arc::clone);
         let pruner = Arc::clone(&self.pruner);
         let ledger_seq_shared = Arc::clone(&ledger_seq);
@@ -1894,6 +2002,7 @@ impl Node {
                                             &mut self_validation_guard,
                                             &amendment_blocked_for_loop,
                                             &known_amendment_ids,
+                                            resume_dir_for_loop.as_deref(),
                                         ).await;
                                         if let Ok(mut lc) = last_close_arc.write() {
                                             lc.proposers = proposers_this_round;
@@ -2088,6 +2197,7 @@ impl Node {
                                             &mut self_validation_guard,
                                             &amendment_blocked_for_loop,
                                             &known_amendment_ids,
+                                            resume_dir_for_loop.as_deref(),
                                         ).await;
                                         if let Ok(mut lc) = last_close_arc.write() {
                                             lc.proposers = proposers_this_round;
@@ -3081,6 +3191,7 @@ impl Node {
         validation_guard: &mut crate::validation_guard::SelfValidationGuard,
         amendment_blocked: &Arc<AtomicBool>,
         known_amendment_ids: &HashSet<Hash256>,
+        resume_dir: Option<&Path>,
     ) {
         // Resolve close_time in priority order:
         //  1. Quorum-accepted close_time from converge() — strongest signal,
@@ -3154,9 +3265,18 @@ impl Node {
             return;
         }
 
-        // Flush closed ledger to node store
-        if let Err(e) = l.flush() {
-            tracing::warn!("failed to flush ledger: {}", e);
+        // Flush closed ledger to node store, then persist the resume pointer
+        // (best-effort) so a restart can reconstruct this validated ledger
+        // from the store and skip the ~32-minute RPC re-bootstrap.
+        match l.flush() {
+            Ok(_) => {
+                if let Some(dir) = resume_dir {
+                    if let Err(e) = crate::resume_ledger_store::save(dir, &l.header) {
+                        tracing::warn!("failed to persist resume pointer: {}", e);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("failed to flush ledger: {}", e),
         }
 
         let hash = l.header.hash;
