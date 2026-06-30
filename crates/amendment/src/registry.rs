@@ -51,6 +51,13 @@ impl FeatureRegistry {
         self.by_id.values()
     }
 
+    /// Iterate the ids of every known amendment (the set this build can apply).
+    /// Used by the amendment-blocked safety halt to detect an on-ledger
+    /// amendment this node does not understand.
+    pub fn known_ids(&self) -> impl Iterator<Item = &Hash256> {
+        self.by_id.keys()
+    }
+
     /// Number of registered features.
     pub fn len(&self) -> usize {
         self.by_id.len()
@@ -294,5 +301,34 @@ mod tests {
         // fixAMMv1_3 should exist exactly once as retired
         let f = reg.get_by_name("fixAMMv1_3").unwrap();
         assert!(f.retired);
+    }
+
+    #[test]
+    fn amendment_blocked_detection_predicate() {
+        use crate::rules::Rules;
+        use std::collections::HashSet;
+
+        let reg = FeatureRegistry::with_known_amendments();
+        let known: HashSet<Hash256> = reg.known_ids().copied().collect();
+
+        // A clearly-unknown amendment id is not in the registry.
+        let unknown = Hash256::new([0xAB; 32]);
+        assert!(reg.get(&unknown).is_none());
+
+        // Rules that enable the unknown amendment trip the halt predicate.
+        let mut enabled: Vec<Hash256> = known.iter().take(3).copied().collect();
+        enabled.push(unknown);
+        let rules_with_unknown = Rules::from_enabled(enabled);
+        assert!(
+            rules_with_unknown.iter().any(|id| !known.contains(id)),
+            "rules enabling an unknown amendment must be flagged as blocked"
+        );
+
+        // Rules whose enabled set is a subset of known ids do NOT trip it.
+        let rules_all_known = Rules::from_enabled(known.iter().copied().collect::<Vec<_>>());
+        assert!(
+            !rules_all_known.iter().any(|id| !known.contains(id)),
+            "rules with only known amendments must not be flagged"
+        );
     }
 }

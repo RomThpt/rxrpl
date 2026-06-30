@@ -2,7 +2,7 @@ use std::collections::{HashSet, VecDeque};
 #[cfg(feature = "grpc")]
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use rxrpl_amendment::{AmendmentTable, FeatureRegistry, Rules};
@@ -923,13 +923,21 @@ impl Node {
         let cmd_tx_catchup = cmd_tx.clone();
         let cmd_tx_rpc = cmd_tx.clone();
 
+        // Amendment-blocked safety halt: set true by `close_consensus_round`
+        // once an on-ledger amendment this build does not understand becomes
+        // enabled. Shared with the consensus adapter (suppresses proposals),
+        // the consensus loop (suppresses validation), and the RPC context
+        // (reports `server_info.amendment_blocked`). Once set, stays set.
+        let amendment_blocked = Arc::new(AtomicBool::new(false));
+
         // 5. Create NetworkConsensusAdapter (consumes cmd_tx). When a
         // validator identity is configured, attach it so that proposals are
         // signed with the manifest-bound ephemeral signing key (issue #76 —
         // rippled drops proposals signed with the node peer key as
         // untrusted).
         let adapter = {
-            let base = NetworkConsensusAdapter::new(cmd_tx, Arc::clone(&identity));
+            let base = NetworkConsensusAdapter::new(cmd_tx, Arc::clone(&identity))
+                .with_amendment_blocked_flag(Arc::clone(&amendment_blocked));
             match validator_id.as_ref() {
                 Some(vid) => base.with_validator_identity(Arc::clone(vid)),
                 None => base,
@@ -1064,6 +1072,8 @@ impl Node {
             rxrpl_rpc_server::NetworkValidatedSnapshot::default(),
         ));
         ctx.attach_network_validated(Arc::clone(&network_validated_arc));
+        // Amendment-blocked flag: surfaced as `server_info.amendment_blocked`.
+        ctx.attach_amendment_blocked(Arc::clone(&amendment_blocked));
         // B5: expose the local manifest to the RPC `manifest` handler.
         if let Some(vid) = validator_id.as_deref() {
             let seq = self.config.validator_identity.sequence.max(1);
@@ -1410,6 +1420,14 @@ impl Node {
         }
 
         let validator_id_for_loop = validator_id.clone();
+        // Set of amendment ids this build knows how to apply. Captured by the
+        // consensus loop so each close can detect an on-ledger amendment it
+        // does not understand and trip the amendment-blocked halt.
+        let known_amendment_ids: HashSet<Hash256> = FeatureRegistry::with_known_amendments()
+            .known_ids()
+            .copied()
+            .collect();
+        let amendment_blocked_for_loop = Arc::clone(&amendment_blocked);
         tokio::spawn(async move {
             let node_id = NodeId(identity.node_id);
             // Networked mode: enforce a minimum Establish-phase duration
@@ -1857,6 +1875,8 @@ impl Node {
                                             &pruner, &node_store,
                                             &self_validation_tx,
                                             &mut self_validation_guard,
+                                            &amendment_blocked_for_loop,
+                                            &known_amendment_ids,
                                         ).await;
                                         if let Ok(mut lc) = last_close_arc.write() {
                                             lc.proposers = proposers_this_round;
@@ -2047,6 +2067,8 @@ impl Node {
                                             &pruner, &node_store,
                                             &self_validation_tx,
                                             &mut self_validation_guard,
+                                            &amendment_blocked_for_loop,
+                                            &known_amendment_ids,
                                         ).await;
                                         if let Ok(mut lc) = last_close_arc.write() {
                                             lc.proposers = proposers_this_round;
@@ -3021,6 +3043,8 @@ impl Node {
         node_store: &Option<Arc<dyn NodeStore>>,
         self_validation_tx: &tokio::sync::mpsc::Sender<rxrpl_overlay::ConsensusMessage>,
         validation_guard: &mut crate::validation_guard::SelfValidationGuard,
+        amendment_blocked: &Arc<AtomicBool>,
+        known_amendment_ids: &HashSet<Hash256>,
     ) {
         // Resolve close_time in priority order:
         //  1. Quorum-accepted close_time from converge() — strongest signal,
@@ -3171,13 +3195,39 @@ impl Node {
         );
         drop(l);
 
+        // Amendment-blocked detection: if the just-closed ledger has an
+        // amendment enabled that this build does not understand, halt this
+        // node's own validation and proposals so it cannot fork away from the
+        // network that does understand it. Once blocked, stays blocked.
+        if !amendment_blocked.load(Ordering::Relaxed) {
+            let closed_rules = crate::play_forward::rules_for_ledger(&closed);
+            if let Some(unknown) = closed_rules
+                .iter()
+                .find(|id| !known_amendment_ids.contains(*id))
+            {
+                tracing::error!(
+                    "amendment_blocked: ledger #{} enabled unknown amendment {}; \
+                     halting own validation and proposals to avoid forking",
+                    closed_seq,
+                    unknown
+                );
+                amendment_blocked.store(true, Ordering::Relaxed);
+            }
+        }
+
         // Broadcast validation (STObject format, rippled-compatible)
         //
         // Equivocation guard (M0): refuse to emit a FULL validation that would
         // conflict with one we already produced for this (or a newer) sequence.
         // Without this a sync/consensus race could double-sign a sequence with
         // two different hashes and get this node dropped as an equivocator.
-        if !validation_guard.may_validate(closed_seq, hash) {
+        if amendment_blocked.load(Ordering::Relaxed) {
+            tracing::warn!(
+                "amendment_blocked: not validating ledger #{} hash={}",
+                closed_seq,
+                hash
+            );
+        } else if !validation_guard.may_validate(closed_seq, hash) {
             tracing::warn!(
                 "equivocation guard: refusing to validate ledger #{} hash={} \
                  (already self-validated up to #{}); skipping validation broadcast",
