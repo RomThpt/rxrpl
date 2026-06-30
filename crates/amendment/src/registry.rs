@@ -164,6 +164,13 @@ const RETIRED_AMENDMENTS: &[&str] = &[
 ];
 
 /// Amendments that are supported but may not yet be enabled on mainnet.
+///
+/// Every name here must be a real rippled amendment (see rippled's
+/// `features.macro`); the amendment id is `SHA512Half(name)`, so a misspelled
+/// or invented name computes an id that matches no on-ledger amendment and can
+/// never be gated or voted. The phantom names `TokenKeg` and `InvariantsV1_1`
+/// (no rippled counterpart) were removed, and `Delegate` was corrected to its
+/// real name `PermissionDelegationV1_1`.
 const SUPPORTED_AMENDMENTS: &[(&str, bool)] = &[
     ("FlowCross", true),
     ("Flow", true),
@@ -173,13 +180,19 @@ const SUPPORTED_AMENDMENTS: &[(&str, bool)] = &[
     ("MPTokensV1", true),
     ("Credentials", true),
     ("AMMClawback", true),
-    ("InvariantsV1_1", true),
     ("PermissionedDomains", true),
     ("DeepFreeze", false),
-    ("TokenKeg", false),
     ("SingleAssetVault", false),
     ("Batch", false),
-    ("Delegate", false),
+    // Real rippled name for the granular-permission / Delegate feature
+    // (previously registered under the phantom name "Delegate").
+    ("PermissionDelegationV1_1", false),
+    // Implemented by the NFTokenModify transactor, which gates on it.
+    ("DynamicNFT", true),
+    // Registered so the on-ledger amendment id is recognised; rxrpl escrow is
+    // still XRP-only, so this is not voted for by default.
+    ("TokenEscrow", false),
+    ("fixPayChanCancelAfter", false),
     ("fixAMMClawbackRounding", true),
     ("fixDirectoryLimit", true),
     ("fixIncludeKeyletFields", true),
