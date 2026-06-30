@@ -36,7 +36,29 @@ pub trait ApplyView: ReadView {
     fn thread_directories(&self) -> bool {
         true
     }
+
+    /// Snapshot the current mutation state so a speculative sub-flow can be
+    /// rolled back (rippled's nested `ApplyView`/`Sandbox` checkpointing, used by
+    /// `flow`'s multi-pass strand trials). The returned token is opaque; pass it
+    /// back to [`ApplyView::rollback`] to restore the view to exactly this point.
+    ///
+    /// The default (for non-`Sandbox` views) returns an empty token and
+    /// `rollback` is a no-op — only the copy-on-write `Sandbox` supports true
+    /// speculative nesting.
+    fn checkpoint(&self) -> ApplyCheckpoint {
+        ApplyCheckpoint(None)
+    }
+
+    /// Restore the view to a previous [`ApplyView::checkpoint`]. Mutations made
+    /// after the checkpoint are discarded.
+    fn rollback(&mut self, _cp: ApplyCheckpoint) {}
 }
+
+/// Opaque snapshot of an [`ApplyView`]'s mutation state, taken by
+/// [`ApplyView::checkpoint`] and consumed by [`ApplyView::rollback`]. Carries a
+/// type-erased copy of the concrete view's internal change set (only `Sandbox`
+/// produces a non-empty one).
+pub struct ApplyCheckpoint(pub(crate) Option<Box<dyn std::any::Any>>);
 
 /// Errors from apply view operations.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

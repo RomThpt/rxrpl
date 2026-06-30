@@ -166,6 +166,25 @@ impl Transactor for PaymentTransactor {
         // (Account == Destination) or a direct payment to another account.
         if let Some(send_max) = ctx.tx.get("SendMax") {
             if cross_assets_differ(send_max, &ctx.tx["Amount"]) {
+                // Multi-path Flow: a Payment with two or more alternative `Paths`
+                // that each resolve to a pure book/AMM boundary chain. rippled
+                // runs these through the multi-pass Flow loop, consuming any
+                // shared AMM pool in fibonacci-sized chunks clamped to the
+                // competing CLOB quality; a single full swap over-delivers. Gated
+                // narrowly (>= 2 resolvable boundary chains) so single-path
+                // cross-currency and AMM-routed payments keep their existing
+                // byte-exact single-strand engine.
+                if count_flow_strands(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]) >= 2
+                    && flow_strands_have_amm(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"])
+                {
+                    return apply_paths_payment_multi(
+                        ctx,
+                        account_str,
+                        destination_str,
+                        ctx.tx["Amount"].clone(),
+                        send_max.clone(),
+                    );
+                }
                 if ctx.tx.get("Paths").is_none() {
                     // Single-book shape.
                     return apply_conversion(
@@ -871,6 +890,202 @@ fn apply_paths_payment(
             return Err(TransactionResult::TecPathPartial);
         }
     }
+
+    let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(src_key, nb)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    Ok(TransactionResult::TesSuccess)
+}
+
+/// Count the transaction's alternative `Paths` that resolve to a pure book/AMM
+/// boundary chain of at least two assets. The multi-path Flow gate fires when at
+/// least two paths resolve (so a shared AMM is consumed in fib chunks). Unlike
+/// [`paths_resolve_to_chain`], this does NOT require an account-ripple step: the
+/// multi-path repro's paths are pure currency steps (no `account` field).
+fn count_flow_strands(
+    view: &dyn ReadView,
+    tx: &serde_json::Value,
+    send_max: &serde_json::Value,
+    amount: &serde_json::Value,
+) -> usize {
+    let Some(paths) = tx.get("Paths").and_then(|v| v.as_array()) else {
+        return 0;
+    };
+    if paths.len() < 2 {
+        return 0;
+    }
+    paths
+        .iter()
+        .filter(|p| {
+            p.as_array()
+                .and_then(|steps| build_path_boundaries(view, steps, send_max, amount))
+                .map(|b| b.len() >= 2)
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// Whether any resolvable strand carries an AMM pool on one of its hops.
+///
+/// The multi-pass Flow loop (`apply_paths_payment_multi`) exists specifically to
+/// consume a *shared AMM pool* in fibonacci-sized chunks across competing
+/// strands — the byte-exact behaviour the single-strand/back-solve engines
+/// cannot reproduce. A pure-CLOB multi-path payment (no AMM on any hop) is
+/// handled correctly by the legacy quality-ranked back-solve
+/// (`apply_cross_currency`), which dry-runs every alternative and commits the
+/// cheapest. So the Flow gate fires only when an AMM is actually present;
+/// routing pure-CLOB multi-path through `flow_multi` (whose forward walk does not
+/// reverse-price interior book hops) would mis-size them.
+fn flow_strands_have_amm(
+    view: &dyn ReadView,
+    tx: &serde_json::Value,
+    send_max: &serde_json::Value,
+    amount: &serde_json::Value,
+) -> bool {
+    let Some(paths) = tx.get("Paths").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    for p in paths {
+        let Some(steps) = p.as_array() else {
+            continue;
+        };
+        let Some(boundaries) = build_path_boundaries(view, steps, send_max, amount) else {
+            continue;
+        };
+        for pair in boundaries.windows(2) {
+            let (Some((_, in_cur, in_iss)), Some((_, out_cur, out_iss))) =
+                (amm_asset_of(&pair[0]), amm_asset_of(&pair[1]))
+            else {
+                continue;
+            };
+            let amm_key = keylet::amm(&in_cur, &in_iss, &out_cur, &out_iss);
+            if view.read(&amm_key).is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A SendMax / Amount value as a `Number` magnitude (XRP drops as an integer,
+/// IOU as its decimal value).
+fn value_to_number(v: &serde_json::Value) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::Number;
+    if let Some(s) = v.as_str() {
+        return Number::from_int(s.parse::<i64>().unwrap_or(0));
+    }
+    match v
+        .get("value")
+        .and_then(|x| x.as_str())
+        .and_then(|s| rxrpl_amount::IOUAmount::from_decimal_string(s).ok())
+    {
+        Some(iou) => Number::from_iou(&iou),
+        None => Number::ZERO,
+    }
+}
+
+/// Apply a multi-path cross-currency Payment through the multi-pass Flow loop.
+/// Builds every resolvable strand, runs `flow_multi` (fib-chunked shared-AMM
+/// consumption when two or more strands are live), enforces the partial-payment
+/// gate, then writes the source working copy back. Mirrors rippled's `Flow`
+/// driving `apply_paths_payment`'s single-strand engine across multiple strands.
+fn apply_paths_payment_multi(
+    ctx: &mut ApplyContext<'_>,
+    account_str: &str,
+    destination_str: &str,
+    amount: serde_json::Value,
+    send_max: serde_json::Value,
+) -> Result<TransactionResult, TransactionResult> {
+    use rxrpl_amount::number::Number;
+    let src_id =
+        decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let dst_id =
+        decode_account_id(destination_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let src_key = keylet::account(&src_id);
+    let bytes = ctx
+        .view
+        .read(&src_key)
+        .ok_or(TransactionResult::TerNoAccount)?;
+    let mut acct: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+
+    let paths = ctx
+        .tx
+        .get("Paths")
+        .and_then(|v| v.as_array())
+        .ok_or(TransactionResult::TemBadPath)?
+        .clone();
+
+    // Build every strand that resolves to a boundary chain (>= 2 assets).
+    let mut strands = Vec::new();
+    for path in &paths {
+        let Some(steps) = path.as_array() else {
+            continue;
+        };
+        let Some(boundaries) = build_path_boundaries(ctx.view, steps, &send_max, &amount) else {
+            continue;
+        };
+        if boundaries.len() < 2 {
+            continue;
+        }
+        if let Some(strand) = crate::handlers::offer_create::build_flow_strand(ctx, &boundaries) {
+            strands.push(strand);
+        }
+    }
+    if strands.is_empty() {
+        return Err(TransactionResult::TecPathDry);
+    }
+
+    // Source-funds cap on the SendMax (cannot spend more than held).
+    let deliver_req = value_to_number(&amount);
+    let send_max_num = value_to_number(&send_max);
+
+    let mut amm_ctx = crate::handlers::flow::AmmContext::new(strands.len() > 1);
+    let (delivered_num, _spent_num) = crate::handlers::offer_create::flow_multi(
+        ctx,
+        &src_id,
+        &mut acct,
+        &dst_id,
+        &strands,
+        &deliver_req,
+        &send_max_num,
+        &mut amm_ctx,
+    );
+
+    if delivered_num.is_zero() {
+        return Err(TransactionResult::TecPathPartial);
+    }
+
+    // The delivered magnitude in the Amount asset, for the partial-payment gate.
+    let (amt_cur, amt_iss) = asset_of(&amount);
+    let delivered = if amount.is_string() {
+        serde_json::Value::String(delivered_num.to_xrp_drops().to_string())
+    } else {
+        serde_json::json!({
+            "currency": amt_cur,
+            "issuer": amt_iss,
+            "value": delivered_num.to_iou().to_decimal_string(),
+        })
+    };
+
+    // Partial-payment gate: without tfPartialPayment the full Amount must be
+    // delivered; with it, the delivery must reach DeliverMin (when present).
+    const TF_PARTIAL_PAYMENT: u32 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT;
+    let partial = helpers::get_flags(ctx.tx) & TF_PARTIAL_PAYMENT != 0;
+    if !partial {
+        if !delivered_meets_target(&delivered, &amount) {
+            return Err(TransactionResult::TecPathPartial);
+        }
+    } else if let Some((dm_cur, dm_iss, dm_val)) = get_deliver_min_iou(ctx.tx) {
+        let target = serde_json::json!({
+            "currency": dm_cur, "issuer": dm_iss, "value": dm_val,
+        });
+        if !delivered_meets_target(&delivered, &target) {
+            return Err(TransactionResult::TecPathPartial);
+        }
+    }
+    let _ = Number::ZERO;
 
     let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view

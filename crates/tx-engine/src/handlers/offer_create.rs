@@ -899,6 +899,7 @@ pub(crate) fn cross_book_payment(
         &budget,
         /*skip_input_debit=*/ false,
         /*skip_output_credit=*/ false,
+        /*single_band=*/ false,
     )?;
     Ok((
         delivered.with_amount(&delivered.iou, delivered.drops),
@@ -931,6 +932,7 @@ fn cross_book_hop(
     budget_in: &Leg,
     skip_input_debit: bool,
     skip_output_credit: bool,
+    single_band: bool,
 ) -> Result<(Leg, Leg), TransactionResult> {
     let inverse_book = keylet::book_dir(
         &budget_in.currency,
@@ -941,6 +943,13 @@ fn cross_book_hop(
 
     let mut remaining_out = demand_out.clone();
     let mut remaining_in = budget_in.clone();
+    // When `single_band`, the walk consumes only ONE quality level (the first
+    // page on which a funded offer is actually filled). rippled's `forEachOffer`
+    // processes one quality band per `BookStep::rev/fwd`; the multi-path Flow loop
+    // (`flow_multi`) drives one band per pass so a hop's CLOB liquidity interleaves
+    // with the shared AMM's fib chunks. Unfunded/skipped offers do not lock the
+    // band (they are reaped and the walk continues to the next page).
+    let mut band_quality: Option<u64> = None;
     // Accumulate the realised delivery / spend directly from each fill. Computing
     // them as `start - remaining` underflows for an interior hop, whose demand cap
     // is the huge `unbounded_leg` sentinel (~1e96): a real ~0.2 delivery is below
@@ -957,6 +966,15 @@ fn cross_book_hop(
         }
         probe = dir_key;
         let dir_quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
+        // Bounded to a single quality band: once an offer at quality Q has been
+        // filled, stop at the first page of a worse quality.
+        if single_band {
+            if let Some(bq) = band_quality {
+                if bq != dir_quality {
+                    break 'walk;
+                }
+            }
+        }
         let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
         let Some(dir_bytes) = ctx.view.read(&dir_key) else {
             continue;
@@ -1096,6 +1114,11 @@ fn cross_book_hop(
             remaining_in = leg_sub_round(&remaining_in, &order_in);
             delivered = leg_add(&delivered, &net_out);
             spent = leg_add(&spent, &order_in);
+            // Lock the band on the first funded fill: subsequent pages of a worse
+            // quality are not consumed this call.
+            if single_band {
+                band_quality = Some(dir_quality);
+            }
         }
     }
 
@@ -1195,7 +1218,7 @@ pub(crate) fn cross_path_payment(
 
         let (clob_out, clob_spent) = cross_book_hop(
             ctx, taker, taker_acct, dest, &demand, &budget, /*skip_input_debit=*/ !is_first,
-            /*skip_output_credit=*/ !is_last,
+            /*skip_output_credit=*/ !is_last, /*single_band=*/ false,
         )?;
 
         // Residual liquidity from the AMM pool for this pair, on the budget not
@@ -1290,6 +1313,12 @@ fn number_to_leg(mag: &rxrpl_amount::number::Number, template: &Leg) -> Leg {
 fn num_le(a: &rxrpl_amount::number::Number, b: &rxrpl_amount::number::Number) -> bool {
     let d = a.sub(b);
     d.is_zero() || d.negative()
+}
+
+/// `a > b` for two `Number`s.
+fn num_gt(a: &rxrpl_amount::number::Number, b: &rxrpl_amount::number::Number) -> bool {
+    let d = a.sub(b);
+    !d.is_zero() && !d.negative()
 }
 
 /// The AMM pool's holding of one asset as a `Number`: the pseudo-account's XRP
@@ -1765,6 +1794,740 @@ fn reverse_amm_strand(
         delivered_leg.with_amount(&delivered_leg.iou, delivered_leg.drops),
         spent_leg.with_amount(&spent_leg.iou, spent_leg.drops),
     )))
+}
+
+// ===========================================================================
+// Multi-path Flow (rippled `Flow` + `AMMLiquidity` fib-chunked AMM consumption)
+// ===========================================================================
+//
+// When two or more strands are live, rippled consumes a shared AMM pool in
+// *fibonacci-sized synthetic offers* (one per multi-pass iteration) clamped to
+// the competing CLOB quality, instead of one full output-limited swap. This is
+// the difference between over-delivering (one swap) and the byte-exact chunked
+// total rippled produces. The fib sizing + per-chunk quality clamp live in
+// `super::flow`; the actual pool/holding mutation reuses `apply_amm_move` and
+// the CLOB walk reuses `cross_book_hop` verbatim.
+
+use super::flow::{AmmContext, AmmLiquidity};
+use rxrpl_amount::number::Number;
+
+/// rippled `Flow` loop bounds (StrandFlow.h).
+const FLOW_MAX_TRIES: u32 = 1000;
+const FLOW_MAX_OFFERS: u32 = 1500;
+
+/// One hop of a resolved strand: the in→out boundary pair plus the AMM pool
+/// (if any) and whether the book carries resting CLOB offers.
+pub(crate) struct FlowHop {
+    in_leg: Leg,
+    out_leg: Leg,
+    inverse_book: Hash256,
+    has_clob: bool,
+    /// AMM pool pseudo-account + trading fee, when a pool exists for the pair.
+    amm_pool: Option<AccountId>,
+    amm_tfee: u16,
+    /// Frozen initial-pool snapshot for the fib seed (held stable for the whole
+    /// payment); the live balances are refetched each pass.
+    liquidity: Option<AmmLiquidity>,
+}
+
+/// A resolved strand = an ordered boundary chain of hops.
+pub(crate) struct FlowStrand {
+    hops: Vec<FlowHop>,
+}
+
+/// The realised result of executing one pass of a strand.
+struct StrandPass {
+    in_amt: Number,
+    out_amt: Number,
+    offers_used: u32,
+}
+
+/// The best-page (tip) quality of an order book, or `None` when empty.
+fn book_tip_quality(ctx: &ApplyContext<'_>, inverse_book: &Hash256) -> Option<u64> {
+    let probe = book_dir_with_quality(inverse_book, 0);
+    let dir_key = ctx.view.succ(&probe)?;
+    if dir_key.as_bytes()[0..24] != inverse_book.as_bytes()[0..24] {
+        return None;
+    }
+    Some(u64::from_be_bytes(
+        dir_key.as_bytes()[24..32].try_into().unwrap(),
+    ))
+}
+
+/// Build a strand from a boundary chain, snapshotting each hop's AMM pool (with
+/// its frozen initial balances) and CLOB presence. Returns `None` if any hop has
+/// neither an AMM pool nor a resting offer (a dead hop).
+pub(crate) fn build_flow_strand(
+    ctx: &ApplyContext<'_>,
+    boundaries: &[Value],
+) -> Option<FlowStrand> {
+    let n = boundaries.len();
+    if n < 2 {
+        return None;
+    }
+    let mut hops = Vec::with_capacity(n - 1);
+    for h in 0..(n - 1) {
+        let in_leg = Leg::parse(&boundaries[h])?;
+        let out_leg = Leg::parse(&boundaries[h + 1])?;
+        let inverse_book = keylet::book_dir(
+            &in_leg.currency,
+            &in_leg.issuer,
+            &out_leg.currency,
+            &out_leg.issuer,
+        );
+        let has_clob = book_has_resting_offer(ctx, &inverse_book);
+
+        let amm_key = keylet::amm(
+            &in_leg.currency,
+            &in_leg.issuer,
+            &out_leg.currency,
+            &out_leg.issuer,
+        );
+        let (amm_pool, amm_tfee, liquidity) = match ctx
+            .view
+            .read(&amm_key)
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        {
+            Some(amm) => {
+                let pool_id = amm
+                    .get("Account")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| decode_account_id(s).ok());
+                let tfee = amm.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                match pool_id {
+                    Some(pid) => {
+                        let pool_in = pool_balance_number(
+                            ctx,
+                            &pid,
+                            in_leg.is_xrp,
+                            &in_leg.currency,
+                            &in_leg.issuer,
+                        );
+                        let pool_out = pool_balance_number(
+                            ctx,
+                            &pid,
+                            out_leg.is_xrp,
+                            &out_leg.currency,
+                            &out_leg.issuer,
+                        );
+                        if pool_in.is_zero() || pool_out.is_zero() {
+                            (None, 0, None)
+                        } else {
+                            (
+                                Some(pid),
+                                tfee,
+                                Some(AmmLiquidity {
+                                    in_is_xrp: in_leg.is_xrp,
+                                    out_is_xrp: out_leg.is_xrp,
+                                    tfee,
+                                    initial_pool_in: pool_in,
+                                    initial_pool_out: pool_out,
+                                }),
+                            )
+                        }
+                    }
+                    None => (None, 0, None),
+                }
+            }
+            None => (None, 0, None),
+        };
+
+        // NOTE: a hop with neither an AMM pool nor a resting CLOB offer is a
+        // *dry* hop — the strand cannot deliver — but the strand is still
+        // syntactically valid and its PRESENCE keeps `multi_path > 1`, which is
+        // what triggers rippled's fib-chunked AMM consumption on the OTHER live
+        // strand. So we keep it (it simply returns no delivery each pass) rather
+        // than dropping it (which would collapse a multi-path payment to a
+        // single full swap).
+        hops.push(FlowHop {
+            in_leg,
+            out_leg,
+            inverse_book,
+            has_clob,
+            amm_pool,
+            amm_tfee,
+            liquidity,
+        });
+    }
+    Some(FlowStrand { hops })
+}
+
+/// A strand's a-priori quality upper bound as a `Number` rate (in/out, lower is
+/// better): the product of each hop's best-possible rate. Composing left→right,
+/// the intermediate magnitudes cancel so the product is the overall
+/// input-per-output rate. Used to rank live strands best-first each pass (rippled
+/// `StrandFlow.h:444-496` -> `BookStep::qualityUpperBound` -> `getTipQuality`).
+///
+/// Each hop's rate is the better of its CLOB tip and its AMM offer. The AMM
+/// contribution is the *fib-offer* quality (`getAMMOffer(nullopt).quality()`,
+/// which folds in the trading fee and the chunk's price impact for the CURRENT
+/// `amm_ctx` iteration), NOT the raw spot price — the raw spot over-ranks a
+/// pure-AMM strand and flips the first-survivor pick (StrandFlow `getTipQuality`,
+/// go-xrpl `step_book.go:869`).
+fn strand_quality_ub(ctx: &ApplyContext<'_>, strand: &FlowStrand, amm_ctx: &AmmContext) -> Number {
+    let mut rate = Number::from_int(1);
+    for hop in &strand.hops {
+        // AMM fib-offer quality for this iteration (fee + impact), as rippled's
+        // `getTipQuality` uses `getAMMOffer(nullopt).quality()`.
+        let amm_rate = match (hop.liquidity.as_ref(), hop.amm_pool.as_ref()) {
+            (Some(liq), Some(pool)) => {
+                let pin = pool_balance_number(
+                    ctx,
+                    pool,
+                    hop.in_leg.is_xrp,
+                    &hop.in_leg.currency,
+                    &hop.in_leg.issuer,
+                );
+                let pout = pool_balance_number(
+                    ctx,
+                    pool,
+                    hop.out_leg.is_xrp,
+                    &hop.out_leg.currency,
+                    &hop.out_leg.issuer,
+                );
+                liq.get_offer(&pin, &pout, None, amm_ctx)
+                    .and_then(|o| from_rate(o.quality).ok())
+                    .map(|r| Number::from_iou(&r))
+            }
+            _ => None,
+        };
+        // CLOB best-tip rate (in/out) from the book directory quality.
+        let clob_rate = book_tip_quality(ctx, &hop.inverse_book)
+            .and_then(|q| from_rate(q).ok())
+            .map(|r| Number::from_iou(&r));
+        let hop_rate = match (amm_rate, clob_rate) {
+            (Some(a), Some(c)) => {
+                if num_le(&a, &c) {
+                    a
+                } else {
+                    c
+                }
+            }
+            (Some(a), None) => a,
+            (None, Some(c)) => c,
+            (None, None) => Number::from_int(1),
+        };
+        rate = rate.mul(&hop_rate);
+    }
+    rate
+}
+
+/// Sum a slice of `Number`s smallest-magnitude first (rippled
+/// `StrandFlow.h:619-624`): never a running subtraction. Stable accumulation
+/// keeps the byte-exact total independent of pass order.
+fn sum_smallest_to_largest(v: &[Number]) -> Number {
+    let mut sorted: Vec<Number> = v.to_vec();
+    sorted.sort_by(|a, b| {
+        let d = a.sub(b);
+        if d.is_zero() {
+            std::cmp::Ordering::Equal
+        } else if d.negative() {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        }
+    });
+    let mut acc = Number::ZERO;
+    for n in &sorted {
+        acc = acc.add(n);
+    }
+    acc
+}
+
+/// `a >= b` for two `Number`s.
+fn num_ge(a: &Number, b: &Number) -> bool {
+    !num_gt(b, a)
+}
+
+/// Snapshot a hop's AMM pool as an [`AmmHop`] at the current (live) balances.
+fn hop_amm_snapshot(ctx: &ApplyContext<'_>, hop: &FlowHop) -> Option<(AmmHop, Number, Number)> {
+    let pool = hop.amm_pool.as_ref()?;
+    let pool_in = pool_balance_number(
+        ctx,
+        pool,
+        hop.in_leg.is_xrp,
+        &hop.in_leg.currency,
+        &hop.in_leg.issuer,
+    );
+    let pool_out = pool_balance_number(
+        ctx,
+        pool,
+        hop.out_leg.is_xrp,
+        &hop.out_leg.currency,
+        &hop.out_leg.issuer,
+    );
+    let amm_hop = AmmHop {
+        pool_id: *pool,
+        in_xrp: hop.in_leg.is_xrp,
+        out_xrp: hop.out_leg.is_xrp,
+        in_cur: hop.in_leg.currency,
+        in_iss: hop.in_leg.issuer,
+        out_cur: hop.out_leg.currency,
+        out_iss: hop.out_leg.issuer,
+        tfee: hop.amm_tfee,
+        pool_in,
+        pool_out,
+    };
+    Some((amm_hop, pool_in, pool_out))
+}
+
+/// Price one CLOB tip band in the reverse direction: how much input the resting
+/// offers need to deliver `demanded` output, and what they actually deliver
+/// (`min(band capacity, demanded)`). The walk mutates the view (consumes /
+/// reaps offers) so it runs on a checkpoint that is immediately rolled back; the
+/// forward pass re-walks and commits the real consumption. Returns
+/// `(input_needed, output_delivered)` as `Number`s, or `None` when the band is
+/// dry. The `skip_*` flags mirror the forward application so the grossed/netted
+/// transfer-fee amounts match.
+#[allow(clippy::too_many_arguments)]
+fn price_clob_band_reverse(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    hop: &FlowHop,
+    demanded: &Number,
+    is_first: bool,
+    is_last: bool,
+) -> Option<(Number, Number)> {
+    let demand_leg = number_to_leg(demanded, &hop.out_leg);
+    let budget_leg = unbounded_leg(&hop.in_leg);
+    let cp = ctx.view.checkpoint();
+    let res = cross_book_hop(
+        ctx,
+        taker,
+        taker_acct,
+        dest,
+        &demand_leg,
+        &budget_leg,
+        /*skip_input_debit=*/ !is_first,
+        /*skip_output_credit=*/ !is_last,
+        /*single_band=*/ true,
+    );
+    ctx.view.rollback(cp);
+    let (delivered, spent) = res.ok()?;
+    if delivered.is_zero() || spent.is_zero() {
+        return None;
+    }
+    Some((leg_to_number(&spent), leg_to_number(&delivered)))
+}
+
+/// Execute ONE pass of a (multi-hop, AMM and/or CLOB) strand with rippled's
+/// reverse-then-forward `StrandFlow` algorithm (StrandFlow.h:80-281).
+///
+/// Each hop consumes ONE quality band per pass. rippled's `BookStep` tries the
+/// AMM FIRST at the CLOB tip quality ([`AmmLiquidity::get_offer`]); the AMM
+/// declines (returns `None`) when its fib chunk is no better than the resting
+/// book, and the band is then filled by the CLOB tip alone (a one-band
+/// [`cross_book_hop`] walk). A pure-AMM hop is the fib chunk; a pure-CLOB hop is
+/// the tip band; a dry hop (neither) fails the strand this pass.
+///
+/// **Reverse pass**: from the demanded strand output `remaining_out`, pull the
+/// demand back through every hop. An AMM hop's chunk is clamped to the demand via
+/// `limit_out`; a CLOB hop is priced by a one-band `cross_book_hop` on a
+/// checkpoint that is immediately rolled back. The chunk/band's required input
+/// becomes the upstream hop's demand. The hop whose band cannot meet the
+/// back-propagated demand is the *limiting step*. The source (hop 0) is also
+/// limited when its required input exceeds the `remaining_in` budget.
+///
+/// **Forward pass** (mutates the checkpointed view): hops `0..=limiting` keep
+/// their reverse-priced amounts (which already thread — each hop's output equals
+/// the next hop's input); hops past the limiting step are re-priced forward
+/// against the reduced carry (AMM via `limit_in`, CLOB by an input-limited
+/// one-band walk), so the intermediate asset is conserved exactly. The AMM
+/// mutation reuses [`apply_amm_move`]; the CLOB mutation/reap reuses
+/// [`cross_book_hop`]. The SHARED `amm_ctx` threads `curIters` across all AMM
+/// hops of the strand.
+///
+/// Returns the realised `(source-in, delivered-out)`, or `None` when the strand
+/// cannot deliver this pass (a pool is frozen, a hop is dry, or the demand cannot
+/// be priced).
+#[allow(clippy::too_many_arguments)]
+fn execute_strand_pass(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    strand: &FlowStrand,
+    remaining_in: &Number,
+    remaining_out: &Number,
+    amm_ctx: &mut AmmContext,
+) -> Option<StrandPass> {
+    let trace = std::env::var("RXRPL_FLOW_TRACE").is_ok();
+    let n = strand.hops.len();
+    if n == 0 {
+        return None;
+    }
+
+    // Per-hop AMM snapshot (live pool balances at the start of this pass), or
+    // `None` for a pure-CLOB hop. A hop with neither AMM nor CLOB is dry.
+    let mut amm_hops: Vec<Option<AmmHop>> = Vec::with_capacity(n);
+    for hop in &strand.hops {
+        amm_hops.push(hop_amm_snapshot(ctx, hop).map(|(a, _, _)| a));
+    }
+
+    // Whether a hop consumes its AMM fib chunk this pass, or its CLOB tip band.
+    // rippled's `BookStep` tries the AMM FIRST at the CLOB tip quality; the AMM
+    // declines (`get_offer` -> None) when it is no better than the book, and the
+    // band is then filled by the resting CLOB offers alone.
+    #[derive(Clone, Copy, PartialEq)]
+    enum HopKindR {
+        Amm,
+        Clob,
+    }
+
+    // --- REVERSE PASS: back-propagate the demand, find the limiting step. ---
+    let mut ins: Vec<Number> = vec![Number::ZERO; n];
+    let mut outs: Vec<Number> = vec![Number::ZERO; n];
+    let mut kinds: Vec<HopKindR> = vec![HopKindR::Amm; n];
+    // The lowest-index hop whose band cannot meet the demand pulled back to it;
+    // `n` means "no interior limit" (only the source budget may bind).
+    let mut limiting = n;
+    let mut demanded = *remaining_out;
+    for h in (0..n).rev() {
+        let hop = &strand.hops[h];
+        let is_first = h == 0;
+        let is_last = h == n - 1;
+        let clob_quality = book_tip_quality(ctx, &hop.inverse_book);
+
+        // Try the AMM fib chunk first, gated to the CLOB tip quality.
+        let amm_offer = match (hop.liquidity.as_ref(), amm_hops[h].as_ref()) {
+            (Some(liq), Some(amm)) => {
+                liq.get_offer(&amm.pool_in, &amm.pool_out, clob_quality, amm_ctx)
+            }
+            _ => None,
+        };
+
+        if let Some(offer) = amm_offer {
+            kinds[h] = HopKindR::Amm;
+            if num_ge(&offer.out_num, &demanded) {
+                // The chunk covers the demand: clamp output to demand at constant
+                // quality (`ceilOutStrict`, round the cost up).
+                let (i, o) = offer.limit_out(&demanded, true);
+                ins[h] = i;
+                outs[h] = o;
+            } else {
+                // The chunk is smaller than the demand: this hop limits the pass.
+                ins[h] = offer.in_num;
+                outs[h] = offer.out_num;
+                limiting = h;
+            }
+        } else if clob_quality.is_some() {
+            // AMM declined (or absent) but the book has resting offers: price the
+            // CLOB tip band for the demand pulled to this hop. Done on a
+            // checkpoint that is rolled back — the forward pass re-runs the walk
+            // and commits the offer consumption / reaps.
+            kinds[h] = HopKindR::Clob;
+            let (i, o) = price_clob_band_reverse(
+                ctx, taker, taker_acct, dest, hop, &demanded, is_first, is_last,
+            )?;
+            ins[h] = i;
+            outs[h] = o;
+            // The band delivered less than demanded -> this hop limits the pass.
+            if num_gt(&demanded, &o) {
+                limiting = h;
+            }
+        } else {
+            // Dry hop: neither AMM liquidity nor a resting CLOB offer.
+            return None;
+        }
+        if ins[h].is_zero() || outs[h].is_zero() || ins[h].negative() {
+            return None;
+        }
+        demanded = ins[h];
+    }
+
+    // The source (hop 0) is input-limited when its required input exceeds the
+    // remaining SendMax budget: drive it forward from the budget instead.
+    let source_capped = num_gt(&ins[0], remaining_in);
+    if source_capped {
+        limiting = 0;
+    }
+
+    // --- FORWARD PASS: apply, threading the intermediate so it conserves. ---
+    let mut source_in = ins[0];
+    let mut carry = Number::ZERO;
+    for h in 0..n {
+        let hop = &strand.hops[h];
+        let is_first = h == 0;
+        let is_last = h == n - 1;
+        let clob_q = book_tip_quality(ctx, &hop.inverse_book);
+
+        match kinds[h] {
+            HopKindR::Amm => {
+                let amm = amm_hops[h].as_ref()?;
+                let (in_num, out_num) = if is_first && source_capped {
+                    // Source-limited: re-price hop 0 forward from the budget.
+                    let liq = hop.liquidity.as_ref()?;
+                    let offer = liq.get_offer(&amm.pool_in, &amm.pool_out, clob_q, amm_ctx)?;
+                    offer.limit_in(remaining_in, false)
+                } else if h <= limiting {
+                    // Reverse-priced; conserved by construction (outs[h-1] == ins[h]).
+                    (ins[h], outs[h])
+                } else {
+                    // Past the limiting step: re-price forward against the reduced
+                    // carry (`limitStepIn`, round the output down), keeping quality.
+                    let liq = hop.liquidity.as_ref()?;
+                    let offer = liq.get_offer(&amm.pool_in, &amm.pool_out, clob_q, amm_ctx)?;
+                    if num_ge(&offer.in_num, &carry) {
+                        offer.limit_in(&carry, false)
+                    } else {
+                        (offer.in_num, offer.out_num)
+                    }
+                };
+                if in_num.is_zero() || out_num.is_zero() || in_num.negative() || out_num.negative()
+                {
+                    return None;
+                }
+                // Conservation: an interior hop takes exactly what the previous hop
+                // delivered (`carry`); otherwise the intermediate does not balance.
+                let in_num = if is_first { in_num } else { carry };
+                apply_amm_move(
+                    ctx, taker, taker_acct, dest, amm, &in_num, &out_num,
+                    /*skip_input_debit=*/ !is_first, /*skip_output_credit=*/ !is_last,
+                )
+                .ok()?;
+                amm_ctx.set_amm_used();
+                if trace {
+                    eprintln!(
+                        "[flow]     hop{h} AMM in={} out={} (iter={} limiting={limiting})",
+                        in_num.to_iou().to_decimal_string(),
+                        out_num.to_iou().to_decimal_string(),
+                        amm_ctx.cur_iters(),
+                    );
+                }
+                if is_first {
+                    source_in = in_num;
+                }
+                carry = out_num;
+            }
+            HopKindR::Clob => {
+                // Drive the CLOB band: at/below the limiting step deliver the
+                // reverse-priced output; above it (or source-capped) drive by the
+                // available input (`BookStep::fwd`, input-limited).
+                let (demand_leg, budget_leg) = if is_first && source_capped {
+                    (
+                        unbounded_leg(&hop.out_leg),
+                        number_to_leg(remaining_in, &hop.in_leg),
+                    )
+                } else if h <= limiting {
+                    let budget = if is_first {
+                        number_to_leg(&ins[0], &hop.in_leg)
+                    } else {
+                        unbounded_leg(&hop.in_leg)
+                    };
+                    (number_to_leg(&outs[h], &hop.out_leg), budget)
+                } else {
+                    (
+                        unbounded_leg(&hop.out_leg),
+                        number_to_leg(&carry, &hop.in_leg),
+                    )
+                };
+                let (delivered, spent) = cross_book_hop(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    dest,
+                    &demand_leg,
+                    &budget_leg,
+                    /*skip_input_debit=*/ !is_first,
+                    /*skip_output_credit=*/ !is_last,
+                    /*single_band=*/ true,
+                )
+                .ok()?;
+                if delivered.is_zero() || spent.is_zero() {
+                    return None;
+                }
+                if trace {
+                    eprintln!(
+                        "[flow]     hop{h} CLOB in={} out={} (limiting={limiting})",
+                        leg_to_number(&spent).to_iou().to_decimal_string(),
+                        leg_to_number(&delivered).to_iou().to_decimal_string(),
+                    );
+                }
+                if is_first {
+                    source_in = leg_to_number(&spent);
+                }
+                carry = leg_to_number(&delivered);
+            }
+        }
+    }
+
+    if source_in.is_zero() || carry.is_zero() {
+        return None;
+    }
+    Some(StrandPass {
+        in_amt: source_in,
+        out_amt: carry,
+        offers_used: 0,
+    })
+}
+
+/// rippled `Flow` multi-pass loop (sorted / first-survivor, `fixFlowSortStrands`
+/// active). Each pass ranks the live strands best-quality-first, recomputes the
+/// `multi_path` toggle from the live count, then picks the FIRST strand that
+/// delivers (checkpointing before each trial, rolling back failed ones, keeping
+/// the winner's mutation). `amm_ctx` is cleared per trial and advanced once per
+/// committed winner — this drives the fib index. Remaining in/out are always
+/// recomputed via `sum_smallest_to_largest`, never a running subtraction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flow_multi(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    strands: &[FlowStrand],
+    deliver_req: &Number,
+    send_max: &Number,
+    amm_ctx: &mut AmmContext,
+) -> (Number, Number) {
+    let trace = std::env::var("RXRPL_FLOW_TRACE").is_ok();
+    if trace {
+        eprintln!(
+            "[flow] ENTER strands={} deliver_req={} send_max={}",
+            strands.len(),
+            deliver_req.to_iou().to_decimal_string(),
+            send_max.to_iou().to_decimal_string(),
+        );
+        for (si, s) in strands.iter().enumerate() {
+            let desc: Vec<String> = s
+                .hops
+                .iter()
+                .map(|h| format!("amm={} clob={}", h.amm_pool.is_some(), h.has_clob))
+                .collect();
+            eprintln!(
+                "[flow]   strand {si}: {} hops [{}]",
+                s.hops.len(),
+                desc.join(" | ")
+            );
+        }
+    }
+    let mut saved_ins: Vec<Number> = Vec::new();
+    let mut saved_outs: Vec<Number> = Vec::new();
+    let mut offers_considered = 0u32;
+
+    for cur_try in 0..FLOW_MAX_TRIES {
+        let remaining_out = {
+            let d = deliver_req.sub(&sum_smallest_to_largest(&saved_outs));
+            if d.is_zero() || d.negative() {
+                break;
+            }
+            d
+        };
+        let remaining_in = {
+            let r = send_max.sub(&sum_smallest_to_largest(&saved_ins));
+            if r.is_zero() || r.negative() {
+                break;
+            }
+            r
+        };
+
+        // (A) activateNext: rank ALL strands best-quality-first each pass.
+        //
+        // Unlike rippled's `ActiveStrands` (which drops a strand once its rev
+        // pass returns dry, shrinking the active set), we keep every strand live
+        // for the whole payment. A strand that delivers nothing this pass simply
+        // loses the first-survivor race, but its PRESENCE keeps `multi_path > 1`
+        // — which is what sustains the fib-chunked AMM consumption across all
+        // passes (a shared AMM first hop drains in fib increments only while two
+        // or more strands are live). Dropping the dry strand would collapse the
+        // payment to a single full swap (over-delivery).
+
+        let mut cur: Vec<usize> = (0..strands.len()).collect();
+        if cur.len() > 1 {
+            cur.sort_by(|&a, &b| {
+                let ra = strand_quality_ub(ctx, &strands[a], amm_ctx);
+                let rb = strand_quality_ub(ctx, &strands[b], amm_ctx);
+                let d = ra.sub(&rb);
+                if d.is_zero() {
+                    std::cmp::Ordering::Equal
+                } else if d.negative() {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            });
+        }
+        if cur.is_empty() {
+            break;
+        }
+        if trace {
+            let qs: Vec<String> = cur
+                .iter()
+                .map(|&i| {
+                    format!(
+                        "s{i}={}",
+                        strand_quality_ub(ctx, &strands[i], amm_ctx)
+                            .to_iou()
+                            .to_decimal_string()
+                    )
+                })
+                .collect();
+            eprintln!("[flow]   try={cur_try} rank [{}]", qs.join(" "));
+        }
+        // (B) multiPath toggle, from the live strand count (seeded at setup like
+        // rippled `Flow.cpp:106` = `strands.size() > 1`).
+        amm_ctx.set_multi_path(cur.len() > 1);
+
+        // (D) pick the FIRST surviving strand (checkpoint per trial; roll back
+        // losers; keep the winner's mutation).
+        let mut winner: Option<(usize, StrandPass)> = None;
+        for &si in cur.iter() {
+            let cp = ctx.view.checkpoint();
+            amm_ctx.clear();
+            match execute_strand_pass(
+                ctx,
+                taker,
+                taker_acct,
+                dest,
+                &strands[si],
+                &remaining_in,
+                &remaining_out,
+                amm_ctx,
+            ) {
+                Some(res) if !res.out_amt.is_zero() => {
+                    offers_considered += res.offers_used;
+                    winner = Some((si, res));
+                    break;
+                }
+                other => {
+                    if let Some(r) = other {
+                        offers_considered += r.offers_used;
+                    }
+                    if trace {
+                        eprintln!("[flow]   try={cur_try} strand={si} FAILED pass");
+                    }
+                    ctx.view.rollback(cp);
+                }
+            }
+        }
+
+        let Some((si, res)) = winner else {
+            break;
+        };
+        if trace {
+            eprintln!(
+                "[flow] try={cur_try} strand={si} multi={} amm_iter={} in={} out={}",
+                amm_ctx.multi_path(),
+                amm_ctx.cur_iters(),
+                res.in_amt.to_iou().to_decimal_string(),
+                res.out_amt.to_iou().to_decimal_string(),
+            );
+        }
+        saved_ins.push(res.in_amt);
+        saved_outs.push(res.out_amt);
+        // (E) advance the fib counter once per committed winner.
+        amm_ctx.update();
+
+        if offers_considered >= FLOW_MAX_OFFERS {
+            break;
+        }
+    }
+
+    (
+        sum_smallest_to_largest(&saved_outs),
+        sum_smallest_to_largest(&saved_ins),
+    )
 }
 
 /// `a + b` for like-typed legs (same asset).

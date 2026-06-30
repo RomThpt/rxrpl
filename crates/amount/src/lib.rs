@@ -13,5 +13,5 @@ pub use error::AmountError;
 pub use iou::IOUAmount;
 pub use quality::{
     from_rate, get_rate, get_rate_round_even, is_better_quality, offer_quality,
-    offer_quality_round_even, round_quality,
+    offer_quality_round_even, round_quality, within_relative_distance,
 };
