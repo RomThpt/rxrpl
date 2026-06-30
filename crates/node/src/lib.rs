@@ -12,6 +12,7 @@ pub mod pending_validations;
 pub mod play_forward;
 pub mod pruner;
 pub mod reporting;
+pub mod resume_ledger_store;
 pub mod shutdown;
 pub mod validation_guard;
 
