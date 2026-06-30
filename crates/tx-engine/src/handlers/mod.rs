@@ -15,6 +15,7 @@ pub mod clawback;
 pub mod credential_accept;
 pub mod credential_create;
 pub mod credential_delete;
+pub mod credentials;
 pub mod delegate_set;
 pub mod deposit_preauth;
 pub mod did_delete;
