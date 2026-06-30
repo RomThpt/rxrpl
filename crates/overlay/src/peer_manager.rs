@@ -53,6 +53,26 @@ const LI_TS_CANDIDATE: i32 = 3;
 /// per-reply node cap is large (bench: 3 peers 91 rounds -> 8 peers 69).
 const DELTA_SYNC_FANOUT: usize = 8;
 
+/// Capacity of the bounded overlay->consensus message channel.
+///
+/// This channel was previously unbounded: under a mainnet transaction or
+/// ledger-data burst the producer (this single peer-manager event loop) can
+/// outrun the consensus consumer and the queue grows without limit until the
+/// node OOMs (M0 validator-hardening finding). Bounding it caps the queued
+/// message count, so a sustained flood sheds at the tail instead of eating
+/// all memory -- the rippled policy of bounded buffers + shedding under
+/// overload, never unbounded growth.
+///
+/// 4096 is sized off the upstream `event_tx` bound (8192) and the message mix
+/// that reaches consensus: proposals/validations are a few tens per ledger,
+/// relay-filtered transactions a few hundred/s, and the largest contributor is
+/// catchup `LedgerData` (fan-out of 8 peers x batched fat-subtree replies).
+/// 4096 slots absorb several seconds of steady consensus traffic plus multiple
+/// full fan-out `LedgerData` bursts, while keeping the worst-case queued memory
+/// bounded (O(cap x max message size)). A few thousand is the sweet spot: large
+/// enough that healthy operation never sheds, small enough to bound memory.
+const CONSENSUS_CHANNEL_CAP: usize = 4096;
+
 /// HaveTransactionSet status values from rippled.
 /// tsNEW_SET = 1: peer is proposing a new transaction set.
 const _TS_NEW_SET: u32 = 1;
@@ -97,6 +117,39 @@ pub enum ConsensusMessage {
     TxSetAcquired(TxSet),
 }
 
+impl ConsensusMessage {
+    /// Short static label for logging shed messages without moving the value.
+    fn kind(&self) -> &'static str {
+        match self {
+            ConsensusMessage::Proposal(_) => "Proposal",
+            ConsensusMessage::Validation(_) => "Validation",
+            ConsensusMessage::Transaction { .. } => "Transaction",
+            ConsensusMessage::StatusChange { .. } => "StatusChange",
+            ConsensusMessage::LedgerData { .. } => "LedgerData",
+            ConsensusMessage::LedgerHeader { .. } => "LedgerHeader",
+            ConsensusMessage::ValidatorListReceived { .. } => "ValidatorListReceived",
+            ConsensusMessage::ValidatorListVerified { .. } => "ValidatorListVerified",
+            ConsensusMessage::ManifestApplied { .. } => "ManifestApplied",
+            ConsensusMessage::TxSetAcquired(_) => "TxSetAcquired",
+        }
+    }
+
+    /// Whether losing this message can stall consensus. Proposals, validations
+    /// and the acquired tx-set are the votes/inputs a round needs to converge;
+    /// everything else is either high-volume gossip (transactions) or
+    /// re-requestable/replayable state (ledger data/headers, validator lists,
+    /// manifests, status changes). Critical drops are logged loudly; bulk
+    /// drops are logged at debug so a transaction flood cannot spam the log.
+    fn is_critical(&self) -> bool {
+        matches!(
+            self,
+            ConsensusMessage::Proposal(_)
+                | ConsensusMessage::Validation(_)
+                | ConsensusMessage::TxSetAcquired(_)
+        )
+    }
+}
+
 /// Configuration for the peer manager.
 pub struct PeerManagerConfig {
     pub listen_port: u16,
@@ -133,7 +186,10 @@ pub struct PeerManager {
     cmd_tx_internal: mpsc::UnboundedSender<OverlayCommand>,
     event_rx: mpsc::Receiver<PeerEvent>,
     event_tx: mpsc::Sender<PeerEvent>,
-    consensus_tx: mpsc::UnboundedSender<ConsensusMessage>,
+    consensus_tx: mpsc::Sender<ConsensusMessage>,
+    /// Count of messages shed because [`consensus_tx`](Self::consensus_tx) was
+    /// full (overload back-pressure). Surfaced via [`consensus_dropped`].
+    consensus_dropped: AtomicU64,
     ledger_provider: Option<Arc<dyn LedgerProvider>>,
     node_store: Option<Arc<dyn rxrpl_shamap::NodeStore>>,
     ledger_syncer: LedgerSyncer,
@@ -177,11 +233,13 @@ impl PeerManager {
     ) -> (
         Self,
         mpsc::UnboundedSender<OverlayCommand>,
-        mpsc::UnboundedReceiver<ConsensusMessage>,
+        mpsc::Receiver<ConsensusMessage>,
     ) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let cmd_tx_internal = cmd_tx.clone();
-        let (consensus_tx, consensus_rx) = mpsc::unbounded_channel();
+        // Bounded so a transaction/ledger-data burst sheds at the tail instead
+        // of growing without limit and OOMing the node (see CONSENSUS_CHANNEL_CAP).
+        let (consensus_tx, consensus_rx) = mpsc::channel(CONSENSUS_CHANNEL_CAP);
         // Bounded so a flood of inbound peer messages exerts TCP
         // backpressure on the offending peer's read loop instead of
         // growing an unbounded queue (audit finding C4). 8192 is well
@@ -209,6 +267,7 @@ impl PeerManager {
             event_rx,
             event_tx,
             consensus_tx,
+            consensus_dropped: AtomicU64::new(0),
             ledger_provider: None,
             node_store: None,
             ledger_syncer: LedgerSyncer::new(),
@@ -243,8 +302,54 @@ impl PeerManager {
     /// the consensus loop's input queue. This lets the local close handler
     /// feed its own freshly-signed validation back into the same path used
     /// for peer-received validations, so it counts toward UNL quorum.
-    pub fn consensus_sender(&self) -> mpsc::UnboundedSender<ConsensusMessage> {
+    pub fn consensus_sender(&self) -> mpsc::Sender<ConsensusMessage> {
         self.consensus_tx.clone()
+    }
+
+    /// Forward a message to the consensus loop over the bounded channel.
+    ///
+    /// Always uses `try_send` (never `await`): this runs on the single
+    /// peer-manager event loop, which also drives `accept`, sync and the
+    /// per-peer dispatch. Awaiting a full channel here would stall every one
+    /// of those, and because the consensus consumer (`node.rs`) drains this
+    /// channel from the *same* `tokio::select!` task that closes ledgers,
+    /// awaiting would risk a self-inflicted deadlock. So under overload we
+    /// shed: increment the dropped counter and log (loudly for
+    /// consensus-critical messages, at debug for bulk gossip/replayable
+    /// state). Shedding the tail is strictly better than OOMing the node.
+    fn forward_to_consensus(&self, msg: ConsensusMessage) {
+        use tokio::sync::mpsc::error::TrySendError;
+        let kind = msg.kind();
+        let critical = msg.is_critical();
+        match self.consensus_tx.try_send(msg) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                let dropped = self.consensus_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                if critical {
+                    tracing::warn!(
+                        "consensus channel full: shed critical {} ({} total shed)",
+                        kind,
+                        dropped
+                    );
+                } else {
+                    tracing::debug!(
+                        "consensus channel full: shed {} ({} total shed)",
+                        kind,
+                        dropped
+                    );
+                }
+            }
+            Err(TrySendError::Closed(_)) => {
+                // Consensus loop has shut down; nothing left to feed.
+                tracing::debug!("consensus channel closed, dropping {}", kind);
+            }
+        }
+    }
+
+    /// Total number of consensus messages shed because the bounded channel was
+    /// full. Non-zero means the consensus consumer fell behind a burst.
+    pub fn consensus_dropped(&self) -> u64 {
+        self.consensus_dropped.load(Ordering::Relaxed)
     }
 
     /// Set a ledger provider for serving GetLedger requests.
@@ -767,7 +872,7 @@ impl PeerManager {
                         // TMHaveTransactions/TMTransactions protocol.
                         self.tx_batch_relay.add_known_tx(tx_hash, tx_data.clone());
                         if self.relay_filter.should_relay(&tx_hash) {
-                            let _ = self.consensus_tx.send(ConsensusMessage::Transaction {
+                            self.forward_to_consensus(ConsensusMessage::Transaction {
                                 hash: tx_hash,
                                 data: tx_data,
                             });
@@ -794,7 +899,7 @@ impl PeerManager {
                     if let Some(ref info) = peer_info {
                         info.reputation.record_valid_message(payload_len);
                     }
-                    let _ = self.consensus_tx.send(ConsensusMessage::Proposal(proposal));
+                    self.forward_to_consensus(ConsensusMessage::Proposal(proposal));
                 }
                 Err(_) => {
                     if let Some(ref info) = peer_info {
@@ -860,9 +965,7 @@ impl PeerManager {
                                 }
                             }
 
-                            let _ = self
-                                .consensus_tx
-                                .send(ConsensusMessage::Validation(validation));
+                            self.forward_to_consensus(ConsensusMessage::Validation(validation));
                         }
                     }
                     Err(_) => {
@@ -906,7 +1009,7 @@ impl PeerManager {
                             }
                         }
 
-                        let _ = self.consensus_tx.send(ConsensusMessage::StatusChange {
+                        self.forward_to_consensus(ConsensusMessage::StatusChange {
                             from,
                             ledger_seq,
                             ledger_hash,
@@ -1016,7 +1119,7 @@ impl PeerManager {
                                         leaves.len()
                                     );
                                     self.ledger_syncer.mark_synced(ledger_seq);
-                                    let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
+                                    self.forward_to_consensus(ConsensusMessage::LedgerData {
                                         hash,
                                         seq: ledger_seq,
                                         nodes: leaves,
@@ -1069,7 +1172,7 @@ impl PeerManager {
                                 // alignment gate is defeated → divergence from rippled.
                                 // Every catchup path below (immediate-complete AND the
                                 // common multi-round `feed_nodes` path) relies on this.
-                                let _ = self.consensus_tx.send(ConsensusMessage::LedgerHeader {
+                                self.forward_to_consensus(ConsensusMessage::LedgerHeader {
                                     seq: header.sequence,
                                     header: header.clone(),
                                 });
@@ -1094,12 +1197,11 @@ impl PeerManager {
                                             leaves.len()
                                         );
                                         self.ledger_syncer.mark_synced(header.sequence);
-                                        let _ =
-                                            self.consensus_tx.send(ConsensusMessage::LedgerData {
-                                                hash: header.hash,
-                                                seq: header.sequence,
-                                                nodes: leaves,
-                                            });
+                                        self.forward_to_consensus(ConsensusMessage::LedgerData {
+                                            hash: header.hash,
+                                            seq: header.sequence,
+                                            nodes: leaves,
+                                        });
                                     }
                                 }
                             } else {
@@ -1191,7 +1293,7 @@ impl PeerManager {
                                     if self.manifest_store.apply(m) {
                                         applied += 1;
                                         to_relay.push(raw.clone());
-                                        let _ = self.consensus_tx.send(
+                                        self.forward_to_consensus(
                                             ConsensusMessage::ManifestApplied {
                                                 master_key,
                                                 ephemeral_key: eph_key,
@@ -1349,12 +1451,11 @@ impl PeerManager {
                                             leaves.len()
                                         );
                                         self.ledger_syncer.mark_synced(seq);
-                                        let _ =
-                                            self.consensus_tx.send(ConsensusMessage::LedgerData {
-                                                hash,
-                                                seq,
-                                                nodes: leaves,
-                                            });
+                                        self.forward_to_consensus(ConsensusMessage::LedgerData {
+                                            hash,
+                                            seq,
+                                            nodes: leaves,
+                                        });
                                     }
                                     FeedResult::FallbackToHashFetch(content_hashes) => {
                                         self.send_get_objects_by_hash(seq, &content_hashes);
@@ -1433,7 +1534,7 @@ impl PeerManager {
                                                     .current_ephemeral_key(&master_key)
                                                     .cloned();
                                                 if self.manifest_store.apply(m) {
-                                                    let _ = self.consensus_tx.send(
+                                                    self.forward_to_consensus(
                                                         ConsensusMessage::ManifestApplied {
                                                             master_key,
                                                             ephemeral_key: eph_key,
@@ -1446,7 +1547,7 @@ impl PeerManager {
                                         }
 
                                         // Send verified list to consensus
-                                        let _ = self.consensus_tx.send(
+                                        self.forward_to_consensus(
                                             ConsensusMessage::ValidatorListVerified {
                                                 validators: vl_data.validators,
                                                 sequence: seq,
@@ -1461,7 +1562,7 @@ impl PeerManager {
                                     }
 
                                     // Also send the count for backward compatibility
-                                    let _ = self.consensus_tx.send(
+                                    self.forward_to_consensus(
                                         ConsensusMessage::ValidatorListReceived {
                                             validator_count: count,
                                         },
@@ -1476,7 +1577,7 @@ impl PeerManager {
                                     // Fall back to unverified count extraction
                                     if let Some(blob_b) = vl.blob.as_ref() {
                                         if let Ok(count) = base64_decode_validator_blob(blob_b) {
-                                            let _ = self.consensus_tx.send(
+                                            self.forward_to_consensus(
                                                 ConsensusMessage::ValidatorListReceived {
                                                     validator_count: count,
                                                 },
@@ -1489,7 +1590,7 @@ impl PeerManager {
                             // Missing fields, fall back to unverified extraction
                             if let Some(blob_bytes) = vl.blob.as_ref() {
                                 if let Ok(decoded) = base64_decode_validator_blob(blob_bytes) {
-                                    let _ = self.consensus_tx.send(
+                                    self.forward_to_consensus(
                                         ConsensusMessage::ValidatorListReceived {
                                             validator_count: decoded,
                                         },
@@ -1639,7 +1740,7 @@ impl PeerManager {
                         // Forward each new transaction to the consensus layer
                         for (tx_hash, tx_data) in &new_txs {
                             if self.relay_filter.should_relay(tx_hash) {
-                                let _ = self.consensus_tx.send(ConsensusMessage::Transaction {
+                                self.forward_to_consensus(ConsensusMessage::Transaction {
                                     hash: *tx_hash,
                                     data: tx_data.clone(),
                                 });
@@ -2924,9 +3025,7 @@ impl PeerManager {
         }
 
         // Notify the consensus engine.
-        let _ = self
-            .consensus_tx
-            .send(ConsensusMessage::TxSetAcquired(tx_set));
+        self.forward_to_consensus(ConsensusMessage::TxSetAcquired(tx_set));
     }
 }
 
