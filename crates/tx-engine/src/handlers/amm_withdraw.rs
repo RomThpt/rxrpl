@@ -424,6 +424,18 @@ impl AMMWithdrawTransactor {
         // XRP paid out for burning the holder's entire LP.
         let amount_out = amm_helpers::amm_asset_out_single_xrp(pool, &total_lp, &holder_lp, tfee);
 
+        // tfOneAssetWithdrawAll: sfAmount is a minimum payout; rippled
+        // `singleWithdrawTokens` returns tecAMM_FAILED (no effect) when the full
+        // LP position redeems for fewer drops than requested.
+        let requested = ctx
+            .tx
+            .get("Amount")
+            .and_then(amm_helpers::amount_value_drops_or_iou)
+            .unwrap_or(0);
+        if requested > amount_out {
+            return Ok(TransactionResult::TecAmmFailed);
+        }
+
         // AMM.LPTokenBalance -= holder LP.
         let new_total = Number::from_iou(&total_lp)
             .sub(&Number::from_iou(&holder_lp))
@@ -515,6 +527,13 @@ impl AMMWithdrawTransactor {
         // singleWithdraw applies min(amount, assetOut); withdraw_all takes the
         // full re-derived payout.
         let payout = if withdraw_all {
+            // tfOneAssetWithdrawAll: rippled `singleWithdrawTokens` treats sfAmount
+            // as a minimum and fails with tecAMM_FAILED (no effect) when redeeming
+            // the full LP position yields less than it.
+            let requested = leg.requested_number(amount);
+            if gt(&requested, &asset_out) {
+                return Ok(TransactionResult::TecAmmFailed);
+            }
             asset_out
         } else {
             let requested = leg.requested_number(amount);

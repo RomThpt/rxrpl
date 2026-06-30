@@ -81,6 +81,14 @@ impl Transactor for AMMDepositTransactor {
         let amm_key = amm_helpers::compute_amm_key_from_tx(ctx.tx)?;
         let mut amm = amm_helpers::read_amm(ctx.view, &amm_key)?;
 
+        // rippled AMMDeposit::preclaim runs the funding + new-line reserve checks
+        // before doApply; mirror them here (our engine consumes fee+sequence
+        // centrally just before apply, so a CLAIMED tec must surface from apply
+        // to charge them). Returns tecUNFUNDED_AMM / tecINSUF_RESERVE_LINE with
+        // no deposit when the depositor cannot fund the amounts or the new
+        // LP-token trust line.
+        self.check_deposit_funding(ctx, &account_id, &amm)?;
+
         // Single-asset XRP deposit on the real (rippled) AMM model: the pool
         // balance is the AMM account's own XRP balance, LP tokens are minted by
         // the Number-precise `lpTokensOut`, and the depositor is credited on the
@@ -154,6 +162,184 @@ impl Transactor for AMMDepositTransactor {
 }
 
 impl AMMDepositTransactor {
+    /// rippled `AMMDeposit::preclaim` funding + reserve checks, run from apply so
+    /// a CLAIMED tec charges fee+sequence (the engine consumes those centrally
+    /// just before apply, after preclaim, so a preclaim-style tec must surface
+    /// here). For each present Amount/Amount2: an XRP leg must be covered by the
+    /// depositor's spendable XRP — balance minus `accountReserve`, with one extra
+    /// owned object counted when no LP-token line exists yet — else
+    /// tecINSUF_RESERVE_LINE (no line) or tecUNFUNDED_AMM (line already present);
+    /// an IOU leg must be covered by the depositor's holding of that asset (or the
+    /// depositor is its issuer), else tecUNFUNDED_AMM. Finally, when the depositor
+    /// holds no LP yet, the deposit creates a new LP-token trust line, so the
+    /// spendable XRP for `OwnerCount + 1` must be strictly positive, else
+    /// tecINSUF_RESERVE_LINE. Mirrors AMMDeposit.cpp's `balance` lambda and the
+    /// trailing `ammLPHolds == 0` reserve guard.
+    fn check_deposit_funding(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+        depositor: &rxrpl_primitives::AccountId,
+        amm: &serde_json::Value,
+    ) -> Result<(), TransactionResult> {
+        use rxrpl_amount::number::Number;
+
+        let acct_key = keylet::account(depositor);
+        let acct_bytes = ctx
+            .view
+            .read(&acct_key)
+            .ok_or(TransactionResult::TerNoAccount)?;
+        let account: serde_json::Value =
+            serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        // rippled's preclaim runs before the fee is paid (mPriorBalance); the
+        // engine already consumed it centrally, so add it back.
+        let prior_balance = helpers::get_balance(&account).saturating_add(helpers::get_fee(ctx.tx));
+        let owner_count = helpers::get_owner_count(&account);
+
+        let amm_account = decode_account_id(
+            amm["Account"]
+                .as_str()
+                .ok_or(TransactionResult::TefInternal)?,
+        )
+        .map_err(|_| TransactionResult::TefInternal)?;
+        let lp_cur_bytes: [u8; 20] = amm
+            .get("LPTokenBalance")
+            .and_then(|b| b.get("currency"))
+            .and_then(|v| v.as_str())
+            .and_then(|c| hex::decode(c).ok())
+            .and_then(|b| b.try_into().ok())
+            .ok_or(TransactionResult::TefInternal)?;
+        // rippled distinguishes two predicates: `!sle` (the LP-token line is
+        // absent) gates the reserve adjustment in the per-leg `balance` check,
+        // while `ammLPHolds == 0` (the depositor holds zero LP — true when the
+        // line is absent OR present with a zero balance) gates the trailing
+        // new-line reserve guard.
+        let lp_line = ctx
+            .view
+            .read(&keylet::trust_line(depositor, &amm_account, &lp_cur_bytes));
+        let lp_line_exists = lp_line.is_some();
+        let amm_lp_holds_zero = match &lp_line {
+            None => true,
+            Some(bytes) => serde_json::from_slice::<serde_json::Value>(bytes)
+                .ok()
+                .and_then(|line| {
+                    line["Balance"]["value"]
+                        .as_str()
+                        .map(|v| amm_helpers::parse_iou_value(v.trim_start_matches('-')).is_zero())
+                })
+                .unwrap_or(true),
+        };
+
+        // xrpLiquid(ownerCountAdj): spendable XRP after the reserve, clamped at 0.
+        let xrp_liquid = |owner_adj: u32| -> i128 {
+            let reserve = ctx.fees.account_reserve(owner_count + owner_adj) as i128;
+            (prior_balance as i128 - reserve).max(0)
+        };
+
+        // rippled `balance(deposit)` for each present leg.
+        for field in ["Amount", "Amount2"] {
+            let Some(amount) = ctx.tx.get(field) else {
+                continue;
+            };
+            if let Some(s) = amount.as_str() {
+                // XRP leg.
+                let deposit = s.parse::<u64>().unwrap_or(0) as i128;
+                let owner_adj = u32::from(!lp_line_exists);
+                if xrp_liquid(owner_adj) < deposit {
+                    return Err(if lp_line_exists {
+                        TransactionResult::TecUnfundedAmm
+                    } else {
+                        TransactionResult::TecInsufReserveLine
+                    });
+                }
+                continue;
+            }
+            // IOU leg.
+            let issuer = decode_account_id(
+                amount["issuer"]
+                    .as_str()
+                    .ok_or(TransactionResult::TemBadIssuer)?,
+            )
+            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+            // The depositor as the asset's issuer always has the funds.
+            if depositor.as_bytes() == issuer.as_bytes() {
+                continue;
+            }
+            let currency =
+                helpers::currency_to_bytes(amount["currency"].as_str().unwrap_or_default());
+            let holding = amm_helpers::iou_holding_number(ctx.view, depositor, &issuer, &currency);
+            let deposit = Number::from_iou(&amm_helpers::parse_iou_value(
+                amount["value"].as_str().unwrap_or("0"),
+            ));
+            // holding < deposit -> underfunded.
+            if holding.sub(&deposit).negative() {
+                return Err(TransactionResult::TecUnfundedAmm);
+            }
+        }
+
+        // New LP-token trust line reserve (rippled: ammLPHolds == 0).
+        if amm_lp_holds_zero && xrp_liquid(1) <= 0 {
+            return Err(TransactionResult::TecInsufReserveLine);
+        }
+        Ok(())
+    }
+
+    /// rippled `AMMDeposit::deposit`'s post-fee `checkBalance`, run on the
+    /// *re-derived* deposit amount of one leg before it is sent to the pool.
+    /// Unlike the preclaim check (pre-fee, requested amounts), this runs after
+    /// the engine has already paid the fee, so `get_balance` is the post-fee
+    /// value doApply sees — a deposit funded to the drop pre-fee can tip into
+    /// tecUNFUNDED_AMM here. XRP uses spendable balance after the reserve (one
+    /// extra owned object when the depositor holds no LP-token line yet); IOU
+    /// uses the asset holding (the issuer always has funds). doApply returns
+    /// tecUNFUNDED_AMM for either shortfall.
+    fn post_fee_check_leg(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+        depositor: &rxrpl_primitives::AccountId,
+        amm_account: &rxrpl_primitives::AccountId,
+        lp_currency_hex: &str,
+        leg: &DepositLeg,
+        dep: &rxrpl_amount::number::Number,
+    ) -> Result<(), TransactionResult> {
+        match leg {
+            DepositLeg::Xrp => {
+                let deposit_drops = dep.to_xrp_drops() as i128;
+                let acct_bytes = ctx
+                    .view
+                    .read(&keylet::account(depositor))
+                    .ok_or(TransactionResult::TerNoAccount)?;
+                let acct: serde_json::Value = serde_json::from_slice(&acct_bytes)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+                let balance = helpers::get_balance(&acct) as i128; // post-fee
+                let owner_count = helpers::get_owner_count(&acct);
+                let lp_cur: [u8; 20] = hex::decode(lp_currency_hex)
+                    .ok()
+                    .and_then(|b| b.try_into().ok())
+                    .ok_or(TransactionResult::TefInternal)?;
+                let line_exists =
+                    ctx.view
+                        .exists(&keylet::trust_line(depositor, amm_account, &lp_cur));
+                let reserve = ctx
+                    .fees
+                    .account_reserve(owner_count + u32::from(!line_exists))
+                    as i128;
+                if (balance - reserve).max(0) < deposit_drops {
+                    return Err(TransactionResult::TecUnfundedAmm);
+                }
+            }
+            DepositLeg::Iou { issuer, currency } => {
+                if depositor.as_bytes() != issuer.as_bytes() {
+                    let holding =
+                        amm_helpers::iou_holding_number(ctx.view, depositor, issuer, currency);
+                    if holding.sub(dep).negative() {
+                        return Err(TransactionResult::TecUnfundedAmm);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Single-asset XRP deposit on the real AMM model (byte-exact path).
     fn single_xrp_deposit(
         &self,
@@ -214,6 +400,16 @@ impl AMMDepositTransactor {
             (tokens0, asset_adj0)
         };
         let deposit = deposit.min(asset_adj);
+
+        // Post-fee funds re-check on the derived deposit (rippled deposit()).
+        self.post_fee_check_leg(
+            ctx,
+            depositor,
+            &amm_account,
+            &lp_currency_hex,
+            &DepositLeg::Xrp,
+            &Number::from_int(deposit as i64),
+        )?;
 
         // AMM.LPTokenBalance += tokens.
         let new_total = Number::from_iou(&total_lp)
@@ -331,6 +527,19 @@ impl AMMDepositTransactor {
             deposit
         };
 
+        // Post-fee funds re-check on the derived deposit (rippled deposit()).
+        self.post_fee_check_leg(
+            ctx,
+            depositor,
+            &amm_account,
+            &lp_currency_hex,
+            &DepositLeg::Iou {
+                issuer: asset_issuer,
+                currency: asset_currency,
+            },
+            &deposit,
+        )?;
+
         // AMM.LPTokenBalance += tokens.
         let new_total = Number::from_iou(&total_lp)
             .add(&Number::from_iou(&tokens))
@@ -439,6 +648,10 @@ impl AMMDepositTransactor {
             }
             (amount1_dep, amount2, tokens)
         };
+
+        // Post-fee funds re-check on the derived amounts (rippled deposit()).
+        self.post_fee_check_leg(ctx, depositor, &amm_account, &lp_currency_hex, &leg1, &dep1)?;
+        self.post_fee_check_leg(ctx, depositor, &amm_account, &lp_currency_hex, &leg2, &dep2)?;
 
         // AMM.LPTokenBalance += tokens.
         let new_total = Number::from_iou(&total_lp)
