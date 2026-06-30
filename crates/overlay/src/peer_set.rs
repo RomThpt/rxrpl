@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 use rxrpl_primitives::Hash256;
@@ -8,9 +9,22 @@ use crate::rate_limiter::PeerRateLimiter;
 use crate::reputation::PeerReputation;
 
 /// Thread-safe collection of connected peers.
+///
+/// Beyond the total `max_peers` cap, the set enforces two rippled-style
+/// eclipse-attack defenses: a reserved block of outbound-only slots
+/// (`max_inbound = max_peers - reserved_outbound_slots`) so inbound peers can
+/// never fill every slot, and a per-remote-IP cap (`max_peers_per_ip`).
 pub struct PeerSet {
     peers: DashMap<Hash256, Arc<PeerInfo>>,
+    /// Live count of peers per remote IP (key = IP portion of `address`).
+    ip_counts: DashMap<String, usize>,
     max_peers: usize,
+    /// Maximum inbound peers; the remaining slots are reserved for outbound.
+    max_inbound: usize,
+    /// Maximum simultaneous peers sharing one remote IP.
+    max_peers_per_ip: usize,
+    /// Live count of inbound peers (a subset of `peers`).
+    inbound_count: AtomicUsize,
 }
 
 /// Software identity of a remote peer (parsed from `User-Agent` header).
@@ -79,25 +93,107 @@ pub struct PeerInfo {
 }
 
 impl PeerSet {
-    pub fn new(max_peers: usize) -> Self {
+    /// Build a peer set.
+    ///
+    /// `reserved_outbound_slots` slots are withheld from inbound peers so the
+    /// node always has room for the outbound connections it dials itself;
+    /// `max_peers_per_ip` bounds how many peers a single remote IP may hold.
+    pub fn new(max_peers: usize, reserved_outbound_slots: usize, max_peers_per_ip: usize) -> Self {
         Self {
             peers: DashMap::new(),
+            ip_counts: DashMap::new(),
             max_peers,
+            max_inbound: max_peers.saturating_sub(reserved_outbound_slots),
+            max_peers_per_ip,
+            inbound_count: AtomicUsize::new(0),
         }
     }
 
-    /// Add a peer. Returns false if the peer limit is reached.
+    /// Extract the IP portion of an `IP:port` address.
+    ///
+    /// Splits on the LAST `:` so bracketed/`host:port` IPv6 forms still yield a
+    /// stable key; an address with no `:` is used verbatim.
+    fn ip_of(address: &str) -> &str {
+        match address.rsplit_once(':') {
+            Some((ip, _port)) => ip,
+            None => address,
+        }
+    }
+
+    /// Add a peer. Returns false if any slot limit rejects it:
+    /// (a) the total `max_peers` cap, (b) the inbound reservation
+    /// (`max_inbound`) for inbound peers, or (c) the per-IP cap.
+    /// Counters are only bumped once all checks pass, so a rejected peer is
+    /// never counted (keeping `remove` symmetric).
     pub fn add(&self, info: Arc<PeerInfo>) -> bool {
+        // (a) Total cap (unchanged). Mirrors the original behavior of
+        // returning false when full, even for an already-present node_id.
         if self.peers.len() >= self.max_peers {
             return false;
         }
-        self.peers.insert(info.node_id, info);
+        // Re-adding an existing node_id is an in-place update: it changes no
+        // counter (preserves the original "don't double count" semantics).
+        let already_present = self.peers.contains_key(&info.node_id);
+        // (b) Inbound reservation: keep the outbound-only slots free.
+        if !already_present
+            && info.inbound
+            && self.inbound_count.load(Ordering::Relaxed) >= self.max_inbound
+        {
+            return false;
+        }
+        // (c) Per-IP cap.
+        let ip = Self::ip_of(&info.address).to_string();
+        if !already_present {
+            let cur = self.ip_counts.get(&ip).map(|r| *r.value()).unwrap_or(0);
+            if cur >= self.max_peers_per_ip {
+                return false;
+            }
+        }
+        let inbound = info.inbound;
+        let prev = self.peers.insert(info.node_id, info);
+        if prev.is_none() {
+            if inbound {
+                self.inbound_count.fetch_add(1, Ordering::Relaxed);
+            }
+            *self.ip_counts.entry(ip).or_insert(0) += 1;
+        }
         true
     }
 
-    /// Remove a peer by node ID.
+    /// Remove a peer by node ID, decrementing the inbound and per-IP counters
+    /// so they stay in lock-step with `add`.
     pub fn remove(&self, node_id: &Hash256) -> Option<Arc<PeerInfo>> {
-        self.peers.remove(node_id).map(|(_, v)| v)
+        let removed = self.peers.remove(node_id).map(|(_, v)| v);
+        if let Some(info) = &removed {
+            if info.inbound {
+                self.inbound_count.fetch_sub(1, Ordering::Relaxed);
+            }
+            let ip = Self::ip_of(&info.address);
+            let now_zero = match self.ip_counts.get_mut(ip) {
+                Some(mut e) => {
+                    *e = e.saturating_sub(1);
+                    *e == 0
+                }
+                None => false,
+            };
+            if now_zero {
+                // Atomically drop the entry only if a concurrent add did not
+                // re-increment it in the meantime.
+                self.ip_counts.remove_if(ip, |_, &v| v == 0);
+            }
+        }
+        removed
+    }
+
+    /// Current number of inbound peers.
+    pub fn inbound_count(&self) -> usize {
+        self.inbound_count.load(Ordering::Relaxed)
+    }
+
+    /// Number of peers currently connected from the given remote IP
+    /// (pass the IP portion only, e.g. `"1.2.3.4"`).
+    pub fn peers_for_ip(&self, ip: &str) -> usize {
+        self.ip_counts.get(ip).map(|r| *r.value()).unwrap_or(0)
     }
 
     /// Get a peer by node ID.
@@ -243,9 +339,17 @@ mod tests {
     use super::*;
 
     fn make_peer(id_byte: u8, inbound: bool) -> Arc<PeerInfo> {
+        make_peer_at(
+            id_byte,
+            inbound,
+            format!("127.0.0.1:{}", 51235 + id_byte as u16),
+        )
+    }
+
+    fn make_peer_at(id_byte: u8, inbound: bool, address: String) -> Arc<PeerInfo> {
         Arc::new(PeerInfo {
             node_id: Hash256::new([id_byte; 32]),
-            address: format!("127.0.0.1:{}", 51235 + id_byte as u16),
+            address,
             inbound,
             public_key: vec![0x03; 33],
             connected_at: std::time::Instant::now(),
@@ -255,6 +359,12 @@ mod tests {
             rate_limiter: PeerRateLimiter::default(),
             software: PeerSoftware::Unknown,
         })
+    }
+
+    /// Old behavior for tests that predate the eclipse limits: no reserved
+    /// outbound slots and an effectively unlimited per-IP cap.
+    fn unlimited(max_peers: usize) -> PeerSet {
+        PeerSet::new(max_peers, 0, usize::MAX)
     }
 
     #[test]
@@ -276,7 +386,7 @@ mod tests {
 
     #[test]
     fn add_and_get() {
-        let set = PeerSet::new(10);
+        let set = unlimited(10);
         let peer = make_peer(1, false);
         assert!(set.add(peer.clone()));
         assert_eq!(set.len(), 1);
@@ -285,14 +395,14 @@ mod tests {
 
     #[test]
     fn peer_limit() {
-        let set = PeerSet::new(1);
+        let set = unlimited(1);
         assert!(set.add(make_peer(1, false)));
         assert!(!set.add(make_peer(2, false)));
     }
 
     #[test]
     fn remove_peer() {
-        let set = PeerSet::new(10);
+        let set = unlimited(10);
         let id = Hash256::new([1; 32]);
         set.add(make_peer(1, false));
         assert!(set.remove(&id).is_some());
@@ -318,13 +428,13 @@ mod tests {
 
     #[test]
     fn best_peers_empty() {
-        let set = PeerSet::new(10);
+        let set = unlimited(10);
         assert!(set.best_peers(3).is_empty());
     }
 
     #[test]
     fn best_peers_filters_negative() {
-        let set = PeerSet::new(10);
+        let set = unlimited(10);
         // Peer 1: score 0 (included)
         set.add(make_peer(1, false));
         // Peer 2: negative score (excluded) -- 1 invalid message = -10
@@ -339,7 +449,7 @@ mod tests {
 
     #[test]
     fn best_peers_sorted_by_score() {
-        let set = PeerSet::new(10);
+        let set = unlimited(10);
 
         // Peer 1: score +5 (5 valid messages)
         let p1 = make_peer(1, false);
@@ -372,7 +482,7 @@ mod tests {
 
     #[test]
     fn best_peers_for_ledger_prefers_ahead() {
-        let set = PeerSet::new(10);
+        let set = unlimited(10);
 
         // Peer 1: score +10, ledger_seq = 50 (behind target)
         let p1 = make_peer(1, false);
@@ -397,5 +507,82 @@ mod tests {
         // Peer 2 has effective score 5 + 200 = 205, peer 1 has 10
         assert_eq!(best[0], Hash256::new([2; 32]));
         assert_eq!(best[1], Hash256::new([1; 32]));
+    }
+
+    #[test]
+    fn reserved_outbound_slots_block_excess_inbound() {
+        // max_peers=10, reserved=6 => max_inbound=4. Per-IP cap high so it does
+        // not interfere (all test peers share 127.0.0.1).
+        let set = PeerSet::new(10, 6, usize::MAX);
+
+        // 4 inbound peers fill the inbound allowance.
+        for i in 1..=4u8 {
+            assert!(set.add(make_peer(i, true)), "inbound {i} should fit");
+        }
+        assert_eq!(set.inbound_count(), 4);
+
+        // The 5th inbound is rejected -- the remaining 6 slots are reserved.
+        assert!(
+            !set.add(make_peer(5, true)),
+            "5th inbound must be rejected by the reservation"
+        );
+        assert_eq!(set.inbound_count(), 4);
+
+        // An outbound peer still succeeds: the reserved slots are for it.
+        assert!(
+            set.add(make_peer(6, false)),
+            "outbound must still fit in a reserved slot"
+        );
+        assert_eq!(set.len(), 5);
+    }
+
+    #[test]
+    fn per_ip_cap_rejects_third_peer_from_same_ip() {
+        // No inbound reservation; cap = 2 peers per IP.
+        let set = PeerSet::new(10, 0, 2);
+
+        assert!(set.add(make_peer_at(1, false, "1.2.3.4:1000".into())));
+        assert!(set.add(make_peer_at(2, false, "1.2.3.4:1001".into())));
+        assert_eq!(set.peers_for_ip("1.2.3.4"), 2);
+
+        // Third peer from the same IP (new port, new node_id) is rejected.
+        assert!(
+            !set.add(make_peer_at(3, false, "1.2.3.4:1002".into())),
+            "third peer from same IP must be rejected"
+        );
+        assert_eq!(set.peers_for_ip("1.2.3.4"), 2);
+
+        // A peer from a different IP still succeeds.
+        assert!(set.add(make_peer_at(4, false, "5.6.7.8:1000".into())));
+        assert_eq!(set.peers_for_ip("5.6.7.8"), 1);
+    }
+
+    #[test]
+    fn remove_frees_inbound_and_ip_counters() {
+        // max_inbound = 2, per-IP cap = 2.
+        let set = PeerSet::new(10, 8, 2);
+
+        let p1 = make_peer_at(1, true, "9.9.9.9:1000".into());
+        let p2 = make_peer_at(2, true, "9.9.9.9:1001".into());
+        assert!(set.add(Arc::clone(&p1)));
+        assert!(set.add(Arc::clone(&p2)));
+        assert_eq!(set.inbound_count(), 2);
+        assert_eq!(set.peers_for_ip("9.9.9.9"), 2);
+
+        // Both limits are now saturated: a third inbound from the same IP fails
+        // on the inbound reservation, and even an outbound from that IP fails
+        // on the per-IP cap.
+        assert!(!set.add(make_peer_at(3, true, "9.9.9.9:1002".into())));
+        assert!(!set.add(make_peer_at(4, false, "9.9.9.9:1003".into())));
+
+        // Removing one peer frees one inbound slot and one IP slot.
+        assert!(set.remove(&p1.node_id).is_some());
+        assert_eq!(set.inbound_count(), 1);
+        assert_eq!(set.peers_for_ip("9.9.9.9"), 1);
+
+        // A fresh peer from the freed IP / inbound slot now succeeds again.
+        assert!(set.add(make_peer_at(5, true, "9.9.9.9:1004".into())));
+        assert_eq!(set.inbound_count(), 2);
+        assert_eq!(set.peers_for_ip("9.9.9.9"), 2);
     }
 }

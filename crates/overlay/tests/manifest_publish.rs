@@ -16,6 +16,8 @@ fn make_peer_config(identity: &NodeIdentity, listen_port: u16) -> PeerManagerCon
     PeerManagerConfig {
         listen_port,
         max_peers: 10,
+        reserved_outbound_slots: 0,
+        max_peers_per_ip: usize::MAX,
         seeds: vec![],
         fixed_peers: vec![],
         network_id: 99999,
@@ -111,6 +113,8 @@ async fn two_nodes_handshake_and_node_b_receives_node_a_manifest() {
     let cfg_a = PeerManagerConfig {
         listen_port: port_a,
         max_peers: 4,
+        reserved_outbound_slots: 0,
+        max_peers_per_ip: usize::MAX,
         seeds: vec![],
         fixed_peers: vec![],
         network_id: 555,
@@ -135,6 +139,8 @@ async fn two_nodes_handshake_and_node_b_receives_node_a_manifest() {
     let cfg_b = PeerManagerConfig {
         listen_port: 0,
         max_peers: 4,
+        reserved_outbound_slots: 0,
+        max_peers_per_ip: usize::MAX,
         seeds: vec![],
         fixed_peers: vec![format!("127.0.0.1:{port_a}")],
         network_id: 555,

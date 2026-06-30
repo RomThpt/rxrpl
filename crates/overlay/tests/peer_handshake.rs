@@ -20,6 +20,8 @@ fn make_peer_config(
     PeerManagerConfig {
         listen_port,
         max_peers: 10,
+        reserved_outbound_slots: 0,
+        max_peers_per_ip: usize::MAX,
         seeds: vec![],
         fixed_peers,
         network_id: 99999,

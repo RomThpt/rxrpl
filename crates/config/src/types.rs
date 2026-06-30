@@ -107,6 +107,12 @@ pub struct PeerConfig {
     /// Maximum number of peer connections.
     #[serde(default = "default_max_peers")]
     pub max_peers: usize,
+    /// Outbound slots an inbound peer may never occupy (eclipse-attack resistance).
+    #[serde(default = "default_reserved_outbound_slots")]
+    pub reserved_outbound_slots: usize,
+    /// Max simultaneous peers sharing one remote IP (eclipse-attack resistance).
+    #[serde(default = "default_max_peers_per_ip")]
+    pub max_peers_per_ip: usize,
     /// Bootstrap peer addresses.
     #[serde(default = "default_seeds")]
     pub seeds: Vec<String>,
@@ -133,6 +139,14 @@ fn default_max_peers() -> usize {
     21
 }
 
+fn default_reserved_outbound_slots() -> usize {
+    6
+}
+
+fn default_max_peers_per_ip() -> usize {
+    2
+}
+
 fn default_seeds() -> Vec<String> {
     Vec::new()
 }
@@ -142,6 +156,8 @@ impl Default for PeerConfig {
         Self {
             port: default_peer_port(),
             max_peers: default_max_peers(),
+            reserved_outbound_slots: default_reserved_outbound_slots(),
+            max_peers_per_ip: default_max_peers_per_ip(),
             seeds: default_seeds(),
             fixed_peers: Vec::new(),
             node_seed: None,
