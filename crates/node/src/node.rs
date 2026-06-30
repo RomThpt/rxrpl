@@ -1238,6 +1238,12 @@ impl Node {
         let ledger_hash_shared = Arc::clone(&ledger_hash);
         let network_validated_for_loop = Arc::clone(&network_validated_arc);
         let configured_quorum = self.config.validators.quorum;
+        // Whether a dynamic validator list is configured. Gates every
+        // runtime mutation of the consensus engine's UNL so that a node
+        // running on a static `[validators]` config (e.g. hive clusters)
+        // never has its trusted set or ephemeral mappings rewritten — its
+        // consensus behavior is identical to before this wiring existed.
+        let vl_dynamic = !self.config.validators.validator_list_sites.is_empty();
         let trusted_validators_for_aggregator = if self.config.validators.require_trusted_validators
             && !self.config.validators.validator_list_sites.is_empty()
             && !vl_publisher_keys.is_empty()
@@ -2830,11 +2836,24 @@ impl Node {
                                     "verified validator list seq={} with {} validators",
                                     sequence, validators.len()
                                 );
+                                if vl_dynamic && !validators.is_empty() {
+                                    consensus.set_trusted_master_keys(&validators);
+                                    if configured_quorum.is_none() {
+                                        val_aggregator
+                                            .update_quorum(Node::compute_quorum(validators.len()));
+                                    }
+                                    tracing::info!(
+                                        "applied verified validator list seq={}: consensus UNL now {} validators, quorum {}",
+                                        sequence,
+                                        validators.len(),
+                                        consensus.unl().quorum_threshold()
+                                    );
+                                }
                             }
                             ConsensusMessage::ManifestApplied {
                                 master_key,
                                 ephemeral_key,
-                                old_ephemeral_key: _,
+                                old_ephemeral_key,
                                 revoked,
                             } => {
                                 if revoked {
@@ -2847,6 +2866,28 @@ impl Node {
                                         "manifest applied: master={} ephemeral={}",
                                         master_key, eph
                                     );
+                                }
+
+                                // Keep the consensus engine's UNL aware of the
+                                // ephemeral->master mapping so trusted proposals
+                                // and validations signed by the ephemeral key
+                                // resolve to their (VL-trusted) master. Gated on
+                                // a dynamic VL so static-config nodes are
+                                // untouched.
+                                if vl_dynamic {
+                                    let unl = consensus.unl_mut();
+                                    if revoked {
+                                        unl.revoke_master_key(&master_key);
+                                        if let Some(ref eph) = ephemeral_key {
+                                            unl.remove_ephemeral_key(eph);
+                                        }
+                                    } else if let Some(ref eph) = ephemeral_key {
+                                        unl.register_ephemeral_key(
+                                            &master_key,
+                                            eph,
+                                            old_ephemeral_key.as_ref(),
+                                        );
+                                    }
                                 }
 
                                 if !revoked {

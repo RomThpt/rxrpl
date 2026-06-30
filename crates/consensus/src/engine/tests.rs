@@ -1986,3 +1986,35 @@ fn higher_prop_seq_proposal_replaces_existing() {
         1
     );
 }
+
+#[test]
+fn set_trusted_master_keys_updates_unl_quorum_and_trie() {
+    // Start from a 2-validator config UNL; the trie is seeded from it.
+    let mut engine = ConsensusEngine::new_with_unl(
+        SimpleAdapter,
+        node(1),
+        Vec::new(),
+        ConsensusParams::default(),
+        make_unl(&[1, 2]),
+    );
+    assert_eq!(engine.unl().effective_size(), 2);
+    assert_eq!(engine.validations_trie().trusted_count(), 2);
+
+    // A verified VL of 5 master keys replaces the set.
+    let keys: Vec<rxrpl_primitives::PublicKey> = (10u8..15)
+        .map(|i| rxrpl_primitives::PublicKey::from_slice(&test_pk(i)).unwrap())
+        .collect();
+    engine.set_trusted_master_keys(&keys);
+
+    // UNL trusted set and its derived quorum follow the new size, and the
+    // trie trusted set is kept in sync (old 2 dropped, new 5 added).
+    assert_eq!(engine.unl().effective_size(), 5);
+    assert_eq!(engine.unl().quorum_threshold(), 4); // ceil(5 * 0.8)
+    assert_eq!(engine.validations_trie().trusted_count(), 5);
+    assert!(engine.unl().is_trusted(&node(10)));
+    assert!(!engine.unl().is_trusted(&node(1)));
+
+    // An empty list is a no-op: a malformed VL never wipes the UNL to solo.
+    engine.set_trusted_master_keys(&[]);
+    assert_eq!(engine.unl().effective_size(), 5);
+}
