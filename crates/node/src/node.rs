@@ -663,6 +663,39 @@ impl Node {
         Ok(())
     }
 
+    /// Refuse to run as a validator on a live network with no source of
+    /// trust. A validating node (validation seed set) whose UNL would be
+    /// empty -- no parseable `[validators]` key and no validator-list
+    /// publisher site -- puts the consensus engine in solo mode, where it
+    /// accepts its own ledgers as validated with no quorum. On a public
+    /// network that is a silent fork. Legitimate single-node validation
+    /// goes through `run_standalone`; tracking nodes (no validation seed)
+    /// are unaffected.
+    fn validate_validating_unl(&self) -> Result<(), NodeError> {
+        if self.validation_seed.is_none() {
+            return Ok(());
+        }
+        const NODE_PUBLIC_KEY_PREFIX: u8 = 0x1C;
+        let has_trusted_key = self.config.validators.trusted.iter().any(|entry| {
+            let t = entry.trim();
+            if let Ok(decoded) = rxrpl_codec::address::base58::base58check_decode(t) {
+                if decoded.len() == 1 + 33 && decoded[0] == NODE_PUBLIC_KEY_PREFIX {
+                    return true;
+                }
+            }
+            hex::decode(t).is_ok()
+        });
+        if !has_trusted_key && self.config.validators.validator_list_sites.is_empty() {
+            return Err(NodeError::Config(
+                "refusing to validate with no trusted validators: configure \
+                 `[validators]` keys or a `validators.validator_list_sites` \
+                 publisher, or run in standalone mode for solo validation"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn run_networked(
         &self,
         close_interval_secs: u64,
@@ -673,6 +706,7 @@ impl Node {
         // task spawn so a misconfiguration is reported deterministically
         // rather than racing `EADDRINUSE` (port collision in parallel tests).
         self.validate_starting_ledger_unl(starting_ledger.as_ref())?;
+        self.validate_validating_unl()?;
 
         // 1. Generate/load node identity. node_seed accepts either:
         //   - 32 hex characters (16 raw seed bytes)
