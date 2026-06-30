@@ -99,6 +99,26 @@ pub struct Validation {
     /// Optional `sfReserveIncrementDrops` (UINT64) — XRP-amount-encoded
     /// reserve increment (post-XRPFees amendment).
     pub reserve_increment_drops: Option<u64>,
+    /// Master public key this validation's ephemeral signing key maps to,
+    /// resolved from the manifest store at receive time. `None` when no
+    /// manifest maps the signing key (the validator signs directly with its
+    /// master key, or the manifest has not been seen yet). Trust decisions
+    /// must consult [`Validation::trusted_key`], not `public_key`, because
+    /// the trusted validator set is keyed by master keys while `public_key`
+    /// carries the ephemeral signing key used for the signature and node id.
+    pub master_public_key: Option<Vec<u8>>,
+}
+
+impl Validation {
+    /// Key to use for trusted-set membership checks: the resolved master key
+    /// when a manifest mapped the ephemeral signing key, otherwise the
+    /// signing key itself (covers validators that sign directly with their
+    /// master key and matches pre-manifest behavior).
+    pub fn trusted_key(&self) -> &[u8] {
+        self.master_public_key
+            .as_deref()
+            .unwrap_or(&self.public_key)
+    }
 }
 
 impl Proposal {

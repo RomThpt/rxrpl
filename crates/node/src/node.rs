@@ -2206,7 +2206,7 @@ impl Node {
                                 // could resolve the anchor on a forged hash and
                                 // bootstrap the node onto an attacker-chosen chain.
                                 let anchor_trustable =
-                                    val_aggregator.is_trusted(&validation.public_key);
+                                    val_aggregator.is_trusted(validation.trusted_key());
                                 if let Some(anchor) = checkpoint_anchor.as_mut() {
                                     if !anchor_trustable {
                                         // Drop silently — the same validation may
