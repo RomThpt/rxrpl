@@ -78,6 +78,11 @@ const CONSENSUS_CHANNEL_CAP: usize = 4096;
 const _TS_NEW_SET: u32 = 1;
 
 /// Messages forwarded from the overlay to the consensus layer.
+// The Validation variant is intentionally the largest: it carries the full
+// validation with its optional fee/reserve/cookie fields. Boxing it would add
+// a heap allocation per validation on the hot consensus-message path for no
+// real memory win, so the size spread is accepted here.
+#[allow(clippy::large_enum_variant)]
 pub enum ConsensusMessage {
     Proposal(Proposal),
     Validation(Validation),
@@ -909,7 +914,7 @@ impl PeerManager {
             },
             MessageType::Validation => {
                 match proto_convert::decode_validation(payload) {
-                    Ok(validation) => {
+                    Ok(mut validation) => {
                         // Reject validations with missing or invalid signatures
                         if !crate::identity::verify_validation_signature(&validation) {
                             tracing::warn!(
@@ -962,6 +967,23 @@ impl PeerManager {
                                             payload: payload.to_vec(),
                                         });
                                     }
+                                }
+                            }
+
+                            // Resolve the ephemeral signing key to the
+                            // validator's master key via the manifest store, so
+                            // the consensus loop can match it against the
+                            // master-keyed trusted set. Without this the trust
+                            // filter never matches a real validation (its
+                            // public_key is the ephemeral key) and zero trusted
+                            // validations are ever counted.
+                            if let Ok(eph) =
+                                rxrpl_primitives::PublicKey::from_slice(&validation.public_key)
+                            {
+                                if let Some(master) =
+                                    self.manifest_store.master_key_for_ephemeral(&eph)
+                                {
+                                    validation.master_public_key = Some(master.as_bytes().to_vec());
                                 }
                             }
 

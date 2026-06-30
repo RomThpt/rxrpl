@@ -261,7 +261,10 @@ impl ValidationAggregator {
         // wired through.
 
         // Trust filter: ignore validations from validators not in the UNL.
-        if !self.is_trusted(&validation.public_key) {
+        // Checked against the resolved master key (trusted_key), since the
+        // UNL is keyed by master keys while public_key is the ephemeral
+        // signing key.
+        if !self.is_trusted(validation.trusted_key()) {
             return None;
         }
 
@@ -523,6 +526,38 @@ mod tests {
         let mut val = make_validation(2, 5, Hash256::new([0xAA; 32]));
         val.public_key = trusted_key_bytes.to_vec();
         assert!(agg.add_validation_at(val, TEST_NOW).is_some());
+    }
+
+    #[tokio::test]
+    async fn ephemeral_validation_counted_via_master_resolution() {
+        // The trusted set holds MASTER keys, but a real validation's
+        // public_key is the EPHEMERAL signing key. When a manifest maps the
+        // two, the resolved master (Validation::trusted_key) must be matched
+        // against the set so the validation counts toward quorum.
+        use crate::vl_fetcher::new_trusted_keys;
+        use rxrpl_primitives::PublicKey;
+
+        let master_bytes = [0xED; 33];
+        let ephemeral_bytes = [0xAB; 33];
+        let trusted = new_trusted_keys();
+        trusted
+            .write()
+            .await
+            .insert(PublicKey::from_slice(&master_bytes).unwrap());
+        let mut agg = ValidationAggregator::new(1).with_trusted_keys(trusted);
+
+        // Ephemeral key alone is NOT in the trusted set: without resolution
+        // (master_public_key == None) the validation is dropped.
+        let mut unmapped = make_validation(1, 10, Hash256::new([0xCC; 32]));
+        unmapped.public_key = ephemeral_bytes.to_vec();
+        assert!(agg.add_validation_at(unmapped, TEST_NOW).is_none());
+
+        // With the manifest-resolved master attached, the same ephemeral
+        // signing key now counts toward quorum.
+        let mut mapped = make_validation(2, 10, Hash256::new([0xCC; 32]));
+        mapped.public_key = ephemeral_bytes.to_vec();
+        mapped.master_public_key = Some(master_bytes.to_vec());
+        assert!(agg.add_validation_at(mapped, TEST_NOW).is_some());
     }
 
     #[test]
