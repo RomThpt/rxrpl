@@ -1534,6 +1534,15 @@ impl Node {
             // Track consensus stalls for escalating recovery.
             let mut stall_metrics = rxrpl_consensus::StallMetrics::new();
 
+            // Validator-safety guard (M0): tracks the highest (seq, hash) this
+            // node has self-validated and the monotonic SigningTime floor.
+            // Shared by BOTH self-validation producers — the consensus-close
+            // path (`close_consensus_round`) and the catchup-adopt path below —
+            // so a sync/consensus race can never emit two conflicting FULL
+            // validations for one sequence (equivocation), nor a non-increasing
+            // SigningTime. See `crate::validation_guard`.
+            let mut self_validation_guard = crate::validation_guard::SelfValidationGuard::default();
+
             let sync_check_duration = Duration::from_secs(5);
             let mut sync_check_interval = tokio::time::interval(sync_check_duration);
             let mut sync_started_at: Option<tokio::time::Instant> = None;
@@ -1807,6 +1816,7 @@ impl Node {
                                             &amendment_votes, trusted_validator_count,
                                             &pruner, &node_store,
                                             &self_validation_tx,
+                                            &mut self_validation_guard,
                                         ).await;
                                         if let Ok(mut lc) = last_close_arc.write() {
                                             lc.proposers = proposers_this_round;
@@ -1996,6 +2006,7 @@ impl Node {
                                             &amendment_votes, trusted_validator_count,
                                             &pruner, &node_store,
                                             &self_validation_tx,
+                                            &mut self_validation_guard,
                                         ).await;
                                         if let Ok(mut lc) = last_close_arc.write() {
                                             lc.proposers = proposers_this_round;
@@ -2682,7 +2693,18 @@ impl Node {
                                                 // and broadcast — peer receives 2 validations
                                                 // (own + ours) for the same hash, reaches quorum,
                                                 // advances validated_ledger.
-                                                {
+                                                //
+                                                // Equivocation guard (M0): if the consensus-close
+                                                // path already self-validated this (or a newer) seq
+                                                // with a different hash, refuse — emitting a second
+                                                // conflicting FULL validation would get this node
+                                                // dropped as an equivocator.
+                                                if !self_validation_guard.may_validate(seq, reconstructed.header.hash) {
+                                                    tracing::warn!(
+                                                        "equivocation guard: refusing to validate adopted ledger #{} hash={} (already self-validated up to #{}); skipping validation broadcast",
+                                                        seq, reconstructed.header.hash, self_validation_guard.highest_seq(),
+                                                    );
+                                                } else {
                                                     use rxrpl_consensus::types::Validation;
                                                     use rxrpl_primitives::Hash256;
                                                     let our_amendment_votes =
@@ -2696,6 +2718,9 @@ impl Node {
                                                         .unwrap_or_default()
                                                         .as_secs()
                                                         .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
+                                                    // SigningTime monotonic floor (M0):
+                                                    // max(now, lastSigningTime + 1s).
+                                                    let sign_time = self_validation_guard.floor_signing_time(now_netclock);
                                                     let signing_pubkey: Vec<u8> = match validator_id_for_loop.as_ref() {
                                                         Some(vid) => vid.signing_pubkey().as_bytes().to_vec(),
                                                         None => identity.public_key_bytes().to_vec(),
@@ -2707,7 +2732,7 @@ impl Node {
                                                         ledger_seq: seq,
                                                         full: true,
                                                         close_time: reconstructed.header.close_time,
-                                                        sign_time: now_netclock,
+                                                        sign_time,
                                                         signature: None,
                                                         amendments: our_amendment_votes,
                                                         signing_payload: None,
@@ -2726,6 +2751,8 @@ impl Node {
                                                         msg_type: rxrpl_p2p_proto::MessageType::Validation,
                                                         payload,
                                                     });
+                                                    self_validation_guard.record_validation(seq, reconstructed.header.hash);
+                                                    self_validation_guard.record_signing_time(sign_time);
                                                     tracing::debug!(
                                                         "adopted ledger #{} validated by us, broadcast Validation",
                                                         seq
@@ -2906,6 +2933,7 @@ impl Node {
         pruner: &Arc<LedgerPruner>,
         node_store: &Option<Arc<dyn NodeStore>>,
         self_validation_tx: &tokio::sync::mpsc::UnboundedSender<rxrpl_overlay::ConsensusMessage>,
+        validation_guard: &mut crate::validation_guard::SelfValidationGuard,
     ) {
         // Resolve close_time in priority order:
         //  1. Quorum-accepted close_time from converge() — strongest signal,
@@ -3057,7 +3085,20 @@ impl Node {
         drop(l);
 
         // Broadcast validation (STObject format, rippled-compatible)
-        {
+        //
+        // Equivocation guard (M0): refuse to emit a FULL validation that would
+        // conflict with one we already produced for this (or a newer) sequence.
+        // Without this a sync/consensus race could double-sign a sequence with
+        // two different hashes and get this node dropped as an equivocator.
+        if !validation_guard.may_validate(closed_seq, hash) {
+            tracing::warn!(
+                "equivocation guard: refusing to validate ledger #{} hash={} \
+                 (already self-validated up to #{}); skipping validation broadcast",
+                closed_seq,
+                hash,
+                validation_guard.highest_seq(),
+            );
+        } else {
             use rxrpl_consensus::types::Validation;
             // Include our amendment votes in the validation message
             let our_amendment_votes = amendment_table.read().await.get_votes();
@@ -3065,6 +3106,10 @@ impl Node {
                 Some(vid) => vid.signing_pubkey().as_bytes().to_vec(),
                 None => identity.public_key_bytes().to_vec(),
             };
+            // SigningTime monotonic floor (M0): max(ledgerCloseTime, last+1s),
+            // mirroring rippled's RCLConsensus::Adaptor::validate so successive
+            // validations never carry a non-increasing timestamp.
+            let sign_time = validation_guard.floor_signing_time(effective_close_time);
             let mut validation = Validation {
                 node_id: rxrpl_consensus::types::NodeId(Hash256::new(identity.node_id.0)),
                 public_key: signing_pubkey.clone(),
@@ -3072,7 +3117,7 @@ impl Node {
                 ledger_seq: closed_seq,
                 full: true,
                 close_time: effective_close_time,
-                sign_time: effective_close_time,
+                sign_time,
                 signature: None,
                 amendments: our_amendment_votes,
                 signing_payload: None,
@@ -3099,6 +3144,11 @@ impl Node {
             // `Validations::add` from its own onAccept path.
             let _ =
                 self_validation_tx.send(rxrpl_overlay::ConsensusMessage::Validation(validation));
+
+            // Advance the equivocation high-water mark + SigningTime floor only
+            // once the validation has actually been emitted.
+            validation_guard.record_validation(closed_seq, hash);
+            validation_guard.record_signing_time(sign_time);
         }
 
         // Broadcast StatusChange so peers know our current ledger and our

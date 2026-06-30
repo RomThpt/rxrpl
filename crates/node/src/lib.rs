@@ -13,6 +13,7 @@ pub mod play_forward;
 pub mod pruner;
 pub mod reporting;
 pub mod shutdown;
+pub mod validation_guard;
 
 pub use checkpoint::{AnchorConfig, CheckpointAnchor, StartingLedger};
 pub use error::NodeError;
