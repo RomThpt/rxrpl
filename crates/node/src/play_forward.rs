@@ -707,15 +707,21 @@ mod tests {
             }
         }
 
-        // A sell NFTokenCreateOffer reads the seller's NFTokenPage to verify
-        // ownership, but creating an offer does not modify the page, so it is
-        // absent from AffectedNodes and would not be seeded — the ownership
-        // walk would then fail with tecNO_ENTRY. Seed the seller's full page
-        // chain from the parent ledger (account_objects), unchanged by the tx.
-        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("NFTokenCreateOffer")
-            && tx_json.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & 1 != 0
-        {
-            if let Some(acct) = tx_json.get("Account").and_then(|v| v.as_str()) {
+        // An NFTokenCreateOffer reads the token holder's NFTokenPage chain to
+        // verify ownership (rippled preclaim `findToken`), but creating an offer
+        // does not modify the page, so it is absent from AffectedNodes and would
+        // not be seeded — the ownership walk would then wrongly fail with
+        // tecNO_ENTRY. The holder is the seller (sfAccount) for a sell offer and
+        // the named sfOwner for a buy offer. Seed that account's full page chain
+        // from the parent ledger (account_objects), unchanged by the tx.
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("NFTokenCreateOffer") {
+            let is_sell = tx_json.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & 1 != 0;
+            let holder = if is_sell {
+                tx_json.get("Account").and_then(|v| v.as_str())
+            } else {
+                tx_json.get("Owner").and_then(|v| v.as_str())
+            };
+            if let Some(acct) = holder {
                 let r = rpc(serde_json::json!({
                     "method":"account_objects",
                     "params":[{"account":acct,"type":"nft_page","ledger_index":parent}]

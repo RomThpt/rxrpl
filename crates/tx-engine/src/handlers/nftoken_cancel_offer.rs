@@ -184,6 +184,16 @@ mod tests {
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let mut sandbox = Sandbox::new(&view);
+        // The seller must own the NFT for the sell offer to be placed
+        // (NFTokenCreateOffer::preclaim findToken).
+        let nft: rxrpl_primitives::Hash256 = NFTOKEN_ID.parse().unwrap();
+        crate::nftoken::insert_token(
+            &mut sandbox,
+            &id,
+            &nft,
+            serde_json::json!({ "NFToken": { "NFTokenID": NFTOKEN_ID } }),
+        )
+        .unwrap();
         let rules = Rules::new();
         let tx = serde_json::json!({
             "TransactionType": "NFTokenCreateOffer",
