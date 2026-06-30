@@ -112,20 +112,51 @@ fn apply_negative_unl_creates_unl_modify_tx_for_unreliable_validator() {
     let tx_engine = make_tx_engine_with_pseudo();
     let fees = FeeSettings::default();
 
+    // Deferred move at flag 256 is a no-op (nothing pending yet).
+    Node::update_negative_unl(&mut ledger, 256);
+
     let results = Node::apply_negative_unl(&mut consensus, &mut ledger, &tx_engine, &fees, 256);
     assert_eq!(results.len(), 1);
     assert!(results[0].is_success());
 
-    // NegativeUNL ledger entry must exist with validator 5's key in DisabledValidators.
     let nunl_key = keylet::negative_unl();
+    let key5 = key_map.get(&node_id(5)).unwrap();
+
+    // Deferred model: the pseudo-tx only records ValidatorToDisable; the
+    // DisabledValidators array is NOT touched yet.
     let data = ledger
         .get_state(&nunl_key)
         .expect("NegativeUNL SLE present after pseudo-tx");
     let obj: Value = rxrpl_ledger::sle_codec::decode_state(data).expect("decodes");
+    assert_eq!(obj["ValidatorToDisable"].as_str().unwrap(), key5);
+    assert!(
+        obj.get("DisabledValidators").is_none(),
+        "DisabledValidators must stay absent until the deferred move: {obj}"
+    );
+
+    // The deferred move at the NEXT flag ledger (512) moves the pending
+    // validator into DisabledValidators with the wrapper + FirstLedgerSequence
+    // stamp, and clears the pending field.
+    Node::update_negative_unl(&mut ledger, 512);
+    let data = ledger
+        .get_state(&nunl_key)
+        .expect("NegativeUNL still present");
+    let obj: Value = rxrpl_ledger::sle_codec::decode_state(data).expect("decodes");
     let disabled = obj["DisabledValidators"].as_array().expect("array");
     assert_eq!(disabled.len(), 1);
-    let key5 = key_map.get(&node_id(5)).unwrap();
-    assert_eq!(disabled[0]["PublicKey"].as_str().unwrap(), key5);
+    assert_eq!(
+        disabled[0]["DisabledValidator"]["PublicKey"]
+            .as_str()
+            .unwrap(),
+        key5
+    );
+    assert_eq!(
+        disabled[0]["DisabledValidator"]["FirstLedgerSequence"]
+            .as_u64()
+            .unwrap(),
+        512
+    );
+    assert!(obj.get("ValidatorToDisable").is_none());
 }
 
 // ===== B5 =====
@@ -143,41 +174,73 @@ fn apply_negative_unl_re_enable_validator_on_next_flag_ledger() {
     let tx_engine = make_tx_engine_with_pseudo();
     let fees = FeeSettings::default();
 
-    // Window 1
+    let nunl_key = keylet::negative_unl();
+    let key5 = key_map.get(&node_id(5)).unwrap().clone();
+
+    // -- Flag ledger 256: validator 5 disabled (pending only). --
     for _ in 0..256u32 {
         for id in 1..=4 {
             consensus.record_validation(node_id(id));
         }
         consensus.on_ledger_close_for_tracker();
     }
+    Node::update_negative_unl(&mut ledger, 256); // no-op, nothing pending
     let r1 = Node::apply_negative_unl(&mut consensus, &mut ledger, &tx_engine, &fees, 256);
     assert_eq!(r1.len(), 1);
     assert!(r1[0].is_success());
 
-    // Confirm validator 5 disabled.
-    let nunl_data = ledger
-        .get_state(&keylet::negative_unl())
-        .expect("nunl SLE present after window 1");
-    let obj: Value = rxrpl_ledger::sle_codec::decode_state(nunl_data).unwrap();
-    assert_eq!(obj["DisabledValidators"].as_array().unwrap().len(), 1);
+    // Pending ValidatorToDisable set; DisabledValidators still absent.
+    let obj: Value =
+        rxrpl_ledger::sle_codec::decode_state(ledger.get_state(&nunl_key).unwrap()).unwrap();
+    assert_eq!(obj["ValidatorToDisable"].as_str().unwrap(), key5);
+    assert!(obj.get("DisabledValidators").is_none());
 
-    // Window 2: validator 5 reliable.
+    // -- Flag ledger 512: deferred move makes the disable effective, then
+    //    validator 5 (now reliable) is re-enabled (pending only). --
     for _ in 0..256u32 {
         for id in 1..=5 {
             consensus.record_validation(node_id(id));
         }
         consensus.on_ledger_close_for_tracker();
     }
+    Node::update_negative_unl(&mut ledger, 512);
+    let obj: Value =
+        rxrpl_ledger::sle_codec::decode_state(ledger.get_state(&nunl_key).unwrap()).unwrap();
+    let disabled = obj["DisabledValidators"].as_array().unwrap();
+    assert_eq!(disabled.len(), 1);
+    assert_eq!(
+        disabled[0]["DisabledValidator"]["PublicKey"]
+            .as_str()
+            .unwrap(),
+        key5
+    );
+    assert_eq!(
+        disabled[0]["DisabledValidator"]["FirstLedgerSequence"]
+            .as_u64()
+            .unwrap(),
+        512
+    );
+    assert!(obj.get("ValidatorToDisable").is_none());
+
     let r2 = Node::apply_negative_unl(&mut consensus, &mut ledger, &tx_engine, &fees, 512);
     assert_eq!(r2.len(), 1);
     assert!(r2[0].is_success());
 
-    // After re-enable, DisabledValidators is empty.
-    let nunl_data2 = ledger.get_state(&keylet::negative_unl()).unwrap();
-    let obj2: Value = rxrpl_ledger::sle_codec::decode_state(nunl_data2).unwrap();
-    assert!(obj2["DisabledValidators"].as_array().unwrap().is_empty());
-    // UNL also synced.
+    // Re-enable is pending; the disabled entry is still on-ledger until moved.
+    let obj: Value =
+        rxrpl_ledger::sle_codec::decode_state(ledger.get_state(&nunl_key).unwrap()).unwrap();
+    assert_eq!(obj["ValidatorToReEnable"].as_str().unwrap(), key5);
+    assert_eq!(obj["DisabledValidators"].as_array().unwrap().len(), 1);
+    // Engine UNL is synced as soon as the re-enable is decided.
     assert!(!consensus.unl().is_in_negative_unl(&node_id(5)));
+
+    // -- Flag ledger 768: deferred move removes the last entry, erasing the
+    //    NegativeUNL object (mirrors rippled rawErase). --
+    Node::update_negative_unl(&mut ledger, 768);
+    assert!(
+        ledger.get_state(&nunl_key).is_none(),
+        "NegativeUNL object must be erased once DisabledValidators is empty"
+    );
 }
 
 #[test]
