@@ -497,6 +497,37 @@ impl Transactor for TrustSetTransactor {
                 return Err(TransactionResult::TecNoLineRedundant);
             }
 
+            // Owner reserve (rippled SetTrust::doApply): a brand-new trust line
+            // adds one owned object to the creator, so it must fund the reserve.
+            // rippled computes `reserveCreate = (OwnerCount < 2) ? 0 :
+            // accountReserve(OwnerCount + 1)` — the first two trust lines are
+            // reserve-free, a deliberate gateway-funding feature — and returns
+            // tecNO_LINE_INSUF_RESERVE when `mPriorBalance` (the XRP balance
+            // *before* the fee) is below it. This is a CLAIMED tec (fee and
+            // sequence charged, no line created); returning it from apply routes
+            // through the engine's central fee/sequence consume. The engine
+            // already deducted the fee centrally before doApply, so reconstruct
+            // mPriorBalance by adding it back. The check sits only on the create
+            // path (after the redundant guard), exactly the
+            // `else if (mPriorBalance < reserveCreate)` branch that precedes
+            // trustCreate — an existing line takes the update path with no check.
+            let creator = ctx
+                .view
+                .read(&keylet::account(&account_id))
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .ok_or(TransactionResult::TefInternal)?;
+            let owner_count = helpers::get_owner_count(&creator);
+            let reserve_create = if owner_count < 2 {
+                0
+            } else {
+                ctx.fees.account_reserve(owner_count + 1)
+            };
+            let prior_balance =
+                helpers::get_balance(&creator).saturating_add(helpers::get_fee(ctx.tx));
+            if prior_balance < reserve_create {
+                return Err(TransactionResult::TecNoLineInsuf);
+            }
+
             let currency = limit["currency"].clone();
             let acct_limit = serde_json::json!({
                 "currency": currency,

@@ -115,6 +115,26 @@ impl Transactor for NFTokenMintTransactor {
             serde_json::from_slice(&minter_bytes).map_err(|_| TransactionResult::TefInternal)?;
         if new_page {
             helpers::adjust_owner_count(&mut minter_acct, 1);
+
+            // Owner reserve (rippled NFTokenMint::doApply): a mint only raises the
+            // owner count when a brand-new NFTokenPage has to be created (adding a
+            // token to an existing, non-full page reserves nothing). rippled
+            // checks the reserve ONLY when the owner count actually rose, and
+            // compares `accountReserve(ownerCountAfter)` against `mPriorBalance`
+            // (the XRP balance *before* the fee), returning tecINSUFFICIENT_RESERVE
+            // — fee and sequence charged, no token minted — when it falls short.
+            // This is a CLAIMED tec; returning it from apply routes through the
+            // engine's central fee/sequence consume, and all child writes (the new
+            // page, the issuer mint count) are discarded. The engine already
+            // deducted the fee centrally before doApply, so reconstruct
+            // mPriorBalance by adding it back; ownerCountAfter is the just-bumped
+            // count.
+            let owner_count_after = helpers::get_owner_count(&minter_acct);
+            let prior_balance =
+                helpers::get_balance(&minter_acct).saturating_add(helpers::get_fee(ctx.tx));
+            if prior_balance < ctx.fees.account_reserve(owner_count_after) {
+                return Err(TransactionResult::TecInsufficientReserve);
+            }
         }
         let minter_data =
             serde_json::to_vec(&minter_acct).map_err(|_| TransactionResult::TefInternal)?;
