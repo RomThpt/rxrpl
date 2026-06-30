@@ -3,6 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+use rxrpl_txq::{BASE_FEE_LEVEL, FeeMetrics};
+
 use crate::context::ServerContext;
 use crate::error::RpcServerError;
 
@@ -186,6 +188,24 @@ pub async fn server_info(
             .map(|b| b.load(std::sync::atomic::Ordering::Relaxed))
             .unwrap_or(false)
     );
+    // Live validation quorum (80% of the trusted UNL, or the configured
+    // override). 0 in standalone/reporting mode. Mirrors rippled's
+    // `validation_quorum` so operator dashboards can confirm the node's
+    // quorum target.
+    info["validation_quorum"] = ctx.validation_quorum().into();
+    // load_factor / load_base: fee-escalation level over the base fee level
+    // (256 = 1x). Reuses the same `FeeMetrics` computation as `queue_info` so
+    // dashboards see consistent numbers. With no tx queue attached (reporting
+    // mode), report no escalation.
+    let (load_base, load_factor) = if let Some(ref tq) = ctx.tx_queue {
+        let q = tq.read().await;
+        let metrics = FeeMetrics::from_queue(q.len(), q.max_size());
+        (BASE_FEE_LEVEL, metrics.escalated_fee_level(BASE_FEE_LEVEL))
+    } else {
+        (BASE_FEE_LEVEL, BASE_FEE_LEVEL)
+    };
+    info["load_base"] = load_base.into();
+    info["load_factor"] = load_factor.into();
     if let Some(lc) = ctx.last_close() {
         info["last_close"] = serde_json::json!({
             "proposers": lc.proposers,

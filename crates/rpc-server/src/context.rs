@@ -1,5 +1,5 @@
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{Arc, OnceLock};
 
 use rxrpl_config::ServerConfig;
@@ -114,6 +114,17 @@ pub struct ServerContext {
     /// halted its own validation/proposal to avoid forking. `None` in
     /// standalone/reporting mode (no consensus loop to set it).
     pub amendment_blocked: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Live validation quorum (80% of the trusted UNL size, or the configured
+    /// override), published by the consensus loop and re-stored on every
+    /// VL-driven quorum change. Read by `server_info.validation_quorum` and
+    /// the `validators` RPC. `None` in standalone/reporting mode (no consensus
+    /// loop) → reported as 0.
+    quorum: Option<Arc<AtomicUsize>>,
+    /// Startup snapshot of the trusted validators' master public keys
+    /// (canonical 33-byte hex), derived from the configured `[validators]`
+    /// set. Read by the `validators` RPC. `None` when no UNL is configured →
+    /// reported as an empty array.
+    trusted_validator_keys: Option<Arc<Vec<String>>>,
     /// Wall-clock instant the server was constructed; used to compute
     /// `server_info.uptime` in seconds.
     startup_instant: std::time::Instant,
@@ -189,6 +200,8 @@ impl ServerContext {
             last_close: None,
             network_validated: None,
             amendment_blocked: None,
+            quorum: None,
+            trusted_validator_keys: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -232,6 +245,8 @@ impl ServerContext {
             last_close: None,
             network_validated: None,
             amendment_blocked: None,
+            quorum: None,
+            trusted_validator_keys: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -276,6 +291,8 @@ impl ServerContext {
             last_close: None,
             network_validated: None,
             amendment_blocked: None,
+            quorum: None,
+            trusted_validator_keys: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -320,6 +337,8 @@ impl ServerContext {
             last_close: None,
             network_validated: None,
             amendment_blocked: None,
+            quorum: None,
+            trusted_validator_keys: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -357,6 +376,8 @@ impl ServerContext {
             last_close: None,
             network_validated: None,
             amendment_blocked: None,
+            quorum: None,
+            trusted_validator_keys: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -513,6 +534,43 @@ impl ServerContext {
         if let Some(ctx) = Arc::get_mut(self) {
             ctx.amendment_blocked = Some(flag);
         }
+    }
+
+    /// Attach the shared live validation-quorum cell so `server_info` and the
+    /// `validators` RPC report the quorum the consensus loop is using. Same
+    /// Arc::get_mut constraint as `attach_validator_list_status`: must be
+    /// called before the context is shared with other tasks.
+    pub fn attach_quorum(self: &mut Arc<Self>, q: Arc<AtomicUsize>) {
+        if let Some(ctx) = Arc::get_mut(self) {
+            ctx.quorum = Some(q);
+        }
+    }
+
+    /// Current validation quorum (live). Returns 0 when no quorum cell is
+    /// attached (standalone/reporting mode).
+    pub fn validation_quorum(&self) -> usize {
+        self.quorum
+            .as_ref()
+            .map(|q| q.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Attach the startup snapshot of trusted validator master public keys
+    /// (canonical 33-byte hex) so the `validators` RPC can surface the UNL.
+    /// Same Arc::get_mut constraint as `attach_validator_list_status`.
+    pub fn attach_trusted_validator_keys(self: &mut Arc<Self>, keys: Arc<Vec<String>>) {
+        if let Some(ctx) = Arc::get_mut(self) {
+            ctx.trusted_validator_keys = Some(keys);
+        }
+    }
+
+    /// The trusted validator master public keys (hex), or an empty vec when
+    /// no snapshot is attached.
+    pub fn trusted_validator_keys(&self) -> Vec<String> {
+        self.trusted_validator_keys
+            .as_ref()
+            .map(|k| k.as_ref().clone())
+            .unwrap_or_default()
     }
 
     /// Seconds elapsed since the context was constructed (used as
