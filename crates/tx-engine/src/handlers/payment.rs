@@ -196,7 +196,7 @@ impl Transactor for PaymentTransactor {
                 // Paths that need a genuine DirectStep or multi-path blend the
                 // book/AMM chain cannot represent fall through to the legacy
                 // back-solve (`apply_cross_currency`) below.
-                if paths_resolve_to_chain(ctx.tx, send_max, &ctx.tx["Amount"]) {
+                if paths_resolve_to_chain(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]) {
                     return apply_paths_payment(
                         ctx,
                         account_str,
@@ -654,6 +654,7 @@ fn apply_conversion(
 /// legacy back-solve to serve the bare-book synthetic shapes and any path that
 /// needs a genuine cross-issuer `DirectStep` or multi-path quality blend.
 fn paths_resolve_to_chain(
+    view: &dyn ReadView,
     tx: &serde_json::Value,
     send_max: &serde_json::Value,
     amount: &serde_json::Value,
@@ -669,12 +670,29 @@ fn paths_resolve_to_chain(
                     .iter()
                     .any(|s| s.get("account").and_then(|v| v.as_str()).is_some());
                 has_ripple_step
-                    && build_path_boundaries(steps, send_max, amount)
+                    && build_path_boundaries(view, steps, send_max, amount)
                         .map(|b| b.len() >= 2)
                         .unwrap_or(false)
             })
         })
         .unwrap_or(false)
+}
+
+/// Whether `account`'s `AccountRoot` carries an `AMMID` field — i.e. it is an
+/// AMM pseudo-account. A bare account path step naming such an account is an AMM
+/// crossing pivot (folded into the surrounding book/AMM-by-pair hop) rather than
+/// a genuine cross-issuer `DirectStep` ripple.
+fn account_has_ammid(view: &dyn ReadView, account: &str) -> bool {
+    let Ok(id) = decode_account_id(account) else {
+        return false;
+    };
+    let Some(bytes) = view.read(&keylet::account(&id)) else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|a| a.get("AMMID").cloned())
+        .is_some()
 }
 
 /// Build the boundary chain of a single resolved path: `[source asset,
@@ -684,6 +702,7 @@ fn paths_resolve_to_chain(
 /// pure book step (an account-ripple `0x01` step or a step that names neither a
 /// currency nor an issuer), so the caller can fall back to another path.
 fn build_path_boundaries(
+    view: &dyn ReadView,
     path: &[serde_json::Value],
     send_max: &serde_json::Value,
     amount: &serde_json::Value,
@@ -705,15 +724,24 @@ fn build_path_boundaries(
         let step_cur = step.get("currency").and_then(|v| v.as_str());
         let step_iss = step.get("issuer").and_then(|v| v.as_str());
         if let Some(account) = step_account {
-            // A pure account-rippling step (`type` 0x01) through the issuer of
-            // the asset the previous book step just produced (`account == iss`)
-            // is a no-op on the asset boundary: it lands the book output on the
-            // issuer's own books before the next book step, leaving currency and
-            // issuer unchanged. Skip it. Genuine cross-issuer rippling (a
-            // DirectStep to a different issuer) and mixed account+currency/issuer
-            // steps are not modelled by this book/AMM-chain engine — fall back to
-            // another path (or the legacy back-solve for IOU<->IOU).
-            if step_cur.is_none() && step_iss.is_none() && account == iss {
+            // A bare account-rippling step (`type` 0x01, no currency/issuer)
+            // ripples into that account keeping the current asset; whether it
+            // changes the boundary depends on what that account is:
+            //   * `account == iss` is a literal no-op (the book output lands on
+            //     the issuer's own books before the next book step). Skip it.
+            //   * an AMM pseudo-account (its `AccountRoot` carries `AMMID`) is the
+            //     pivot the pathfinder names for an AMM crossing: the currency
+            //     change and liquidity are resolved between the adjacent
+            //     boundaries by `cross_path_payment` (AMM-by-pair via
+            //     `keylet::amm`), so the step is a pass-through here.
+            //   * any other account is a genuine cross-issuer `DirectStep` ripple
+            //     (same currency, different issuer obligations) that this
+            //     book/AMM-chain engine does not model — fall back to another path
+            //     (or the legacy IOU<->IOU back-solve).
+            if step_cur.is_none()
+                && step_iss.is_none()
+                && (account == iss || account_has_ammid(view, account))
+            {
                 continue;
             }
             return None;
@@ -727,11 +755,22 @@ fn build_path_boundaries(
         if let Some(i) = step_iss {
             iss = i.to_string();
         }
-        out.push(serde_json::json!({
-            "currency": cur,
-            "issuer": iss,
-            "value": "0",
-        }));
+        // A `currency: XRP` step is a native boundary: XRP carries no issuer, so
+        // clear any issuer inherited from the previous hop and represent the
+        // boundary as a drops string (the shape `Leg::parse` decodes as native).
+        // Keeping it as an `{currency, issuer}` object would mint a bogus
+        // issued-XRP boundary, splitting a single AMM/book hop into two dead hops
+        // with no liquidity (the pool/book keylet would never match).
+        if cur == "XRP" {
+            iss = String::new();
+            out.push(serde_json::Value::String("0".into()));
+        } else {
+            out.push(serde_json::json!({
+                "currency": cur,
+                "issuer": iss,
+                "value": "0",
+            }));
+        }
     }
     // Append the destination asset (Amount) unless the last step already lands
     // on it.
@@ -790,7 +829,7 @@ fn apply_paths_payment(
         let Some(path) = path.as_array() else {
             continue;
         };
-        let Some(boundaries) = build_path_boundaries(path, &send_max, &amount) else {
+        let Some(boundaries) = build_path_boundaries(ctx.view, path, &send_max, &amount) else {
             continue;
         };
         match crate::handlers::offer_create::cross_path_payment(
