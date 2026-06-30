@@ -2905,7 +2905,7 @@ impl Node {
         trusted_validator_count: usize,
         pruner: &Arc<LedgerPruner>,
         node_store: &Option<Arc<dyn NodeStore>>,
-        self_validation_tx: &tokio::sync::mpsc::UnboundedSender<rxrpl_overlay::ConsensusMessage>,
+        self_validation_tx: &tokio::sync::mpsc::Sender<rxrpl_overlay::ConsensusMessage>,
     ) {
         // Resolve close_time in priority order:
         //  1. Quorum-accepted close_time from converge() — strongest signal,
@@ -3097,8 +3097,19 @@ impl Node {
             // and never reach quorum=ceil(N*0.8) when N=4 (mixed kurtosis:
             // 2 rxrpl + 2 rippled). Rippled does the equivalent in
             // `Validations::add` from its own onAccept path.
-            let _ =
-                self_validation_tx.send(rxrpl_overlay::ConsensusMessage::Validation(validation));
+            // `try_send`, never `await`: this runs inside the same
+            // `tokio::select!` task that drains the consensus channel
+            // (`consensus_rx.recv()`), so awaiting a full channel here would
+            // deadlock (the task can't drain while blocked on send). The
+            // bounded channel is large and self-validations are emitted once
+            // per ledger close, so Full is only reachable when the consumer is
+            // already badly backed up -- in which case we warn and shed rather
+            // than stall consensus.
+            if let Err(e) =
+                self_validation_tx.try_send(rxrpl_overlay::ConsensusMessage::Validation(validation))
+            {
+                tracing::warn!("could not self-inject local validation: {}", e);
+            }
         }
 
         // Broadcast StatusChange so peers know our current ledger and our

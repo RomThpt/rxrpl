@@ -295,6 +295,95 @@ fn make_test_peer_manager() -> (PeerManager, Hash256, mpsc::Receiver<PeerMessage
     (mgr, peer_id, rx)
 }
 
+/// Like [`make_test_peer_manager`] but keeps the consensus receiver alive so a
+/// test can observe the bounded overlay->consensus channel directly.
+fn make_test_peer_manager_with_consensus() -> (PeerManager, mpsc::Receiver<ConsensusMessage>) {
+    use crate::identity::NodeIdentity;
+    use crate::tls;
+    use std::sync::atomic::AtomicU32;
+    use tokio::sync::RwLock;
+
+    let id = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("test-consensus-cap"));
+    let id_arc = Arc::new(id);
+    let config = PeerManagerConfig {
+        listen_port: 0,
+        max_peers: 4,
+        seeds: vec![],
+        fixed_peers: vec![],
+        network_id: 1,
+        tls_server: tls::build_server_config(&id_arc),
+        tls_client: tls::build_client_config(),
+        cluster_enabled: false,
+        cluster_node_name: String::new(),
+        cluster_members: vec![],
+        cluster_broadcast_interval_secs: 5,
+    };
+    let (mgr, _cmd_tx, consensus_rx) = PeerManager::new(
+        id_arc,
+        config,
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(RwLock::new(Hash256::ZERO)),
+    );
+    (mgr, consensus_rx)
+}
+
+#[tokio::test]
+async fn consensus_channel_sheds_when_consumer_stalled() {
+    // A stalled consumer (consensus_rx never drained) must not let the bounded
+    // overlay->consensus channel grow without limit: once full, forwarding
+    // sheds (and counts) instead of OOMing the node under a tx/ledger-data
+    // burst. This is the M0 hardening fix's whole point.
+    let (mgr, mut consensus_rx) = make_test_peer_manager_with_consensus();
+
+    // Fill exactly to capacity -- nothing shed while space remains.
+    for _ in 0..CONSENSUS_CHANNEL_CAP {
+        mgr.forward_to_consensus(ConsensusMessage::ValidatorListReceived { validator_count: 1 });
+    }
+    assert_eq!(
+        mgr.consensus_dropped(),
+        0,
+        "must not shed while capacity remains"
+    );
+
+    // Overflow: each further send is shed and counted, and the buffer never
+    // grows past capacity.
+    for _ in 0..16 {
+        mgr.forward_to_consensus(ConsensusMessage::ValidatorListReceived { validator_count: 1 });
+    }
+    assert_eq!(
+        mgr.consensus_dropped(),
+        16,
+        "overflow must shed rather than grow the queue"
+    );
+
+    let mut buffered = 0;
+    while consensus_rx.try_recv().is_ok() {
+        buffered += 1;
+    }
+    assert_eq!(
+        buffered, CONSENSUS_CHANNEL_CAP,
+        "bounded channel must hold at most its capacity"
+    );
+}
+
+#[tokio::test]
+async fn consensus_channel_delivers_normal_flow() {
+    // With a live consumer the bounded channel behaves transparently: the
+    // message is delivered and nothing is shed.
+    let (mgr, mut consensus_rx) = make_test_peer_manager_with_consensus();
+
+    mgr.forward_to_consensus(ConsensusMessage::ValidatorListReceived { validator_count: 7 });
+
+    match consensus_rx.recv().await {
+        Some(ConsensusMessage::ValidatorListReceived { validator_count }) => {
+            assert_eq!(validator_count, 7);
+        }
+        Some(_) => panic!("delivered the wrong ConsensusMessage variant"),
+        None => panic!("channel closed without delivering"),
+    }
+    assert_eq!(mgr.consensus_dropped(), 0, "normal flow must not shed");
+}
+
 #[tokio::test]
 async fn peer_manager_get_ledger_unknown_returns_no_response() {
     let (mut mgr, peer_id, mut rx) = make_test_peer_manager();
