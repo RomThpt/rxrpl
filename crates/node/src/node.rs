@@ -3,7 +3,7 @@ use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rxrpl_amendment::{AmendmentTable, FeatureRegistry, Rules};
@@ -1191,6 +1191,20 @@ impl Node {
         ctx.attach_network_validated(Arc::clone(&network_validated_arc));
         // Amendment-blocked flag: surfaced as `server_info.amendment_blocked`.
         ctx.attach_amendment_blocked(Arc::clone(&amendment_blocked));
+        // Live validation quorum: seeded to 0 here and set to the computed
+        // initial quorum by the consensus loop below (and re-stored on every
+        // VL-driven quorum change), so `server_info.validation_quorum` and the
+        // `validators` RPC always reflect what consensus is actually using.
+        let quorum_arc = Arc::new(AtomicUsize::new(0));
+        ctx.attach_quorum(Arc::clone(&quorum_arc));
+        // Trusted validator master pubkeys (canonical 33-byte hex): startup
+        // snapshot from the configured `[validators]` set, surfaced by the
+        // `validators` RPC. Dynamic-VL nodes populate the consensus UNL's
+        // master_keys map at runtime; this immutable snapshot mirrors what
+        // that map exposes for the common static-config case.
+        let trusted_validator_keys_snapshot =
+            Self::config_trusted_master_hex(&self.config.validators.trusted);
+        ctx.attach_trusted_validator_keys(Arc::new(trusted_validator_keys_snapshot));
         // B5: expose the local manifest to the RPC `manifest` handler.
         if let Some(vid) = validator_id.as_deref() {
             let seq = self.config.validator_identity.sequence.max(1);
@@ -1401,6 +1415,10 @@ impl Node {
         let ledger_seq_shared = Arc::clone(&ledger_seq);
         let ledger_hash_shared = Arc::clone(&ledger_hash);
         let network_validated_for_loop = Arc::clone(&network_validated_arc);
+        // Live quorum cell shared with the RPC context: the loop stores the
+        // initial quorum once computed and re-stores it on every VL update so
+        // `server_info.validation_quorum` tracks the live value.
+        let quorum_arc_for_loop = Arc::clone(&quorum_arc);
         let configured_quorum = self.config.validators.quorum;
         // Whether a dynamic validator list is configured. Gates every
         // runtime mutation of the consensus engine's UNL so that a node
@@ -1665,6 +1683,9 @@ impl Node {
                 tracing::info!("validation aggregator: trust filter enabled (UNL-bound)");
             }
             tracing::info!("validation quorum initialized to {}", initial_quorum);
+            // Publish the live quorum so `server_info.validation_quorum` and the
+            // `validators` RPC reflect what consensus is using from the start.
+            quorum_arc_for_loop.store(initial_quorum, Ordering::Relaxed);
 
             let mut pending_validations = crate::pending_validations::PendingValidations::new();
 
@@ -3044,6 +3065,7 @@ impl Node {
                                 if configured_quorum.is_none() && validator_count > 0 {
                                     let new_quorum = Node::compute_quorum(validator_count);
                                     val_aggregator.update_quorum(new_quorum);
+                                    quorum_arc_for_loop.store(new_quorum, Ordering::Relaxed);
                                     tracing::info!(
                                         "auto-set validation quorum to {} (from {} validators)",
                                         new_quorum, validator_count
@@ -3058,8 +3080,9 @@ impl Node {
                                 if vl_dynamic && !validators.is_empty() {
                                     consensus.set_trusted_master_keys(&validators);
                                     if configured_quorum.is_none() {
-                                        val_aggregator
-                                            .update_quorum(Node::compute_quorum(validators.len()));
+                                        let new_quorum = Node::compute_quorum(validators.len());
+                                        val_aggregator.update_quorum(new_quorum);
+                                        quorum_arc_for_loop.store(new_quorum, Ordering::Relaxed);
                                     }
                                     tracing::info!(
                                         "applied verified validator list seq={}: consensus UNL now {} validators, quorum {}",
@@ -3756,6 +3779,37 @@ impl Node {
     /// This matches the XRPL UNL quorum formula.
     pub fn compute_quorum(validator_count: usize) -> usize {
         (validator_count as f64 * 0.8).ceil().max(1.0) as usize
+    }
+
+    /// Canonical 33-byte hex master public keys for the configured trusted
+    /// validators. Accepts both rippled-style base58 `n...` node-public-key
+    /// encodings (the 0x1C-prefixed form used in validators.txt) and raw hex;
+    /// invalid entries are skipped. Used to seed
+    /// `ServerContext::trusted_validator_keys` so the `validators` RPC can
+    /// surface the UNL without exposing the consensus engine's hashed NodeIds.
+    fn config_trusted_master_hex(entries: &[String]) -> Vec<String> {
+        const NODE_PUBLIC_KEY_PREFIX: &[u8] = &[0x1C];
+        let mut keys: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| {
+                let trimmed = entry.trim();
+                let bytes = if let Ok(decoded) =
+                    rxrpl_codec::address::base58::base58check_decode(trimmed)
+                {
+                    if decoded.len() == 1 + 33 && decoded[..1] == NODE_PUBLIC_KEY_PREFIX[..] {
+                        Some(decoded[1..].to_vec())
+                    } else {
+                        None
+                    }
+                } else {
+                    hex::decode(trimmed).ok()
+                };
+                bytes.map(hex::encode)
+            })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
     }
 
     /// Apply a transaction to the current open ledger (standalone mode).

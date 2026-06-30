@@ -208,6 +208,17 @@ impl TrustedValidatorList {
         &self.trusted
     }
 
+    /// Get the master public-key map (hex master pubkey -> NodeId).
+    ///
+    /// Populated by [`Self::update_from_validator_keys`] /
+    /// [`Self::update_from_validator_keys_v2`] (dynamic VL path); empty for a
+    /// statically-constructed UNL ([`Self::new`]). Exposed so the `validators`
+    /// RPC can surface the trusted validators' hex public keys rather than the
+    /// hashed NodeIds.
+    pub fn master_keys(&self) -> &HashMap<String, NodeId> {
+        &self.master_keys
+    }
+
     /// Get a reference to the negative UNL set.
     pub fn negative_unl_set(&self) -> &HashSet<NodeId> {
         &self.negative_unl

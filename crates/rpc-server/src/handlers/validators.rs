@@ -20,12 +20,12 @@ pub async fn validators(_params: Value, ctx: &Arc<ServerContext>) -> Result<Valu
         None => Value::Array(Vec::new()),
     };
     Ok(serde_json::json!({
-        "validation_quorum": 0,
+        "validation_quorum": ctx.validation_quorum(),
         "validator_list": {
             "expiration": "unknown",
             "status": "active",
         },
-        "trusted_validator_keys": [],
+        "trusted_validator_keys": ctx.trusted_validator_keys(),
         "publisher_lists": [],
         "validator_domains": validator_domains,
     }))
