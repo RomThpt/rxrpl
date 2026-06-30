@@ -119,6 +119,25 @@ impl Validation {
             .as_deref()
             .unwrap_or(&self.public_key)
     }
+
+    /// A copy of this validation re-keyed to its trusted (master) identity
+    /// for the validations-trie. `node_id` and `public_key` are both derived
+    /// from [`Self::trusted_key`], so the trie attributes the vote to the
+    /// validator's master key -- independent of ephemeral-key rotation, the
+    /// way rippled keys validations by master node id -- and the
+    /// `record_trusted_validation` node_id<->public_key binding holds.
+    pub fn to_trie_identity(&self) -> Validation {
+        let key = self.trusted_key().to_vec();
+        Validation {
+            node_id: NodeId::from_public_key(&key),
+            public_key: key,
+            ledger_hash: self.ledger_hash,
+            ledger_seq: self.ledger_seq,
+            full: self.full,
+            sign_time: self.sign_time,
+            ..Default::default()
+        }
+    }
 }
 
 impl Proposal {

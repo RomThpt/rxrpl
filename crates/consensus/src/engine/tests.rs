@@ -2018,3 +2018,51 @@ fn set_trusted_master_keys_updates_unl_quorum_and_trie() {
     engine.set_trusted_master_keys(&[]);
     assert_eq!(engine.unl().effective_size(), 5);
 }
+
+#[test]
+fn to_trie_identity_uses_master_when_mapped_else_signing() {
+    let lh = Hash256::new([0x55; 32]);
+
+    // Ephemeral signing identity node(99), manifest-mapped to master node(20).
+    let mut mapped = validation_for(node(99), lh, 7);
+    mapped.master_public_key = Some(test_pk(20));
+    let t = mapped.to_trie_identity();
+    assert_eq!(t.node_id, node(20));
+    assert_eq!(t.public_key, test_pk(20));
+
+    // No mapping: falls back to the signing key.
+    let unmapped = validation_for(node(99), lh, 7);
+    let t2 = unmapped.to_trie_identity();
+    assert_eq!(t2.node_id, node(99));
+    assert_eq!(t2.public_key, test_pk(99));
+}
+
+#[test]
+fn ephemeral_validation_feeds_trie_under_master_identity() {
+    // UNL trusts master node(20); a validation signed by an ephemeral key
+    // (node(99)) but manifest-mapped to that master must land in the trie
+    // under the master identity and drive get_preferred.
+    let mut engine = ConsensusEngine::new_with_unl(
+        SimpleAdapter,
+        node(1),
+        Vec::new(),
+        ConsensusParams::default(),
+        make_unl(&[20]),
+    );
+    let ledger_hash = Hash256::new([0x44; 32]);
+    let mut v = validation_for(node(99), ledger_hash, 10);
+    v.master_public_key = Some(test_pk(20));
+    // Under its ephemeral identity it would not be trusted.
+    assert!(!engine.unl().is_trusted(&node(99)));
+
+    let accepted = engine.record_trusted_validation(v.to_trie_identity());
+    assert!(
+        accepted,
+        "master-identity validation must be accepted by the trie"
+    );
+    assert_eq!(engine.validations_trie().count_for(&ledger_hash), 1);
+    assert_eq!(
+        engine.validations_trie().get_preferred(10),
+        Some(ledger_hash)
+    );
+}
