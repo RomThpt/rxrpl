@@ -435,10 +435,29 @@ pub fn consume_seq_or_ticket(
     match tx.get("TicketSequence").and_then(|v| v.as_u64()) {
         Some(ticket_seq) => {
             let ticket_key = keylet::ticket(account_id, ticket_seq as u32);
-            if !view.exists(&ticket_key) {
+            let Some(ticket_bytes) = view.read(&ticket_key) else {
                 return Err(TransactionResult::TefNoTicket);
+            };
+            // rippled consumes the ticket via a HINTED directory removal using
+            // the page recorded on the Ticket SLE's `OwnerNode` (`dirRemove` with
+            // the known page), not a walk from the root. This is essential for a
+            // large owner directory whose intermediate pages are not loaded (e.g.
+            // the single-tx oracle seeds only touched pages): a root walk stops at
+            // the first absent page and would leave the consumed ticket's index
+            // stranded on its high-numbered page. `OwnerNode` is default-dropped
+            // when zero, so its absence means the ticket lives on the root page —
+            // fall back to the walk, which finds it there immediately.
+            let owner_node = serde_json::from_slice::<Value>(&ticket_bytes)
+                .ok()
+                .and_then(|t| {
+                    t.get("OwnerNode")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| u64::from_str_radix(s, 16).ok())
+                });
+            match owner_node {
+                Some(page) => remove_from_owner_dir_page(view, account_id, page, &ticket_key)?,
+                None => remove_from_owner_dir(view, account_id, &ticket_key)?,
             }
-            remove_from_owner_dir(view, account_id, &ticket_key)?;
             view.erase(&ticket_key)
                 .map_err(|_| TransactionResult::TefInternal)?;
             crate::helpers::adjust_owner_count(account_obj, -1);
