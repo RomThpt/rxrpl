@@ -224,6 +224,16 @@ pub struct PeerManager {
     /// this bound a remote attacker could open thousands of half-open
     /// TCP connections and saturate the runtime (audit finding H5).
     inbound_handshake_permits: Arc<Semaphore>,
+    /// Caps the number of concurrent off-loop peer **serve** tasks
+    /// (GetLedger / GetObjects / FetchPack). Serving does synchronous SHAMap
+    /// tree walks and blocking RocksDB reads; running it inline on the
+    /// consensus/peer event loop head-of-line-blocks proposals and
+    /// validations. Each serve is spawned onto a blocking task that first
+    /// acquires a permit here, bounding concurrent serves so a request burst
+    /// can't saturate the blocking pool. Serving is read-only against
+    /// immutable ledger snapshots, so it offloads with no ordering
+    /// constraints. Mirrors [`inbound_handshake_permits`](Self::inbound_handshake_permits).
+    serve_permits: Arc<Semaphore>,
     /// Supplies the server-level fields of the `/crawl` response. `None` keeps
     /// the crawl limited to overlay-known data (used in tests).
     crawl_info: Option<Arc<dyn CrawlInfo>>,
@@ -296,6 +306,12 @@ impl PeerManager {
             // simply cause new TCP connections to wait, which Linux's accept
             // queue absorbs naturally.
             inbound_handshake_permits: Arc::new(Semaphore::new(64)),
+            // Bound concurrent off-loop serve tasks to 32 (mirrors
+            // inbound_handshake_permits). Serving is read-only against
+            // immutable ledger snapshots, so offloading is safe; the permit
+            // just caps how many heavy SHAMap tree-walks / RocksDB reads run at
+            // once instead of letting a request burst saturate the runtime.
+            serve_permits: Arc::new(Semaphore::new(32)),
             crawl_info: None,
         };
 
@@ -1088,7 +1104,31 @@ impl PeerManager {
                 if let Some(ref info) = peer_info {
                     info.reputation.record_valid_message(payload_len);
                 }
-                self.handle_get_ledger(from, payload);
+                // Serve off the consensus/peer event loop: the SHAMap tree
+                // walk plus blocking RocksDB reads must not head-of-line-block
+                // proposals/validations. Clone the reply sender and the
+                // read-only Arcs at dispatch time, then run the (byte-identical)
+                // serve body on a bounded blocking task. If the peer is already
+                // gone there is no reply target, so skip.
+                if let Some(reply_tx) = self.peer_handles.get(&from).map(|h| h.tx.clone()) {
+                    let ledger_provider = self.ledger_provider.clone();
+                    let tx_sets = self.tx_sets.clone();
+                    let payload = payload.to_vec();
+                    let permit = Arc::clone(&self.serve_permits);
+                    tokio::spawn(async move {
+                        let _p = permit.acquire_owned().await; // bound concurrency; drop on task end
+                        let _ = tokio::task::spawn_blocking(move || {
+                            Self::serve_get_ledger(
+                                from,
+                                payload,
+                                ledger_provider,
+                                tx_sets,
+                                reply_tx,
+                            );
+                        })
+                        .await;
+                    });
+                }
             }
             MessageType::LedgerData => {
                 tracing::info!("received LedgerData from {}: {} bytes", from, payload.len());
@@ -1489,7 +1529,32 @@ impl PeerManager {
                                 }
                             }
                         } else {
-                            self.handle_get_objects_query(from, msg);
+                            // Serve off the loop (see GetLedger arm): the
+                            // node-store lookups are blocking RocksDB reads and
+                            // the fetch-pack path walks the header chain. Clone
+                            // the reply sender + read-only Arcs, then run the
+                            // byte-identical serve body on a bounded blocking
+                            // task. Skip if the peer already disconnected.
+                            if let Some(reply_tx) =
+                                self.peer_handles.get(&from).map(|h| h.tx.clone())
+                            {
+                                let node_store = self.node_store.clone();
+                                let ledger_provider = self.ledger_provider.clone();
+                                let permit = Arc::clone(&self.serve_permits);
+                                tokio::spawn(async move {
+                                    let _p = permit.acquire_owned().await; // bound concurrency
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        Self::serve_get_objects_query(
+                                            from,
+                                            msg,
+                                            node_store,
+                                            ledger_provider,
+                                            reply_tx,
+                                        );
+                                    })
+                                    .await;
+                                });
+                            }
                         }
                     }
                     Err(e) => {
@@ -2246,10 +2311,12 @@ impl PeerManager {
     /// response containing the found objects. Caps the number of objects per
     /// response to avoid excessive bandwidth usage (matching rippled's limit
     /// of 16384 objects per response and 256 KB total payload size).
-    fn handle_get_objects_query(
-        &self,
+    fn serve_get_objects_query(
         from: Hash256,
         msg: rxrpl_p2p_proto::proto::TmGetObjectByHash,
+        node_store: Option<Arc<dyn rxrpl_shamap::NodeStore>>,
+        ledger_provider: Option<Arc<dyn LedgerProvider>>,
+        reply_tx: mpsc::Sender<PeerMessage>,
     ) {
         /// Maximum number of objects to serve in a single response.
         ///
@@ -2283,11 +2350,11 @@ impl PeerManager {
         if object_type == OT_FETCH_PACK {
             // Fetch packs are served from the ledger provider (header chain),
             // not the raw node store, so dispatch before the node-store check.
-            self.handle_fetch_pack_query(from, msg);
+            Self::serve_fetch_pack_query(from, msg, ledger_provider, reply_tx);
             return;
         }
 
-        let store = match &self.node_store {
+        let store = match &node_store {
             Some(s) => s,
             None => {
                 tracing::debug!("GetObjectByHash from {} but no node store configured", from);
@@ -2372,12 +2439,10 @@ impl PeerManager {
             response.len()
         );
 
-        if let Some(handle) = self.peer_handles.get(&from) {
-            let _ = handle.tx.try_send(PeerMessage {
-                msg_type: MessageType::GetObjects,
-                payload: response,
-            });
-        }
+        let _ = reply_tx.try_send(PeerMessage {
+            msg_type: MessageType::GetObjects,
+            payload: response,
+        });
     }
 
     /// Serve a `TMGetObjectByHash` query with `type=otFETCH_PACK`.
@@ -2393,17 +2458,18 @@ impl PeerManager {
     /// out of locally-known ledgers, hit `MAX_FETCH_PACK_LEDGERS`, or fill
     /// the 256 KB response budget. Each entry costs ~150 bytes so the cap
     /// effectively bounds total work to a few KB per request.
-    fn handle_fetch_pack_query(
-        &self,
+    fn serve_fetch_pack_query(
         from: Hash256,
         msg: rxrpl_p2p_proto::proto::TmGetObjectByHash,
+        ledger_provider: Option<Arc<dyn LedgerProvider>>,
+        reply_tx: mpsc::Sender<PeerMessage>,
     ) {
         const MAX_FETCH_PACK_LEDGERS: usize = 32;
         const MAX_RESPONSE_SIZE: usize = 256 * 1024;
         // rippled `HashPrefix::ledgerMaster` ('L','W','R',0).
         const HASH_PREFIX_LEDGER_MASTER: [u8; 4] = [b'L', b'W', b'R', 0];
 
-        let provider = match &self.ledger_provider {
+        let provider = match &ledger_provider {
             Some(p) => p,
             None => {
                 tracing::debug!("FetchPack from {} but no ledger provider configured", from);
@@ -2484,12 +2550,10 @@ impl PeerManager {
             requested_ledger_hash
         );
 
-        if let Some(handle) = self.peer_handles.get(&from) {
-            let _ = handle.tx.try_send(PeerMessage {
-                msg_type: MessageType::GetObjects,
-                payload: response,
-            });
-        }
+        let _ = reply_tx.try_send(PeerMessage {
+            msg_type: MessageType::GetObjects,
+            payload: response,
+        });
     }
 
     /// Send TMGetObjectByHash requests to fetch missing nodes by content hash.
@@ -2597,8 +2661,14 @@ impl PeerManager {
         }
     }
 
-    fn handle_get_ledger(&self, from: Hash256, payload: &[u8]) {
-        let req = match proto_convert::decode_get_ledger(payload) {
+    fn serve_get_ledger(
+        from: Hash256,
+        payload: Vec<u8>,
+        ledger_provider: Option<Arc<dyn LedgerProvider>>,
+        tx_sets: Option<Arc<std::sync::RwLock<HashMap<Hash256, TxSet>>>>,
+        reply_tx: mpsc::Sender<PeerMessage>,
+    ) {
+        let req = match proto_convert::decode_get_ledger(&payload) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("bad GetLedger from {}: {}", from, e);
@@ -2614,7 +2684,7 @@ impl PeerManager {
             req.node_ids.len()
         );
 
-        let provider = match &self.ledger_provider {
+        let provider = match &ledger_provider {
             Some(p) => p,
             None => {
                 tracing::debug!("GetLedger from {} but no ledger provider", from);
@@ -2632,7 +2702,14 @@ impl PeerManager {
 
         // Handle tx-set requests (liTS_CANDIDATE) separately.
         if req_ledger_type == LI_TS_CANDIDATE {
-            self.handle_get_tx_set(from, &req_ledger_hash, &req.node_ids, req_cookie);
+            Self::serve_get_tx_set(
+                from,
+                &req_ledger_hash,
+                &req.node_ids,
+                req_cookie,
+                &tx_sets,
+                &reply_tx,
+            );
             return;
         }
 
@@ -2750,12 +2827,10 @@ impl PeerManager {
                 nodes,
                 req_cookie,
             );
-            if let Some(handle) = self.peer_handles.get(&from) {
-                let _ = handle.tx.try_send(PeerMessage {
-                    msg_type: MessageType::LedgerData,
-                    payload: response,
-                });
-            }
+            let _ = reply_tx.try_send(PeerMessage {
+                msg_type: MessageType::LedgerData,
+                payload: response,
+            });
             return;
         }
 
@@ -2848,12 +2923,10 @@ impl PeerManager {
             req_cookie,
         );
 
-        if let Some(handle) = self.peer_handles.get(&from) {
-            let _ = handle.tx.try_send(PeerMessage {
-                msg_type: MessageType::LedgerData,
-                payload: response,
-            });
-        }
+        let _ = reply_tx.try_send(PeerMessage {
+            msg_type: MessageType::LedgerData,
+            payload: response,
+        });
     }
 
     /// Serve a tx-set request from a peer (GetLedger with itype=liTS_CANDIDATE).
@@ -2864,12 +2937,13 @@ impl PeerManager {
     /// the same wire encoding `handle_get_ledger` uses for a ledger's tx tree,
     /// which is what lets a rippled peer acquire and re-apply rxrpl's proposed
     /// transactions instead of timing the set out.
-    fn handle_get_tx_set(
-        &self,
+    fn serve_get_tx_set(
         from: Hash256,
         hash_bytes: &[u8],
         req_node_ids: &[Vec<u8>],
         cookie: Option<u32>,
+        tx_sets: &Option<Arc<std::sync::RwLock<HashMap<Hash256, TxSet>>>>,
+        reply_tx: &mpsc::Sender<PeerMessage>,
     ) {
         let set_hash = if hash_bytes.len() >= 32 {
             Hash256::new(hash_bytes[..32].try_into().unwrap_or([0u8; 32]))
@@ -2878,8 +2952,7 @@ impl PeerManager {
             return;
         };
 
-        let tx_set = self
-            .tx_sets
+        let tx_set = tx_sets
             .as_ref()
             .and_then(|cache| cache.read().unwrap().get(&set_hash).cloned());
         let tx_set = match tx_set {
@@ -2949,12 +3022,71 @@ impl PeerManager {
         let response =
             proto_convert::encode_ledger_data(&set_hash, 0, LI_TS_CANDIDATE, nodes, cookie);
 
-        if let Some(handle) = self.peer_handles.get(&from) {
-            let _ = handle.tx.try_send(PeerMessage {
-                msg_type: MessageType::LedgerData,
-                payload: response,
-            });
-        }
+        let _ = reply_tx.try_send(PeerMessage {
+            msg_type: MessageType::LedgerData,
+            payload: response,
+        });
+    }
+
+    // ---------------------------------------------------------------------
+    // Test-only synchronous shims. Production dispatch serves these requests
+    // off the event loop (see the GetLedger/GetObjects arms in
+    // `dispatch_message`), which spawns the `serve_*` bodies on a bounded
+    // blocking task. Unit tests need the reply delivered synchronously so they
+    // can `try_recv` it immediately; these shims clone the same fields the
+    // dispatch path clones and call the identical serve body inline. They carry
+    // no extra logic, so the served bytes are exactly what production emits.
+    #[cfg(test)]
+    fn handle_get_ledger(&self, from: Hash256, payload: &[u8]) {
+        let Some(reply_tx) = self.peer_handles.get(&from).map(|h| h.tx.clone()) else {
+            return;
+        };
+        Self::serve_get_ledger(
+            from,
+            payload.to_vec(),
+            self.ledger_provider.clone(),
+            self.tx_sets.clone(),
+            reply_tx,
+        );
+    }
+
+    #[cfg(test)]
+    fn handle_get_tx_set(
+        &self,
+        from: Hash256,
+        hash_bytes: &[u8],
+        req_node_ids: &[Vec<u8>],
+        cookie: Option<u32>,
+    ) {
+        let Some(reply_tx) = self.peer_handles.get(&from).map(|h| h.tx.clone()) else {
+            return;
+        };
+        Self::serve_get_tx_set(
+            from,
+            hash_bytes,
+            req_node_ids,
+            cookie,
+            &self.tx_sets,
+            &reply_tx,
+        );
+    }
+
+    #[cfg(test)]
+    fn handle_get_objects_query(
+        &self,
+        from: Hash256,
+        msg: rxrpl_p2p_proto::proto::TmGetObjectByHash,
+    ) {
+        let Some(reply_tx) = self.peer_handles.get(&from).map(|h| h.tx.clone()) else {
+            return;
+        };
+        Self::serve_get_objects_query(
+            from,
+            msg,
+            self.node_store.clone(),
+            self.ledger_provider.clone(),
+            reply_tx,
+        );
     }
 
     /// Send a TMGetLedger request with itype=liTS_CANDIDATE to fetch a tx-set.
