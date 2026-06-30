@@ -807,6 +807,89 @@ mod tests {
             }
         }
 
+        // AMMDeposit / AMMWithdraw read the pool's AMM SLE, the pseudo-account
+        // AccountRoot (pool XRP balance), each pool asset's IOU trust lines, and
+        // the sender's LP-token + asset trust lines to run the reserve / funding
+        // / withdraw-math checks. On a `tec` result none of these appear in
+        // AffectedNodes (only the sender's fee charge does), so seed them from
+        // the parent ledger so the transactor reaches its real verdict (e.g.
+        // tecINSUF_RESERVE_LINE / tecUNFUNDED_AMM / tecAMM_FAILED) rather than
+        // tecNO_ENTRY against a missing pool.
+        if matches!(
+            tx_json.get("TransactionType").and_then(|v| v.as_str()),
+            Some("AMMDeposit") | Some("AMMWithdraw")
+        ) {
+            if let (Some(a1), Some(a2)) = (tx_json.get("Asset"), tx_json.get("Asset2")) {
+                if let Ok(amm_key) = rxrpl_tx_engine::amm_helpers::compute_amm_key(a1, a2) {
+                    let amm_idx = amm_key.to_string().to_uppercase();
+                    read_keys.insert(amm_idx.clone());
+                    let r = rpc(serde_json::json!({
+                        "method":"ledger_entry","params":[{"index":amm_idx,"ledger_index":parent}]
+                    }));
+                    let amm = &r["result"]["node"];
+                    let sender_id = tx_json
+                        .get("Account")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| decode_account_id(s).ok());
+                    if let Some(amm_id) = amm
+                        .get("Account")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| decode_account_id(s).ok())
+                    {
+                        // The AMM pseudo-account AccountRoot (pool XRP balance and
+                        // the accountSle the transactor peeks).
+                        read_keys.insert(keylet::account(&amm_id).to_string().to_uppercase());
+                        // The sender's LP-token trust line: whether they already
+                        // hold LP gates the new-line reserve adjustment, and a
+                        // withdraw-all reads it for the redeemable balance.
+                        if let (Some(sid), Ok(lp_cur)) = (
+                            &sender_id,
+                            amm.get("LPTokenBalance")
+                                .and_then(|b| b.get("currency"))
+                                .and_then(|v| v.as_str())
+                                .ok_or(())
+                                .and_then(|c| {
+                                    hex::decode(c).map_err(|_| ()).and_then(|b| {
+                                        <[u8; 20]>::try_from(b.as_slice()).map_err(|_| ())
+                                    })
+                                }),
+                        ) {
+                            read_keys.insert(
+                                keylet::trust_line(sid, &amm_id, &lp_cur)
+                                    .to_string()
+                                    .to_uppercase(),
+                            );
+                        }
+                        // Each pool asset's IOU trust lines: the AMM's holding (the
+                        // pool balance) and the sender's holding (the funding
+                        // check). XRP legs carry no issuer and are skipped.
+                        for asset in [a1, a2] {
+                            if let (Some(cur), Some(iss)) = (
+                                asset.get("currency").and_then(|v| v.as_str()),
+                                asset.get("issuer").and_then(|v| v.as_str()),
+                            ) {
+                                if let Ok(iss_id) = decode_account_id(iss) {
+                                    let cb = currency_bytes(cur);
+                                    read_keys.insert(
+                                        keylet::trust_line(&amm_id, &iss_id, &cb)
+                                            .to_string()
+                                            .to_uppercase(),
+                                    );
+                                    if let Some(sid) = &sender_id {
+                                        read_keys.insert(
+                                            keylet::trust_line(sid, &iss_id, &cb)
+                                                .to_string()
+                                                .to_uppercase(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // AMMClawback withdraws the holder's full LP, then directSends the
         // clawed `Asset` from holder to issuer. The holder's trust line for
         // that Asset nets to zero change (withdrawn then clawed) so it is
