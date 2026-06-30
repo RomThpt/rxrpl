@@ -436,6 +436,19 @@ impl AMMWithdrawTransactor {
             return Ok(TransactionResult::TecAmmFailed);
         }
 
+        // rippled `withdraw()` (AMMWithdraw.cpp): a single-asset withdraw whose
+        // payout takes the entire XRP side of the pool — `amountWithdrawActual ==
+        // curBalance` with `amount2WithdrawActual == none`, or it redeems the
+        // pool's whole LP supply (`lpTokensWithdrawActual == lpTokensAMMBalance`)
+        // — would strand the other asset, so rippled rejects it with
+        // tecAMM_BALANCE (the `curBalance` / `lptBalance` guards). This fires
+        // when the withdrawer holds 100% of the LP: `ammAssetOut` with
+        // `tokens == totalLP` re-derives `frac == 1`, so `amount_out == pool`.
+        // Return before any mutation so only fee + sequence are charged.
+        if amount_out >= pool {
+            return Ok(TransactionResult::TecAmmBalance);
+        }
+
         // AMM.LPTokenBalance -= holder LP.
         let new_total = Number::from_iou(&total_lp)
             .sub(&Number::from_iou(&holder_lp))
@@ -543,6 +556,14 @@ impl AMMWithdrawTransactor {
                 requested
             }
         };
+
+        // rippled `withdraw()`: a single-asset withdraw-all that would take the
+        // entire IOU side of the pool (sole-LP redemption re-derives `frac == 1`,
+        // so `payout == pool`) strands the other asset and is rejected with
+        // tecAMM_BALANCE — mirror of the XRP guard in `single_xrp_withdraw_all`.
+        if withdraw_all && !gt(&pool, &payout) {
+            return Ok(TransactionResult::TecAmmBalance);
+        }
 
         self.burn_and_update_amm(ctx, amm_key, amm, &ctx_amm, &tokens)?;
         leg.pay_out(ctx, holder, &ctx_amm.account, &pool, &payout, &mut 0)?;
