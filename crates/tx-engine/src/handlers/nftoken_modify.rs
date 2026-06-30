@@ -1,3 +1,4 @@
+use rxrpl_amendment::feature::feature_id;
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
@@ -16,6 +17,14 @@ pub struct NFTokenModifyTransactor;
 
 impl Transactor for NFTokenModifyTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
+        // NFTokenModify is gated on the DynamicNFT amendment. rippled enforces
+        // this in the transactor framework (via the transaction's required
+        // feature) before the transactor's own preflight, returning temDISABLED
+        // when the amendment is not yet enabled. Mirror that here.
+        if !ctx.rules.enabled(&feature_id("DynamicNFT")) {
+            return Err(TransactionResult::TemDisabled);
+        }
+
         let id =
             helpers::get_str_field(ctx.tx, "NFTokenID").ok_or(TransactionResult::TemMalformed)?;
         if id.len() != 64 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -234,7 +243,8 @@ mod tests {
             "NFTokenID": "00000000000000000000000000000000B5F762798A53D543A014CAF8B297CFF8",
             "Fee": "12",
         });
-        let rules = Rules::new();
+        // DynamicNFT enabled so preflight reaches the URI check (not the gate).
+        let rules = Rules::from_enabled([feature_id("DynamicNFT")]);
         let fees = FeeSettings::default();
         let ctx = PreflightContext {
             tx: &tx,
@@ -244,6 +254,30 @@ mod tests {
         assert_eq!(
             NFTokenModifyTransactor.preflight(&ctx),
             Err(TransactionResult::TemMalformed)
+        );
+    }
+
+    #[test]
+    fn reject_when_dynamicnft_disabled() {
+        // A well-formed NFTokenModify (valid NFTokenID + URI) must still be
+        // rejected with temDISABLED while the DynamicNFT amendment is off.
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenModify",
+            "Account": OWNER,
+            "NFTokenID": "00000000000000000000000000000000B5F762798A53D543A014CAF8B297CFF8",
+            "URI": "https://new-uri.com",
+            "Fee": "12",
+        });
+        let rules = Rules::new(); // DynamicNFT not enabled
+        let fees = FeeSettings::default();
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            NFTokenModifyTransactor.preflight(&ctx),
+            Err(TransactionResult::TemDisabled)
         );
     }
 
