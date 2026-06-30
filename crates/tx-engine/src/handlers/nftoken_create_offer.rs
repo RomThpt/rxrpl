@@ -134,6 +134,35 @@ impl Transactor for NFTokenCreateOfferTransactor {
             return Err(TransactionResult::TecNoEntry);
         }
 
+        // DisallowIncomingNFTokenOffer (rippled nft::tokenOfferCreatePreclaim):
+        // the offer is refused with tecNO_PERMISSION when a named Destination, or
+        // (for a buy offer) the token's Owner, has set lsfDisallowIncomingNFTokenOffer
+        // on its AccountRoot. rippled checks the destination first, then the owner,
+        // both in preclaim — i.e. before the reserve test in doApply — so this runs
+        // after the tecNO_ENTRY ownership check and before the reserve check below.
+        // Like those, it is a CLAIMED tec (fee/sequence charged, no offer created).
+        const LSF_DISALLOW_INCOMING_NFTOKEN_OFFER: u32 = 0x0400_0000;
+        if let Some(dest) = helpers::get_str_field(ctx.tx, "Destination") {
+            if let Ok((_, dst_acct)) = helpers::read_account_by_address(ctx.view, dest) {
+                if helpers::get_flags(&dst_acct) & LSF_DISALLOW_INCOMING_NFTOKEN_OFFER != 0 {
+                    return Err(TransactionResult::TecNoPermission);
+                }
+            }
+        }
+        if !is_sell {
+            // Buy offer: `token_owner` is the named sfOwner whose AccountRoot
+            // must permit incoming NFToken offers.
+            if let Some(owner_acct) = ctx
+                .view
+                .read(&keylet::account(&token_owner))
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            {
+                if helpers::get_flags(&owner_acct) & LSF_DISALLOW_INCOMING_NFTOKEN_OFFER != 0 {
+                    return Err(TransactionResult::TecNoPermission);
+                }
+            }
+        }
+
         // Owner reserve (rippled nft::tokenOfferCreateApply): a new NFTokenOffer
         // adds 1 owned object, so the creator must fund the reserve for one more
         // entry. rippled compares its `mPriorBalance` (the XRP balance *before*
@@ -373,6 +402,52 @@ mod tests {
         assert_eq!(
             NFTokenCreateOfferTransactor.apply(&mut ctx),
             Err(TransactionResult::TecNoEntry)
+        );
+    }
+
+    #[test]
+    fn buy_offer_owner_disallows_incoming_is_no_permission() {
+        let mut ledger = setup_ledger();
+        // Owner exists and holds the NFT, but has set
+        // lsfDisallowIncomingNFTokenOffer (0x04000000) on its AccountRoot.
+        let owner_id = decode_account_id(OWNER).unwrap();
+        let owner_obj = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": OWNER,
+            "Balance": "100000000",
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0x0400_0000u32,
+        });
+        ledger
+            .put_state(
+                keylet::account(&owner_id),
+                serde_json::to_vec(&owner_obj).unwrap(),
+            )
+            .unwrap();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        seed_nft(&mut sandbox, OWNER);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenCreateOffer",
+            "Account": ACCOUNT,
+            "Owner": OWNER,
+            "NFTokenID": NFTOKEN_ID,
+            "Amount": "5000000",
+            "Fee": "12",
+            "Sequence": 1,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            NFTokenCreateOfferTransactor.apply(&mut ctx),
+            Err(TransactionResult::TecNoPermission)
         );
     }
 

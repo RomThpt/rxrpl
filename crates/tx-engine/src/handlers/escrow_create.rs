@@ -40,15 +40,10 @@ impl Transactor for EscrowCreateTransactor {
 
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let (_, src_account) = helpers::read_account_by_address(ctx.view, account_str)?;
-
-        let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
-        let fee = helpers::get_fee(ctx.tx);
-        let balance = helpers::get_balance(&src_account);
-
-        if balance < amount + fee {
-            return Err(TransactionResult::TecUnfundedPayment);
-        }
+        // The funded / reserve check lives in `apply` so its tec is CLAIMED (fee +
+        // sequence charged), matching rippled's EscrowCreate::doApply. rippled has
+        // no funds check in preclaim; only confirm the sender exists here.
+        helpers::read_account_by_address(ctx.view, account_str)?;
 
         // RequireDestTag enforcement on destination.
         let destination_str = helpers::get_destination(ctx.tx)?;
@@ -84,6 +79,26 @@ impl Transactor for EscrowCreateTransactor {
             .ok_or(TransactionResult::TerNoAccount)?;
         let mut src_account: serde_json::Value =
             serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
+
+        // Funded / reserve check (rippled EscrowCreate::doApply): the new Escrow
+        // both locks `amount` XRP and adds one owned object, so the creator's
+        // spendable balance must cover accountReserve(OwnerCount + 1) for the new
+        // object PLUS the locked amount. rippled reads sfBalance — already reduced
+        // by the fee in Transactor::apply — and returns tecINSUFFICIENT_RESERVE
+        // when it can't cover the reserve, else tecUNFUNDED when it can't also
+        // cover the amount. Both are CLAIMED tecs (fee + sequence charged, no
+        // escrow); the engine consumed the fee centrally before apply, so
+        // get_balance here is rippled's post-fee `balance`.
+        let reserve = ctx
+            .fees
+            .account_reserve(helpers::get_owner_count(&src_account) + 1);
+        let post_fee_balance = helpers::get_balance(&src_account);
+        if post_fee_balance < reserve {
+            return Err(TransactionResult::TecInsufficientReserve);
+        }
+        if post_fee_balance < reserve.saturating_add(amount) {
+            return Err(TransactionResult::TecUnfunded);
+        }
 
         let src_balance = helpers::get_balance(&src_account);
         helpers::set_balance(
@@ -281,5 +296,64 @@ mod tests {
         let escrow: serde_json::Value = serde_json::from_slice(&escrow_bytes).unwrap();
         assert_eq!(escrow["Amount"].as_str().unwrap(), "10000000");
         assert_eq!(escrow["Destination"].as_str().unwrap(), DST);
+    }
+
+    #[test]
+    fn apply_unfunded_below_reserve_plus_amount() {
+        // Balance covers the single-object reserve (12 XRP) but not the reserve
+        // plus the 10 XRP locked amount -> tecUNFUNDED (rippled doApply).
+        let ledger = setup_ledger(SRC, 13_000_000);
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "EscrowCreate",
+            "Account": SRC,
+            "Destination": DST,
+            "Amount": "10000000",
+            "Fee": "12",
+            "Sequence": 1,
+            "FinishAfter": 1000,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            EscrowCreateTransactor.apply(&mut ctx),
+            Err(TransactionResult::TecUnfunded)
+        );
+    }
+
+    #[test]
+    fn apply_below_object_reserve_is_insufficient_reserve() {
+        // Balance under the single-object reserve (account_reserve(1) = 12 XRP).
+        let ledger = setup_ledger(SRC, 11_000_000);
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "EscrowCreate",
+            "Account": SRC,
+            "Destination": DST,
+            "Amount": "1000000",
+            "Fee": "12",
+            "Sequence": 1,
+            "FinishAfter": 1000,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            EscrowCreateTransactor.apply(&mut ctx),
+            Err(TransactionResult::TecInsufficientReserve)
+        );
     }
 }
