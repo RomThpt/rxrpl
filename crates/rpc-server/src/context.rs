@@ -108,6 +108,12 @@ pub struct ServerContext {
     /// tip, not the locally-closed one. `None` until quorum is reached at
     /// least once.
     network_validated: Option<Arc<std::sync::RwLock<NetworkValidatedSnapshot>>>,
+    /// Shared amendment-blocked flag, set by the consensus loop when an
+    /// on-ledger amendment this build does not understand activates. Surfaced
+    /// as `server_info.amendment_blocked` so operators can see the node has
+    /// halted its own validation/proposal to avoid forking. `None` in
+    /// standalone/reporting mode (no consensus loop to set it).
+    pub amendment_blocked: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Wall-clock instant the server was constructed; used to compute
     /// `server_info.uptime` in seconds.
     startup_instant: std::time::Instant,
@@ -182,6 +188,7 @@ impl ServerContext {
             overlay_command: None,
             last_close: None,
             network_validated: None,
+            amendment_blocked: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -224,6 +231,7 @@ impl ServerContext {
             overlay_command: None,
             last_close: None,
             network_validated: None,
+            amendment_blocked: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -267,6 +275,7 @@ impl ServerContext {
             overlay_command: None,
             last_close: None,
             network_validated: None,
+            amendment_blocked: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -310,6 +319,7 @@ impl ServerContext {
             overlay_command: None,
             last_close: None,
             network_validated: None,
+            amendment_blocked: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -346,6 +356,7 @@ impl ServerContext {
             overlay_command: None,
             last_close: None,
             network_validated: None,
+            amendment_blocked: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -490,6 +501,18 @@ impl ServerContext {
                 .ok()
                 .and_then(|guard| if guard.seq > 0 { Some(*guard) } else { None })
         })
+    }
+
+    /// Attach the shared amendment-blocked flag so `server_info` can report
+    /// it. Same Arc::get_mut constraint as `attach_validator_list_status`:
+    /// must be called before the context is shared with other tasks.
+    pub fn attach_amendment_blocked(
+        self: &mut Arc<Self>,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        if let Some(ctx) = Arc::get_mut(self) {
+            ctx.amendment_blocked = Some(flag);
+        }
     }
 
     /// Seconds elapsed since the context was constructed (used as

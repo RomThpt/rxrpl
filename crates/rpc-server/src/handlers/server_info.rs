@@ -180,6 +180,12 @@ pub async fn server_info(
         "peers": ctx.peer_count(),
         "uptime": ctx.uptime_seconds(),
     });
+    info["amendment_blocked"] = serde_json::json!(
+        ctx.amendment_blocked
+            .as_ref()
+            .map(|b| b.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+    );
     if let Some(lc) = ctx.last_close() {
         info["last_close"] = serde_json::json!({
             "proposers": lc.proposers,

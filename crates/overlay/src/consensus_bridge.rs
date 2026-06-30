@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rxrpl_consensus::ConsensusAdapter;
 use rxrpl_consensus::types::{Proposal, TxSet, Validation};
@@ -27,6 +28,12 @@ pub struct NetworkConsensusAdapter {
     /// (issue #76 root cause for `laggards: N`).
     validator_identity: Option<Arc<ValidatorIdentity>>,
     tx_sets: Arc<std::sync::RwLock<HashMap<Hash256, TxSet>>>,
+    /// When set and `true`, this node is amendment-blocked: an on-ledger
+    /// amendment it does not understand has activated. It must stop emitting
+    /// its own consensus proposals to avoid forking away from the network
+    /// (mirrors rippled's amendment-blocked halt). `None` for non-consensus
+    /// constructions (peers, observers, tests).
+    amendment_blocked: Option<Arc<AtomicBool>>,
 }
 
 impl NetworkConsensusAdapter {
@@ -36,6 +43,7 @@ impl NetworkConsensusAdapter {
             identity,
             validator_identity: None,
             tx_sets: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            amendment_blocked: None,
         }
     }
 
@@ -45,6 +53,14 @@ impl NetworkConsensusAdapter {
     /// silently drops them as untrusted (see field doc above).
     pub fn with_validator_identity(mut self, vid: Arc<ValidatorIdentity>) -> Self {
         self.validator_identity = Some(vid);
+        self
+    }
+
+    /// Attach the shared amendment-blocked flag. Once it reads `true`,
+    /// `propose` becomes a no-op so this node stops proposing rather than
+    /// forking away from a network running an amendment it cannot apply.
+    pub fn with_amendment_blocked_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.amendment_blocked = Some(flag);
         self
     }
 
@@ -63,6 +79,14 @@ impl NetworkConsensusAdapter {
 
 impl ConsensusAdapter for NetworkConsensusAdapter {
     fn propose(&self, proposal: &Proposal) {
+        if self
+            .amendment_blocked
+            .as_ref()
+            .is_some_and(|b| b.load(Ordering::Relaxed))
+        {
+            tracing::warn!("amendment_blocked: suppressing consensus proposal");
+            return;
+        }
         let mut signed = proposal.clone();
         // When operating as a UNL validator, the proposal MUST be signed by
         // the manifest-bound signing key and MUST carry the matching
