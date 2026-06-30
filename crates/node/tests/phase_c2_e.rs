@@ -1,3 +1,4 @@
+use rxrpl_amendment::feature::feature_id;
 use rxrpl_codec::address::classic::{decode_account_id, encode_classic_address_from_pubkey};
 use rxrpl_crypto::{KeyPair, KeyType, Seed};
 use rxrpl_ledger::Ledger;
@@ -37,9 +38,30 @@ fn setup_funded_account() -> (Ledger, String) {
     let genesis_addr = encode_classic_address_from_pubkey(genesis_kp.public_key.as_bytes());
 
     let closed_genesis = Node::genesis_with_funded_account(&genesis_addr).unwrap();
-    let ledger = Ledger::new_open(&closed_genesis);
+    let mut ledger = Ledger::new_open(&closed_genesis);
+    seed_dcp_amendments(&mut ledger);
 
     (ledger, genesis_addr)
+}
+
+/// Enable the amendments these transactors are gated on. The bare genesis
+/// seeds no Amendments object, so rules_for_ledger would otherwise leave them
+/// off and DIDSet/Credential*/PermissionedDomain* would return temDISABLED.
+fn seed_dcp_amendments(ledger: &mut Ledger) {
+    let amendment_ids: Vec<String> = ["DID", "fixEmptyDID", "Credentials", "PermissionedDomains"]
+        .iter()
+        .map(|n| hex::encode_upper(feature_id(n).as_bytes()))
+        .collect();
+    let amendments = serde_json::json!({
+        "LedgerEntryType": "Amendments",
+        "Flags": 0,
+        "Amendments": amendment_ids,
+    });
+    let amendments_bytes =
+        rxrpl_ledger::sle_codec::encode_sle(&serde_json::to_vec(&amendments).unwrap()).unwrap();
+    ledger
+        .put_state(keylet::amendments(), amendments_bytes)
+        .unwrap();
 }
 
 // -- DIDSet: create a DID entry --
@@ -160,6 +182,7 @@ fn tx_indexing_on_ledger_close() {
     // Apply a DIDSet transaction
     {
         let mut ledger = node.ledger().blocking_write();
+        seed_dcp_amendments(&mut ledger);
         let tx = serde_json::json!({
             "TransactionType": "DIDSet",
             "Account": genesis_addr,
