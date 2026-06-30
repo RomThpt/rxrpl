@@ -159,6 +159,10 @@ impl ConsensusMessage {
 pub struct PeerManagerConfig {
     pub listen_port: u16,
     pub max_peers: usize,
+    /// Outbound slots an inbound peer may never occupy (eclipse-attack resistance).
+    pub reserved_outbound_slots: usize,
+    /// Max simultaneous peers sharing one remote IP (eclipse-attack resistance).
+    pub max_peers_per_ip: usize,
     pub seeds: Vec<String>,
     pub fixed_peers: Vec<String>,
     pub network_id: u32,
@@ -260,7 +264,11 @@ impl PeerManager {
         // growing an unbounded queue (audit finding C4). 8192 is well
         // above the steady-state of 21 peers x 100 msg/s rate-limited.
         let (event_tx, event_rx) = mpsc::channel(8192);
-        let peer_set = Arc::new(PeerSet::new(config.max_peers));
+        let peer_set = Arc::new(PeerSet::new(
+            config.max_peers,
+            config.reserved_outbound_slots,
+            config.max_peers_per_ip,
+        ));
 
         let seeds = config.seeds.clone();
         let cluster_manager = ClusterManager::new(

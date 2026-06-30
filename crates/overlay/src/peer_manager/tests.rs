@@ -253,6 +253,8 @@ fn make_test_peer_manager() -> (PeerManager, Hash256, mpsc::Receiver<PeerMessage
     let config = PeerManagerConfig {
         listen_port: 0,
         max_peers: 4,
+        reserved_outbound_slots: 0,
+        max_peers_per_ip: usize::MAX,
         seeds: vec![],
         fixed_peers: vec![],
         network_id: 1,
@@ -308,6 +310,8 @@ fn make_test_peer_manager_with_consensus() -> (PeerManager, mpsc::Receiver<Conse
     let config = PeerManagerConfig {
         listen_port: 0,
         max_peers: 4,
+        reserved_outbound_slots: 0,
+        max_peers_per_ip: usize::MAX,
         seeds: vec![],
         fixed_peers: vec![],
         network_id: 1,
@@ -522,6 +526,8 @@ async fn send_local_manifest_to_pushes_our_manifest_into_peer_channel() {
     let cfg = PeerManagerConfig {
         listen_port: 0,
         max_peers: 4,
+        reserved_outbound_slots: 0,
+        max_peers_per_ip: usize::MAX,
         seeds: vec![],
         fixed_peers: vec![],
         network_id: 12345,
@@ -615,6 +621,8 @@ async fn dispatch_manifest_relays_to_other_peers_but_not_back_to_sender() {
     let cfg = PeerManagerConfig {
         listen_port: 0,
         max_peers: 4,
+        reserved_outbound_slots: 0,
+        max_peers_per_ip: usize::MAX,
         seeds: vec![],
         fixed_peers: vec![],
         network_id: 12345,
@@ -702,6 +710,8 @@ async fn send_local_manifest_to_is_noop_without_local_manifest() {
     let cfg = PeerManagerConfig {
         listen_port: 0,
         max_peers: 4,
+        reserved_outbound_slots: 0,
+        max_peers_per_ip: usize::MAX,
         seeds: vec![],
         fixed_peers: vec![],
         network_id: 12345,

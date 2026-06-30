@@ -29,6 +29,8 @@ fn config(identity: &NodeIdentity, port: u16) -> PeerManagerConfig {
     PeerManagerConfig {
         listen_port: port,
         max_peers: 10,
+        reserved_outbound_slots: 0,
+        max_peers_per_ip: usize::MAX,
         seeds: vec![],
         fixed_peers: vec![],
         network_id: 1234,

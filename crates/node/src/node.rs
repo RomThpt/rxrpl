@@ -1001,6 +1001,8 @@ impl Node {
         let peer_config = PeerManagerConfig {
             listen_port: self.config.peer.port,
             max_peers: self.config.peer.max_peers,
+            reserved_outbound_slots: self.config.peer.reserved_outbound_slots,
+            max_peers_per_ip: self.config.peer.max_peers_per_ip,
             seeds: self.config.peer.seeds.clone(),
             fixed_peers: self.config.peer.fixed_peers.clone(),
             network_id: self.config.network.network_id,
@@ -1555,6 +1557,9 @@ impl Node {
             // Poll converge() every 250ms (vs the 1250ms proposal cadence)
             // so a round finalizes close to the 1950ms floor instead of
             // overshooting to the next coarse 1250ms tick (~2.5s → ~2.0s).
+            // The 2000ms open (`ledger_idle_interval_ms`) + 1950ms establish
+            // floor gives a ~3.95s open+establish floor that targets mainnet's
+            // 3-4s close cadence.
             let consensus_params = ConsensusParams {
                 min_consensus_time_ms: 1_950,
                 converge_poll_interval_ms: 250,
