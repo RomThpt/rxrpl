@@ -40,7 +40,9 @@ pub enum AmendmentAction {
 ///
 /// This function implements the XRPL amendment voting algorithm:
 /// 1. Count how many trusted validators vote for each amendment.
-/// 2. An amendment has majority if >= 80% of trusted validators support it.
+/// 2. An amendment has majority when its support exceeds
+///    `max(1, trustedCount * 80 / 100)` (rippled `AmendmentSet`: strict `>`,
+///    with a single trusted validator the one exception that uses `>=`).
 /// 3. If an amendment that did not have majority now does, emit `GotMajority`.
 /// 4. If an amendment that had majority now does not, emit `LostMajority`.
 /// 5. If an amendment has held majority for the required window, emit `Activate`.
@@ -63,7 +65,17 @@ pub fn tally_votes(
         return vec![];
     }
 
-    let threshold = (trusted_count as u64 * MAJORITY_THRESHOLD as u64 / 100) as usize;
+    // rippled `AmendmentSet` (AmendmentTable.cpp): the threshold is
+    // `max(1, trustedValidations * 80 / 100)` and `passes()` compares with a
+    // strict `>` EXCEPT when there is exactly one trusted validator, which is
+    // the one case that uses `>=` (otherwise majority would be unreachable).
+    // Mirror it exactly — the previous code dropped the `max(1, ..)` floor and
+    // the single-validator `>=` exception, so this keeps amendment activation
+    // byte-faithful with rippled 3.2 and avoids a cross-impl divergence.
+    let threshold = std::cmp::max(
+        1,
+        (trusted_count as u64 * MAJORITY_THRESHOLD as u64 / 100) as usize,
+    );
 
     let mut actions = Vec::new();
 
@@ -94,7 +106,11 @@ pub fn tally_votes(
         }
 
         let vote_count = votes.get(&id).copied().unwrap_or(0);
-        let has_majority_now = vote_count > threshold;
+        let has_majority_now = if trusted_count == 1 {
+            vote_count >= threshold
+        } else {
+            vote_count > threshold
+        };
 
         if has_majority_now {
             // Record majority (no-op if already recorded)
@@ -268,6 +284,61 @@ mod tests {
 
         let actions = tally_votes(&mut table, 10, &votes, 1000, 256);
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn tally_votes_threshold_boundary_matches_rippled() {
+        // rippled `AmendmentSet`: threshold = max(1, N*80/100), strict `>` for
+        // N > 1. For N = 10, threshold = 8 and support must be STRICTLY greater
+        // than 8 (i.e. >= 9). Exactly 80% (8/10) is therefore NOT majority —
+        // this asserts we did not introduce the lenient `>= 80%` off-by-one
+        // that would diverge from rippled at round UNL sizes.
+        let reg = test_registry();
+
+        // 8 of 10 (exactly 80%) -> NO majority (rippled requires > 8).
+        {
+            let mut table = AmendmentTable::new(&reg, 100);
+            let id_a = reg.id_for_name("FeatureA").unwrap();
+            let mut votes = HashMap::new();
+            votes.insert(id_a, 8);
+            let actions = tally_votes(&mut table, 10, &votes, 1000, 256);
+            assert!(
+                actions.is_empty(),
+                "8/10 (exactly 80%) must not reach majority under rippled's strict >"
+            );
+        }
+
+        // 9 of 10 (90%) -> majority.
+        {
+            let mut table = AmendmentTable::new(&reg, 100);
+            let id_a = reg.id_for_name("FeatureA").unwrap();
+            let mut votes = HashMap::new();
+            votes.insert(id_a, 9);
+            let actions = tally_votes(&mut table, 10, &votes, 1000, 256);
+            assert!(actions.iter().any(|a| matches!(
+                a,
+                AmendmentAction::GotMajority { amendment_id, .. } if *amendment_id == id_a
+            )));
+        }
+    }
+
+    #[test]
+    fn tally_votes_single_validator_uses_ge() {
+        // rippled `AmendmentSet::passes`: with exactly one trusted validator the
+        // comparison is `>=` (threshold floored at 1), otherwise a solo UNL
+        // could never enact an amendment. One vote out of one -> majority.
+        let reg = test_registry();
+        let mut table = AmendmentTable::new(&reg, 100);
+        let id_a = reg.id_for_name("FeatureA").unwrap();
+
+        let mut votes = HashMap::new();
+        votes.insert(id_a, 1);
+
+        let actions = tally_votes(&mut table, 1, &votes, 1000, 256);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            AmendmentAction::GotMajority { amendment_id, .. } if *amendment_id == id_a
+        )));
     }
 
     #[test]
