@@ -305,6 +305,10 @@ pub fn replay_forward(
     // Adopt the validated header's adaptive close-time resolution; `new_open`
     // inherits the parent's, which can differ from the chain's chosen value.
     ledger.header.close_time_resolution = header.close_time_resolution;
+    // Recompute the provisional open-ledger close time with that resolution, so
+    // transactors reading the close time (e.g. LoanSet's StartDate) match the
+    // chain (rippled's open ctor: prevClose + resolution).
+    ledger.header.close_time = parent.header.close_time + u32::from(header.close_time_resolution);
 
     // Amendments in force are those enabled in the (inherited) parent state, so
     // each replayed ledger applies with its own era's amendment-gated logic.

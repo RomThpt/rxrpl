@@ -48,6 +48,12 @@ impl Ledger {
         header.parent_close_time = parent.header.close_time;
         header.drops = parent.header.drops;
         header.close_time_resolution = parent.header.close_time_resolution;
+        // Provisional open-ledger close time used while transactions apply
+        // (rippled's open Ledger ctor: prevClose + resolution). Transactors that
+        // read the close time (e.g. LoanSet's StartDate) see this value; the
+        // final close time replaces it at close().
+        header.close_time =
+            parent.header.close_time + u32::from(parent.header.close_time_resolution);
 
         // Mutable copy of parent state, fresh tx map
         let state_map = parent.state_map.mutable_copy();

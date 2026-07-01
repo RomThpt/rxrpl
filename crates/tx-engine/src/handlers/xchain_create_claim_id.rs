@@ -71,11 +71,16 @@ impl Transactor for XChainCreateClaimIdTransactor {
             .update(bridge_key, bridge_data_updated)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Create XChainOwnedClaimID entry. The empty XChainClaimAttestations and
-        // Flags=0 are omitted; PreviousTxnID is stamped.
+        // Create XChainOwnedClaimID entry. Link it into the creator's owner
+        // directory first so the page hint can be serialized (SoeRequired
+        // sfOwnerNode). rippled builds the SLE from the ledger template, so the
+        // empty sfXChainClaimAttestations STArray (just the array-end marker),
+        // the common sfFlags=0, and sfOwnerNode are all serialized. PreviousTxnID
+        // is stamped centrally.
         let signature_reward = helpers::get_u64_str_field(ctx.tx, "SignatureReward")
             .ok_or(TransactionResult::TemMalformed)?;
         let claim_key = keylet::xchain_claim_id(&bridge_data, new_claim_id);
+        let owner_node = crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &claim_key)?;
         let claim_entry = serde_json::json!({
             "LedgerEntryType": "XChainOwnedClaimID",
             "Account": account_str,
@@ -83,6 +88,9 @@ impl Transactor for XChainCreateClaimIdTransactor {
             "XChainClaimID": new_claim_id.to_string(),
             "OtherChainSource": other_chain_source,
             "SignatureReward": signature_reward.to_string(),
+            "XChainClaimAttestations": [],
+            "Flags": 0u32,
+            "OwnerNode": format!("{owner_node:016X}"),
             "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
             "PreviousTxnLgrSeq": 0,
         });
@@ -92,8 +100,6 @@ impl Transactor for XChainCreateClaimIdTransactor {
         ctx.view
             .insert(claim_key, claim_data)
             .map_err(|_| TransactionResult::TefInternal)?;
-
-        crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &claim_key)?;
 
         // Update creator account: increment owner count and sequence
         let src_key = keylet::account(&account_id);
@@ -295,6 +301,15 @@ mod tests {
         );
         assert_eq!(claim["XChainClaimID"].as_str().unwrap(), "1");
         assert_eq!(claim["Account"].as_str().unwrap(), USER);
+        // SoeRequired fields serialized at creation defaults.
+        assert!(
+            claim["XChainClaimAttestations"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(claim["Flags"].as_u64().unwrap(), 0);
+        assert!(claim.get("OwnerNode").is_some());
 
         // Verify bridge counter incremented
         let door_id = decode_account_id(DOOR).unwrap();

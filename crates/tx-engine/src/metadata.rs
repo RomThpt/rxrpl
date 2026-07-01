@@ -82,8 +82,9 @@ fn is_default_json(v: &serde_json::Value) -> bool {
         serde_json::Value::Array(a) => a.is_empty(),
         serde_json::Value::Object(o) => {
             // STAmount: `isDefault() == value_ == 0 && native()`. A native (XRP)
-            // amount is a string, so an object amount (an IOU, which carries a
-            // currency/issuer) is never default — even at value 0.
+            // amount is a string, so an object amount (an IOU/MPT, which carries a
+            // currency/issuer) is never default — even at value 0 (so a created
+            // node's zero Balance/LowLimit/HighLimit is still serialized).
             if o.contains_key("value") {
                 return false;
             }

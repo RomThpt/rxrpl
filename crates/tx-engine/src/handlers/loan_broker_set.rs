@@ -108,6 +108,9 @@ impl Transactor for LoanBrokerSetTransactor {
             "Balance": "0",
             "Flags": LSF_DISABLE_MASTER | LSF_DEFAULT_RIPPLE | LSF_DEPOSIT_AUTH,
             "OwnerCount": pseudo_owner_count,
+            // Pseudo-accounts are created with Sequence 0 (SoeRequired on
+            // AccountRoot, serialized even at its default).
+            "Sequence": 0,
             "LoanBrokerID": hex::encode_upper(broker_key.as_bytes()),
             "PreviousTxnID": ZERO_TXID,
             "PreviousTxnLgrSeq": 0,
@@ -128,6 +131,8 @@ impl Transactor for LoanBrokerSetTransactor {
             "Sequence": seq,
             "VaultID": hex::encode_upper(vault_key.as_bytes()),
             "LoanSequence": 1,
+            // Default sfFlags is serialized (SoeRequired common field).
+            "Flags": 0u32,
             "PreviousTxnID": ZERO_TXID,
             "PreviousTxnLgrSeq": 0,
         });
@@ -146,15 +151,14 @@ impl Transactor for LoanBrokerSetTransactor {
         if let Some(data) = helpers::get_str_field(ctx.tx, "Data") {
             broker["Data"] = serde_json::Value::String(data.to_string());
         }
+        // rippled links the broker into the owner's directory as sfOwnerNode and
+        // into the vault pseudo-account's directory as sfVaultNode; both are
+        // SoeRequired and written unconditionally (even when the page hint is 0).
         let owner_node = crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &broker_key)?;
-        if owner_node != 0 {
-            broker["OwnerNode"] = serde_json::Value::String(format!("{owner_node:016X}"));
-        }
+        broker["OwnerNode"] = serde_json::Value::String(format!("{owner_node:016X}"));
         let vault_node =
             crate::owner_dir::add_to_owner_dir(ctx.view, &vault_pseudo_id, &broker_key)?;
-        if vault_node != 0 {
-            broker["VaultNode"] = serde_json::Value::String(format!("{vault_node:016X}"));
-        }
+        broker["VaultNode"] = serde_json::Value::String(format!("{vault_node:016X}"));
         ctx.view
             .insert(
                 broker_key,
