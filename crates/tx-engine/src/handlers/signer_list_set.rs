@@ -115,30 +115,48 @@ impl Transactor for SignerListSetTransactor {
             // The signer list carries lsfOneOwnerCount and counts as a single
             // owner-reserve item (MultiSignReserve, retired/permanent).
             let flags = LSF_ONE_OWNER_COUNT;
-            // Fields mirror rippled's created SignerList SLE: sfSignerListID and
-            // sfOwnerNode default to 0 and are not serialized.
-            let sl_obj = serde_json::json!({
+            // rippled's writeSignersToSLE always sets sfSignerListID to the
+            // default signer-list id (0); both sfSignerListID and sfOwnerNode are
+            // SoeRequired and serialized onto the SLE.
+            let mut sl_obj = serde_json::json!({
                 "LedgerEntryType": "SignerList",
                 "Owner": account_str,
                 "SignerQuorum": quorum,
                 "SignerEntries": ctx.tx.get("SignerEntries").cloned().unwrap_or(Value::Array(vec![])),
                 "Flags": flags,
+                // SoeRequired, default signer-list id.
+                "SignerListID": 0u32,
                 // Placeholder filled by the engine's central PreviousTxnID stamping.
                 "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
                 "PreviousTxnLgrSeq": 0,
             });
 
-            let sl_bytes =
-                serde_json::to_vec(&sl_obj).map_err(|_| TransactionResult::TemMalformed)?;
             if existing {
+                // Preserve the owner-directory page hint of the list being
+                // replaced (rippled removes and re-adds the entry, which lands on
+                // the same page in the common single-page directory case).
+                if let Some(bytes) = ctx.view.read(&sl_key) {
+                    if let Ok(old) = serde_json::from_slice::<Value>(&bytes) {
+                        if let Some(node) = old.get("OwnerNode").and_then(|v| v.as_str()) {
+                            sl_obj["OwnerNode"] = Value::String(node.to_string());
+                        }
+                    }
+                }
+                let sl_bytes =
+                    serde_json::to_vec(&sl_obj).map_err(|_| TransactionResult::TemMalformed)?;
                 ctx.view
                     .update(sl_key, sl_bytes)
                     .map_err(|_| TransactionResult::TemMalformed)?;
             } else {
+                // Link into the owner directory first so the page index can be
+                // recorded as the SoeRequired sfOwnerNode.
+                let owner_node = add_to_owner_dir(ctx.view, &account_id, &sl_key)?;
+                sl_obj["OwnerNode"] = Value::String(format!("{owner_node:016X}"));
+                let sl_bytes =
+                    serde_json::to_vec(&sl_obj).map_err(|_| TransactionResult::TemMalformed)?;
                 ctx.view
                     .insert(sl_key, sl_bytes)
                     .map_err(|_| TransactionResult::TemMalformed)?;
-                add_to_owner_dir(ctx.view, &account_id, &sl_key)?;
             }
 
             // Update account

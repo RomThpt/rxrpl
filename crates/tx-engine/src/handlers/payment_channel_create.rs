@@ -107,19 +107,39 @@ impl Transactor for PaymentChannelCreateTransactor {
         // Create PayChannel entry
         let channel_key = keylet::pay_channel(&src_id, &dst_id, tx_seq);
 
+        // Link the channel into the creator's owner directory (SoeRequired
+        // sfOwnerNode) and the recipient's owner directory (SoeOptional
+        // sfDestinationNode); preflight guarantees Destination != Account.
+        let owner_node = add_to_owner_dir(ctx.view, &src_id, &channel_key)?;
+        let dest_node = if dst_id != src_id {
+            Some(add_to_owner_dir(ctx.view, &dst_id, &channel_key)?)
+        } else {
+            None
+        };
+
         let mut channel = serde_json::json!({
             "LedgerEntryType": "PayChannel",
             "Account": account_str,
             "Destination": destination_str,
             "Amount": amount.to_string(),
+            // rippled stores sfBalance = sfAmount.zeroed(): a SoeRequired XRP
+            // STAmount of 0 drops, serialized as "0".
+            "Balance": "0",
             "SettleDelay": helpers::get_u32_field(ctx.tx, "SettleDelay").unwrap(),
             "PublicKey": helpers::get_str_field(ctx.tx, "PublicKey").unwrap(),
             // Creating account's sequence; identifies the channel.
             "Sequence": tx_seq,
+            // Default sfFlags is serialized (SoeRequired common field).
+            "Flags": 0u32,
+            // Owner-directory page hint (SoeRequired).
+            "OwnerNode": format!("{owner_node:016X}"),
             // Placeholder filled by the engine's central PreviousTxnID stamping.
             "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
             "PreviousTxnLgrSeq": 0,
         });
+        if let Some(dest_node) = dest_node {
+            channel["DestinationNode"] = serde_json::Value::String(format!("{dest_node:016X}"));
+        }
 
         if let Some(cancel_after) = helpers::get_u32_field(ctx.tx, "CancelAfter") {
             channel["CancelAfter"] = serde_json::Value::from(cancel_after);
@@ -137,13 +157,13 @@ impl Transactor for PaymentChannelCreateTransactor {
             .insert(channel_key, channel_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        add_to_owner_dir(ctx.view, &src_id, &channel_key)?;
-
-        // When the destination differs from the owner, rippled also links the
-        // channel into the destination's owner directory and threads the
-        // destination AccountRoot (no field change).
+        // rippled threads the destination AccountRoot's PreviousTxnID to this
+        // transaction (it lands in the modified set via the destination
+        // owner-directory link). Re-touch it with unchanged bytes so the engine's
+        // central PreviousTxnID stamping records this tx (only PreviousTxnID /
+        // PreviousTxnLgrSeq change; the channel does not count against the
+        // destination's reserve).
         if dst_id != src_id {
-            add_to_owner_dir(ctx.view, &dst_id, &channel_key)?;
             let dst_key = keylet::account(&dst_id);
             if let Some(dst_bytes) = ctx.view.read(&dst_key) {
                 ctx.view
@@ -256,8 +276,14 @@ mod tests {
         let ch_bytes = sandbox.read(&channel_key).unwrap();
         let ch: serde_json::Value = serde_json::from_slice(&ch_bytes).unwrap();
         assert_eq!(ch["Amount"].as_str().unwrap(), "10000000");
-        // Balance defaults to 0 and is omitted from a freshly created channel.
-        assert!(ch.get("Balance").is_none());
+        // rippled writes sfBalance = sfAmount.zeroed() (SoeRequired): a freshly
+        // created channel carries Balance "0", not an absent field.
+        assert_eq!(ch["Balance"].as_str().unwrap(), "0");
         assert_eq!(ch["Sequence"].as_u64().unwrap(), 1);
+        // Default sfFlags=0 and the owner-directory page hints are serialized
+        // (sfOwnerNode always; sfDestinationNode since DST != SRC).
+        assert_eq!(ch["Flags"].as_u64().unwrap(), 0);
+        assert_eq!(ch["OwnerNode"].as_str().unwrap(), "0000000000000000");
+        assert_eq!(ch["DestinationNode"].as_str().unwrap(), "0000000000000000");
     }
 }

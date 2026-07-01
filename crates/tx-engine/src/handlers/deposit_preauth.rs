@@ -82,10 +82,20 @@ impl Transactor for DepositPreauthTransactor {
                 decode_account_id(authorize).map_err(|_| TransactionResult::TemInvalidAccountId)?;
             let dp_key = keylet::deposit_preauth(&account_id, &auth_id);
 
+            // Link into the owner directory first so the resulting page index can
+            // be written as the SoeRequired sfOwnerNode. rippled builds the SLE
+            // from the ledger-entry template, so the default sfFlags=0 (a
+            // SoeRequired common field) is serialized too.
+            let owner_node = crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &dp_key)?;
+
             let entry = serde_json::json!({
                 "LedgerEntryType": "DepositPreauth",
                 "Account": account_str,
                 "Authorize": authorize,
+                // Default sfFlags is serialized (SoeRequired common field).
+                "Flags": 0u32,
+                // Owner-directory page hint (SoeRequired).
+                "OwnerNode": format!("{owner_node:016X}"),
                 // Placeholder filled by the engine's central PreviousTxnID stamping.
                 "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
                 "PreviousTxnLgrSeq": 0,
@@ -96,7 +106,6 @@ impl Transactor for DepositPreauthTransactor {
                 .insert(dp_key, entry_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
 
-            crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &dp_key)?;
             helpers::adjust_owner_count(&mut account, 1);
         }
 
@@ -232,6 +241,14 @@ mod tests {
         let target_id = decode_account_id(TARGET).unwrap();
         let dp_key = keylet::deposit_preauth(&owner_id, &target_id);
         assert!(sandbox.exists(&dp_key));
+
+        // The created DepositPreauth carries the default sfFlags=0 and the
+        // owner-directory page hint (sfOwnerNode), both serialized to match
+        // rippled's account_hash.
+        let dp_bytes = sandbox.read(&dp_key).unwrap();
+        let dp: serde_json::Value = serde_json::from_slice(&dp_bytes).unwrap();
+        assert_eq!(dp["Flags"].as_u64().unwrap(), 0);
+        assert_eq!(dp["OwnerNode"].as_str().unwrap(), "0000000000000000");
 
         // Verify owner count
         let owner_key = keylet::account(&owner_id);

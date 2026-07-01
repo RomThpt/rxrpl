@@ -216,13 +216,27 @@ impl TxMeta {
                             inner.insert(f.into(), v.clone());
                         }
                     }
-                    let finals = section_fields(&fin, SMD_ALWAYS | SMD_CHANGE_NEW, false);
-                    if !finals.is_empty() {
-                        inner.insert("FinalFields".into(), finals.into());
-                    }
-                    let prevs = changed_previous_fields(&prev, &fin);
-                    if !prevs.is_empty() {
-                        inner.insert("PreviousFields".into(), prevs.into());
+                    // When the entry's only delta is the PreviousTxnID threading
+                    // (e.g. an Escrow/PayChannel destination AccountRoot that gains
+                    // a directory link but no field change), rippled emits the
+                    // node header alone — no FinalFields, no PreviousFields. Only
+                    // a real field change (add / remove / modify, ignoring the
+                    // threading bookkeeping) populates those sections.
+                    let strip_thread = |m: &serde_json::Map<String, serde_json::Value>| {
+                        let mut c = m.clone();
+                        c.remove("PreviousTxnID");
+                        c.remove("PreviousTxnLgrSeq");
+                        c
+                    };
+                    if strip_thread(&prev) != strip_thread(&fin) {
+                        let finals = section_fields(&fin, SMD_ALWAYS | SMD_CHANGE_NEW, false);
+                        if !finals.is_empty() {
+                            inner.insert("FinalFields".into(), finals.into());
+                        }
+                        let prevs = changed_previous_fields(&prev, &fin);
+                        if !prevs.is_empty() {
+                            inner.insert("PreviousFields".into(), prevs.into());
+                        }
                     }
                     "ModifiedNode"
                 }
