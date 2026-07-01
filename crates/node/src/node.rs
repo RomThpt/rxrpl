@@ -1109,6 +1109,11 @@ impl Node {
             let fetcher_status_handle: rxrpl_overlay::StatusHandle =
                 Arc::new(RwLock::new(Vec::new()));
             let fetcher_status_for_publish = Arc::clone(&fetcher_status_handle);
+            // Feed HTTP-verified VLs into the consensus loop (UNL + quorum),
+            // not just the aggregator trust filter, so a publisher-served
+            // dynamic VL actually drives consensus instead of leaving the
+            // engine in solo mode.
+            let vl_consensus_tx = peer_mgr.consensus_sender();
             tokio::spawn(async move {
                 let fetcher = match VlFetcher::new(
                     sites_for_fetcher,
@@ -1122,6 +1127,7 @@ impl Node {
                         return;
                     }
                 };
+                let fetcher = fetcher.with_consensus_sender(vl_consensus_tx);
                 // Bridge the typed status snapshot into the JSON value the
                 // RPC handler reads from `ctx.validator_list_status`.
                 let publish_handle = Arc::clone(&fetcher_status_for_publish);
