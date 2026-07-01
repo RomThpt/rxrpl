@@ -91,11 +91,29 @@ impl Transactor for DelegateSetTransactor {
                 decode_account_id(authorize).map_err(|_| TransactionResult::TemInvalidAccountId)?;
             let delegate_key = keylet::delegate(&account_id, &auth_id);
 
+            // rippled's DelegateSet::doApply links the new Delegate into TWO owner
+            // directories: the delegating account's (page recorded as the
+            // SoeRequired sfOwnerNode) and the authorized account's (page recorded
+            // as sfDestinationNode) so AccountDelete can find and clean up inbound
+            // delegations when the authorized account is deleted. Only the
+            // delegating account's owner count is incremented on creation.
+            let owner_node =
+                crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &delegate_key)?;
+            let dest_node = crate::owner_dir::add_to_owner_dir(ctx.view, &auth_id, &delegate_key)?;
+
             let mut entry = serde_json::json!({
                 "LedgerEntryType": "Delegate",
                 "Account": account_str,
                 "Authorize": authorize,
-                "Flags": 0,
+                // Default sfFlags is serialized (SoeRequired common field).
+                "Flags": 0u32,
+                // Owner-directory page hints: sfOwnerNode (SoeRequired) for the
+                // delegating account, sfDestinationNode for the authorized account.
+                "OwnerNode": format!("{owner_node:016X}"),
+                "DestinationNode": format!("{dest_node:016X}"),
+                // Placeholder filled by the engine's central PreviousTxnID stamping.
+                "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+                "PreviousTxnLgrSeq": 0,
             });
             if let Some(permissions) = ctx.tx.get("Permissions") {
                 entry["Permissions"] = permissions.clone();
@@ -106,7 +124,6 @@ impl Transactor for DelegateSetTransactor {
                 .insert(delegate_key, entry_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
 
-            crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &delegate_key)?;
             helpers::adjust_owner_count(&mut account, 1);
         }
 
@@ -115,7 +132,44 @@ impl Transactor for DelegateSetTransactor {
                 .map_err(|_| TransactionResult::TemInvalidAccountId)?;
             let delegate_key = keylet::delegate(&account_id, &auth_id);
 
-            crate::owner_dir::remove_from_owner_dir(ctx.view, &account_id, &delegate_key)?;
+            // Mirror rippled's DelegateSet::deleteDelegate: unlink from BOTH owner
+            // directories using the page hints recorded on the SLE — sfOwnerNode
+            // for the delegating account and, when present, sfDestinationNode for
+            // the authorized account. Only the delegating account's owner count was
+            // incremented on creation, so only it is decremented here.
+            let entry_bytes = ctx
+                .view
+                .read(&delegate_key)
+                .ok_or(TransactionResult::TefInternal)?;
+            let entry: serde_json::Value =
+                serde_json::from_slice(&entry_bytes).map_err(|_| TransactionResult::TefInternal)?;
+            let page_hint = |field: &str| -> Option<u64> {
+                entry
+                    .get(field)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| u64::from_str_radix(s, 16).ok())
+            };
+
+            match page_hint("OwnerNode") {
+                Some(page) => crate::owner_dir::remove_from_owner_dir_page(
+                    ctx.view,
+                    &account_id,
+                    page,
+                    &delegate_key,
+                )?,
+                None => {
+                    crate::owner_dir::remove_from_owner_dir(ctx.view, &account_id, &delegate_key)?
+                }
+            }
+            if let Some(page) = page_hint("DestinationNode") {
+                crate::owner_dir::remove_from_owner_dir_page(
+                    ctx.view,
+                    &auth_id,
+                    page,
+                    &delegate_key,
+                )?;
+            }
+
             ctx.view
                 .erase(&delegate_key)
                 .map_err(|_| TransactionResult::TefInternal)?;
@@ -243,6 +297,7 @@ mod tests {
             "TransactionType": "DelegateSet",
             "Account": ALICE,
             "Authorize": BOB,
+            "Permissions": [{ "Permission": { "PermissionValue": 1 } }],
             "Fee": "12",
             "Sequence": 1,
         });
@@ -261,6 +316,33 @@ mod tests {
         let bob_id = decode_account_id(BOB).unwrap();
         let delegate_key = keylet::delegate(&alice_id, &bob_id);
         assert!(sandbox.exists(&delegate_key));
+
+        // The Delegate SLE carries the SoeRequired sfFlags/sfOwnerNode and the
+        // sfDestinationNode second page hint (single-entry pages ⇒ page 0).
+        let entry: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&delegate_key).unwrap()).unwrap();
+        assert_eq!(entry["Flags"], serde_json::json!(0));
+        assert_eq!(entry["OwnerNode"], serde_json::json!("0000000000000000"));
+        assert_eq!(
+            entry["DestinationNode"],
+            serde_json::json!("0000000000000000")
+        );
+
+        // The delegate is linked into BOTH owner directories: the delegating
+        // account's (ALICE) and the authorized account's (BOB).
+        let key_hex = delegate_key.to_string().to_uppercase();
+        let dir_indexes = |root: &rxrpl_primitives::Hash256| -> Vec<String> {
+            let bytes = sandbox.read(root).unwrap();
+            let dir: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            dir["Indexes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_uppercase())
+                .collect()
+        };
+        assert!(dir_indexes(&keylet::owner_dir(&alice_id)).contains(&key_hex));
+        assert!(dir_indexes(&keylet::owner_dir(&bob_id)).contains(&key_hex));
 
         let account_key = keylet::account(&alice_id);
         let account_bytes = sandbox.read(&account_key).unwrap();
@@ -287,6 +369,11 @@ mod tests {
         assert_eq!(result2, TransactionResult::TesSuccess);
 
         assert!(!sandbox.exists(&delegate_key));
+
+        // Both owner directories are unlinked symmetrically; each held a single
+        // entry so the (empty) root pages are erased.
+        assert!(sandbox.read(&keylet::owner_dir(&alice_id)).is_none());
+        assert!(sandbox.read(&keylet::owner_dir(&bob_id)).is_none());
 
         let account_bytes = sandbox.read(&account_key).unwrap();
         let account: serde_json::Value = serde_json::from_slice(&account_bytes).unwrap();
