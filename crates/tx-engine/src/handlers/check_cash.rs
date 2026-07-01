@@ -4,7 +4,7 @@ use rxrpl_protocol::{TransactionResult, keylet};
 
 use crate::amount_helpers::{compute_holder_balance, compute_new_iou_balance};
 use crate::helpers;
-use crate::owner_dir::remove_from_owner_dir_page;
+use crate::owner_dir::remove_from_owner_dir_page_keep_root;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
 pub struct CheckCashTransactor;
@@ -298,10 +298,13 @@ impl Transactor for CheckCashTransactor {
         // Unlink the check from both the creator's and the destination's owner
         // directories using the page hints it recorded (OwnerNode points at the
         // creator's page, DestinationNode at the destination's), then erase it.
+        // rippled's CheckCash::doApply removes from both directories with
+        // keepRoot = true (see CheckCash.cpp), so an emptied owner/destination
+        // directory keeps its now-empty root DirectoryNode rather than erasing it.
         let owner_page = page_hint(&check, "OwnerNode");
         let dest_page = page_hint(&check, "DestinationNode");
-        remove_from_owner_dir_page(ctx.view, &check_src_id, owner_page, &check_key)?;
-        remove_from_owner_dir_page(ctx.view, &account_id, dest_page, &check_key)?;
+        remove_from_owner_dir_page_keep_root(ctx.view, &check_src_id, owner_page, &check_key)?;
+        remove_from_owner_dir_page_keep_root(ctx.view, &account_id, dest_page, &check_key)?;
         ctx.view
             .erase(&check_key)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -440,5 +443,65 @@ mod tests {
         let dst_bytes = sandbox.read(&dst_key).unwrap();
         let dst: serde_json::Value = serde_json::from_slice(&dst_bytes).unwrap();
         assert_eq!(dst["Balance"].as_str().unwrap(), "53000000");
+    }
+
+    /// Cashing a check must leave both the source's owner directory and the
+    /// destination's directory root DirectoryNode in place (empty `Indexes`)
+    /// rather than erasing them — rippled CheckCash::doApply removes the check
+    /// with `dirRemove(..., keepRoot = true)` for both directories. Confirmed
+    /// byte-exact against the L33 oracle (both dirs stay ModifiedNode).
+    #[test]
+    fn apply_keeps_empty_dir_roots() {
+        use crate::owner_dir::add_to_owner_dir;
+
+        let (ledger, check_id) = setup_with_check(SRC, DST, 5_000_000);
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+
+        let src_id = decode_account_id(SRC).unwrap();
+        let dst_id = decode_account_id(DST).unwrap();
+        let check_key = keylet::check(&src_id, 1);
+
+        // Link the check into both directories so the removal empties each root.
+        add_to_owner_dir(&mut sandbox, &src_id, &check_key).unwrap();
+        add_to_owner_dir(&mut sandbox, &dst_id, &check_key).unwrap();
+
+        let tx = serde_json::json!({
+            "TransactionType": "CheckCash",
+            "Account": DST,
+            "CheckID": check_id,
+            "Amount": "3000000",
+            "Fee": "12",
+            "Sequence": 1,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            CheckCashTransactor.apply(&mut ctx).unwrap(),
+            TransactionResult::TesSuccess
+        );
+
+        // The check itself is gone.
+        assert!(sandbox.read(&check_key).is_none(), "check must be erased");
+
+        // Both owner-directory roots survive, now empty.
+        for (label, id) in [("source", &src_id), ("destination", &dst_id)] {
+            let root = sandbox
+                .read(&keylet::owner_dir(id))
+                .unwrap_or_else(|| panic!("{label} owner-dir root must be kept, not erased"));
+            let node: serde_json::Value = serde_json::from_slice(&root).unwrap();
+            let empty = node
+                .get("Indexes")
+                .and_then(|v| v.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(true);
+            assert!(empty, "{label} owner-dir root must be empty after cashing");
+        }
     }
 }
