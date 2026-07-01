@@ -1871,6 +1871,1459 @@ mod tests {
         );
     }
 
+    /// Seed the read-set and apply a single mainnet transaction with the full
+    /// engine, returning the post-apply OPEN ledger and the transaction's
+    /// metadata entry (carrying `AffectedNodes`).
+    ///
+    /// This is a DELIBERATE VERBATIM COPY of the read-set seeding + `full_engine`
+    /// apply used by `single_tx_oracle_mainnet`, extracted so a second oracle can
+    /// reuse the machinery WITHOUT changing that test. Only the trailing
+    /// comparison differs between the two callers.
+    fn seed_and_apply_single_tx(url: String, n: u32, txhash: String) -> (Ledger, Value) {
+        let parent = n - 1;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap();
+        // Public load-balanced RPC clusters intermittently return non-JSON
+        // (rate-limit / 503) on rapid sequential POSTs. Retry with backoff so a
+        // transient hiccup on any of the many per-tx calls doesn't fail the run.
+        let rpc = |params: serde_json::Value| -> Value {
+            rt.block_on(async {
+                for attempt in 0..8u32 {
+                    if let Ok(resp) = client.post(&url).json(&params).send().await {
+                        if let Ok(v) = resp.json::<Value>().await {
+                            return v;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        400 * u64::from(attempt + 1),
+                    ))
+                    .await;
+                }
+                panic!("rpc failed after retries: {params}");
+            })
+        };
+
+        // Target tx as a canonical blob (binary) -> our JSON, exactly like replay.
+        let txs_resp = rpc(serde_json::json!({
+            "method":"ledger","params":[{"ledger_index":n,"transactions":true,"expand":true,"binary":true}]
+        }));
+        let (_set_hash, txs) = parse_tx_set(&txs_resp["result"]).expect("tx set");
+        let want_id: Hash256 = txhash.parse().expect("txhash");
+        let blob = txs
+            .into_iter()
+            .find(|(id, _)| *id == want_id)
+            .map(|(_, b)| b)
+            .expect("tx not in ledger");
+        let tx_json = rxrpl_codec::binary::decode(&blob).expect("decode tx");
+
+        // Affected SLE keys + classification from the expanded metadata.
+        let meta_resp = rpc(serde_json::json!({
+            "method":"ledger","params":[{"ledger_index":n,"transactions":true,"expand":true}]
+        }));
+        let entries = meta_resp["result"]["ledger"]["transactions"]
+            .as_array()
+            .expect("transactions");
+        let txm = entries
+            .iter()
+            .find(|t| t["hash"].as_str() == Some(&txhash))
+            .expect("tx meta");
+        let mut affected: Vec<(String, String)> = Vec::new(); // (key, nodeType)
+        for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
+            for nt in ["CreatedNode", "ModifiedNode", "DeletedNode"] {
+                if let Some(e) = node.get(nt) {
+                    affected.push((
+                        e["LedgerIndex"].as_str().unwrap().to_uppercase(),
+                        nt.to_string(),
+                    ));
+                }
+            }
+        }
+
+        // Read-set = affected keys + FeeSettings + Amendments (for Rules) + every
+        // AccountRoot any apply might read. The latter is any account the tx or an
+        // affected entry references — Account/Destination, every issuer (Amount,
+        // TrustSet LimitAmount, NFToken Issuer), owners, authorized accounts, the
+        // HighLimit/LowLimit issuers of touched trust lines, etc. Collected by
+        // walking the tx JSON and the affected nodes' fields for r-addresses.
+        let mut read_keys: std::collections::BTreeSet<String> =
+            affected.iter().map(|(k, _)| k.clone()).collect();
+        read_keys.insert(keylet::fee_settings().to_string().to_uppercase());
+        read_keys.insert(keylet::amendments().to_string().to_uppercase());
+        let mut stack: Vec<&Value> = vec![&tx_json];
+        for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
+            for nt in ["CreatedNode", "ModifiedNode", "DeletedNode"] {
+                if let Some(e) = node.get(nt) {
+                    for f in ["FinalFields", "NewFields", "PreviousFields"] {
+                        if let Some(ff) = e.get(f) {
+                            stack.push(ff);
+                        }
+                    }
+                }
+            }
+        }
+        while let Some(v) = stack.pop() {
+            match v {
+                Value::String(s) => {
+                    if s.starts_with('r') && s.len() >= 25 {
+                        if let Ok(id) = decode_account_id(s) {
+                            read_keys.insert(keylet::account(&id).to_string().to_uppercase());
+                        }
+                    }
+                }
+                Value::Array(a) => stack.extend(a.iter()),
+                Value::Object(o) => stack.extend(o.values()),
+                _ => {}
+            }
+        }
+
+        // MPToken transactors read the MPTokenIssuance (id = seq||issuer) without
+        // listing it in AffectedNodes; derive and seed its SLE key.
+        if let Some(idhex) = tx_json
+            .get("MPTokenIssuanceID")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.len() == 48)
+        {
+            if let Ok(b) = hex::decode(idhex) {
+                let seq = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+                if let Ok(iss) = rxrpl_primitives::AccountId::from_slice(&b[4..24]) {
+                    read_keys.insert(
+                        keylet::mptoken_issuance(&iss, seq)
+                            .to_string()
+                            .to_uppercase(),
+                    );
+                }
+            }
+        }
+
+        // XChain transactors read the Bridge SLE (keyed per door) without listing
+        // it in AffectedNodes; derive and seed both candidate keylets.
+        if let Some(bridge) = tx_json.get("XChainBridge") {
+            for (door_f, issue_f) in [
+                ("LockingChainDoor", "LockingChainIssue"),
+                ("IssuingChainDoor", "IssuingChainIssue"),
+            ] {
+                if let (Some(d), Some(iss)) = (
+                    bridge.get(door_f).and_then(|v| v.as_str()),
+                    bridge.get(issue_f),
+                ) {
+                    if let Ok(did) = decode_account_id(d) {
+                        read_keys.insert(
+                            rxrpl_tx_engine::bridge_helpers::bridge_keylet_for_door(&did, iss)
+                                .to_string()
+                                .to_uppercase(),
+                        );
+                    }
+                }
+            }
+        }
+
+        // LoanBroker/Vault transactors read the referenced Vault SLE (by its
+        // 32-byte VaultID keylet) without listing it in AffectedNodes. Seed it
+        // from the tx, and from any affected object that carries a VaultID
+        // (e.g. a LoanBroker referenced only by LoanBrokerID).
+        if let Some(vid) = tx_json.get("VaultID").and_then(|v| v.as_str()) {
+            read_keys.insert(vid.to_uppercase());
+        }
+        for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
+            for wrap in ["CreatedNode", "ModifiedNode", "DeletedNode"] {
+                for fields in ["FinalFields", "NewFields"] {
+                    // The referenced Vault, and the LoanBroker referenced by a
+                    // Loan (which carries only LoanBrokerID), are read but not
+                    // always listed in AffectedNodes.
+                    if let Some(vid) = node[wrap][fields]["VaultID"].as_str() {
+                        read_keys.insert(vid.to_uppercase());
+                    }
+                    if let Some(bid) = node[wrap][fields]["LoanBrokerID"].as_str() {
+                        read_keys.insert(bid.to_uppercase());
+                    }
+                }
+            }
+        }
+
+        // An entry created or removed on a non-root directory page touches only
+        // that page; the root (page 0) is left unchanged and so is absent from
+        // AffectedNodes. dirAdd needs the root to walk to the chain's last page,
+        // so seed the RootIndex of every affected directory.
+        for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
+            for nt in ["CreatedNode", "ModifiedNode", "DeletedNode"] {
+                let Some(e) = node.get(nt) else { continue };
+                if e.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("DirectoryNode") {
+                    continue;
+                }
+                for f in ["FinalFields", "NewFields"] {
+                    if let Some(root) = e
+                        .get(f)
+                        .and_then(|ff| ff.get("RootIndex"))
+                        .and_then(|v| v.as_str())
+                    {
+                        read_keys.insert(root.to_uppercase());
+                    }
+                }
+            }
+        }
+
+        // A TrustSet may read a trust line it leaves unchanged (already in the
+        // requested state), so the line is absent from AffectedNodes and would
+        // not be seeded — the handler would then recreate it and over-count the
+        // owner reserve. Seed the line the LimitAmount names.
+        let currency_bytes = |c: &str| -> [u8; 20] {
+            let mut b = [0u8; 20];
+            if c.len() == 3 {
+                b[12..15].copy_from_slice(c.as_bytes());
+            } else if c.len() == 40 {
+                if let Ok(d) = hex::decode(c) {
+                    if d.len() == 20 {
+                        b.copy_from_slice(&d);
+                    }
+                }
+            }
+            b
+        };
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("TrustSet") {
+            if let Some(lim) = tx_json.get("LimitAmount") {
+                if let (Some(a), Some(iss), Some(cur)) = (
+                    tx_json.get("Account").and_then(|v| v.as_str()),
+                    lim.get("issuer").and_then(|v| v.as_str()),
+                    lim.get("currency").and_then(|v| v.as_str()),
+                ) {
+                    if let (Ok(aid), Ok(iid)) = (decode_account_id(a), decode_account_id(iss)) {
+                        read_keys.insert(
+                            keylet::trust_line(&aid, &iid, &currency_bytes(cur))
+                                .to_string()
+                                .to_uppercase(),
+                        );
+                    }
+                }
+            }
+        }
+
+        // An OfferCreate reads the creator's own trust lines for the offer's
+        // TakerPays / TakerGets currencies — the unfunded check (accountFunds on
+        // TakerGets) and the owner-funds clamp — even when crossing leaves them
+        // unchanged. A non-crossing or fully-funded offer therefore omits them
+        // from AffectedNodes; seed both lines from the parent ledger so
+        // accountFunds reflects the chain rather than a missing line (== 0).
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("OfferCreate") {
+            if let Some(aid) = tx_json
+                .get("Account")
+                .and_then(|v| v.as_str())
+                .and_then(|a| decode_account_id(a).ok())
+            {
+                for side in ["TakerPays", "TakerGets"] {
+                    if let (Some(iss), Some(cur)) = (
+                        tx_json[side].get("issuer").and_then(|v| v.as_str()),
+                        tx_json[side].get("currency").and_then(|v| v.as_str()),
+                    ) {
+                        if let Ok(iid) = decode_account_id(iss) {
+                            read_keys.insert(
+                                keylet::trust_line(&aid, &iid, &currency_bytes(cur))
+                                    .to_string()
+                                    .to_uppercase(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // A multi-signed tx (carrying a `Signers` array) reads the sender's
+        // SignerList SLE to validate the signers against the registered quorum
+        // (Transactor::checkMultiSign). A successful apply does not modify the
+        // SignerList, so it is absent from AffectedNodes and would not be seeded
+        // — the engine's stateful multi-sign gate would then read no list and
+        // return tefNOT_MULTI_SIGNING. Seed the sender's SignerList keylet from
+        // the parent ledger so the gate sees the real list (oracle faithfulness,
+        // mirrors the OfferCreate trust-line seeding above).
+        if tx_json
+            .get("Signers")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty())
+        {
+            if let Some(aid) = tx_json
+                .get("Account")
+                .and_then(|v| v.as_str())
+                .and_then(|a| decode_account_id(a).ok())
+            {
+                read_keys.insert(keylet::signer_list(&aid).to_string().to_uppercase());
+            }
+        }
+
+        // A ticketed tx (`TicketSequence` set, `Sequence` 0) consumes the
+        // sender's Ticket SLE: the engine reads it to authorize the tx and then
+        // deletes it (decrementing OwnerCount/TicketCount). rippled records the
+        // Ticket as a DeletedNode, but with no `PreviousFields` (it is removed,
+        // not modified), so the metadata-driven reconstruction never seeds it —
+        // the engine would then fail to find the ticket, skip the consume, and
+        // wrongly bump the account Sequence. Seed the Ticket keylet from the
+        // parent ledger so the consume path runs (mirrors the SignerList seeding
+        // above).
+        if let Some(ticket_seq) = tx_json.get("TicketSequence").and_then(|v| v.as_u64()) {
+            if let Some(aid) = tx_json
+                .get("Account")
+                .and_then(|v| v.as_str())
+                .and_then(|a| decode_account_id(a).ok())
+            {
+                read_keys.insert(
+                    keylet::ticket(&aid, ticket_seq as u32)
+                        .to_string()
+                        .to_uppercase(),
+                );
+            }
+        }
+
+        // A CheckCash / CheckCancel reads the Check SLE named by `CheckID`: the
+        // engine looks it up to authorize the cash (and, on success, delete it).
+        // The Check is not always an AffectedNode — a `tec` result (e.g.
+        // tecPATH_PARTIAL when the writer cannot fund the amount) leaves it
+        // untouched, so the metadata-driven seed misses it entirely and the engine
+        // returns tecNO_ENTRY instead of the real verdict (skipping the fee/ticket
+        // effects). Seed the Check from the parent ledger (its 32-byte key IS the
+        // CheckID), plus the writer's AccountRoot (the funding source the cash
+        // prices) and, for an IOU SendMax, the issuer + the writer/casher trust
+        // lines the path reads — none of which appear in the tx JSON.
+        if let Some(check_id) = tx_json.get("CheckID").and_then(|v| v.as_str()) {
+            let cid = check_id.to_uppercase();
+            read_keys.insert(cid.clone());
+            let r = rpc(serde_json::json!({
+                "method":"ledger_entry","params":[{"index":cid,"ledger_index":parent}]
+            }));
+            let check = &r["result"]["node"];
+            if let Some(writer) = check
+                .get("Account")
+                .and_then(|v| v.as_str())
+                .and_then(|a| decode_account_id(a).ok())
+            {
+                read_keys.insert(keylet::account(&writer).to_string().to_uppercase());
+                if let (Some(cur), Some(iss)) = (
+                    check
+                        .get("SendMax")
+                        .and_then(|s| s.get("currency"))
+                        .and_then(|v| v.as_str()),
+                    check
+                        .get("SendMax")
+                        .and_then(|s| s.get("issuer"))
+                        .and_then(|v| v.as_str()),
+                ) {
+                    if let Ok(iid) = decode_account_id(iss) {
+                        let cb = currency_bytes(cur);
+                        read_keys.insert(keylet::account(&iid).to_string().to_uppercase());
+                        read_keys.insert(
+                            keylet::trust_line(&writer, &iid, &cb)
+                                .to_string()
+                                .to_uppercase(),
+                        );
+                        if let Some(casher) = tx_json
+                            .get("Account")
+                            .and_then(|v| v.as_str())
+                            .and_then(|a| decode_account_id(a).ok())
+                        {
+                            read_keys.insert(
+                                keylet::trust_line(&casher, &iid, &cb)
+                                    .to_string()
+                                    .to_uppercase(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // An NFTokenCreateOffer reads the token holder's NFTokenPage chain to
+        // verify ownership (rippled preclaim `findToken`), but creating an offer
+        // does not modify the page, so it is absent from AffectedNodes and would
+        // not be seeded — the ownership walk would then wrongly fail with
+        // tecNO_ENTRY. The holder is the seller (sfAccount) for a sell offer and
+        // the named sfOwner for a buy offer. Seed that account's full page chain
+        // from the parent ledger (account_objects), unchanged by the tx.
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("NFTokenCreateOffer") {
+            let is_sell = tx_json.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & 1 != 0;
+            let holder = if is_sell {
+                tx_json.get("Account").and_then(|v| v.as_str())
+            } else {
+                tx_json.get("Owner").and_then(|v| v.as_str())
+            };
+            if let Some(acct) = holder {
+                let r = rpc(serde_json::json!({
+                    "method":"account_objects",
+                    "params":[{"account":acct,"type":"nft_page","ledger_index":parent}]
+                }));
+                if let Some(objs) = r["result"]["account_objects"].as_array() {
+                    for o in objs {
+                        if let Some(idx) = o.get("index").and_then(|v| v.as_str()) {
+                            read_keys.insert(idx.to_uppercase());
+                        }
+                    }
+                }
+            }
+        }
+
+        // AMMVote recomputes the trading fee as the LP-weighted average over
+        // every account already in the AMM's VoteSlots: applyVote calls
+        // ammLPHolds(entryAccount) for each one, reading that account's LP-token
+        // trust line. Those lines are read-only, so they are absent from the tx
+        // AffectedNodes and would not be seeded — every existing voter would then
+        // read 0 LP and be wrongly evicted. Seed each voter's (and the auction
+        // slot account's) LP trust line from the parent ledger so the average and
+        // eviction match the chain.
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("AMMVote") {
+            if let (Some(a1), Some(a2)) = (tx_json.get("Asset"), tx_json.get("Asset2")) {
+                if let Ok(amm_key) = rxrpl_tx_engine::amm_helpers::compute_amm_key(a1, a2) {
+                    let amm_idx = amm_key.to_string().to_uppercase();
+                    let r = rpc(serde_json::json!({
+                        "method":"ledger_entry","params":[{"index":amm_idx,"ledger_index":parent}]
+                    }));
+                    let amm = &r["result"]["node"];
+                    if let (Some(amm_acct), Some(lp_cur)) = (
+                        amm.get("Account").and_then(|v| v.as_str()),
+                        amm.get("LPTokenBalance")
+                            .and_then(|b| b.get("currency"))
+                            .and_then(|v| v.as_str()),
+                    ) {
+                        if let (Ok(amm_id), Ok(cur_bytes)) = (
+                            decode_account_id(amm_acct),
+                            hex::decode(lp_cur)
+                                .map_err(|_| ())
+                                .and_then(|b| <[u8; 20]>::try_from(b.as_slice()).map_err(|_| ())),
+                        ) {
+                            let mut voters: Vec<String> = amm
+                                .get("VoteSlots")
+                                .and_then(|v| v.as_array())
+                                .map(|slots| {
+                                    slots
+                                        .iter()
+                                        .filter_map(|s| {
+                                            s.get("VoteEntry")
+                                                .unwrap_or(s)
+                                                .get("Account")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string())
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if let Some(a) = amm
+                                .get("AuctionSlot")
+                                .and_then(|au| au.get("Account"))
+                                .and_then(|v| v.as_str())
+                            {
+                                voters.push(a.to_string());
+                            }
+                            // applyVote also reads the voter's own LP line
+                            // (lpTokensNew) before it has a vote slot; seed it too.
+                            if let Some(a) = tx_json.get("Account").and_then(|v| v.as_str()) {
+                                voters.push(a.to_string());
+                            }
+                            for voter in voters {
+                                if let Ok(vid) = decode_account_id(&voter) {
+                                    read_keys.insert(
+                                        keylet::trust_line(&vid, &amm_id, &cur_bytes)
+                                            .to_string()
+                                            .to_uppercase(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // AMMDeposit / AMMWithdraw read the pool's AMM SLE, the pseudo-account
+        // AccountRoot (pool XRP balance), each pool asset's IOU trust lines, and
+        // the sender's LP-token + asset trust lines to run the reserve / funding
+        // / withdraw-math checks. On a `tec` result none of these appear in
+        // AffectedNodes (only the sender's fee charge does), so seed them from
+        // the parent ledger so the transactor reaches its real verdict (e.g.
+        // tecINSUF_RESERVE_LINE / tecUNFUNDED_AMM / tecAMM_FAILED) rather than
+        // tecNO_ENTRY against a missing pool.
+        if matches!(
+            tx_json.get("TransactionType").and_then(|v| v.as_str()),
+            Some("AMMDeposit") | Some("AMMWithdraw")
+        ) {
+            if let (Some(a1), Some(a2)) = (tx_json.get("Asset"), tx_json.get("Asset2")) {
+                if let Ok(amm_key) = rxrpl_tx_engine::amm_helpers::compute_amm_key(a1, a2) {
+                    let amm_idx = amm_key.to_string().to_uppercase();
+                    read_keys.insert(amm_idx.clone());
+                    let r = rpc(serde_json::json!({
+                        "method":"ledger_entry","params":[{"index":amm_idx,"ledger_index":parent}]
+                    }));
+                    let amm = &r["result"]["node"];
+                    let sender_id = tx_json
+                        .get("Account")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| decode_account_id(s).ok());
+                    if let Some(amm_id) = amm
+                        .get("Account")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| decode_account_id(s).ok())
+                    {
+                        // The AMM pseudo-account AccountRoot (pool XRP balance and
+                        // the accountSle the transactor peeks).
+                        read_keys.insert(keylet::account(&amm_id).to_string().to_uppercase());
+                        // The sender's LP-token trust line: whether they already
+                        // hold LP gates the new-line reserve adjustment, and a
+                        // withdraw-all reads it for the redeemable balance.
+                        if let (Some(sid), Ok(lp_cur)) = (
+                            &sender_id,
+                            amm.get("LPTokenBalance")
+                                .and_then(|b| b.get("currency"))
+                                .and_then(|v| v.as_str())
+                                .ok_or(())
+                                .and_then(|c| {
+                                    hex::decode(c).map_err(|_| ()).and_then(|b| {
+                                        <[u8; 20]>::try_from(b.as_slice()).map_err(|_| ())
+                                    })
+                                }),
+                        ) {
+                            read_keys.insert(
+                                keylet::trust_line(sid, &amm_id, &lp_cur)
+                                    .to_string()
+                                    .to_uppercase(),
+                            );
+                        }
+                        // Each pool asset's IOU trust lines: the AMM's holding (the
+                        // pool balance) and the sender's holding (the funding
+                        // check). XRP legs carry no issuer and are skipped.
+                        for asset in [a1, a2] {
+                            if let (Some(cur), Some(iss)) = (
+                                asset.get("currency").and_then(|v| v.as_str()),
+                                asset.get("issuer").and_then(|v| v.as_str()),
+                            ) {
+                                if let Ok(iss_id) = decode_account_id(iss) {
+                                    let cb = currency_bytes(cur);
+                                    read_keys.insert(
+                                        keylet::trust_line(&amm_id, &iss_id, &cb)
+                                            .to_string()
+                                            .to_uppercase(),
+                                    );
+                                    if let Some(sid) = &sender_id {
+                                        read_keys.insert(
+                                            keylet::trust_line(sid, &iss_id, &cb)
+                                                .to_string()
+                                                .to_uppercase(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // AMMClawback withdraws the holder's full LP, then directSends the
+        // clawed `Asset` from holder to issuer. The holder's trust line for
+        // that Asset nets to zero change (withdrawn then clawed) so it is
+        // absent from AffectedNodes and would not be seeded — the directSend
+        // would then fail with tecNO_ENTRY. Seed the holder<->issuer line.
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("AMMClawback") {
+            if let (Some(holder), Some(asset)) = (
+                tx_json.get("Holder").and_then(|v| v.as_str()),
+                tx_json.get("Asset"),
+            ) {
+                if let (Some(cur), Some(iss)) = (
+                    asset.get("currency").and_then(|v| v.as_str()),
+                    asset.get("issuer").and_then(|v| v.as_str()),
+                ) {
+                    if let (Ok(hid), Ok(iid)) = (decode_account_id(holder), decode_account_id(iss))
+                    {
+                        read_keys.insert(
+                            keylet::trust_line(&hid, &iid, &currency_bytes(cur))
+                                .to_string()
+                                .to_uppercase(),
+                        );
+                    }
+                }
+            }
+        }
+
+        // A cross-currency Payment that routes through an AMM reads the pool's
+        // AMM SLE (for the TradingFee and the pseudo-account) but never modifies
+        // it, so it is absent from AffectedNodes and would not be seeded — the
+        // swap would then find no pool and deliver nothing. Derive the AMM key
+        // for the (SendMax → Amount) pair and seed it from the parent ledger.
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("Payment") {
+            if let (Some(amt), Some(sm)) = (tx_json.get("Amount"), tx_json.get("SendMax")) {
+                if let (Some(a1), Some(a2)) = (
+                    rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(amt),
+                    rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(sm),
+                ) {
+                    if a1 != a2 {
+                        if let Ok(amm_key) = rxrpl_tx_engine::amm_helpers::compute_amm_key(&a1, &a2)
+                        {
+                            read_keys.insert(amm_key.to_string().to_uppercase());
+                        }
+                    }
+                }
+            }
+        }
+
+        // A multi-hop (Paths) cross-currency Payment routes through one AMM SLE
+        // per consecutive boundary along each path (e.g. XRP -> BCHAMP -> FAMILY
+        // reads the XRP/BCHAMP and BCHAMP/FAMILY pools). Like the direct pair,
+        // these intermediate AMM SLEs are read for the pool account + TradingFee
+        // but never modified, so they are absent from AffectedNodes. Walk each
+        // path's boundary chain and seed every consecutive pool's AMM key.
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("Payment") {
+            if let (Some(amt), Some(sm), Some(paths)) = (
+                tx_json.get("Amount"),
+                tx_json.get("SendMax"),
+                tx_json.get("Paths").and_then(|v| v.as_array()),
+            ) {
+                if let (Some(src_spec), Some(dst_spec)) = (
+                    rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(sm),
+                    rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(amt),
+                ) {
+                    for path in paths {
+                        let Some(steps) = path.as_array() else {
+                            continue;
+                        };
+                        // Boundary asset-spec chain: source, each currency/issuer
+                        // step, then the destination asset.
+                        let mut specs: Vec<Value> = vec![src_spec.clone()];
+                        let (mut cur, mut iss) = match &src_spec {
+                            Value::String(_) => (None, None),
+                            v => (
+                                v.get("currency").and_then(|c| c.as_str()).map(String::from),
+                                v.get("issuer").and_then(|c| c.as_str()).map(String::from),
+                            ),
+                        };
+                        for step in steps {
+                            if step.get("account").and_then(|v| v.as_str()).is_some() {
+                                continue; // account-ripple step: no book/pool
+                            }
+                            if let Some(c) = step.get("currency").and_then(|v| v.as_str()) {
+                                cur = Some(c.to_string());
+                            }
+                            if let Some(i) = step.get("issuer").and_then(|v| v.as_str()) {
+                                iss = Some(i.to_string());
+                            }
+                            if let (Some(c), Some(i)) = (&cur, &iss) {
+                                specs.push(serde_json::json!({"currency": c, "issuer": i}));
+                            }
+                        }
+                        specs.push(dst_spec.clone());
+                        // A genuinely multi-path Payment (>= 2 alternative Paths)
+                        // runs through the multi-pass Flow loop, which prices EVERY
+                        // boundary AMM along EVERY path — not just the first /
+                        // metadata-touched pool. The downstream pools (e.g. the
+                        // XRP/RLUSD and RLUSD/USDC AMMs of an XJOY->XRP->RLUSD->USDC
+                        // strand) read their pseudo-account AccountRoot (pool XRP
+                        // balance) and each pool asset's IOU trust line (pool IOU
+                        // balance), none of which appear in this tx's AffectedNodes
+                        // (only the metadata-touched first pool does). Seed them so
+                        // `build_flow_strand` reads real pool balances at every hop
+                        // instead of zeroing the downstream AMMs (which collapses
+                        // the multi-strand competition to a single full swap). Gated
+                        // on Paths.len() > 1 so the 18 single-path cross-currency
+                        // and 8 single-path AMM-routed repros are untouched.
+                        let seed_pools = paths.len() > 1;
+                        for pair in specs.windows(2) {
+                            if pair[0] == pair[1] {
+                                continue;
+                            }
+                            if let Ok(amm_key) =
+                                rxrpl_tx_engine::amm_helpers::compute_amm_key(&pair[0], &pair[1])
+                            {
+                                let amm_idx = amm_key.to_string().to_uppercase();
+                                read_keys.insert(amm_idx.clone());
+                                if !seed_pools {
+                                    continue;
+                                }
+                                // Fetch the pool SLE to learn the pseudo-account,
+                                // then seed its AccountRoot + each pool asset's
+                                // trust line so the pool balances are readable.
+                                let r = rpc(serde_json::json!({
+                                    "method":"ledger_entry",
+                                    "params":[{"index":amm_idx,"ledger_index":parent}]
+                                }));
+                                let amm = &r["result"]["node"];
+                                let Some(amm_id) = amm
+                                    .get("Account")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|s| decode_account_id(s).ok())
+                                else {
+                                    continue;
+                                };
+                                read_keys
+                                    .insert(keylet::account(&amm_id).to_string().to_uppercase());
+                                for asset in [&pair[0], &pair[1]] {
+                                    if let (Some(cur), Some(iss)) = (
+                                        asset.get("currency").and_then(|v| v.as_str()),
+                                        asset.get("issuer").and_then(|v| v.as_str()),
+                                    ) {
+                                        if let Ok(iss_id) = decode_account_id(iss) {
+                                            read_keys.insert(
+                                                keylet::trust_line(
+                                                    &amm_id,
+                                                    &iss_id,
+                                                    &currency_bytes(cur),
+                                                )
+                                                .to_string()
+                                                .to_uppercase(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Keys our tx creates must start ABSENT. Usually a CreatedNode is simply
+        // missing from the parent, but a deterministic key (a book/owner
+        // DirectoryNode page) can have been deleted *and re-created* within this
+        // same ledger N: the parent then still holds its stale pre-deletion
+        // content, which would pollute the freshly created entry. Never seed a
+        // CreatedNode from the parent.
+        let created_keys: std::collections::BTreeSet<String> = affected
+            .iter()
+            .filter(|(_, nt)| nt == "CreatedNode")
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        // Seed a partial state map from the parent ledger.
+        let mut state = rxrpl_shamap::SHAMap::account_state();
+        for key in &read_keys {
+            if created_keys.contains(key) {
+                continue;
+            }
+            let r = rpc(serde_json::json!({
+                "method":"ledger_entry","params":[{"index":key,"ledger_index":parent,"binary":true}]
+            }));
+            if let Some(hex_node) = r["result"]["node_binary"].as_str() {
+                let kb: [u8; 32] = hex::decode(key).unwrap().try_into().unwrap();
+                state
+                    .put(Hash256::new(kb), hex::decode(hex_node).unwrap())
+                    .unwrap();
+            }
+        }
+
+        // Owner-directory pages our tx touches are stale in the parent seed when
+        // an EARLIER sibling tx in this same ledger N added/removed entries to the
+        // same page (or split/merged its page chain). rippled's metadata OMITS the
+        // `Indexes` array, so we cannot read the per-tx delta. But when OUR tx is
+        // the page's LAST toucher in ledger N, the validated on-chain page at N is
+        // authoritative: it equals the faithful pre-tx page with OUR tx's own
+        // owned-object additions/removals already applied. Reconstruct the pre-tx
+        // page by taking the on-chain page at N and reversing only OUR delta — drop
+        // the owned objects our tx CREATED (the engine re-adds them) and restore
+        // the owned objects our tx DELETED (the engine re-removes them). For a page
+        // no sibling touched this yields exactly the parent-ledger page, so passing
+        // repros are unchanged; for an interfered page it supplies the
+        // sibling-updated membership and page-chain pointers the parent seed lacks.
+        // Index the deltas here; the reconstruction runs inside the override loop.
+        let this_txid = txhash.to_uppercase();
+        // Indexes of every owned object our tx CREATED (offers, trust lines, …) —
+        // present in the on-chain page only because our tx added them.
+        let mut created_members: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        // Owner-directory ROOT keys of accounts our tx ADDS an owned object to.
+        // Such a directory is grown via `dir_insert`, which follows the root's
+        // `IndexPrevious` to the last page and may split it. The validated on-chain
+        // page at N already records the POST-split structure (its `IndexPrevious`
+        // can point at a page our tx newly created, which is NOT seeded), so
+        // reconstructing the page's structural links from N would break the add
+        // walk. For these directories the reconstruction keeps the PARENT page's
+        // structure and lets the engine redo the split; only pure-removal
+        // directories take the on-chain structure (the engine never relinks them).
+        let mut add_owner_roots: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        // Owner-directory page key -> indexes of owned objects our tx DELETED that
+        // were linked into that page (mapped via the object's Account/Owner +
+        // OwnerNode hint). RippleState lines (no OwnerNode) are restored by the
+        // trust-line patch further below, so they are skipped here.
+        let mut deleted_owner_members: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        // Owner-directory ROOT key -> the non-zero page numbers our tx removes an
+        // object from. The OfferCancel / crossing-OfferCreate removal path
+        // (`dir_remove`) walks the owner directory FROM the root following
+        // `IndexNext`; in a partial-state replay the deep intermediate pages are
+        // unseeded, so a busy account's root walk stops early and the removal
+        // silently no-ops, leaving the entry stranded. We seed the root below with
+        // an `IndexNext` jump straight to the removed object's page so the walk
+        // reaches it (the add path reads `IndexPrevious`, so this is invisible to
+        // dirAdd). Keyed by the root index, which is also the ledger_entry key.
+        let mut owner_remove_targets: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeSet<u64>,
+        > = std::collections::BTreeMap::new();
+        for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
+            if let Some(e) = node.get("CreatedNode") {
+                if e.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("DirectoryNode") {
+                    if let Some(idx) = e.get("LedgerIndex").and_then(|v| v.as_str()) {
+                        created_members.insert(idx.to_uppercase());
+                    }
+                    // Record every owner directory this creation grows. Most owned
+                    // objects name their owner via Account/Owner; a created
+                    // RippleState links into both the Low/High issuers' directories.
+                    let nf = e.get("NewFields");
+                    let mut owners: Vec<&str> = Vec::new();
+                    if let Some(a) = nf
+                        .and_then(|f| f.get("Account").or_else(|| f.get("Owner")))
+                        .and_then(|v| v.as_str())
+                    {
+                        owners.push(a);
+                    }
+                    for side in ["LowLimit", "HighLimit"] {
+                        if let Some(a) = nf
+                            .and_then(|f| f.get(side))
+                            .and_then(|l| l.get("issuer"))
+                            .and_then(|v| v.as_str())
+                        {
+                            owners.push(a);
+                        }
+                    }
+                    for a in owners {
+                        if let Ok(aid) = decode_account_id(a) {
+                            add_owner_roots
+                                .insert(keylet::owner_dir(&aid).to_string().to_uppercase());
+                        }
+                    }
+                }
+            }
+            if let Some(e) = node.get("DeletedNode") {
+                let lt = e.get("LedgerEntryType").and_then(|v| v.as_str());
+                if lt == Some("DirectoryNode") {
+                    continue;
+                }
+                let ff = e.get("FinalFields");
+                let Some(idx) = e.get("LedgerIndex").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let owner = ff
+                    .and_then(|f| f.get("Account").or_else(|| f.get("Owner")))
+                    .and_then(|v| v.as_str())
+                    .and_then(|a| decode_account_id(a).ok());
+                let node_no = ff
+                    .and_then(|f| f.get("OwnerNode"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| u64::from_str_radix(s, 16).ok());
+                if let (Some(owner), Some(node_no)) = (owner, node_no) {
+                    let root = keylet::owner_dir(&owner);
+                    let page = keylet::dir_node(&root, node_no).to_string().to_uppercase();
+                    deleted_owner_members
+                        .entry(page)
+                        .or_default()
+                        .push(idx.to_uppercase());
+                    // Only the Offer removal path (`dir_remove`) walks from the
+                    // root and so needs the jump; Tickets and other owned objects
+                    // are removed via their recorded page hint and reach their page
+                    // directly. Restrict the jump target to deleted Offers so a
+                    // sibling object on a different page does not misdirect it.
+                    if node_no != 0 && lt == Some("Offer") {
+                        owner_remove_targets
+                            .entry(root.to_string().to_uppercase())
+                            .or_default()
+                            .insert(node_no);
+                    }
+                }
+            }
+        }
+
+        // Override affected entries with their exact PRE-tx state, reconstructed
+        // from metadata (FinalFields overlaid with PreviousFields). The
+        // parent-ledger value is stale whenever an account was already touched by
+        // an earlier transaction in the same ledger N — its Sequence and balances
+        // would differ, failing the sequence check or drifting amounts. The
+        // metadata captures the value the target tx actually saw.
+        for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
+            for nt in ["ModifiedNode", "DeletedNode"] {
+                let Some(e) = node.get(nt) else {
+                    continue;
+                };
+                let Some(let_type) = e.get("LedgerEntryType").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                // DirectoryNode metadata omits the `Indexes` array. Book
+                // directories (no `Owner` field) are left to the crossing-walk seed
+                // below, which keeps the pre-tx offers the engine must cross. Owner
+                // directories that OUR tx is the last toucher of are reconstructed
+                // faithfully from the validated on-chain page at N with our own
+                // owned-object create/delete reversed (see the delta index above);
+                // a non-interfered page reduces to the parent seed, an interfered
+                // one gains the sibling-updated membership and page-chain pointers.
+                // Pages a LATER sibling touches last keep the parent seed and are
+                // skipped in the comparison.
+                if let_type == "DirectoryNode" {
+                    let key = e["LedgerIndex"].as_str().unwrap().to_uppercase();
+                    let kb: [u8; 32] = hex::decode(&key).unwrap().try_into().unwrap();
+                    let is_owner_dir = e.get("FinalFields").and_then(|f| f.get("Owner")).is_some();
+                    if !is_owner_dir {
+                        continue;
+                    }
+                    if nt == "ModifiedNode" {
+                        // Fetch the validated on-chain page at N and only
+                        // reconstruct when OUR tx threaded it last; otherwise a
+                        // later sibling owns the on-chain membership/pointers and
+                        // the single-tx replay genuinely cannot reproduce it (the
+                        // comparison skips it).
+                        let r = rpc(serde_json::json!({
+                            "method":"ledger_entry","params":[{"index":key,"ledger_index":n,"binary":true}]
+                        }));
+                        let Some(on_chain) = r["result"]["node_binary"]
+                            .as_str()
+                            .and_then(|h| hex::decode(h).ok())
+                            .and_then(|b| rxrpl_codec::binary::decode(&b).ok())
+                        else {
+                            continue;
+                        };
+                        let last = on_chain
+                            .get("PreviousTxnID")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_uppercase());
+                        if last.as_deref() != Some(this_txid.as_str()) {
+                            continue;
+                        }
+                        // Faithful pre-tx membership: the on-chain page with OUR
+                        // delta reversed (drop our creations, restore our deletions).
+                        let mut members: Vec<Value> = on_chain
+                            .get("Indexes")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter(|x| {
+                                        x.as_str()
+                                            .map(|s| !created_members.contains(&s.to_uppercase()))
+                                            .unwrap_or(true)
+                                    })
+                                    .cloned()
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if let Some(add) = deleted_owner_members.get(&key) {
+                            for idx in add {
+                                if !members.iter().any(|x| x.as_str() == Some(idx.as_str())) {
+                                    members.push(Value::String(idx.clone()));
+                                }
+                            }
+                        }
+                        // Structure source: for a directory our tx GROWS, the engine
+                        // re-derives the page-chain links (and may split) from the
+                        // PARENT page, whose `IndexPrevious` still points at a seeded
+                        // last page — so keep the parent structure. A pure-removal
+                        // directory keeps the on-chain structure (the engine never
+                        // relinks it, but a sibling may have).
+                        let root_idx = on_chain
+                            .get("RootIndex")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_uppercase());
+                        let grows = root_idx
+                            .as_deref()
+                            .map(|r| add_owner_roots.contains(r))
+                            .unwrap_or(false);
+                        let mut page = if grows {
+                            state
+                                .get(&Hash256::new(kb))
+                                .and_then(|b| rxrpl_codec::binary::decode(b).ok())
+                                .unwrap_or(on_chain)
+                        } else {
+                            on_chain
+                        };
+                        if let Some(obj) = page.as_object_mut() {
+                            obj.insert("Indexes".into(), Value::Array(members));
+                        }
+                        if let Ok(b) = serde_json::to_vec(&page) {
+                            if let Ok(bin) = rxrpl_ledger::sle_codec::encode_sle(&b) {
+                                state.put(Hash256::new(kb), bin).unwrap();
+                            }
+                        }
+                    } else if let Some(add) = deleted_owner_members.get(&key) {
+                        // Our tx emptied and removed this owner page. Pre-tx it held
+                        // exactly the owned objects our tx removed from it; seed them
+                        // (with the page's structural fields from the DeletedNode's
+                        // FinalFields) so the engine re-removes them and deletes the
+                        // now-empty page (matching theirs == absent).
+                        if let Some(ff) = e.get("FinalFields").and_then(|v| v.as_object()) {
+                            let mut page = serde_json::Map::new();
+                            page.insert(
+                                "LedgerEntryType".into(),
+                                Value::String("DirectoryNode".into()),
+                            );
+                            for f in ["Flags", "RootIndex", "Owner", "IndexNext", "IndexPrevious"] {
+                                if let Some(v) = ff.get(f) {
+                                    page.insert(f.into(), v.clone());
+                                }
+                            }
+                            page.insert(
+                                "Indexes".into(),
+                                Value::Array(add.iter().cloned().map(Value::String).collect()),
+                            );
+                            if let Ok(b) = serde_json::to_vec(&Value::Object(page)) {
+                                if let Ok(bin) = rxrpl_ledger::sle_codec::encode_sle(&b) {
+                                    state.put(Hash256::new(kb), bin).unwrap();
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // A ModifiedNode that only threads PreviousTxnID (a pure "touch",
+                // e.g. the counterparty of a created/deleted trust line) carries
+                // empty FinalFields and changed no field values. Reconstructing
+                // from it would wipe the real account (Flags, OwnerCount, …) that
+                // was correctly seeded from the parent ledger above. Keep that
+                // seed; central stamping re-threads its PreviousTxnID.
+                if nt == "ModifiedNode"
+                    && e.get("FinalFields")
+                        .and_then(|v| v.as_object())
+                        .map(|o| o.is_empty())
+                        .unwrap_or(true)
+                {
+                    continue;
+                }
+                let mut pre = e
+                    .get("FinalFields")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let key = e["LedgerIndex"].as_str().unwrap().to_uppercase();
+                let kb: [u8; 32] = hex::decode(&key).unwrap().try_into().unwrap();
+                if let Some(obj) = pre.as_object_mut() {
+                    if let Some(prev) = e.get("PreviousFields").and_then(|v| v.as_object()) {
+                        for (k, v) in prev {
+                            obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                    obj.insert("LedgerEntryType".into(), Value::String(let_type.into()));
+                    // FinalFields omits the threaded PreviousTxnID/LgrSeq; carry
+                    // them over from the parent-ledger seed so the central
+                    // stamping has a field to overwrite (its value is irrelevant).
+                    // When the entry was created earlier in this same ledger
+                    // there is no parent seed — add a placeholder for threaded
+                    // types so stamping still fires (DirectoryNode et al. carry
+                    // no such field and must be left alone).
+                    let threaded = !matches!(
+                        let_type,
+                        "DirectoryNode" | "LedgerHashes" | "Amendments" | "FeeSettings"
+                    );
+                    let seed = state
+                        .get(&Hash256::new(kb))
+                        .and_then(|b| rxrpl_codec::binary::decode(b).ok());
+                    if threaded {
+                        if let Some(seed) = &seed {
+                            for f in ["PreviousTxnID", "PreviousTxnLgrSeq"] {
+                                if let Some(v) = seed.get(f) {
+                                    obj.insert(f.into(), v.clone());
+                                }
+                            }
+                        }
+                    }
+                    if threaded && !obj.contains_key("PreviousTxnID") {
+                        obj.insert("PreviousTxnID".into(), Value::String("0".repeat(64)));
+                        obj.insert("PreviousTxnLgrSeq".into(), Value::from(0u32));
+                    }
+                    // A field in FinalFields that is absent from both
+                    // PreviousFields and the parent-ledger seed was *added* by
+                    // this tx, so it was not part of the pre-tx state — drop it
+                    // (e.g. an NFTokenPage's PreviousPageMin when a page splits).
+                    if let Some(seed_obj) = seed.as_ref().and_then(|s| s.as_object()) {
+                        let prev_keys: std::collections::BTreeSet<&String> = e
+                            .get("PreviousFields")
+                            .and_then(|v| v.as_object())
+                            .map(|o| o.keys().collect())
+                            .unwrap_or_default();
+                        let added: Vec<String> = obj
+                            .keys()
+                            .filter(|k| {
+                                !prev_keys.contains(k)
+                                    && !seed_obj.contains_key(k.as_str())
+                                    && !matches!(
+                                        k.as_str(),
+                                        "LedgerEntryType" | "PreviousTxnID" | "PreviousTxnLgrSeq"
+                                    )
+                            })
+                            .cloned()
+                            .collect();
+                        for k in added {
+                            obj.remove(&k);
+                        }
+                    }
+                }
+                let Ok(json_bytes) = serde_json::to_vec(&pre) else {
+                    continue;
+                };
+                let Ok(bin) = rxrpl_ledger::sle_codec::encode_sle(&json_bytes) else {
+                    continue;
+                };
+                let kb: [u8; 32] = hex::decode(&key).unwrap().try_into().unwrap();
+                state.put(Hash256::new(kb), bin).unwrap();
+            }
+        }
+
+        // Order-book crossing walks the book directory pages to find offers.
+        // Map each seeded offer to its `BookDirectory` page and guarantee that
+        // page lists the offer's index. The parent-ledger page is stale when the
+        // offer was created or moved by another tx in this same ledger (it would
+        // omit the entry, so the walk would miss it); patch the page (or build a
+        // minimal one) so every affected offer is reachable.
+        let mut dir_offers: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for key in &read_keys {
+            let kb: [u8; 32] = hex::decode(key).unwrap().try_into().unwrap();
+            let Some(node) = state.get(&Hash256::new(kb)) else {
+                continue;
+            };
+            let Ok(j) = rxrpl_codec::binary::decode(node) else {
+                continue;
+            };
+            if j.get("LedgerEntryType").and_then(|t| t.as_str()) == Some("Offer") {
+                if let Some(bd) = j.get("BookDirectory").and_then(|v| v.as_str()) {
+                    dir_offers
+                        .entry(bd.to_uppercase())
+                        .or_default()
+                        .push(key.clone());
+                }
+            }
+        }
+        for (key, offers) in &dir_offers {
+            if created_keys.contains(key) {
+                continue; // a re-created page must not inherit stale parent entries
+            }
+            let r = rpc(serde_json::json!({
+                "method":"ledger_entry","params":[{"index":key,"ledger_index":parent,"binary":true}]
+            }));
+            let mut page = r["result"]["node_binary"]
+                .as_str()
+                .and_then(|h| hex::decode(h).ok())
+                .and_then(|b| rxrpl_codec::binary::decode(&b).ok())
+                .unwrap_or_else(|| {
+                    serde_json::json!({
+                        "LedgerEntryType": "DirectoryNode",
+                        "Flags": 0,
+                        "RootIndex": key,
+                        "Indexes": [],
+                    })
+                });
+            if let Some(arr) = page.get_mut("Indexes").and_then(|v| v.as_array_mut()) {
+                for off in offers {
+                    if !arr.iter().any(|x| x.as_str() == Some(off.as_str())) {
+                        arr.push(Value::String(off.clone()));
+                    }
+                }
+            }
+            if let Ok(b) = serde_json::to_vec(&page) {
+                if let Ok(bin) = rxrpl_ledger::sle_codec::encode_sle(&b) {
+                    let kb: [u8; 32] = hex::decode(key).unwrap().try_into().unwrap();
+                    state.put(Hash256::new(kb), bin).unwrap();
+                }
+            }
+        }
+
+        // A trust line deleted by this tx is unlinked from each owner's directory
+        // page named by the line's Low/HighNode hint (rippled `trustDelete` ->
+        // `dirRemove`). When a sibling tx earlier in THIS same ledger N *created*
+        // that same line, the parent-ledger page predates the insertion and omits
+        // the entry, so our hinted removal would no-op and never re-thread the
+        // page (its PreviousTxnID would stay stale). Reconstruct the pre-deletion
+        // membership by adding the line's index to each named page in the seed —
+        // the same mid-ledger reconstruction the book-directory patch above does
+        // for offers. The page is itself a ModifiedNode (re-threaded) and was thus
+        // already fetched from the parent into `state`.
+        for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
+            let Some(e) = node.get("DeletedNode") else {
+                continue;
+            };
+            if e.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("RippleState") {
+                continue;
+            }
+            let Some(ff) = e.get("FinalFields") else {
+                continue;
+            };
+            let line_idx = e["LedgerIndex"].as_str().unwrap().to_uppercase();
+            for (limit_f, node_f) in [("LowLimit", "LowNode"), ("HighLimit", "HighNode")] {
+                let Some(acct) = ff
+                    .get(limit_f)
+                    .and_then(|l| l.get("issuer"))
+                    .and_then(|v| v.as_str())
+                else {
+                    continue;
+                };
+                let Ok(aid) = decode_account_id(acct) else {
+                    continue;
+                };
+                let page_no = ff
+                    .get(node_f)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| u64::from_str_radix(s, 16).ok())
+                    .unwrap_or(0);
+                let page_key = keylet::dir_node(&keylet::owner_dir(&aid), page_no)
+                    .to_string()
+                    .to_uppercase();
+                let kb: [u8; 32] = hex::decode(&page_key).unwrap().try_into().unwrap();
+                let Some(bin) = state.get(&Hash256::new(kb)) else {
+                    continue; // page not seeded (not affected) — leave it alone
+                };
+                let Ok(mut page) = rxrpl_codec::binary::decode(bin) else {
+                    continue;
+                };
+                let mut changed = false;
+                if let Some(arr) = page.get_mut("Indexes").and_then(|v| v.as_array_mut()) {
+                    if !arr.iter().any(|x| x.as_str() == Some(line_idx.as_str())) {
+                        arr.push(Value::String(line_idx.clone()));
+                        changed = true;
+                    }
+                }
+                if changed {
+                    if let Ok(b) = serde_json::to_vec(&page) {
+                        if let Ok(newbin) = rxrpl_ledger::sle_codec::encode_sle(&b) {
+                            state.put(Hash256::new(kb), newbin).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Seed each owner-directory ROOT that our tx removes an object from on a
+        // non-root page, with an `IndexNext` jump straight to the removed object's
+        // page. `dir_remove` walks the owner directory from the root following
+        // `IndexNext`; the deep intermediate pages of a busy account are unseeded
+        // in this partial-state replay, so without the jump the walk stops early
+        // and the removal no-ops (the entry stays stranded on its high page). The
+        // jump lets the walk land directly on the touched page (already seeded with
+        // the entry by the reconstruction above), where the engine performs the
+        // genuine removal/relink. The add path reads `IndexPrevious`, untouched
+        // here, so dirAdd is unaffected. Roots that are themselves AffectedNodes
+        // (and thus compared) are left alone.
+        let affected_keys: std::collections::BTreeSet<&str> =
+            affected.iter().map(|(k, _)| k.as_str()).collect();
+        for (root_hex, pages) in &owner_remove_targets {
+            if affected_keys.contains(root_hex.as_str()) {
+                continue;
+            }
+            let Some(target) = pages.iter().next().copied() else {
+                continue;
+            };
+            let kb: [u8; 32] = hex::decode(root_hex).unwrap().try_into().unwrap();
+            // Prefer a root already in the seed; else fetch the real one.
+            let mut root = state
+                .get(&Hash256::new(kb))
+                .and_then(|b| rxrpl_codec::binary::decode(b).ok());
+            if root.is_none() {
+                let r = rpc(serde_json::json!({
+                    "method":"ledger_entry",
+                    "params":[{"index":root_hex,"ledger_index":parent,"binary":true}]
+                }));
+                root = r["result"]["node_binary"]
+                    .as_str()
+                    .and_then(|h| hex::decode(h).ok())
+                    .and_then(|b| rxrpl_codec::binary::decode(&b).ok());
+            }
+            // A brand-new owner directory (no root at parent) cannot need a deep
+            // walk; skip. Otherwise point IndexNext straight at the touched page.
+            let Some(mut root) = root else { continue };
+            if let Some(obj) = root.as_object_mut() {
+                obj.insert("IndexNext".into(), Value::String(format!("{target:016X}")));
+            }
+            if let Ok(b) = serde_json::to_vec(&root) {
+                if let Ok(bin) = rxrpl_ledger::sle_codec::encode_sle(&b) {
+                    state.put(Hash256::new(kb), bin).unwrap();
+                }
+            }
+        }
+
+        let parent_hdr = rpc(serde_json::json!({
+            "method":"ledger","params":[{"ledger_index":parent,"transactions":false,"expand":false}]
+        }));
+        let parent_header = parse_header(&parent_hdr["result"]["ledger"]).expect("parent header");
+        let mut base = Ledger::from_catchup(parent, parent_header.hash, state);
+        base.header = parent_header;
+        let mut open = Ledger::new_open(&base);
+        // The open ledger's close time (the standalone advances by one
+        // resolution per ledger_accept); transactors that stamp the current
+        // time (e.g. LoanSet StartDate) read this.
+        open.header.close_time =
+            base.header.close_time + base.header.close_time_resolution.max(1) as u32;
+        let rules = rules_for_ledger(&open);
+        let fees = fees_for_ledger(&base);
+
+        let res = full_engine().apply(&tx_json, &mut open, &rules, &fees);
+        eprintln!("apply result: {res:?}");
+        (open, txm.clone())
+    }
+
+    /// Prove a mainnet transaction's CREATED SLEs are byte-exact against the
+    /// REAL on-chain bytes at ledger N. A created key is UNIQUE to its creating
+    /// tx, so `ledger_entry(key, ledger_index=N, binary=true).node_binary` is its
+    /// exact post-tx serialization -- immune both to the metadata default-drop
+    /// false-positive that `single_tx_oracle_mainnet` accepts (it compares to
+    /// FinalFields/NewFields, which omit sfFlags=0 / sfOwnerNode=0) AND to
+    /// later-tx contamination (no other tx in N creates the same key). This is
+    /// the only oracle that can PROVE the default-zero fields the DCP fixes add.
+    ///
+    /// Guards against a later tx in N re-touching the created key by checking the
+    /// on-chain entry's `PreviousTxnID` equals our tx; if not, the effect cannot
+    /// be isolated and the key is SKIPPED (honest, never a false pass).
+    ///
+    /// Run with:
+    /// `RXRPL_PLAY_FORWARD_RPC=http://host:5005 RXRPL_PLAY_FORWARD_LEDGER=N \
+    ///  RXRPL_PLAY_FORWARD_TXHASH=<hash> cargo test -p rxrpl-node --lib \
+    ///  single_tx_created_nodes_match_onchain_mainnet -- --ignored --nocapture`
+    #[test]
+    #[ignore = "hits a live mainnet RPC server"]
+    fn single_tx_created_nodes_match_onchain_mainnet() {
+        let Ok(url) = std::env::var("RXRPL_PLAY_FORWARD_RPC") else {
+            eprintln!("RXRPL_PLAY_FORWARD_RPC unset; skipping");
+            return;
+        };
+        let (Some(n), Ok(txhash)) = (
+            std::env::var("RXRPL_PLAY_FORWARD_LEDGER")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok()),
+            std::env::var("RXRPL_PLAY_FORWARD_TXHASH"),
+        ) else {
+            eprintln!("RXRPL_PLAY_FORWARD_LEDGER / _TXHASH unset; skipping");
+            return;
+        };
+
+        // Reuse the exact read-set seeding + full_engine apply of
+        // single_tx_oracle_mainnet, then compare CreatedNodes to on-chain bytes.
+        let (open, txm) = seed_and_apply_single_tx(url.clone(), n, txhash.clone());
+
+        // Fresh RPC channel for the ledger_entry@N fetches (the helper's runtime
+        // is already dropped). Same retry/backoff as the sibling harness.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let rpc = |params: serde_json::Value| -> Value {
+            rt.block_on(async {
+                for attempt in 0..8u32 {
+                    if let Ok(resp) = client.post(&url).json(&params).send().await {
+                        if let Ok(v) = resp.json::<Value>().await {
+                            return v;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        400 * u64::from(attempt + 1),
+                    ))
+                    .await;
+                }
+                panic!("rpc failed after retries: {params}");
+            })
+        };
+
+        let trunc = |h: &str| -> String {
+            if h.len() <= 160 {
+                h.to_string()
+            } else {
+                format!("{}...{}", &h[..96], &h[h.len() - 32..])
+            }
+        };
+
+        let txid_upper = txhash.to_uppercase();
+        let mut created = 0usize;
+        let mut matched = 0usize;
+        let mut mismatches = 0usize;
+        let mut skipped = 0usize;
+
+        for node in txm["metaData"]["AffectedNodes"].as_array().unwrap() {
+            let Some(e) = node.get("CreatedNode") else {
+                continue;
+            };
+            created += 1;
+            let key = e["LedgerIndex"].as_str().unwrap().to_uppercase();
+            let let_type = e
+                .get("LedgerEntryType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let kb: [u8; 32] = hex::decode(&key).unwrap().try_into().unwrap();
+            let ours = open.state_map.get(&Hash256::new(kb)).map(hex::encode_upper);
+
+            // Real post-tx bytes for this created key.
+            let r = rpc(serde_json::json!({
+                "method":"ledger_entry",
+                "params":[{"index":key,"ledger_index":n,"binary":true}]
+            }));
+            let Some(theirs_hex) = r["result"]["node_binary"]
+                .as_str()
+                .map(|s| s.to_uppercase())
+            else {
+                eprintln!(
+                    "  SKIP {key} ({let_type}): no node_binary@{n} (deleted later in the ledger?)"
+                );
+                skipped += 1;
+                continue;
+            };
+            // Guard: a created key is unique to its creating tx, but a LATER tx in
+            // the same ledger could still MODIFY it. If the on-chain entry's last
+            // toucher is not our tx, we cannot isolate our effect -- skip honestly.
+            let last_tx = hex::decode(&theirs_hex)
+                .ok()
+                .and_then(|b| rxrpl_codec::binary::decode(&b).ok())
+                .and_then(|j| {
+                    j.get("PreviousTxnID")
+                        .and_then(|v| v.as_str().map(|s| s.to_uppercase()))
+                });
+            if last_tx.as_deref() != Some(txid_upper.as_str()) {
+                eprintln!(
+                    "  SKIP {key} ({let_type}): on-chain PreviousTxnID={last_tx:?} != our tx \
+(re-touched by a later tx in ledger {n})"
+                );
+                skipped += 1;
+                continue;
+            }
+
+            let ours_disp = ours.as_deref().unwrap_or("<absent>");
+            let is_match = ours.as_deref() == Some(theirs_hex.as_str());
+            eprintln!(
+                "  key {key} {let_type} ours={} theirs={} {}",
+                trunc(ours_disp),
+                trunc(&theirs_hex),
+                if is_match { "MATCH" } else { "MISMATCH" }
+            );
+            if is_match {
+                matched += 1;
+            } else {
+                mismatches += 1;
+                // Decode both and print the field-level diff.
+                let dj = |h: &str| -> Value {
+                    hex::decode(h)
+                        .ok()
+                        .and_then(|b| rxrpl_codec::binary::decode(&b).ok())
+                        .unwrap_or(Value::Null)
+                };
+                let oj = ours.as_deref().map(dj).unwrap_or(Value::Null);
+                let tj = dj(&theirs_hex);
+                if let (Some(o), Some(t)) = (oj.as_object(), tj.as_object()) {
+                    let mut fkeys: std::collections::BTreeSet<&String> = o.keys().collect();
+                    fkeys.extend(t.keys());
+                    for k in fkeys {
+                        if o.get(k) != t.get(k) {
+                            eprintln!("      {k}: ours={:?} theirs={:?}", o.get(k), t.get(k));
+                        }
+                    }
+                } else {
+                    eprintln!("    ours:   {ours_disp}");
+                    eprintln!("    theirs: {theirs_hex}");
+                }
+            }
+        }
+
+        eprintln!(
+            "created={created} matched={matched} mismatch={mismatches} skipped={skipped} \
+(tx {txhash} @ ledger {n})"
+        );
+        if created == 0 {
+            eprintln!(
+                "  NOTE: tx has zero CreatedNodes; the on-chain node_binary method \
+does not apply to this tx type (e.g. a pure delete/modify)."
+            );
+        }
+        assert_eq!(
+            mismatches, 0,
+            "every created SLE must match its real on-chain node_binary"
+        );
+    }
+
     fn payment(seq: u32, dest: AccountId, amount_drops: u64) -> (Hash256, Vec<u8>) {
         let json = serde_json::json!({
             "TransactionType": "Payment",
