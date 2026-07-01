@@ -390,6 +390,21 @@ pub fn remove_from_owner_dir_page(
     dir_remove_page(view, &keylet::owner_dir(account_id), page, entry_key)
 }
 
+/// As `remove_from_owner_dir_page`, but keeps the (empty) root DirectoryNode
+/// when the removal empties the directory, using the recorded page hint. Matches
+/// rippled call sites that pass `dirRemove(..., keepRoot = true)` yet still know
+/// the page — e.g. CheckCash removes the check from both the source `OwnerNode`
+/// and the destination `DestinationNode` with keepRoot, so an emptied owner or
+/// destination directory keeps its `Indexes:[]` root instead of being erased.
+pub fn remove_from_owner_dir_page_keep_root(
+    view: &mut dyn ApplyView,
+    account_id: &AccountId,
+    page: u64,
+    entry_key: &Hash256,
+) -> Result<(), TransactionResult> {
+    dir_remove_page_impl(view, &keylet::owner_dir(account_id), page, entry_key, true)
+}
+
 /// Collect every entry key listed in an account's owner directory, walking the
 /// page chain from the root. Entries are returned in directory order (page by
 /// page). Used by AMMDelete and AccountDelete to enumerate an account's holdings.
