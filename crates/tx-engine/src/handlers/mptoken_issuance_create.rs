@@ -4,6 +4,10 @@ use rxrpl_protocol::{TransactionResult, keylet};
 use crate::helpers;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
+/// The universal transaction-flag bits (`tfFullyCanonicalSig | tfInnerBatchTxn`)
+/// that rippled strips before storing sfFlags on the created ledger entry.
+const TF_UNIVERSAL: u32 = 0x8000_0000 | 0x4000_0000;
+
 pub struct MPTokenIssuanceCreateTransactor;
 
 impl Transactor for MPTokenIssuanceCreateTransactor {
@@ -47,36 +51,51 @@ impl Transactor for MPTokenIssuanceCreateTransactor {
         // already consumed the sender's Sequence/Ticket centrally).
         let acct_seq = helpers::tx_seq_proxy_value(ctx.tx);
 
-        // Build issuance entry
+        // Build issuance entry. rippled stores sfFlags with the universal
+        // (tfFullyCanonicalSig | tfInnerBatchTxn) bits stripped; the remaining
+        // MPT ledger flags map bit-for-bit onto the tx flags.
         let tx_flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
-        let transfer_fee = helpers::get_u32_field(ctx.tx, "TransferFee").unwrap_or(0);
-        let asset_scale = helpers::get_u32_field(ctx.tx, "AssetScale").unwrap_or(0);
+        let stored_flags = tx_flags & !TF_UNIVERSAL;
+
+        // Link the issuance into the issuer's owner directory first so the page
+        // number can be recorded as the SoeRequired sfOwnerNode.
+        let issuance_key = keylet::mptoken_issuance(&account_id, acct_seq);
+        let owner_node = crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &issuance_key)?;
 
         let mut issuance = serde_json::json!({
             "LedgerEntryType": "MPTokenIssuance",
+            "Flags": stored_flags,
             "Issuer": account_str,
+            // OutstandingAmount is SoeRequired and rippled serializes it at 0.
+            "OutstandingAmount": "0",
+            "OwnerNode": format!("{owner_node:016X}"),
             "Sequence": acct_seq,
-            "TransferFee": transfer_fee,
-            "AssetScale": asset_scale,
-            "Flags": tx_flags,
             // Placeholder filled by the engine's central PreviousTxnID stamping.
             "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
             "PreviousTxnLgrSeq": 0,
         });
 
+        // Optional fields are only serialized when the transaction carries them
+        // (mirrors rippled's `if (args.foo)` guards).
         if let Some(max_amount) = helpers::get_str_field(ctx.tx, "MaximumAmount") {
             issuance["MaximumAmount"] = serde_json::Value::String(max_amount.to_string());
         }
+        if let Some(asset_scale) = helpers::get_u32_field(ctx.tx, "AssetScale") {
+            issuance["AssetScale"] = serde_json::Value::from(asset_scale);
+        }
+        if let Some(transfer_fee) = helpers::get_u32_field(ctx.tx, "TransferFee") {
+            issuance["TransferFee"] = serde_json::Value::from(transfer_fee);
+        }
+        if let Some(metadata) = helpers::get_str_field(ctx.tx, "MPTokenMetadata") {
+            issuance["MPTokenMetadata"] = serde_json::Value::String(metadata.to_string());
+        }
 
         // Insert issuance
-        let issuance_key = keylet::mptoken_issuance(&account_id, acct_seq);
         let issuance_data =
             serde_json::to_vec(&issuance).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .insert(issuance_key, issuance_data)
             .map_err(|_| TransactionResult::TefInternal)?;
-
-        crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &issuance_key)?;
 
         // Update account
         helpers::adjust_owner_count(&mut acct, 1);
@@ -153,8 +172,14 @@ mod tests {
         let issuance_bytes = sandbox.read(&issuance_key).unwrap();
         let issuance: serde_json::Value = serde_json::from_slice(&issuance_bytes).unwrap();
         assert_eq!(issuance["Issuer"].as_str().unwrap(), ISSUER);
-        // OutstandingAmount defaults to 0 and is omitted from a created issuance.
-        assert!(issuance.get("OutstandingAmount").is_none());
+        // OutstandingAmount is SoeRequired and rippled serializes it at 0.
+        assert_eq!(issuance["OutstandingAmount"].as_str().unwrap(), "0");
+        // OwnerNode (the owner-directory page) is SoeRequired and must be set.
+        assert_eq!(issuance["OwnerNode"].as_str().unwrap(), "0000000000000000");
+        assert_eq!(issuance["Flags"].as_u64().unwrap(), 0);
+        // A bare issuance carries no AssetScale / TransferFee (both optional).
+        assert!(issuance.get("AssetScale").is_none());
+        assert!(issuance.get("TransferFee").is_none());
         assert_eq!(issuance["Sequence"].as_u64().unwrap(), 1);
 
         // Verify owner count incremented
@@ -201,6 +226,41 @@ mod tests {
         assert_eq!(issuance["TransferFee"].as_u64().unwrap(), 5000);
         assert_eq!(issuance["AssetScale"].as_u64().unwrap(), 6);
         assert_eq!(issuance["Flags"].as_u64().unwrap(), 0x0022);
+        assert_eq!(issuance["OutstandingAmount"].as_str().unwrap(), "0");
+        assert_eq!(issuance["OwnerNode"].as_str().unwrap(), "0000000000000000");
+    }
+
+    #[test]
+    fn stored_flags_strip_universal_bits() {
+        let ledger = setup_accounts();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        // tfFullyCanonicalSig (0x80000000) | tfMPTCanTransfer (0x20).
+        let tx = serde_json::json!({
+            "TransactionType": "MPTokenIssuanceCreate",
+            "Account": ISSUER,
+            "Flags": 0x8000_0020u32,
+            "Fee": "12",
+            "Sequence": 1,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            MPTokenIssuanceCreateTransactor.apply(&mut ctx).unwrap(),
+            TransactionResult::TesSuccess
+        );
+        let issuer_id = decode_account_id(ISSUER).unwrap();
+        let issuance_key = keylet::mptoken_issuance(&issuer_id, 1);
+        let issuance: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&issuance_key).unwrap()).unwrap();
+        // The universal bit is stripped; the MPT ledger flag survives.
+        assert_eq!(issuance["Flags"].as_u64().unwrap(), 0x20);
     }
 
     #[test]

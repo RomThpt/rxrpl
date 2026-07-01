@@ -111,12 +111,10 @@ fn create_empty_iou_line(
         "PreviousTxnID": ZERO_TXID,
         "PreviousTxnLgrSeq": 0,
     });
-    if low_node != 0 {
-        tl_obj["LowNode"] = serde_json::Value::String(format!("{low_node:016X}"));
-    }
-    if high_node != 0 {
-        tl_obj["HighNode"] = serde_json::Value::String(format!("{high_node:016X}"));
-    }
+    // rippled's trustCreate always records both directory pages, so they are
+    // serialized (as SoeOptional-but-present fields) even at page 0.
+    tl_obj["LowNode"] = serde_json::Value::String(format!("{low_node:016X}"));
+    tl_obj["HighNode"] = serde_json::Value::String(format!("{high_node:016X}"));
     ctx.view
         .insert(
             tl_key,
@@ -242,13 +240,15 @@ impl Transactor for VaultCreateTransactor {
         let pseudo_str = encode_account_id(&pseudo_id);
         let vault_id_hex = hex::encode_upper(vault_key.as_bytes());
 
-        // 2. Pseudo-account root (Sequence 0 and Balance 0 are defaults, omitted).
+        // 2. Pseudo-account root. sfSequence is SoeRequired on an AccountRoot,
+        //    so rippled serializes it even at 0 for a freshly created pseudo.
         let pseudo_acct = serde_json::json!({
             "LedgerEntryType": "AccountRoot",
             "Account": pseudo_str,
             "Balance": "0",
             "Flags": LSF_DISABLE_MASTER | LSF_DEFAULT_RIPPLE | LSF_DEPOSIT_AUTH,
             "OwnerCount": pseudo_owner_count,
+            "Sequence": 0,
             "VaultID": vault_id_hex,
             "PreviousTxnID": ZERO_TXID,
             "PreviousTxnLgrSeq": 0,
@@ -277,10 +277,17 @@ impl Transactor for VaultCreateTransactor {
             mpt_flags |= LSF_MPT_REQUIRE_AUTH;
         }
         let issuance_key = keylet::mptoken_issuance(&pseudo_id, 1);
+        // Link the share issuance into the pseudo-account's owner directory
+        // first so the page can be recorded as the SoeRequired sfOwnerNode.
+        let issuance_node =
+            crate::owner_dir::add_to_owner_dir(ctx.view, &pseudo_id, &issuance_key)?;
         let mut issuance = serde_json::json!({
             "LedgerEntryType": "MPTokenIssuance",
             "Flags": mpt_flags,
             "Issuer": pseudo_str,
+            // OutstandingAmount is SoeRequired; rippled serializes it at 0.
+            "OutstandingAmount": "0",
+            "OwnerNode": format!("{issuance_node:016X}"),
             "Sequence": 1,
             "PreviousTxnID": ZERO_TXID,
             "PreviousTxnLgrSeq": 0,
@@ -297,7 +304,6 @@ impl Transactor for VaultCreateTransactor {
                 serde_json::to_vec(&issuance).map_err(|_| TransactionResult::TefInternal)?,
             )
             .map_err(|_| TransactionResult::TefInternal)?;
-        crate::owner_dir::add_to_owner_dir(ctx.view, &pseudo_id, &issuance_key)?;
 
         // 5. For an IOU vault, create the pseudo-account's empty trust line to the
         //    issuer (added to the pseudo directory after the share issuance).
@@ -321,33 +327,48 @@ impl Transactor for VaultCreateTransactor {
             "PreviousTxnID": ZERO_TXID,
             "PreviousTxnLgrSeq": 0,
         });
+        // sfAsset is SoeRequired on a Vault, so rippled serializes it even for
+        // an XRP-asset vault (the XRP STIssue encodes as 20 zero bytes).
+        vault["Asset"] = if is_iou {
+            asset.clone()
+        } else {
+            serde_json::json!({ "currency": "XRP" })
+        };
         if is_iou {
-            vault["Asset"] = asset.clone();
             vault["Scale"] = serde_json::Value::from(scale);
         }
-        if tx_flags & TF_VAULT_PRIVATE != 0 {
-            vault["Flags"] = serde_json::Value::from(TF_VAULT_PRIVATE);
-        }
+        // sfFlags is SoeRequired on every ledger entry, so rippled serializes it
+        // even for a public vault (value 0); it stores `tx.getFlags() &
+        // tfVaultPrivate`.
+        vault["Flags"] = serde_json::Value::from(tx_flags & TF_VAULT_PRIVATE);
         if let Some(max) = helpers::get_u64_str_field(ctx.tx, "AssetsMaximum") {
             vault["AssetsMaximum"] = serde_json::Value::String(max.to_string());
         }
         if let Some(data) = helpers::get_str_field(ctx.tx, "Data") {
             vault["Data"] = serde_json::Value::String(data.to_string());
         }
+        // Link the vault into the owner's directory and record the page as the
+        // SoeRequired sfOwnerNode.
+        let vault_node = crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &vault_key)?;
+        vault["OwnerNode"] = serde_json::Value::String(format!("{vault_node:016X}"));
         ctx.view
             .insert(
                 vault_key,
                 serde_json::to_vec(&vault).map_err(|_| TransactionResult::TefInternal)?,
             )
             .map_err(|_| TransactionResult::TefInternal)?;
-        crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &vault_key)?;
 
         // 5. Owner's MPToken holding for the shares (linked after the vault).
         let owner_mptoken_key = keylet::mptoken(issuance_key.as_bytes(), &account_id);
+        let owner_mptoken_node =
+            crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &owner_mptoken_key)?;
         let owner_mptoken = serde_json::json!({
             "LedgerEntryType": "MPToken",
             "Account": account_str,
             "MPTokenIssuanceID": share_id,
+            // Flags (SoeRequired, value 0) and OwnerNode (SoeRequired).
+            "Flags": 0,
+            "OwnerNode": format!("{owner_mptoken_node:016X}"),
             "PreviousTxnID": ZERO_TXID,
             "PreviousTxnLgrSeq": 0,
         });
@@ -357,7 +378,6 @@ impl Transactor for VaultCreateTransactor {
                 serde_json::to_vec(&owner_mptoken).map_err(|_| TransactionResult::TefInternal)?,
             )
             .map_err(|_| TransactionResult::TefInternal)?;
-        crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &owner_mptoken_key)?;
 
         // 6. Owner account: bump sequence and OwnerCount by 3 (vault + pseudo +
         //    the share MPToken holding).
@@ -436,9 +456,14 @@ mod tests {
         let vault: serde_json::Value = serde_json::from_slice(&vault_bytes).unwrap();
         assert_eq!(vault["LedgerEntryType"].as_str().unwrap(), "Vault");
         assert_eq!(vault["Owner"].as_str().unwrap(), OWNER);
-        assert!(vault.get("Asset").is_none()); // XRP is the default STIssue
+        // sfAsset is SoeRequired; the XRP vault carries the XRP STIssue.
+        assert_eq!(vault["Asset"]["currency"].as_str().unwrap(), "XRP");
+        assert!(vault["Asset"].get("issuer").is_none());
         assert_eq!(vault["WithdrawalPolicy"].as_u64().unwrap(), 1);
         assert_eq!(vault["Sequence"].as_u64().unwrap(), 1);
+        // Flags is SoeRequired and serialized even for a public vault (0).
+        assert_eq!(vault["Flags"].as_u64().unwrap(), 0);
+        assert_eq!(vault["OwnerNode"].as_str().unwrap(), "0000000000000000");
 
         // Pseudo-account is the vault's Account, with the share issuance.
         let pseudo_str = vault["Account"].as_str().unwrap();
@@ -459,6 +484,11 @@ mod tests {
         assert_eq!(issuance["Flags"].as_u64().unwrap(), 56);
         assert_eq!(issuance["Issuer"].as_str().unwrap(), pseudo_str);
         assert_eq!(issuance["Sequence"].as_u64().unwrap(), 1);
+        // OutstandingAmount + OwnerNode are SoeRequired; AssetScale (0 here) is
+        // a soeDEFAULT and omitted for an XRP-asset vault.
+        assert_eq!(issuance["OutstandingAmount"].as_str().unwrap(), "0");
+        assert_eq!(issuance["OwnerNode"].as_str().unwrap(), "0000000000000000");
+        assert!(issuance.get("AssetScale").is_none());
         assert_eq!(
             vault["ShareMPTID"].as_str().unwrap(),
             share_mptid(&pseudo_id)
@@ -473,6 +503,9 @@ mod tests {
             owner_mpt["MPTokenIssuanceID"].as_str().unwrap(),
             share_mptid(&pseudo_id)
         );
+        // Flags (0) and OwnerNode are SoeRequired on the created MPToken.
+        assert_eq!(owner_mpt["Flags"].as_u64().unwrap(), 0);
+        assert_eq!(owner_mpt["OwnerNode"].as_str().unwrap(), "0000000000000000");
 
         // Owner: +3 owner count (vault + pseudo + share MPToken), sequence bumped.
         let acct_bytes = sandbox.read(&keylet::account(&owner_id)).unwrap();

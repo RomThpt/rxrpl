@@ -179,10 +179,16 @@ impl Transactor for VaultDepositTransactor {
         let mptoken_key = keylet::mptoken(issuance_key.as_bytes(), &depositor_id);
         let created_mptoken = !ctx.view.exists(&mptoken_key);
         if created_mptoken {
+            // Link into the depositor's owner directory first so the page can be
+            // recorded as the SoeRequired sfOwnerNode; Flags (0) is SoeRequired.
+            let owner_node =
+                crate::owner_dir::add_to_owner_dir(ctx.view, &depositor_id, &mptoken_key)?;
             let mptoken = serde_json::json!({
                 "LedgerEntryType": "MPToken",
                 "Account": depositor_str,
                 "MPTokenIssuanceID": share_id,
+                "Flags": 0,
+                "OwnerNode": format!("{owner_node:016X}"),
                 "MPTAmount": shares.to_string(),
                 "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
                 "PreviousTxnLgrSeq": 0,
@@ -193,7 +199,6 @@ impl Transactor for VaultDepositTransactor {
                     serde_json::to_vec(&mptoken).map_err(|_| TransactionResult::TefInternal)?,
                 )
                 .map_err(|_| TransactionResult::TefInternal)?;
-            crate::owner_dir::add_to_owner_dir(ctx.view, &depositor_id, &mptoken_key)?;
         } else {
             let mptoken_bytes = ctx
                 .view
@@ -399,10 +404,15 @@ fn apply_iou_deposit(
     let mptoken_key = keylet::mptoken(issuance_key.as_bytes(), depositor_id);
     let created_mptoken = !ctx.view.exists(&mptoken_key);
     if created_mptoken {
+        // Link into the depositor's owner directory first so the page can be
+        // recorded as the SoeRequired sfOwnerNode; Flags (0) is SoeRequired.
+        let owner_node = crate::owner_dir::add_to_owner_dir(ctx.view, depositor_id, &mptoken_key)?;
         let mptoken = serde_json::json!({
             "LedgerEntryType": "MPToken",
             "Account": depositor_str,
             "MPTokenIssuanceID": share_id,
+            "Flags": 0,
+            "OwnerNode": format!("{owner_node:016X}"),
             "MPTAmount": shares.to_string(),
             "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
             "PreviousTxnLgrSeq": 0,
@@ -413,7 +423,6 @@ fn apply_iou_deposit(
                 serde_json::to_vec(&mptoken).map_err(|_| TransactionResult::TefInternal)?,
             )
             .map_err(|_| TransactionResult::TefInternal)?;
-        crate::owner_dir::add_to_owner_dir(ctx.view, depositor_id, &mptoken_key)?;
     } else {
         let mptoken_bytes = ctx
             .view
@@ -600,6 +609,62 @@ mod tests {
         let mptoken_key = keylet::mptoken(issuance_key.as_bytes(), &owner_id);
         let mptoken: serde_json::Value =
             serde_json::from_slice(&sandbox.read(&mptoken_key).unwrap()).unwrap();
+        assert_eq!(mptoken["MPTAmount"].as_str().unwrap(), "10000000");
+    }
+
+    #[test]
+    fn deposit_creates_depositor_mptoken_with_owner_node() {
+        const DEPOSITOR: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
+        let (mut ledger, vault_key) = setup();
+        // Fund a fresh depositor that holds no shares MPToken yet.
+        let depositor_id = decode_account_id(DEPOSITOR).unwrap();
+        ledger
+            .put_state(
+                keylet::account(&depositor_id),
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "AccountRoot",
+                    "Account": DEPOSITOR,
+                    "Balance": "100000000",
+                    "Sequence": 1,
+                    "OwnerCount": 0,
+                    "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "VaultDeposit",
+            "Account": DEPOSITOR,
+            "VaultID": hex::encode_upper(vault_key.as_bytes()),
+            "Amount": "10000000",
+            "Fee": "20",
+            "Sequence": 1,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            VaultDepositTransactor.apply(&mut ctx).unwrap(),
+            TransactionResult::TesSuccess
+        );
+
+        let pseudo_id = decode_account_id(PSEUDO).unwrap();
+        let issuance_key = keylet::mptoken_issuance(&pseudo_id, 1);
+        let mptoken_key = keylet::mptoken(issuance_key.as_bytes(), &depositor_id);
+        let mptoken: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&mptoken_key).unwrap()).unwrap();
+        // The freshly created depositor MPToken carries the SoeRequired Flags (0)
+        // and OwnerNode, plus the minted shares.
+        assert_eq!(mptoken["Flags"].as_u64().unwrap(), 0);
+        assert_eq!(mptoken["OwnerNode"].as_str().unwrap(), "0000000000000000");
         assert_eq!(mptoken["MPTAmount"].as_str().unwrap(), "10000000");
     }
 

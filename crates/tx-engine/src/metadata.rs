@@ -80,8 +80,18 @@ fn is_default_json(v: &serde_json::Value) -> bool {
         serde_json::Value::Number(n) => n.as_u64() == Some(0) || n.as_i64() == Some(0),
         serde_json::Value::String(s) => s.is_empty() || s.chars().all(|c| c == '0'),
         serde_json::Value::Array(a) => a.is_empty(),
-        // STAmount: default is a zero value (XRP or IOU).
-        serde_json::Value::Object(o) => o.get("value").and_then(|x| x.as_str()) == Some("0"),
+        serde_json::Value::Object(o) => {
+            // STAmount: `isDefault() == value_ == 0 && native()`. A native (XRP)
+            // amount is a string, so an object amount (an IOU, which carries a
+            // currency/issuer) is never default — even at value 0.
+            if o.contains_key("value") {
+                return false;
+            }
+            // STIssue: the default is the XRP issue (`{"currency":"XRP"}`, no
+            // issuer). rippled keeps SoeRequired Asset in the state SLE but
+            // omits this default value from a CreatedNode's NewFields.
+            o.get("issuer").is_none() && o.get("currency").and_then(|x| x.as_str()) == Some("XRP")
+        }
     }
 }
 
@@ -107,6 +117,33 @@ fn section_fields(
         }
     }
     out
+}
+
+/// True when the only differences between the original and final node are the
+/// threading fields (`PreviousTxnID` / `PreviousTxnLgrSeq`). Such a node was
+/// touched purely to re-point its transaction thread (rippled's `threadOwners`)
+/// and carries no FinalFields/PreviousFields in the metadata.
+fn is_threading_only(
+    prev: &serde_json::Map<String, serde_json::Value>,
+    fin: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    prev.keys()
+        .chain(fin.keys())
+        .all(|k| k == "PreviousTxnID" || k == "PreviousTxnLgrSeq" || prev.get(k) == fin.get(k))
+}
+
+/// True when the final node gained a metadata-eligible field that was absent
+/// (or at its default) in the original — i.e. a pure field addition. rippled
+/// still emits a (possibly empty) `PreviousFields` container in that case.
+fn has_added_field(
+    prev: &serde_json::Map<String, serde_json::Value>,
+    fin: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    fin.iter().any(|(k, v)| {
+        should_meta(k, SMD_CHANGE_NEW)
+            && !is_default_json(v)
+            && prev.get(k).map(is_default_json).unwrap_or(true)
+    })
 }
 
 /// `PreviousFields`: original values of fields that changed and carry the
@@ -216,19 +253,13 @@ impl TxMeta {
                             inner.insert(f.into(), v.clone());
                         }
                     }
-                    // When the entry's only delta is the PreviousTxnID threading
-                    // (e.g. an Escrow/PayChannel destination AccountRoot that gains
-                    // a directory link but no field change), rippled emits the
-                    // node header alone — no FinalFields, no PreviousFields. Only
-                    // a real field change (add / remove / modify, ignoring the
-                    // threading bookkeeping) populates those sections.
-                    let strip_thread = |m: &serde_json::Map<String, serde_json::Value>| {
-                        let mut c = m.clone();
-                        c.remove("PreviousTxnID");
-                        c.remove("PreviousTxnLgrSeq");
-                        c
-                    };
-                    if strip_thread(&prev) != strip_thread(&fin) {
+                    // A node that only had its transaction thread re-pointed
+                    // (PreviousTxnID/LgrSeq) — e.g. an Escrow/PayChannel destination
+                    // AccountRoot, or an issuer restamped because a new object was
+                    // linked into its directory — is threaded in rippled via
+                    // threadOwners and carries NO FinalFields or PreviousFields,
+                    // only the node-level PreviousTxnID/LgrSeq.
+                    if !is_threading_only(&prev, &fin) {
                         let finals = section_fields(&fin, SMD_ALWAYS | SMD_CHANGE_NEW, false);
                         if !finals.is_empty() {
                             inner.insert("FinalFields".into(), finals.into());
@@ -236,6 +267,14 @@ impl TxMeta {
                         let prevs = changed_previous_fields(&prev, &fin);
                         if !prevs.is_empty() {
                             inner.insert("PreviousFields".into(), prevs.into());
+                        } else if has_added_field(&prev, &fin) {
+                            // rippled still emits an (empty) PreviousFields when the
+                            // node's only metadata-eligible changes are additions of
+                            // fields that were previously at their default (absent)
+                            // value — e.g. a Vault's AssetsTotal/AssetsAvailable on
+                            // the first deposit. The prior values (defaults) are not
+                            // recorded, leaving the object empty.
+                            inner.insert("PreviousFields".into(), serde_json::Map::new().into());
                         }
                     }
                     "ModifiedNode"

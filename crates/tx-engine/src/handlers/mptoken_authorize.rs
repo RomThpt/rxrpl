@@ -128,13 +128,18 @@ impl Transactor for MPTokenAuthorizeTransactor {
             let holder_id = &account_id;
 
             if tx_flags & TF_MPT_UNAUTHORIZE == 0 {
-                // Create MPToken entry (holder opt-in). MPTAmount and Flags
-                // default to 0 and are omitted; PreviousTxnID is stamped.
+                // Create MPToken entry (holder opt-in). MPTAmount defaults to 0
+                // and is omitted; rippled sets sfFlags to 0 and records the
+                // owner-directory page in the SoeRequired sfOwnerNode.
                 let mptoken_key = keylet::mptoken(issuance_key.as_bytes(), holder_id);
+                let owner_node =
+                    crate::owner_dir::add_to_owner_dir(ctx.view, holder_id, &mptoken_key)?;
                 let mptoken = serde_json::json!({
                     "LedgerEntryType": "MPToken",
                     "Account": account_str,
                     "MPTokenIssuanceID": issuance_id_hex,
+                    "Flags": 0,
+                    "OwnerNode": format!("{owner_node:016X}"),
                     "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
                     "PreviousTxnLgrSeq": 0,
                 });
@@ -143,8 +148,6 @@ impl Transactor for MPTokenAuthorizeTransactor {
                 ctx.view
                     .insert(mptoken_key, mptoken_data)
                     .map_err(|_| TransactionResult::TefInternal)?;
-
-                crate::owner_dir::add_to_owner_dir(ctx.view, holder_id, &mptoken_key)?;
 
                 // +1 owner count on holder
                 let acct_key = keylet::account(holder_id);
@@ -328,6 +331,9 @@ mod tests {
         assert_eq!(mptoken["Account"].as_str().unwrap(), HOLDER);
         // MPTAmount defaults to 0 and is omitted from a freshly created MPToken.
         assert!(mptoken.get("MPTAmount").is_none());
+        // rippled sets Flags=0 and OwnerNode on the created MPToken.
+        assert_eq!(mptoken["Flags"].as_u64().unwrap(), 0);
+        assert_eq!(mptoken["OwnerNode"].as_str().unwrap(), "0000000000000000");
         assert_eq!(mptoken["LedgerEntryType"].as_str().unwrap(), "MPToken");
 
         // Verify owner count incremented on holder
