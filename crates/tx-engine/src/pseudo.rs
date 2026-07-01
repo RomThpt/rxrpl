@@ -98,21 +98,19 @@ pub(crate) fn create_empty_iou_line(
     let mut account_one = [0u8; 20];
     account_one[19] = 1;
     let no_account = encode_account_id(&AccountId::from(account_one));
-    let mut tl_obj = serde_json::json!({
+    let tl_obj = serde_json::json!({
         "LedgerEntryType": "RippleState",
         "Balance": { "currency": currency_hex, "issuer": no_account, "value": "0" },
         "LowLimit": low_limit,
         "HighLimit": high_limit,
         "Flags": flags,
+        // rippled's trustCreate sets both directory page hints unconditionally
+        // (even when 0), so they are always serialized on a created RippleState.
+        "LowNode": format!("{low_node:016X}"),
+        "HighNode": format!("{high_node:016X}"),
         "PreviousTxnID": ZERO_TXID,
         "PreviousTxnLgrSeq": 0,
     });
-    if low_node != 0 {
-        tl_obj["LowNode"] = serde_json::Value::String(format!("{low_node:016X}"));
-    }
-    if high_node != 0 {
-        tl_obj["HighNode"] = serde_json::Value::String(format!("{high_node:016X}"));
-    }
     ctx.view
         .insert(
             tl_key,

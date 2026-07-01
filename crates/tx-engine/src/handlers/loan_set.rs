@@ -159,18 +159,21 @@ impl Transactor for LoanSetTransactor {
             "PrincipalOutstanding": principal.to_decimal_string(),
             "StartDate": start_date,
             "TotalValueOutstanding": principal.to_decimal_string(),
+            // Default sfFlags is serialized (SoeRequired common field).
+            "Flags": 0u32,
             "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
             "PreviousTxnLgrSeq": 0,
         });
-        let borrower_node = crate::owner_dir::add_to_owner_dir(ctx.view, &borrower_id, &loan_key)?;
-        if borrower_node != 0 {
-            loan["BorrowerNode"] = serde_json::Value::String(format!("{borrower_node:016X}"));
-        }
+        // rippled links the loan into the borrower's directory as sfOwnerNode and
+        // into the broker pseudo-account's directory as sfLoanBrokerNode; both are
+        // SoeRequired and written unconditionally (even when the page hint is 0).
+        // (The old code wrote a bogus "BorrowerNode" field — dropped by the codec
+        // as unknown — and omitted both pointers when the page was 0.)
+        let owner_node = crate::owner_dir::add_to_owner_dir(ctx.view, &borrower_id, &loan_key)?;
+        loan["OwnerNode"] = serde_json::Value::String(format!("{owner_node:016X}"));
         let broker_node =
             crate::owner_dir::add_to_owner_dir(ctx.view, &broker_pseudo_id, &loan_key)?;
-        if broker_node != 0 {
-            loan["LoanBrokerNode"] = serde_json::Value::String(format!("{broker_node:016X}"));
-        }
+        loan["LoanBrokerNode"] = serde_json::Value::String(format!("{broker_node:016X}"));
         ctx.view
             .insert(
                 loan_key,

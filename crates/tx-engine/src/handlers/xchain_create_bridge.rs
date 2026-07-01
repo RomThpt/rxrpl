@@ -67,14 +67,25 @@ impl Transactor for XChainCreateBridgeTransactor {
         let signature_reward = helpers::get_u64_str_field(ctx.tx, "SignatureReward")
             .ok_or(TransactionResult::TemMalformed)?;
 
-        // Build the Bridge ledger entry
-        // The XChainClaimID / account-create / account-claim counters default to
-        // 0 and are omitted; Flags=0 is omitted; PreviousTxnID is stamped.
+        // Link the bridge into the door account's owner directory first, so the
+        // page hint can be serialized onto the SLE (SoeRequired sfOwnerNode).
+        let owner_node = crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &bridge_key)?;
+
+        // Build the Bridge ledger entry. rippled builds the SLE from the ledger
+        // template, so every SoeRequired field is serialized even at its default:
+        // the XChainClaimID / account-create / account-claim counters (all 0 at
+        // creation), the common sfFlags=0, and sfOwnerNode. PreviousTxnID is
+        // stamped centrally.
         let mut entry = serde_json::json!({
             "LedgerEntryType": "Bridge",
             "Account": account_str,
             "XChainBridge": bridge,
             "SignatureReward": signature_reward.to_string(),
+            "XChainClaimID": "0",
+            "XChainAccountCreateCount": "0",
+            "XChainAccountClaimCount": "0",
+            "Flags": 0u32,
+            "OwnerNode": format!("{owner_node:016X}"),
             "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
             "PreviousTxnLgrSeq": 0,
         });
@@ -87,8 +98,6 @@ impl Transactor for XChainCreateBridgeTransactor {
         ctx.view
             .insert(bridge_key, entry_data)
             .map_err(|_| TransactionResult::TefInternal)?;
-
-        crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &bridge_key)?;
 
         // Update source account: increment owner count and sequence
         let src_key = keylet::account(&account_id);
@@ -292,7 +301,12 @@ mod tests {
         let entry: serde_json::Value = serde_json::from_slice(&entry_bytes).unwrap();
         assert_eq!(entry["LedgerEntryType"].as_str().unwrap(), "Bridge");
         assert_eq!(entry["SignatureReward"].as_str().unwrap(), "100");
-        assert!(entry.get("XChainClaimID").is_none());
+        // SoeRequired counters are serialized at their creation default of 0.
+        assert_eq!(entry["XChainClaimID"].as_str().unwrap(), "0");
+        assert_eq!(entry["XChainAccountCreateCount"].as_str().unwrap(), "0");
+        assert_eq!(entry["XChainAccountClaimCount"].as_str().unwrap(), "0");
+        assert_eq!(entry["Flags"].as_u64().unwrap(), 0);
+        assert!(entry.get("OwnerNode").is_some());
 
         // Verify owner count incremented
         let src_key = keylet::account(&door_id);
