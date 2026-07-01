@@ -190,7 +190,10 @@ impl Transactor for NFTokenCreateOfferTransactor {
         let offer_key = keylet::nftoken_offer(&account_id, tx_seq);
 
         // Link into the creator's owner directory and the per-NFToken offer
-        // book (buy or sell), recording the owner-directory page as OwnerNode.
+        // book (buy or sell), recording the owner-directory page as sfOwnerNode
+        // and the per-NFToken offer-directory page as sfNFTokenOfferNode. Both
+        // are SoeRequired on ltNFTOKEN_OFFER (ledger_entries.macro), so rippled
+        // always serializes them (0 for the root page).
         let owner_node = add_to_owner_dir(ctx.view, &account_id, &offer_key)?;
         let nft_bytes: [u8; 32] = hex::decode(&nftoken_id)
             .ok()
@@ -202,7 +205,8 @@ impl Transactor for NFTokenCreateOfferTransactor {
         } else {
             keylet::nft_buys(&nft_id_hash)
         };
-        add_to_nft_offer_dir(ctx.view, &book_key, &nftoken_id, &offer_key, is_sell)?;
+        let offer_node =
+            add_to_nft_offer_dir(ctx.view, &book_key, &nftoken_id, &offer_key, is_sell)?;
 
         // Amount passes through in its original shape (XRP drops string or IOU
         // object). rippled stores no Sequence on the offer, and sfFlags only
@@ -216,6 +220,8 @@ impl Transactor for NFTokenCreateOfferTransactor {
             "LedgerEntryType": "NFTokenOffer",
             "Owner": account_str,
             "NFTokenID": nftoken_id,
+            "OwnerNode": format!("{owner_node:016X}"),
+            "NFTokenOfferNode": format!("{offer_node:016X}"),
             "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
             "PreviousTxnLgrSeq": 0,
         });
@@ -223,10 +229,6 @@ impl Transactor for NFTokenCreateOfferTransactor {
         // it, matching rippled's serialization.
         if !amount_is_zero(&amount_value) {
             offer["Amount"] = amount_value;
-        }
-        // OwnerNode is omitted on the directory's root page (node 0).
-        if owner_node != 0 {
-            offer["OwnerNode"] = Value::from(format!("{owner_node:016X}"));
         }
         if flags != 0 {
             offer["Flags"] = Value::from(flags);
@@ -342,6 +344,13 @@ mod tests {
         let offer: Value = serde_json::from_slice(&offer_bytes).unwrap();
         assert_eq!(offer["NFTokenID"].as_str().unwrap(), NFTOKEN_ID);
         assert_eq!(offer["Flags"].as_u64().unwrap(), TF_SELL_NFTOKEN as u64);
+        // sfOwnerNode and sfNFTokenOfferNode are SoeRequired on ltNFTOKEN_OFFER,
+        // so both are always serialized (0 for the root directory page).
+        assert_eq!(offer["OwnerNode"].as_str().unwrap(), "0000000000000000");
+        assert_eq!(
+            offer["NFTokenOfferNode"].as_str().unwrap(),
+            "0000000000000000"
+        );
     }
 
     #[test]

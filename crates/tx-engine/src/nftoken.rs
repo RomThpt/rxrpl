@@ -73,8 +73,11 @@ pub fn insert_token(
         }
         None => {
             let page_key = keylet::nftoken_page_max(owner);
+            // sfFlags is a common SoeRequired field on every SLE, so rippled
+            // always serializes Flags=0 on an NFTokenPage.
             let page = serde_json::json!({
                 "LedgerEntryType": "NFTokenPage",
+                "Flags": 0,
                 "NFTokens": [entry],
                 "PreviousTxnID": PREV_TXN_PLACEHOLDER,
                 "PreviousTxnLgrSeq": 0,
@@ -133,6 +136,7 @@ fn split_page_and_insert(
     // original page, which now holds the upper half.
     let mut new_page = serde_json::json!({
         "LedgerEntryType": "NFTokenPage",
+        "Flags": 0,
         "NFTokens": lower,
         "NextPageMin": orig_key_hex,
         "PreviousTxnID": PREV_TXN_PLACEHOLDER,
