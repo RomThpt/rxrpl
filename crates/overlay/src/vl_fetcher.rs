@@ -31,9 +31,10 @@ use std::time::Duration;
 
 use rxrpl_primitives::PublicKey;
 use serde::Deserialize;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 
 use crate::manifest::ManifestStore;
+use crate::peer_manager::ConsensusMessage;
 use crate::validator_list::{self, ValidatorListData, ValidatorListTracker};
 
 /// Default polling interval between successive fetches (5 minutes,
@@ -82,6 +83,12 @@ pub struct VlFetcher {
     refresh: Duration,
     timeout: Duration,
     http: reqwest::Client,
+    /// When set, each verified VL is forwarded to the consensus loop as a
+    /// `ValidatorListVerified` message so the engine's UNL/quorum are updated
+    /// from an HTTP-fetched list -- the same effect the P2P `TMValidatorList`
+    /// path has. Without this, an HTTP-only dynamic VL populates the
+    /// aggregator trust filter but leaves the consensus engine in solo mode.
+    consensus_tx: Option<mpsc::Sender<ConsensusMessage>>,
 }
 
 impl VlFetcher {
@@ -110,7 +117,16 @@ impl VlFetcher {
             refresh: DEFAULT_REFRESH,
             timeout: DEFAULT_TIMEOUT,
             http,
+            consensus_tx: None,
         })
+    }
+
+    /// Forward every verified VL to the consensus loop (as
+    /// `ConsensusMessage::ValidatorListVerified`) so the engine UNL + quorum
+    /// track an HTTP-fetched dynamic list, not just the aggregator trust filter.
+    pub fn with_consensus_sender(mut self, tx: mpsc::Sender<ConsensusMessage>) -> Self {
+        self.consensus_tx = Some(tx);
+        self
     }
 
     /// Override the refresh interval (default 5 minutes).
@@ -238,6 +254,19 @@ impl VlFetcher {
             parsed.sequence,
             parsed.validators.len(),
         );
+        drop(guard);
+
+        // Feed the verified list into the consensus engine (UNL + quorum +
+        // validations-trie), mirroring the P2P `ValidatorListVerified` path.
+        if let Some(tx) = &self.consensus_tx {
+            let msg = ConsensusMessage::ValidatorListVerified {
+                validators: parsed.validators.clone(),
+                sequence: parsed.sequence,
+            };
+            if let Err(e) = tx.try_send(msg) {
+                tracing::warn!("could not forward verified VL to consensus: {e}");
+            }
+        }
     }
 
     async fn record_status(
@@ -320,5 +349,62 @@ mod tests {
             guard.insert(PublicKey::from_slice(&[0xED; 33]).unwrap());
         }
         assert_eq!(tk_clone.read().await.len(), 1);
+    }
+
+    fn test_pubkey(byte1: u8) -> PublicKey {
+        let mut b = [0xED; 33];
+        b[1] = byte1;
+        PublicKey::from_slice(&b).unwrap()
+    }
+
+    #[tokio::test]
+    async fn forwards_verified_vl_to_consensus() {
+        // A VlFetcher with a consensus sender must forward each verified VL to
+        // the consensus loop as ValidatorListVerified, so an HTTP-fetched
+        // dynamic list drives the engine UNL/quorum (not just the aggregator
+        // trust filter -- otherwise consensus stays in solo mode).
+        let (tx, mut rx) = mpsc::channel(8);
+        let publisher = test_pubkey(0);
+        let fetcher = VlFetcher::new(
+            vec!["http://localhost/vl".into()],
+            vec![publisher.clone()],
+            new_trusted_keys(),
+            Arc::new(RwLock::new(Vec::new())),
+        )
+        .unwrap()
+        .with_consensus_sender(tx);
+
+        let masters = vec![test_pubkey(1), test_pubkey(2), test_pubkey(3)];
+        let parsed = ValidatorListData {
+            sequence: 7,
+            expiration: 999,
+            validators: masters.clone(),
+            validator_manifests: vec![],
+            publisher_master_key: publisher,
+        };
+        fetcher.publish(&parsed).await;
+
+        let msg = rx.try_recv().expect("verified VL forwarded to consensus");
+        if let ConsensusMessage::ValidatorListVerified {
+            validators,
+            sequence,
+        } = msg
+        {
+            assert_eq!(sequence, 7);
+            assert_eq!(validators, masters);
+        } else {
+            panic!("expected ValidatorListVerified");
+        }
+
+        // With no consensus sender configured, publish is a no-op (does not
+        // panic, emits nothing).
+        let fetcher2 = VlFetcher::new(
+            vec!["http://localhost/vl".into()],
+            vec![test_pubkey(0)],
+            new_trusted_keys(),
+            Arc::new(RwLock::new(Vec::new())),
+        )
+        .unwrap();
+        fetcher2.publish(&parsed).await;
     }
 }
