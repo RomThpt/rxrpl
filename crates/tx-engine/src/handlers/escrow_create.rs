@@ -121,6 +121,22 @@ impl Transactor for EscrowCreateTransactor {
         let tx_seq = helpers::tx_seq_proxy_value(ctx.tx);
         let escrow_key = keylet::escrow(&src_id, tx_seq);
 
+        let dst_id = decode_account_id(destination_str)
+            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+
+        // Link the escrow into the creator's owner directory (the resulting page
+        // is the SoeRequired sfOwnerNode) and, when the destination differs from
+        // the creator, into the destination's owner directory (the SoeOptional
+        // sfDestinationNode). Both page hints are serialized onto the SLE; rippled
+        // creates the SLE from the ledger-entry template, so even the default
+        // sfFlags=0 (a SoeRequired common field) is written.
+        let owner_node = add_to_owner_dir(ctx.view, &src_id, &escrow_key)?;
+        let dest_node = if dst_id != src_id {
+            Some(add_to_owner_dir(ctx.view, &dst_id, &escrow_key)?)
+        } else {
+            None
+        };
+
         let mut escrow = serde_json::json!({
             "LedgerEntryType": "Escrow",
             "Account": account_str,
@@ -129,10 +145,17 @@ impl Transactor for EscrowCreateTransactor {
             // Originating tx Sequence; consumed by EscrowFinish/Cancel
             // via OfferSequence and surfaced through account_objects.
             "Sequence": tx_seq,
+            // Default sfFlags is serialized (SoeRequired common field).
+            "Flags": 0u32,
+            // Owner-directory page hint (SoeRequired).
+            "OwnerNode": format!("{owner_node:016X}"),
             // Placeholder filled by the engine's central PreviousTxnID stamping.
             "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
             "PreviousTxnLgrSeq": 0,
         });
+        if let Some(dest_node) = dest_node {
+            escrow["DestinationNode"] = serde_json::Value::String(format!("{dest_node:016X}"));
+        }
 
         if let Some(finish_after) = helpers::get_u32_field(ctx.tx, "FinishAfter") {
             escrow["FinishAfter"] = serde_json::Value::from(finish_after);
@@ -156,15 +179,14 @@ impl Transactor for EscrowCreateTransactor {
             .insert(escrow_key, escrow_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        add_to_owner_dir(ctx.view, &src_id, &escrow_key)?;
-
-        // When the destination differs from the owner, rippled also links the
-        // escrow into the destination's owner directory and threads the
-        // destination AccountRoot (no field change).
-        let dst_id = decode_account_id(destination_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        // When the destination differs from the creator, rippled threads the
+        // destination AccountRoot's PreviousTxnID to this transaction (it lands
+        // in the modified set via the destination owner-directory link). Re-touch
+        // it with unchanged bytes so the engine's central PreviousTxnID stamping
+        // records this tx (only PreviousTxnID / PreviousTxnLgrSeq change; balance,
+        // owner count and sequence stay put — the escrow does not count against
+        // the destination's reserve).
         if dst_id != src_id {
-            add_to_owner_dir(ctx.view, &dst_id, &escrow_key)?;
             let dst_key = keylet::account(&dst_id);
             if let Some(dst_bytes) = ctx.view.read(&dst_key) {
                 ctx.view
@@ -296,6 +318,15 @@ mod tests {
         let escrow: serde_json::Value = serde_json::from_slice(&escrow_bytes).unwrap();
         assert_eq!(escrow["Amount"].as_str().unwrap(), "10000000");
         assert_eq!(escrow["Destination"].as_str().unwrap(), DST);
+        // The created Escrow carries the default sfFlags=0 and the owner-directory
+        // page hints (sfOwnerNode always; sfDestinationNode because DST != SRC),
+        // all serialized onto the SLE to match rippled's account_hash.
+        assert_eq!(escrow["Flags"].as_u64().unwrap(), 0);
+        assert_eq!(escrow["OwnerNode"].as_str().unwrap(), "0000000000000000");
+        assert_eq!(
+            escrow["DestinationNode"].as_str().unwrap(),
+            "0000000000000000"
+        );
     }
 
     #[test]

@@ -80,12 +80,27 @@ impl Transactor for OracleSetTransactor {
         let oracle_key = keylet::oracle(&account_id, doc_id);
         let is_create = !ctx.view.exists(&oracle_key);
 
+        // On create, link the Oracle into the owner directory up front so its
+        // page index can be recorded as the SoeRequired sfOwnerNode on the SLE.
+        let owner_node = if is_create {
+            Some(add_to_owner_dir(ctx.view, &account_id, &oracle_key)?)
+        } else {
+            None
+        };
+
         let mut entry = if is_create {
             serde_json::json!({
                 "LedgerEntryType": "Oracle",
                 "Owner": account_str,
                 "OracleDocumentID": doc_id,
                 "Flags": 0,
+                // Owner-directory page hint (SoeRequired).
+                "OwnerNode": format!("{:016X}", owner_node.unwrap()),
+                // Placeholders filled by the engine's central PreviousTxnID
+                // stamping (it only backfills entries that already carry the
+                // field, so both must be seeded here).
+                "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+                "PreviousTxnLgrSeq": 0,
             })
         } else {
             let entry_bytes = ctx
@@ -198,7 +213,6 @@ impl Transactor for OracleSetTransactor {
             ctx.view
                 .insert(oracle_key, entry_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
-            add_to_owner_dir(ctx.view, &account_id, &oracle_key)?;
             helpers::adjust_owner_count(&mut account, 1);
         } else {
             ctx.view
@@ -380,6 +394,13 @@ mod tests {
         let entry: serde_json::Value = serde_json::from_slice(&entry_bytes).unwrap();
         assert_eq!(entry["Provider"].as_str().unwrap(), "chainlink");
         assert_eq!(entry["Owner"].as_str().unwrap(), ALICE);
+        // The created Oracle carries the owner-directory page hint (sfOwnerNode)
+        // and the PreviousTxnID placeholder the central stamp backfills.
+        assert_eq!(entry["OwnerNode"].as_str().unwrap(), "0000000000000000");
+        assert_eq!(
+            entry["PreviousTxnID"].as_str().unwrap(),
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
 
         let account_key = keylet::account(&id);
         let account_bytes = sandbox.read(&account_key).unwrap();
