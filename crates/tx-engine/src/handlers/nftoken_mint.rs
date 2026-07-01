@@ -56,15 +56,30 @@ impl Transactor for NFTokenMintTransactor {
         let mut issuer_acct: Value =
             serde_json::from_slice(&issuer_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        // The token sequence is FirstNFTokenSequence + MintedNFTokens; the first
-        // ever mint stamps FirstNFTokenSequence with the ledger sequence.
+        // The token sequence is FirstNFTokenSequence + MintedNFTokens. On the
+        // first ever mint rippled (NFTokenMint::doApply) stamps
+        // FirstNFTokenSequence with the *issuer's account Sequence* — NOT the
+        // ledger index. Because the engine consumed the sender's Sequence/Ticket
+        // centrally before doApply (mirroring rippled's pre-increment), the
+        // issuer's Sequence is already advanced for a sequence-based self-mint,
+        // so we subtract one; for a ticketed mint (Sequence untouched) or an
+        // authorized-minter mint (sfIssuer present, the issuer's Sequence is left
+        // alone) we use the Sequence as-is. Getting this wrong also corrupts the
+        // minted NFTokenID, whose low bytes encode this token sequence.
         let first_seq = match issuer_acct
             .get("FirstNFTokenSequence")
             .and_then(|v| v.as_u64())
         {
             Some(s) => s as u32,
             None => {
-                let s = ctx.view.seq();
+                let acct_seq = helpers::get_sequence(&issuer_acct);
+                let has_issuer = ctx.tx.get("Issuer").is_some();
+                let is_ticket = ctx.tx.get("TicketSequence").is_some();
+                let s = if has_issuer || is_ticket {
+                    acct_seq
+                } else {
+                    acct_seq.saturating_sub(1)
+                };
                 issuer_acct["FirstNFTokenSequence"] = Value::from(s);
                 s
             }
@@ -208,16 +223,22 @@ impl NFTokenMintTransactor {
         let tx_seq = helpers::tx_seq_proxy_value(ctx.tx);
         let offer_key = keylet::nftoken_offer(minter_id, tx_seq);
 
-        // Owner directory link + per-NFToken sell-offer book link.
+        // Owner directory link + per-NFToken sell-offer book link. sfOwnerNode
+        // and sfNFTokenOfferNode are SoeRequired on ltNFTOKEN_OFFER, so rippled
+        // always serializes both directory-page numbers (0 for the root page).
         let owner_node = crate::owner_dir::add_to_owner_dir(ctx.view, minter_id, &offer_key)?;
         let book_key = keylet::nft_sells(nft_hash);
-        crate::owner_dir::add_to_nft_offer_dir(ctx.view, &book_key, nftoken_id, &offer_key, true)?;
+        let offer_node = crate::owner_dir::add_to_nft_offer_dir(
+            ctx.view, &book_key, nftoken_id, &offer_key, true,
+        )?;
 
         let mut offer = serde_json::json!({
             "LedgerEntryType": "NFTokenOffer",
             "Owner": minter_str,
             "NFTokenID": nftoken_id,
             "Flags": 1u32,
+            "OwnerNode": format!("{owner_node:016X}"),
+            "NFTokenOfferNode": format!("{offer_node:016X}"),
             "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
             "PreviousTxnLgrSeq": 0,
         });
@@ -228,10 +249,6 @@ impl NFTokenMintTransactor {
             .unwrap_or_else(|| Value::String("0".to_string()));
         if !amount_is_zero(&amount_value) {
             offer["Amount"] = amount_value;
-        }
-        // OwnerNode is omitted on the directory's root page (node 0).
-        if owner_node != 0 {
-            offer["OwnerNode"] = Value::from(format!("{owner_node:016X}"));
         }
         if let Some(dest) = helpers::get_str_field(ctx.tx, "Destination") {
             offer["Destination"] = Value::String(dest.to_string());
@@ -330,17 +347,24 @@ mod tests {
         let page: Value = serde_json::from_slice(&page_bytes).unwrap();
         let tokens = page["NFTokens"].as_array().unwrap();
         assert_eq!(tokens.len(), 1);
-        assert_eq!(
-            tokens[0]["NFToken"]["NFTokenID"].as_str().unwrap().len(),
-            64
-        );
+        // sfFlags is a common SoeRequired field: the page serializes Flags=0.
+        assert_eq!(page["Flags"].as_u64().unwrap(), 0);
+        let nftoken_id = tokens[0]["NFToken"]["NFTokenID"].as_str().unwrap();
+        assert_eq!(nftoken_id.len(), 64);
+        // FirstNFTokenSequence is the account's own Sequence at mint time (the
+        // tx Sequence 1, i.e. post-consume account Sequence 2 minus 1), NOT the
+        // ledger index. token_seq = FirstNFTokenSequence + MintedNFTokens(0) = 1,
+        // so the NFTokenID's low 4 bytes encode 0x00000001.
+        assert_eq!(&nftoken_id[56..], "00000001");
 
-        // Verify owner count incremented
+        // Verify owner count incremented and FirstNFTokenSequence stamped.
         let acct_key = keylet::account(&minter_id);
         let acct_bytes = sandbox.read(&acct_key).unwrap();
         let acct: Value = serde_json::from_slice(&acct_bytes).unwrap();
         assert_eq!(acct["OwnerCount"].as_u64().unwrap(), 1);
         assert_eq!(acct["Sequence"].as_u64().unwrap(), 2);
+        assert_eq!(acct["FirstNFTokenSequence"].as_u64().unwrap(), 1);
+        assert_eq!(acct["MintedNFTokens"].as_u64().unwrap(), 1);
     }
 
     #[test]

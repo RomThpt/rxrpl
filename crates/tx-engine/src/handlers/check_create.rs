@@ -105,11 +105,12 @@ impl Transactor for CheckCreateTransactor {
             .get("SendMax")
             .cloned()
             .unwrap_or_else(|| serde_json::Value::String("0".to_string()));
-        // rippled does not set sfFlags on a Check, so it is absent (unlike a
-        // Ticket, which carries Flags=0). Emitting it here breaks byte fidelity.
+        // sfFlags is a common SoeRequired field on every SLE (LedgerFormats
+        // getCommonFields), so rippled always serializes Flags=0 on a Check.
         let mut check = serde_json::json!({
             "LedgerEntryType": "Check",
             "Account": account_str,
+            "Flags": 0,
             "Destination": destination_str,
             "SendMax": send_max_value,
             "Sequence": tx_seq,
@@ -240,10 +241,11 @@ mod tests {
         let check: serde_json::Value = serde_json::from_slice(&check_bytes).unwrap();
         assert_eq!(check["SendMax"].as_str().unwrap(), "5000000");
         assert_eq!(check["Destination"].as_str().unwrap(), DST);
-        // Linked into both directories, with page hints recorded and no sfFlags.
+        // Linked into both directories, with page hints recorded and Flags=0
+        // (sfFlags is a common SoeRequired field on every SLE).
         assert!(check.get("OwnerNode").is_some());
         assert!(check.get("DestinationNode").is_some());
-        assert!(check.get("Flags").is_none());
+        assert_eq!(check["Flags"].as_u64().unwrap(), 0);
 
         // The check is in the destination's owner directory too.
         let dst_id = decode_account_id(DST).unwrap();
