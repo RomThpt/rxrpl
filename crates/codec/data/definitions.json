@@ -1511,6 +1511,16 @@
       }
     ],
     [
+      "ReferenceHolding",
+      {
+        "isSerialized": true,
+        "isSigningField": true,
+        "isVLEncoded": false,
+        "nth": 39,
+        "type": "Hash256"
+      }
+    ],
+    [
       "hash",
       {
         "isSerialized": false,
