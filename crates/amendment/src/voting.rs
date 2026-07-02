@@ -162,38 +162,42 @@ pub fn count_votes(validator_votes: &[Vec<Hash256>]) -> HashMap<Hash256, usize> 
     counts
 }
 
+/// The zero `AccountID` (`rrrrrrrrrrrrrrrrrrrrrhoLvTp`) carried by every
+/// consensus pseudo-transaction (rippled `AccountID()`).
+const ACCOUNT_ZERO: &str = "rrrrrrrrrrrrrrrrrrrrrhoLvTp";
+
+/// Flag values that select the amendment action, matching rippled's
+/// `tfGotMajority` / `tfLostMajority`. `Activate` carries no `Flags` field.
+const TF_GOT_MAJORITY: u32 = 0x00010000;
+const TF_LOST_MAJORITY: u32 = 0x00020000;
+
 /// Build an `EnableAmendment` pseudo-transaction JSON for a given action.
 ///
-/// These pseudo-transactions are applied to the ledger via the tx-engine
-/// just like normal transactions, but bypass signature/fee checks.
-pub fn make_enable_amendment_tx(action: &AmendmentAction) -> serde_json::Value {
-    match action {
-        AmendmentAction::GotMajority {
-            amendment_id,
-            close_time,
-        } => {
-            serde_json::json!({
-                "TransactionType": "EnableAmendment",
-                "Amendment": hex::encode(amendment_id.as_bytes()),
-                "Flags": 0x00010000u32,
-                "CloseTime": close_time,
-            })
-        }
-        AmendmentAction::LostMajority { amendment_id } => {
-            serde_json::json!({
-                "TransactionType": "EnableAmendment",
-                "Amendment": hex::encode(amendment_id.as_bytes()),
-                "Flags": 0x00020000u32,
-            })
-        }
-        AmendmentAction::Activate { amendment_id } => {
-            serde_json::json!({
-                "TransactionType": "EnableAmendment",
-                "Amendment": hex::encode(amendment_id.as_bytes()),
-                "Flags": 0u32,
-            })
-        }
+/// `ledger_seq` is the sequence of the ledger the pseudo-tx lands in
+/// (the ledger after a flag ledger); it becomes the `LedgerSequence` field.
+/// The layout mirrors rippled's `AmendmentTable::doVoting` pseudo-tx: the
+/// zero account, `Sequence` 0, zero `Fee`, and empty `SigningPubKey` skeleton,
+/// with `Flags` present only for the majority-change actions.
+pub fn make_enable_amendment_tx(action: &AmendmentAction, ledger_seq: u32) -> serde_json::Value {
+    let (amendment_id, flags) = match action {
+        AmendmentAction::GotMajority { amendment_id, .. } => (amendment_id, Some(TF_GOT_MAJORITY)),
+        AmendmentAction::LostMajority { amendment_id } => (amendment_id, Some(TF_LOST_MAJORITY)),
+        AmendmentAction::Activate { amendment_id } => (amendment_id, None),
+    };
+
+    let mut tx = serde_json::json!({
+        "TransactionType": "EnableAmendment",
+        "Sequence": 0u32,
+        "LedgerSequence": ledger_seq,
+        "Amendment": hex::encode_upper(amendment_id.as_bytes()),
+        "Fee": "0",
+        "SigningPubKey": "",
+        "Account": ACCOUNT_ZERO,
+    });
+    if let Some(flags) = flags {
+        tx["Flags"] = serde_json::json!(flags);
     }
+    tx
 }
 
 #[cfg(test)]
@@ -475,28 +479,38 @@ mod tests {
             amendment_id: id,
             close_time: 1000,
         };
-        let tx = make_enable_amendment_tx(&action);
+        let tx = make_enable_amendment_tx(&action, 257);
         assert_eq!(tx["TransactionType"], "EnableAmendment");
         assert_eq!(tx["Flags"], 0x00010000u32);
-        assert_eq!(tx["CloseTime"], 1000);
+        assert_eq!(tx["Sequence"], 0);
+        assert_eq!(tx["LedgerSequence"], 257);
+        assert_eq!(tx["Fee"], "0");
+        assert_eq!(tx["SigningPubKey"], "");
+        assert_eq!(tx["Account"], ACCOUNT_ZERO);
+        // The close time lives in the Amendments SLE, never on the pseudo-tx.
+        assert!(tx.get("CloseTime").is_none());
     }
 
     #[test]
     fn make_enable_amendment_tx_lost_majority() {
         let id = Hash256::new([0xBB; 32]);
         let action = AmendmentAction::LostMajority { amendment_id: id };
-        let tx = make_enable_amendment_tx(&action);
+        let tx = make_enable_amendment_tx(&action, 513);
         assert_eq!(tx["TransactionType"], "EnableAmendment");
         assert_eq!(tx["Flags"], 0x00020000u32);
+        assert_eq!(tx["LedgerSequence"], 513);
     }
 
     #[test]
     fn make_enable_amendment_tx_activate() {
         let id = Hash256::new([0xCC; 32]);
         let action = AmendmentAction::Activate { amendment_id: id };
-        let tx = make_enable_amendment_tx(&action);
+        let tx = make_enable_amendment_tx(&action, 769);
         assert_eq!(tx["TransactionType"], "EnableAmendment");
-        assert_eq!(tx["Flags"], 0);
+        // Activate carries no Flags field.
+        assert!(tx.get("Flags").is_none());
+        assert_eq!(tx["LedgerSequence"], 769);
+        assert_eq!(tx["Account"], ACCOUNT_ZERO);
     }
 
     #[test]
