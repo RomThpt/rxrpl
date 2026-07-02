@@ -2066,3 +2066,137 @@ fn ephemeral_validation_feeds_trie_under_master_identity() {
         Some(ledger_hash)
     );
 }
+
+// --- Fork-choice discrimination (engine level, a REAL two-branch fork) ---
+//
+// The sibling `check_wrong_prev_ledger_via_validations_trie_supermajority`
+// populates only ONE branch (our prev_ledger has zero trie support), so
+// `get_preferred` never has to choose between two contested tips. The tests
+// below give BOTH branches live trusted validations at the same fork height,
+// so the fork-choice actually DISCRIMINATES — the live gap the audit flagged
+// ("get_preferred is fed live but never tripped").
+
+#[test]
+fn fork_choice_minority_node_detects_majority_branch_as_wrong_prev() {
+    // Fork at parent height seq 10. Our prev_ledger = minority branch B (1
+    // vote, our own); 4/5 of the UNL validated majority branch A. Both tips
+    // are populated, so discrimination is genuine.
+    let unl = make_unl(&[1, 2, 3, 4, 5]);
+    let mut engine = ConsensusEngine::new_with_unl(
+        SimpleAdapter,
+        node(1), // we are validator 1, sitting on the minority branch
+        Vec::new(),
+        ConsensusParams::default(),
+        unl,
+    );
+
+    let branch_a = Hash256::new([0xAA; 32]); // majority parent
+    let branch_b = Hash256::new([0xBB; 32]); // minority parent (ours)
+
+    // Round producing ledger 11 on top of B => prev_ledger = B, prev_ledger_seq = 10.
+    engine.start_round(branch_b, 11);
+
+    // Our own validation makes B a POPULATED tip (forces real discrimination).
+    assert!(engine.record_trusted_validation(validation_for(node(1), branch_b, 10)));
+    // Majority: validators 2..=5 validated branch A at the same fork height.
+    for n in 2u8..=5 {
+        assert!(engine.record_trusted_validation(validation_for(node(n), branch_a, 10)));
+    }
+
+    // (a) The trusted-majority branch wins the trie, queried with the SAME
+    //     cursor the engine uses internally (prev_ledger_seq == 10). A(4) > B(1).
+    assert_eq!(
+        engine.validations_trie().get_preferred(10),
+        Some(branch_a),
+        "trie must prefer the 4-validator branch A over our branch B"
+    );
+
+    // (b) The minority node detects the wrong prev-ledger through the
+    //     production entrypoint. No proposals were fed, so this can only fire
+    //     via the validations-trie stage.
+    let expected = WrongPrevLedgerDetected {
+        preferred_ledger: branch_a,
+        peer_count: 4,    // count_for(branch_a)
+        total_trusted: 5, // UNL size
+    };
+    assert_eq!(engine.check_wrong_prev_ledger(), Some(expected.clone()));
+    // Stage isolation: it is the primary validations-trie path that fired,
+    // not the proposal fallback.
+    assert_eq!(
+        engine.check_wrong_prev_ledger_from_validations(),
+        Some(expected)
+    );
+
+    // The engine does NOT self-switch; adopting A is the node/sync layer's job.
+    assert_eq!(
+        engine.prev_ledger(),
+        branch_b,
+        "engine.prev_ledger unchanged"
+    );
+}
+
+#[test]
+fn fork_choice_triggers_at_exactly_60pct_boundary() {
+    // A = {2,3,4} (3/5 = 60%, the inclusive threshold); B = {1,5} (ours).
+    let unl = make_unl(&[1, 2, 3, 4, 5]);
+    let mut engine = ConsensusEngine::new_with_unl(
+        SimpleAdapter,
+        node(1),
+        Vec::new(),
+        ConsensusParams::default(),
+        unl,
+    );
+    let branch_a = Hash256::new([0xAA; 32]);
+    let branch_b = Hash256::new([0xBB; 32]);
+    engine.start_round(branch_b, 11);
+    for n in [1u8, 5] {
+        assert!(engine.record_trusted_validation(validation_for(node(n), branch_b, 10)));
+    }
+    for n in [2u8, 3, 4] {
+        assert!(engine.record_trusted_validation(validation_for(node(n), branch_a, 10)));
+    }
+    assert_eq!(engine.validations_trie().get_preferred(10), Some(branch_a));
+    assert_eq!(
+        engine.check_wrong_prev_ledger(),
+        Some(WrongPrevLedgerDetected {
+            preferred_ledger: branch_a,
+            peer_count: 3,
+            total_trusted: 5,
+        }),
+        "3/5 == 60% must trigger at the inclusive boundary"
+    );
+}
+
+#[test]
+fn fork_choice_keeps_our_branch_when_it_holds_the_majority() {
+    // A = {2,3} (2 votes); B = {1,4,5} (3 votes, ours). Our branch wins the
+    // trie, so there is NO wrong-prev-ledger: guards the descend logic and the
+    // >= threshold against a false switch away from a branch we rightly hold.
+    let unl = make_unl(&[1, 2, 3, 4, 5]);
+    let mut engine = ConsensusEngine::new_with_unl(
+        SimpleAdapter,
+        node(1),
+        Vec::new(),
+        ConsensusParams::default(),
+        unl,
+    );
+    let branch_a = Hash256::new([0xAA; 32]);
+    let branch_b = Hash256::new([0xBB; 32]);
+    engine.start_round(branch_b, 11);
+    for n in [1u8, 4, 5] {
+        assert!(engine.record_trusted_validation(validation_for(node(n), branch_b, 10)));
+    }
+    for n in [2u8, 3] {
+        assert!(engine.record_trusted_validation(validation_for(node(n), branch_a, 10)));
+    }
+    assert_eq!(
+        engine.validations_trie().get_preferred(10),
+        Some(branch_b),
+        "our branch B (3 votes) must win over A (2 votes)"
+    );
+    assert_eq!(
+        engine.check_wrong_prev_ledger(),
+        None,
+        "when our branch holds the majority there is no wrong-prev-ledger"
+    );
+}
