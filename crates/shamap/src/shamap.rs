@@ -1128,6 +1128,15 @@ impl SHAMap {
         out: &mut Vec<MissingNode>,
         complete: &mut HashSet<Hash256>,
     ) -> bool {
+        // A SHAMap key is 256 bits = 64 nibbles, so inner nodes live at depths
+        // 0..=63 and leaves at depth 64. An inner node reaching depth 64 is
+        // malformed (a peer can send bad node data during delta sync); walking
+        // it would index `child_key` past the 32-byte key. Refuse it instead of
+        // panicking, and report the subtree as incomplete so it is re-fetched.
+        if depth as usize >= Hash256::LEN * 2 {
+            return false;
+        }
+
         let mut subtree_complete = true;
         let mut mask = inner.branch_mask();
         while mask != 0 {

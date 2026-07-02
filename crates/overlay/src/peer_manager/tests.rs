@@ -762,3 +762,101 @@ async fn send_local_manifest_to_is_noop_without_local_manifest() {
         other => panic!("expected empty channel, got {:?}", other.is_ok()),
     }
 }
+
+fn signed_validation() -> Validation {
+    use crate::identity::NodeIdentity;
+    use rxrpl_consensus::types::NodeId;
+
+    let id = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("val-signer"));
+    let mut v = Validation {
+        node_id: NodeId(id.node_id),
+        public_key: id.public_key_bytes().to_vec(),
+        ledger_hash: Hash256::new([0xCC; 32]),
+        ledger_seq: 42,
+        full: true,
+        close_time: 1000,
+        sign_time: 1000,
+        signature: None,
+        amendments: vec![],
+        signing_payload: None,
+        ..Default::default()
+    };
+    id.sign_validation(&mut v);
+    v
+}
+
+#[tokio::test]
+async fn verified_validation_forwarded_only_when_valid() {
+    let (mut mgr, mut consensus_rx) = make_test_peer_manager_with_consensus();
+    let peer_id = Hash256::new([0xAB; 32]);
+    let v = signed_validation();
+    let payload = proto_convert::encode_validation(&v, &v.public_key);
+
+    // A validation whose signature verified is forwarded to consensus.
+    mgr.handle_verified_validation(peer_id, payload.clone(), v.clone(), true);
+    assert!(matches!(
+        consensus_rx.try_recv(),
+        Ok(ConsensusMessage::Validation(_))
+    ));
+
+    // One that failed verification is dropped, never reaching consensus.
+    mgr.handle_verified_validation(peer_id, payload, v, false);
+    assert!(consensus_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn validation_dispatch_offloads_signature_verify() {
+    let (mut mgr, _consensus_rx) = make_test_peer_manager_with_consensus();
+    let peer_id = Hash256::new([0xAB; 32]);
+    let v = signed_validation();
+    let payload = proto_convert::encode_validation(&v, &v.public_key);
+
+    mgr.dispatch_message(peer_id, MessageType::Validation, &payload);
+
+    // The verify worker only runs inside run(); in this unit context the job
+    // waits in the queue, proving dispatch offloaded the signature check off the
+    // event loop instead of verifying inline.
+    let job = mgr
+        .validation_verify_rx
+        .as_mut()
+        .expect("verify receiver present")
+        .try_recv()
+        .expect("verify job queued");
+    assert_eq!(job.validation.ledger_seq, 42);
+    assert!(crate::identity::verify_validation_signature(
+        &job.validation
+    ));
+}
+
+#[tokio::test]
+async fn validation_offload_removes_verify_from_event_loop() {
+    // The event loop's per-validation cost drops from "decode + verify" to
+    // "decode + enqueue": the signature verify now runs on the worker. This
+    // asserts the loop path is cheaper than the inline path it replaced, which
+    // is what unblocks the sync pipeline during a validation burst.
+    let (mut mgr, _consensus_rx) = make_test_peer_manager_with_consensus();
+    let peer_id = Hash256::new([0xAB; 32]);
+    let v = signed_validation();
+    let payload = proto_convert::encode_validation(&v, &v.public_key);
+    const N: usize = 2000;
+
+    let t0 = std::time::Instant::now();
+    for _ in 0..N {
+        mgr.dispatch_message(peer_id, MessageType::Validation, &payload);
+        let _ = mgr.validation_verify_rx.as_mut().unwrap().try_recv();
+    }
+    let offload = t0.elapsed();
+
+    let t1 = std::time::Instant::now();
+    for _ in 0..N {
+        let _ = proto_convert::decode_validation(&payload);
+        let _ = crate::identity::verify_validation_signature(&v);
+    }
+    let inline = t1.elapsed();
+
+    eprintln!("event-loop per-validation over {N}: offload {offload:?} vs inline {inline:?}");
+    assert!(
+        offload < inline,
+        "offloading the verify must make the event-loop path cheaper: offload={offload:?} inline={inline:?}"
+    );
+}
