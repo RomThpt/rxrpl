@@ -1572,6 +1572,9 @@ impl Node {
             .copied()
             .collect();
         let amendment_blocked_for_loop = Arc::clone(&amendment_blocked);
+        // This node's fee-vote targets, captured by value for the consensus
+        // loop. Empty by default => fee voting is a no-op (see `apply_fee_voting`).
+        let fee_vote_cfg = self.config.fee_vote.clone();
         tokio::spawn(async move {
             let node_id = NodeId(identity.node_id);
             // Networked mode: enforce a minimum Establish-phase duration
@@ -1723,6 +1726,9 @@ impl Node {
             // Collect amendment votes from received validations for the current round.
             // Reset after each ledger close.
             let mut amendment_votes: Vec<Vec<Hash256>> = Vec::new();
+            // Fee/reserve votes carried by the same trusted validations, in
+            // lockstep with `amendment_votes` (same dedup + reset lifecycle).
+            let mut fee_votes: Vec<rxrpl_amendment::fee_voting::FeeVoteEntry> = Vec::new();
             // Denominator for amendment voting: the number of DISTINCT trusted
             // validators that sent a FULL validation this voting window. An
             // empty amendment list is a "no" vote that still counts toward the
@@ -2029,6 +2035,7 @@ impl Node {
                                             &cmd_tx_catchup,
                                             &amendment_table, &tx_engine, &fees,
                                             &amendment_votes, trusted_validator_count,
+                                            &fee_votes, &fee_vote_cfg,
                                             &pruner, &node_store,
                                             &self_validation_tx,
                                             &mut self_validation_guard,
@@ -2046,6 +2053,7 @@ impl Node {
                                         stall_metrics.reset_consecutive();
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
+                                        fee_votes.clear();
                                         seen_amendment_voters.clear();
                                         // Start new open phase
                                         timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
@@ -2204,6 +2212,7 @@ impl Node {
                                         consensus.start_round(reset_prev, 0);
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
+                                        fee_votes.clear();
                                         seen_amendment_voters.clear();
                                         round_started_at = None;
                                         continue;
@@ -2224,6 +2233,7 @@ impl Node {
                                             &cmd_tx_catchup,
                                             &amendment_table, &tx_engine, &fees,
                                             &amendment_votes, trusted_validator_count,
+                                            &fee_votes, &fee_vote_cfg,
                                             &pruner, &node_store,
                                             &self_validation_tx,
                                             &mut self_validation_guard,
@@ -2241,6 +2251,7 @@ impl Node {
                                         stall_metrics.reset_consecutive();
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
+                                        fee_votes.clear();
                                         seen_amendment_voters.clear();
                                         // Start new open phase
                                         timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
@@ -2274,6 +2285,7 @@ impl Node {
                                             timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
                                             amendment_votes.clear();
                                             trusted_validator_count = 0;
+                                            fee_votes.clear();
                                             seen_amendment_voters.clear();
                                         }
                                         rxrpl_consensus::StallAction::Resync => {
@@ -2291,6 +2303,7 @@ impl Node {
                                             );
                                             amendment_votes.clear();
                                             trusted_validator_count = 0;
+                                            fee_votes.clear();
                                             seen_amendment_voters.clear();
                                         }
                                     }
@@ -2391,6 +2404,7 @@ impl Node {
                                         consensus.start_round(detected.preferred_ledger, 0);
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
+                                        fee_votes.clear();
                                         seen_amendment_voters.clear();
                                     }
                                 }
@@ -2435,6 +2449,21 @@ impl Node {
                                     if !validation.amendments.is_empty() {
                                         amendment_votes.push(validation.amendments.clone());
                                     }
+                                    // Fee vote: prefer the drops variant, fall
+                                    // back to the legacy fields (pre-XRPFees). A
+                                    // field absent on both sides stays None and
+                                    // the tally treats it as a vote for current.
+                                    fee_votes.push(rxrpl_amendment::fee_voting::FeeVoteEntry {
+                                        base_fee: validation
+                                            .base_fee_drops
+                                            .or(validation.base_fee),
+                                        reserve_base: validation
+                                            .reserve_base_drops
+                                            .or(validation.reserve_base.map(u64::from)),
+                                        reserve_increment: validation
+                                            .reserve_increment_drops
+                                            .or(validation.reserve_increment.map(u64::from)),
+                                    });
                                 }
 
                                 // Feed into the checkpoint anchor first (if active). On
@@ -3219,6 +3248,8 @@ impl Node {
         fees: &Arc<FeeSettings>,
         validator_amendment_votes: &[Vec<Hash256>],
         trusted_validator_count: usize,
+        validator_fee_votes: &[rxrpl_amendment::fee_voting::FeeVoteEntry],
+        fee_vote_cfg: &rxrpl_config::FeeVoteConfig,
         pruner: &Arc<LedgerPruner>,
         node_store: &Option<Arc<dyn NodeStore>>,
         self_validation_tx: &tokio::sync::mpsc::Sender<rxrpl_overlay::ConsensusMessage>,
@@ -3269,10 +3300,10 @@ impl Node {
 
         // Apply amendment voting on flag ledgers (before close computes
         // final hashes). Votes are collected from received validations.
-        {
+        let rules_after_voting = {
             let ledger_seq = l.header.sequence;
             let mut at = amendment_table.write().await;
-            let _rules = Node::apply_amendment_voting(
+            Node::apply_amendment_voting(
                 &mut l,
                 tx_engine,
                 &mut at,
@@ -3280,6 +3311,31 @@ impl Node {
                 trusted_validator_count,
                 validator_amendment_votes,
                 effective_close_time,
+                ledger_seq,
+            )
+        };
+
+        // Fee / reserve voting on flag ledgers (rippled FeeVoteImpl::doVoting),
+        // right after amendment voting. No-op unless an operator configured
+        // fee-vote targets AND the weighted median actually moves a value — a
+        // `None` config field resolves to the current value, collapsing the vote
+        // range so no in-range peer vote can shift it.
+        {
+            let ledger_seq = l.header.sequence;
+            let target = rxrpl_amendment::fee_voting::FeeSettingsVote {
+                base_fee: fee_vote_cfg.base_fee_drops.unwrap_or(fees.base_fee),
+                reserve_base: fee_vote_cfg.reserve_base_drops.unwrap_or(fees.reserve_base),
+                reserve_increment: fee_vote_cfg
+                    .reserve_increment_drops
+                    .unwrap_or(fees.reserve_increment),
+            };
+            Node::apply_fee_voting(
+                &mut l,
+                tx_engine,
+                fees,
+                &rules_after_voting,
+                target,
+                validator_fee_votes,
                 ledger_seq,
             );
         }
@@ -3455,6 +3511,29 @@ impl Node {
                 signing_payload: None,
                 ..Default::default()
             };
+            // Advertise our fee-vote preference on flag-ledger validations, so
+            // peers can tally it (rippled `FeeVoteImpl::doValidation`: a field is
+            // added only when current != target). Drops variant (XRPFees era).
+            // No-op unless an operator configured a target that differs from the
+            // current on-ledger value, so a default node adds no fee fields and
+            // its validation bytes are unchanged.
+            if rxrpl_amendment::is_flag_ledger(closed_seq) {
+                if let Some(bf) = fee_vote_cfg.base_fee_drops {
+                    if bf != fees.base_fee {
+                        validation.base_fee_drops = Some(bf);
+                    }
+                }
+                if let Some(rb) = fee_vote_cfg.reserve_base_drops {
+                    if rb != fees.reserve_base {
+                        validation.reserve_base_drops = Some(rb);
+                    }
+                }
+                if let Some(ri) = fee_vote_cfg.reserve_increment_drops {
+                    if ri != fees.reserve_increment {
+                        validation.reserve_increment_drops = Some(ri);
+                    }
+                }
+            }
             if let Some(vid) = validator_id_for_loop.as_ref() {
                 vid.sign_validation(&mut validation);
             } else {
@@ -3914,6 +3993,68 @@ impl Node {
 
         // Return updated rules after any activations
         amendment_table.build_rules()
+    }
+
+    /// Apply fee / reserve voting on a flag ledger.
+    ///
+    /// Mirrors [`Self::apply_amendment_voting`] for the fee-vote mechanism
+    /// (rippled `FeeVoteImpl::doVoting`). On a flag ledger this tallies the fee
+    /// votes carried by trusted validations against this node's configured
+    /// `target` and, if the weighted median moves any of base fee / base reserve
+    /// / owner-reserve increment, applies a `SetFee` pseudo-transaction that
+    /// rewrites the `FeeSettings` object. Off a flag ledger, or when nothing
+    /// moves, it is a no-op.
+    ///
+    /// Safety: a `None` fee-vote config field is passed here as the current
+    /// value (no preference), so with no config `target == current`; the
+    /// [`rxrpl_amendment::fee_voting::tally_fee_votes`] range then collapses to a
+    /// single point and no in-range peer vote can move it — the node emits no
+    /// `SetFee` and stays byte-identical to a non-voting node. The `SetFee`
+    /// field variant (drops vs legacy) follows the `XRPFees` amendment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_fee_voting(
+        ledger: &mut Ledger,
+        tx_engine: &TxEngine,
+        fees: &FeeSettings,
+        rules: &Rules,
+        target: rxrpl_amendment::fee_voting::FeeSettingsVote,
+        fee_votes: &[rxrpl_amendment::fee_voting::FeeVoteEntry],
+        ledger_seq: u32,
+    ) {
+        if !rxrpl_amendment::is_flag_ledger(ledger_seq) {
+            return;
+        }
+
+        let current = rxrpl_amendment::fee_voting::FeeSettingsVote {
+            base_fee: fees.base_fee,
+            reserve_base: fees.reserve_base,
+            reserve_increment: fees.reserve_increment,
+        };
+
+        let Some(new) = rxrpl_amendment::fee_voting::tally_fee_votes(current, target, fee_votes)
+        else {
+            return;
+        };
+
+        let xrp_fees = rules.enabled(&rxrpl_amendment::feature_id("XRPFees"));
+        let tx = rxrpl_amendment::fee_voting::make_set_fee_tx(new, ledger_seq, xrp_fees);
+        match tx_engine.apply(&tx, ledger, rules, fees) {
+            Ok(result) if result.is_success() => {
+                tracing::info!(
+                    "fee voting: SetFee applied at flag ledger #{} (base={} reserve_base={} reserve_inc={})",
+                    ledger_seq,
+                    new.base_fee,
+                    new.reserve_base,
+                    new.reserve_increment
+                );
+            }
+            Ok(result) => {
+                tracing::warn!("fee voting: SetFee pseudo-tx failed: {}", result);
+            }
+            Err(e) => {
+                tracing::error!("fee voting: failed to apply SetFee pseudo-tx: {}", e);
+            }
+        }
     }
 
     /// Forward a received `Validation` message into the consensus engine's

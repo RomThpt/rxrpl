@@ -27,6 +27,34 @@ pub struct NodeConfig {
     pub reporting: ReportingConfig,
     #[serde(default)]
     pub amendments: AmendmentConfig,
+    #[serde(default)]
+    pub fee_vote: FeeVoteConfig,
+}
+
+/// Fee / reserve voting targets advertised at flag ledgers.
+///
+/// Mirrors rippled's `[voting]` config section. Each field is the value this
+/// validator *wants* for the corresponding fee parameter. A `None` field means
+/// "no preference" — the node votes for the current on-ledger value and never
+/// pushes to change that parameter. With every field unset (the default), fee
+/// voting is a complete no-op: no vote fields are added to validations and no
+/// `SetFee` pseudo-transaction is ever produced, so a non-configured node is
+/// byte-for-byte identical to one without fee voting at all.
+///
+/// Consensus note: a fee change only enacts when a super-majority of the UNL
+/// agrees, so these targets must be coordinated across the trusted validator
+/// set — a lone divergent target simply never reaches majority.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct FeeVoteConfig {
+    /// Preferred base transaction fee, in drops (`sfBaseFeeDrops`).
+    #[serde(default)]
+    pub base_fee_drops: Option<u64>,
+    /// Preferred account base reserve, in drops (`sfReserveBaseDrops`).
+    #[serde(default)]
+    pub reserve_base_drops: Option<u64>,
+    /// Preferred owner reserve increment, in drops (`sfReserveIncrementDrops`).
+    #[serde(default)]
+    pub reserve_increment_drops: Option<u64>,
 }
 
 /// Reporting mode configuration.
