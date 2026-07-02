@@ -310,6 +310,7 @@ impl ServerContext {
         tx_queue: Option<Arc<RwLock<TxQueue>>>,
         relay_tx: Option<mpsc::UnboundedSender<(Hash256, Vec<u8>)>>,
         pruner_state: Arc<PrunerState>,
+        metrics_handle: Option<PrometheusHandle>,
     ) -> Arc<Self> {
         let (event_tx, _) = broadcast::channel(1024);
         Arc::new(Self {
@@ -321,7 +322,7 @@ impl ServerContext {
             tx_store,
             tx_queue,
             relay_tx,
-            metrics_handle: None,
+            metrics_handle,
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
             pruner_state: Some(pruner_state),
             shard_manager: None,

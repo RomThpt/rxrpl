@@ -411,6 +411,7 @@ impl Node {
             Some(Arc::clone(&self.tx_queue)),
             None, // no relay in standalone mode
             self.pruner.shared_state(),
+            Some(rxrpl_rpc_server::metrics::global_handle()),
         );
         let event_tx = ctx.event_sender().clone();
 
@@ -1169,6 +1170,7 @@ impl Node {
             Some(Arc::clone(&self.tx_queue)),
             Some(relay_tx),
             self.pruner.shared_state(),
+            Some(rxrpl_rpc_server::metrics::global_handle()),
         );
         ctx.attach_validator_list_status(Arc::clone(&vl_status));
         ctx.attach_network_id(self.config.network.network_id);
@@ -3398,6 +3400,12 @@ impl Node {
                 });
             }
         });
+
+        // Prometheus: current validated ledger height + tx count on every close,
+        // the two gauges operators graph. No-op unless the global recorder was
+        // installed at startup (via `metrics::global_handle`).
+        rxrpl_rpc_server::metrics::set_ledger_sequence(closed_seq as f64);
+        rxrpl_rpc_server::metrics::set_ledger_tx_count(tx_count as f64);
 
         // Emit book change events for order book modifications
         if has_offer_changes {
