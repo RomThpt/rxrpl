@@ -823,7 +823,9 @@ async fn validation_dispatch_offloads_signature_verify() {
         .try_recv()
         .expect("verify job queued");
     assert_eq!(job.validation.ledger_seq, 42);
-    assert!(crate::identity::verify_validation_signature(&job.validation));
+    assert!(crate::identity::verify_validation_signature(
+        &job.validation
+    ));
 }
 
 #[tokio::test]

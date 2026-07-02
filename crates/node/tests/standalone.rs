@@ -137,7 +137,10 @@ async fn standalone_auto_close() {
     // auto-close advance itself is asserted below.
     let resp = rpc_call(&addr, "ledger", json!({ "ledger_index": "current" })).await;
     let initial_seq = resp["result"]["ledger"]["ledger_index"].as_u64().unwrap();
-    assert!(initial_seq >= 2, "expected running ledger >= 2, got {initial_seq}");
+    assert!(
+        initial_seq >= 2,
+        "expected running ledger >= 2, got {initial_seq}"
+    );
 
     // Wait for at least one further close.
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
