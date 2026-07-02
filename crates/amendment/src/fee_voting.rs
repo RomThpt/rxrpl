@@ -156,18 +156,30 @@ pub fn tally_fee_votes(
 /// `EnableAmendment` pseudo-tx ([`crate::voting::make_enable_amendment_tx`]).
 /// `xrp_fees` selects the field variant per the `XRPFees` amendment: the
 /// `*Drops` fields when enabled, the legacy fields (plus `ReferenceFeeUnits`)
-/// otherwise. The tx-engine `SetFeeTransactor` consumes exactly these field
-/// names. `LedgerSequence` is the flag ledger's successor (`flag_ledger_seq + 1`),
-/// matching rippled's `sfLedgerSequence = lcl->seq() + 1`.
+/// otherwise. `LedgerSequence` is the flag ledger's successor
+/// (`flag_ledger_seq + 1`), matching rippled's `sfLedgerSequence = lcl->seq() + 1`.
+///
+/// The canonical pseudo-tx skeleton fields — `Account = ACCOUNT_ZERO`,
+/// `Sequence = 0`, `Fee = "0"`, `SigningPubKey = ""` — are included so the
+/// serialized transaction (and therefore its id / the tx-tree hash) is
+/// byte-identical to rippled's `FeeVoteImpl::doVoting` `STTx`. Verified against
+/// a real mainnet SetFee (txid recomputes exactly). The tx-engine ignores them
+/// on the pseudo-tx apply path but they are consensus-critical for the hash.
 pub fn make_set_fee_tx(
     new: FeeSettingsVote,
     flag_ledger_seq: u32,
     xrp_fees: bool,
 ) -> serde_json::Value {
     let ledger_sequence = flag_ledger_seq + 1;
+    // The all-zero AccountID (`ACCOUNT_ZERO`), base58check-encoded.
+    const ACCOUNT_ZERO: &str = "rrrrrrrrrrrrrrrrrrrrrhoLvTp";
     if xrp_fees {
         serde_json::json!({
             "TransactionType": "SetFee",
+            "Account": ACCOUNT_ZERO,
+            "Sequence": 0u32,
+            "Fee": "0",
+            "SigningPubKey": "",
             "LedgerSequence": ledger_sequence,
             "BaseFeeDrops": new.base_fee.to_string(),
             "ReserveBaseDrops": new.reserve_base.to_string(),
@@ -179,8 +191,14 @@ pub fn make_set_fee_tx(
         // units; ReferenceFeeUnits carries rippled's kFeeUnitsDeprecated (10).
         serde_json::json!({
             "TransactionType": "SetFee",
+            "Account": ACCOUNT_ZERO,
+            "Sequence": 0u32,
+            "Fee": "0",
+            "SigningPubKey": "",
             "LedgerSequence": ledger_sequence,
-            "BaseFee": new.base_fee.to_string(),
+            // sfBaseFee is a UInt64; rippled renders UInt64 fields as an
+            // uppercase hex string in JSON, and the codec parses them as hex.
+            "BaseFee": format!("{:X}", new.base_fee),
             "ReserveBase": new.reserve_base as u32,
             "ReserveIncrement": new.reserve_increment as u32,
             "ReferenceFeeUnits": 10u32,
@@ -382,6 +400,11 @@ mod tests {
         assert_eq!(tx["ReserveBaseDrops"], "20000000");
         assert_eq!(tx["ReserveIncrementDrops"], "5000000");
         assert!(tx.get("BaseFee").is_none());
+        // Canonical pseudo-tx skeleton (byte-exactness vs rippled).
+        assert_eq!(tx["Account"], "rrrrrrrrrrrrrrrrrrrrrhoLvTp");
+        assert_eq!(tx["Sequence"], 0);
+        assert_eq!(tx["Fee"], "0");
+        assert_eq!(tx["SigningPubKey"], "");
     }
 
     #[test]
@@ -394,10 +417,15 @@ mod tests {
         let tx = make_set_fee_tx(new, 512, false);
         assert_eq!(tx["TransactionType"], "SetFee");
         assert_eq!(tx["LedgerSequence"], 513);
-        assert_eq!(tx["BaseFee"], "10");
+        // sfBaseFee is a UInt64: rendered as an uppercase hex string (10 -> "A").
+        assert_eq!(tx["BaseFee"], "A");
         assert_eq!(tx["ReserveBase"], 200);
         assert_eq!(tx["ReserveIncrement"], 50);
         assert_eq!(tx["ReferenceFeeUnits"], 10);
         assert!(tx.get("BaseFeeDrops").is_none());
+        assert_eq!(tx["Account"], "rrrrrrrrrrrrrrrrrrrrrhoLvTp");
+        assert_eq!(tx["Sequence"], 0);
+        assert_eq!(tx["Fee"], "0");
+        assert_eq!(tx["SigningPubKey"], "");
     }
 }

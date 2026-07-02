@@ -30,17 +30,19 @@ fn current_of(fees: &FeeSettings) -> FeeSettingsVote {
     }
 }
 
-/// Read the committed `FeeSettings.BaseFee` (canonical binary -> JSON). The
-/// field may render as a decimal string, hex string, or number depending on the
-/// codec; accept all three.
+/// Rules with `XRPFees` enabled, so voting emits the modern drops variant
+/// (`BaseFeeDrops`, an XRP amount) rather than the legacy `BaseFee` UInt64.
+fn drops_rules() -> Rules {
+    Rules::from_enabled([rxrpl_amendment::feature_id("XRPFees")])
+}
+
+/// Read the committed `FeeSettings.BaseFeeDrops` (canonical binary -> JSON).
+/// The drops field is an XRP amount, rendered as a decimal string or number.
 fn committed_base_fee(ledger: &Ledger) -> Option<u64> {
     let data = ledger.get_state(&keylet::fee_settings())?;
     let obj = rxrpl_ledger::sle_codec::decode_state(data).expect("FeeSettings decodes");
-    match &obj["BaseFee"] {
-        Value::String(s) => s
-            .parse::<u64>()
-            .or_else(|_| u64::from_str_radix(s, 16))
-            .ok(),
+    match &obj["BaseFeeDrops"] {
+        Value::String(s) => s.parse::<u64>().ok(),
         Value::Number(n) => n.as_u64(),
         _ => None,
     }
@@ -107,7 +109,7 @@ fn no_op_when_target_equals_current_even_with_peer_votes() {
 fn applies_setfee_on_flag_ledger_when_configured() {
     let engine = make_engine();
     let fees = FeeSettings::default();
-    let rules = Rules::new();
+    let rules = drops_rules();
     let mut ledger = Ledger::genesis();
 
     let cur = current_of(&fees);
@@ -130,7 +132,7 @@ fn applies_setfee_on_flag_ledger_when_configured() {
 fn peer_majority_beats_self_vote() {
     let engine = make_engine();
     let fees = FeeSettings::default();
-    let rules = Rules::new();
+    let rules = drops_rules();
     let mut ledger = Ledger::genesis();
 
     let cur = current_of(&fees);
@@ -158,5 +160,47 @@ fn peer_majority_beats_self_vote() {
         committed_base_fee(&ledger),
         Some(cur.base_fee + 2),
         "peer majority (+2) must win over our self-vote (+10)"
+    );
+}
+
+// --- Byte-exact SetFee serialization vs a rippled 3.2.0 oracle ---
+//
+// The SetFee pseudo-tx must serialize identically to rippled's
+// `FeeVoteImpl::doVoting` STTx, or the transaction-tree hash forks cross-impl.
+// Oracle bytes were captured from rippled 3.2.0 (source + a real mainnet SetFee
+// whose txid recomputes exactly). Scenario: BaseFee 20 drops, ReserveBase 10 XRP
+// (10_000_000), ReserveIncrement 2 XRP (2_000_000), flag ledger 256 -> tx in 257.
+
+#[test]
+fn setfee_drops_serialization_is_byte_exact_vs_rippled() {
+    let new = FeeSettingsVote {
+        base_fee: 20,
+        reserve_base: 10_000_000,
+        reserve_increment: 2_000_000,
+    };
+    let tx = rxrpl_amendment::fee_voting::make_set_fee_tx(new, 256, true);
+    let bytes = rxrpl_codec::binary::encode(&tx).expect("SetFee encodes");
+    let expected = "120065240000000026000001016840000000000000006016400000000000001460174000000000989680601840000000001e8480730081140000000000000000000000000000000000000000";
+    assert_eq!(
+        hex::encode(&bytes),
+        expected,
+        "drops SetFee must match rippled byte-for-byte"
+    );
+}
+
+#[test]
+fn setfee_legacy_serialization_is_byte_exact_vs_rippled() {
+    let new = FeeSettingsVote {
+        base_fee: 20,
+        reserve_base: 10_000_000,
+        reserve_increment: 2_000_000,
+    };
+    let tx = rxrpl_amendment::fee_voting::make_set_fee_tx(new, 256, false);
+    let bytes = rxrpl_codec::binary::encode(&tx).expect("SetFee encodes");
+    let expected = "12006524000000002600000101201e0000000a201f009896802020001e8480350000000000000014684000000000000000730081140000000000000000000000000000000000000000";
+    assert_eq!(
+        hex::encode(&bytes),
+        expected,
+        "legacy SetFee must match rippled byte-for-byte"
     );
 }
