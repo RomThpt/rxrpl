@@ -131,17 +131,24 @@ async fn standalone_auto_close() {
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Initial state: current=2, last closed=1
+    // The node opens #2 on top of the closed genesis #1. Auto-close may already
+    // have advanced it by the time we poll (the close cadence is not gated on
+    // wall-clock precision), so only require a valid running ledger here; the
+    // auto-close advance itself is asserted below.
     let resp = rpc_call(&addr, "ledger", json!({ "ledger_index": "current" })).await;
-    assert_eq!(resp["result"]["ledger"]["ledger_index"], 2);
+    let initial_seq = resp["result"]["ledger"]["ledger_index"].as_u64().unwrap();
+    assert!(initial_seq >= 2, "expected running ledger >= 2, got {initial_seq}");
 
-    // Wait for at least one close
+    // Wait for at least one further close.
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
-    // After close: current should be >= 3
+    // After close: current should have advanced past where we started.
     let resp = rpc_call(&addr, "ledger", json!({ "ledger_index": "current" })).await;
     let current_seq = resp["result"]["ledger"]["ledger_index"].as_u64().unwrap();
-    assert!(current_seq >= 3, "expected >= 3, got {current_seq}");
+    assert!(
+        current_seq > initial_seq,
+        "auto-close should advance the ledger: started {initial_seq}, now {current_seq}"
+    );
 
     // Closed ledger should have a non-zero hash
     let resp = rpc_call(&addr, "ledger_closed", json!({})).await;
