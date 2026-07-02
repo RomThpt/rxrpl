@@ -15,6 +15,24 @@ pub struct EnableAmendmentTransactor;
 const TF_GOT_MAJORITY: u32 = 0x00010000;
 const TF_LOST_MAJORITY: u32 = 0x00020000;
 
+/// The amendment hash of a `Majorities` STArray element (`{"Majority": {...}}`).
+fn majority_amendment(entry: &Value) -> Option<&str> {
+    entry
+        .get("Majority")
+        .and_then(|m| m.get("Amendment"))
+        .and_then(|v| v.as_str())
+}
+
+/// Borrow the `Majorities` array, inserting an empty one if absent.
+fn ensure_majorities(obj: &mut Value) -> Result<&mut Vec<Value>, TransactionResult> {
+    let map = obj.as_object_mut().ok_or(TransactionResult::TefInternal)?;
+    map.entry("Majorities")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    map.get_mut("Majorities")
+        .and_then(|v| v.as_array_mut())
+        .ok_or(TransactionResult::TefInternal)
+}
+
 impl Transactor for EnableAmendmentTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
         // Amendment hash must be present (64-char hex)
@@ -69,7 +87,6 @@ impl Transactor for EnableAmendmentTransactor {
                 serde_json::json!({
                     "LedgerEntryType": "Amendments",
                     "Amendments": [],
-                    "Majorities": [],
                 }),
                 false,
             )
@@ -77,29 +94,28 @@ impl Transactor for EnableAmendmentTransactor {
 
         match flags {
             TF_GOT_MAJORITY => {
-                // Add to Majorities
-                let majorities = obj
-                    .get_mut("Majorities")
-                    .and_then(|v| v.as_array_mut())
-                    .ok_or(TransactionResult::TefInternal)?;
-
-                // Don't add duplicate
+                // The close time recorded in the Majorities entry is the parent
+                // ledger's close time (rippled Change::applyAmendment:
+                // `view().parentCloseTime()`), not a field on the pseudo-tx.
+                let close_time = ctx.view.parent_close_time();
+                let majorities = ensure_majorities(&mut obj)?;
                 if !majorities
                     .iter()
-                    .any(|m| m.get("Amendment").and_then(|v| v.as_str()) == Some(amendment_hash))
+                    .any(|m| majority_amendment(m) == Some(amendment_hash))
                 {
+                    // Each STArray element is the inner `Majority` object; the
+                    // codec requires this wrapper to encode byte-exact.
                     majorities.push(serde_json::json!({
-                        "Amendment": amendment_hash,
-                        "CloseTime": ctx.tx.get("CloseTime").cloned().unwrap_or(Value::from(0)),
+                        "Majority": {
+                            "Amendment": amendment_hash,
+                            "CloseTime": close_time,
+                        }
                     }));
                 }
             }
             TF_LOST_MAJORITY => {
-                // Remove from Majorities
                 if let Some(majorities) = obj.get_mut("Majorities").and_then(|v| v.as_array_mut()) {
-                    majorities.retain(|m| {
-                        m.get("Amendment").and_then(|v| v.as_str()) != Some(amendment_hash)
-                    });
+                    majorities.retain(|m| majority_amendment(m) != Some(amendment_hash));
                 }
             }
             0 => {
@@ -110,14 +126,24 @@ impl Transactor for EnableAmendmentTransactor {
                     .ok_or(TransactionResult::TefInternal)?;
                 amendments.push(Value::String(amendment_hash.to_string()));
 
-                // Remove from Majorities
                 if let Some(majorities) = obj.get_mut("Majorities").and_then(|v| v.as_array_mut()) {
-                    majorities.retain(|m| {
-                        m.get("Amendment").and_then(|v| v.as_str()) != Some(amendment_hash)
-                    });
+                    majorities.retain(|m| majority_amendment(m) != Some(amendment_hash));
                 }
             }
             _ => return Err(TransactionResult::TefInternal),
+        }
+
+        // rippled removes the Majorities field once it holds nothing
+        // (`makeFieldAbsent`); an empty STArray would still serialize a field
+        // marker and diverge from mainnet's account_hash.
+        if obj
+            .get("Majorities")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| a.is_empty())
+        {
+            if let Some(map) = obj.as_object_mut() {
+                map.remove("Majorities");
+            }
         }
 
         let data = serde_json::to_vec(&obj).map_err(|_| TransactionResult::TefInternal)?;
@@ -225,7 +251,8 @@ mod tests {
 
     #[test]
     fn apply_got_majority_adds_to_majorities() {
-        let ledger = Ledger::genesis();
+        let mut ledger = Ledger::genesis();
+        ledger.header.parent_close_time = 831959361;
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let mut sandbox = Sandbox::new(&view);
@@ -242,13 +269,21 @@ mod tests {
         let result = EnableAmendmentTransactor.apply(&mut ctx).unwrap();
         assert_eq!(result, TransactionResult::TesSuccess);
 
-        // Verify amendment in Majorities
+        // The Majorities STArray element is wrapped in a `Majority` object and
+        // the close time comes from the parent ledger, not the pseudo-tx.
         let key = keylet::amendments();
         let data = sandbox.read(&key).unwrap();
         let obj: Value = serde_json::from_slice(&data).unwrap();
         let majorities = obj["Majorities"].as_array().unwrap();
         assert_eq!(majorities.len(), 1);
-        assert_eq!(majorities[0]["Amendment"].as_str().unwrap(), AMENDMENT_HASH);
+        assert_eq!(
+            majorities[0]["Majority"]["Amendment"].as_str().unwrap(),
+            AMENDMENT_HASH
+        );
+        assert_eq!(
+            majorities[0]["Majority"]["CloseTime"].as_u64().unwrap(),
+            831959361
+        );
     }
 
     #[test]
@@ -260,7 +295,7 @@ mod tests {
         let amendments_obj = serde_json::json!({
             "LedgerEntryType": "Amendments",
             "Amendments": [],
-            "Majorities": [{ "Amendment": AMENDMENT_HASH, "CloseTime": 0 }],
+            "Majorities": [{ "Majority": { "Amendment": AMENDMENT_HASH, "CloseTime": 0 } }],
         });
         ledger
             .put_state(amendments_key, serde_json::to_vec(&amendments_obj).unwrap())
@@ -282,10 +317,10 @@ mod tests {
         let result = EnableAmendmentTransactor.apply(&mut ctx).unwrap();
         assert_eq!(result, TransactionResult::TesSuccess);
 
+        // Losing the only majority removes the whole Majorities field.
         let data = sandbox.read(&amendments_key).unwrap();
         let obj: Value = serde_json::from_slice(&data).unwrap();
-        let majorities = obj["Majorities"].as_array().unwrap();
-        assert!(majorities.is_empty());
+        assert!(obj.get("Majorities").is_none());
     }
 
     #[test]
@@ -296,7 +331,7 @@ mod tests {
         let amendments_obj = serde_json::json!({
             "LedgerEntryType": "Amendments",
             "Amendments": [],
-            "Majorities": [{ "Amendment": AMENDMENT_HASH, "CloseTime": 0 }],
+            "Majorities": [{ "Majority": { "Amendment": AMENDMENT_HASH, "CloseTime": 0 } }],
         });
         ledger
             .put_state(amendments_key, serde_json::to_vec(&amendments_obj).unwrap())
@@ -323,8 +358,7 @@ mod tests {
         let amendments = obj["Amendments"].as_array().unwrap();
         assert_eq!(amendments.len(), 1);
         assert_eq!(amendments[0].as_str().unwrap(), AMENDMENT_HASH);
-        // Majorities should be cleared
-        let majorities = obj["Majorities"].as_array().unwrap();
-        assert!(majorities.is_empty());
+        // Activating the only majority removes the whole Majorities field.
+        assert!(obj.get("Majorities").is_none());
     }
 }

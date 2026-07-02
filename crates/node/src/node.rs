@@ -3942,7 +3942,14 @@ impl Node {
         close_time: u32,
         ledger_seq: u32,
     ) -> Rules {
-        if !rxrpl_amendment::is_flag_ledger(ledger_seq) {
+        // Amendment (and fee) pseudo-transactions land in the ledger AFTER a
+        // flag ledger, not in the flag ledger itself: rippled's onClose injects
+        // them when `prevLedger->isFlagLedger()`, so they carry
+        // `LedgerSequence == flag + 1` and the Amendments SLE changes one ledger
+        // later than the vote is tallied. (nUNL, handled separately, DOES land
+        // in the flag ledger.) Gating on the previous ledger keeps the whole
+        // tally/apply keyed to `ledger_seq == flag + 1`.
+        if ledger_seq == 0 || !rxrpl_amendment::is_flag_ledger(ledger_seq - 1) {
             return amendment_table.build_rules();
         }
 
@@ -3962,9 +3969,29 @@ impl Node {
             return rules;
         }
 
+        // Apply the pseudo-transactions in the order a validating peer would.
+        // rippled orders the consensus set by (salted account, sequence, txid);
+        // every amendment pseudo-tx carries account 0 and sequence 0, so within
+        // a flag+1 ledger they apply in transaction-id order. Sorting here keeps
+        // the resulting account_hash deterministic (independent of the tally's
+        // hash-set iteration order) and matches rippled when more than one
+        // amendment changes on the same ledger.
+        let mut pending: Vec<(
+            Hash256,
+            &rxrpl_amendment::AmendmentAction,
+            serde_json::Value,
+        )> = Vec::with_capacity(actions.len());
         for action in &actions {
-            let tx = rxrpl_amendment::voting::make_enable_amendment_tx(action);
-            match tx_engine.apply(&tx, ledger, &rules, fees) {
+            let tx = rxrpl_amendment::voting::make_enable_amendment_tx(action, ledger_seq);
+            let txid = rxrpl_codec::binary::encode(&tx)
+                .map(|blob| crate::play_forward::transaction_id(&blob))
+                .unwrap_or_else(|_| Hash256::new([0u8; 32]));
+            pending.push((txid, action, tx));
+        }
+        pending.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+
+        for (_txid, action, tx) in &pending {
+            match tx_engine.apply(tx, ledger, &rules, fees) {
                 Ok(result) => {
                     if result.is_success() {
                         match action {
