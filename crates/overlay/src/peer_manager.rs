@@ -178,6 +178,27 @@ pub struct PeerManagerConfig {
     pub cluster_broadcast_interval_secs: u64,
 }
 
+/// Depth of the queue feeding the validation-signature verify worker. Sized
+/// well above the steady-state validation rate so bursts are absorbed off the
+/// event loop; once full, the event loop verifies inline (never dropping one).
+const VALIDATION_VERIFY_QUEUE: usize = 8192;
+
+/// A received validation awaiting off-loop signature verification.
+struct ValidationVerifyJob {
+    from: Hash256,
+    payload: Vec<u8>,
+    validation: Validation,
+}
+
+/// The outcome of an off-loop signature verification, handed back to the event
+/// loop for reputation, squelch, relay, master-key resolution and forwarding.
+struct ValidationVerifyResult {
+    from: Hash256,
+    payload: Vec<u8>,
+    validation: Validation,
+    valid: bool,
+}
+
 /// Central P2P network manager.
 ///
 /// Accepts inbound connections, manages outbound connections,
@@ -199,6 +220,10 @@ pub struct PeerManager {
     /// Count of messages shed because [`consensus_tx`](Self::consensus_tx) was
     /// full (overload back-pressure). Surfaced via [`consensus_dropped`].
     consensus_dropped: AtomicU64,
+    validation_verify_tx: mpsc::Sender<ValidationVerifyJob>,
+    validation_verify_rx: Option<mpsc::Receiver<ValidationVerifyJob>>,
+    validation_verify_result_tx: mpsc::Sender<ValidationVerifyResult>,
+    validation_verify_result_rx: mpsc::Receiver<ValidationVerifyResult>,
     ledger_provider: Option<Arc<dyn LedgerProvider>>,
     node_store: Option<Arc<dyn rxrpl_shamap::NodeStore>>,
     ledger_syncer: LedgerSyncer,
@@ -264,6 +289,9 @@ impl PeerManager {
         // growing an unbounded queue (audit finding C4). 8192 is well
         // above the steady-state of 21 peers x 100 msg/s rate-limited.
         let (event_tx, event_rx) = mpsc::channel(8192);
+        let (validation_verify_tx, validation_verify_rx) = mpsc::channel(VALIDATION_VERIFY_QUEUE);
+        let (validation_verify_result_tx, validation_verify_result_rx) =
+            mpsc::channel(VALIDATION_VERIFY_QUEUE);
         let peer_set = Arc::new(PeerSet::new(
             config.max_peers,
             config.reserved_outbound_slots,
@@ -291,6 +319,10 @@ impl PeerManager {
             event_tx,
             consensus_tx,
             consensus_dropped: AtomicU64::new(0),
+            validation_verify_tx,
+            validation_verify_rx: Some(validation_verify_rx),
+            validation_verify_result_tx,
+            validation_verify_result_rx,
             ledger_provider: None,
             node_store: None,
             ledger_syncer: LedgerSyncer::new(),
@@ -508,6 +540,29 @@ impl PeerManager {
         let mut batch_relay_interval = tokio::time::interval(Duration::from_millis(250));
         batch_relay_interval.tick().await; // skip first immediate tick
 
+        // Dedicated worker that verifies validation signatures off the event
+        // loop. It owns the job receiver and forwards each verified outcome back
+        // to the loop over `validation_verify_result_tx`.
+        if let Some(mut verify_rx) = self.validation_verify_rx.take() {
+            let result_tx = self.validation_verify_result_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                while let Some(job) = verify_rx.blocking_recv() {
+                    let valid = crate::identity::verify_validation_signature(&job.validation);
+                    if result_tx
+                        .blocking_send(ValidationVerifyResult {
+                            from: job.from,
+                            payload: job.payload,
+                            validation: job.validation,
+                            valid,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+
         loop {
             tokio::select! {
                 accept_result = listener.accept() => {
@@ -528,6 +583,15 @@ impl PeerManager {
 
                 Some(event) = self.event_rx.recv() => {
                     self.handle_event(event);
+                }
+
+                Some(result) = self.validation_verify_result_rx.recv() => {
+                    self.handle_verified_validation(
+                        result.from,
+                        result.payload,
+                        result.validation,
+                        result.valid,
+                    );
                 }
 
                 _ = sync_interval.tick() => {
@@ -818,6 +882,88 @@ impl PeerManager {
         }
     }
 
+    /// Post-verification handling of a received validation, once its signature
+    /// has been checked (on the verify worker, or inline when the queue is
+    /// full). Splitting this out lets the signature check run off the event loop
+    /// while reputation, squelch, relay, master-key resolution and consensus
+    /// forwarding stay on it.
+    fn handle_verified_validation(
+        &mut self,
+        from: Hash256,
+        payload: Vec<u8>,
+        mut validation: Validation,
+        valid: bool,
+    ) {
+        let peer_info = self.peer_set.get(&from);
+        if !valid {
+            tracing::warn!(
+                "rejecting validation with invalid signature for ledger #{}",
+                validation.ledger_seq,
+            );
+            if let Some(ref info) = peer_info {
+                info.reputation.record_invalid_message();
+            }
+            return;
+        }
+
+        if let Some(ref info) = peer_info {
+            info.reputation.record_valid_message(payload.len() as u64);
+        }
+
+        // Track which peer is relaying this validator's messages and send
+        // squelch to redundant sources.
+        if let Some(action) = self
+            .squelch_manager
+            .record_validation_source(from, &validation.public_key)
+        {
+            self.send_squelch_to_peers(&action);
+        }
+
+        if let Some(ref tx) = self.server_event_tx {
+            let _ = tx.send(serde_json::json!({
+                "type": "validationReceived",
+                "validator": validation.node_id.0.to_string(),
+                "ledger_hash": validation.ledger_hash.to_string(),
+                "ledger_seq": validation.ledger_seq,
+                "full": validation.full,
+            }));
+        }
+
+        // Relay validation to peers, respecting inbound squelch. A node still
+        // acquiring its base state is not a useful relay, and this loop is
+        // O(validators x peers) per message on the single event loop that must
+        // drive the state sync, so skip it during initial catchup. We still
+        // verify and forward to the node loop so the quorum-validated tip is
+        // learned.
+        if !self.ledger_syncer.in_initial_catchup() {
+            for (id, handle) in &self.peer_handles {
+                if *id != from
+                    && !self
+                        .squelch_manager
+                        .is_relay_squelched(id, &validation.public_key)
+                {
+                    let _ = handle.tx.try_send(PeerMessage {
+                        msg_type: MessageType::Validation,
+                        payload: payload.clone(),
+                    });
+                }
+            }
+        }
+
+        // Resolve the ephemeral signing key to the validator's master key via
+        // the manifest store, so the consensus loop can match it against the
+        // master-keyed trusted set. Without this the trust filter never matches
+        // a real validation (its public_key is the ephemeral key) and zero
+        // trusted validations are ever counted.
+        if let Ok(eph) = rxrpl_primitives::PublicKey::from_slice(&validation.public_key) {
+            if let Some(master) = self.manifest_store.master_key_for_ephemeral(&eph) {
+                validation.master_public_key = Some(master.as_bytes().to_vec());
+            }
+        }
+
+        self.forward_to_consensus(ConsensusMessage::Validation(validation));
+    }
+
     fn dispatch_message(&mut self, from: Hash256, msg_type: MessageType, payload: &[u8]) {
         let peer_info = self.peer_set.get(&from);
         let payload_len = payload.len() as u64;
@@ -938,80 +1084,35 @@ impl PeerManager {
             },
             MessageType::Validation => {
                 match proto_convert::decode_validation(payload) {
-                    Ok(mut validation) => {
-                        // Reject validations with missing or invalid signatures
-                        if !crate::identity::verify_validation_signature(&validation) {
-                            tracing::warn!(
-                                "rejecting validation with invalid signature for ledger #{}",
-                                validation.ledger_seq,
-                            );
-                            if let Some(ref info) = peer_info {
-                                info.reputation.record_invalid_message();
+                    Ok(validation) => {
+                        // Signature verification (secp256k1/ed25519 over the
+                        // canonical STObject) is the dominant CPU cost on this
+                        // event loop -- a busy flag ledger relays tens of
+                        // thousands of validations in seconds, which would stall
+                        // the loop and starve the sync pipeline. Offload it to a
+                        // worker thread; the verified result comes back on
+                        // `validation_verify_result_rx` and is handled by
+                        // `handle_verified_validation`. If the queue is saturated
+                        // (or unavailable) fall back to verifying inline so no
+                        // validation is silently dropped.
+                        let job = ValidationVerifyJob {
+                            from,
+                            payload: payload.to_vec(),
+                            validation,
+                        };
+                        match self.validation_verify_tx.try_send(job) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(job))
+                            | Err(mpsc::error::TrySendError::Closed(job)) => {
+                                let valid =
+                                    crate::identity::verify_validation_signature(&job.validation);
+                                self.handle_verified_validation(
+                                    job.from,
+                                    job.payload,
+                                    job.validation,
+                                    valid,
+                                );
                             }
-                        } else {
-                            if let Some(ref info) = peer_info {
-                                info.reputation.record_valid_message(payload_len);
-                            }
-
-                            // Track which peer is relaying this validator's messages
-                            // and send squelch to redundant sources.
-                            if let Some(action) = self
-                                .squelch_manager
-                                .record_validation_source(from, &validation.public_key)
-                            {
-                                self.send_squelch_to_peers(&action);
-                            }
-
-                            if let Some(ref tx) = self.server_event_tx {
-                                let _ = tx.send(serde_json::json!({
-                                    "type": "validationReceived",
-                                    "validator": validation.node_id.0.to_string(),
-                                    "ledger_hash": validation.ledger_hash.to_string(),
-                                    "ledger_seq": validation.ledger_seq,
-                                    "full": validation.full,
-                                }));
-                            }
-
-                            // Relay validation to peers, respecting inbound squelch.
-                            // A node still acquiring its base state is not a useful
-                            // relay, and this loop is O(validators x peers) per
-                            // message on the single event loop that must drive the
-                            // state sync, so skip it during initial catchup. We
-                            // still verify (above) and forward to the node loop
-                            // (below) so the quorum-validated tip is learned.
-                            if !self.ledger_syncer.in_initial_catchup() {
-                                for (id, handle) in &self.peer_handles {
-                                    if *id != from
-                                        && !self
-                                            .squelch_manager
-                                            .is_relay_squelched(id, &validation.public_key)
-                                    {
-                                        let _ = handle.tx.try_send(PeerMessage {
-                                            msg_type: MessageType::Validation,
-                                            payload: payload.to_vec(),
-                                        });
-                                    }
-                                }
-                            }
-
-                            // Resolve the ephemeral signing key to the
-                            // validator's master key via the manifest store, so
-                            // the consensus loop can match it against the
-                            // master-keyed trusted set. Without this the trust
-                            // filter never matches a real validation (its
-                            // public_key is the ephemeral key) and zero trusted
-                            // validations are ever counted.
-                            if let Ok(eph) =
-                                rxrpl_primitives::PublicKey::from_slice(&validation.public_key)
-                            {
-                                if let Some(master) =
-                                    self.manifest_store.master_key_for_ephemeral(&eph)
-                                {
-                                    validation.master_public_key = Some(master.as_bytes().to_vec());
-                                }
-                            }
-
-                            self.forward_to_consensus(ConsensusMessage::Validation(validation));
                         }
                     }
                     Err(_) => {
