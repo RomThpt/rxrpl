@@ -307,6 +307,12 @@ impl<'a> BinaryParser<'a> {
             "AccountID" => {
                 let len = self.read_vl_length()?;
                 let bytes = self.read_bytes(len)?;
+                // An empty VL is the SOTemplate-default (unset) account, e.g.
+                // UNLModify's sfAccount. Render it as an empty string, the
+                // inverse of the serializer's empty-account handling.
+                if bytes.is_empty() {
+                    return Ok(Value::String(String::new()));
+                }
                 // Encode as classic address
                 let account_id = rxrpl_primitives::AccountId::from_slice(bytes)
                     .map_err(|e| CodecError::InvalidAddress(e.to_string()))?;

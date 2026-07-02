@@ -4109,9 +4109,17 @@ impl Node {
         for change in changes {
             let tx = serde_json::json!({
                 "TransactionType": "UNLModify",
+                // Canonical pseudo-tx skeleton (byte-exactness vs rippled). For
+                // UNLModify sfAccount is left at the SOTemplate default -> empty
+                // VL (`8100`), NOT the 20 zero bytes an EnableAmendment emits;
+                // the empty Account string drives the codec's empty-VL path.
+                "Account": "",
+                "Sequence": 0u32,
+                "Fee": "0",
+                "SigningPubKey": "",
+                "LedgerSequence": change.ledger_seq,
                 "UNLModifyDisabling": if change.disable { 1u32 } else { 0u32 },
                 "UNLModifyValidator": change.validator_key,
-                "LedgerSequence": change.ledger_seq,
             });
             match tx_engine.apply(&tx, ledger, &rules, fees) {
                 Ok(result) => {
