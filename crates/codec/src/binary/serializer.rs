@@ -362,6 +362,15 @@ impl BinarySerializer {
             CodecError::UnsupportedType("expected string for AccountID".to_string())
         })?;
 
+        // An empty string denotes the SOTemplate-default (unset) account, which
+        // rippled serializes as an empty VL (length 0, no bytes). This is how
+        // the zero-Account UNLModify pseudo-transaction encodes sfAccount --
+        // distinct from an explicit ACCOUNT_ZERO, which is 20 zero bytes.
+        if s.is_empty() {
+            self.write_vl_length(0);
+            return Ok(());
+        }
+
         let account_bytes = if s.len() == 40 {
             hex::decode(s).map_err(|e| CodecError::Hex(e.to_string()))?
         } else {
@@ -634,6 +643,34 @@ mod tests {
         // Verify: m * 10^e == 100
         assert_eq!(e, -13);
         assert_eq!(m, 1_000_000_000_000_000);
+    }
+
+    #[test]
+    fn unl_modify_empty_account_is_byte_exact_and_round_trips() {
+        // rippled leaves sfAccount at the SOTemplate default on UNLModify, so it
+        // serializes as an EMPTY VL (`8100`), not 20 zero bytes. An empty
+        // Account string must drive that path, match rippled byte-for-byte, and
+        // decode back to "". Oracle: hash-verified mainnet UNLModify
+        // 32ECFA4C... at ledger 105298944 (Disabling=0).
+        let tx = serde_json::json!({
+            "TransactionType": "UNLModify",
+            "Account": "",
+            "Sequence": 0u32,
+            "Fee": "0",
+            "SigningPubKey": "",
+            "LedgerSequence": 105298944u32,
+            "UNLModifyDisabling": 0u32,
+            "UNLModifyValidator": "EDD3DB9E85A9B26772464BE9FCE120007E504AAF7AFF4648FA24E155B35A48FE6D",
+        });
+        let bytes = crate::binary::encode(&tx).unwrap();
+        let oracle = "1200662400000000260646bc006840000000000000007300701321edd3db9e85a9b26772464be9fce120007e504aaf7aff4648fa24e155b35a48fe6d810000101100";
+        assert_eq!(
+            hex::encode(&bytes),
+            oracle,
+            "UNLModify must serialize byte-for-byte like rippled"
+        );
+        let back = crate::binary::decode(&bytes).unwrap();
+        assert_eq!(back["Account"], "", "empty VL Account must decode to \"\"");
     }
 
     #[test]
