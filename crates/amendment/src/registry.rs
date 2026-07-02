@@ -106,6 +106,7 @@ const RETIRED_AMENDMENTS: &[&str] = &[
     "SortedDirectories",
     "fix1201",
     "fix1512",
+    "fix1513",
     "fix1523",
     "fix1528",
     "DepositAuth",
