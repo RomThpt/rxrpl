@@ -631,7 +631,17 @@ impl AMMWithdrawTransactor {
         let (tokens, payout1, payout2) = if drains_all {
             (lp_in, pool1, pool2)
         } else {
-            let tokens = amm_helpers::adjust_lp_tokens_withdraw(total, &lp_in);
+            // rippled `adjustLPTokensIn`: tfWithdrawAll burns the holder's full
+            // LP balance unadjusted, so the trust line drains to zero and is
+            // deleted; only a partial LPTokenIn withdraw snaps the burned tokens
+            // onto the pool's LP grid. Adjusting here too would leave a dust LP
+            // balance, so the line (and its owner-directory entry / OwnerCount)
+            // would wrongly survive.
+            let tokens = if withdraw_all {
+                lp_in
+            } else {
+                amm_helpers::adjust_lp_tokens_withdraw(total, &lp_in)
+            };
             // equalWithdrawTokens: frac = divide(tokensAdj, lptAMMBalance,
             // noIssue()) — rounded onto the IOU grid, not a full-precision ratio.
             let frac = Number::from_iou(
