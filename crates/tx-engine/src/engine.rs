@@ -308,9 +308,16 @@ impl TxEngine {
             view: &view,
             rules,
         };
-        if let Err(result) = transactor.preclaim(&preclaim_ctx) {
-            return Ok(result);
-        }
+        // A `tec` from preclaim is a claimed failure: rippled still includes the
+        // transaction, charges the fee and consumes the sequence/ticket, and
+        // applies no other effect. Only ter/tem/tef/tel (not is_claimed) are
+        // left out entirely and pay nothing. `preclaim` returns Err, so
+        // `is_claimed()` here means exactly `tec`.
+        let preclaim_tec = match transactor.preclaim(&preclaim_ctx) {
+            Ok(()) => None,
+            Err(result) if result.is_claimed() => Some(result),
+            Err(result) => return Ok(result),
+        };
 
         // 6. Create sandbox and deduct fee from sender account
         //    (skip fee deduction for pseudo-transactions)
@@ -373,50 +380,56 @@ impl TxEngine {
             }
         }
 
-        // 7. Apply in child sandbox
-        let mut child = sandbox.child();
-
-        let handler_result = if tx_type == TransactionType::BatchSubmit {
-            self.apply_batch(tx, &mut child, rules, fees)
+        // 7. Apply in child sandbox. A preclaim `tec` skips this entirely: the
+        // fee and sequence/ticket were already charged in the parent sandbox and
+        // it produces no further effect.
+        let (result, should_commit) = if let Some(tec) = preclaim_tec {
+            (tec, true)
         } else {
-            let mut apply_ctx = ApplyContext {
-                tx,
-                view: &mut child,
-                rules,
-                fees,
+            let mut child = sandbox.child();
+
+            let handler_result = if tx_type == TransactionType::BatchSubmit {
+                self.apply_batch(tx, &mut child, rules, fees)
+            } else {
+                let mut apply_ctx = ApplyContext {
+                    tx,
+                    view: &mut child,
+                    rules,
+                    fees,
+                };
+                transactor.apply(&mut apply_ctx)
             };
-            transactor.apply(&mut apply_ctx)
-        };
-        // Consume child to release borrow on sandbox
-        let child_changes = child.into_changes();
+            // Consume child to release borrow on sandbox
+            let child_changes = child.into_changes();
 
-        let (result, should_commit) = match handler_result {
-            Ok(result) => {
-                // tes: merge child mutations into parent
-                sandbox.merge_child_changes(child_changes);
+            match handler_result {
+                Ok(result) => {
+                    // tes: merge child mutations into parent
+                    sandbox.merge_child_changes(child_changes);
 
-                // Execute hooks on the destination account (if any)
-                if result == TransactionResult::TesSuccess {
-                    let tx_hash = rxrpl_protocol::tx::compute_tx_hash(tx).unwrap_or_default();
-                    if let Some(hook_result) =
-                        crate::hooks::execute_hooks_for_tx(tx, &tx_hash, &sandbox)
-                    {
-                        if hook_result.rollback {
-                            // A hook called rollback -- revert the transaction
-                            return Ok(TransactionResult::TecHookRejected);
+                    // Execute hooks on the destination account (if any)
+                    if result == TransactionResult::TesSuccess {
+                        let tx_hash = rxrpl_protocol::tx::compute_tx_hash(tx).unwrap_or_default();
+                        if let Some(hook_result) =
+                            crate::hooks::execute_hooks_for_tx(tx, &tx_hash, &sandbox)
+                        {
+                            if hook_result.rollback {
+                                // A hook called rollback -- revert the transaction
+                                return Ok(TransactionResult::TecHookRejected);
+                            }
                         }
                     }
-                }
 
-                (result, true)
-            }
-            Err(result) if result.is_claimed() => {
-                // tec: discard child mutations, keep fee deduction
-                (result, true)
-            }
-            Err(result) => {
-                // tem/tef/ter: discard everything
-                return Ok(result);
+                    (result, true)
+                }
+                Err(result) if result.is_claimed() => {
+                    // tec: discard child mutations, keep fee deduction
+                    (result, true)
+                }
+                Err(result) => {
+                    // tem/tef/ter: discard everything
+                    return Ok(result);
+                }
             }
         };
 
@@ -657,6 +670,24 @@ mod tests {
         }
     }
 
+    /// A test transactor whose `preclaim` fails with a tec (claimed cost).
+    struct PreclaimTecTransactor;
+
+    impl Transactor for PreclaimTecTransactor {
+        fn preflight(&self, _ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
+            Ok(())
+        }
+        fn preclaim(&self, _ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
+            Err(TransactionResult::TecClaimCost)
+        }
+        fn apply(
+            &self,
+            _ctx: &mut ApplyContext<'_>,
+        ) -> Result<TransactionResult, TransactionResult> {
+            unreachable!("a preclaim tec must not reach apply");
+        }
+    }
+
     fn test_engine_with(
         tx_type: TransactionType,
         transactor: impl Transactor + 'static,
@@ -846,6 +877,28 @@ mod tests {
         let data = ledger.get_state(&key).unwrap();
         let account: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
         assert_eq!(account["Balance"].as_str().unwrap(), "999990");
+    }
+
+    #[test]
+    fn preclaim_tec_charges_fee_and_consumes_sequence() {
+        // rippled includes a preclaim tec, charging the fee and bumping the
+        // sequence, then applies no other effect. Only ter/tem/tef/tel are left
+        // out and pay nothing.
+        let engine = test_engine_with(TransactionType::AccountSet, PreclaimTecTransactor);
+        let mut ledger = setup_ledger_with_account("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh", 1_000_000);
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+        let tx = make_tx("AccountSet");
+
+        let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
+        assert_eq!(result, TransactionResult::TecClaimCost);
+
+        let account_id = decode_account_id("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh").unwrap();
+        let key = keylet::account(&account_id);
+        let data = ledger.get_state(&key).unwrap();
+        let account: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
+        assert_eq!(account["Balance"].as_str().unwrap(), "999990");
+        assert_eq!(account["Sequence"].as_u64().unwrap(), 2);
     }
 
     #[test]
