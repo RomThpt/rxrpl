@@ -350,6 +350,32 @@ pub fn adjust_lp_tokens_withdraw(
     Number::from_iou(&minus).add(&t).to_iou()
 }
 
+/// rippled `divide(STAmount, STAmount, noIssue())` (STAmount.cpp) under the
+/// modern `getSTNumberSwitchover` regime: `muldiv(num, 1e17, den) + 5` with
+/// exponent `numExp - denExp - 17`, canonicalised onto the 16-significant-digit
+/// IOU grid with round-half-even.
+///
+/// This is NOT `Number::div` (which ports `Number::operator/` and omits the
+/// `+5`): the AMM equal-withdraw fraction is `frac = divide(tokensAdj,
+/// lptAMMBalance, noIssue())`, an STAmount, and the `+5` legacy fudge shifts an
+/// exact half-tie one ULP upward where the plain `Number` quotient rounds it
+/// down — a divergence amplified by the pool balance into a 1-2 ULP asset payout.
+pub fn stamount_divide_iou(
+    num: &rxrpl_amount::IOUAmount,
+    den: &rxrpl_amount::IOUAmount,
+) -> rxrpl_amount::IOUAmount {
+    use rxrpl_amount::IOUAmount;
+    use rxrpl_amount::number::Number;
+    if num.mantissa() == 0 {
+        return IOUAmount::ZERO;
+    }
+    const TEN_TO_17: u128 = 100_000_000_000_000_000;
+    let scaled = (num.mantissa() as u128) * TEN_TO_17 / (den.mantissa() as u128) + 5;
+    let exp = num.exponent() - den.exponent() - 17;
+    let neg = num.sign_bit() != den.sign_bit();
+    Number::new(neg, scaled as u64, exp).to_iou()
+}
+
 /// `getRoundedAsset(balance, frac, Withdraw)` for an IOU leg: `multiply(balance,
 /// frac, Downward)` rounded onto the IOU grid (minimise the payout).
 pub fn rounded_asset_down_iou(
@@ -940,6 +966,26 @@ mod tests {
     // drops, tfee 967. rippled delivers exactly 0.03775571 BEAR. The 19-digit
     // "Large" scale would give 0.0377557229938542 (wrong); the 16-digit Small
     // scale baked into swap_asset_in reproduces the chain value byte-for-byte.
+    // Mainnet tx 529015BD… (ledger 105330061): Beats/XRP tfWithdrawAll. The
+    // equal-withdraw frac = divide(holderLP, totalLP, noIssue()) must use the
+    // STAmount `+5` fudge (round-half-even), not the plain Number quotient:
+    // the tie lands on an odd digit and rounds UP one ULP, moving the Beats
+    // payout floor from 202088.9724532827 (Number::div) to the chain's
+    // 202088.9724532829.
+    #[test]
+    fn stamount_divide_beats_withdraw_all_byte_exact() {
+        use rxrpl_amount::number::{MantissaScale, MantissaScaleGuard};
+        let _scale = MantissaScaleGuard::new(MantissaScale::Small);
+        let tokens = parse_iou_value("847705.70467585");
+        let total = parse_iou_value("59602830.80566885");
+        let frac = stamount_divide_iou(&tokens, &total);
+        assert_eq!(frac.mantissa(), 1_422_257_455_253_660);
+
+        let pool = Number::from_iou(&parse_iou_value("14209028.87214891"));
+        let payout = rounded_asset_down_iou(&pool, &Number::from_iou(&frac));
+        assert_eq!(payout.to_decimal_string(), "202088.9724532829");
+    }
+
     #[test]
     fn swap_asset_in_xrp_bear_byte_exact() {
         let pool_in = Number::from_int(116_014_735_240); // pool XRP drops

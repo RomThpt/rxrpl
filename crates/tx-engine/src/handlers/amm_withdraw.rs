@@ -643,12 +643,10 @@ impl AMMWithdrawTransactor {
                 amm_helpers::adjust_lp_tokens_withdraw(total, &lp_in)
             };
             // equalWithdrawTokens: frac = divide(tokensAdj, lptAMMBalance,
-            // noIssue()) — rounded onto the IOU grid, not a full-precision ratio.
-            let frac = Number::from_iou(
-                &Number::from_iou(&tokens)
-                    .div(&Number::from_iou(total))
-                    .to_iou(),
-            );
+            // noIssue()) — the STAmount free function (muldiv + `+5`, half-even),
+            // not the plain Number quotient. The `+5` fudge is what rounds a
+            // half-tie up one ULP and reproduces the chain's asset payout.
+            let frac = Number::from_iou(&amm_helpers::stamount_divide_iou(&tokens, total));
             let p1 = leg1.rounded_asset_down(&pool1, &frac);
             let p2 = leg2.rounded_asset_down(&pool2, &frac);
             (tokens, p1, p2)
