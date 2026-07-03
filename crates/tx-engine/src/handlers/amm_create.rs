@@ -1,3 +1,4 @@
+use rxrpl_amendment::feature::feature_id;
 use rxrpl_codec::address::classic::{decode_account_id, encode_account_id};
 use rxrpl_primitives::{AccountId, Hash256};
 use rxrpl_protocol::{TransactionResult, keylet};
@@ -131,14 +132,22 @@ impl Transactor for AMMCreateTransactor {
         let amt2_num = amount_to_number(&amount2_field)?;
         let lp_tokens = amm_helpers::amm_lp_tokens(&amt1_num, &amt2_num);
 
-        // 1. Create the AMM pseudo-account root. Pseudo-accounts always have
-        // sfSequence = 0 (rippled's createPseudoAccount), not the ledger index.
+        // 1. Create the AMM pseudo-account root. rippled's createPseudoAccount
+        // sets sfSequence to the ledger index, unless the SingleAssetVault or
+        // LendingProtocol amendment is enabled -- then it is 0.
         let amm_acct_key = keylet::account(&amm_id);
+        let pseudo_seq = if ctx.rules.enabled(&feature_id("SingleAssetVault"))
+            || ctx.rules.enabled(&feature_id("LendingProtocol"))
+        {
+            0
+        } else {
+            ctx.view.seq()
+        };
         let amm_acct = serde_json::json!({
             "LedgerEntryType": "AccountRoot",
             "Account": amm_str,
             "Balance": "0",
-            "Sequence": 0,
+            "Sequence": pseudo_seq,
             "OwnerCount": 0,
             "Flags": LSF_DISABLE_MASTER | LSF_DEFAULT_RIPPLE | LSF_DEPOSIT_AUTH,
             "AMMID": hex::encode_upper(amm_key.as_bytes()),
@@ -672,11 +681,12 @@ mod tests {
         assert!(amm.get("VoteSlots").is_some());
         assert!(amm.get("AuctionSlot").is_some());
 
-        // AMM pseudo-account root has Sequence = 0 (like all pseudo-accounts).
+        // Without SingleAssetVault/LendingProtocol the AMM pseudo-account root
+        // takes the ledger sequence (rippled's createPseudoAccount).
         let amm_id = decode_account_id(amm["Account"].as_str().unwrap()).unwrap();
         let amm_acct_bytes = sandbox.read(&keylet::account(&amm_id)).unwrap();
         let amm_acct: serde_json::Value = serde_json::from_slice(&amm_acct_bytes).unwrap();
-        assert_eq!(amm_acct["Sequence"].as_u64().unwrap(), 0);
+        assert_eq!(amm_acct["Sequence"].as_u64().unwrap(), sandbox.seq() as u64);
 
         // The LP RippleState (creator <-> AMM pseudo-account) carries LowNode
         // and HighNode even at page 0 (rippled's trustCreate).
