@@ -3852,17 +3852,23 @@ does not apply to this tx type (e.g. a pure delete/modify)."
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .unwrap();
+        // The parent-state bootstrap paginates ~9k `ledger_data` pages; a busy
+        // RPC node intermittently resets the connection. Retry with backoff so a
+        // transient reset mid-bootstrap doesn't abort the whole (multi-hour) run.
         let rpc = |params: serde_json::Value| -> Value {
             rt.block_on(async {
-                client
-                    .post(&url)
-                    .json(&params)
-                    .send()
-                    .await
-                    .unwrap()
-                    .json()
-                    .await
-                    .unwrap()
+                for attempt in 0..12u32 {
+                    if let Ok(resp) = client.post(&url).json(&params).send().await {
+                        if let Ok(v) = resp.json::<Value>().await {
+                            return v;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        500 * u64::from(attempt + 1),
+                    ))
+                    .await;
+                }
+                panic!("rpc failed after retries: {params}");
             })
         };
 
