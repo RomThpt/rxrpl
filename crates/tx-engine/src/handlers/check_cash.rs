@@ -141,13 +141,21 @@ impl Transactor for CheckCashTransactor {
             // Delivered amount: a fixed Amount delivers exactly; a DeliverMin
             // delivers up to SendMax, capped by the drawer's spendable XRP
             // (rippled doApply: max(deliverMin, min(sendMax, xrpLiquid(-1)))).
+            // `srcLiquid` = the drawer's spendable XRP with the check's own
+            // reserve freed (rippled doApply `xrpLiquid(-1)`).
+            let src_liquid =
+                src_balance.saturating_sub(ctx.fees.account_reserve(owner_count.saturating_sub(1)));
             let cash_amount = if is_amount {
                 requested
             } else {
-                let src_liquid = src_balance
-                    .saturating_sub(ctx.fees.account_reserve(owner_count.saturating_sub(1)));
                 send_max.min(src_liquid).max(requested)
             };
+            // rippled doApply: `srcLiquid < xrpDeliver` is unfunded. This also
+            // keeps the debit at or below the drawer's balance (the preclaim
+            // `available` includes one freed increment and can exceed it).
+            if src_liquid < cash_amount {
+                return Err(TransactionResult::TecUnfundedPayment);
+            }
             helpers::set_balance(&mut check_src_account, src_balance - cash_amount);
             helpers::adjust_owner_count(&mut check_src_account, -1);
             let check_src_data = serde_json::to_vec(&check_src_account)
@@ -520,5 +528,57 @@ mod tests {
                 .unwrap_or(true);
             assert!(empty, "{label} owner-dir root must be empty after cashing");
         }
+    }
+
+    #[test]
+    fn cash_amount_above_spendable_is_tec_not_panic() {
+        // Regression: a drawer whose balance sits below its reserve had the cash
+        // amount (allowed by the reserve-freed preclaim `available`) exceed the
+        // raw balance, underflowing the debit `src_balance - cash_amount`.
+        // rippled returns a tec; we must not panic.
+        let mut ledger = Ledger::genesis();
+        let src_id = decode_account_id(SRC).unwrap();
+        let dst_id = decode_account_id(DST).unwrap();
+        for (addr, id, bal, oc) in [
+            (SRC, &src_id, 1_000_000u64, 1u64),
+            (DST, &dst_id, 50_000_000, 0),
+        ] {
+            let acct = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": addr,
+                "Balance": bal.to_string(), "Sequence": 1, "OwnerCount": oc, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(id), serde_json::to_vec(&acct).unwrap())
+                .unwrap();
+        }
+        let check_key = keylet::check(&src_id, 1);
+        let check = serde_json::json!({
+            "LedgerEntryType": "Check", "Account": SRC, "Destination": DST,
+            "SendMax": "5000000", "Sequence": 1, "Flags": 0,
+        });
+        ledger
+            .put_state(check_key, serde_json::to_vec(&check).unwrap())
+            .unwrap();
+        let check_id = hex::encode(check_key.as_bytes());
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "CheckCash", "Account": DST, "CheckID": check_id,
+            "Amount": "1500000", "Fee": "12", "Sequence": 1,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        // 1 XRP balance minus reserve can't fund a 1.5 XRP cash: tec, not a panic.
+        assert_eq!(
+            CheckCashTransactor.apply(&mut ctx),
+            Err(TransactionResult::TecUnfundedPayment)
+        );
     }
 }
