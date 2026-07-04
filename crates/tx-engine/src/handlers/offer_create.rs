@@ -3009,6 +3009,42 @@ fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) ->
     if !holder_positive {
         return zero;
     }
+    // rippled `accountFundsHelper` prices a maker's IOU with
+    // `ZeroIfFrozen`/`ZeroIfUnauthorized`: a maker cannot deliver an IOU it
+    // can't move, so the offer is found unfunded (0) and reaped. Mirror that —
+    // the issuer global-froze, or froze this line, or requires auth and hasn't
+    // authorized it.
+    const LSF_LOW_FREEZE: u64 = 0x0040_0000;
+    const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
+    const LSF_LOW_AUTH: u64 = 0x0004_0000;
+    const LSF_HIGH_AUTH: u64 = 0x0008_0000;
+    const LSF_GLOBAL_FREEZE: u64 = 0x0040_0000;
+    const LSF_REQUIRE_AUTH: u64 = 0x0004_0000;
+    let tl_flags = tl.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+    let issuer_flags = ctx
+        .view
+        .read(&keylet::account(&gets.issuer))
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|a| a.get("Flags").and_then(Value::as_u64))
+        .unwrap_or(0);
+    let line_frozen = if issuer_is_low {
+        tl_flags & LSF_LOW_FREEZE != 0
+    } else {
+        tl_flags & LSF_HIGH_FREEZE != 0
+    };
+    if line_frozen || issuer_flags & LSF_GLOBAL_FREEZE != 0 {
+        return zero;
+    }
+    if issuer_flags & LSF_REQUIRE_AUTH != 0 {
+        let authorized = if issuer_is_low {
+            tl_flags & LSF_LOW_AUTH != 0
+        } else {
+            tl_flags & LSF_HIGH_AUTH != 0
+        };
+        if !authorized {
+            return zero;
+        }
+    }
     let mag = raw_str.trim_start_matches('-');
     Leg {
         is_xrp: false,
@@ -3066,5 +3102,126 @@ fn remove_from_book_dir(
             return Ok(());
         }
         page = next_page;
+    }
+}
+
+#[cfg(test)]
+mod owner_funds_tests {
+    use super::*;
+    use crate::fees::FeeSettings;
+    use crate::transactor::ApplyContext;
+    use crate::view::ledger_view::LedgerView;
+    use crate::view::sandbox::Sandbox;
+    use rxrpl_amendment::Rules;
+    use rxrpl_ledger::Ledger;
+
+    const MAKER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    const ISSUER: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
+
+    // Build a ledger where MAKER holds 100 USD from ISSUER with the given
+    // trust-line and issuer-account flags, then return the maker's offer funds
+    // for an offer that SELLS that USD (`owner_funds_leg` on the USD leg).
+    fn maker_usd_funds(line_flags: u64, issuer_flags: u64) -> Leg {
+        let maker = decode_account_id(MAKER).unwrap();
+        let issuer = decode_account_id(ISSUER).unwrap();
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+        let issuer_is_low = issuer.as_bytes() < maker.as_bytes();
+        // Balance is the low account's view; the maker (holder) is positive iff
+        // value < 0 when the issuer is low, else value > 0.
+        let value = if issuer_is_low { "-100" } else { "100" };
+        let (low, high) = if issuer_is_low {
+            (ISSUER, MAKER)
+        } else {
+            (MAKER, ISSUER)
+        };
+        let mut ledger = Ledger::genesis();
+        for (addr, id, flags) in [(MAKER, &maker, 0u64), (ISSUER, &issuer, issuer_flags)] {
+            let acct = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": addr,
+                "Balance": "100000000", "Sequence": 1, "OwnerCount": 0, "Flags": flags,
+            });
+            ledger
+                .put_state(keylet::account(id), serde_json::to_vec(&acct).unwrap())
+                .unwrap();
+        }
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": value},
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "0"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "1000000"},
+            "Flags": line_flags,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&maker, &issuer, &cur),
+                serde_json::to_vec(&tl).unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({});
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let gets = Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: IOUAmount::ZERO,
+            currency: cur,
+            issuer,
+        };
+        owner_funds_leg(&mut ctx, &maker, &gets)
+    }
+
+    fn freeze_flag() -> u64 {
+        let maker = decode_account_id(MAKER).unwrap();
+        let issuer = decode_account_id(ISSUER).unwrap();
+        if issuer.as_bytes() < maker.as_bytes() {
+            0x0040_0000 // lsfLowFreeze
+        } else {
+            0x0080_0000 // lsfHighFreeze
+        }
+    }
+
+    fn auth_flag() -> u64 {
+        let maker = decode_account_id(MAKER).unwrap();
+        let issuer = decode_account_id(ISSUER).unwrap();
+        if issuer.as_bytes() < maker.as_bytes() {
+            0x0004_0000 // lsfLowAuth
+        } else {
+            0x0008_0000 // lsfHighAuth
+        }
+    }
+
+    #[test]
+    fn clean_line_is_funded() {
+        assert!(!maker_usd_funds(0, 0).is_zero());
+    }
+
+    #[test]
+    fn issuer_frozen_line_is_zero() {
+        assert!(maker_usd_funds(freeze_flag(), 0).is_zero());
+    }
+
+    #[test]
+    fn issuer_global_freeze_is_zero() {
+        assert!(maker_usd_funds(0, 0x0040_0000).is_zero());
+    }
+
+    #[test]
+    fn require_auth_unauthorized_is_zero() {
+        assert!(maker_usd_funds(0, 0x0004_0000).is_zero());
+    }
+
+    #[test]
+    fn require_auth_authorized_is_funded() {
+        assert!(!maker_usd_funds(auth_flag(), 0x0004_0000).is_zero());
     }
 }
