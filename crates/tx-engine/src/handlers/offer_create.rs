@@ -731,6 +731,19 @@ fn cross_offers(
                     continue;
                 }
             }
+            // A bad offer with a zero amount on either side is removed 0-fill
+            // (rippled `OfferStream`: `amount.empty()`).
+            if offer_out.is_zero() || offer_in.is_zero() {
+                reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                continue;
+            }
+            // A maker whose IN asset (what it receives) is deep-frozen can neither
+            // receive nor send it, so the offer is removed 0-fill (rippled
+            // `OfferStream`: `isDeepFrozen(owner, assetIn)`).
+            if is_deep_frozen(ctx, &owner, &offer_in) {
+                reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                continue;
+            }
             // Owner-funds clamp: an offer can give at most what its owner
             // holds. Fully funded → the whole offer is available; underfunded
             // but positive → fill against the funded amount; zero → reap.
@@ -2943,6 +2956,29 @@ fn check_permissioned_asset(
 /// than requiring the whole offer to be funded). XRP uses the raw balance; an
 /// IOU issuer can always issue its own currency (not a binding constraint); an
 /// IOU holder is bounded by its trust-line balance.
+/// rippled `isDeepFrozen(view, account, asset)`: a line the account holds for
+/// `asset` is deep-frozen when either side set the deep-freeze flag (a
+/// deep-frozen line can neither receive nor send). XRP and the issuer's own
+/// asset are never deep-frozen.
+fn is_deep_frozen(ctx: &mut ApplyContext<'_>, account: &AccountId, asset: &Leg) -> bool {
+    const LSF_LOW_DEEP_FREEZE: u64 = 0x0200_0000;
+    const LSF_HIGH_DEEP_FREEZE: u64 = 0x0400_0000;
+    if asset.is_xrp || &asset.issuer == account {
+        return false;
+    }
+    let Some(tl_bytes) =
+        ctx.view
+            .read(&keylet::trust_line(account, &asset.issuer, &asset.currency))
+    else {
+        return false;
+    };
+    let Ok(tl) = serde_json::from_slice::<Value>(&tl_bytes) else {
+        return false;
+    };
+    let flags = tl.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+    flags & (LSF_LOW_DEEP_FREEZE | LSF_HIGH_DEEP_FREEZE) != 0
+}
+
 fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) -> Leg {
     let zero = Leg {
         is_xrp: gets.is_xrp,
@@ -3223,5 +3259,64 @@ mod owner_funds_tests {
     #[test]
     fn require_auth_authorized_is_funded() {
         assert!(!maker_usd_funds(auth_flag(), 0x0004_0000).is_zero());
+    }
+
+    // Does MAKER's USD line report deep-frozen for the given line flags?
+    fn maker_usd_deep_frozen(line_flags: u64) -> bool {
+        let maker = decode_account_id(MAKER).unwrap();
+        let issuer = decode_account_id(ISSUER).unwrap();
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+        let issuer_is_low = issuer.as_bytes() < maker.as_bytes();
+        let (low, high) = if issuer_is_low {
+            (ISSUER, MAKER)
+        } else {
+            (MAKER, ISSUER)
+        };
+        let mut ledger = Ledger::genesis();
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": "0"},
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "0"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "1000000"},
+            "Flags": line_flags,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&maker, &issuer, &cur),
+                serde_json::to_vec(&tl).unwrap(),
+            )
+            .unwrap();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({});
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let asset = Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: IOUAmount::ZERO,
+            currency: cur,
+            issuer,
+        };
+        is_deep_frozen(&mut ctx, &maker, &asset)
+    }
+
+    #[test]
+    fn deep_freeze_detected_either_side() {
+        assert!(maker_usd_deep_frozen(0x0200_0000)); // lsfLowDeepFreeze
+        assert!(maker_usd_deep_frozen(0x0400_0000)); // lsfHighDeepFreeze
+    }
+
+    #[test]
+    fn clean_or_regular_freeze_is_not_deep_frozen() {
+        assert!(!maker_usd_deep_frozen(0));
+        assert!(!maker_usd_deep_frozen(0x0040_0000)); // regular freeze, not deep
     }
 }
