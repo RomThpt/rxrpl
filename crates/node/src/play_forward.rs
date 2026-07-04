@@ -99,6 +99,81 @@ pub fn parse_tx_set(result: &Value) -> Result<(Hash256, TxSet), NodeError> {
     Ok((set_hash, txs))
 }
 
+/// Reseed read keys with their MID-LEDGER value for a single-tx oracle.
+///
+/// The oracle seeds every read key from the parent ledger, but a key our target
+/// tx only READS (not in its own `AffectedNodes`) may have been changed by an
+/// EARLIER tx in the same ledger. Order the ledger's txs canonically, and for
+/// every read key an earlier tx modified/created — but our tx does not affect —
+/// overwrite the parent seed with that earlier tx's `FinalFields`/`NewFields`
+/// (the last earlier writer wins). Keys our tx affects are left to the
+/// metadata-driven reconstruction. Without this a `tec` whose verdict depends on
+/// such a key (e.g. a CheckCash drawer drained earlier in the ledger) can't be
+/// reproduced.
+#[cfg(test)]
+fn reseed_mid_ledger(
+    state: &mut rxrpl_shamap::SHAMap,
+    set_hash: Hash256,
+    txs: &[(Hash256, Vec<u8>)],
+    want_id: Hash256,
+    entries: &[Value],
+    affected: &[(String, String)],
+    read_keys: &std::collections::BTreeSet<String>,
+) {
+    let ordered = canonical_order(set_hash, txs.to_vec());
+    let Some(tpos) = ordered.iter().position(|(id, _)| *id == want_id) else {
+        return;
+    };
+    let affected_set: std::collections::HashSet<&str> =
+        affected.iter().map(|(k, _)| k.as_str()).collect();
+    let mut mid: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    for (id, _) in &ordered[..tpos] {
+        let hex = id.to_string().to_uppercase();
+        let Some(m) = entries
+            .iter()
+            .find(|t| t["hash"].as_str().map(str::to_uppercase) == Some(hex.clone()))
+        else {
+            continue;
+        };
+        for node in m["metaData"]["AffectedNodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            for (nt, fld) in [
+                ("ModifiedNode", "FinalFields"),
+                ("CreatedNode", "NewFields"),
+            ] {
+                let Some(e) = node.get(nt) else { continue };
+                let key = e["LedgerIndex"].as_str().unwrap_or_default().to_uppercase();
+                if !read_keys.contains(&key) || affected_set.contains(key.as_str()) {
+                    continue;
+                }
+                if let Some(ff) = e.get(fld).filter(|v| v.is_object()) {
+                    let mut sle = ff.clone();
+                    if let (Some(o), Some(t)) = (
+                        sle.as_object_mut(),
+                        e.get("LedgerEntryType").and_then(|v| v.as_str()),
+                    ) {
+                        o.insert("LedgerEntryType".into(), Value::String(t.into()));
+                    }
+                    mid.insert(key, sle);
+                }
+            }
+        }
+    }
+    for (key, sle) in mid {
+        if let (Ok(kb), Ok(jb)) = (hex::decode(&key), serde_json::to_vec(&sle)) {
+            if let (Ok(kb32), Ok(bin)) = (
+                <[u8; 32]>::try_from(kb),
+                rxrpl_ledger::sle_codec::encode_sle(&jb),
+            ) {
+                let _ = state.put(Hash256::new(kb32), bin);
+            }
+        }
+    }
+}
+
 /// Build the amendment `Rules` in force for a ledger from its `Amendments`
 /// state object, the way rippled derives them. Returns empty rules (every
 /// amendment off) when the object is absent — correct for pre-amendment
@@ -447,12 +522,12 @@ mod tests {
         let txs_resp = rpc(serde_json::json!({
             "method":"ledger","params":[{"ledger_index":n,"transactions":true,"expand":true,"binary":true}]
         }));
-        let (_set_hash, txs) = parse_tx_set(&txs_resp["result"]).expect("tx set");
+        let (set_hash, txs) = parse_tx_set(&txs_resp["result"]).expect("tx set");
         let want_id: Hash256 = txhash.parse().expect("txhash");
         let blob = txs
-            .into_iter()
+            .iter()
             .find(|(id, _)| *id == want_id)
-            .map(|(_, b)| b)
+            .map(|(_, b)| b.clone())
             .expect("tx not in ledger");
         let tx_json = rxrpl_codec::binary::decode(&blob).expect("decode tx");
 
@@ -1212,6 +1287,17 @@ mod tests {
                     .unwrap();
             }
         }
+
+        // Mid-ledger reconstruction: a read key OUR tx does not itself affect,
+        // but that an EARLIER tx (in canonical apply order) modified in this same
+        // ledger, is stale in the parent seed. Reseed it from that earlier tx's
+        // FinalFields — the state OUR tx actually read at execution. This is what
+        // lets a CheckCash `tec` reproduce when the drawer was drained by an
+        // earlier tx in ledger N (the drawer is not in this tec's AffectedNodes,
+        // so it would otherwise carry its higher parent-ledger balance).
+        reseed_mid_ledger(
+            &mut state, set_hash, &txs, want_id, entries, &affected, &read_keys,
+        );
 
         // Owner-directory pages our tx touches are stale in the parent seed when
         // an EARLIER sibling tx in this same ledger N added/removed entries to the
@@ -1984,12 +2070,12 @@ mod tests {
         let txs_resp = rpc(serde_json::json!({
             "method":"ledger","params":[{"ledger_index":n,"transactions":true,"expand":true,"binary":true}]
         }));
-        let (_set_hash, txs) = parse_tx_set(&txs_resp["result"]).expect("tx set");
+        let (set_hash, txs) = parse_tx_set(&txs_resp["result"]).expect("tx set");
         let want_id: Hash256 = txhash.parse().expect("txhash");
         let blob = txs
-            .into_iter()
+            .iter()
             .find(|(id, _)| *id == want_id)
-            .map(|(_, b)| b)
+            .map(|(_, b)| b.clone())
             .expect("tx not in ledger");
         let tx_json = rxrpl_codec::binary::decode(&blob).expect("decode tx");
 
@@ -2749,6 +2835,17 @@ mod tests {
                     .unwrap();
             }
         }
+
+        // Mid-ledger reconstruction: a read key OUR tx does not itself affect,
+        // but that an EARLIER tx (in canonical apply order) modified in this same
+        // ledger, is stale in the parent seed. Reseed it from that earlier tx's
+        // FinalFields — the state OUR tx actually read at execution. This is what
+        // lets a CheckCash `tec` reproduce when the drawer was drained by an
+        // earlier tx in ledger N (the drawer is not in this tec's AffectedNodes,
+        // so it would otherwise carry its higher parent-ledger balance).
+        reseed_mid_ledger(
+            &mut state, set_hash, &txs, want_id, entries, &affected, &read_keys,
+        );
 
         // Owner-directory pages our tx touches are stale in the parent seed when
         // an EARLIER sibling tx in this same ledger N added/removed entries to the
