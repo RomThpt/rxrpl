@@ -2953,22 +2953,30 @@ fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) ->
     };
     if gets.is_xrp {
         let key = keylet::account(owner);
-        let bal = ctx
+        let acct = ctx
             .view
             .read(&key)
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+        let bal = acct
+            .as_ref()
             .and_then(|a| {
                 a.get("Balance")
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<i64>().ok())
             })
             .unwrap_or(0);
-        if bal <= 0 {
+        // rippled `accountFunds` for XRP is `xrpLiquid(owner, 0)` = balance minus
+        // the account reserve, clamped at zero: an offer can only sell the owner's
+        // spendable XRP, not the reserve-locked portion. Using the raw balance let
+        // a reserve-constrained offer over-fill (execute instead of being reaped).
+        let owner_count = acct.as_ref().map(helpers::get_owner_count).unwrap_or(0);
+        let liquid = bal - ctx.fees.account_reserve(owner_count) as i64;
+        if liquid <= 0 {
             return zero;
         }
         return Leg {
             is_xrp: true,
-            drops: bal,
+            drops: liquid,
             iou: IOUAmount::ZERO,
             currency: gets.currency,
             issuer: gets.issuer,
