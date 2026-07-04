@@ -107,19 +107,19 @@ impl Transactor for CheckCashTransactor {
                 .and_then(|s| s.parse().ok())
                 .ok_or(TransactionResult::TefInternal)?;
 
-            let cash_amount = if let Some(amount) = helpers::get_xrp_amount(ctx.tx) {
-                if amount > send_max {
-                    return Err(TransactionResult::TecInsufficientPayment);
-                }
+            let is_amount = helpers::get_xrp_amount(ctx.tx).is_some();
+            // rippled `value` = the fixed Amount, or the DeliverMin minimum.
+            let requested = if let Some(amount) = helpers::get_xrp_amount(ctx.tx) {
                 amount
             } else {
-                let deliver_min = helpers::get_u64_str_field(ctx.tx, "DeliverMin")
-                    .ok_or(TransactionResult::TemMalformed)?;
-                if deliver_min > send_max {
-                    return Err(TransactionResult::TecInsufficientPayment);
-                }
-                send_max
+                helpers::get_u64_str_field(ctx.tx, "DeliverMin")
+                    .ok_or(TransactionResult::TemMalformed)?
             };
+            // rippled CheckCash preclaim: cashing for more than the check's
+            // SendMax is a partial path.
+            if requested > send_max {
+                return Err(TransactionResult::TecPathPartial);
+            }
 
             let check_src_bytes = ctx
                 .view
@@ -128,9 +128,26 @@ impl Transactor for CheckCashTransactor {
             let mut check_src_account: serde_json::Value = serde_json::from_slice(&check_src_bytes)
                 .map_err(|_| TransactionResult::TefInternal)?;
             let src_balance = helpers::get_balance(&check_src_account);
-            if src_balance < cash_amount {
-                return Err(TransactionResult::TecUnfundedPayment);
+            let owner_count = helpers::get_owner_count(&check_src_account);
+            // rippled preclaim `availableFunds` = the drawer's XRP minus its
+            // reserve, plus one increment (cashing frees the check's own reserve
+            // slot). Cashing more than that is a partial path (tecPATH_PARTIAL),
+            // not the raw-balance / tecUNFUNDED check we had.
+            let available = src_balance.saturating_sub(ctx.fees.account_reserve(owner_count))
+                + ctx.fees.reserve_increment;
+            if requested > available {
+                return Err(TransactionResult::TecPathPartial);
             }
+            // Delivered amount: a fixed Amount delivers exactly; a DeliverMin
+            // delivers up to SendMax, capped by the drawer's spendable XRP
+            // (rippled doApply: max(deliverMin, min(sendMax, xrpLiquid(-1)))).
+            let cash_amount = if is_amount {
+                requested
+            } else {
+                let src_liquid = src_balance
+                    .saturating_sub(ctx.fees.account_reserve(owner_count.saturating_sub(1)));
+                send_max.min(src_liquid).max(requested)
+            };
             helpers::set_balance(&mut check_src_account, src_balance - cash_amount);
             helpers::adjust_owner_count(&mut check_src_account, -1);
             let check_src_data = serde_json::to_vec(&check_src_account)
