@@ -664,6 +664,78 @@ mod tests {
                     }
                 }
             }
+
+            // A crossing OfferCreate walks the OPPOSITE book by quality, reading
+            // each maker Offer, its book-directory page, the maker's AccountRoot
+            // and trust lines (owner-funds), and each issuer's TransferRate. Only
+            // the offers this tx fully consumes appear in AffectedNodes, so the
+            // metadata-driven seed leaves the book un-walkable and the cross dies
+            // as tecPATH_DRY. Seed the whole crossable book from the parent ledger
+            // via `book_offers` (taker_gets/taker_pays swapped: the offers this
+            // OfferCreate takes) so `succ` finds the real quality pages and every
+            // maker offer is fundable.
+            // Only a crossing OfferCreate (one that consumed offers) needs the
+            // book; a plain placement does not, so skip the heavy book fetch.
+            let crossed = txm["metaData"]["AffectedNodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|n| {
+                    ["DeletedNode", "ModifiedNode"]
+                        .iter()
+                        .any(|w| n[w]["LedgerEntryType"].as_str() == Some("Offer"))
+                });
+            let book_asset = |a: &Value| -> Value {
+                match a.as_object() {
+                    Some(o) => {
+                        serde_json::json!({"currency": o["currency"], "issuer": o["issuer"]})
+                    }
+                    None => serde_json::json!({"currency": "XRP"}),
+                }
+            };
+            let book = if crossed {
+                rpc(serde_json::json!({
+                    "method":"book_offers",
+                    "params":[{
+                        "taker_gets": book_asset(&tx_json["TakerPays"]),
+                        "taker_pays": book_asset(&tx_json["TakerGets"]),
+                        "ledger_index": parent,
+                        "limit": 30
+                    }]
+                }))
+            } else {
+                serde_json::json!({})
+            };
+            for off in book["result"]["offers"].as_array().into_iter().flatten() {
+                if let Some(idx) = off["index"].as_str() {
+                    read_keys.insert(idx.to_uppercase());
+                }
+                if let Some(bd) = off["BookDirectory"].as_str() {
+                    read_keys.insert(bd.to_uppercase());
+                }
+                let Some(maker) = off["Account"]
+                    .as_str()
+                    .and_then(|a| decode_account_id(a).ok())
+                else {
+                    continue;
+                };
+                read_keys.insert(keylet::account(&maker).to_string().to_uppercase());
+                for side in ["TakerGets", "TakerPays"] {
+                    if let (Some(iss), Some(cur)) = (
+                        off[side].get("issuer").and_then(|v| v.as_str()),
+                        off[side].get("currency").and_then(|v| v.as_str()),
+                    ) {
+                        if let Ok(iid) = decode_account_id(iss) {
+                            read_keys.insert(keylet::account(&iid).to_string().to_uppercase());
+                            read_keys.insert(
+                                keylet::trust_line(&maker, &iid, &currency_bytes(cur))
+                                    .to_string()
+                                    .to_uppercase(),
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // A multi-signed tx (carrying a `Signers` array) reads the sender's
@@ -2122,6 +2194,78 @@ mod tests {
                         if let Ok(iid) = decode_account_id(iss) {
                             read_keys.insert(
                                 keylet::trust_line(&aid, &iid, &currency_bytes(cur))
+                                    .to_string()
+                                    .to_uppercase(),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // A crossing OfferCreate walks the OPPOSITE book by quality, reading
+            // each maker Offer, its book-directory page, the maker's AccountRoot
+            // and trust lines (owner-funds), and each issuer's TransferRate. Only
+            // the offers this tx fully consumes appear in AffectedNodes, so the
+            // metadata-driven seed leaves the book un-walkable and the cross dies
+            // as tecPATH_DRY. Seed the whole crossable book from the parent ledger
+            // via `book_offers` (taker_gets/taker_pays swapped: the offers this
+            // OfferCreate takes) so `succ` finds the real quality pages and every
+            // maker offer is fundable.
+            // Only a crossing OfferCreate (one that consumed offers) needs the
+            // book; a plain placement does not, so skip the heavy book fetch.
+            let crossed = txm["metaData"]["AffectedNodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|n| {
+                    ["DeletedNode", "ModifiedNode"]
+                        .iter()
+                        .any(|w| n[w]["LedgerEntryType"].as_str() == Some("Offer"))
+                });
+            let book_asset = |a: &Value| -> Value {
+                match a.as_object() {
+                    Some(o) => {
+                        serde_json::json!({"currency": o["currency"], "issuer": o["issuer"]})
+                    }
+                    None => serde_json::json!({"currency": "XRP"}),
+                }
+            };
+            let book = if crossed {
+                rpc(serde_json::json!({
+                    "method":"book_offers",
+                    "params":[{
+                        "taker_gets": book_asset(&tx_json["TakerPays"]),
+                        "taker_pays": book_asset(&tx_json["TakerGets"]),
+                        "ledger_index": parent,
+                        "limit": 30
+                    }]
+                }))
+            } else {
+                serde_json::json!({})
+            };
+            for off in book["result"]["offers"].as_array().into_iter().flatten() {
+                if let Some(idx) = off["index"].as_str() {
+                    read_keys.insert(idx.to_uppercase());
+                }
+                if let Some(bd) = off["BookDirectory"].as_str() {
+                    read_keys.insert(bd.to_uppercase());
+                }
+                let Some(maker) = off["Account"]
+                    .as_str()
+                    .and_then(|a| decode_account_id(a).ok())
+                else {
+                    continue;
+                };
+                read_keys.insert(keylet::account(&maker).to_string().to_uppercase());
+                for side in ["TakerGets", "TakerPays"] {
+                    if let (Some(iss), Some(cur)) = (
+                        off[side].get("issuer").and_then(|v| v.as_str()),
+                        off[side].get("currency").and_then(|v| v.as_str()),
+                    ) {
+                        if let Ok(iid) = decode_account_id(iss) {
+                            read_keys.insert(keylet::account(&iid).to_string().to_uppercase());
+                            read_keys.insert(
+                                keylet::trust_line(&maker, &iid, &currency_bytes(cur))
                                     .to_string()
                                     .to_uppercase(),
                             );

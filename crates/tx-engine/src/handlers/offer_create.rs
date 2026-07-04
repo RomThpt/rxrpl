@@ -721,6 +721,16 @@ fn cross_offers(
             let Some(offer_in) = Leg::parse(&offer["TakerPays"]) else {
                 continue;
             };
+            // An expired offer is removed 0-fill during the book walk, before any
+            // funds/quality crossing (rippled `OfferStream`: `sfExpiration <=
+            // parentCloseTime` via `hasExpired`). Core behaviour, not amendment
+            // gated, so it applies on every ledger.
+            if let Some(exp) = offer.get("Expiration").and_then(|v| v.as_u64()) {
+                if exp <= ctx.view.parent_close_time() as u64 {
+                    reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                    continue;
+                }
+            }
             // Owner-funds clamp: an offer can give at most what its owner
             // holds. Fully funded → the whole offer is available; underfunded
             // but positive → fill against the funded amount; zero → reap.
