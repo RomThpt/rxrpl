@@ -4038,6 +4038,238 @@ does not apply to this tx type (e.g. a pure delete/modify)."
         assert_eq!(diffs, 0, "no state entry may differ from rippled");
     }
 
+    /// Localise the FIRST transaction whose cumulative result diverges from
+    /// mainnet. Replays the ledger like the end-to-end test, but after each tx
+    /// applies it compares that tx's affected SLEs to their on-chain metadata
+    /// (semantic fields only, ignoring PreviousTxnID/LgrSeq threading). The
+    /// bootstrapped parent state is cached on disk (`/tmp/e2e_state_<seq>.bin`)
+    /// so re-runs during a fix loop skip the multi-minute state fetch. Run with
+    /// `RXRPL_PLAY_FORWARD_RPC=... RXRPL_PLAY_FORWARD_LEDGER=N cargo test -p
+    /// rxrpl-node --lib e2e_first_divergent_tx -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "hits a live mainnet RPC server"]
+    fn e2e_first_divergent_tx() {
+        let Ok(url) = std::env::var("RXRPL_PLAY_FORWARD_RPC") else {
+            eprintln!("RXRPL_PLAY_FORWARD_RPC unset; skipping");
+            return;
+        };
+        let next: u32 = std::env::var("RXRPL_PLAY_FORWARD_LEDGER")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .expect("RXRPL_PLAY_FORWARD_LEDGER");
+        let parent_seq = next - 1;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let rpc = |params: serde_json::Value| -> Value {
+            rt.block_on(async {
+                for attempt in 0..12u32 {
+                    if let Ok(resp) = client.post(&url).json(&params).send().await {
+                        if let Ok(v) = resp.json::<Value>().await {
+                            return v;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        500 * u64::from(attempt + 1),
+                    ))
+                    .await;
+                }
+                panic!("rpc failed after retries");
+            })
+        };
+        let parent_resp = rpc(serde_json::json!({
+            "method":"ledger","params":[{"ledger_index":parent_seq}]
+        }));
+        let parent_header = parse_header(&parent_resp["result"]["ledger"]).expect("parent header");
+        let cache = format!("/tmp/e2e_state_{parent_seq}.bin");
+        let mut state = rxrpl_shamap::SHAMap::account_state();
+        if let Ok(data) = std::fs::read(&cache) {
+            let mut off = 0usize;
+            while off + 34 <= data.len() {
+                let key: [u8; 32] = data[off..off + 32].try_into().unwrap();
+                let dlen = u16::from_be_bytes([data[off + 32], data[off + 33]]) as usize;
+                off += 34;
+                state
+                    .put(Hash256::new(key), data[off..off + dlen].to_vec())
+                    .unwrap();
+                off += dlen;
+            }
+            eprintln!("loaded cached parent state");
+        } else {
+            let mut marker: Option<String> = None;
+            loop {
+                let mut p =
+                    serde_json::json!({"ledger_index":parent_seq,"binary":true,"limit":2048});
+                if let Some(m) = &marker {
+                    p["marker"] = Value::String(m.clone());
+                }
+                let r = rpc(serde_json::json!({"method":"ledger_data","params":[p]}));
+                for e in r["result"]["state"].as_array().unwrap() {
+                    let key: [u8; 32] = hex::decode(e["index"].as_str().unwrap())
+                        .unwrap()
+                        .try_into()
+                        .unwrap();
+                    let d = hex::decode(e["data"].as_str().unwrap()).unwrap();
+                    state.put(Hash256::new(key), d).unwrap();
+                }
+                marker = r["result"]["marker"].as_str().map(|s| s.to_string());
+                if marker.is_none() {
+                    break;
+                }
+            }
+            let mut buf = Vec::new();
+            state.for_each(&mut |k, v| {
+                buf.extend_from_slice(k.as_bytes());
+                buf.extend_from_slice(&(v.len() as u16).to_be_bytes());
+                buf.extend_from_slice(v);
+            });
+            let _ = std::fs::write(&cache, &buf);
+        }
+        assert_eq!(
+            state.root_hash(),
+            parent_header.account_hash,
+            "parent state root"
+        );
+        let mut parent = Ledger::from_catchup(parent_seq, parent_header.hash, state);
+        parent.header = parent_header;
+        let fees = fees_for_ledger(&parent);
+
+        let txs_resp = rpc(serde_json::json!({
+            "method":"ledger","params":[{"ledger_index":next,"transactions":true,"expand":true,"binary":true}]
+        }));
+        let (set_hash, txs) = parse_tx_set(&txs_resp["result"]).expect("tx set");
+        let meta_resp = rpc(serde_json::json!({
+            "method":"ledger","params":[{"ledger_index":next,"transactions":true,"expand":true}]
+        }));
+        let entries = meta_resp["result"]["ledger"]["transactions"]
+            .as_array()
+            .expect("txs");
+        let mut meta: std::collections::HashMap<String, Vec<(String, String, Value)>> =
+            Default::default();
+        for t in entries {
+            let hash = t["hash"].as_str().unwrap_or_default().to_uppercase();
+            let mut nodes = Vec::new();
+            for an in t["metaData"]["AffectedNodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                for (nt, fld) in [
+                    ("ModifiedNode", "FinalFields"),
+                    ("CreatedNode", "NewFields"),
+                    ("DeletedNode", "FinalFields"),
+                ] {
+                    if let Some(e) = an.get(nt) {
+                        let key = e["LedgerIndex"].as_str().unwrap_or_default().to_uppercase();
+                        nodes.push((
+                            key,
+                            nt.to_string(),
+                            e.get(fld).cloned().unwrap_or(Value::Null),
+                        ));
+                    }
+                }
+            }
+            meta.insert(hash, nodes);
+        }
+
+        let ledger_open = Ledger::new_open(&parent);
+        let rules = rules_for_ledger(&ledger_open);
+        let mut ledger = ledger_open;
+        let engine = full_engine();
+        let mut pending: Vec<(String, Value)> = canonical_order(set_hash, txs)
+            .into_iter()
+            .filter_map(|(id, blob)| {
+                rxrpl_codec::binary::decode(&blob)
+                    .ok()
+                    .map(|j| (id.to_string().to_uppercase(), j))
+            })
+            .collect();
+        let mut divergent: Vec<String> = Vec::new();
+        loop {
+            let before = pending.len();
+            let mut deferred = Vec::new();
+            for (txid, json) in std::mem::take(&mut pending) {
+                if let Ok(r) = engine.apply(&json, &mut ledger, &rules, &fees) {
+                    if r.is_retryable() {
+                        deferred.push((txid, json));
+                        continue;
+                    }
+                }
+                let Some(nodes) = meta.get(&txid) else {
+                    continue;
+                };
+                let ty = json["TransactionType"].as_str().unwrap_or("?");
+                for (key, nt, fields) in nodes {
+                    let Some(kb) = hex::decode(key)
+                        .ok()
+                        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    else {
+                        continue;
+                    };
+                    let ours = ledger.state_map.get(&Hash256::new(kb));
+                    if nt == "DeletedNode" {
+                        if ours.is_some() && !divergent.contains(&txid) {
+                            divergent.push(txid.clone());
+                            eprintln!("DIVERGENT {txid} ({ty}): {key} kept but should be deleted");
+                        }
+                        continue;
+                    }
+                    let Some(ob) = ours else {
+                        if !divergent.contains(&txid) {
+                            divergent.push(txid.clone());
+                            eprintln!("DIVERGENT {txid} ({ty}): {key} missing in ours");
+                        }
+                        continue;
+                    };
+                    let Ok(oj) = rxrpl_codec::binary::decode(ob) else {
+                        continue;
+                    };
+                    // rippled metadata and our codec render the same value with
+                    // different casing / zero-padding (e.g. IndexNext "d7" vs
+                    // "00000000000000D7"); normalise hex-ish strings before
+                    // comparing so only genuine value differences are flagged.
+                    let norm = |v: &Value| -> String {
+                        match v.as_str() {
+                            Some(s) => {
+                                let t = s.trim_start_matches('0').to_lowercase();
+                                if t.is_empty() { "0".into() } else { t }
+                            }
+                            None => v.to_string(),
+                        }
+                    };
+                    for (f, want) in fields.as_object().into_iter().flatten() {
+                        if f == "PreviousTxnID" || f == "PreviousTxnLgrSeq" {
+                            continue;
+                        }
+                        let same = oj.get(f).map(&norm).as_deref() == Some(&norm(want));
+                        if !same && !divergent.contains(&txid) {
+                            divergent.push(txid.clone());
+                            eprintln!(
+                                "DIVERGENT {txid} ({ty}): {key} .{f} ours={} theirs={}",
+                                oj.get(f).map(ToString::to_string).unwrap_or_default(),
+                                want
+                            );
+                        }
+                    }
+                }
+            }
+            pending = deferred;
+            if pending.is_empty() || pending.len() == before {
+                break;
+            }
+        }
+        eprintln!(
+            "=== {} divergent txs (first is the cumulative root) ===",
+            divergent.len()
+        );
+        for t in &divergent {
+            eprintln!("  {t}");
+        }
+    }
+
     /// Multi-ledger play-forward: bootstrap one base ledger's state, then follow
     /// the chain by replaying each successor's transaction set over RPC. Proves
     /// the node can *track* mainnet (not just replay a single step). Each step
