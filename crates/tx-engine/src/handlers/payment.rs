@@ -1266,6 +1266,11 @@ fn try_amm_conversion(
             &in_cur,
             &src_in_funds.sub(&spent),
         )?;
+        // rippled's rippleCredit deletes a line drained to zero in the default
+        // state (trustDelete); fires inline after the debit.
+        crate::handlers::trust_set::maybe_delete_drained_trust_line(
+            ctx, user_id, user_acct, &in_iss, &in_cur,
+        )?;
         crate::amm_helpers::set_iou_holding(
             ctx.view,
             &pool_id,
