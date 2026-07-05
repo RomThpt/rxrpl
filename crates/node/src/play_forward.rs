@@ -1145,6 +1145,61 @@ mod tests {
             }
         }
 
+        // An OfferCreate that crosses the AMM (empty/uncrossable CLOB, pool
+        // within the taker's limit) reads the pool's AMM SLE for its account +
+        // TradingFee but never modifies it, so the AMM SLE is absent from
+        // AffectedNodes and would not be seeded — `amm_hop` would then find no
+        // pool and leave the offer unfilled (TecKilled under tfFillOrKill).
+        // Derive the AMM key for the (TakerGets → TakerPays) pair and seed it,
+        // plus the pool pseudo-account and each pool asset's IOU trust line.
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("OfferCreate") {
+            if let (Some(tg), Some(tp)) = (tx_json.get("TakerGets"), tx_json.get("TakerPays")) {
+                if let (Some(a1), Some(a2)) = (
+                    rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(tg),
+                    rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(tp),
+                ) {
+                    if a1 != a2 {
+                        if let Ok(amm_key) =
+                            rxrpl_tx_engine::amm_helpers::compute_amm_key(&a1, &a2)
+                        {
+                            let amm_idx = amm_key.to_string().to_uppercase();
+                            read_keys.insert(amm_idx.clone());
+                            let r = rpc(serde_json::json!({
+                                "method":"ledger_entry","params":[{"index":amm_idx,"ledger_index":parent}]
+                            }));
+                            let amm = &r["result"]["node"];
+                            if let Some(amm_id) = amm
+                                .get("Account")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| decode_account_id(s).ok())
+                            {
+                                read_keys
+                                    .insert(keylet::account(&amm_id).to_string().to_uppercase());
+                                for asset in [&a1, &a2] {
+                                    if let (Some(cur), Some(iss)) = (
+                                        asset.get("currency").and_then(|v| v.as_str()),
+                                        asset.get("issuer").and_then(|v| v.as_str()),
+                                    ) {
+                                        if let Ok(iss_id) = decode_account_id(iss) {
+                                            read_keys.insert(
+                                                keylet::trust_line(
+                                                    &amm_id,
+                                                    &iss_id,
+                                                    &currency_bytes(cur),
+                                                )
+                                                .to_string()
+                                                .to_uppercase(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // A multi-hop (Paths) cross-currency Payment routes through one AMM SLE
         // per consecutive boundary along each path (e.g. XRP -> BCHAMP -> FAMILY
         // reads the XRP/BCHAMP and BCHAMP/FAMILY pools). Like the direct pair,
@@ -2687,6 +2742,61 @@ mod tests {
                         if let Ok(amm_key) = rxrpl_tx_engine::amm_helpers::compute_amm_key(&a1, &a2)
                         {
                             read_keys.insert(amm_key.to_string().to_uppercase());
+                        }
+                    }
+                }
+            }
+        }
+
+        // An OfferCreate that crosses the AMM (empty/uncrossable CLOB, pool
+        // within the taker's limit) reads the pool's AMM SLE for its account +
+        // TradingFee but never modifies it, so the AMM SLE is absent from
+        // AffectedNodes and would not be seeded — `amm_hop` would then find no
+        // pool and leave the offer unfilled (TecKilled under tfFillOrKill).
+        // Derive the AMM key for the (TakerGets → TakerPays) pair and seed it,
+        // plus the pool pseudo-account and each pool asset's IOU trust line.
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("OfferCreate") {
+            if let (Some(tg), Some(tp)) = (tx_json.get("TakerGets"), tx_json.get("TakerPays")) {
+                if let (Some(a1), Some(a2)) = (
+                    rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(tg),
+                    rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(tp),
+                ) {
+                    if a1 != a2 {
+                        if let Ok(amm_key) =
+                            rxrpl_tx_engine::amm_helpers::compute_amm_key(&a1, &a2)
+                        {
+                            let amm_idx = amm_key.to_string().to_uppercase();
+                            read_keys.insert(amm_idx.clone());
+                            let r = rpc(serde_json::json!({
+                                "method":"ledger_entry","params":[{"index":amm_idx,"ledger_index":parent}]
+                            }));
+                            let amm = &r["result"]["node"];
+                            if let Some(amm_id) = amm
+                                .get("Account")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| decode_account_id(s).ok())
+                            {
+                                read_keys
+                                    .insert(keylet::account(&amm_id).to_string().to_uppercase());
+                                for asset in [&a1, &a2] {
+                                    if let (Some(cur), Some(iss)) = (
+                                        asset.get("currency").and_then(|v| v.as_str()),
+                                        asset.get("issuer").and_then(|v| v.as_str()),
+                                    ) {
+                                        if let Ok(iss_id) = decode_account_id(iss) {
+                                            read_keys.insert(
+                                                keylet::trust_line(
+                                                    &amm_id,
+                                                    &iss_id,
+                                                    &currency_bytes(cur),
+                                                )
+                                                .to_string()
+                                                .to_uppercase(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

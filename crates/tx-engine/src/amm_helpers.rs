@@ -1007,6 +1007,20 @@ mod tests {
         assert_eq!(out.to_iou().to_decimal_string(), "932.437210367");
     }
 
+    // Mainnet tx 955856C7… (ledger 105333100): a tfFillOrKill OfferCreate whose
+    // book has no resting CLOB offer crosses the V4X/XRP AMM (pool 921658042
+    // drops XRP + 641921.2615094566 V4X, tfee 269). Requesting 8070.85058826842
+    // V4X out, rippled swaps in exactly 11767174 drops (pool XRP -> 933425216).
+    // This anchors the AMM-fallback crossing wired into `cross_offers`.
+    #[test]
+    fn swap_asset_out_xrp_v4x_byte_exact() {
+        let pool_in = Number::from_int(921_658_042); // pool XRP drops
+        let pool_out = Number::from_iou(&parse_iou_value("641921.2615094566")); // pool V4X
+        let asset_out = Number::from_iou(&parse_iou_value("8070.85058826842"));
+        let out = swap_asset_out(&pool_in, &pool_out, &asset_out, 269, true).unwrap();
+        assert_eq!(out.to_xrp_drops_mode(), 11_767_174);
+    }
+
     // A Large-scale computation (deposit/withdraw default) must be unaffected by
     // the Small-scale guard living and dying inside swap_asset_in.
     #[test]

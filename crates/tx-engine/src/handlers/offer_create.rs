@@ -826,6 +826,30 @@ fn cross_offers(
         }
     }
 
+    // AMM fallback: with no crossable CLOB offer, cross the remaining demand
+    // against a single AMM pool for this book (rippled `BookStep::tryAMM` with an
+    // empty CLOB — the AMM is swapped with no quality clamp, the taker's own
+    // limit still enforced by `amm_hop`'s budget check). Gated on `!crossed` so a
+    // mixed AMM+CLOB book (which rippled interleaves by quality) is left to the
+    // existing CLOB path unchanged.
+    if !crossed && !remaining_out.is_zero() && !remaining_in.is_zero() {
+        if let Some((delivered, spent)) = amm_hop(
+            ctx,
+            taker,
+            taker_acct,
+            taker,
+            &remaining_out,
+            &remaining_in,
+            /*skip_input_debit=*/ false,
+            /*skip_output_credit=*/ false,
+            /*create_missing_dest_line=*/ true,
+        )? {
+            remaining_out = leg_sub(&remaining_out, &delivered);
+            remaining_in = leg_sub(&remaining_in, &spent);
+            crossed = true;
+        }
+    }
+
     Ok((
         remaining_out.with_amount(&remaining_out.iou, remaining_out.drops),
         remaining_in.with_amount(&remaining_in.iou, remaining_in.drops),
@@ -1263,6 +1287,7 @@ pub(crate) fn cross_path_payment(
                 &residual_budget,
                 /*skip_input_debit=*/ !is_first,
                 /*skip_output_credit=*/ !is_last,
+                /*create_missing_dest_line=*/ false,
             )? {
                 got = leg_add(&got, &amm_out);
                 spent = leg_add(&spent, &amm_spent);
@@ -1379,6 +1404,100 @@ fn pool_balance_number(
 /// already fell by the same amount), and an interior output is not credited to
 /// `dest` (it becomes the next pool's input).
 #[allow(clippy::too_many_arguments)]
+/// Auto-create `holder`'s trust line to `issuer` for `currency` when an AMM swap
+/// delivers an IOU the holder has never held (rippled `rippleCredit` ->
+/// `trustCreate`). The receiver bears the reserve, so its side carries the
+/// reserve flag and (unless it has lsfDefaultRipple) the NoRipple flag; the owner
+/// count is bumped on the in-memory `holder_acct` (committed by the caller). The
+/// balance is left at zero here — the caller's `set_iou_holding` writes it with
+/// the correct low/high sign.
+fn create_iou_trust_line(
+    ctx: &mut ApplyContext<'_>,
+    holder: &AccountId,
+    holder_acct: &mut Value,
+    issuer: &AccountId,
+    currency: &[u8; 20],
+) -> Result<(), TransactionResult> {
+    const LSF_LOW_RESERVE: u64 = 0x0001_0000;
+    const LSF_HIGH_RESERVE: u64 = 0x0002_0000;
+    const LSF_LOW_NO_RIPPLE: u64 = 0x0010_0000;
+    const LSF_HIGH_NO_RIPPLE: u64 = 0x0020_0000;
+    const LSF_DEFAULT_RIPPLE: u32 = 0x0080_0000;
+    const NO_ACCOUNT: &str = "rrrrrrrrrrrrrrrrrrrrBZbvji";
+
+    let tl_key = keylet::trust_line(holder, issuer, currency);
+    let holder_is_low = holder.as_bytes() < issuer.as_bytes();
+    let cur_str = currency_code_str(currency);
+    let holder_str = encode_account_id(holder);
+    let issuer_str = encode_account_id(issuer);
+
+    let holder_lacks_default_ripple = ctx
+        .view
+        .read(&keylet::account(holder))
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .map(|a| helpers::get_flags(&a) & LSF_DEFAULT_RIPPLE == 0)
+        .unwrap_or(true);
+
+    let mut flags: u64 = if holder_is_low {
+        LSF_LOW_RESERVE
+    } else {
+        LSF_HIGH_RESERVE
+    };
+    if holder_lacks_default_ripple {
+        flags |= if holder_is_low {
+            LSF_LOW_NO_RIPPLE
+        } else {
+            LSF_HIGH_NO_RIPPLE
+        };
+    }
+
+    let holder_limit =
+        serde_json::json!({ "currency": cur_str, "issuer": holder_str, "value": "0" });
+    let issuer_limit =
+        serde_json::json!({ "currency": cur_str, "issuer": issuer_str, "value": "0" });
+    let (low_limit, high_limit) = if holder_is_low {
+        (holder_limit, issuer_limit)
+    } else {
+        (issuer_limit, holder_limit)
+    };
+
+    let holder_node = add_to_owner_dir(ctx.view, holder, &tl_key)?;
+    let issuer_node = add_to_owner_dir(ctx.view, issuer, &tl_key)?;
+    let (low_node, high_node) = if holder_is_low {
+        (holder_node, issuer_node)
+    } else {
+        (issuer_node, holder_node)
+    };
+
+    let tl = serde_json::json!({
+        "LedgerEntryType": "RippleState",
+        "Balance": { "currency": cur_str, "issuer": NO_ACCOUNT, "value": "0" },
+        "LowLimit": low_limit,
+        "HighLimit": high_limit,
+        "LowNode": format!("{low_node:016X}"),
+        "HighNode": format!("{high_node:016X}"),
+        "Flags": flags,
+        // Placeholder so the central PreviousTxnID stamping records this tx on
+        // the newly created line (it only touches entries already exposing it).
+        "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+        "PreviousTxnLgrSeq": 0u32,
+    });
+    let bytes = serde_json::to_vec(&tl).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .insert(tl_key, bytes)
+        .map_err(|_| TransactionResult::TefInternal)?;
+
+    helpers::adjust_owner_count(holder_acct, 1);
+
+    // The line entered the issuer's owner directory; re-touch its account root so
+    // the central PreviousTxnID stamping records it (rippled re-writes it).
+    let issuer_key = keylet::account(issuer);
+    if let Some(issuer_bytes) = ctx.view.read(&issuer_key) {
+        let _ = ctx.view.update(issuer_key, issuer_bytes);
+    }
+    Ok(())
+}
+
 fn amm_hop(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
@@ -1388,6 +1507,7 @@ fn amm_hop(
     budget_in: &Leg,
     skip_input_debit: bool,
     skip_output_credit: bool,
+    create_missing_dest_line: bool,
 ) -> Result<Option<(Leg, Leg)>, TransactionResult> {
     let in_xrp = budget_in.is_xrp;
     let out_xrp = demand_out.is_xrp;
@@ -1520,6 +1640,21 @@ fn amm_hop(
             &pool_h.sub(&deliver_num),
         )?;
         if !skip_output_credit {
+            // rippled's rippleCredit auto-creates the receiver's trust line the
+            // first time an AMM swap delivers an IOU it has never held.
+            if create_missing_dest_line {
+                let tl_key =
+                    keylet::trust_line(dest, &demand_out.issuer, &demand_out.currency);
+                if ctx.view.read(&tl_key).is_none() {
+                    create_iou_trust_line(
+                        ctx,
+                        dest,
+                        taker_acct,
+                        &demand_out.issuer,
+                        &demand_out.currency,
+                    )?;
+                }
+            }
             let dest_h = crate::amm_helpers::iou_holding_number(
                 ctx.view,
                 dest,
