@@ -849,6 +849,7 @@ fn cross_offers(
             /*skip_output_credit=*/ false,
             /*create_missing_dest_line=*/ true,
             /*partial=*/ !fok,
+            /*target_quality=*/ Some(threshold),
         )? {
             remaining_out = leg_sub(&remaining_out, &delivered);
             remaining_in = leg_sub(&remaining_in, &spent);
@@ -1295,6 +1296,7 @@ pub(crate) fn cross_path_payment(
                 /*skip_output_credit=*/ !is_last,
                 /*create_missing_dest_line=*/ false,
                 /*partial=*/ true,
+                /*target_quality=*/ None,
             )? {
                 got = leg_add(&got, &amm_out);
                 spent = leg_add(&spent, &amm_spent);
@@ -1505,6 +1507,17 @@ fn create_iou_trust_line(
     Ok(())
 }
 
+/// A pool-balance `Number` as the `IOUAmount` used for `get_rate`/quality: XRP
+/// uses its drops integer as the IOU value, an IOU its own value. Mirrors
+/// `flow.rs::quality_iou`.
+fn num_quality_iou(n: &rxrpl_amount::number::Number, is_xrp: bool) -> IOUAmount {
+    if is_xrp {
+        IOUAmount::from_decimal_string(&n.to_xrp_drops().to_string()).unwrap_or(IOUAmount::ZERO)
+    } else {
+        n.to_iou()
+    }
+}
+
 fn amm_hop(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
@@ -1516,6 +1529,7 @@ fn amm_hop(
     skip_output_credit: bool,
     create_missing_dest_line: bool,
     partial: bool,
+    target_quality: Option<u64>,
 ) -> Result<Option<(Leg, Leg)>, TransactionResult> {
     let in_xrp = budget_in.is_xrp;
     let out_xrp = demand_out.is_xrp;
@@ -1562,6 +1576,27 @@ fn amm_hop(
     let demand_num = leg_to_number(demand_out);
     if budget_num.is_zero() || budget_num.negative() {
         return Ok(None);
+    }
+
+    // Spot-price-quality gate (rippled AMMLiquidity::getOffer, AMMLiquidity.cpp:
+    // 184-190): an offer crossing may consume the AMM only when its spot quality
+    // (pool_out/pool_in, fee-free) STRICTLY beats the taker's limit quality and
+    // is not within 1e-7 of it. When the AMM is no better, deliver nothing so
+    // cross_offers places the full offer as resting. Payments pass None (any
+    // quality is acceptable, BookPaymentStep::checkQualityThreshold == true).
+    if let Some(cq) = target_quality {
+        let spq = rxrpl_amount::get_rate(
+            &num_quality_iou(&pool_in, in_xrp),
+            &num_quality_iou(&pool_out, out_xrp),
+        )
+        .ok();
+        let Some(spq) = spq else {
+            return Ok(None);
+        };
+        if !rxrpl_amount::is_better_quality(spq, cq) || rxrpl_amount::within_relative_distance(spq, cq)
+        {
+            return Ok(None);
+        }
     }
 
     // Output-limited (deliver the demand) when the input required fits the
