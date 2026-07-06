@@ -4508,6 +4508,26 @@ does not apply to this tx type (e.g. a pure delete/modify)."
         for t in &divergent {
             eprintln!("  {t}");
         }
+
+        // Definitive full-ledger hashes after close (skip list + close-time
+        // effects), not just the per-tx metadata comparison above.
+        let ledger_json = &meta_resp["result"]["ledger"];
+        let close_time = ledger_json["close_time"].as_u64().unwrap_or(0) as u32;
+        let close_flags = ledger_json["close_flags"].as_u64().unwrap_or(0) as u8;
+        let _ = ledger.close(close_time, close_flags);
+        let hx = |v: &Value, k: &str| v[k].as_str().unwrap_or("").to_uppercase();
+        let ah = ledger.header.account_hash.to_string().to_uppercase();
+        let th = ledger.header.tx_hash.to_string().to_uppercase();
+        eprintln!(
+            "=== account_hash ours={ah} theirs={} MATCH={} ===",
+            hx(ledger_json, "account_hash"),
+            ah == hx(ledger_json, "account_hash")
+        );
+        eprintln!(
+            "=== tx_hash ours={th} theirs={} MATCH={} ===",
+            hx(ledger_json, "transaction_hash"),
+            th == hx(ledger_json, "transaction_hash")
+        );
     }
 
     /// Multi-ledger play-forward: bootstrap one base ledger's state, then follow
