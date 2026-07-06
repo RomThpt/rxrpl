@@ -47,9 +47,13 @@ fn sort_key(set_hash: Hash256, txid: Hash256, blob: &[u8]) -> SortKey {
     }
 }
 
-/// Extract the signing account (20 bytes) and `Sequence` from a canonical blob.
-/// A blob that fails to decode, or a pseudo-transaction with the zero account
-/// and no sequence, sorts deterministically by `(zero, 0, txid)`.
+/// Extract the signing account (20 bytes) and the effective sort sequence from a
+/// canonical blob. rippled's `CanonicalTXSet` keys on `getSeqProxy().value()`,
+/// which is the `TicketSequence` for a ticketed transaction and the `Sequence`
+/// otherwise; `SeqProxy` compares purely by value, so a ticket and a sequence of
+/// the same number tie. A blob that fails to decode, or a pseudo-transaction
+/// with the zero account and no sequence, sorts deterministically by `(zero, 0,
+/// txid)`.
 fn decode_account_and_seq(blob: &[u8]) -> ([u8; 20], u32) {
     let json = match rxrpl_codec::binary::decode(blob) {
         Ok(v) => v,
@@ -61,7 +65,11 @@ fn decode_account_and_seq(blob: &[u8]) -> ([u8; 20], u32) {
         .and_then(|a| decode_account_id(a).ok())
         .map(|id| *id.as_bytes())
         .unwrap_or([0u8; 20]);
-    let sequence = json.get("Sequence").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let sequence = json
+        .get("TicketSequence")
+        .and_then(Value::as_u64)
+        .or_else(|| json.get("Sequence").and_then(Value::as_u64))
+        .unwrap_or(0) as u32;
     (account, sequence)
 }
 

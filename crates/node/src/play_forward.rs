@@ -3878,11 +3878,14 @@ does not apply to this tx type (e.g. a pure delete/modify)."
             let apply_index = t["metaData"]["TransactionIndex"]
                 .as_u64()
                 .expect("TransactionIndex");
-            let blob = rxrpl_codec::binary::encode(&serde_json::json!({
+            let mut tx_json = serde_json::json!({
                 "Account": account,
                 "Sequence": sequence,
-            }))
-            .unwrap();
+            });
+            if let Some(ts) = t.get("TicketSequence").and_then(Value::as_u64) {
+                tx_json["TicketSequence"] = serde_json::json!(ts);
+            }
+            let blob = rxrpl_codec::binary::encode(&tx_json).unwrap();
             set.push((txid, blob));
             expected.push((apply_index, txid));
         }
@@ -3922,6 +3925,64 @@ does not apply to this tx type (e.g. a pure delete/modify)."
             runs(parent_hash),
             runs(ledger_hash),
         );
+        // Targeted diagnostic: canonical vs mainnet apply position of specific
+        // txids (comma-separated hex prefixes in RXRPL_ORDER_PROBE).
+        if let Ok(probe) = std::env::var("RXRPL_ORDER_PROBE") {
+            fn decode_probe(blob: &[u8]) -> ([u8; 20], u32) {
+                let json = match rxrpl_codec::binary::decode(blob) {
+                    Ok(v) => v,
+                    Err(_) => return ([0u8; 20], 0),
+                };
+                let account = json
+                    .get("Account")
+                    .and_then(Value::as_str)
+                    .and_then(|a| rxrpl_codec::address::classic::decode_account_id(a).ok())
+                    .map(|id| *id.as_bytes())
+                    .unwrap_or([0u8; 20]);
+                let seq = json
+                    .get("TicketSequence")
+                    .and_then(Value::as_u64)
+                    .or_else(|| json.get("Sequence").and_then(Value::as_u64))
+                    .unwrap_or(0) as u32;
+                (account, seq)
+            }
+            let got: Vec<Hash256> = canonical_order(set_hash, set.clone())
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            for p in probe.split(',').filter(|s| !s.is_empty()) {
+                let pu = p.to_uppercase();
+                let ci = got
+                    .iter()
+                    .position(|h| h.to_string().to_uppercase().starts_with(&pu));
+                let mi = want
+                    .iter()
+                    .position(|h| h.to_string().to_uppercase().starts_with(&pu));
+                eprintln!("PROBE {pu}: canonical_idx={ci:?} mainnet_apply_idx={mi:?}");
+            }
+            // Dump mainnet apply order (want) with each tx's canonical index and
+            // signing account, so retry-pass descents (canonical_idx dropping)
+            // are visible. Enable with RXRPL_ORDER_DUMP=1.
+            if std::env::var("RXRPL_ORDER_DUMP").is_ok() {
+                let cidx: std::collections::HashMap<Hash256, usize> =
+                    got.iter().enumerate().map(|(i, h)| (*h, i)).collect();
+                let acct_of: std::collections::HashMap<Hash256, ([u8; 20], u32)> = set
+                    .iter()
+                    .map(|(id, blob)| (*id, decode_probe(blob)))
+                    .collect();
+                let mut prev_ci = 0usize;
+                for (mi, h) in want.iter().enumerate() {
+                    let ci = cidx[h];
+                    let (acct, seq) = acct_of[h];
+                    let desc = if ci <= prev_ci { " <-RETRY" } else { "" };
+                    eprintln!(
+                        "ORD mainnet={mi:>3} canon={ci:>3} acct={} seq={seq}{desc}",
+                        hex::encode(&acct[..4])
+                    );
+                    prev_ci = ci;
+                }
+            }
+        }
         assert!(
             set_runs < runs(Hash256::ZERO)
                 && set_runs < runs(parent_hash)
@@ -4298,6 +4359,15 @@ does not apply to this tx type (e.g. a pure delete/modify)."
             })
             .collect();
         let mut divergent: Vec<String> = Vec::new();
+        // Optional per-tx trace of watched SLE keys (comma-separated prefixes in
+        // RXRPL_E2E_WATCH): prints ours-vs-theirs for the key on EVERY affecting
+        // tx, so a cumulative pool/balance drift can be located to its first tx.
+        let watch: Vec<String> = std::env::var("RXRPL_E2E_WATCH")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_uppercase())
+            .collect();
         loop {
             let before = pending.len();
             let mut deferred = Vec::new();
@@ -4350,6 +4420,20 @@ does not apply to this tx type (e.g. a pure delete/modify)."
                             None => v.to_string(),
                         }
                     };
+                    if watch.iter().any(|w| key.starts_with(w.as_str())) {
+                        for (f, want) in fields.as_object().into_iter().flatten() {
+                            if f == "PreviousTxnID" || f == "PreviousTxnLgrSeq" {
+                                continue;
+                            }
+                            let got = oj.get(f).map(ToString::to_string).unwrap_or_default();
+                            let same = oj.get(f).map(&norm).as_deref() == Some(&norm(want));
+                            eprintln!(
+                                "TRACE {txid} ({ty}) {} .{f} ours={got} theirs={want} {}",
+                                &key[..12],
+                                if same { "ok" } else { "DIFF" }
+                            );
+                        }
+                    }
                     for (f, want) in fields.as_object().into_iter().flatten() {
                         if f == "PreviousTxnID" || f == "PreviousTxnLgrSeq" {
                             continue;
