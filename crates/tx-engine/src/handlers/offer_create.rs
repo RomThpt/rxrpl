@@ -833,6 +833,11 @@ fn cross_offers(
     // mixed AMM+CLOB book (which rippled interleaves by quality) is left to the
     // existing CLOB path unchanged.
     if !crossed && !remaining_out.is_zero() && !remaining_in.is_zero() {
+        // rippled runs the offer-crossing flow with partialPayment = !tfFillOrKill
+        // (OfferCreate.cpp:451): a fill-or-kill offer crosses all-or-nothing, so
+        // an AMM that cannot deliver the full demand within budget delivers zero
+        // and the FoK check kills the offer — never a partial spend.
+        let fok = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_FILL_OR_KILL != 0;
         if let Some((delivered, spent)) = amm_hop(
             ctx,
             taker,
@@ -843,6 +848,7 @@ fn cross_offers(
             /*skip_input_debit=*/ false,
             /*skip_output_credit=*/ false,
             /*create_missing_dest_line=*/ true,
+            /*partial=*/ !fok,
         )? {
             remaining_out = leg_sub(&remaining_out, &delivered);
             remaining_in = leg_sub(&remaining_in, &spent);
@@ -1288,6 +1294,7 @@ pub(crate) fn cross_path_payment(
                 /*skip_input_debit=*/ !is_first,
                 /*skip_output_credit=*/ !is_last,
                 /*create_missing_dest_line=*/ false,
+                /*partial=*/ true,
             )? {
                 got = leg_add(&got, &amm_out);
                 spent = leg_add(&spent, &amm_spent);
@@ -1508,6 +1515,7 @@ fn amm_hop(
     skip_input_debit: bool,
     skip_output_credit: bool,
     create_missing_dest_line: bool,
+    partial: bool,
 ) -> Result<Option<(Leg, Leg)>, TransactionResult> {
     let in_xrp = budget_in.is_xrp;
     let out_xrp = demand_out.is_xrp;
@@ -1557,10 +1565,18 @@ fn amm_hop(
     }
 
     // Output-limited (deliver the demand) when the input required fits the
-    // budget; otherwise input-limited (spend the whole budget).
+    // budget; otherwise input-limited (spend the whole budget). A non-partial
+    // (fill-or-kill) crossing is all-or-nothing: it delivers the FULL demand or
+    // nothing (never a partial spend), matching rippled's flow() with
+    // partialPayment=false.
     let out_full =
         crate::amm_helpers::swap_asset_in(&pool_in, &pool_out, &budget_num, tfee, out_xrp);
-    let (spent_num, deliver_num) = if num_le(&out_full, &demand_num) {
+    let (spent_num, deliver_num) = if !partial {
+        match crate::amm_helpers::swap_asset_out(&pool_in, &pool_out, &demand_num, tfee, in_xrp) {
+            Some(needed) if num_le(&needed, &budget_num) => (needed, demand_num),
+            _ => return Ok(None),
+        }
+    } else if num_le(&out_full, &demand_num) {
         (budget_num, out_full)
     } else {
         match crate::amm_helpers::swap_asset_out(&pool_in, &pool_out, &demand_num, tfee, in_xrp) {
