@@ -26,12 +26,17 @@ pub fn canonical_order(
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct SortKey {
     salted_account: [u8; 32],
-    sequence: u32,
+    // rippled's `SeqProxy::operator<` compares the type first (Seq < Ticket)
+    // and only falls back to the value on a type tie, so every Sequence tx of
+    // an account sorts ahead of every Ticket tx even when the ticket number is
+    // lower. `false` (Seq) orders before `true` (Ticket).
+    is_ticket: bool,
+    seq_value: u32,
     txid: Hash256,
 }
 
 fn sort_key(set_hash: Hash256, txid: Hash256, blob: &[u8]) -> SortKey {
-    let (account, sequence) = decode_account_and_seq(blob);
+    let (account, is_ticket, seq_value) = decode_account_and_seq(blob);
 
     // rippled: uint256 key = 0; memcpy(key, account, 20); key ^= salt.
     let mut salted_account = [0u8; 32];
@@ -42,22 +47,22 @@ fn sort_key(set_hash: Hash256, txid: Hash256, blob: &[u8]) -> SortKey {
 
     SortKey {
         salted_account,
-        sequence,
+        is_ticket,
+        seq_value,
         txid,
     }
 }
 
-/// Extract the signing account (20 bytes) and the effective sort sequence from a
-/// canonical blob. rippled's `CanonicalTXSet` keys on `getSeqProxy().value()`,
-/// which is the `TicketSequence` for a ticketed transaction and the `Sequence`
-/// otherwise; `SeqProxy` compares purely by value, so a ticket and a sequence of
-/// the same number tie. A blob that fails to decode, or a pseudo-transaction
-/// with the zero account and no sequence, sorts deterministically by `(zero, 0,
-/// txid)`.
-fn decode_account_and_seq(blob: &[u8]) -> ([u8; 20], u32) {
+/// Extract the signing account (20 bytes) and the `SeqProxy` sort key from a
+/// canonical blob: `(is_ticket, value)` where a ticketed tx yields
+/// `(true, TicketSequence)` and a sequenced tx `(false, Sequence)`. rippled's
+/// `SeqProxy::operator<` orders by type first (Seq before Ticket), then by
+/// value. A blob that fails to decode, or a pseudo-transaction with the zero
+/// account and no sequence, sorts deterministically by `(zero, false, 0, txid)`.
+fn decode_account_and_seq(blob: &[u8]) -> ([u8; 20], bool, u32) {
     let json = match rxrpl_codec::binary::decode(blob) {
         Ok(v) => v,
-        Err(_) => return ([0u8; 20], 0),
+        Err(_) => return ([0u8; 20], false, 0),
     };
     let account = json
         .get("Account")
@@ -65,12 +70,14 @@ fn decode_account_and_seq(blob: &[u8]) -> ([u8; 20], u32) {
         .and_then(|a| decode_account_id(a).ok())
         .map(|id| *id.as_bytes())
         .unwrap_or([0u8; 20]);
-    let sequence = json
-        .get("TicketSequence")
-        .and_then(Value::as_u64)
-        .or_else(|| json.get("Sequence").and_then(Value::as_u64))
-        .unwrap_or(0) as u32;
-    (account, sequence)
+    let (is_ticket, seq_value) = match json.get("TicketSequence").and_then(Value::as_u64) {
+        Some(t) => (true, t as u32),
+        None => (
+            false,
+            json.get("Sequence").and_then(Value::as_u64).unwrap_or(0) as u32,
+        ),
+    };
+    (account, is_ticket, seq_value)
 }
 
 #[cfg(test)]
@@ -83,6 +90,15 @@ mod tests {
         let json = serde_json::json!({
             "Account": encode_account_id(&account),
             "Sequence": sequence,
+        });
+        rxrpl_codec::binary::encode(&json).expect("encode test blob")
+    }
+
+    fn ticket_blob(account: AccountId, ticket_sequence: u32) -> Vec<u8> {
+        let json = serde_json::json!({
+            "Account": encode_account_id(&account),
+            "Sequence": 0,
+            "TicketSequence": ticket_sequence,
         });
         rxrpl_codec::binary::encode(&json).expect("encode test blob")
     }
@@ -103,9 +119,36 @@ mod tests {
         let ordered = canonical_order(txid(0xaa), txs);
         let seqs: Vec<u32> = ordered
             .iter()
-            .map(|(_, b)| decode_account_and_seq(b).1)
+            .map(|(_, b)| decode_account_and_seq(b).2)
             .collect();
         assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn sequence_txs_sort_before_ticket_txs_even_with_lower_ticket() {
+        // rippled SeqProxy: all Sequence txs sort ahead of all Ticket txs for
+        // the account, even when the ticket value is smaller. Here the ticketed
+        // txs carry the LOWER numbers (337, 338) yet must apply after the
+        // sequenced ones (339, 340).
+        let acct = AccountId([0x7b; 20]);
+        let txs = vec![
+            (txid(0x01), ticket_blob(acct, 337)),
+            (txid(0x02), ticket_blob(acct, 338)),
+            (txid(0x03), blob(acct, 339)),
+            (txid(0x04), blob(acct, 340)),
+        ];
+        let ordered = canonical_order(txid(0xaa), txs);
+        let keys: Vec<(bool, u32)> = ordered
+            .iter()
+            .map(|(_, b)| {
+                let (_, is_ticket, v) = decode_account_and_seq(b);
+                (is_ticket, v)
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![(false, 339), (false, 340), (true, 337), (true, 338)]
+        );
     }
 
     #[test]
