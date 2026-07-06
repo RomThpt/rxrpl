@@ -368,6 +368,63 @@ impl ReplayOutcome {
 /// without metadata) — the salt rippled uses for canonical apply ordering. It
 /// is distinct from `header.tx_hash`, which is the closed ledger's
 /// transaction tree root over transactions *with* metadata.
+/// Apply an agreed transaction set to `ledger` in rippled's canonical build
+/// order — the single byte-exact apply model shared by catchup replay
+/// (`replay_forward`) and the live consensus build. Sorts by
+/// `canonical_order(set_hash, …)`, then runs `LEDGER_TOTAL_PASSES` passes of
+/// which the first `LEDGER_RETRY_PASSES` defer a `tec` (tapRETRY) instead of
+/// committing it, matching rippled BuildLedger.cpp:106-162 and go-xrpl
+/// openledger/apply.go BuildLedgerMode. Returns `(applied, failed)`; the caller
+/// closes the ledger.
+pub fn apply_tx_set_multipass(
+    ledger: &mut Ledger,
+    set_hash: Hash256,
+    txs: TxSet,
+    tx_engine: &TxEngine,
+    rules: &Rules,
+    fees: &FeeSettings,
+) -> (usize, usize) {
+    let total = txs.len();
+    let mut pending: Vec<Value> = canonical_order(set_hash, txs)
+        .into_iter()
+        .filter_map(|(_id, blob)| rxrpl_codec::binary::decode(&blob).ok())
+        .collect();
+
+    const LEDGER_TOTAL_PASSES: usize = 3;
+    const LEDGER_RETRY_PASSES: usize = 1;
+    let mut applied = 0usize;
+    let mut certain_retry = true;
+    for pass in 0..LEDGER_TOTAL_PASSES {
+        let mut changes = 0usize;
+        let mut deferred = Vec::new();
+        for json in std::mem::take(&mut pending) {
+            let result = if certain_retry {
+                tx_engine.apply_retriable(&json, ledger, rules, fees)
+            } else {
+                tx_engine.apply(&json, ledger, rules, fees)
+            };
+            match result {
+                Ok(r) if r.is_retryable() || (certain_retry && r.is_tec()) => deferred.push(json),
+                Ok(r) => {
+                    if r.is_claimed() {
+                        applied += 1;
+                        changes += 1;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        pending = deferred;
+        if changes == 0 && !certain_retry {
+            break;
+        }
+        if changes == 0 || pass >= LEDGER_RETRY_PASSES {
+            certain_retry = false;
+        }
+    }
+    (applied, total - applied)
+}
+
 pub fn replay_forward(
     parent: &Ledger,
     set_hash: Hash256,
@@ -389,54 +446,9 @@ pub fn replay_forward(
     // each replayed ledger applies with its own era's amendment-gated logic.
     let rules = rules_for_ledger(&ledger);
 
-    // Decode once, in canonical order. Anything that fails to decode is dropped.
-    let total = txs.len();
-    let mut pending: Vec<Value> = canonical_order(set_hash, txs)
-        .into_iter()
-        .filter_map(|(_id, blob)| rxrpl_codec::binary::decode(&blob).ok())
-        .collect();
-
-    // rippled BuildLedger.cpp: apply the set over LEDGER_TOTAL_PASSES passes,
-    // the first LEDGER_RETRY_PASSES of which run with tapRETRY set so a `tec`
-    // (claimed failure, e.g. a cross-currency payment that is dry until a
-    // sibling funds its pool) is DEFERRED — not committed — to a later pass; a
-    // `ter` always defers, a `tes` always finalises. Once past the retriable
-    // passes (or a pass makes no change) a leftover tec commits. Matches rippled
-    // (BuildLedger.cpp:106-162, applySteps.h:28 tec-as-retry under TapRetry) and
-    // go-xrpl (openledger/apply.go BuildLedgerMode).
-    const LEDGER_TOTAL_PASSES: usize = 3;
-    const LEDGER_RETRY_PASSES: usize = 1;
-    let mut applied = 0usize;
-    let mut certain_retry = true;
-    for pass in 0..LEDGER_TOTAL_PASSES {
-        let mut changes = 0usize;
-        let mut deferred = Vec::new();
-        for json in std::mem::take(&mut pending) {
-            let result = if certain_retry {
-                tx_engine.apply_retriable(&json, &mut ledger, &rules, fees)
-            } else {
-                tx_engine.apply(&json, &mut ledger, &rules, fees)
-            };
-            match result {
-                Ok(r) if r.is_retryable() || (certain_retry && r.is_tec()) => deferred.push(json),
-                Ok(r) => {
-                    if r.is_claimed() {
-                        applied += 1;
-                        changes += 1;
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-        pending = deferred;
-        if changes == 0 && !certain_retry {
-            break;
-        }
-        if changes == 0 || pass >= LEDGER_RETRY_PASSES {
-            certain_retry = false;
-        }
-    }
-    let failed = total - applied;
+    // Apply the set in rippled's canonical build order (shared with the live
+    // consensus build).
+    let (applied, failed) = apply_tx_set_multipass(&mut ledger, set_hash, txs, tx_engine, &rules, fees);
 
     ledger
         .close(header.close_time, header.close_flags)
