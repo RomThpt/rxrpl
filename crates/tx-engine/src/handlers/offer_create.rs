@@ -97,6 +97,16 @@ const MAX_TICK_SIZE: u8 = 16;
 /// currency/issuer. Returns `None` for XRP sides (no tick rounding applies to
 /// a recomputed native amount here).
 fn rebuild_iou(original: &Value, value: &IOUAmount) -> Option<Value> {
+    // An XRP side is a bare drops string, not an IOU object: the tick
+    // re-derivation yields a fractional drops magnitude which rippled floors to
+    // an integer drop (STAmount(XRP)). Without this the re-derivation silently
+    // failed on XRP offers and the tick snap was skipped.
+    if original.is_string() {
+        let dec = value.to_decimal_string();
+        let int_part = dec.split('.').next().unwrap_or("0");
+        let drops: u64 = int_part.parse().ok()?;
+        return Some(Value::String(drops.to_string()));
+    }
     let obj = original.as_object()?;
     let mut out = obj.clone();
     out.insert("value".into(), Value::from(value.to_decimal_string()));
@@ -3333,6 +3343,27 @@ fn remove_from_book_dir(
 }
 
 #[cfg(test)]
+mod tick_round_tests {
+    use super::rebuild_iou;
+    use rxrpl_amount::IOUAmount;
+
+    // The tick re-derivation of an XRP side yields a fractional drops magnitude;
+    // rebuild_iou must floor it onto an integer drop (mainnet tx DFF0E4CB snaps
+    // TakerGets 3654519 -> 3654430 from the re-derived 3654430.39499415). Before
+    // the fix rebuild_iou returned None for the bare-string XRP side, silently
+    // skipping the snap.
+    #[test]
+    fn rebuild_iou_floors_xrp_drops() {
+        let original = serde_json::json!("3654519");
+        let redrived = IOUAmount::from_decimal_string("3654430.39499415").unwrap();
+        assert_eq!(
+            rebuild_iou(&original, &redrived),
+            Some(serde_json::json!("3654430"))
+        );
+    }
+}
+
+#[cfg(test)]
 mod book_directory_quality_tests {
     use super::offer_book_quality;
 
@@ -3580,4 +3611,5 @@ mod owner_funds_tests {
         assert!(!maker_usd_deep_frozen(0x0040_0000)); // regular freeze, not deep
     }
 }
+
 
