@@ -3328,6 +3328,46 @@ fn remove_from_book_dir(
 }
 
 #[cfg(test)]
+mod amm_quality_gate_tests {
+    use super::num_quality_iou;
+    use rxrpl_amount::number::Number;
+
+    // Mainnet tx 062FDE11 (ledger 105333100): offer sells 1061920 USD for
+    // 1e12 drops XRP => limit quality (in/out rate) = get_rate(1061920, 1e12).
+    // The USD/XRP AMM (4014336154 drops XRP + 4363.056921446038 USD) has a spot
+    // quality of only 920074 drops/USD, worse than the offer's 941690, so the
+    // gate must refuse the cross (amm_hop returns None) and the offer rests.
+    #[test]
+    fn amm_worse_than_offer_quality_is_gated_out() {
+        // AMM spot rate: in = pool USD (received), out = pool XRP (paid).
+        let pool_in = Number::from_iou(
+            &rxrpl_amount::IOUAmount::from_decimal_string("4363.056921446038").unwrap(),
+        );
+        let pool_out = Number::from_int(4_014_336_154); // XRP drops
+        let spq = rxrpl_amount::get_rate(
+            &num_quality_iou(&pool_in, false),
+            &num_quality_iou(&pool_out, true),
+        )
+        .unwrap();
+        // Offer limit: in = TakerGets 1061920 USD, out = TakerPays 1e12 drops.
+        let offer_in =
+            Number::from_iou(&rxrpl_amount::IOUAmount::from_decimal_string("1061920").unwrap());
+        let offer_out = Number::from_int(1_000_000_000_000);
+        let cq = rxrpl_amount::get_rate(
+            &num_quality_iou(&offer_in, false),
+            &num_quality_iou(&offer_out, true),
+        )
+        .unwrap();
+        // Gate refuses when the AMM does not strictly beat the offer quality.
+        assert!(
+            !rxrpl_amount::is_better_quality(spq, cq)
+                || rxrpl_amount::within_relative_distance(spq, cq),
+            "AMM spot must not beat the offer limit -> no cross"
+        );
+    }
+}
+
+#[cfg(test)]
 mod owner_funds_tests {
     use super::*;
     use crate::fees::FeeSettings;
