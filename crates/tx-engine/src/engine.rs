@@ -122,6 +122,32 @@ impl TxEngine {
         rules: &Rules,
         fees: &FeeSettings,
     ) -> Result<TransactionResult, TxEngineError> {
+        self.apply_inner(tx, ledger, rules, fees, false)
+    }
+
+    /// Apply under rippled's `tapRETRY` semantics: a `tec` (claimed failure) is
+    /// NOT committed — it is discarded and returned so the caller's build-ledger
+    /// retry loop can defer it to a later pass (rippled `applyTransaction` with
+    /// `certainRetry`, where `isTecClaimHardFail` is false so a tec becomes
+    /// `terRETRY`). `tes` still commits and `tef/tem/tel` still fail terminally.
+    pub fn apply_retriable(
+        &self,
+        tx: &Value,
+        ledger: &mut rxrpl_ledger::Ledger,
+        rules: &Rules,
+        fees: &FeeSettings,
+    ) -> Result<TransactionResult, TxEngineError> {
+        self.apply_inner(tx, ledger, rules, fees, true)
+    }
+
+    fn apply_inner(
+        &self,
+        tx: &Value,
+        ledger: &mut rxrpl_ledger::Ledger,
+        rules: &Rules,
+        fees: &FeeSettings,
+        tap_retry: bool,
+    ) -> Result<TransactionResult, TxEngineError> {
         // 1. Determine transaction type
         let tx_type_str = tx
             .get("TransactionType")
@@ -315,7 +341,14 @@ impl TxEngine {
         // `is_claimed()` here means exactly `tec`.
         let preclaim_tec = match transactor.preclaim(&preclaim_ctx) {
             Ok(()) => None,
-            Err(result) if result.is_claimed() => Some(result),
+            // Under tapRETRY a preclaim tec is deferred, not claimed: return it
+            // before any sandbox/fee mutation so the ledger is untouched.
+            Err(result) if result.is_claimed() => {
+                if tap_retry {
+                    return Ok(result);
+                }
+                Some(result)
+            }
             Err(result) => return Ok(result),
         };
 
@@ -423,6 +456,13 @@ impl TxEngine {
                     (result, true)
                 }
                 Err(result) if result.is_claimed() => {
+                    // Under tapRETRY a tec is deferred: discard the parent
+                    // sandbox (fee + seq consume included) by returning before
+                    // the commit, so the ledger is untouched and the caller can
+                    // retry it in a later pass.
+                    if tap_retry {
+                        return Ok(result);
+                    }
                     // tec: discard child mutations, keep fee deduction
                     (result, true)
                 }

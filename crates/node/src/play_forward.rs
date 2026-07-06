@@ -396,30 +396,44 @@ pub fn replay_forward(
         .filter_map(|(_id, blob)| rxrpl_codec::binary::decode(&blob).ok())
         .collect();
 
-    // rippled applies the set over multiple passes: each pass applies the
-    // still-pending transactions in canonical order, deferring any that return
-    // a retriable (`ter`) result to the next pass. The loop ends when a pass
-    // resolves nothing more, so a transaction whose precondition is satisfied
-    // only by a later-canonical transaction still applies. Without this, a
-    // single pass would drop such transactions and diverge from the chain.
+    // rippled BuildLedger.cpp: apply the set over LEDGER_TOTAL_PASSES passes,
+    // the first LEDGER_RETRY_PASSES of which run with tapRETRY set so a `tec`
+    // (claimed failure, e.g. a cross-currency payment that is dry until a
+    // sibling funds its pool) is DEFERRED — not committed — to a later pass; a
+    // `ter` always defers, a `tes` always finalises. Once past the retriable
+    // passes (or a pass makes no change) a leftover tec commits. Matches rippled
+    // (BuildLedger.cpp:106-162, applySteps.h:28 tec-as-retry under TapRetry) and
+    // go-xrpl (openledger/apply.go BuildLedgerMode).
+    const LEDGER_TOTAL_PASSES: usize = 3;
+    const LEDGER_RETRY_PASSES: usize = 1;
     let mut applied = 0usize;
-    loop {
-        let before = pending.len();
+    let mut certain_retry = true;
+    for pass in 0..LEDGER_TOTAL_PASSES {
+        let mut changes = 0usize;
         let mut deferred = Vec::new();
         for json in std::mem::take(&mut pending) {
-            match tx_engine.apply(&json, &mut ledger, &rules, fees) {
-                Ok(result) if result.is_retryable() => deferred.push(json),
-                Ok(result) => {
-                    if result.is_claimed() {
+            let result = if certain_retry {
+                tx_engine.apply_retriable(&json, &mut ledger, &rules, fees)
+            } else {
+                tx_engine.apply(&json, &mut ledger, &rules, fees)
+            };
+            match result {
+                Ok(r) if r.is_retryable() || (certain_retry && r.is_tec()) => deferred.push(json),
+                Ok(r) => {
+                    if r.is_claimed() {
                         applied += 1;
+                        changes += 1;
                     }
                 }
                 Err(_) => {}
             }
         }
         pending = deferred;
-        if pending.is_empty() || pending.len() == before {
+        if changes == 0 && !certain_retry {
             break;
+        }
+        if changes == 0 || pass >= LEDGER_RETRY_PASSES {
+            certain_retry = false;
         }
     }
     let failed = total - applied;
@@ -4368,14 +4382,31 @@ does not apply to this tx type (e.g. a pure delete/modify)."
             .filter(|s| !s.is_empty())
             .map(|s| s.to_uppercase())
             .collect();
-        loop {
-            let before = pending.len();
+        // rippled BuildLedger.cpp: LEDGER_TOTAL_PASSES passes, of which the first
+        // LEDGER_RETRY_PASSES run with tapRETRY set so a tec is deferred (not
+        // committed) rather than claimed. A ter always defers; a tes always
+        // finalizes. Once past the retriable passes (or a pass makes no change) a
+        // tec commits. This is what defers a dry cross-currency payment to a
+        // later pass so its liquidity-providing siblings apply first.
+        const LEDGER_TOTAL_PASSES: usize = 3;
+        const LEDGER_RETRY_PASSES: usize = 1;
+        let mut certain_retry = true;
+        for pass in 0..LEDGER_TOTAL_PASSES {
+            let mut changes = 0usize;
             let mut deferred = Vec::new();
             for (txid, json) in std::mem::take(&mut pending) {
-                if let Ok(r) = engine.apply(&json, &mut ledger, &rules, &fees) {
-                    if r.is_retryable() {
+                let result = if certain_retry {
+                    engine.apply_retriable(&json, &mut ledger, &rules, &fees)
+                } else {
+                    engine.apply(&json, &mut ledger, &rules, &fees)
+                };
+                if let Ok(r) = result {
+                    if r.is_retryable() || (certain_retry && r.is_tec()) {
                         deferred.push((txid, json));
                         continue;
+                    }
+                    if r.is_success() || r.is_tec() {
+                        changes += 1;
                     }
                 }
                 let Some(nodes) = meta.get(&txid) else {
@@ -4451,8 +4482,11 @@ does not apply to this tx type (e.g. a pure delete/modify)."
                 }
             }
             pending = deferred;
-            if pending.is_empty() || pending.len() == before {
+            if changes == 0 && !certain_retry {
                 break;
+            }
+            if changes == 0 || pass >= LEDGER_RETRY_PASSES {
+                certain_retry = false;
             }
         }
         eprintln!(
