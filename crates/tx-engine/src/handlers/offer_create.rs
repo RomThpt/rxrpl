@@ -388,8 +388,13 @@ impl Transactor for OfferCreateTransactor {
         // issuers) with its low 64 bits replaced by the offer's quality (rate),
         // so offers sort by price. rippled stores this as the offer's
         // BookDirectory and tags the directory with the rate + book assets.
+        // The book directory quality is the rate of the offer AS PLACED — the
+        // leftover amounts after crossing (remaining_pays/remaining_gets), which
+        // are what the Offer SLE carries — not the original tx amounts. A partial
+        // cross that trims TakerGets but leaves TakerPays shifts the rate, and
+        // rippled keys the directory on the placed offer's rate.
         let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
-        let quality = offer_book_quality(&taker_pays, &taker_gets, number_switchover);
+        let quality = offer_book_quality(&remaining_pays, &remaining_gets, number_switchover);
         let book_base =
             keylet::book_dir(&pays_currency, &pays_issuer, &gets_currency, &gets_issuer);
         let book_dir_key = book_dir_with_quality(&book_base, quality);
@@ -3328,6 +3333,35 @@ fn remove_from_book_dir(
 }
 
 #[cfg(test)]
+mod book_directory_quality_tests {
+    use super::offer_book_quality;
+
+    // Mainnet tx DFF0E4CB (ledger 105333100): an offer selling XRP for
+    // 140.55304742187 ZRP partially crosses, leaving TakerGets = 3654430 drops
+    // (the original tx amount was 3654519). The book directory quality must be
+    // the rate of the PLACED (leftover) amounts, so its low 64 bits are
+    // 0x500DAA02090C875D, not the original-amount 0x500DA9EC3A23F7E9.
+    #[test]
+    fn book_quality_uses_placed_leftover_amounts() {
+        let zrp = serde_json::json!({
+            "currency": "ZRP",
+            "issuer": "rZapJ1PZ297QAEXRGu3SZkAiwXbA7BNoe",
+            "value": "140.55304742187"
+        });
+        let remaining_gets = serde_json::json!("3654430");
+        let original_gets = serde_json::json!("3654519");
+        assert_eq!(
+            offer_book_quality(&zrp, &remaining_gets, true),
+            0x500DAA02090C875D
+        );
+        assert_eq!(
+            offer_book_quality(&zrp, &original_gets, true),
+            0x500DA9EC3A23F7E9
+        );
+    }
+}
+
+#[cfg(test)]
 mod amm_quality_gate_tests {
     use super::num_quality_iou;
     use rxrpl_amount::number::Number;
@@ -3546,3 +3580,4 @@ mod owner_funds_tests {
         assert!(!maker_usd_deep_frozen(0x0040_0000)); // regular freeze, not deep
     }
 }
+
