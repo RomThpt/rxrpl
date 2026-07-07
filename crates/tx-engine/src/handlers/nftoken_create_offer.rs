@@ -218,6 +218,12 @@ impl Transactor for NFTokenCreateOfferTransactor {
             .unwrap_or_else(|| Value::String("0".to_string()));
         let mut offer = serde_json::json!({
             "LedgerEntryType": "NFTokenOffer",
+            // rippled sets sfFlags on the NFTokenOffer unconditionally
+            // (tokenOfferCreateApply), so it serialises even for a buy offer
+            // (Flags 0). It is NOT default-droppable here — omitting it diverges
+            // the account_hash (the metadata NewFields hides the zero, so the
+            // per-tx value check cannot see it).
+            "Flags": flags,
             "Owner": account_str,
             "NFTokenID": nftoken_id,
             "OwnerNode": format!("{owner_node:016X}"),
@@ -229,9 +235,6 @@ impl Transactor for NFTokenCreateOfferTransactor {
         // it, matching rippled's serialization.
         if !amount_is_zero(&amount_value) {
             offer["Amount"] = amount_value;
-        }
-        if flags != 0 {
-            offer["Flags"] = Value::from(flags);
         }
         if let Some(dest) = helpers::get_str_field(ctx.tx, "Destination") {
             offer["Destination"] = Value::String(dest.to_string());
