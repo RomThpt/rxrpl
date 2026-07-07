@@ -4528,6 +4528,78 @@ does not apply to this tx type (e.g. a pure delete/modify)."
             hx(ledger_json, "transaction_hash"),
             th == hx(ledger_json, "transaction_hash")
         );
+
+        // Byte-level state diff: the per-tx metadata check compares only affected
+        // SLEs' FinalFields values (normalised). account_hash is the SHAMap of the
+        // SERIALIZED SLEs, so a value that matches but serialises differently (or a
+        // final value the norm masks / a SKIP-DIR re-modified SLE) diverges here.
+        // Compare our stored SLE bytes to mainnet's ledger_entry(binary) for every
+        // key any tx touched. RXRPL_STATE_DIFF=1 (RPC-heavy).
+        if std::env::var("RXRPL_STATE_DIFF").is_ok() {
+            let mut keys: std::collections::BTreeSet<String> = Default::default();
+            for nodes in meta.values() {
+                for (key, _nt, _f) in nodes {
+                    keys.insert(key.clone());
+                }
+            }
+            let mut diffs = 0usize;
+            for key in &keys {
+                let Some(kb) = hex::decode(key)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                else {
+                    continue;
+                };
+                let ours = ledger.state_map.get(&Hash256::new(kb));
+                let r = rpc(serde_json::json!({
+                    "method":"ledger_entry",
+                    "params":[{"index":key,"ledger_index":next,"binary":true}]
+                }));
+                let theirs = r["result"]["node_binary"].as_str().map(|s| s.to_uppercase());
+                match (ours, theirs) {
+                    (Some(ob), Some(th)) => {
+                        let oh = hex::encode_upper(&ob);
+                        if oh != th {
+                            diffs += 1;
+                            let et = rxrpl_codec::binary::decode(&ob)
+                                .ok()
+                                .and_then(|j| j["LedgerEntryType"].as_str().map(String::from))
+                                .unwrap_or_default();
+                            eprintln!("STATEDIFF {} ({et}): bytes differ", &key[..16]);
+                            if let (Ok(oj), Some(tj)) = (
+                                rxrpl_codec::binary::decode(&ob),
+                                hex::decode(&th).ok().and_then(|b| rxrpl_codec::binary::decode(&b).ok()),
+                            ) {
+                                if let Some(o) = oj.as_object() {
+                                    for (f, ov) in o {
+                                        if tj.get(f) != Some(ov) {
+                                            eprintln!("    .{f} ours={ov} theirs={}", tj.get(f).map(ToString::to_string).unwrap_or_else(|| "<absent>".into()));
+                                        }
+                                    }
+                                }
+                                if let Some(t) = tj.as_object() {
+                                    for f in t.keys() {
+                                        if oj.get(f).is_none() {
+                                            eprintln!("    .{f} ours=<absent> theirs={}", t[f]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (Some(_), None) => {
+                        diffs += 1;
+                        eprintln!("STATEDIFF {}: present in ours, absent theirs", &key[..16]);
+                    }
+                    (None, Some(_)) => {
+                        diffs += 1;
+                        eprintln!("STATEDIFF {}: absent ours, present theirs", &key[..16]);
+                    }
+                    (None, None) => {}
+                }
+            }
+            eprintln!("=== {diffs} byte-level SLE diffs (over {} affected keys) ===", keys.len());
+        }
     }
 
     /// Multi-ledger play-forward: bootstrap one base ledger's state, then follow
