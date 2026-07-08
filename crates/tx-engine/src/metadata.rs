@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use rxrpl_primitives::Hash256;
 
 use crate::view::sandbox::SandboxChanges;
@@ -28,6 +30,11 @@ pub struct AffectedNode {
     pub previous: Option<Vec<u8>>,
     /// New state (for created/modified).
     pub final_fields: Option<Vec<u8>>,
+    /// Node-level `(PreviousTxnID, PreviousTxnLgrSeq)` a modified node carried
+    /// before this tx threaded it (rippled `threadItem`). `None` when the node
+    /// is not threaded; the zero placeholder of a recreated directory is left
+    /// in place so it is filtered out downstream.
+    pub prev_txn: Option<(serde_json::Value, serde_json::Value)>,
 }
 
 /// How a ledger entry was changed.
@@ -164,7 +171,12 @@ fn changed_previous_fields(
 
 impl SandboxChanges {
     /// Build transaction metadata from these sandbox changes.
-    pub fn build_metadata(&self, tx_index: u32, result_code: i32) -> TxMeta {
+    pub fn build_metadata(
+        &self,
+        tx_index: u32,
+        result_code: i32,
+        node_prev_txn: &HashMap<Hash256, (serde_json::Value, serde_json::Value)>,
+    ) -> TxMeta {
         let mut affected_nodes = Vec::new();
 
         for (key, data) in &self.inserts {
@@ -174,6 +186,7 @@ impl SandboxChanges {
                 ledger_entry_type: extract_entry_type(data),
                 previous: None,
                 final_fields: Some(data.clone()),
+                prev_txn: None,
             });
         }
 
@@ -184,6 +197,7 @@ impl SandboxChanges {
                 ledger_entry_type: extract_entry_type(data),
                 previous: self.originals.get(key).cloned(),
                 final_fields: Some(data.clone()),
+                prev_txn: node_prev_txn.get(key).cloned(),
             });
         }
 
@@ -201,6 +215,7 @@ impl SandboxChanges {
                 // zero before deletion). Equals the original when nothing
                 // mutated it first, so a plain delete shows no PreviousFields.
                 final_fields: Some(data.clone()),
+                prev_txn: None,
             });
         }
 
@@ -247,11 +262,16 @@ impl TxMeta {
                     if prev == fin {
                         continue;
                     }
-                    // Threaded types (those carrying PreviousTxnID) record the
-                    // PREVIOUS values at the node level, via threadItem.
-                    for f in ["PreviousTxnID", "PreviousTxnLgrSeq"] {
-                        if let Some(v) = prev.get(f).filter(|v| !is_default_json(v)) {
-                            inner.insert(f.into(), v.clone());
+                    // Threaded types record, at the node level, the value the
+                    // SLE carried BEFORE this tx threaded it (rippled threadItem
+                    // / SLE::thread) — captured pre-stamp, not the parent's. A
+                    // directory emptied and recreated this tx holds only a zero
+                    // placeholder, which is default and thus omitted, matching
+                    // rippled leaving the recreated node unthreaded in metadata.
+                    if let Some((pid, pseq)) = &n.prev_txn {
+                        if !is_default_json(pid) {
+                            inner.insert("PreviousTxnID".into(), pid.clone());
+                            inner.insert("PreviousTxnLgrSeq".into(), pseq.clone());
                         }
                     }
                     // A node that only had its transaction thread re-pointed
@@ -331,7 +351,7 @@ mod tests {
             destroyed_drops: 0,
         };
 
-        let meta = changes.build_metadata(0, 0);
+        let meta = changes.build_metadata(0, 0, &HashMap::new());
         assert_eq!(meta.affected_nodes.len(), 1);
         assert_eq!(meta.affected_nodes[0].change_type, ChangeType::Created);
         assert_eq!(meta.affected_nodes[0].ledger_entry_type, "AccountRoot");
@@ -352,7 +372,7 @@ mod tests {
             destroyed_drops: 10,
         };
 
-        let meta = changes.build_metadata(1, 0);
+        let meta = changes.build_metadata(1, 0, &HashMap::new());
         assert_eq!(meta.affected_nodes.len(), 1);
         assert_eq!(meta.affected_nodes[0].change_type, ChangeType::Modified);
         assert!(meta.affected_nodes[0].previous.is_some());
@@ -371,7 +391,7 @@ mod tests {
             destroyed_drops: 0,
         };
 
-        let meta = changes.build_metadata(0, 0);
+        let meta = changes.build_metadata(0, 0, &HashMap::new());
         assert_eq!(meta.affected_nodes.len(), 1);
         assert_eq!(meta.affected_nodes[0].change_type, ChangeType::Deleted);
         assert!(meta.affected_nodes[0].previous.is_some());

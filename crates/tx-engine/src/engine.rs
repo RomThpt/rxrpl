@@ -494,7 +494,7 @@ impl TxEngine {
             // carries PreviousTxnID, mirroring rippled, before metadata/commit.
             let tx_hash = rxrpl_protocol::tx::compute_tx_hash(tx)
                 .map_err(|e| TxEngineError::Codec(e.to_string()))?;
-            changes.stamp_previous_txn(
+            let node_prev_txn = changes.stamp_previous_txn(
                 &hex::encode_upper(tx_hash.as_bytes()),
                 ledger.header.sequence,
             );
@@ -517,7 +517,7 @@ impl TxEngine {
             // transaction SHAMap leaf in rippled's canonical form,
             // `VL(tx) || VL(meta)`, so the transaction tree root (tx_hash)
             // matches the validated chain.
-            let meta = changes.build_metadata(ledger.tx_count(), result.code());
+            let meta = changes.build_metadata(ledger.tx_count(), result.code(), &node_prev_txn);
             let meta_json = meta.to_canonical_json();
 
             changes.apply_to_ledger(ledger)?;
