@@ -4755,7 +4755,11 @@ does not apply to this tx type (e.g. a pure delete/modify)."
                 }
             }
             if !r.contains("\n") {
-                r.push_str("  [raw-only diff: field encoding/order]");
+                r.push_str(&format!(
+                    "  [raw-only diff]\n    ours  ={}\n    theirs={}",
+                    hex::encode_upper(&our_meta),
+                    hex::encode_upper(their_meta_b)
+                ));
             }
             reports.push(r);
         });
