@@ -5,21 +5,44 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transac
 
 pub struct LedgerStateFixTransactor;
 
+/// The only LedgerFixType rippled defines: fixNFTokenPageLinks.
+const FIX_NFTOKEN_PAGE_LINK: u64 = 1;
+
 impl Transactor for LedgerStateFixTransactor {
-    fn preflight(&self, _ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
-        Ok(())
+    fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
+        match ctx.tx.get("LedgerFixType").and_then(|v| v.as_u64()) {
+            Some(FIX_NFTOKEN_PAGE_LINK) => {
+                if ctx.tx.get("Owner").and_then(|v| v.as_str()).is_none() {
+                    return Err(TransactionResult::TemInvalid);
+                }
+                Ok(())
+            }
+            _ => Err(TransactionResult::TefInvalidLedgerFixType),
+        }
     }
 
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         helpers::read_account_by_address(ctx.view, account_str)?;
+
+        // fixNFTokenPageLinks repairs the pages owned by `Owner`, which must
+        // exist (rippled returns tecOBJECT_NOT_FOUND otherwise).
+        let owner = ctx
+            .tx
+            .get("Owner")
+            .and_then(|v| v.as_str())
+            .ok_or(TransactionResult::TemInvalid)?;
+        helpers::read_account_by_address(ctx.view, owner)
+            .map_err(|_| TransactionResult::TecObjectNotFound)?;
         Ok(())
     }
 
     fn apply(&self, _ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
-        // The sender's fee and Sequence/Ticket are consumed centrally by the
-        // engine (parent sandbox) before doApply; this transactor has no other
-        // ledger effect in the currently-supported scope.
+        // The sender's fee and Sequence/Ticket are consumed centrally before
+        // doApply. The actual NFTokenPage directory-link repair
+        // (rippled's repairNFTokenDirectoryLinks) is not implemented, so this
+        // does not modify the owner's pages — it only accepts a well-formed
+        // request validated above.
         Ok(TransactionResult::TesSuccess)
     }
 }
@@ -57,26 +80,71 @@ mod tests {
         ledger
     }
 
+    fn preflight_of(tx: &serde_json::Value) -> Result<(), TransactionResult> {
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+        let ctx = PreflightContext {
+            tx,
+            rules: &rules,
+            fees: &fees,
+        };
+        LedgerStateFixTransactor.preflight(&ctx)
+    }
+
     #[test]
-    fn preflight_always_ok() {
+    fn preflight_valid_type_with_owner_ok() {
+        let tx = serde_json::json!({
+            "TransactionType": "LedgerStateFix",
+            "Account": ALICE,
+            "LedgerFixType": 1,
+            "Owner": ALICE,
+            "Fee": "12",
+        });
+        assert_eq!(preflight_of(&tx), Ok(()));
+    }
+
+    #[test]
+    fn preflight_unknown_type_rejected() {
+        let tx = serde_json::json!({
+            "TransactionType": "LedgerStateFix",
+            "Account": ALICE,
+            "LedgerFixType": 2,
+            "Owner": ALICE,
+            "Fee": "12",
+        });
+        assert_eq!(
+            preflight_of(&tx),
+            Err(TransactionResult::TefInvalidLedgerFixType)
+        );
+    }
+
+    #[test]
+    fn preflight_missing_type_rejected() {
         let tx = serde_json::json!({
             "TransactionType": "LedgerStateFix",
             "Account": ALICE,
             "Fee": "12",
         });
-        let rules = Rules::new();
-        let fees = FeeSettings::default();
-        let ctx = PreflightContext {
-            tx: &tx,
-            rules: &rules,
-            fees: &fees,
-        };
-        assert_eq!(LedgerStateFixTransactor.preflight(&ctx), Ok(()));
+        assert_eq!(
+            preflight_of(&tx),
+            Err(TransactionResult::TefInvalidLedgerFixType)
+        );
     }
 
     #[test]
-    fn preclaim_account_must_exist() {
-        let ledger = Ledger::genesis();
+    fn preflight_type1_without_owner_rejected() {
+        let tx = serde_json::json!({
+            "TransactionType": "LedgerStateFix",
+            "Account": ALICE,
+            "LedgerFixType": 1,
+            "Fee": "12",
+        });
+        assert_eq!(preflight_of(&tx), Err(TransactionResult::TemInvalid));
+    }
+
+    #[test]
+    fn preclaim_owner_must_exist() {
+        let ledger = setup_account();
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let rules = Rules::new();
@@ -84,6 +152,8 @@ mod tests {
         let tx = serde_json::json!({
             "TransactionType": "LedgerStateFix",
             "Account": ALICE,
+            "LedgerFixType": 1,
+            "Owner": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTZ",
             "Fee": "12",
         });
         let ctx = PreclaimContext {
@@ -93,12 +163,12 @@ mod tests {
         };
         assert_eq!(
             LedgerStateFixTransactor.preclaim(&ctx),
-            Err(TransactionResult::TerNoAccount)
+            Err(TransactionResult::TecObjectNotFound)
         );
     }
 
     #[test]
-    fn preclaim_existing_account_ok() {
+    fn preclaim_existing_owner_ok() {
         let ledger = setup_account();
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
@@ -107,6 +177,8 @@ mod tests {
         let tx = serde_json::json!({
             "TransactionType": "LedgerStateFix",
             "Account": ALICE,
+            "LedgerFixType": 1,
+            "Owner": ALICE,
             "Fee": "12",
         });
         let ctx = PreclaimContext {
