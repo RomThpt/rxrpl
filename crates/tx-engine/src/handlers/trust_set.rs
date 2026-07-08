@@ -350,8 +350,9 @@ impl Transactor for TrustSetTransactor {
 
         if let Some(bytes) = existing {
             // Update existing trust line
-            let mut obj: Value =
+            let obj_orig: Value =
                 serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
+            let mut obj = obj_orig.clone();
 
             // Determine which side we are (low or high). The `*Limit.issuer`
             // field is THIS side's address (rippled convention), so rebuild
@@ -576,7 +577,11 @@ impl Transactor for TrustSetTransactor {
                 // is unchanged. Mark both dirty so central stamping threads them.
                 low_dirty = true;
                 high_dirty = true;
-            } else {
+            } else if obj != obj_orig {
+                // rippled drops a modified node whose serialized SLE equals the
+                // original (ApplyStateTable `*curNode == *origNode`): a no-op
+                // TrustSet (re-set an already-set flag, same limit) must not
+                // restamp the line's PreviousTxnID nor emit a ModifiedNode.
                 let new_bytes =
                     serde_json::to_vec(&obj).map_err(|_| TransactionResult::TemMalformed)?;
                 ctx.view
