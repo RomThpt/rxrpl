@@ -4609,6 +4609,47 @@ does not apply to this tx type (e.g. a pure delete/modify)."
                 }
             }
             eprintln!("=== {diffs} byte-level SLE diffs (over {} affected keys) ===", keys.len());
+
+            // AffectedNodes key-set comparison: a key OUR apply touched that
+            // mainnet's metadata does not list is an extra SLE change that
+            // diverges the account_hash (not in the affected-key set above);
+            // a missing one is a state change we failed to make. Also localises
+            // the tx_hash (metadata) gap.
+            let mut ours_keys: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
+                Default::default();
+            ledger.tx_map.for_each(&mut |tx_hash, data| {
+                let txid = tx_hash.to_string().to_uppercase();
+                if let Ok((_tx, m)) = rxrpl_codec::binary::decode_tx_leaf(data) {
+                    let mut set = std::collections::BTreeSet::new();
+                    for an in m["AffectedNodes"].as_array().into_iter().flatten() {
+                        for k in ["CreatedNode", "ModifiedNode", "DeletedNode"] {
+                            if let Some(idx) = an.get(k).and_then(|e| e["LedgerIndex"].as_str()) {
+                                set.insert(idx.to_uppercase());
+                            }
+                        }
+                    }
+                    ours_keys.insert(txid, set);
+                }
+            });
+            let mut metadiffs = 0usize;
+            for (txid, nodes) in &meta {
+                let mainnet_keys: std::collections::BTreeSet<String> =
+                    nodes.iter().map(|(k, _, _)| k.to_uppercase()).collect();
+                let empty = std::collections::BTreeSet::new();
+                let ours = ours_keys.get(txid).unwrap_or(&empty);
+                let extra: Vec<&String> = ours.difference(&mainnet_keys).collect();
+                let missing: Vec<&String> = mainnet_keys.difference(ours).collect();
+                if !extra.is_empty() || !missing.is_empty() {
+                    metadiffs += 1;
+                    eprintln!(
+                        "METADIFF {}: extra_in_ours={:?} missing_in_ours={:?}",
+                        &txid[..16],
+                        extra.iter().map(|k| &k[..16]).collect::<Vec<_>>(),
+                        missing.iter().map(|k| &k[..16]).collect::<Vec<_>>()
+                    );
+                }
+            }
+            eprintln!("=== {metadiffs} txs with AffectedNodes key-set diffs ===");
         }
     }
 
