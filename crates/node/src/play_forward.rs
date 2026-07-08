@@ -4651,6 +4651,118 @@ does not apply to this tx type (e.g. a pure delete/modify)."
             }
             eprintln!("=== {metadiffs} txs with AffectedNodes key-set diffs ===");
         }
+
+        // Per-tx metadata BYTE comparison. account_hash (state) can match while
+        // tx_hash (the metadata tree) diverges: identical state change serialised
+        // to different metadata, or a different TransactionIndex from a reordered
+        // apply. Compare our metadata blob to mainnet's (the binary tx set's
+        // `meta`) for every tx — no extra RPC.
+        let read_vl = |b: &[u8], off: &mut usize| -> Option<Vec<u8>> {
+            let b0 = *b.get(*off)? as usize;
+            *off += 1;
+            let len = if b0 <= 192 {
+                b0
+            } else if b0 <= 240 {
+                let b1 = *b.get(*off)? as usize;
+                *off += 1;
+                193 + (b0 - 193) * 256 + b1
+            } else if b0 <= 254 {
+                let b1 = *b.get(*off)? as usize;
+                let b2 = *b.get(*off + 1)? as usize;
+                *off += 2;
+                12481 + (b0 - 241) * 65536 + b1 * 256 + b2
+            } else {
+                return None;
+            };
+            let seg = b.get(*off..*off + len)?.to_vec();
+            *off += len;
+            Some(seg)
+        };
+        let mut their_meta: std::collections::HashMap<String, Vec<u8>> = Default::default();
+        for e in txs_resp["result"]["ledger"]["transactions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let (Some(blob_hex), Some(meta_hex)) = (e["tx_blob"].as_str(), e["meta"].as_str())
+            else {
+                continue;
+            };
+            let (Ok(blob), Ok(mb)) = (hex::decode(blob_hex), hex::decode(meta_hex)) else {
+                continue;
+            };
+            their_meta.insert(transaction_id(&blob).to_string().to_uppercase(), mb);
+        }
+        let mut meta_diffs = 0usize;
+        let mut idx_diffs = 0usize;
+        let mut reports: Vec<String> = Vec::new();
+        ledger.tx_map.for_each(&mut |tx_hash, data| {
+            let txid = tx_hash.to_string().to_uppercase();
+            let mut off = 0usize;
+            let tx_bytes = read_vl(data, &mut off);
+            let Some(our_meta) = read_vl(data, &mut off) else {
+                return;
+            };
+            let Some(their_meta_b) = their_meta.get(&txid) else {
+                return;
+            };
+            if &our_meta == their_meta_b {
+                return;
+            }
+            meta_diffs += 1;
+            let ty = tx_bytes
+                .as_deref()
+                .and_then(|b| rxrpl_codec::binary::decode(b).ok())
+                .and_then(|j| j["TransactionType"].as_str().map(String::from))
+                .unwrap_or_default();
+            let oj = rxrpl_codec::binary::decode(&our_meta).unwrap_or(Value::Null);
+            let tj = rxrpl_codec::binary::decode(their_meta_b).unwrap_or(Value::Null);
+            let oi = oj["TransactionIndex"].as_u64();
+            let ti = tj["TransactionIndex"].as_u64();
+            if oi != ti {
+                idx_diffs += 1;
+            }
+            if reports.len() >= 12 {
+                return;
+            }
+            let node_map = |m: &Value| -> std::collections::BTreeMap<String, Value> {
+                let mut out = std::collections::BTreeMap::new();
+                for an in m["AffectedNodes"].as_array().into_iter().flatten() {
+                    if let Some((wrap, inner)) = an.as_object().and_then(|o| o.iter().next()) {
+                        let idx = inner["LedgerIndex"].as_str().unwrap_or("?").to_uppercase();
+                        out.insert(idx, serde_json::json!({ "w": wrap, "n": inner }));
+                    }
+                }
+                out
+            };
+            let om = node_map(&oj);
+            let tm = node_map(&tj);
+            let mut r = format!("METABYTES {} ({ty}) txnIdx ours={oi:?} theirs={ti:?}", &txid[..16]);
+            let mut keys: std::collections::BTreeSet<String> = om.keys().cloned().collect();
+            keys.extend(tm.keys().cloned());
+            for k in keys {
+                match (om.get(&k), tm.get(&k)) {
+                    (Some(o), Some(t)) if o != t => {
+                        r.push_str(&format!("\n  {} ours={o} theirs={t}", &k[..16.min(k.len())]));
+                    }
+                    (Some(o), None) => {
+                        r.push_str(&format!("\n  {} ONLY-OURS {o}", &k[..16.min(k.len())]));
+                    }
+                    (None, Some(t)) => {
+                        r.push_str(&format!("\n  {} ONLY-THEIRS {t}", &k[..16.min(k.len())]));
+                    }
+                    _ => {}
+                }
+            }
+            if !r.contains("\n") {
+                r.push_str("  [raw-only diff: field encoding/order]");
+            }
+            reports.push(r);
+        });
+        for r in &reports {
+            eprintln!("{r}");
+        }
+        eprintln!("=== {meta_diffs} txs with metadata BYTE diffs ({idx_diffs} are TransactionIndex) ===");
     }
 
     /// Multi-ledger play-forward: bootstrap one base ledger's state, then follow
