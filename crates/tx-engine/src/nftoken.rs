@@ -210,6 +210,99 @@ fn page_key_hex(key: &Hash256) -> String {
     key.to_string().to_uppercase()
 }
 
+/// Like [`read_page`] but treats an absent entry as `None` rather than an
+/// error, for the directory walk where a missing successor is normal.
+fn read_page_opt(view: &dyn ApplyView, key: &Hash256) -> Option<Value> {
+    serde_json::from_slice(&view.read(key)?).ok()
+}
+
+/// rippled `nft::repairNFTokenDirectoryLinks`: walk `owner`'s NFTokenPage
+/// directory and repair the doubly-linked `PreviousPageMin`/`NextPageMin`
+/// chain. If the final page lost its canonical `nftoken_page_max` index, its
+/// contents are moved into a page keyed there. Returns whether anything was
+/// actually repaired.
+pub fn repair_directory_links(
+    view: &mut dyn ApplyView,
+    owner: &AccountId,
+) -> Result<bool, TransactionResult> {
+    let mut did_repair = false;
+    let min = keylet::nftoken_page_min(owner);
+    let last = keylet::nftoken_page_max(owner);
+
+    let first_key = view.succ(&min).filter(|k| *k <= last).unwrap_or(last);
+    let Some(mut page) = read_page_opt(view, &first_key) else {
+        return Ok(did_repair);
+    };
+    let mut page_key = first_key;
+
+    if page_key == last {
+        let obj = page.as_object_mut().unwrap();
+        let had = obj.remove("NextPageMin").is_some() | obj.remove("PreviousPageMin").is_some();
+        if had {
+            did_repair = true;
+            write_page(view, &page_key, &page)?;
+        }
+        return Ok(did_repair);
+    }
+
+    if page.get("PreviousPageMin").is_some() {
+        did_repair = true;
+        page.as_object_mut().unwrap().remove("PreviousPageMin");
+        write_page(view, &page_key, &page)?;
+    }
+
+    loop {
+        let next_key = view.succ(&page_key).filter(|k| *k <= last).unwrap_or(last);
+        let Some(mut next_page) = read_page_opt(view, &next_key) else {
+            // The last real page is not at the canonical index: move its
+            // contents into a fresh page keyed by `last` (carrying only the
+            // tokens and previous link, never a next link) and rethread its
+            // previous page.
+            did_repair = true;
+            let mut relocated = serde_json::json!({
+                "LedgerEntryType": "NFTokenPage",
+                "NFTokens": Value::Array(page_tokens(&page)),
+            });
+            if let Some(prev_key) = page_link(&page, "PreviousPageMin") {
+                relocated["PreviousPageMin"] = Value::String(page_key_hex(&prev_key));
+                let mut new_prev = read_page(view, &prev_key)?;
+                new_prev["NextPageMin"] = Value::String(page_key_hex(&last));
+                write_page(view, &prev_key, &new_prev)?;
+            }
+            view.erase(&page_key)
+                .map_err(|_| TransactionResult::TefInternal)?;
+            let data =
+                serde_json::to_vec(&relocated).map_err(|_| TransactionResult::TefInternal)?;
+            view.insert(last, data)
+                .map_err(|_| TransactionResult::TefInternal)?;
+            return Ok(did_repair);
+        };
+
+        if page_link(&page, "NextPageMin") != Some(next_key) {
+            did_repair = true;
+            page["NextPageMin"] = Value::String(page_key_hex(&next_key));
+            write_page(view, &page_key, &page)?;
+        }
+        if page_link(&next_page, "PreviousPageMin") != Some(page_key) {
+            did_repair = true;
+            next_page["PreviousPageMin"] = Value::String(page_key_hex(&page_key));
+            write_page(view, &next_key, &next_page)?;
+        }
+
+        if next_key == last {
+            if next_page.get("NextPageMin").is_some() {
+                did_repair = true;
+                next_page.as_object_mut().unwrap().remove("NextPageMin");
+                write_page(view, &next_key, &next_page)?;
+            }
+            return Ok(did_repair);
+        }
+
+        page = next_page;
+        page_key = next_key;
+    }
+}
+
 /// rippled `nft::mergePages`: if the linked pages `lo` (lower key) and `hi`
 /// (higher key) hold few enough tokens combined to fit one page, merge `lo`'s
 /// tokens into `hi`, rethread the chain around `lo`, and erase `lo`. Returns
