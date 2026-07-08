@@ -138,6 +138,16 @@ pub(crate) fn maybe_delete_drained_trust_line(
     let sender_reserve_flag = if is_low { LSF_LOW_RESERVE } else { LSF_HIGH_RESERVE };
     if (flags & sender_reserve_flag) != 0 {
         helpers::adjust_owner_count(sender_acct, -1);
+        // rippled's trustDelete releases the sender's reserve before removing
+        // the line: clear its reserve flag so the DeletedNode metadata shows
+        // FinalFields with the flag cleared and PreviousFields with the
+        // original flags. The erase below snapshots this cleared value; the
+        // line leaves state either way, so account_hash is unaffected.
+        let mut cleared = obj.clone();
+        cleared["Flags"] = Value::from(flags & !sender_reserve_flag);
+        if let Ok(nb) = serde_json::to_vec(&cleared) {
+            let _ = ctx.view.update(tl_key, nb);
+        }
     }
 
     let parse_node = |o: &Value, f: &str| -> u64 {
