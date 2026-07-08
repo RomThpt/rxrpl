@@ -1177,6 +1177,15 @@ impl Node {
         // Peer set: shared with the overlay so `server_info.peers` reads the
         // live connection count.
         ctx.attach_peer_set(peer_mgr.peer_set());
+        // Shard store: when `[shard] enabled`, construct the manager and share
+        // it with the overlay (shard exchange protocol) and the RPC context so
+        // `shard_info`/`node_to_shard`/`crawl_shards` report the live store.
+        if self.config.database.shard.enabled {
+            let shard_manager =
+                Arc::new(RwLock::new(rxrpl_nodestore::ShardManager::new()));
+            peer_mgr.set_shard_manager(Arc::clone(&shard_manager));
+            ctx.attach_shard_manager(shard_manager);
+        }
         // Overlay command channel: lets the `connect` admin RPC initiate
         // outbound peer connections via OverlayCommand::ConnectTo.
         ctx.attach_overlay_command(cmd_tx_rpc);

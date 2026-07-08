@@ -439,6 +439,17 @@ impl ServerContext {
         self.local_manifest.get().map(|arc| arc.as_ref())
     }
 
+    /// Attach the shard manager so the shard admin RPCs (`shard_info`,
+    /// `node_to_shard`, `crawl_shards`, `download_shard`) operate on the live
+    /// store instead of returning the not-enabled stub. Set when
+    /// `[shard] enabled` is configured; must be called before the `Arc` is
+    /// shared (same constraint as `attach_peer_set`).
+    pub fn attach_shard_manager(self: &mut Arc<Self>, manager: Arc<RwLock<ShardManager>>) {
+        if let Some(ctx) = Arc::get_mut(self) {
+            ctx.shard_manager = Some(manager);
+        }
+    }
+
     /// Attach the overlay's PeerSet so `server_info.peers` reflects live
     /// connection count. Standalone mode leaves this `None` → peers=0.
     /// Same Arc::get_mut constraint as `attach_validator_list_status`.
