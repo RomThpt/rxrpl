@@ -56,7 +56,7 @@ pub fn execute_hooks_for_tx(
     let otxn_blob = serde_json::to_vec(tx).unwrap_or_default();
 
     let engine = HookExecutionEngine::new();
-    let all_emitted = Vec::new();
+    let mut all_emitted = Vec::new();
     let mut results = Vec::new();
     let mut rollback = false;
 
@@ -121,23 +121,18 @@ pub fn execute_hooks_for_tx(
         populate_otxn_fields(&mut ctx, tx);
 
         match engine.execute(&wasm_bytes, ctx) {
-            Ok(result) => {
-                if let HookResult::Rollback(_) = &result {
+            Ok(execution) => {
+                if let HookResult::Rollback(_) = &execution.result {
                     rollback = true;
                 }
-                results.push(result);
+                all_emitted.extend(execution.emitted_txns);
+                results.push(execution.result);
             }
             Err(_) => {
                 results.push(HookResult::Error("hook execution failed".into()));
             }
         }
     }
-
-    // In a full implementation, emitted txns would be extracted from each
-    // hook's context after execution. The current engine consumes the context,
-    // so this would require returning it. For now, emitted_txns remains empty
-    // and can be wired up when the engine is extended.
-    let _ = &all_emitted;
 
     Some(HookExecutionResult {
         rollback,

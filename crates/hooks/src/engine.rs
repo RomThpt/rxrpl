@@ -20,6 +20,13 @@ pub enum HookResult {
     Error(String),
 }
 
+/// Outcome of executing one hook: its result plus any transactions it emitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookExecution {
+    pub result: HookResult,
+    pub emitted_txns: Vec<Vec<u8>>,
+}
+
 /// Errors from the hook execution engine.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -57,11 +64,14 @@ impl HookExecutionEngine {
     /// Its i64 return value determines the result:
     /// - >= 0: Accept
     /// - < 0: Rollback
-    pub fn execute(&self, wasm: &[u8], context: HookContext) -> Result<HookResult, EngineError> {
+    pub fn execute(&self, wasm: &[u8], context: HookContext) -> Result<HookExecution, EngineError> {
         // Check HookOn filter before executing
         if let Some(ref hook_on_mask) = context.hook_on {
             if !hook_on::should_hook_fire(hook_on_mask, context.otxn_type) {
-                return Ok(HookResult::Accept(0));
+                return Ok(HookExecution {
+                    result: HookResult::Accept(0),
+                    emitted_txns: Vec::new(),
+                });
             }
         }
 
@@ -87,16 +97,18 @@ impl HookExecutionEngine {
             .get_typed_func::<i32, i64>(&store, "hook")
             .map_err(|e| EngineError::Execution(e.to_string()))?;
 
-        match hook_fn.call(&mut store, 0) {
-            Ok(result) => {
-                if result >= 0 {
-                    Ok(HookResult::Accept(result))
-                } else {
-                    Ok(HookResult::Rollback(result))
-                }
-            }
-            Err(e) => Ok(HookResult::Error(e.to_string())),
-        }
+        let result = match hook_fn.call(&mut store, 0) {
+            Ok(code) if code >= 0 => HookResult::Accept(code),
+            Ok(code) => HookResult::Rollback(code),
+            Err(e) => HookResult::Error(e.to_string()),
+        };
+
+        let emitted_txns = std::mem::take(&mut ctx.lock().unwrap().emitted_txns);
+
+        Ok(HookExecution {
+            result,
+            emitted_txns,
+        })
     }
 }
 
@@ -135,7 +147,7 @@ mod tests {
     fn execute_accepting_hook() {
         let engine = HookExecutionEngine::new();
         let ctx = HookContext::new(Hash256::default(), [0u8; 20]);
-        let result = engine.execute(&accepting_hook_wasm(), ctx).unwrap();
+        let result = engine.execute(&accepting_hook_wasm(), ctx).unwrap().result;
         assert_eq!(result, HookResult::Accept(42));
     }
 
@@ -143,7 +155,7 @@ mod tests {
     fn execute_rejecting_hook() {
         let engine = HookExecutionEngine::new();
         let ctx = HookContext::new(Hash256::default(), [0u8; 20]);
-        let result = engine.execute(&rejecting_hook_wasm(), ctx).unwrap();
+        let result = engine.execute(&rejecting_hook_wasm(), ctx).unwrap().result;
         assert_eq!(result, HookResult::Rollback(-1));
     }
 
@@ -153,5 +165,35 @@ mod tests {
         let ctx = HookContext::new(Hash256::default(), [0u8; 20]);
         let err = engine.execute(b"not wasm", ctx).unwrap_err();
         assert!(matches!(err, EngineError::Validation(_)));
+    }
+
+    #[test]
+    fn execute_surfaces_emitted_txns() {
+        let emitting_hook = wat::parse_str(
+            r#"
+            (module
+                (import "env" "emit" (func $emit (param i32 i32 i32 i32) (result i64)))
+                (memory (export "memory") 1)
+                (data (i32.const 100) "\AA\BB\CC\DD\EE")
+                (func $hook (export "hook") (param i32) (result i64)
+                    i32.const 0
+                    i32.const 32
+                    i32.const 100
+                    i32.const 5
+                    call $emit
+                    drop
+                    i64.const 0
+                )
+            )
+            "#,
+        )
+        .expect("valid WAT");
+
+        let engine = HookExecutionEngine::new();
+        let ctx = HookContext::new(Hash256::default(), [0u8; 20]);
+        let execution = engine.execute(&emitting_hook, ctx).unwrap();
+
+        assert_eq!(execution.result, HookResult::Accept(0));
+        assert_eq!(execution.emitted_txns, vec![vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE]]);
     }
 }

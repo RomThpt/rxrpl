@@ -327,9 +327,10 @@ pub fn register_host_functions(
                 return OUT_OF_BOUNDS;
             }
 
-            // Store the keylet data as the slot content.
-            // In a full implementation this would look up the ledger entry;
-            // here we store the raw keylet bytes as a placeholder.
+            // NOTE: HookContext carries no ledger view, so this cannot resolve
+            // the keylet to a serialized SLE. It stores the raw keylet bytes,
+            // which is NOT the ledger entry — ledger-backed slots require
+            // threading a read view into HookContext.
             let keylet_data = data[start..end].to_vec();
             hook_ctx.slot_data[slot_no as usize] = Some(keylet_data);
             slot_no as i64
@@ -364,9 +365,10 @@ pub fn register_host_functions(
                 None => return SLOT_EMPTY,
             };
 
-            // In a full implementation, this would parse the serialized object
-            // and extract the subfield. For now, we store the parent data
-            // tagged with the field_id as a simple representation.
+            // NOTE: this does NOT parse the serialized STObject to extract the
+            // field. It tags the parent bytes with the field id, which is not
+            // the field value — real subfield extraction needs an STObject
+            // parser over genuine SLE bytes (see the slot() limitation above).
             let field_tag = (field_id as u32).to_be_bytes();
             let mut subfield_data = field_tag.to_vec();
             subfield_data.extend_from_slice(&parent_data);
