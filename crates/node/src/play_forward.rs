@@ -4542,6 +4542,16 @@ does not apply to this tx type (e.g. a pure delete/modify)."
                     keys.insert(key.clone());
                 }
             }
+            // Close-step / singleton SLEs no tx touches but that are part of the
+            // account_hash: the recent LedgerHashes skip-list (appended at close),
+            // FeeSettings and Amendments.
+            for special in [
+                rxrpl_protocol::keylet::skip(),
+                rxrpl_protocol::keylet::fee_settings(),
+                rxrpl_protocol::keylet::amendments(),
+            ] {
+                keys.insert(hex::encode_upper(special.as_bytes()));
+            }
             let mut diffs = 0usize;
             for key in &keys {
                 let Some(kb) = hex::decode(key)
