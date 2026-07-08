@@ -172,6 +172,20 @@ impl Transactor for NFTokenCreateOfferTransactor {
         // reconstruct mPriorBalance by adding it back.
         let owner_count = helpers::get_owner_count(&acct);
         let prior_balance = helpers::get_balance(&acct).saturating_add(helpers::get_fee(ctx.tx));
+
+        // rippled nft::tokenOfferCreatePreclaim: a buy offer requires the
+        // account to hold positive funds of the offered Amount at hand
+        // (`accountFunds(...).signum() <= 0` -> tecUNFUNDED_OFFER). For XRP that
+        // is spendable balance = prior balance minus the current owner reserve.
+        // This claimed tec precedes the owner-reserve test below, matching the
+        // preclaim/doApply ordering in rippled.
+        if !is_sell
+            && ctx.tx.get("Amount").map(Value::is_string).unwrap_or(false)
+            && prior_balance.saturating_sub(ctx.fees.account_reserve(owner_count)) == 0
+        {
+            return Err(TransactionResult::TecUnfundedOffer);
+        }
+
         if prior_balance < ctx.fees.account_reserve(owner_count + 1) {
             return Err(TransactionResult::TecInsufficientReserve);
         }
