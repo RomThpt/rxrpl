@@ -416,6 +416,7 @@ impl TxEngine {
         // 7. Apply in child sandbox. A preclaim `tec` skips this entirely: the
         // fee and sequence/ticket were already charged in the parent sandbox and
         // it produces no further effect.
+        let mut node_delivered: Option<serde_json::Value> = None;
         let (result, should_commit) = if let Some(tec) = preclaim_tec {
             (tec, true)
         } else {
@@ -432,6 +433,9 @@ impl TxEngine {
                 };
                 transactor.apply(&mut apply_ctx)
             };
+            // Capture the delivered amount (if the handler set one) before the
+            // child is consumed, so metadata can carry sfDeliveredAmount.
+            node_delivered = child.take_delivered_amount();
             // Consume child to release borrow on sandbox
             let child_changes = child.into_changes();
 
@@ -517,7 +521,8 @@ impl TxEngine {
             // transaction SHAMap leaf in rippled's canonical form,
             // `VL(tx) || VL(meta)`, so the transaction tree root (tx_hash)
             // matches the validated chain.
-            let meta = changes.build_metadata(ledger.tx_count(), result.code(), &node_prev_txn);
+            let meta =
+                changes.build_metadata(ledger.tx_count(), result.code(), &node_prev_txn, node_delivered);
             let meta_json = meta.to_canonical_json();
 
             changes.apply_to_ledger(ledger)?;

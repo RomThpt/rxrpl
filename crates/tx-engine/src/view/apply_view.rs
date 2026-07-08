@@ -19,6 +19,13 @@ pub trait ApplyView: ReadView {
     /// Record destroyed XRP drops (transaction fees).
     fn destroy_drops(&mut self, drops: u64);
 
+    /// Record the amount this transaction actually delivered (rippled's
+    /// `ApplyContext::deliver`). A Payment sets it only when the delivered
+    /// amount differs from the requested `Amount` (a partial or path-limited
+    /// delivery), and the engine then writes `sfDeliveredAmount` into the
+    /// metadata. Default is a no-op for views that do not track it.
+    fn set_delivered_amount(&mut self, _amount: serde_json::Value) {}
+
     /// Whether the `SortedDirectories` amendment is active. Gates directory
     /// maintenance: when enabled, owner directories are kept sorted and entry
     /// removal preserves order; otherwise rippled's legacy append / swap-with-

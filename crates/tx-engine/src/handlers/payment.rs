@@ -664,6 +664,13 @@ fn apply_conversion(
         return Err(TransactionResult::TecPathPartial);
     }
 
+    // rippled Payment::doApply: record sfDeliveredAmount when the delivered
+    // amount differs from the requested Amount (a partial or path-limited
+    // delivery); a full delivery leaves it unset.
+    if delivered != amount {
+        ctx.view.set_delivered_amount(delivered.clone());
+    }
+
     let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view
         .update(src_key, nb)
@@ -907,6 +914,12 @@ fn apply_paths_payment(
         }
     }
 
+    // rippled Payment::doApply: record sfDeliveredAmount when delivered differs
+    // from the requested Amount (partial or path-limited delivery).
+    if delivered != amount {
+        ctx.view.set_delivered_amount(delivered.clone());
+    }
+
     let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view
         .update(src_key, nb)
@@ -1103,6 +1116,12 @@ fn apply_paths_payment_multi(
         }
     }
     let _ = Number::ZERO;
+
+    // rippled Payment::doApply: record sfDeliveredAmount when delivered differs
+    // from the requested Amount (partial or path-limited delivery).
+    if delivered != amount {
+        ctx.view.set_delivered_amount(delivered.clone());
+    }
 
     let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view

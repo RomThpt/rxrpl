@@ -13,8 +13,9 @@ pub struct TxMeta {
     pub tx_index: u32,
     /// Result code.
     pub result_code: i32,
-    /// Delivered amount for payments (if applicable).
-    pub delivered_amount: Option<String>,
+    /// Delivered amount for payments (if applicable). An XRP-drops string or an
+    /// IOU/MPT amount object, mirroring rippled's `sfDeliveredAmount`.
+    pub delivered_amount: Option<serde_json::Value>,
 }
 
 /// A ledger entry affected by a transaction.
@@ -176,6 +177,7 @@ impl SandboxChanges {
         tx_index: u32,
         result_code: i32,
         node_prev_txn: &HashMap<Hash256, (serde_json::Value, serde_json::Value)>,
+        delivered_amount: Option<serde_json::Value>,
     ) -> TxMeta {
         let mut affected_nodes = Vec::new();
 
@@ -223,7 +225,7 @@ impl SandboxChanges {
             affected_nodes,
             tx_index,
             result_code,
-            delivered_amount: None,
+            delivered_amount,
         }
     }
 }
@@ -320,7 +322,7 @@ impl TxMeta {
         meta.insert("TransactionResult".into(), self.result_code.into());
         meta.insert("AffectedNodes".into(), serde_json::Value::Array(affected));
         if let Some(amt) = &self.delivered_amount {
-            meta.insert("DeliveredAmount".into(), amt.clone().into());
+            meta.insert("DeliveredAmount".into(), amt.clone());
         }
         serde_json::Value::Object(meta)
     }
@@ -351,7 +353,7 @@ mod tests {
             destroyed_drops: 0,
         };
 
-        let meta = changes.build_metadata(0, 0, &HashMap::new());
+        let meta = changes.build_metadata(0, 0, &HashMap::new(), None);
         assert_eq!(meta.affected_nodes.len(), 1);
         assert_eq!(meta.affected_nodes[0].change_type, ChangeType::Created);
         assert_eq!(meta.affected_nodes[0].ledger_entry_type, "AccountRoot");
@@ -372,7 +374,7 @@ mod tests {
             destroyed_drops: 10,
         };
 
-        let meta = changes.build_metadata(1, 0, &HashMap::new());
+        let meta = changes.build_metadata(1, 0, &HashMap::new(), None);
         assert_eq!(meta.affected_nodes.len(), 1);
         assert_eq!(meta.affected_nodes[0].change_type, ChangeType::Modified);
         assert!(meta.affected_nodes[0].previous.is_some());
@@ -391,7 +393,7 @@ mod tests {
             destroyed_drops: 0,
         };
 
-        let meta = changes.build_metadata(0, 0, &HashMap::new());
+        let meta = changes.build_metadata(0, 0, &HashMap::new(), None);
         assert_eq!(meta.affected_nodes.len(), 1);
         assert_eq!(meta.affected_nodes[0].change_type, ChangeType::Deleted);
         assert!(meta.affected_nodes[0].previous.is_some());

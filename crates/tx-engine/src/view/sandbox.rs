@@ -37,6 +37,9 @@ pub struct Sandbox<'a> {
     /// Whether the `fixPreviousTxnID` amendment is active for this apply. Gates
     /// whether newly created directory-node pages are threaded.
     thread_directories: bool,
+    /// The amount this transaction actually delivered, set by a Payment when it
+    /// differs from the requested `Amount`; surfaced as `sfDeliveredAmount`.
+    delivered_amount: Option<serde_json::Value>,
 }
 
 impl<'a> Sandbox<'a> {
@@ -51,7 +54,14 @@ impl<'a> Sandbox<'a> {
             destroyed_drops: 0,
             sorted_directories: false,
             thread_directories: true,
+            delivered_amount: None,
         }
+    }
+
+    /// Take the amount recorded via [`ApplyView::set_delivered_amount`], if any.
+    /// The engine reads it after `apply` to write `sfDeliveredAmount` metadata.
+    pub fn take_delivered_amount(&mut self) -> Option<serde_json::Value> {
+        self.delivered_amount.take()
     }
 
     /// Record whether the `SortedDirectories` amendment is active. Set once per
@@ -255,6 +265,9 @@ impl ApplyView for Sandbox<'_> {
 
     fn destroy_drops(&mut self, drops: u64) {
         self.destroyed_drops += drops;
+    }
+    fn set_delivered_amount(&mut self, amount: serde_json::Value) {
+        self.delivered_amount = Some(amount);
     }
     fn sorted_directories(&self) -> bool {
         self.sorted_directories
