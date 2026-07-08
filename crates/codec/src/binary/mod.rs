@@ -16,6 +16,16 @@ pub fn encode(json: &Value) -> Result<Vec<u8>, CodecError> {
     Ok(s.into_bytes())
 }
 
+/// Extract the raw value bytes of the field `(type_code, field_code)` from a
+/// serialized STObject, or `None` if the field is absent.
+pub fn extract_field(
+    data: &[u8],
+    type_code: i32,
+    field_code: i32,
+) -> Result<Option<Vec<u8>>, CodecError> {
+    parser::BinaryParser::new(data).extract_field_value(type_code, field_code)
+}
+
 /// Decode XRPL binary format to JSON.
 pub fn decode(bytes: &[u8]) -> Result<Value, CodecError> {
     let mut p = parser::BinaryParser::new(bytes);

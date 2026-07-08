@@ -11,6 +11,20 @@ use serde_json::Value;
 
 use crate::view::read_view::ReadView;
 
+/// Adapts a read-only ledger view to the hooks crate's `SlotLedger` so the
+/// `slot` host function can load ledger entries by keylet. The view stores SLEs
+/// as JSON internally; hooks expect XRPL-binary, so re-encode before handing
+/// the bytes to the slot.
+struct ViewSlotLedger<'v>(&'v dyn ReadView);
+
+impl rxrpl_hooks::SlotLedger for ViewSlotLedger<'_> {
+    fn lookup(&self, keylet: &[u8]) -> Option<Vec<u8>> {
+        let key = Hash256::from_slice(keylet).ok()?;
+        let json: Value = serde_json::from_slice(&self.0.read(&key)?).ok()?;
+        rxrpl_codec::binary::encode(&json).ok()
+    }
+}
+
 /// Result of running hooks for a transaction.
 #[derive(Clone, Debug)]
 pub struct HookExecutionResult {
@@ -56,7 +70,8 @@ pub fn execute_hooks_for_tx(
     let otxn_blob = serde_json::to_vec(tx).unwrap_or_default();
 
     let engine = HookExecutionEngine::new();
-    let all_emitted = Vec::new();
+    let slot_ledger = ViewSlotLedger(view);
+    let mut all_emitted = Vec::new();
     let mut results = Vec::new();
     let mut rollback = false;
 
@@ -120,24 +135,19 @@ pub fn execute_hooks_for_tx(
         // Populate otxn_fields from the transaction JSON
         populate_otxn_fields(&mut ctx, tx);
 
-        match engine.execute(&wasm_bytes, ctx) {
-            Ok(result) => {
-                if let HookResult::Rollback(_) = &result {
+        match engine.execute_with_ledger(&wasm_bytes, ctx, Some(&slot_ledger)) {
+            Ok(execution) => {
+                if let HookResult::Rollback(_) = &execution.result {
                     rollback = true;
                 }
-                results.push(result);
+                all_emitted.extend(execution.emitted_txns);
+                results.push(execution.result);
             }
             Err(_) => {
                 results.push(HookResult::Error("hook execution failed".into()));
             }
         }
     }
-
-    // In a full implementation, emitted txns would be extracted from each
-    // hook's context after execution. The current engine consumes the context,
-    // so this would require returning it. For now, emitted_txns remains empty
-    // and can be wired up when the engine is extended.
-    let _ = &all_emitted;
 
     Some(HookExecutionResult {
         rollback,
