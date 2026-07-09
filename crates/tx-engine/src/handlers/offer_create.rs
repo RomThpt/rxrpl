@@ -376,6 +376,22 @@ impl Transactor for OfferCreateTransactor {
             return Ok(TransactionResult::TesSuccess);
         }
 
+        // rippled clears the leftover offer when crossing exhausted the taker's
+        // funds in the asset it sells: an offer it cannot fund at all is not
+        // placed (OfferCreate.cpp:481, `takerInBalance <= 0`). Applied to an IOU
+        // gets side, whose post-crossing balance is already committed to the
+        // view; an XRP gets side is reserve-gated below instead.
+        if crossed {
+            if let Some(gets_leg) = Leg::parse(&taker_gets) {
+                if !gets_leg.is_xrp
+                    && owner_funds_leg(ctx, &account_id, &gets_leg).is_zero()
+                {
+                    commit_acct(ctx, &acct)?;
+                    return Ok(TransactionResult::TesSuccess);
+                }
+            }
+        }
+
         // A remainder survives crossing. Time-in-force flags decide its fate
         // before any resting offer is placed.
         let tx_flags = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -870,22 +886,30 @@ fn cross_offers(
         // an AMM that cannot deliver the full demand within budget delivers zero
         // and the FoK check kills the offer — never a partial spend.
         let fok = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_FILL_OR_KILL != 0;
-        if let Some((delivered, spent)) = amm_hop(
-            ctx,
-            taker,
-            taker_acct,
-            taker,
-            &remaining_out,
-            &remaining_in,
-            /*skip_input_debit=*/ false,
-            /*skip_output_credit=*/ false,
-            /*create_missing_dest_line=*/ true,
-            /*partial=*/ !fok,
-            /*target_quality=*/ Some(threshold),
-        )? {
-            remaining_out = leg_sub(&remaining_out, &delivered);
-            remaining_in = leg_sub(&remaining_in, &spent);
-            crossed = true;
+        // rippled's flowCross limits the crossing input to the taker's funds
+        // (`sendMax = min(takerAmount.in, accountFunds)`, OfferCreate.cpp:400).
+        // The AMM swap would otherwise overdraw the taker (its balance in the
+        // sold asset goes negative) whenever TakerGets exceeds what it holds.
+        let taker_funds = owner_funds_leg(ctx, taker, &in_leg);
+        let budget = leg_min(&remaining_in, &taker_funds);
+        if !budget.is_zero() {
+            if let Some((delivered, spent)) = amm_hop(
+                ctx,
+                taker,
+                taker_acct,
+                taker,
+                &remaining_out,
+                &budget,
+                /*skip_input_debit=*/ false,
+                /*skip_output_credit=*/ false,
+                /*create_missing_dest_line=*/ true,
+                /*partial=*/ !fok,
+                /*target_quality=*/ Some(threshold),
+            )? {
+                remaining_out = leg_sub(&remaining_out, &delivered);
+                remaining_in = leg_sub(&remaining_in, &spent);
+                crossed = true;
+            }
         }
     }
 
