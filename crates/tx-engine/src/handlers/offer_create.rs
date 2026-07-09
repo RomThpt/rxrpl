@@ -1595,16 +1595,23 @@ fn amm_hop(
 
     // Spot-price-quality gate (rippled AMMLiquidity::getOffer, AMMLiquidity.cpp:
     // 184-190): an offer crossing may consume the AMM only when its spot quality
-    // (pool_out/pool_in, fee-free) STRICTLY beats the taker's limit quality and
-    // is not within 1e-7 of it. When the AMM is no better, deliver nothing so
-    // cross_offers places the full offer as resting. Payments pass None (any
-    // quality is acceptable, BookPaymentStep::checkQualityThreshold == true).
+    // STRICTLY beats the taker's limit quality and is not within 1e-7 of it —
+    // otherwise deliver nothing so cross_offers rests the full offer. The spot
+    // must be FEE-ADJUSTED: the taker pays the trading fee on the input, so the
+    // effective in/out is spot / (1 - fee) (worse than the fee-free spot). An AMM
+    // whose raw spot beats the limit but whose fee-adjusted price does not must
+    // not cross. Payments pass None (any quality is acceptable,
+    // BookPaymentStep::checkQualityThreshold == true).
     if let Some(cq) = target_quality {
-        let spq = rxrpl_amount::get_rate(
-            &num_quality_iou(&pool_in, in_xrp),
-            &num_quality_iou(&pool_out, out_xrp),
+        let one_minus_fee = IOUAmount::divide(
+            &IOUAmount::from_decimal_string(&(100_000u32 - u32::from(tfee)).to_string())
+                .unwrap_or(IOUAmount::ZERO),
+            &IOUAmount::from_decimal_string("100000").unwrap_or(IOUAmount::ZERO),
         )
-        .ok();
+        .unwrap_or(IOUAmount::ZERO);
+        let out_q = num_quality_iou(&pool_out, out_xrp);
+        let out_adj = IOUAmount::multiply(&out_q, &one_minus_fee).unwrap_or(out_q);
+        let spq = rxrpl_amount::get_rate(&num_quality_iou(&pool_in, in_xrp), &out_adj).ok();
         let Some(spq) = spq else {
             return Ok(None);
         };
