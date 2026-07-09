@@ -783,8 +783,8 @@ mod tests {
         wire.push(WIRE_TYPE_INNER);
 
         let (hash, storage) = decode_wire_node(&wire).expect("decode");
-        assert_eq!(storage.len(), 16 * 32);
-        assert_eq!(storage, payload);
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_INNER);
+        assert_eq!(&storage[1..], &payload[..]);
         let expected_hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &payload]);
         assert_eq!(hash, expected_hash);
     }
@@ -805,16 +805,14 @@ mod tests {
         wire.push(WIRE_TYPE_COMPRESSED_INNER);
 
         let (hash, storage) = decode_wire_node(&wire).expect("decode");
-        assert_eq!(storage.len(), 16 * 32);
-        // branch 0 has h0
-        assert_eq!(&storage[0..32], &h0);
-        // branch 1..5 zero
-        assert!(storage[32..5 * 32].iter().all(|&b| b == 0));
-        // branch 5 has h5
-        assert_eq!(&storage[5 * 32..6 * 32], &h5);
-        // branch 6..16 zero
-        assert!(storage[6 * 32..].iter().all(|&b| b == 0));
-        let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &storage]);
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_INNER);
+        let body = &storage[1..];
+        assert_eq!(body.len(), 16 * 32);
+        assert_eq!(&body[0..32], &h0);
+        assert!(body[32..5 * 32].iter().all(|&b| b == 0));
+        assert_eq!(&body[5 * 32..6 * 32], &h5);
+        assert!(body[6 * 32..].iter().all(|&b| b == 0));
+        let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, body]);
         assert_eq!(hash, expected);
     }
 
@@ -827,9 +825,10 @@ mod tests {
         wire.push(WIRE_TYPE_ACCOUNT_STATE);
 
         let (hash, storage) = decode_wire_node(&wire).expect("decode");
-        // Storage layout = key || data
-        assert_eq!(&storage[..32], &key);
-        assert_eq!(&storage[32..], &data[..]);
+        // Storage layout = tag || key || data
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_LEAF);
+        assert_eq!(&storage[1..33], &key);
+        assert_eq!(&storage[33..], &data[..]);
         // Hash uses rippled order (data || key)
         let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_LEAF, &data, &key]);
         assert_eq!(hash, expected);
@@ -844,8 +843,9 @@ mod tests {
         wire.push(WIRE_TYPE_TRANSACTION_WITH_META);
 
         let (hash, storage) = decode_wire_node(&wire).expect("decode");
-        assert_eq!(&storage[..32], &key);
-        assert_eq!(&storage[32..], &data[..]);
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_LEAF);
+        assert_eq!(&storage[1..33], &key);
+        assert_eq!(&storage[33..], &data[..]);
         let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_NODE, &data, &key]);
         assert_eq!(hash, expected);
     }
@@ -860,9 +860,10 @@ mod tests {
         let expected_key = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_ID, &data]);
         // Hash IS the tx hash
         assert_eq!(hash, expected_key);
-        // Storage = key || data
-        assert_eq!(&storage[..32], expected_key.as_bytes());
-        assert_eq!(&storage[32..], &data[..]);
+        // Storage = tag || key || data
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_LEAF);
+        assert_eq!(&storage[1..33], expected_key.as_bytes());
+        assert_eq!(&storage[33..], &data[..]);
     }
 
     #[test]
@@ -978,7 +979,8 @@ mod tests {
         assert_eq!(*wire.last().unwrap(), WIRE_TYPE_INNER);
         let (hash, storage) = decode_wire_node(&wire).expect("wire decodes");
         assert_eq!(hash, expected);
-        assert_eq!(storage, child_hashes);
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_INNER);
+        assert_eq!(&storage[1..], &child_hashes[..]);
     }
 
     /// A leaf account-state NodeObject (`MLN\0 || data || key`) likewise.
@@ -995,9 +997,10 @@ mod tests {
         assert_eq!(*wire.last().unwrap(), WIRE_TYPE_ACCOUNT_STATE);
         let (hash, storage) = decode_wire_node(&wire).expect("wire decodes");
         assert_eq!(hash, expected);
-        // storage layout is key || data.
-        assert_eq!(&storage[..32], &key[..]);
-        assert_eq!(&storage[32..], &data[..]);
+        // storage layout is tag || key || data.
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_LEAF);
+        assert_eq!(&storage[1..33], &key[..]);
+        assert_eq!(&storage[33..], &data[..]);
     }
 
     #[test]
