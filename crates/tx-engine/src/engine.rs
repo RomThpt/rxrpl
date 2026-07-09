@@ -333,7 +333,9 @@ impl TxEngine {
                                                         let reg = acct_obj
                                                             .get("RegularKey")
                                                             .and_then(|v| v.as_str())
-                                                            .and_then(|s| decode_account_id(s).ok());
+                                                            .and_then(|s| {
+                                                                decode_account_id(s).ok()
+                                                            });
                                                         Some(signer_id) == reg
                                                     }
                                                 }
@@ -1419,9 +1421,8 @@ mod tests {
 
         // The genuine list member.
         let member_kp = KeyPair::from_seed(&Seed::from_bytes([0x11u8; 16]), KeyType::Secp256k1);
-        let member_id = rxrpl_codec::address::classic::account_id_from_public_key(
-            &member_kp.public_key.0,
-        );
+        let member_id =
+            rxrpl_codec::address::classic::account_id_from_public_key(&member_kp.public_key.0);
         let member = rxrpl_codec::address::classic::encode_account_id(&member_id);
 
         // The attacker's own key (derives to a different account).
@@ -1447,8 +1448,7 @@ mod tests {
         use rxrpl_crypto::seed::Seed;
 
         let kp = KeyPair::from_seed(&Seed::from_bytes([0x22u8; 16]), KeyType::Secp256k1);
-        let member_id =
-            rxrpl_codec::address::classic::account_id_from_public_key(&kp.public_key.0);
+        let member_id = rxrpl_codec::address::classic::account_id_from_public_key(&kp.public_key.0);
         let member = rxrpl_codec::address::classic::encode_account_id(&member_id);
         let pubkey = hex::encode_upper(&kp.public_key.0);
 
@@ -1477,8 +1477,7 @@ mod tests {
         use rxrpl_crypto::seed::Seed;
 
         let kp = KeyPair::from_seed(&Seed::from_bytes([0x42u8; 16]), KeyType::Secp256k1);
-        let member_id =
-            rxrpl_codec::address::classic::account_id_from_public_key(&kp.public_key.0);
+        let member_id = rxrpl_codec::address::classic::account_id_from_public_key(&kp.public_key.0);
         let member = rxrpl_codec::address::classic::encode_account_id(&member_id);
         let pubkey = hex::encode_upper(&kp.public_key.0);
 
