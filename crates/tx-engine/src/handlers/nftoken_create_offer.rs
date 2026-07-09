@@ -10,24 +10,6 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transac
 /// tfSellNFToken flag
 const TF_SELL_NFTOKEN: u32 = 0x0001;
 
-/// True when an offer amount is zero (XRP `"0"` drops or IOU value `0`).
-fn amount_is_zero(amount: &Value) -> bool {
-    match amount {
-        Value::String(s) => s.parse::<u128>().map(|n| n == 0).unwrap_or(false),
-        Value::Object(o) => o
-            .get("value")
-            .and_then(|v| v.as_str())
-            .map(|s| {
-                s.trim_start_matches('-')
-                    .trim_matches('0')
-                    .trim_matches('.')
-                    .is_empty()
-            })
-            .unwrap_or(false),
-        _ => false,
-    }
-}
-
 fn nft_hash(id_hex: &str) -> Result<Hash256, TransactionResult> {
     let bytes = hex::decode(id_hex).map_err(|_| TransactionResult::TemMalformed)?;
     Hash256::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)
@@ -245,11 +227,12 @@ impl Transactor for NFTokenCreateOfferTransactor {
             "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
             "PreviousTxnLgrSeq": 0,
         });
-        // sfAmount is default-droppable: a zero-amount (gift) sell offer omits
-        // it, matching rippled's serialization.
-        if !amount_is_zero(&amount_value) {
-            offer["Amount"] = amount_value;
-        }
+        // sfAmount is SoeRequired on NFTokenOffer (LedgerFormats), so rippled
+        // serialises it even for a zero-amount (gift) sell offer. Omitting the
+        // zero diverges the account_hash: the state SLE carries Amount="0" while
+        // the metadata NewFields hides the zero, so the per-tx value check cannot
+        // see it (same trap as sfFlags). Always serialise it.
+        offer["Amount"] = amount_value;
         if let Some(dest) = helpers::get_str_field(ctx.tx, "Destination") {
             offer["Destination"] = Value::String(dest.to_string());
         }
