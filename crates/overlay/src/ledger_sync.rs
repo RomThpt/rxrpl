@@ -103,7 +103,7 @@ fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
                 return None;
             }
             let hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, payload]);
-            Some((hash, payload.to_vec()))
+            Some((hash, inner_store_record(payload)))
         }
         WIRE_TYPE_COMPRESSED_INNER => {
             // N * (hash[32] || branch[1])
@@ -119,7 +119,7 @@ fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
                 full[branch * 32..(branch + 1) * 32].copy_from_slice(&chunk[..32]);
             }
             let hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &full]);
-            Some((hash, full))
+            Some((hash, inner_store_record(&full)))
         }
         WIRE_TYPE_ACCOUNT_STATE => {
             // payload = data || key[32]
@@ -131,10 +131,7 @@ fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
             let key = &payload[split..];
             let hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_LEAF, data, key]);
             // Convert wire layout (data || key) to storage layout (key || data).
-            let mut storage = Vec::with_capacity(payload.len());
-            storage.extend_from_slice(key);
-            storage.extend_from_slice(data);
-            Some((hash, storage))
+            Some((hash, leaf_store_record(key, data)))
         }
         WIRE_TYPE_TRANSACTION_WITH_META => {
             // payload = data || key[32]
@@ -145,10 +142,7 @@ fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
             let data = &payload[..split];
             let key = &payload[split..];
             let hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_NODE, data, key]);
-            let mut storage = Vec::with_capacity(payload.len());
-            storage.extend_from_slice(key);
-            storage.extend_from_slice(data);
-            Some((hash, storage))
+            Some((hash, leaf_store_record(key, data)))
         }
         WIRE_TYPE_TRANSACTION => {
             // payload = data only; key = SHA512Half(TXN || data) i.e. the tx hash
@@ -157,13 +151,27 @@ fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
             }
             let key = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_ID, payload]);
             // For tx-no-meta, key IS the hash. Storage = key || data.
-            let mut storage = Vec::with_capacity(32 + payload.len());
-            storage.extend_from_slice(key.as_bytes());
-            storage.extend_from_slice(payload);
-            Some((key, storage))
+            Some((key, leaf_store_record(key.as_bytes(), payload)))
         }
         _ => None,
     }
+}
+
+/// Build a tagged inner-node store record from its raw 16*32 child-hash payload.
+fn inner_store_record(child_hashes_512: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + child_hashes_512.len());
+    out.push(rxrpl_shamap::node_store::STORE_TAG_INNER);
+    out.extend_from_slice(child_hashes_512);
+    out
+}
+
+/// Build a tagged leaf store record (`tag || key || data`).
+fn leaf_store_record(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + key.len() + data.len());
+    out.push(rxrpl_shamap::node_store::STORE_TAG_LEAF);
+    out.extend_from_slice(key);
+    out.extend_from_slice(data);
+    out
 }
 
 /// Convert a `TMGetObjectByHash` NodeObject blob into the SHAMap wire form

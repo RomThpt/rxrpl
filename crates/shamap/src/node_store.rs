@@ -9,36 +9,61 @@ use crate::leaf_node::LeafNode;
 use crate::node::SHAMapNode;
 use crate::node_id::BRANCH_FACTOR;
 
+/// Store-record type tags. A leaf serialized as `key(32) || data` collides in
+/// length with an inner node (16 x 32 = 512 bytes) exactly when the leaf value
+/// is 480 bytes, so the record type must be explicit rather than inferred from
+/// length. The tag does not affect the node hash (computed from node content,
+/// not the store record), so hashes stay rippled-compatible.
+pub const STORE_TAG_INNER: u8 = 0x00;
+pub const STORE_TAG_LEAF: u8 = 0x01;
+
+/// Serialize an inner node's 16 child hashes into a store record.
+pub fn serialize_inner(child_hashes: [Hash256; BRANCH_FACTOR]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + BRANCH_FACTOR * 32);
+    out.push(STORE_TAG_INNER);
+    for h in &child_hashes {
+        out.extend_from_slice(h.as_bytes());
+    }
+    out
+}
+
+/// Serialize a leaf node (`key || data`) into a store record.
+pub fn serialize_leaf(key: &Hash256, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 32 + data.len());
+    out.push(STORE_TAG_LEAF);
+    out.extend_from_slice(key.as_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
 /// Deserialize a node from its stored byte representation.
 ///
-/// - 512 bytes -> inner node (16 x 32-byte child hashes)
-/// - >= 32 bytes (not 512) -> leaf node (key || data)
-/// - < 32 bytes -> error
+/// The first byte is a type tag ([`STORE_TAG_INNER`] / [`STORE_TAG_LEAF`]);
+/// inner = tag || 16 x 32-byte child hashes, leaf = tag || key(32) || data.
 pub fn deserialize_node(
     bytes: &[u8],
     hash: &Hash256,
     leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
 ) -> Result<SHAMapNode, SHAMapError> {
-    if bytes.len() == BRANCH_FACTOR * 32 {
-        // Inner node: 16 child hashes
-        let mut inner = InnerNode::new();
-        for i in 0..BRANCH_FACTOR {
-            let start = i * 32;
-            let child_hash = Hash256::new(bytes[start..start + 32].try_into().unwrap());
-            if !child_hash.is_zero() {
-                inner.set_child_hash(i as u8, child_hash);
+    match bytes.split_first() {
+        Some((&STORE_TAG_INNER, body)) if body.len() == BRANCH_FACTOR * 32 => {
+            let mut inner = InnerNode::new();
+            for i in 0..BRANCH_FACTOR {
+                let start = i * 32;
+                let child_hash = Hash256::new(body[start..start + 32].try_into().unwrap());
+                if !child_hash.is_zero() {
+                    inner.set_child_hash(i as u8, child_hash);
+                }
             }
+            inner.set_cached_hash(*hash);
+            Ok(SHAMapNode::inner(inner))
         }
-        inner.set_cached_hash(*hash);
-        Ok(SHAMapNode::inner(inner))
-    } else if bytes.len() >= 32 {
-        // Leaf node: key (32 bytes) || data
-        let key = Hash256::new(bytes[..32].try_into().unwrap());
-        let data = bytes[32..].to_vec();
-        let leaf = leaf_ctor(key, data);
-        Ok(SHAMapNode::Leaf(leaf))
-    } else {
-        Err(SHAMapError::DeserializeError)
+        Some((&STORE_TAG_LEAF, body)) if body.len() >= 32 => {
+            let key = Hash256::new(body[..32].try_into().unwrap());
+            let data = body[32..].to_vec();
+            Ok(SHAMapNode::Leaf(leaf_ctor(key, data)))
+        }
+        _ => Err(SHAMapError::DeserializeError),
     }
 }
 
@@ -169,11 +194,11 @@ mod tests {
         inner.update_hash();
         let hash = inner.hash();
 
-        // Serialize: 16 x 32-byte child hashes
-        let mut data = Vec::with_capacity(BRANCH_FACTOR * 32);
-        for i in 0..16u8 {
-            data.extend_from_slice(inner.child_hash(i).as_bytes());
+        let mut child_hashes = [Hash256::ZERO; BRANCH_FACTOR];
+        for (i, slot) in child_hashes.iter_mut().enumerate() {
+            *slot = inner.child_hash(i as u8);
         }
+        let data = super::serialize_inner(child_hashes);
 
         let node = super::deserialize_node(&data, &hash, LeafNode::account_state).unwrap();
         match &node {
@@ -194,10 +219,7 @@ mod tests {
         let leaf = LeafNode::account_state(key, leaf_data.clone());
         let leaf_hash = leaf.hash();
 
-        // Serialize: key || data
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(key.as_bytes());
-        bytes.extend_from_slice(&leaf_data);
+        let bytes = super::serialize_leaf(&key, &leaf_data);
 
         let node = super::deserialize_node(&bytes, &leaf_hash, LeafNode::account_state).unwrap();
         match &node {
@@ -206,6 +228,26 @@ mod tests {
                 assert_eq!(deserialized.data(), &leaf_data[..]);
             }
             _ => panic!("expected leaf node"),
+        }
+    }
+
+    #[test]
+    fn leaf_with_480_byte_value_is_not_confused_with_inner() {
+        // A leaf value of exactly 480 bytes makes key(32)||data == 512 bytes,
+        // the length of an inner node's 16 child hashes. The type tag must keep
+        // it decoded as a leaf, not a garbage inner node.
+        let key = Hash256::new([0xCD; 32]);
+        let data = vec![0xBB; 480];
+        let leaf = LeafNode::account_state(key, data.clone());
+        let record = super::serialize_leaf(&key, &data);
+
+        let node = super::deserialize_node(&record, &leaf.hash(), LeafNode::account_state).unwrap();
+        match &node {
+            SHAMapNode::Leaf(l) => {
+                assert_eq!(*l.key(), key);
+                assert_eq!(l.data(), &data[..]);
+            }
+            _ => panic!("480-byte leaf must not decode as an inner node"),
         }
     }
 

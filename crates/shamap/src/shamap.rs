@@ -330,11 +330,11 @@ impl SHAMap {
             SHAMapNode::Inner(inner) => {
                 let hash = inner.hash();
                 if !hash.is_zero() {
-                    let mut data = Vec::with_capacity(16 * 32);
-                    for i in 0..16u8 {
-                        data.extend_from_slice(inner.child_hash(i).as_bytes());
+                    let mut child_hashes = [Hash256::ZERO; 16];
+                    for (i, slot) in child_hashes.iter_mut().enumerate() {
+                        *slot = inner.child_hash(i as u8);
                     }
-                    out.push((hash, data));
+                    out.push((hash, crate::node_store::serialize_inner(child_hashes)));
                 }
 
                 // for_each_branch only visits loaded children
@@ -344,10 +344,10 @@ impl SHAMap {
             }
             SHAMapNode::Leaf(leaf) => {
                 let hash = leaf.hash();
-                let mut data = Vec::with_capacity(32 + leaf.data().len());
-                data.extend_from_slice(leaf.key().as_bytes());
-                data.extend_from_slice(leaf.data());
-                out.push((hash, data));
+                out.push((
+                    hash,
+                    crate::node_store::serialize_leaf(leaf.key(), leaf.data()),
+                ));
             }
         }
     }
