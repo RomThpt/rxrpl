@@ -110,8 +110,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
       # Gate merges on RustSec advisories, banned crates, and unknown sources.
       # deny.toml holds the policy; this makes it actually run in CI.
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories bans sources
+      - run: cargo deny check advisories bans sources

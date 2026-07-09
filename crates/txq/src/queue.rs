@@ -227,7 +227,7 @@ impl TxQueue {
     pub fn drain_for_retry(&mut self) -> Vec<QueueEntry> {
         let mut entries: Vec<QueueEntry> = Vec::with_capacity(self.by_hash.len());
         // Iterate fee-descending (BTreeMap key is Reverse<FeeLevel>)
-        for (_, hash) in self.by_fee.iter() {
+        for hash in self.by_fee.values() {
             if let Some(entry) = self.by_hash.get(hash) {
                 entries.push(entry.clone());
             }
