@@ -712,6 +712,7 @@ fn cross_offers(
     let mut remaining_in = in_leg.clone();
     let mut crossed = false;
     let book_prefix = &inverse_book.as_bytes()[0..24];
+    let fok = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_FILL_OR_KILL != 0;
 
     // The book base for traversal has the quality (low 64 bits) zeroed;
     // `keylet::book_dir` leaves those as hash bytes, so start the walk there.
@@ -724,6 +725,28 @@ fn cross_offers(
         let dir_quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
         if dir_quality > threshold {
             break; // worse than the taker will accept
+        }
+        // Interleave the AMM at this quality band BEFORE the resting CLOB offers.
+        // rippled crosses whichever of the synthetic AMM offer / CLOB tip is
+        // better at each quality level (BookStep tryAMM/execOffer). `amm_hop`'s
+        // fee-adjusted spot gate admits the AMM only when it strictly beats
+        // `dir_quality`, so this fires exactly when the AMM is at least as good
+        // as the offers about to cross at this band; it is a no-op otherwise.
+        if !remaining_out.is_zero() && !remaining_in.is_zero() {
+            try_amm_step(
+                ctx,
+                taker,
+                taker_acct,
+                &in_leg,
+                &mut remaining_out,
+                &mut remaining_in,
+                &mut crossed,
+                dir_quality,
+                fok,
+            )?;
+            if remaining_out.is_zero() || remaining_in.is_zero() {
+                break 'walk; // AMM alone met the demand (or exhausted the taker's funds)
+            }
         }
         let Some(dir_bytes) = ctx.view.read(&dir_key) else {
             continue;
@@ -874,43 +897,24 @@ fn cross_offers(
         }
     }
 
-    // AMM fallback: with no crossable CLOB offer, cross the remaining demand
-    // against a single AMM pool for this book (rippled `BookStep::tryAMM` with an
-    // empty CLOB — the AMM is swapped with no quality clamp, the taker's own
-    // limit still enforced by `amm_hop`'s budget check). Gated on `!crossed` so a
-    // mixed AMM+CLOB book (which rippled interleaves by quality) is left to the
-    // existing CLOB path unchanged.
-    if !crossed && !remaining_out.is_zero() && !remaining_in.is_zero() {
-        // rippled runs the offer-crossing flow with partialPayment = !tfFillOrKill
-        // (OfferCreate.cpp:451): a fill-or-kill offer crosses all-or-nothing, so
-        // an AMM that cannot deliver the full demand within budget delivers zero
-        // and the FoK check kills the offer — never a partial spend.
-        let fok = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_FILL_OR_KILL != 0;
-        // rippled's flowCross limits the crossing input to the taker's funds
-        // (`sendMax = min(takerAmount.in, accountFunds)`, OfferCreate.cpp:400).
-        // The AMM swap would otherwise overdraw the taker (its balance in the
-        // sold asset goes negative) whenever TakerGets exceeds what it holds.
-        let taker_funds = owner_funds_leg(ctx, taker, &in_leg);
-        let budget = leg_min(&remaining_in, &taker_funds);
-        if !budget.is_zero() {
-            if let Some((delivered, spent)) = amm_hop(
-                ctx,
-                taker,
-                taker_acct,
-                taker,
-                &remaining_out,
-                &budget,
-                /*skip_input_debit=*/ false,
-                /*skip_output_credit=*/ false,
-                /*create_missing_dest_line=*/ true,
-                /*partial=*/ !fok,
-                /*target_quality=*/ Some(threshold),
-            )? {
-                remaining_out = leg_sub(&remaining_out, &delivered);
-                remaining_in = leg_sub(&remaining_in, &spent);
-                crossed = true;
-            }
-        }
+    // Tail: the AMM may still beat every remaining CLOB up to the taker's overall
+    // limit — the book was empty, was exhausted, or the walk stopped at a dir
+    // worse than `threshold` while the AMM's spot still beats it. Cross the AMM up
+    // to `threshold` (the loosest gate). rippled interleaves the AMM by quality
+    // rather than gating it on whether any CLOB crossed, so this is NOT `!crossed`
+    // gated: a single crossed CLOB offer must not suppress better AMM liquidity.
+    if !remaining_out.is_zero() && !remaining_in.is_zero() {
+        try_amm_step(
+            ctx,
+            taker,
+            taker_acct,
+            &in_leg,
+            &mut remaining_out,
+            &mut remaining_in,
+            &mut crossed,
+            threshold,
+            fok,
+        )?;
     }
 
     Ok((
@@ -918,6 +922,57 @@ fn cross_offers(
         remaining_in.with_amount(&remaining_in.iou, remaining_in.drops),
         crossed,
     ))
+}
+
+/// Cross the book's AMM pool (if present and strictly better than `cq`) up to the
+/// target quality `cq`, limited to the taker's funds, updating the remaining
+/// demand/budget and `crossed` in place. Mirrors rippled's per-quality-band AMM
+/// injection (`BookStep::tryAMM`): `amm_hop`'s fee-adjusted spot gate admits the
+/// AMM only when it strictly beats `cq`, so this is a no-op unless the AMM is at
+/// least as good as the CLOB at this band.
+#[allow(clippy::too_many_arguments)]
+fn try_amm_step(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    in_leg: &Leg,
+    remaining_out: &mut Leg,
+    remaining_in: &mut Leg,
+    crossed: &mut bool,
+    cq: u64,
+    fok: bool,
+) -> Result<(), TransactionResult> {
+    // rippled's flowCross limits the crossing input to the taker's funds
+    // (`sendMax = min(takerAmount.in, accountFunds)`, OfferCreate.cpp:400): the
+    // AMM swap would otherwise overdraw the taker (its sold-asset balance goes
+    // negative) when TakerGets exceeds what it holds.
+    let taker_funds = owner_funds_leg(ctx, taker, in_leg);
+    let budget = leg_min(remaining_in, &taker_funds);
+    if budget.is_zero() {
+        return Ok(());
+    }
+    // partial = !fok: a fill-or-kill offer crosses all-or-nothing, so an AMM that
+    // cannot deliver the full demand within budget delivers zero. A per-band spend
+    // by a FoK offer that later fails to fully cross is rolled back atomically —
+    // the transactor returns tecKILLED and the engine discards all mutations.
+    if let Some((delivered, spent)) = amm_hop(
+        ctx,
+        taker,
+        taker_acct,
+        taker,
+        remaining_out,
+        &budget,
+        /*skip_input_debit=*/ false,
+        /*skip_output_credit=*/ false,
+        /*create_missing_dest_line=*/ true,
+        /*partial=*/ !fok,
+        /*target_quality=*/ Some(cq),
+    )? {
+        *remaining_out = leg_sub(remaining_out, &delivered);
+        *remaining_in = leg_sub(remaining_in, &spent);
+        *crossed = true;
+    }
+    Ok(())
 }
 
 /// Output deliverable for a given input at a resting offer's price. This mirrors
@@ -1574,6 +1629,7 @@ fn num_quality_iou(n: &rxrpl_amount::number::Number, is_xrp: bool) -> IOUAmount 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn amm_hop(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
