@@ -60,6 +60,19 @@ pub async fn submit(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
     let tx_json = rxrpl_codec::binary::decode(&tx_bytes)
         .map_err(|e| RpcServerError::InvalidParams(format!("invalid tx blob: {e}")))?;
 
+    // The production tx engine skips cryptographic signature verification (it is
+    // reused for trusted replay and consensus apply). Client-submitted blobs are
+    // untrusted, so verify the signature here at ingress before accepting them.
+    if let Err(e) = rxrpl_protocol::tx::verify_signature(&tx_json) {
+        tracing::debug!("submit: rejecting tx with bad signature: {e}");
+        return Ok(serde_json::json!({
+            "engine_result": "tefBAD_SIGNATURE",
+            "engine_result_code": rxrpl_protocol::TransactionResult::TefBadSignature.code(),
+            "engine_result_message": "The signature is not valid for the given transaction.",
+            "tx_json": tx_json,
+        }));
+    }
+
     let ledger = ctx
         .ledger
         .as_ref()

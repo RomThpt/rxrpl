@@ -2630,6 +2630,14 @@ impl Node {
                                     }
                                 };
 
+                                // Peer-relayed transactions are untrusted: verify the
+                                // signature before touching the open ledger, otherwise a
+                                // peer could inject forged/unsigned transactions.
+                                if let Err(e) = rxrpl_protocol::tx::verify_signature(&tx_json) {
+                                    tracing::warn!("dropping P2P tx {} with bad signature: {}", hash, e);
+                                    continue;
+                                }
+
                                 // Apply to open ledger (speculative)
                                 let mut l = ledger.write().await;
                                 let rules = crate::play_forward::rules_for_ledger(&l);
