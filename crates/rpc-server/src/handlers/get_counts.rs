@@ -28,6 +28,6 @@ pub async fn get_counts(_params: Value, ctx: &Arc<ServerContext>) -> Result<Valu
         "ledger_count": ledger_count,
         "tx_queue_size": tx_queue_size,
         "peer_reservations": peer_reservations,
-        "uptime": 0,
+        "uptime": ctx.uptime_seconds(),
     }))
 }

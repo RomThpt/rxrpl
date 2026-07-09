@@ -14,7 +14,8 @@ pub async fn tx(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcSer
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcServerError::InvalidParams("missing 'transaction' field".into()))?;
 
-    let hash = Hash256::from_str(hash_str).map_err(|_| RpcServerError::NotImplemented)?;
+    let hash = Hash256::from_str(hash_str)
+        .map_err(|_| RpcServerError::InvalidParams("malformed 'transaction' hash".into()))?;
 
     // In reporting mode, query the ledger store directly
     if ctx.reporting_mode {

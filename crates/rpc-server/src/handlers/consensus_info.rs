@@ -34,12 +34,14 @@ pub async fn consensus_info(
     let proposing = ctx.local_manifest().is_some();
     let consensus_state = if proposing { "proposing" } else { "observing" };
 
+    let proposers = ctx.last_close().map(|lc| lc.proposers).unwrap_or(0);
+
     Ok(serde_json::json!({
         "info": {
             "consensus": consensus_state,
             "ledger_seq": ledger_seq,
             "our_position": {
-                "proposers": 0,
+                "proposers": proposers,
             },
             "proposing": proposing,
             "validated_ledger": validated_seq,

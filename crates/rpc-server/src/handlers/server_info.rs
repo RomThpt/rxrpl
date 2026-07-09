@@ -28,6 +28,22 @@ fn ledger_age(close_time: u32) -> u64 {
     now.saturating_sub(close_time as u64)
 }
 
+const DROPS_PER_XRP: f64 = 1_000_000.0;
+
+/// `validated_ledger` fee/reserve fields (in XRP), from the live `FeeSettings`
+/// or the protocol defaults when no fee snapshot is attached (reporting mode).
+fn ledger_fee_fields(ctx: &Arc<ServerContext>) -> (f64, f64, f64) {
+    let fees = ctx.fees.as_ref();
+    let base_fee = fees.map(|f| f.base_fee).unwrap_or(10);
+    let reserve_base = fees.map(|f| f.reserve_base).unwrap_or(10_000_000);
+    let reserve_inc = fees.map(|f| f.reserve_increment).unwrap_or(2_000_000);
+    (
+        base_fee as f64 / DROPS_PER_XRP,
+        reserve_base as f64 / DROPS_PER_XRP,
+        reserve_inc as f64 / DROPS_PER_XRP,
+    )
+}
+
 /// Snapshot of "what's in the closed ledger window" used by both
 /// `server_info` and `server_state`.
 struct ClosedLedgersSummary {
@@ -82,6 +98,7 @@ async fn closed_ledgers_summary(ctx: &Arc<ServerContext>) -> ClosedLedgersSummar
     // In standalone (no slot attached) or before the first quorum is reached,
     // fall back to the locally-closed window — that's all the truth we have.
     let net = ctx.network_validated();
+    let (base_fee_xrp, reserve_base_xrp, reserve_inc_xrp) = ledger_fee_fields(ctx);
     if let Some(ref closed) = ctx.closed_ledgers {
         let closed = closed.read().await;
         if closed.is_empty() {
@@ -110,9 +127,9 @@ async fn closed_ledgers_summary(ctx: &Arc<ServerContext>) -> ClosedLedgersSummar
                     "hash": snap.hash.to_string(),
                     "close_time": snap.close_time,
                     "age": ledger_age(snap.close_time),
-                    "base_fee_xrp": 0.00001,
-                    "reserve_base_xrp": 10,
-                    "reserve_inc_xrp": 2,
+                    "base_fee_xrp": base_fee_xrp,
+                    "reserve_base_xrp": reserve_base_xrp,
+                    "reserve_inc_xrp": reserve_inc_xrp,
                 });
                 ClosedLedgersSummary {
                     complete_ledgers: format_ledger_ranges(&seqs),
@@ -128,9 +145,9 @@ async fn closed_ledgers_summary(ctx: &Arc<ServerContext>) -> ClosedLedgersSummar
                     "hash": last_ledger.header.hash.to_string(),
                     "close_time": last_ledger.header.close_time,
                     "age": ledger_age(last_ledger.header.close_time),
-                    "base_fee_xrp": 0.00001,
-                    "reserve_base_xrp": 10,
-                    "reserve_inc_xrp": 2,
+                    "base_fee_xrp": base_fee_xrp,
+                    "reserve_base_xrp": reserve_base_xrp,
+                    "reserve_inc_xrp": reserve_inc_xrp,
                 });
                 ClosedLedgersSummary {
                     complete_ledgers: format_ledger_ranges(&seqs),
