@@ -93,18 +93,35 @@ const LSF_SELL: u64 = 0x0002_0000;
 /// rippled's `Quality::kMaxTickSize` — no rounding at or above 16 digits.
 const MAX_TICK_SIZE: u8 = 16;
 
+/// Round a non-negative decimal magnitude to the nearest integer drop, ties to
+/// even — rippled's `Number`-based `STAmount(XRP)` canonicalisation
+/// (`Number::operator rep()`, "round towards nearest, and on tie towards even"),
+/// not truncation.
+fn round_drops_half_even(dec: &str) -> Option<u64> {
+    let dec = dec.strip_prefix('-').unwrap_or(dec);
+    let (int_str, frac_str) = dec.split_once('.').unwrap_or((dec, ""));
+    let mut drops: u64 = int_str.parse().ok()?;
+    if let Some(&first) = frac_str.as_bytes().first() {
+        let first = first - b'0';
+        let rest_nonzero = frac_str.as_bytes()[1..].iter().any(|&b| b != b'0');
+        if first > 5 || (first == 5 && (rest_nonzero || drops & 1 == 1)) {
+            drops = drops.checked_add(1)?;
+        }
+    }
+    Some(drops)
+}
+
 /// Reserialize an IOU offer side with a recomputed magnitude, preserving its
 /// currency/issuer. Returns `None` for XRP sides (no tick rounding applies to
 /// a recomputed native amount here).
 fn rebuild_iou(original: &Value, value: &IOUAmount) -> Option<Value> {
     // An XRP side is a bare drops string, not an IOU object: the tick
-    // re-derivation yields a fractional drops magnitude which rippled floors to
-    // an integer drop (STAmount(XRP)). Without this the re-derivation silently
-    // failed on XRP offers and the tick snap was skipped.
+    // re-derivation yields a fractional drops magnitude which rippled rounds to
+    // the nearest drop (round half to even, `STAmount(XRP)` via `Number`), not
+    // truncates. Without this the re-derivation silently failed on XRP offers
+    // and the tick snap was skipped.
     if original.is_string() {
-        let dec = value.to_decimal_string();
-        let int_part = dec.split('.').next().unwrap_or("0");
-        let drops: u64 = int_part.parse().ok()?;
+        let drops = round_drops_half_even(&value.to_decimal_string())?;
         return Some(Value::String(drops.to_string()));
     }
     let obj = original.as_object()?;
@@ -3351,22 +3368,39 @@ fn remove_from_book_dir(
 
 #[cfg(test)]
 mod tick_round_tests {
-    use super::rebuild_iou;
+    use super::{rebuild_iou, round_drops_half_even};
     use rxrpl_amount::IOUAmount;
 
     // The tick re-derivation of an XRP side yields a fractional drops magnitude;
-    // rebuild_iou must floor it onto an integer drop (mainnet tx DFF0E4CB snaps
-    // TakerGets 3654519 -> 3654430 from the re-derived 3654430.39499415). Before
-    // the fix rebuild_iou returned None for the bare-string XRP side, silently
-    // skipping the snap.
+    // rebuild_iou must round it onto an integer drop the way rippled's
+    // `STAmount(XRP)` does (round half to even), not truncate. Mainnet tx
+    // DFF0E4CB snaps TakerGets 3654519 -> 3654430 (re-derived 3654430.39499415,
+    // rounds down); tx 3CB55737 snaps 8543180 -> 8543055 (re-derived
+    // 8543054.951085025, rounds up — truncation produced 8543054 and diverged).
     #[test]
-    fn rebuild_iou_floors_xrp_drops() {
+    fn rebuild_iou_rounds_xrp_drops_half_even() {
         let original = serde_json::json!("3654519");
         let redrived = IOUAmount::from_decimal_string("3654430.39499415").unwrap();
         assert_eq!(
             rebuild_iou(&original, &redrived),
             Some(serde_json::json!("3654430"))
         );
+
+        let original = serde_json::json!("8543180");
+        let redrived = IOUAmount::from_decimal_string("8543054.951085025").unwrap();
+        assert_eq!(
+            rebuild_iou(&original, &redrived),
+            Some(serde_json::json!("8543055"))
+        );
+    }
+
+    #[test]
+    fn round_drops_ties_to_even() {
+        assert_eq!(round_drops_half_even("10.5"), Some(10));
+        assert_eq!(round_drops_half_even("11.5"), Some(12));
+        assert_eq!(round_drops_half_even("10.5000001"), Some(11));
+        assert_eq!(round_drops_half_even("10.4999999"), Some(10));
+        assert_eq!(round_drops_half_even("42"), Some(42));
     }
 }
 
