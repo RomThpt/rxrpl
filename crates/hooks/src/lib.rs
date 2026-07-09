@@ -13,6 +13,6 @@ pub mod validation;
 pub use context::{DEFAULT_GAS_LIMIT, HookContext, MAX_EMITTED_TXNS, MAX_SLOTS};
 pub use engine::{EngineError, HookExecution, HookExecutionEngine, HookResult};
 pub use grants::{HookGrant, is_grant_authorized};
-pub use host::SlotLedger;
 pub use hook_on::should_hook_fire;
+pub use host::SlotLedger;
 pub use validation::validate_wasm;

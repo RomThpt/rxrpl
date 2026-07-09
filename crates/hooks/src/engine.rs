@@ -203,6 +203,9 @@ mod tests {
         let ctx = HookContext::new(Hash256::default(), [0u8; 20]);
         let execution = engine.execute(&emitting_hook, ctx).unwrap();
         assert_eq!(execution.result, HookResult::Accept(0));
-        assert_eq!(execution.emitted_txns, vec![vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE]]);
+        assert_eq!(
+            execution.emitted_txns,
+            vec![vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE]]
+        );
     }
 }

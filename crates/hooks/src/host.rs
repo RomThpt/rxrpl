@@ -114,7 +114,12 @@ pub fn register_host_functions<'a>(
     linker.func_wrap(
         "env",
         "state_set",
-        move |caller: Caller<HostState>, key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32| -> i64 {
+        move |caller: Caller<HostState>,
+              key_ptr: i32,
+              key_len: i32,
+              val_ptr: i32,
+              val_len: i32|
+              -> i64 {
             let mut hook_ctx = ctx.lock().unwrap();
             let gas_cost = HOST_CALL_GAS + (key_len as u64 + val_len as u64) * STATE_BYTE_GAS;
             if hook_ctx.consume_gas(gas_cost).is_err() {
@@ -199,13 +204,17 @@ pub fn register_host_functions<'a>(
     // otxn_type() -> i64
     // Returns the transaction type code of the originating transaction.
     let ctx = context.clone();
-    linker.func_wrap("env", "otxn_type", move |_caller: Caller<HostState>| -> i64 {
-        let mut hook_ctx = ctx.lock().unwrap();
-        if hook_ctx.consume_gas(HOST_CALL_GAS).is_err() {
-            return OUT_OF_GAS;
-        }
-        hook_ctx.otxn_type as i64
-    })?;
+    linker.func_wrap(
+        "env",
+        "otxn_type",
+        move |_caller: Caller<HostState>| -> i64 {
+            let mut hook_ctx = ctx.lock().unwrap();
+            if hook_ctx.consume_gas(HOST_CALL_GAS).is_err() {
+                return OUT_OF_GAS;
+            }
+            hook_ctx.otxn_type as i64
+        },
+    )?;
 
     // otxn_hash(write_ptr: i32) -> i64
     // Writes the 32-byte originating transaction hash to WASM memory.
@@ -286,7 +295,11 @@ pub fn register_host_functions<'a>(
     linker.func_wrap(
         "env",
         "otxn_field",
-        move |mut caller: Caller<HostState>, field_id: i32, write_ptr: i32, write_len: i32| -> i64 {
+        move |mut caller: Caller<HostState>,
+              field_id: i32,
+              write_ptr: i32,
+              write_len: i32|
+              -> i64 {
             if field_id < 0 || write_len < 0 {
                 return INVALID_ARGUMENT;
             }
