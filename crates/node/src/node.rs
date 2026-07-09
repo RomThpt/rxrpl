@@ -1181,8 +1181,7 @@ impl Node {
         // it with the overlay (shard exchange protocol) and the RPC context so
         // `shard_info`/`node_to_shard`/`crawl_shards` report the live store.
         if self.config.database.shard.enabled {
-            let shard_manager =
-                Arc::new(RwLock::new(rxrpl_nodestore::ShardManager::new()));
+            let shard_manager = Arc::new(RwLock::new(rxrpl_nodestore::ShardManager::new()));
             peer_mgr.set_shard_manager(Arc::clone(&shard_manager));
             ctx.attach_shard_manager(shard_manager);
         }
