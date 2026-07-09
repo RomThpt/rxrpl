@@ -1,6 +1,8 @@
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
+# Vulnerabilities and unsound advisories are always denied by modern cargo-deny;
+# list specific advisory IDs to ignore here (with justification) if ever needed.
+yanked = "deny"
+ignore = []
 
 [licenses]
 allow = [
