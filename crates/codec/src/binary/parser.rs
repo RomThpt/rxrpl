@@ -70,6 +70,30 @@ impl<'a> BinaryParser<'a> {
         Ok(self.read_bytes(len)?.to_vec())
     }
 
+    /// Walk the top-level fields of a serialized STObject and return the raw
+    /// on-wire value bytes (without the field-id header) of the field whose
+    /// header matches `(want_type, want_field)`, or `None` if it is absent.
+    pub fn extract_field_value(
+        &mut self,
+        want_type: i32,
+        want_field: i32,
+    ) -> Result<Option<Vec<u8>>, CodecError> {
+        while self.remaining() > 0 {
+            let (type_code, field_code, consumed) =
+                field_id::decode_field_id(&self.data[self.pos..])?;
+            self.pos += consumed;
+            if (type_code == 14 || type_code == 15) && field_code == 1 {
+                break; // Object/Array end marker
+            }
+            let value_start = self.pos;
+            self.skip_field(type_code)?;
+            if type_code == want_type && field_code == want_field {
+                return Ok(Some(self.data[value_start..self.pos].to_vec()));
+            }
+        }
+        Ok(None)
+    }
+
     /// Parse a complete XRPL binary object into JSON.
     pub fn parse_object(&mut self) -> Result<Value, CodecError> {
         let mut map = Map::new();

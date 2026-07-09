@@ -11,6 +11,7 @@ rxrpl-primitives = { workspace = true }
 wasmi = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }
+rxrpl-codec = { workspace = true }
 
 [dev-dependencies]
 wat = { workspace = true }

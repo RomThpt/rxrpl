@@ -6,6 +6,22 @@ use wasmi::{Caller, Engine, Linker};
 
 use crate::context::{HookContext, MAX_EMITTED_TXNS, MAX_SLOTS};
 
+/// Read-only ledger access exposed to the `slot` host function so a hook can
+/// load a ledger entry by keylet. Implemented by the transaction engine over
+/// its live view; `None` in the store when no ledger is wired (e.g. tests).
+pub trait SlotLedger {
+    /// Serialized SLE bytes for `keylet`, or `None` if the entry is absent.
+    fn lookup(&self, keylet: &[u8]) -> Option<Vec<u8>>;
+}
+
+/// wasmi store data threaded into every host call. Carries the optional ledger
+/// so `slot` can resolve keylets without capturing a borrowed view in a
+/// `'static` closure.
+#[derive(Default)]
+pub struct HostState<'a> {
+    pub ledger: Option<&'a dyn SlotLedger>,
+}
+
 /// Gas cost per host function call.
 const HOST_CALL_GAS: u64 = 100;
 /// Gas cost per byte for state operations.
@@ -35,7 +51,7 @@ const INVALID_SLOT: i64 = -7;
 const OUT_OF_GAS: i64 = -10;
 
 /// Helper: get WASM memory from a caller, returning None if unavailable.
-fn get_memory(caller: &Caller<()>) -> Option<wasmi::Memory> {
+fn get_memory<T>(caller: &Caller<T>) -> Option<wasmi::Memory> {
     match caller.get_export("memory") {
         Some(wasmi::Extern::Memory(mem)) => Some(mem),
         _ => None,
@@ -44,7 +60,7 @@ fn get_memory(caller: &Caller<()>) -> Option<wasmi::Memory> {
 
 /// Helper: write bytes to WASM memory at the given pointer.
 /// Returns the number of bytes written, or OUT_OF_BOUNDS on failure.
-fn write_to_wasm(caller: &mut Caller<()>, memory: wasmi::Memory, ptr: i32, data: &[u8]) -> i64 {
+fn write_to_wasm<T>(caller: &mut Caller<T>, memory: wasmi::Memory, ptr: i32, data: &[u8]) -> i64 {
     let start = ptr as usize;
     let end = start + data.len();
     let mem_data = memory.data_mut(caller);
@@ -59,11 +75,11 @@ fn write_to_wasm(caller: &mut Caller<()>, memory: wasmi::Memory, ptr: i32, data:
 ///
 /// The `context` is shared via `Arc<Mutex<_>>` so that host functions
 /// can mutate it during execution.
-pub fn register_host_functions(
+pub fn register_host_functions<'a>(
     engine: &Engine,
     context: Arc<Mutex<HookContext>>,
-) -> Result<Linker<()>, wasmi::Error> {
-    let mut linker = Linker::<()>::new(engine);
+) -> Result<Linker<HostState<'a>>, wasmi::Error> {
+    let mut linker = Linker::<HostState<'a>>::new(engine);
 
     // accept(code: i32) -> i64
     // Terminates hook execution with an acceptance result.
@@ -71,7 +87,7 @@ pub fn register_host_functions(
     linker.func_wrap(
         "env",
         "accept",
-        move |_caller: Caller<()>, code: i32| -> i64 {
+        move |_caller: Caller<HostState>, code: i32| -> i64 {
             let mut hook_ctx = ctx.lock().unwrap();
             let _ = hook_ctx.consume_gas(HOST_CALL_GAS);
             code as i64
@@ -84,7 +100,7 @@ pub fn register_host_functions(
     linker.func_wrap(
         "env",
         "rollback",
-        move |_caller: Caller<()>, code: i32| -> i64 {
+        move |_caller: Caller<HostState>, code: i32| -> i64 {
             let mut hook_ctx = ctx.lock().unwrap();
             let _ = hook_ctx.consume_gas(HOST_CALL_GAS);
             // Negative indicates rollback
@@ -98,7 +114,12 @@ pub fn register_host_functions(
     linker.func_wrap(
         "env",
         "state_set",
-        move |caller: Caller<()>, key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32| -> i64 {
+        move |caller: Caller<HostState>,
+              key_ptr: i32,
+              key_len: i32,
+              val_ptr: i32,
+              val_len: i32|
+              -> i64 {
             let mut hook_ctx = ctx.lock().unwrap();
             let gas_cost = HOST_CALL_GAS + (key_len as u64 + val_len as u64) * STATE_BYTE_GAS;
             if hook_ctx.consume_gas(gas_cost).is_err() {
@@ -133,7 +154,7 @@ pub fn register_host_functions(
     linker.func_wrap(
         "env",
         "state_get",
-        move |mut caller: Caller<()>,
+        move |mut caller: Caller<HostState>,
               key_ptr: i32,
               key_len: i32,
               val_ptr: i32,
@@ -183,13 +204,17 @@ pub fn register_host_functions(
     // otxn_type() -> i64
     // Returns the transaction type code of the originating transaction.
     let ctx = context.clone();
-    linker.func_wrap("env", "otxn_type", move |_caller: Caller<()>| -> i64 {
-        let mut hook_ctx = ctx.lock().unwrap();
-        if hook_ctx.consume_gas(HOST_CALL_GAS).is_err() {
-            return OUT_OF_GAS;
-        }
-        hook_ctx.otxn_type as i64
-    })?;
+    linker.func_wrap(
+        "env",
+        "otxn_type",
+        move |_caller: Caller<HostState>| -> i64 {
+            let mut hook_ctx = ctx.lock().unwrap();
+            if hook_ctx.consume_gas(HOST_CALL_GAS).is_err() {
+                return OUT_OF_GAS;
+            }
+            hook_ctx.otxn_type as i64
+        },
+    )?;
 
     // otxn_hash(write_ptr: i32) -> i64
     // Writes the 32-byte originating transaction hash to WASM memory.
@@ -197,7 +222,7 @@ pub fn register_host_functions(
     linker.func_wrap(
         "env",
         "otxn_hash",
-        move |mut caller: Caller<()>, write_ptr: i32| -> i64 {
+        move |mut caller: Caller<HostState>, write_ptr: i32| -> i64 {
             let hash_bytes = {
                 let mut hook_ctx = ctx.lock().unwrap();
                 if hook_ctx.consume_gas(HOST_CALL_GAS).is_err() {
@@ -221,7 +246,7 @@ pub fn register_host_functions(
     linker.func_wrap(
         "env",
         "otxn_account",
-        move |mut caller: Caller<()>, write_ptr: i32| -> i64 {
+        move |mut caller: Caller<HostState>, write_ptr: i32| -> i64 {
             let account = {
                 let mut hook_ctx = ctx.lock().unwrap();
                 if hook_ctx.consume_gas(HOST_CALL_GAS).is_err() {
@@ -245,7 +270,7 @@ pub fn register_host_functions(
     linker.func_wrap(
         "env",
         "otxn_amount",
-        move |mut caller: Caller<()>, write_ptr: i32| -> i64 {
+        move |mut caller: Caller<HostState>, write_ptr: i32| -> i64 {
             let amount = {
                 let mut hook_ctx = ctx.lock().unwrap();
                 if hook_ctx.consume_gas(HOST_CALL_GAS).is_err() {
@@ -270,7 +295,11 @@ pub fn register_host_functions(
     linker.func_wrap(
         "env",
         "otxn_field",
-        move |mut caller: Caller<()>, field_id: i32, write_ptr: i32, write_len: i32| -> i64 {
+        move |mut caller: Caller<HostState>,
+              field_id: i32,
+              write_ptr: i32,
+              write_len: i32|
+              -> i64 {
             if field_id < 0 || write_len < 0 {
                 return INVALID_ARGUMENT;
             }
@@ -302,17 +331,12 @@ pub fn register_host_functions(
     linker.func_wrap(
         "env",
         "slot",
-        move |caller: Caller<()>, slot_no: i32, keylet_ptr: i32, keylet_len: i32| -> i64 {
+        move |caller: Caller<HostState>, slot_no: i32, keylet_ptr: i32, keylet_len: i32| -> i64 {
             if slot_no < 0 || (slot_no as usize) >= MAX_SLOTS {
                 return INVALID_SLOT;
             }
             if keylet_len < 0 {
                 return INVALID_ARGUMENT;
-            }
-
-            let mut hook_ctx = ctx.lock().unwrap();
-            if hook_ctx.consume_gas(SLOT_GAS).is_err() {
-                return OUT_OF_GAS;
             }
 
             let memory = match get_memory(&caller) {
@@ -326,12 +350,20 @@ pub fn register_host_functions(
             if end > data.len() {
                 return OUT_OF_BOUNDS;
             }
+            let keylet = data[start..end].to_vec();
 
-            // Store the keylet data as the slot content.
-            // In a full implementation this would look up the ledger entry;
-            // here we store the raw keylet bytes as a placeholder.
-            let keylet_data = data[start..end].to_vec();
-            hook_ctx.slot_data[slot_no as usize] = Some(keylet_data);
+            if ctx.lock().unwrap().consume_gas(SLOT_GAS).is_err() {
+                return OUT_OF_GAS;
+            }
+
+            // Resolve the keylet to the serialized ledger entry via the wired
+            // ledger. Without a ledger, or when the entry is absent, the slot
+            // stays empty and the caller learns the entry does not exist.
+            let sle = match caller.data().ledger.and_then(|l| l.lookup(&keylet)) {
+                Some(bytes) => bytes,
+                None => return DOESNT_EXIST,
+            };
+            ctx.lock().unwrap().slot_data[slot_no as usize] = Some(sle);
             slot_no as i64
         },
     )?;
@@ -342,7 +374,7 @@ pub fn register_host_functions(
     linker.func_wrap(
         "env",
         "slot_subfield",
-        move |_caller: Caller<()>, parent_slot: i32, field_id: i32, new_slot: i32| -> i64 {
+        move |_caller: Caller<HostState>, parent_slot: i32, field_id: i32, new_slot: i32| -> i64 {
             if parent_slot < 0
                 || (parent_slot as usize) >= MAX_SLOTS
                 || new_slot < 0
@@ -364,14 +396,18 @@ pub fn register_host_functions(
                 None => return SLOT_EMPTY,
             };
 
-            // In a full implementation, this would parse the serialized object
-            // and extract the subfield. For now, we store the parent data
-            // tagged with the field_id as a simple representation.
-            let field_tag = (field_id as u32).to_be_bytes();
-            let mut subfield_data = field_tag.to_vec();
-            subfield_data.extend_from_slice(&parent_data);
-            hook_ctx.slot_data[new_slot as usize] = Some(subfield_data);
-            new_slot as i64
+            // `field_id` is the SField code: type in the high 16 bits, field in
+            // the low 16. Parse the serialized STObject in the parent slot and
+            // load the field's raw value bytes into the new slot.
+            let type_code = (field_id >> 16) & 0xFFFF;
+            let field_code = field_id & 0xFFFF;
+            match rxrpl_codec::binary::extract_field(&parent_data, type_code, field_code) {
+                Ok(Some(bytes)) => {
+                    hook_ctx.slot_data[new_slot as usize] = Some(bytes);
+                    new_slot as i64
+                }
+                _ => DOESNT_EXIST,
+            }
         },
     )?;
 
@@ -381,7 +417,7 @@ pub fn register_host_functions(
     linker.func_wrap(
         "env",
         "slot_size",
-        move |_caller: Caller<()>, slot_no: i32| -> i64 {
+        move |_caller: Caller<HostState>, slot_no: i32| -> i64 {
             if slot_no < 0 || (slot_no as usize) >= MAX_SLOTS {
                 return INVALID_SLOT;
             }
@@ -404,7 +440,7 @@ pub fn register_host_functions(
     linker.func_wrap(
         "env",
         "slot_type",
-        move |_caller: Caller<()>, slot_no: i32, _flags: i32| -> i64 {
+        move |_caller: Caller<HostState>, slot_no: i32, _flags: i32| -> i64 {
             if slot_no < 0 || (slot_no as usize) >= MAX_SLOTS {
                 return INVALID_SLOT;
             }
@@ -433,7 +469,7 @@ pub fn register_host_functions(
     linker.func_wrap(
         "env",
         "emit",
-        move |mut caller: Caller<()>,
+        move |mut caller: Caller<HostState>,
               write_ptr: i32,
               write_len: i32,
               read_ptr: i32,
@@ -489,6 +525,14 @@ pub fn register_host_functions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct MockLedger(Vec<u8>);
+    impl SlotLedger for MockLedger {
+        fn lookup(&self, _keylet: &[u8]) -> Option<Vec<u8>> {
+            Some(self.0.clone())
+        }
+    }
+
     use rxrpl_primitives::Hash256;
 
     fn make_context() -> Arc<Mutex<HookContext>> {
@@ -524,7 +568,7 @@ mod tests {
 
         let module = wasmi::Module::new(&engine, &wasm).unwrap();
         let linker = register_host_functions(&engine, ctx).unwrap();
-        let mut store = wasmi::Store::new(&engine, ());
+        let mut store = wasmi::Store::new(&engine, HostState::default());
         let instance = linker
             .instantiate(&mut store, &module)
             .unwrap()
@@ -561,7 +605,7 @@ mod tests {
 
         let module = wasmi::Module::new(&engine, &wasm).unwrap();
         let linker = register_host_functions(&engine, ctx).unwrap();
-        let mut store = wasmi::Store::new(&engine, ());
+        let mut store = wasmi::Store::new(&engine, HostState::default());
         let instance = linker
             .instantiate(&mut store, &module)
             .unwrap()
@@ -603,7 +647,7 @@ mod tests {
 
         let module = wasmi::Module::new(&engine, &wasm).unwrap();
         let linker = register_host_functions(&engine, ctx).unwrap();
-        let mut store = wasmi::Store::new(&engine, ());
+        let mut store = wasmi::Store::new(&engine, HostState::default());
         let instance = linker
             .instantiate(&mut store, &module)
             .unwrap()
@@ -641,7 +685,7 @@ mod tests {
 
         let module = wasmi::Module::new(&engine, &wasm).unwrap();
         let linker = register_host_functions(&engine, ctx).unwrap();
-        let mut store = wasmi::Store::new(&engine, ());
+        let mut store = wasmi::Store::new(&engine, HostState::default());
         let instance = linker
             .instantiate(&mut store, &module)
             .unwrap()
@@ -684,7 +728,7 @@ mod tests {
 
         let module = wasmi::Module::new(&engine, &wasm).unwrap();
         let linker = register_host_functions(&engine, ctx).unwrap();
-        let mut store = wasmi::Store::new(&engine, ());
+        let mut store = wasmi::Store::new(&engine, HostState::default());
         let instance = linker
             .instantiate(&mut store, &module)
             .unwrap()
@@ -723,7 +767,7 @@ mod tests {
 
         let module = wasmi::Module::new(&engine, &wasm).unwrap();
         let linker = register_host_functions(&engine, ctx).unwrap();
-        let mut store = wasmi::Store::new(&engine, ());
+        let mut store = wasmi::Store::new(&engine, HostState::default());
         let instance = linker
             .instantiate(&mut store, &module)
             .unwrap()
@@ -763,9 +807,15 @@ mod tests {
         )
         .expect("valid WAT");
 
+        let ledger = MockLedger(vec![0xDE, 0xAD, 0xBE, 0xEF]);
         let module = wasmi::Module::new(&engine, &wasm).unwrap();
         let linker = register_host_functions(&engine, ctx).unwrap();
-        let mut store = wasmi::Store::new(&engine, ());
+        let mut store = wasmi::Store::new(
+            &engine,
+            HostState {
+                ledger: Some(&ledger),
+            },
+        );
         let instance = linker
             .instantiate(&mut store, &module)
             .unwrap()
@@ -773,7 +823,7 @@ mod tests {
             .unwrap();
         let hook_fn = instance.get_typed_func::<i32, i64>(&store, "hook").unwrap();
         let result = hook_fn.call(&mut store, 0).unwrap();
-        assert_eq!(result, 4); // slot contains 4 bytes
+        assert_eq!(result, 4); // slot contains the 4-byte SLE returned by the ledger
     }
 
     #[test]
@@ -796,7 +846,7 @@ mod tests {
 
         let module = wasmi::Module::new(&engine, &wasm).unwrap();
         let linker = register_host_functions(&engine, ctx).unwrap();
-        let mut store = wasmi::Store::new(&engine, ());
+        let mut store = wasmi::Store::new(&engine, HostState::default());
         let instance = linker
             .instantiate(&mut store, &module)
             .unwrap()
@@ -827,7 +877,7 @@ mod tests {
 
         let module = wasmi::Module::new(&engine, &wasm).unwrap();
         let linker = register_host_functions(&engine, ctx).unwrap();
-        let mut store = wasmi::Store::new(&engine, ());
+        let mut store = wasmi::Store::new(&engine, HostState::default());
         let instance = linker
             .instantiate(&mut store, &module)
             .unwrap()
@@ -842,8 +892,9 @@ mod tests {
     fn slot_subfield_works() {
         let engine = Engine::default();
         let ctx = Arc::new(Mutex::new(HookContext::new(Hash256::default(), [0u8; 20])));
-        // Pre-load slot 0 with some data
-        ctx.lock().unwrap().slot_data[0] = Some(vec![0x01, 0x02, 0x03]);
+        // Pre-load slot 0 with a serialized STObject holding one UInt32 field
+        // sfFlags (type 2, field 2): header 0x22 then the 4-byte value.
+        ctx.lock().unwrap().slot_data[0] = Some(vec![0x22, 0x00, 0x00, 0x00, 0x05]);
 
         let wasm = wat::parse_str(
             r#"
@@ -851,9 +902,9 @@ mod tests {
                 (import "env" "slot_subfield" (func $slot_subfield (param i32 i32 i32) (result i64)))
                 (import "env" "slot_size" (func $slot_size (param i32) (result i64)))
                 (func $hook (export "hook") (param i32) (result i64)
-                    ;; Extract subfield from slot 0, field_id=5, into slot 1
+                    ;; Extract sfFlags (sfCode 0x20002) from slot 0 into slot 1
                     i32.const 0
-                    i32.const 5
+                    i32.const 131074
                     i32.const 1
                     call $slot_subfield
                     drop
@@ -868,7 +919,7 @@ mod tests {
 
         let module = wasmi::Module::new(&engine, &wasm).unwrap();
         let linker = register_host_functions(&engine, ctx).unwrap();
-        let mut store = wasmi::Store::new(&engine, ());
+        let mut store = wasmi::Store::new(&engine, HostState::default());
         let instance = linker
             .instantiate(&mut store, &module)
             .unwrap()
@@ -876,8 +927,8 @@ mod tests {
             .unwrap();
         let hook_fn = instance.get_typed_func::<i32, i64>(&store, "hook").unwrap();
         let result = hook_fn.call(&mut store, 0).unwrap();
-        // 4 bytes (field_id tag) + 3 bytes (parent data) = 7
-        assert_eq!(result, 7);
+        // slot 1 holds the 4-byte UInt32 value bytes
+        assert_eq!(result, 4);
     }
 
     #[test]
@@ -907,7 +958,7 @@ mod tests {
 
         let module = wasmi::Module::new(&engine, &wasm).unwrap();
         let linker = register_host_functions(&engine, ctx.clone()).unwrap();
-        let mut store = wasmi::Store::new(&engine, ());
+        let mut store = wasmi::Store::new(&engine, HostState::default());
         let instance = linker
             .instantiate(&mut store, &module)
             .unwrap()
@@ -957,7 +1008,7 @@ mod tests {
 
         let module = wasmi::Module::new(&engine, &wasm).unwrap();
         let linker = register_host_functions(&engine, ctx).unwrap();
-        let mut store = wasmi::Store::new(&engine, ());
+        let mut store = wasmi::Store::new(&engine, HostState::default());
         let instance = linker
             .instantiate(&mut store, &module)
             .unwrap()
@@ -992,7 +1043,7 @@ mod tests {
 
         let module = wasmi::Module::new(&engine, &wasm).unwrap();
         let linker = register_host_functions(&engine, ctx).unwrap();
-        let mut store = wasmi::Store::new(&engine, ());
+        let mut store = wasmi::Store::new(&engine, HostState::default());
         let instance = linker
             .instantiate(&mut store, &module)
             .unwrap()
@@ -1032,7 +1083,7 @@ mod tests {
 
         let module = wasmi::Module::new(&engine, &wasm).unwrap();
         let linker = register_host_functions(&engine, ctx).unwrap();
-        let mut store = wasmi::Store::new(&engine, ());
+        let mut store = wasmi::Store::new(&engine, HostState::default());
         let instance = linker
             .instantiate(&mut store, &module)
             .unwrap()
@@ -1065,7 +1116,7 @@ mod tests {
 
         let module = wasmi::Module::new(&engine, &wasm).unwrap();
         let linker = register_host_functions(&engine, ctx).unwrap();
-        let mut store = wasmi::Store::new(&engine, ());
+        let mut store = wasmi::Store::new(&engine, HostState::default());
         let instance = linker
             .instantiate(&mut store, &module)
             .unwrap()
