@@ -103,7 +103,7 @@ fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
                 return None;
             }
             let hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, payload]);
-            Some((hash, payload.to_vec()))
+            Some((hash, inner_store_record(payload)))
         }
         WIRE_TYPE_COMPRESSED_INNER => {
             // N * (hash[32] || branch[1])
@@ -119,7 +119,7 @@ fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
                 full[branch * 32..(branch + 1) * 32].copy_from_slice(&chunk[..32]);
             }
             let hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &full]);
-            Some((hash, full))
+            Some((hash, inner_store_record(&full)))
         }
         WIRE_TYPE_ACCOUNT_STATE => {
             // payload = data || key[32]
@@ -131,10 +131,7 @@ fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
             let key = &payload[split..];
             let hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_LEAF, data, key]);
             // Convert wire layout (data || key) to storage layout (key || data).
-            let mut storage = Vec::with_capacity(payload.len());
-            storage.extend_from_slice(key);
-            storage.extend_from_slice(data);
-            Some((hash, storage))
+            Some((hash, leaf_store_record(key, data)))
         }
         WIRE_TYPE_TRANSACTION_WITH_META => {
             // payload = data || key[32]
@@ -145,10 +142,7 @@ fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
             let data = &payload[..split];
             let key = &payload[split..];
             let hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_NODE, data, key]);
-            let mut storage = Vec::with_capacity(payload.len());
-            storage.extend_from_slice(key);
-            storage.extend_from_slice(data);
-            Some((hash, storage))
+            Some((hash, leaf_store_record(key, data)))
         }
         WIRE_TYPE_TRANSACTION => {
             // payload = data only; key = SHA512Half(TXN || data) i.e. the tx hash
@@ -157,13 +151,27 @@ fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
             }
             let key = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_ID, payload]);
             // For tx-no-meta, key IS the hash. Storage = key || data.
-            let mut storage = Vec::with_capacity(32 + payload.len());
-            storage.extend_from_slice(key.as_bytes());
-            storage.extend_from_slice(payload);
-            Some((key, storage))
+            Some((key, leaf_store_record(key.as_bytes(), payload)))
         }
         _ => None,
     }
+}
+
+/// Build a tagged inner-node store record from its raw 16*32 child-hash payload.
+fn inner_store_record(child_hashes_512: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + child_hashes_512.len());
+    out.push(rxrpl_shamap::node_store::STORE_TAG_INNER);
+    out.extend_from_slice(child_hashes_512);
+    out
+}
+
+/// Build a tagged leaf store record (`tag || key || data`).
+fn leaf_store_record(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + key.len() + data.len());
+    out.push(rxrpl_shamap::node_store::STORE_TAG_LEAF);
+    out.extend_from_slice(key);
+    out.extend_from_slice(data);
+    out
 }
 
 /// Convert a `TMGetObjectByHash` NodeObject blob into the SHAMap wire form
@@ -775,8 +783,8 @@ mod tests {
         wire.push(WIRE_TYPE_INNER);
 
         let (hash, storage) = decode_wire_node(&wire).expect("decode");
-        assert_eq!(storage.len(), 16 * 32);
-        assert_eq!(storage, payload);
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_INNER);
+        assert_eq!(&storage[1..], &payload[..]);
         let expected_hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &payload]);
         assert_eq!(hash, expected_hash);
     }
@@ -797,16 +805,14 @@ mod tests {
         wire.push(WIRE_TYPE_COMPRESSED_INNER);
 
         let (hash, storage) = decode_wire_node(&wire).expect("decode");
-        assert_eq!(storage.len(), 16 * 32);
-        // branch 0 has h0
-        assert_eq!(&storage[0..32], &h0);
-        // branch 1..5 zero
-        assert!(storage[32..5 * 32].iter().all(|&b| b == 0));
-        // branch 5 has h5
-        assert_eq!(&storage[5 * 32..6 * 32], &h5);
-        // branch 6..16 zero
-        assert!(storage[6 * 32..].iter().all(|&b| b == 0));
-        let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &storage]);
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_INNER);
+        let body = &storage[1..];
+        assert_eq!(body.len(), 16 * 32);
+        assert_eq!(&body[0..32], &h0);
+        assert!(body[32..5 * 32].iter().all(|&b| b == 0));
+        assert_eq!(&body[5 * 32..6 * 32], &h5);
+        assert!(body[6 * 32..].iter().all(|&b| b == 0));
+        let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, body]);
         assert_eq!(hash, expected);
     }
 
@@ -819,9 +825,10 @@ mod tests {
         wire.push(WIRE_TYPE_ACCOUNT_STATE);
 
         let (hash, storage) = decode_wire_node(&wire).expect("decode");
-        // Storage layout = key || data
-        assert_eq!(&storage[..32], &key);
-        assert_eq!(&storage[32..], &data[..]);
+        // Storage layout = tag || key || data
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_LEAF);
+        assert_eq!(&storage[1..33], &key);
+        assert_eq!(&storage[33..], &data[..]);
         // Hash uses rippled order (data || key)
         let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_LEAF, &data, &key]);
         assert_eq!(hash, expected);
@@ -836,8 +843,9 @@ mod tests {
         wire.push(WIRE_TYPE_TRANSACTION_WITH_META);
 
         let (hash, storage) = decode_wire_node(&wire).expect("decode");
-        assert_eq!(&storage[..32], &key);
-        assert_eq!(&storage[32..], &data[..]);
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_LEAF);
+        assert_eq!(&storage[1..33], &key);
+        assert_eq!(&storage[33..], &data[..]);
         let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_NODE, &data, &key]);
         assert_eq!(hash, expected);
     }
@@ -852,9 +860,10 @@ mod tests {
         let expected_key = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_ID, &data]);
         // Hash IS the tx hash
         assert_eq!(hash, expected_key);
-        // Storage = key || data
-        assert_eq!(&storage[..32], expected_key.as_bytes());
-        assert_eq!(&storage[32..], &data[..]);
+        // Storage = tag || key || data
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_LEAF);
+        assert_eq!(&storage[1..33], expected_key.as_bytes());
+        assert_eq!(&storage[33..], &data[..]);
     }
 
     #[test]
@@ -970,7 +979,8 @@ mod tests {
         assert_eq!(*wire.last().unwrap(), WIRE_TYPE_INNER);
         let (hash, storage) = decode_wire_node(&wire).expect("wire decodes");
         assert_eq!(hash, expected);
-        assert_eq!(storage, child_hashes);
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_INNER);
+        assert_eq!(&storage[1..], &child_hashes[..]);
     }
 
     /// A leaf account-state NodeObject (`MLN\0 || data || key`) likewise.
@@ -987,9 +997,10 @@ mod tests {
         assert_eq!(*wire.last().unwrap(), WIRE_TYPE_ACCOUNT_STATE);
         let (hash, storage) = decode_wire_node(&wire).expect("wire decodes");
         assert_eq!(hash, expected);
-        // storage layout is key || data.
-        assert_eq!(&storage[..32], &key[..]);
-        assert_eq!(&storage[32..], &data[..]);
+        // storage layout is tag || key || data.
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_LEAF);
+        assert_eq!(&storage[1..33], &key[..]);
+        assert_eq!(&storage[33..], &data[..]);
     }
 
     #[test]
