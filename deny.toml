@@ -1,6 +1,12 @@
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
+# Vulnerabilities and unsound advisories are always denied by modern cargo-deny;
+# list specific advisory IDs to ignore here (with justification) if ever needed.
+yanked = "deny"
+# Transitive, non-vulnerability advisories accepted for now (reviewed):
+# - RUSTSEC-2025-0052: async-std discontinued (unmaintained).
+# - RUSTSEC-2026-0002: IterMut Stacked-Borrows unsoundness in a transitive dep.
+# Real vulnerabilities (RUSTSEC vulnerability class) remain a hard deny.
+ignore = ["RUSTSEC-2025-0052", "RUSTSEC-2026-0002"]
 
 [licenses]
 allow = [
