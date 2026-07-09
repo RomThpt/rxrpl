@@ -255,6 +255,7 @@ impl TxEngine {
                                             .cloned()
                                             .unwrap_or_default();
                                         let mut total_weight: u64 = 0;
+                                        let mut seen: Vec<String> = Vec::new();
                                         for s in signers_arr {
                                             let signer_obj = s
                                                 .get("Signer")
@@ -265,7 +266,17 @@ impl TxEngine {
                                                 .get("Account")
                                                 .and_then(|v| v.as_str())
                                                 .unwrap_or("");
-                                            if let Some(weight) = entries.iter().find_map(|e| {
+
+                                            // Reject duplicate signers: rippled requires the
+                                            // Signers array strictly ascending by Account with no
+                                            // repeats. Counting a repeat would inflate the weight.
+                                            if seen.iter().any(|a| a == signer_acct) {
+                                                return Ok(TransactionResult::TemInvalid);
+                                            }
+                                            seen.push(signer_acct.to_string());
+
+                                            // The signer must be a member of the SignerList.
+                                            let Some(weight) = entries.iter().find_map(|e| {
                                                 let entry = e.get("SignerEntry").or(Some(e))?;
                                                 if entry.get("Account").and_then(|v| v.as_str())
                                                     == Some(signer_acct)
@@ -276,9 +287,62 @@ impl TxEngine {
                                                 } else {
                                                     None
                                                 }
-                                            }) {
-                                                total_weight = total_weight.saturating_add(weight);
+                                            }) else {
+                                                return Ok(TransactionResult::TefBadSignature);
+                                            };
+
+                                            // Bind the signing key to the signer's account: the
+                                            // SigningPubKey must be the signer's master key
+                                            // (derives to the account) or its RegularKey. Without
+                                            // this, an attacker signs with arbitrary keys in the
+                                            // name of the list members and forges the quorum.
+                                            let Ok(signer_id_acct) = decode_account_id(signer_acct)
+                                            else {
+                                                return Ok(TransactionResult::TemInvalid);
+                                            };
+                                            let Some(pubkey_bytes) = signer_obj
+                                                .get("SigningPubKey")
+                                                .and_then(|v| v.as_str())
+                                                .and_then(|h| hex::decode(h).ok())
+                                            else {
+                                                return Ok(TransactionResult::TefBadSignature);
+                                            };
+                                            let signer_id =
+                                                rxrpl_codec::address::classic::account_id_from_public_key(
+                                                    &pubkey_bytes,
+                                                );
+                                            let signer_acct_key =
+                                                rxrpl_protocol::keylet::account(&signer_id_acct);
+                                            let authorized = match view.read(&signer_acct_key) {
+                                                // Phantom signer (account not funded): authorized
+                                                // only when the key IS the account's master key.
+                                                None => signer_id == signer_id_acct,
+                                                Some(acct_bytes) => {
+                                                    let acct_obj: serde_json::Value =
+                                                        serde_json::from_slice(&acct_bytes)
+                                                            .unwrap_or(serde_json::Value::Null);
+                                                    if signer_id == signer_id_acct {
+                                                        const LSF_DISABLE_MASTER: u32 = 0x00100000;
+                                                        let flags = acct_obj
+                                                            .get("Flags")
+                                                            .and_then(|v| v.as_u64())
+                                                            .unwrap_or(0)
+                                                            as u32;
+                                                        flags & LSF_DISABLE_MASTER == 0
+                                                    } else {
+                                                        let reg = acct_obj
+                                                            .get("RegularKey")
+                                                            .and_then(|v| v.as_str())
+                                                            .and_then(|s| decode_account_id(s).ok());
+                                                        Some(signer_id) == reg
+                                                    }
+                                                }
+                                            };
+                                            if !authorized {
+                                                return Ok(TransactionResult::TefBadAuth);
                                             }
+
+                                            total_weight = total_weight.saturating_add(weight);
                                         }
                                         if total_weight < quorum {
                                             return Ok(TransactionResult::TefBadQuorum);
@@ -1282,5 +1346,151 @@ mod tests {
 
         let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
         assert_eq!(result, TransactionResult::TerPreSeq);
+    }
+
+    fn put_account(ledger: &mut Ledger, address: &str, regular_key: Option<&str>) {
+        let account_id = decode_account_id(address).unwrap();
+        let mut acct = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": address,
+            "Balance": "1000000000",
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        if let Some(rk) = regular_key {
+            acct["RegularKey"] = Value::from(rk);
+        }
+        let bytes = serde_json::to_vec(&acct).unwrap();
+        ledger
+            .put_state(
+                keylet::account(&account_id),
+                rxrpl_ledger::sle_codec::encode_sle(&bytes).unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn put_signer_list(ledger: &mut Ledger, owner: &str, quorum: u64, entries: &[(&str, u64)]) {
+        let owner_id = decode_account_id(owner).unwrap();
+        let signer_entries: Vec<Value> = entries
+            .iter()
+            .map(|(acct, w)| {
+                serde_json::json!({ "SignerEntry": { "Account": acct, "SignerWeight": w } })
+            })
+            .collect();
+        let sl = serde_json::json!({
+            "LedgerEntryType": "SignerList",
+            "SignerQuorum": quorum,
+            "SignerEntries": signer_entries,
+        });
+        let bytes = serde_json::to_vec(&sl).unwrap();
+        ledger
+            .put_state(
+                keylet::signer_list(&owner_id),
+                rxrpl_ledger::sle_codec::encode_sle(&bytes).unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn signer_entry(account: &str, pubkey_hex: &str) -> Value {
+        serde_json::json!({
+            "Signer": { "Account": account, "SigningPubKey": pubkey_hex, "TxnSignature": "00" }
+        })
+    }
+
+    fn multisig_tx(account: &str, signers: Vec<Value>) -> Value {
+        serde_json::json!({
+            "TransactionType": "AccountSet",
+            "Account": account,
+            "Fee": "10",
+            "Sequence": 1,
+            "SigningPubKey": "",
+            "Signers": signers,
+        })
+    }
+
+    const OWNER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+
+    #[test]
+    fn multisig_forged_signer_key_is_rejected() {
+        use rxrpl_crypto::key_pair::KeyPair;
+        use rxrpl_crypto::key_type::KeyType;
+        use rxrpl_crypto::seed::Seed;
+
+        // The genuine list member.
+        let member_kp = KeyPair::from_seed(&Seed::from_bytes([0x11u8; 16]), KeyType::Secp256k1);
+        let member_id = rxrpl_codec::address::classic::account_id_from_public_key(
+            &member_kp.public_key.0,
+        );
+        let member = rxrpl_codec::address::classic::encode_account_id(&member_id);
+
+        // The attacker's own key (derives to a different account).
+        let attacker_kp = KeyPair::from_seed(&Seed::from_bytes([0x99u8; 16]), KeyType::Secp256k1);
+        let attacker_pub = hex::encode_upper(&attacker_kp.public_key.0);
+
+        let mut ledger = setup_ledger_with_account(OWNER, 1_000_000_000);
+        put_account(&mut ledger, &member, None);
+        put_signer_list(&mut ledger, OWNER, 1, &[(&member, 1)]);
+
+        // Attacker signs with their own key but claims to be the member.
+        let tx = multisig_tx(OWNER, vec![signer_entry(&member, &attacker_pub)]);
+        let engine = test_engine_with(TransactionType::AccountSet, NoopTransactor);
+        let (rules, fees) = (Rules::new(), FeeSettings::default());
+        let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
+        assert_eq!(result, TransactionResult::TefBadAuth);
+    }
+
+    #[test]
+    fn multisig_duplicate_signer_is_rejected() {
+        use rxrpl_crypto::key_pair::KeyPair;
+        use rxrpl_crypto::key_type::KeyType;
+        use rxrpl_crypto::seed::Seed;
+
+        let kp = KeyPair::from_seed(&Seed::from_bytes([0x22u8; 16]), KeyType::Secp256k1);
+        let member_id =
+            rxrpl_codec::address::classic::account_id_from_public_key(&kp.public_key.0);
+        let member = rxrpl_codec::address::classic::encode_account_id(&member_id);
+        let pubkey = hex::encode_upper(&kp.public_key.0);
+
+        let mut ledger = setup_ledger_with_account(OWNER, 1_000_000_000);
+        put_account(&mut ledger, &member, None);
+        put_signer_list(&mut ledger, OWNER, 1, &[(&member, 1)]);
+
+        // Same signer repeated to inflate weight.
+        let tx = multisig_tx(
+            OWNER,
+            vec![
+                signer_entry(&member, &pubkey),
+                signer_entry(&member, &pubkey),
+            ],
+        );
+        let engine = test_engine_with(TransactionType::AccountSet, NoopTransactor);
+        let (rules, fees) = (Rules::new(), FeeSettings::default());
+        let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
+        assert_eq!(result, TransactionResult::TemInvalid);
+    }
+
+    #[test]
+    fn multisig_master_key_signer_is_authorized() {
+        use rxrpl_crypto::key_pair::KeyPair;
+        use rxrpl_crypto::key_type::KeyType;
+        use rxrpl_crypto::seed::Seed;
+
+        let kp = KeyPair::from_seed(&Seed::from_bytes([0x42u8; 16]), KeyType::Secp256k1);
+        let member_id =
+            rxrpl_codec::address::classic::account_id_from_public_key(&kp.public_key.0);
+        let member = rxrpl_codec::address::classic::encode_account_id(&member_id);
+        let pubkey = hex::encode_upper(&kp.public_key.0);
+
+        let mut ledger = setup_ledger_with_account(OWNER, 1_000_000_000);
+        put_account(&mut ledger, &member, None);
+        put_signer_list(&mut ledger, OWNER, 1, &[(&member, 1)]);
+
+        // Member signs with their own master key -> binding passes, quorum met.
+        let tx = multisig_tx(OWNER, vec![signer_entry(&member, &pubkey)]);
+        let engine = test_engine_with(TransactionType::AccountSet, NoopTransactor);
+        let (rules, fees) = (Rules::new(), FeeSettings::default());
+        let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
     }
 }
