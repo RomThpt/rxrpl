@@ -3584,8 +3584,12 @@ does not apply to this tx type (e.g. a pure delete/modify)."
         crate::node::Node::genesis_with_master_account_only(MASTER).expect("genesis")
     }
 
+    // Self-consistency only: the target header in pass 2 is produced by the
+    // code under test in pass 1, so this proves replay is idempotent against
+    // its own output, NOT that it reproduces a mainnet-validated header. The
+    // byte-exact-vs-rippled checks live in the RXRPL_PLAY_FORWARD_RPC oracles.
     #[test]
-    fn faithful_replay_reproduces_the_validated_header() {
+    fn replay_is_faithful_against_its_own_produced_header() {
         let parent = master_genesis();
         let engine = full_engine();
         let fees = FeeSettings::default();
@@ -3596,21 +3600,18 @@ does not apply to this tx type (e.g. a pure delete/modify)."
             payment(2, AccountId([0xbb; 20]), 2_000_000_000),
         ];
 
-        // Pass 1: derive the "validated" header by replaying against a blank
-        // target (matches all false), then trust the produced header.
         let blank = LedgerHeader::new();
         let first = replay_forward(&parent, salt, txs.clone(), &blank, &engine, &fees)
             .expect("first replay");
         assert_eq!(first.applied, 2, "both payments should apply");
         assert_eq!(first.failed, 0);
-        let truth = first.ledger.header.clone();
-        assert_ne!(truth.account_hash, parent.header.account_hash);
-        assert!(!truth.tx_hash.is_zero());
+        let produced = first.ledger.header.clone();
+        assert_ne!(produced.account_hash, parent.header.account_hash);
+        assert!(!produced.tx_hash.is_zero());
 
-        // Pass 2: replaying the same set against the produced header is faithful.
         let second =
-            replay_forward(&parent, salt, txs, &truth, &engine, &fees).expect("second replay");
-        assert!(second.is_faithful(), "replay must reproduce the header");
+            replay_forward(&parent, salt, txs, &produced, &engine, &fees).expect("second replay");
+        assert!(second.is_faithful(), "replay must reproduce its own header");
         assert_eq!(second.applied, 2);
     }
 
