@@ -649,10 +649,26 @@ fn apply_conversion(
         }
     };
 
+    // rippled: a cross-currency payment that delivers exactly zero is dry and
+    // returns tecPATH_DRY EVEN under tfPartialPayment (StrandFlow.h:803-806) —
+    // only a strictly positive (even dust) delivery is tesSUCCESS. Returning it
+    // as a retryable tec lets the build-ledger loop defer the payment to a later
+    // pass once a sibling funds its path, instead of committing a no-op success.
+    if delivered_amount(&delivered) <= 0.0 {
+        return Err(TransactionResult::TecPathDry);
+    }
+
     const TF_PARTIAL_PAYMENT: u32 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT;
     let partial = helpers::get_flags(ctx.tx) & TF_PARTIAL_PAYMENT != 0;
     if !partial && !delivered_meets_target(&delivered, &amount) {
         return Err(TransactionResult::TecPathPartial);
+    }
+
+    // rippled Payment::doApply: record sfDeliveredAmount when the delivered
+    // amount differs from the requested Amount (a partial or path-limited
+    // delivery); a full delivery leaves it unset.
+    if delivered != amount {
+        ctx.view.set_delivered_amount(delivered.clone());
     }
 
     let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
@@ -871,6 +887,13 @@ fn apply_paths_payment(
         return Err(TransactionResult::TecPathPartial);
     };
 
+    // A path that delivers exactly zero is dry (tecPATH_DRY), even under
+    // tfPartialPayment — mirrors rippled StrandFlow and lets the build-ledger
+    // loop retry once a sibling funds the path.
+    if delivered_amount(&delivered) <= 0.0 {
+        return Err(TransactionResult::TecPathDry);
+    }
+
     // Partial-payment gate. Without tfPartialPayment the full Amount must be
     // delivered; with it, the delivery must reach DeliverMin (when present),
     // else the requested Amount.
@@ -889,6 +912,12 @@ fn apply_paths_payment(
         if !delivered_meets_target(&delivered, &target) {
             return Err(TransactionResult::TecPathPartial);
         }
+    }
+
+    // rippled Payment::doApply: record sfDeliveredAmount when delivered differs
+    // from the requested Amount (partial or path-limited delivery).
+    if delivered != amount {
+        ctx.view.set_delivered_amount(delivered.clone());
     }
 
     let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
@@ -1054,7 +1083,8 @@ fn apply_paths_payment_multi(
     );
 
     if delivered_num.is_zero() {
-        return Err(TransactionResult::TecPathPartial);
+        // Zero delivery is dry, not partial (rippled StrandFlow.h:805).
+        return Err(TransactionResult::TecPathDry);
     }
 
     // The delivered magnitude in the Amount asset, for the partial-payment gate.
@@ -1086,6 +1116,12 @@ fn apply_paths_payment_multi(
         }
     }
     let _ = Number::ZERO;
+
+    // rippled Payment::doApply: record sfDeliveredAmount when delivered differs
+    // from the requested Amount (partial or path-limited delivery).
+    if delivered != amount {
+        ctx.view.set_delivered_amount(delivered.clone());
+    }
 
     let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view
@@ -1266,6 +1302,11 @@ fn try_amm_conversion(
             &in_cur,
             &src_in_funds.sub(&spent),
         )?;
+        // rippled's rippleCredit deletes a line drained to zero in the default
+        // state (trustDelete); fires inline after the debit.
+        crate::handlers::trust_set::maybe_delete_drained_trust_line(
+            ctx, user_id, user_acct, &in_iss, &in_cur,
+        )?;
         crate::amm_helpers::set_iou_holding(
             ctx.view,
             &pool_id,
@@ -1324,17 +1365,20 @@ fn try_amm_conversion(
 
 /// Whether `delivered` reaches `target` (gate only — f64 comparison is fine for
 /// a success/fail decision; the byte-exact amounts come from the Taker engine).
+/// Numeric magnitude of a delivered amount, whether it is an XRP drop string or
+/// an IOU `{value}` object.
+fn delivered_amount(v: &serde_json::Value) -> f64 {
+    if let Some(s) = v.as_str() {
+        return s.parse().unwrap_or(0.0);
+    }
+    v.get("value")
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0)
+}
+
 fn delivered_meets_target(delivered: &serde_json::Value, target: &serde_json::Value) -> bool {
-    let val = |v: &serde_json::Value| -> f64 {
-        if let Some(s) = v.as_str() {
-            return s.parse().unwrap_or(0.0);
-        }
-        v.get("value")
-            .and_then(|x| x.as_str())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0)
-    };
-    val(delivered) + 1e-9 >= val(target)
+    delivered_amount(delivered) + 1e-9 >= delivered_amount(target)
 }
 
 /// Apply a cross-currency Payment: the source pays `send_max` (currency A)

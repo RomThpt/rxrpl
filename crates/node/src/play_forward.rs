@@ -368,6 +368,63 @@ impl ReplayOutcome {
 /// without metadata) — the salt rippled uses for canonical apply ordering. It
 /// is distinct from `header.tx_hash`, which is the closed ledger's
 /// transaction tree root over transactions *with* metadata.
+/// Apply an agreed transaction set to `ledger` in rippled's canonical build
+/// order — the single byte-exact apply model shared by catchup replay
+/// (`replay_forward`) and the live consensus build. Sorts by
+/// `canonical_order(set_hash, …)`, then runs `LEDGER_TOTAL_PASSES` passes of
+/// which the first `LEDGER_RETRY_PASSES` defer a `tec` (tapRETRY) instead of
+/// committing it, matching rippled BuildLedger.cpp:106-162 and go-xrpl
+/// openledger/apply.go BuildLedgerMode. Returns `(applied, failed)`; the caller
+/// closes the ledger.
+pub fn apply_tx_set_multipass(
+    ledger: &mut Ledger,
+    set_hash: Hash256,
+    txs: TxSet,
+    tx_engine: &TxEngine,
+    rules: &Rules,
+    fees: &FeeSettings,
+) -> (usize, usize) {
+    let total = txs.len();
+    let mut pending: Vec<Value> = canonical_order(set_hash, txs)
+        .into_iter()
+        .filter_map(|(_id, blob)| rxrpl_codec::binary::decode(&blob).ok())
+        .collect();
+
+    const LEDGER_TOTAL_PASSES: usize = 3;
+    const LEDGER_RETRY_PASSES: usize = 1;
+    let mut applied = 0usize;
+    let mut certain_retry = true;
+    for pass in 0..LEDGER_TOTAL_PASSES {
+        let mut changes = 0usize;
+        let mut deferred = Vec::new();
+        for json in std::mem::take(&mut pending) {
+            let result = if certain_retry {
+                tx_engine.apply_retriable(&json, ledger, rules, fees)
+            } else {
+                tx_engine.apply(&json, ledger, rules, fees)
+            };
+            match result {
+                Ok(r) if r.is_retryable() || (certain_retry && r.is_tec()) => deferred.push(json),
+                Ok(r) => {
+                    if r.is_claimed() {
+                        applied += 1;
+                        changes += 1;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        pending = deferred;
+        if changes == 0 && !certain_retry {
+            break;
+        }
+        if changes == 0 || pass >= LEDGER_RETRY_PASSES {
+            certain_retry = false;
+        }
+    }
+    (applied, total - applied)
+}
+
 pub fn replay_forward(
     parent: &Ledger,
     set_hash: Hash256,
@@ -389,40 +446,10 @@ pub fn replay_forward(
     // each replayed ledger applies with its own era's amendment-gated logic.
     let rules = rules_for_ledger(&ledger);
 
-    // Decode once, in canonical order. Anything that fails to decode is dropped.
-    let total = txs.len();
-    let mut pending: Vec<Value> = canonical_order(set_hash, txs)
-        .into_iter()
-        .filter_map(|(_id, blob)| rxrpl_codec::binary::decode(&blob).ok())
-        .collect();
-
-    // rippled applies the set over multiple passes: each pass applies the
-    // still-pending transactions in canonical order, deferring any that return
-    // a retriable (`ter`) result to the next pass. The loop ends when a pass
-    // resolves nothing more, so a transaction whose precondition is satisfied
-    // only by a later-canonical transaction still applies. Without this, a
-    // single pass would drop such transactions and diverge from the chain.
-    let mut applied = 0usize;
-    loop {
-        let before = pending.len();
-        let mut deferred = Vec::new();
-        for json in std::mem::take(&mut pending) {
-            match tx_engine.apply(&json, &mut ledger, &rules, fees) {
-                Ok(result) if result.is_retryable() => deferred.push(json),
-                Ok(result) => {
-                    if result.is_claimed() {
-                        applied += 1;
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-        pending = deferred;
-        if pending.is_empty() || pending.len() == before {
-            break;
-        }
-    }
-    let failed = total - applied;
+    // Apply the set in rippled's canonical build order (shared with the live
+    // consensus build).
+    let (applied, failed) =
+        apply_tx_set_multipass(&mut ledger, set_hash, txs, tx_engine, &rules, fees);
 
     ledger
         .close(header.close_time, header.close_flags)
@@ -1139,6 +1166,60 @@ mod tests {
                         if let Ok(amm_key) = rxrpl_tx_engine::amm_helpers::compute_amm_key(&a1, &a2)
                         {
                             read_keys.insert(amm_key.to_string().to_uppercase());
+                        }
+                    }
+                }
+            }
+        }
+
+        // An OfferCreate that crosses the AMM (empty/uncrossable CLOB, pool
+        // within the taker's limit) reads the pool's AMM SLE for its account +
+        // TradingFee but never modifies it, so the AMM SLE is absent from
+        // AffectedNodes and would not be seeded — `amm_hop` would then find no
+        // pool and leave the offer unfilled (TecKilled under tfFillOrKill).
+        // Derive the AMM key for the (TakerGets → TakerPays) pair and seed it,
+        // plus the pool pseudo-account and each pool asset's IOU trust line.
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("OfferCreate") {
+            if let (Some(tg), Some(tp)) = (tx_json.get("TakerGets"), tx_json.get("TakerPays")) {
+                if let (Some(a1), Some(a2)) = (
+                    rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(tg),
+                    rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(tp),
+                ) {
+                    if a1 != a2 {
+                        if let Ok(amm_key) = rxrpl_tx_engine::amm_helpers::compute_amm_key(&a1, &a2)
+                        {
+                            let amm_idx = amm_key.to_string().to_uppercase();
+                            read_keys.insert(amm_idx.clone());
+                            let r = rpc(serde_json::json!({
+                                "method":"ledger_entry","params":[{"index":amm_idx,"ledger_index":parent}]
+                            }));
+                            let amm = &r["result"]["node"];
+                            if let Some(amm_id) = amm
+                                .get("Account")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| decode_account_id(s).ok())
+                            {
+                                read_keys
+                                    .insert(keylet::account(&amm_id).to_string().to_uppercase());
+                                for asset in [&a1, &a2] {
+                                    if let (Some(cur), Some(iss)) = (
+                                        asset.get("currency").and_then(|v| v.as_str()),
+                                        asset.get("issuer").and_then(|v| v.as_str()),
+                                    ) {
+                                        if let Ok(iss_id) = decode_account_id(iss) {
+                                            read_keys.insert(
+                                                keylet::trust_line(
+                                                    &amm_id,
+                                                    &iss_id,
+                                                    &currency_bytes(cur),
+                                                )
+                                                .to_string()
+                                                .to_uppercase(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2693,6 +2774,60 @@ mod tests {
             }
         }
 
+        // An OfferCreate that crosses the AMM (empty/uncrossable CLOB, pool
+        // within the taker's limit) reads the pool's AMM SLE for its account +
+        // TradingFee but never modifies it, so the AMM SLE is absent from
+        // AffectedNodes and would not be seeded — `amm_hop` would then find no
+        // pool and leave the offer unfilled (TecKilled under tfFillOrKill).
+        // Derive the AMM key for the (TakerGets → TakerPays) pair and seed it,
+        // plus the pool pseudo-account and each pool asset's IOU trust line.
+        if tx_json.get("TransactionType").and_then(|v| v.as_str()) == Some("OfferCreate") {
+            if let (Some(tg), Some(tp)) = (tx_json.get("TakerGets"), tx_json.get("TakerPays")) {
+                if let (Some(a1), Some(a2)) = (
+                    rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(tg),
+                    rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(tp),
+                ) {
+                    if a1 != a2 {
+                        if let Ok(amm_key) = rxrpl_tx_engine::amm_helpers::compute_amm_key(&a1, &a2)
+                        {
+                            let amm_idx = amm_key.to_string().to_uppercase();
+                            read_keys.insert(amm_idx.clone());
+                            let r = rpc(serde_json::json!({
+                                "method":"ledger_entry","params":[{"index":amm_idx,"ledger_index":parent}]
+                            }));
+                            let amm = &r["result"]["node"];
+                            if let Some(amm_id) = amm
+                                .get("Account")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| decode_account_id(s).ok())
+                            {
+                                read_keys
+                                    .insert(keylet::account(&amm_id).to_string().to_uppercase());
+                                for asset in [&a1, &a2] {
+                                    if let (Some(cur), Some(iss)) = (
+                                        asset.get("currency").and_then(|v| v.as_str()),
+                                        asset.get("issuer").and_then(|v| v.as_str()),
+                                    ) {
+                                        if let Ok(iss_id) = decode_account_id(iss) {
+                                            read_keys.insert(
+                                                keylet::trust_line(
+                                                    &amm_id,
+                                                    &iss_id,
+                                                    &currency_bytes(cur),
+                                                )
+                                                .to_string()
+                                                .to_uppercase(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // A multi-hop (Paths) cross-currency Payment routes through one AMM SLE
         // per consecutive boundary along each path (e.g. XRP -> BCHAMP -> FAMILY
         // reads the XRP/BCHAMP and BCHAMP/FAMILY pools). Like the direct pair,
@@ -3769,11 +3904,14 @@ does not apply to this tx type (e.g. a pure delete/modify)."
             let apply_index = t["metaData"]["TransactionIndex"]
                 .as_u64()
                 .expect("TransactionIndex");
-            let blob = rxrpl_codec::binary::encode(&serde_json::json!({
+            let mut tx_json = serde_json::json!({
                 "Account": account,
                 "Sequence": sequence,
-            }))
-            .unwrap();
+            });
+            if let Some(ts) = t.get("TicketSequence").and_then(Value::as_u64) {
+                tx_json["TicketSequence"] = serde_json::json!(ts);
+            }
+            let blob = rxrpl_codec::binary::encode(&tx_json).unwrap();
             set.push((txid, blob));
             expected.push((apply_index, txid));
         }
@@ -3813,6 +3951,64 @@ does not apply to this tx type (e.g. a pure delete/modify)."
             runs(parent_hash),
             runs(ledger_hash),
         );
+        // Targeted diagnostic: canonical vs mainnet apply position of specific
+        // txids (comma-separated hex prefixes in RXRPL_ORDER_PROBE).
+        if let Ok(probe) = std::env::var("RXRPL_ORDER_PROBE") {
+            fn decode_probe(blob: &[u8]) -> ([u8; 20], u32) {
+                let json = match rxrpl_codec::binary::decode(blob) {
+                    Ok(v) => v,
+                    Err(_) => return ([0u8; 20], 0),
+                };
+                let account = json
+                    .get("Account")
+                    .and_then(Value::as_str)
+                    .and_then(|a| rxrpl_codec::address::classic::decode_account_id(a).ok())
+                    .map(|id| *id.as_bytes())
+                    .unwrap_or([0u8; 20]);
+                let seq = json
+                    .get("TicketSequence")
+                    .and_then(Value::as_u64)
+                    .or_else(|| json.get("Sequence").and_then(Value::as_u64))
+                    .unwrap_or(0) as u32;
+                (account, seq)
+            }
+            let got: Vec<Hash256> = canonical_order(set_hash, set.clone())
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            for p in probe.split(',').filter(|s| !s.is_empty()) {
+                let pu = p.to_uppercase();
+                let ci = got
+                    .iter()
+                    .position(|h| h.to_string().to_uppercase().starts_with(&pu));
+                let mi = want
+                    .iter()
+                    .position(|h| h.to_string().to_uppercase().starts_with(&pu));
+                eprintln!("PROBE {pu}: canonical_idx={ci:?} mainnet_apply_idx={mi:?}");
+            }
+            // Dump mainnet apply order (want) with each tx's canonical index and
+            // signing account, so retry-pass descents (canonical_idx dropping)
+            // are visible. Enable with RXRPL_ORDER_DUMP=1.
+            if std::env::var("RXRPL_ORDER_DUMP").is_ok() {
+                let cidx: std::collections::HashMap<Hash256, usize> =
+                    got.iter().enumerate().map(|(i, h)| (*h, i)).collect();
+                let acct_of: std::collections::HashMap<Hash256, ([u8; 20], u32)> = set
+                    .iter()
+                    .map(|(id, blob)| (*id, decode_probe(blob)))
+                    .collect();
+                let mut prev_ci = 0usize;
+                for (mi, h) in want.iter().enumerate() {
+                    let ci = cidx[h];
+                    let (acct, seq) = acct_of[h];
+                    let desc = if ci <= prev_ci { " <-RETRY" } else { "" };
+                    eprintln!(
+                        "ORD mainnet={mi:>3} canon={ci:>3} acct={} seq={seq}{desc}",
+                        hex::encode(&acct[..4])
+                    );
+                    prev_ci = ci;
+                }
+            }
+        }
         assert!(
             set_runs < runs(Hash256::ZERO)
                 && set_runs < runs(parent_hash)
@@ -4189,14 +4385,40 @@ does not apply to this tx type (e.g. a pure delete/modify)."
             })
             .collect();
         let mut divergent: Vec<String> = Vec::new();
-        loop {
-            let before = pending.len();
+        // Optional per-tx trace of watched SLE keys (comma-separated prefixes in
+        // RXRPL_E2E_WATCH): prints ours-vs-theirs for the key on EVERY affecting
+        // tx, so a cumulative pool/balance drift can be located to its first tx.
+        let watch: Vec<String> = std::env::var("RXRPL_E2E_WATCH")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_uppercase())
+            .collect();
+        // rippled BuildLedger.cpp: LEDGER_TOTAL_PASSES passes, of which the first
+        // LEDGER_RETRY_PASSES run with tapRETRY set so a tec is deferred (not
+        // committed) rather than claimed. A ter always defers; a tes always
+        // finalizes. Once past the retriable passes (or a pass makes no change) a
+        // tec commits. This is what defers a dry cross-currency payment to a
+        // later pass so its liquidity-providing siblings apply first.
+        const LEDGER_TOTAL_PASSES: usize = 3;
+        const LEDGER_RETRY_PASSES: usize = 1;
+        let mut certain_retry = true;
+        for pass in 0..LEDGER_TOTAL_PASSES {
+            let mut changes = 0usize;
             let mut deferred = Vec::new();
             for (txid, json) in std::mem::take(&mut pending) {
-                if let Ok(r) = engine.apply(&json, &mut ledger, &rules, &fees) {
-                    if r.is_retryable() {
+                let result = if certain_retry {
+                    engine.apply_retriable(&json, &mut ledger, &rules, &fees)
+                } else {
+                    engine.apply(&json, &mut ledger, &rules, &fees)
+                };
+                if let Ok(r) = result {
+                    if r.is_retryable() || (certain_retry && r.is_tec()) {
                         deferred.push((txid, json));
                         continue;
+                    }
+                    if r.is_success() || r.is_tec() {
+                        changes += 1;
                     }
                 }
                 let Some(nodes) = meta.get(&txid) else {
@@ -4241,6 +4463,20 @@ does not apply to this tx type (e.g. a pure delete/modify)."
                             None => v.to_string(),
                         }
                     };
+                    if watch.iter().any(|w| key.starts_with(w.as_str())) {
+                        for (f, want) in fields.as_object().into_iter().flatten() {
+                            if f == "PreviousTxnID" || f == "PreviousTxnLgrSeq" {
+                                continue;
+                            }
+                            let got = oj.get(f).map(ToString::to_string).unwrap_or_default();
+                            let same = oj.get(f).map(&norm).as_deref() == Some(&norm(want));
+                            eprintln!(
+                                "TRACE {txid} ({ty}) {} .{f} ours={got} theirs={want} {}",
+                                &key[..12],
+                                if same { "ok" } else { "DIFF" }
+                            );
+                        }
+                    }
                     for (f, want) in fields.as_object().into_iter().flatten() {
                         if f == "PreviousTxnID" || f == "PreviousTxnLgrSeq" {
                             continue;
@@ -4258,8 +4494,11 @@ does not apply to this tx type (e.g. a pure delete/modify)."
                 }
             }
             pending = deferred;
-            if pending.is_empty() || pending.len() == before {
+            if changes == 0 && !certain_retry {
                 break;
+            }
+            if changes == 0 || pass >= LEDGER_RETRY_PASSES {
+                certain_retry = false;
             }
         }
         eprintln!(
@@ -4269,6 +4508,287 @@ does not apply to this tx type (e.g. a pure delete/modify)."
         for t in &divergent {
             eprintln!("  {t}");
         }
+
+        // Definitive full-ledger hashes after close (skip list + close-time
+        // effects), not just the per-tx metadata comparison above.
+        let ledger_json = &meta_resp["result"]["ledger"];
+        let close_time = ledger_json["close_time"].as_u64().unwrap_or(0) as u32;
+        let close_flags = ledger_json["close_flags"].as_u64().unwrap_or(0) as u8;
+        let _ = ledger.close(close_time, close_flags);
+        let hx = |v: &Value, k: &str| v[k].as_str().unwrap_or("").to_uppercase();
+        let ah = ledger.header.account_hash.to_string().to_uppercase();
+        let th = ledger.header.tx_hash.to_string().to_uppercase();
+        eprintln!(
+            "=== account_hash ours={ah} theirs={} MATCH={} ===",
+            hx(ledger_json, "account_hash"),
+            ah == hx(ledger_json, "account_hash")
+        );
+        eprintln!(
+            "=== tx_hash ours={th} theirs={} MATCH={} ===",
+            hx(ledger_json, "transaction_hash"),
+            th == hx(ledger_json, "transaction_hash")
+        );
+
+        // Byte-level state diff: the per-tx metadata check compares only affected
+        // SLEs' FinalFields values (normalised). account_hash is the SHAMap of the
+        // SERIALIZED SLEs, so a value that matches but serialises differently (or a
+        // final value the norm masks / a SKIP-DIR re-modified SLE) diverges here.
+        // Compare our stored SLE bytes to mainnet's ledger_entry(binary) for every
+        // key any tx touched. RXRPL_STATE_DIFF=1 (RPC-heavy).
+        if std::env::var("RXRPL_STATE_DIFF").is_ok() {
+            let mut keys: std::collections::BTreeSet<String> = Default::default();
+            for nodes in meta.values() {
+                for (key, _nt, _f) in nodes {
+                    keys.insert(key.clone());
+                }
+            }
+            // Close-step / singleton SLEs no tx touches but that are part of the
+            // account_hash: the recent LedgerHashes skip-list (appended at close),
+            // FeeSettings and Amendments.
+            for special in [
+                rxrpl_protocol::keylet::skip(),
+                rxrpl_protocol::keylet::fee_settings(),
+                rxrpl_protocol::keylet::amendments(),
+            ] {
+                keys.insert(hex::encode_upper(special.as_bytes()));
+            }
+            let mut diffs = 0usize;
+            for key in &keys {
+                let Some(kb) = hex::decode(key)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                else {
+                    continue;
+                };
+                let ours = ledger.state_map.get(&Hash256::new(kb));
+                let r = rpc(serde_json::json!({
+                    "method":"ledger_entry",
+                    "params":[{"index":key,"ledger_index":next,"binary":true}]
+                }));
+                let theirs = r["result"]["node_binary"]
+                    .as_str()
+                    .map(|s| s.to_uppercase());
+                match (ours, theirs) {
+                    (Some(ob), Some(th)) => {
+                        let oh = hex::encode_upper(ob);
+                        if oh != th {
+                            diffs += 1;
+                            let et = rxrpl_codec::binary::decode(ob)
+                                .ok()
+                                .and_then(|j| j["LedgerEntryType"].as_str().map(String::from))
+                                .unwrap_or_default();
+                            eprintln!("STATEDIFF {} ({et}): bytes differ", &key[..16]);
+                            if let (Ok(oj), Some(tj)) = (
+                                rxrpl_codec::binary::decode(ob),
+                                hex::decode(&th)
+                                    .ok()
+                                    .and_then(|b| rxrpl_codec::binary::decode(&b).ok()),
+                            ) {
+                                if let Some(o) = oj.as_object() {
+                                    for (f, ov) in o {
+                                        if tj.get(f) != Some(ov) {
+                                            eprintln!(
+                                                "    .{f} ours={ov} theirs={}",
+                                                tj.get(f)
+                                                    .map(ToString::to_string)
+                                                    .unwrap_or_else(|| "<absent>".into())
+                                            );
+                                        }
+                                    }
+                                }
+                                if let Some(t) = tj.as_object() {
+                                    for f in t.keys() {
+                                        if oj.get(f).is_none() {
+                                            eprintln!("    .{f} ours=<absent> theirs={}", t[f]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (Some(_), None) => {
+                        diffs += 1;
+                        eprintln!("STATEDIFF {}: present in ours, absent theirs", &key[..16]);
+                    }
+                    (None, Some(_)) => {
+                        diffs += 1;
+                        eprintln!("STATEDIFF {}: absent ours, present theirs", &key[..16]);
+                    }
+                    (None, None) => {}
+                }
+            }
+            eprintln!(
+                "=== {diffs} byte-level SLE diffs (over {} affected keys) ===",
+                keys.len()
+            );
+
+            // AffectedNodes key-set comparison: a key OUR apply touched that
+            // mainnet's metadata does not list is an extra SLE change that
+            // diverges the account_hash (not in the affected-key set above);
+            // a missing one is a state change we failed to make. Also localises
+            // the tx_hash (metadata) gap.
+            let mut ours_keys: std::collections::HashMap<
+                String,
+                std::collections::BTreeSet<String>,
+            > = Default::default();
+            ledger.tx_map.for_each(&mut |tx_hash, data| {
+                let txid = tx_hash.to_string().to_uppercase();
+                if let Ok((_tx, m)) = rxrpl_codec::binary::decode_tx_leaf(data) {
+                    let mut set = std::collections::BTreeSet::new();
+                    for an in m["AffectedNodes"].as_array().into_iter().flatten() {
+                        for k in ["CreatedNode", "ModifiedNode", "DeletedNode"] {
+                            if let Some(idx) = an.get(k).and_then(|e| e["LedgerIndex"].as_str()) {
+                                set.insert(idx.to_uppercase());
+                            }
+                        }
+                    }
+                    ours_keys.insert(txid, set);
+                }
+            });
+            let mut metadiffs = 0usize;
+            for (txid, nodes) in &meta {
+                let mainnet_keys: std::collections::BTreeSet<String> =
+                    nodes.iter().map(|(k, _, _)| k.to_uppercase()).collect();
+                let empty = std::collections::BTreeSet::new();
+                let ours = ours_keys.get(txid).unwrap_or(&empty);
+                let extra: Vec<&String> = ours.difference(&mainnet_keys).collect();
+                let missing: Vec<&String> = mainnet_keys.difference(ours).collect();
+                if !extra.is_empty() || !missing.is_empty() {
+                    metadiffs += 1;
+                    eprintln!(
+                        "METADIFF {}: extra_in_ours={:?} missing_in_ours={:?}",
+                        &txid[..16],
+                        extra.iter().map(|k| &k[..16]).collect::<Vec<_>>(),
+                        missing.iter().map(|k| &k[..16]).collect::<Vec<_>>()
+                    );
+                }
+            }
+            eprintln!("=== {metadiffs} txs with AffectedNodes key-set diffs ===");
+        }
+
+        // Per-tx metadata BYTE comparison. account_hash (state) can match while
+        // tx_hash (the metadata tree) diverges: identical state change serialised
+        // to different metadata, or a different TransactionIndex from a reordered
+        // apply. Compare our metadata blob to mainnet's (the binary tx set's
+        // `meta`) for every tx — no extra RPC.
+        let read_vl = |b: &[u8], off: &mut usize| -> Option<Vec<u8>> {
+            let b0 = *b.get(*off)? as usize;
+            *off += 1;
+            let len = if b0 <= 192 {
+                b0
+            } else if b0 <= 240 {
+                let b1 = *b.get(*off)? as usize;
+                *off += 1;
+                193 + (b0 - 193) * 256 + b1
+            } else if b0 <= 254 {
+                let b1 = *b.get(*off)? as usize;
+                let b2 = *b.get(*off + 1)? as usize;
+                *off += 2;
+                12481 + (b0 - 241) * 65536 + b1 * 256 + b2
+            } else {
+                return None;
+            };
+            let seg = b.get(*off..*off + len)?.to_vec();
+            *off += len;
+            Some(seg)
+        };
+        let mut their_meta: std::collections::HashMap<String, Vec<u8>> = Default::default();
+        for e in txs_resp["result"]["ledger"]["transactions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let (Some(blob_hex), Some(meta_hex)) = (e["tx_blob"].as_str(), e["meta"].as_str())
+            else {
+                continue;
+            };
+            let (Ok(blob), Ok(mb)) = (hex::decode(blob_hex), hex::decode(meta_hex)) else {
+                continue;
+            };
+            their_meta.insert(transaction_id(&blob).to_string().to_uppercase(), mb);
+        }
+        let mut meta_diffs = 0usize;
+        let mut idx_diffs = 0usize;
+        let mut reports: Vec<String> = Vec::new();
+        ledger.tx_map.for_each(&mut |tx_hash, data| {
+            let txid = tx_hash.to_string().to_uppercase();
+            let mut off = 0usize;
+            let tx_bytes = read_vl(data, &mut off);
+            let Some(our_meta) = read_vl(data, &mut off) else {
+                return;
+            };
+            let Some(their_meta_b) = their_meta.get(&txid) else {
+                return;
+            };
+            if &our_meta == their_meta_b {
+                return;
+            }
+            meta_diffs += 1;
+            let ty = tx_bytes
+                .as_deref()
+                .and_then(|b| rxrpl_codec::binary::decode(b).ok())
+                .and_then(|j| j["TransactionType"].as_str().map(String::from))
+                .unwrap_or_default();
+            let oj = rxrpl_codec::binary::decode(&our_meta).unwrap_or(Value::Null);
+            let tj = rxrpl_codec::binary::decode(their_meta_b).unwrap_or(Value::Null);
+            let oi = oj["TransactionIndex"].as_u64();
+            let ti = tj["TransactionIndex"].as_u64();
+            if oi != ti {
+                idx_diffs += 1;
+            }
+            if reports.len() >= 12 {
+                return;
+            }
+            let node_map = |m: &Value| -> std::collections::BTreeMap<String, Value> {
+                let mut out = std::collections::BTreeMap::new();
+                for an in m["AffectedNodes"].as_array().into_iter().flatten() {
+                    if let Some((wrap, inner)) = an.as_object().and_then(|o| o.iter().next()) {
+                        let idx = inner["LedgerIndex"].as_str().unwrap_or("?").to_uppercase();
+                        out.insert(idx, serde_json::json!({ "w": wrap, "n": inner }));
+                    }
+                }
+                out
+            };
+            let om = node_map(&oj);
+            let tm = node_map(&tj);
+            let mut r = format!(
+                "METABYTES {} ({ty}) txnIdx ours={oi:?} theirs={ti:?}",
+                &txid[..16]
+            );
+            let mut keys: std::collections::BTreeSet<String> = om.keys().cloned().collect();
+            keys.extend(tm.keys().cloned());
+            for k in keys {
+                match (om.get(&k), tm.get(&k)) {
+                    (Some(o), Some(t)) if o != t => {
+                        r.push_str(&format!(
+                            "\n  {} ours={o} theirs={t}",
+                            &k[..16.min(k.len())]
+                        ));
+                    }
+                    (Some(o), None) => {
+                        r.push_str(&format!("\n  {} ONLY-OURS {o}", &k[..16.min(k.len())]));
+                    }
+                    (None, Some(t)) => {
+                        r.push_str(&format!("\n  {} ONLY-THEIRS {t}", &k[..16.min(k.len())]));
+                    }
+                    _ => {}
+                }
+            }
+            if !r.contains("\n") {
+                r.push_str(&format!(
+                    "  [raw-only diff]\n    ours  ={}\n    theirs={}",
+                    hex::encode_upper(&our_meta),
+                    hex::encode_upper(their_meta_b)
+                ));
+            }
+            reports.push(r);
+        });
+        for r in &reports {
+            eprintln!("{r}");
+        }
+        eprintln!(
+            "=== {meta_diffs} txs with metadata BYTE diffs ({idx_diffs} are TransactionIndex) ==="
+        );
     }
 
     /// Multi-ledger play-forward: bootstrap one base ledger's state, then follow

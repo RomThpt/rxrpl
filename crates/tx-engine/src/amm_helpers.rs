@@ -1007,6 +1007,38 @@ mod tests {
         assert_eq!(out.to_iou().to_decimal_string(), "932.437210367");
     }
 
+    // Mainnet tx 955856C7… (ledger 105333100): a tfFillOrKill OfferCreate whose
+    // book has no resting CLOB offer crosses the V4X/XRP AMM (pool 921658042
+    // drops XRP + 641921.2615094566 V4X, tfee 269). Requesting 8070.85058826842
+    // V4X out, rippled swaps in exactly 11767174 drops (pool XRP -> 933425216).
+    // This anchors the AMM-fallback crossing wired into `cross_offers`.
+    #[test]
+    fn swap_asset_out_xrp_v4x_byte_exact() {
+        let pool_in = Number::from_int(921_658_042); // pool XRP drops
+        let pool_out = Number::from_iou(&parse_iou_value("641921.2615094566")); // pool V4X
+        let asset_out = Number::from_iou(&parse_iou_value("8070.85058826842"));
+        let out = swap_asset_out(&pool_in, &pool_out, &asset_out, 269, true).unwrap();
+        assert_eq!(out.to_xrp_drops_mode(), 11_767_174);
+    }
+
+    // Same 8070.85 V4X, but at the pool AFTER 955856C7 swapped it (XRP 933425216,
+    // V4X 633850.4109211882): the cost rises to 12071113 drops, ABOVE the 11767578
+    // TakerGets of the arbitrage fill-or-kill offer 1FA2A4D9. A FoK crossing is
+    // all-or-nothing, so this must be killed (deliver zero), not partial-filled —
+    // matching mainnet's tecKILLED. Anchors the amm_hop `partial=false` path.
+    #[test]
+    fn swap_asset_out_v4x_at_moved_pool_exceeds_fok_budget() {
+        let pool_in = Number::from_int(933_425_216); // pool XRP after 955856C7
+        let pool_out = Number::from_iou(&parse_iou_value("633850.4109211882")); // pool V4X
+        let asset_out = Number::from_iou(&parse_iou_value("8070.85058826842"));
+        let cost = swap_asset_out(&pool_in, &pool_out, &asset_out, 269, true).unwrap();
+        assert_eq!(cost.to_xrp_drops_mode(), 12_071_113);
+        assert!(
+            cost.to_xrp_drops_mode() > 11_767_578,
+            "FoK offer must be killed"
+        );
+    }
+
     // A Large-scale computation (deposit/withdraw default) must be unaffected by
     // the Small-scale guard living and dying inside swap_asset_in.
     #[test]

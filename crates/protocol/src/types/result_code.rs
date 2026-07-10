@@ -1021,6 +1021,12 @@ impl TransactionResult {
     pub fn is_retryable(&self) -> bool {
         matches!(self.category(), ResultCategory::Ter)
     }
+
+    /// Returns true if this is a claimed failure (tec). Under rippled's
+    /// `tapRETRY` a tec is deferred like a ter instead of being committed.
+    pub fn is_tec(&self) -> bool {
+        matches!(self.category(), ResultCategory::Tec)
+    }
 }
 
 impl std::fmt::Display for TransactionResult {

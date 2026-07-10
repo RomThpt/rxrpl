@@ -37,6 +37,9 @@ pub struct Sandbox<'a> {
     /// Whether the `fixPreviousTxnID` amendment is active for this apply. Gates
     /// whether newly created directory-node pages are threaded.
     thread_directories: bool,
+    /// The amount this transaction actually delivered, set by a Payment when it
+    /// differs from the requested `Amount`; surfaced as `sfDeliveredAmount`.
+    delivered_amount: Option<serde_json::Value>,
 }
 
 impl<'a> Sandbox<'a> {
@@ -51,7 +54,14 @@ impl<'a> Sandbox<'a> {
             destroyed_drops: 0,
             sorted_directories: false,
             thread_directories: true,
+            delivered_amount: None,
         }
+    }
+
+    /// Take the amount recorded via [`ApplyView::set_delivered_amount`], if any.
+    /// The engine reads it after `apply` to write `sfDeliveredAmount` metadata.
+    pub fn take_delivered_amount(&mut self) -> Option<serde_json::Value> {
+        self.delivered_amount.take()
     }
 
     /// Record whether the `SortedDirectories` amendment is active. Set once per
@@ -256,6 +266,9 @@ impl ApplyView for Sandbox<'_> {
     fn destroy_drops(&mut self, drops: u64) {
         self.destroyed_drops += drops;
     }
+    fn set_delivered_amount(&mut self, amount: serde_json::Value) {
+        self.delivered_amount = Some(amount);
+    }
     fn sorted_directories(&self) -> bool {
         self.sorted_directories
     }
@@ -310,8 +323,52 @@ impl SandboxChanges {
     /// centrally, covers all transaction types. We only touch entries that
     /// already expose `PreviousTxnID` so field-less types (DirectoryNode,
     /// LedgerHashes, Amendments, ...) are left untouched.
-    pub fn stamp_previous_txn(&mut self, tx_id_hex: &str, ledger_seq: u32) {
-        for data in self.inserts.values_mut().chain(self.updates.values_mut()) {
+    pub fn stamp_previous_txn(
+        &mut self,
+        tx_id_hex: &str,
+        ledger_seq: u32,
+    ) -> HashMap<Hash256, (serde_json::Value, serde_json::Value)> {
+        // rippled records a modified node's node-level PreviousTxnID as the
+        // value the SLE carried BEFORE this tx threaded it
+        // (`ApplyStateTable::threadItem` -> `SLE::thread`). A directory emptied
+        // then recreated in this tx carries only a fresh zero placeholder, so
+        // its metadata must not surface the parent's PreviousTxnID. Capture each
+        // updated node's pre-stamp value for the metadata builder to use.
+        let mut pre_stamp = HashMap::new();
+        for (key, data) in self.updates.iter_mut() {
+            let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(data) else {
+                continue;
+            };
+            let Some(obj) = v.as_object_mut() else {
+                continue;
+            };
+            if !obj.contains_key("PreviousTxnID") {
+                continue;
+            }
+            pre_stamp.insert(
+                *key,
+                (
+                    obj.get("PreviousTxnID")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    obj.get("PreviousTxnLgrSeq")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+            );
+            obj.insert(
+                "PreviousTxnID".to_string(),
+                serde_json::Value::String(tx_id_hex.to_string()),
+            );
+            obj.insert(
+                "PreviousTxnLgrSeq".to_string(),
+                serde_json::Value::Number(ledger_seq.into()),
+            );
+            if let Ok(bytes) = serde_json::to_vec(&v) {
+                *data = bytes;
+            }
+        }
+        for data in self.inserts.values_mut() {
             let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(data) else {
                 continue;
             };
@@ -333,6 +390,7 @@ impl SandboxChanges {
                 *data = bytes;
             }
         }
+        pre_stamp
     }
 
     /// Thread `sfAccountTxnID` on the sender's account root to the id of the
