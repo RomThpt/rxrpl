@@ -4568,16 +4568,16 @@ does not apply to this tx type (e.g. a pure delete/modify)."
                 let theirs = r["result"]["node_binary"].as_str().map(|s| s.to_uppercase());
                 match (ours, theirs) {
                     (Some(ob), Some(th)) => {
-                        let oh = hex::encode_upper(&ob);
+                        let oh = hex::encode_upper(ob);
                         if oh != th {
                             diffs += 1;
-                            let et = rxrpl_codec::binary::decode(&ob)
+                            let et = rxrpl_codec::binary::decode(ob)
                                 .ok()
                                 .and_then(|j| j["LedgerEntryType"].as_str().map(String::from))
                                 .unwrap_or_default();
                             eprintln!("STATEDIFF {} ({et}): bytes differ", &key[..16]);
                             if let (Ok(oj), Some(tj)) = (
-                                rxrpl_codec::binary::decode(&ob),
+                                rxrpl_codec::binary::decode(ob),
                                 hex::decode(&th).ok().and_then(|b| rxrpl_codec::binary::decode(&b).ok()),
                             ) {
                                 if let Some(o) = oj.as_object() {
