@@ -383,9 +383,7 @@ impl Transactor for OfferCreateTransactor {
         // view; an XRP gets side is reserve-gated below instead.
         if crossed {
             if let Some(gets_leg) = Leg::parse(&taker_gets) {
-                if !gets_leg.is_xrp
-                    && owner_funds_leg(ctx, &account_id, &gets_leg).is_zero()
-                {
+                if !gets_leg.is_xrp && owner_funds_leg(ctx, &account_id, &gets_leg).is_zero() {
                     commit_acct(ctx, &acct)?;
                     return Ok(TransactionResult::TesSuccess);
                 }
@@ -1712,7 +1710,8 @@ fn amm_hop(
         let Some(spq) = spq else {
             return Ok(None);
         };
-        if !rxrpl_amount::is_better_quality(spq, cq) || rxrpl_amount::within_relative_distance(spq, cq)
+        if !rxrpl_amount::is_better_quality(spq, cq)
+            || rxrpl_amount::within_relative_distance(spq, cq)
         {
             return Ok(None);
         }
@@ -1813,8 +1812,7 @@ fn amm_hop(
             // rippled's rippleCredit auto-creates the receiver's trust line the
             // first time an AMM swap delivers an IOU it has never held.
             if create_missing_dest_line {
-                let tl_key =
-                    keylet::trust_line(dest, &demand_out.issuer, &demand_out.currency);
+                let tl_key = keylet::trust_line(dest, &demand_out.issuer, &demand_out.currency);
                 if ctx.view.read(&tl_key).is_none() {
                     create_iou_trust_line(
                         ctx,
@@ -3732,5 +3730,3 @@ mod owner_funds_tests {
         assert!(!maker_usd_deep_frozen(0x0040_0000)); // regular freeze, not deep
     }
 }
-
-

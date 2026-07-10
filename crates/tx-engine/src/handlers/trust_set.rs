@@ -60,8 +60,7 @@ pub(crate) fn maybe_delete_drained_trust_line(
     let Some(bytes) = ctx.view.read(&tl_key) else {
         return Ok(false);
     };
-    let obj: Value =
-        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let obj: Value = serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
 
     let default_ripple = ctx.rules.enabled(&rxrpl_primitives::Hash256::from(
         DEFAULT_RIPPLE_AMENDMENT_ID,
@@ -135,7 +134,11 @@ pub(crate) fn maybe_delete_drained_trust_line(
         return Ok(false);
     }
 
-    let sender_reserve_flag = if is_low { LSF_LOW_RESERVE } else { LSF_HIGH_RESERVE };
+    let sender_reserve_flag = if is_low {
+        LSF_LOW_RESERVE
+    } else {
+        LSF_HIGH_RESERVE
+    };
     if (flags & sender_reserve_flag) != 0 {
         helpers::adjust_owner_count(sender_acct, -1);
         // rippled's trustDelete releases the sender's reserve before removing

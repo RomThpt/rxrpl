@@ -448,7 +448,8 @@ pub fn replay_forward(
 
     // Apply the set in rippled's canonical build order (shared with the live
     // consensus build).
-    let (applied, failed) = apply_tx_set_multipass(&mut ledger, set_hash, txs, tx_engine, &rules, fees);
+    let (applied, failed) =
+        apply_tx_set_multipass(&mut ledger, set_hash, txs, tx_engine, &rules, fees);
 
     ledger
         .close(header.close_time, header.close_flags)
@@ -1185,8 +1186,7 @@ mod tests {
                     rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(tp),
                 ) {
                     if a1 != a2 {
-                        if let Ok(amm_key) =
-                            rxrpl_tx_engine::amm_helpers::compute_amm_key(&a1, &a2)
+                        if let Ok(amm_key) = rxrpl_tx_engine::amm_helpers::compute_amm_key(&a1, &a2)
                         {
                             let amm_idx = amm_key.to_string().to_uppercase();
                             read_keys.insert(amm_idx.clone());
@@ -2788,8 +2788,7 @@ mod tests {
                     rxrpl_tx_engine::amm_helpers::asset_spec_from_amount(tp),
                 ) {
                     if a1 != a2 {
-                        if let Ok(amm_key) =
-                            rxrpl_tx_engine::amm_helpers::compute_amm_key(&a1, &a2)
+                        if let Ok(amm_key) = rxrpl_tx_engine::amm_helpers::compute_amm_key(&a1, &a2)
                         {
                             let amm_idx = amm_key.to_string().to_uppercase();
                             read_keys.insert(amm_idx.clone());
@@ -4565,7 +4564,9 @@ does not apply to this tx type (e.g. a pure delete/modify)."
                     "method":"ledger_entry",
                     "params":[{"index":key,"ledger_index":next,"binary":true}]
                 }));
-                let theirs = r["result"]["node_binary"].as_str().map(|s| s.to_uppercase());
+                let theirs = r["result"]["node_binary"]
+                    .as_str()
+                    .map(|s| s.to_uppercase());
                 match (ours, theirs) {
                     (Some(ob), Some(th)) => {
                         let oh = hex::encode_upper(ob);
@@ -4578,12 +4579,19 @@ does not apply to this tx type (e.g. a pure delete/modify)."
                             eprintln!("STATEDIFF {} ({et}): bytes differ", &key[..16]);
                             if let (Ok(oj), Some(tj)) = (
                                 rxrpl_codec::binary::decode(ob),
-                                hex::decode(&th).ok().and_then(|b| rxrpl_codec::binary::decode(&b).ok()),
+                                hex::decode(&th)
+                                    .ok()
+                                    .and_then(|b| rxrpl_codec::binary::decode(&b).ok()),
                             ) {
                                 if let Some(o) = oj.as_object() {
                                     for (f, ov) in o {
                                         if tj.get(f) != Some(ov) {
-                                            eprintln!("    .{f} ours={ov} theirs={}", tj.get(f).map(ToString::to_string).unwrap_or_else(|| "<absent>".into()));
+                                            eprintln!(
+                                                "    .{f} ours={ov} theirs={}",
+                                                tj.get(f)
+                                                    .map(ToString::to_string)
+                                                    .unwrap_or_else(|| "<absent>".into())
+                                            );
                                         }
                                     }
                                 }
@@ -4608,15 +4616,20 @@ does not apply to this tx type (e.g. a pure delete/modify)."
                     (None, None) => {}
                 }
             }
-            eprintln!("=== {diffs} byte-level SLE diffs (over {} affected keys) ===", keys.len());
+            eprintln!(
+                "=== {diffs} byte-level SLE diffs (over {} affected keys) ===",
+                keys.len()
+            );
 
             // AffectedNodes key-set comparison: a key OUR apply touched that
             // mainnet's metadata does not list is an extra SLE change that
             // diverges the account_hash (not in the affected-key set above);
             // a missing one is a state change we failed to make. Also localises
             // the tx_hash (metadata) gap.
-            let mut ours_keys: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
-                Default::default();
+            let mut ours_keys: std::collections::HashMap<
+                String,
+                std::collections::BTreeSet<String>,
+            > = Default::default();
             ledger.tx_map.for_each(&mut |tx_hash, data| {
                 let txid = tx_hash.to_string().to_uppercase();
                 if let Ok((_tx, m)) = rxrpl_codec::binary::decode_tx_leaf(data) {
@@ -4737,13 +4750,19 @@ does not apply to this tx type (e.g. a pure delete/modify)."
             };
             let om = node_map(&oj);
             let tm = node_map(&tj);
-            let mut r = format!("METABYTES {} ({ty}) txnIdx ours={oi:?} theirs={ti:?}", &txid[..16]);
+            let mut r = format!(
+                "METABYTES {} ({ty}) txnIdx ours={oi:?} theirs={ti:?}",
+                &txid[..16]
+            );
             let mut keys: std::collections::BTreeSet<String> = om.keys().cloned().collect();
             keys.extend(tm.keys().cloned());
             for k in keys {
                 match (om.get(&k), tm.get(&k)) {
                     (Some(o), Some(t)) if o != t => {
-                        r.push_str(&format!("\n  {} ours={o} theirs={t}", &k[..16.min(k.len())]));
+                        r.push_str(&format!(
+                            "\n  {} ours={o} theirs={t}",
+                            &k[..16.min(k.len())]
+                        ));
                     }
                     (Some(o), None) => {
                         r.push_str(&format!("\n  {} ONLY-OURS {o}", &k[..16.min(k.len())]));
@@ -4766,7 +4785,9 @@ does not apply to this tx type (e.g. a pure delete/modify)."
         for r in &reports {
             eprintln!("{r}");
         }
-        eprintln!("=== {meta_diffs} txs with metadata BYTE diffs ({idx_diffs} are TransactionIndex) ===");
+        eprintln!(
+            "=== {meta_diffs} txs with metadata BYTE diffs ({idx_diffs} are TransactionIndex) ==="
+        );
     }
 
     /// Multi-ledger play-forward: bootstrap one base ledger's state, then follow

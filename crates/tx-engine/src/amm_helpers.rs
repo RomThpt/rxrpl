@@ -1033,7 +1033,10 @@ mod tests {
         let asset_out = Number::from_iou(&parse_iou_value("8070.85058826842"));
         let cost = swap_asset_out(&pool_in, &pool_out, &asset_out, 269, true).unwrap();
         assert_eq!(cost.to_xrp_drops_mode(), 12_071_113);
-        assert!(cost.to_xrp_drops_mode() > 11_767_578, "FoK offer must be killed");
+        assert!(
+            cost.to_xrp_drops_mode() > 11_767_578,
+            "FoK offer must be killed"
+        );
     }
 
     // A Large-scale computation (deposit/withdraw default) must be unaffected by
@@ -1132,4 +1135,3 @@ mod tests {
         assert_eq!(k1, k2);
     }
 }
-
