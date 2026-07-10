@@ -889,7 +889,7 @@ fn cross_offers(
                     consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
                 } else {
                     let new_gets = leg_sub(&offer_out, &order_out);
-                    let new_pays = leg_sub(&offer_in, &order_in);
+                    let new_pays = leg_sub_round(&offer_in, &order_in);
                     consumed["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
                     consumed["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
                 }
@@ -902,7 +902,7 @@ fn cross_offers(
             } else {
                 // Reduce the resting offer in place by the filled amounts.
                 let new_gets = leg_sub(&offer_out, &order_out);
-                let new_pays = leg_sub(&offer_in, &order_in);
+                let new_pays = leg_sub_round(&offer_in, &order_in);
                 let mut reduced = offer.clone();
                 reduced["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
                 reduced["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
