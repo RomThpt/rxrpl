@@ -359,6 +359,7 @@ impl Transactor for OfferCreateTransactor {
             &taker_pays,
             &taker_gets,
             &inverse_book,
+            is_sell,
         )?;
 
         // Nothing left to place when either side is exhausted (fully crossed):
@@ -676,6 +677,7 @@ fn cross_offers(
     taker_pays: &Value,
     taker_gets: &Value,
     inverse_book: &rxrpl_primitives::Hash256,
+    is_sell: bool,
 ) -> Result<(Value, Value, bool), TransactionResult> {
     let out_leg = match Leg::parse(taker_pays) {
         Some(l) => l,
@@ -763,7 +765,15 @@ fn cross_offers(
             .unwrap_or_default();
 
         for offer_key in offers {
-            if remaining_out.is_zero() {
+            // A tfSell offer sells its whole TakerGets and accepts any TakerPays
+            // (rippled: deliver = kMaxNative), so the walk is bounded by the
+            // taker's remaining input, not its TakerPays demand.
+            let done = if is_sell {
+                remaining_in.is_zero()
+            } else {
+                remaining_out.is_zero()
+            };
+            if done {
                 break 'walk;
             }
             let Some(ob) = ctx.view.read(&offer_key) else {
@@ -822,7 +832,15 @@ fn cross_offers(
                 continue;
             }
             let avail_out = leg_min(&offer_out, &funds);
-            let take_out = leg_min(&remaining_out, &avail_out);
+            // A tfSell take is bounded by what the taker's remaining input can buy
+            // at this offer's quality (it sells its whole TakerGets); a buy take is
+            // bounded by the taker's remaining TakerPays demand.
+            let take_out = if is_sell {
+                let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
+                leg_min(&avail_out, &out_for_in(&remaining_in, &rate, &offer_out))
+            } else {
+                leg_min(&remaining_out, &avail_out)
+            };
 
             // Full take when the taker consumes the whole original offer;
             // otherwise a partial take of `take_out`, priced at the offer's
@@ -830,6 +848,12 @@ fn cross_offers(
             let full_take = leg_ge(&take_out, &offer_out);
             let (order_out, order_in) = if full_take {
                 (offer_out.clone(), offer_in.clone())
+            } else if is_sell && !leg_ge(&take_out, &avail_out) {
+                // tfSell input-bound: `take_out` was derived from the taker's whole
+                // remaining input at this quality, so the taker gives exactly that
+                // input — not a re-multiplied approximation that would leave a dust
+                // remainder unsold and diverge the maker's residual TakerPays.
+                (take_out.clone(), remaining_in.clone())
             } else {
                 let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
                 let computed = rxrpl_amount::Amount::multiply(
@@ -865,7 +889,7 @@ fn cross_offers(
                     consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
                 } else {
                     let new_gets = leg_sub(&offer_out, &order_out);
-                    let new_pays = leg_sub(&offer_in, &order_in);
+                    let new_pays = leg_sub_round(&offer_in, &order_in);
                     consumed["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
                     consumed["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
                 }
@@ -878,7 +902,7 @@ fn cross_offers(
             } else {
                 // Reduce the resting offer in place by the filled amounts.
                 let new_gets = leg_sub(&offer_out, &order_out);
-                let new_pays = leg_sub(&offer_in, &order_in);
+                let new_pays = leg_sub_round(&offer_in, &order_in);
                 let mut reduced = offer.clone();
                 reduced["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
                 reduced["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
@@ -889,7 +913,13 @@ fn cross_offers(
                     .map_err(|_| TransactionResult::TefInternal)?;
             }
 
-            remaining_out = leg_sub(&remaining_out, &order_out);
+            // A tfSell fill can deliver more than the remaining TakerPays demand;
+            // clamp the demand at zero rather than underflowing the drops/mantissa.
+            remaining_out = if is_sell && leg_ge(&order_out, &remaining_out) {
+                leg_sub(&remaining_out, &remaining_out)
+            } else {
+                leg_sub(&remaining_out, &order_out)
+            };
             remaining_in = leg_sub(&remaining_in, &order_in);
             crossed = true;
         }
