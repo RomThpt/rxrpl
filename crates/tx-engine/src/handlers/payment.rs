@@ -639,7 +639,8 @@ fn apply_conversion(
     // budget or delivers the whole target, so the order book is left untouched.
     // Books with no AMM (every pre-AMM order-book oracle) fall through to the
     // shared Taker engine unchanged.
-    let delivered = match try_amm_conversion(ctx, &src_id, &mut acct, &amount, &send_max)? {
+    let delivered = match try_amm_conversion(ctx, &src_id, &mut acct, &dst_id, &amount, &send_max)?
+    {
         Some(delivered) => delivered,
         None => {
             crate::handlers::offer_create::cross_book_payment(
@@ -1186,10 +1187,16 @@ fn amm_pool_balance(
 /// SendMax capped by the source's funds). The transaction fee was already
 /// charged on `user_acct`; XRP legs move through that working copy (the caller
 /// writes it back), IOU legs through the trust lines directly.
+///
+/// The `spent` input leg is debited from `user_id` (the source), the `delivered`
+/// output leg is credited to `dst_id` (the destination) — they coincide for a
+/// same-account conversion but differ for a cross-account payment, where the
+/// output must land on the destination's line, not the source's.
 fn try_amm_conversion(
     ctx: &mut ApplyContext<'_>,
     user_id: &rxrpl_primitives::AccountId,
     user_acct: &mut serde_json::Value,
+    dst_id: &rxrpl_primitives::AccountId,
     amount: &serde_json::Value,
     send_max: &serde_json::Value,
 ) -> Result<Option<serde_json::Value>, TransactionResult> {
@@ -1316,7 +1323,8 @@ fn try_amm_conversion(
         )?;
     }
 
-    // --- Apply: move `delivered` out from the pool to the user. ---
+    // --- Apply: move `delivered` out from the pool to the destination. ---
+    let dst_is_src = dst_id.as_bytes() == user_id.as_bytes();
     if out_xrp {
         let drops = delivered.to_xrp_drops();
         let pkey = keylet::account(&pool_id);
@@ -1329,8 +1337,21 @@ fn try_amm_conversion(
         ctx.view
             .update(pkey, pd)
             .map_err(|_| TransactionResult::TefInternal)?;
-        let ubal = helpers::get_balance(user_acct);
-        helpers::set_balance(user_acct, ubal + drops);
+        if dst_is_src {
+            let ubal = helpers::get_balance(user_acct);
+            helpers::set_balance(user_acct, ubal + drops);
+        } else {
+            let dkey = keylet::account(dst_id);
+            let dbytes = ctx.view.read(&dkey).ok_or(TransactionResult::TecNoEntry)?;
+            let mut dacct: serde_json::Value =
+                serde_json::from_slice(&dbytes).map_err(|_| TransactionResult::TefInternal)?;
+            let dbal = helpers::get_balance(&dacct);
+            helpers::set_balance(&mut dacct, dbal + drops);
+            let dd = serde_json::to_vec(&dacct).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(dkey, dd)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
     } else {
         crate::amm_helpers::set_iou_holding(
             ctx.view,
@@ -1339,14 +1360,13 @@ fn try_amm_conversion(
             &out_cur,
             &pool_out.sub(&delivered),
         )?;
-        let user_out =
-            crate::amm_helpers::iou_holding_number(ctx.view, user_id, &out_iss, &out_cur);
+        let dst_out = crate::amm_helpers::iou_holding_number(ctx.view, dst_id, &out_iss, &out_cur);
         crate::amm_helpers::set_iou_holding(
             ctx.view,
-            user_id,
+            dst_id,
             &out_iss,
             &out_cur,
-            &user_out.add(&delivered),
+            &dst_out.add(&delivered),
         )?;
     }
 
