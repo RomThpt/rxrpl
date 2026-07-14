@@ -870,8 +870,28 @@ fn cross_offers(
             // Legacy Taker semantics: `order_out` is the NET the taker receives;
             // the owner's debit is grossed up by the output issuer's transfer
             // fee inside `pay_out`.
-            pay_in(ctx, taker, taker_acct, &owner, &order_in, false, false)?;
-            pay_out(ctx, taker, taker_acct, &owner, taker, &order_out, false)?;
+            // Post-fixUniversalNumber, rippled's Flow rounds trust-line balance
+            // updates to nearest (Number); the legacy pre-2013 path truncated the
+            // smaller term, which loses precision when a large balance is credited
+            // a small amount (e.g. a 10^10 balance minus ~3e3 diverges 3 ULP).
+            pay_in(
+                ctx,
+                taker,
+                taker_acct,
+                &owner,
+                &order_in,
+                number_switchover,
+                false,
+            )?;
+            pay_out(
+                ctx,
+                taker,
+                taker_acct,
+                &owner,
+                taker,
+                &order_out,
+                number_switchover,
+            )?;
 
             // The offer's available liquidity is exhausted when the take
             // consumes all of `avail_out` — either the whole offer (`full_take`)
