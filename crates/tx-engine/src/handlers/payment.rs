@@ -1180,6 +1180,84 @@ fn amm_pool_balance(
 /// for the `(send_max, amount)` pair (or it can deliver nothing), leaving the
 /// caller to fall back to the order book.
 ///
+/// Quality (book-directory `in/out` rate) of the best resting offer a conversion
+/// crossing `in -> out` would hit: the first funded, non-self offer walking the
+/// book best-price-first. `None` when the book has no such offer. Gates the AMM
+/// swap in [`try_amm_conversion`] — rippled's `BookStep` crosses whichever of the
+/// AMM synthetic offer / CLOB tip is better, so an AMM whose fee-adjusted spot
+/// does not beat this must defer to the CLOB.
+fn best_book_dir_quality(
+    ctx: &mut ApplyContext<'_>,
+    taker: &rxrpl_primitives::AccountId,
+    in_cur: &[u8; 20],
+    in_iss: &rxrpl_primitives::AccountId,
+    out_cur: &[u8; 20],
+    out_iss: &rxrpl_primitives::AccountId,
+    out_xrp: bool,
+) -> Option<u64> {
+    let book = keylet::book_dir(in_cur, in_iss, out_cur, out_iss);
+    let book_prefix = book.as_bytes()[0..24].to_vec();
+    let mut probe = crate::handlers::offer_create::book_dir_with_quality(&book, 0);
+    while let Some(dir_key) = ctx.view.succ(&probe) {
+        if dir_key.as_bytes()[0..24] != book_prefix[..] {
+            break;
+        }
+        probe = dir_key;
+        let dir_quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
+        let Some(dir_bytes) = ctx.view.read(&dir_key) else {
+            continue;
+        };
+        let Ok(dir) = serde_json::from_slice::<serde_json::Value>(&dir_bytes) else {
+            continue;
+        };
+        let Some(indexes) = dir.get("Indexes").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for idx in indexes {
+            let Some(h) = idx
+                .as_str()
+                .and_then(|s| s.parse::<rxrpl_primitives::Hash256>().ok())
+            else {
+                continue;
+            };
+            let Some(eb) = ctx.view.read(&h) else {
+                continue;
+            };
+            let Ok(entry) = serde_json::from_slice::<serde_json::Value>(&eb) else {
+                continue;
+            };
+            if entry.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+                continue;
+            }
+            let Some(owner) = entry
+                .get("Account")
+                .and_then(|v| v.as_str())
+                .and_then(|s| decode_account_id(s).ok())
+            else {
+                continue;
+            };
+            if &owner == taker {
+                continue;
+            }
+            let funded = if out_xrp {
+                ctx.view
+                    .read(&keylet::account(&owner))
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                    .map(|a| helpers::get_balance(&a) > 0)
+                    .unwrap_or(false)
+            } else {
+                let h = crate::amm_helpers::iou_holding_number(ctx.view, &owner, out_iss, out_cur);
+                !h.is_zero() && !h.negative()
+            };
+            if !funded {
+                continue;
+            }
+            return Some(dir_quality);
+        }
+    }
+    None
+}
+
 /// Mirrors rippled's single-path AMM offer in a `BookStep`: the delivered/spent
 /// amounts come from `swapAssetIn`/`swapAssetOut` on the live pool reserves. The
 /// trade is output-limited (deliver the full `Amount`) when the required input
@@ -1232,6 +1310,43 @@ fn try_amm_conversion(
     let pool_out = amm_pool_balance(ctx, &pool_id, out_xrp, &out_cur, &out_iss);
     if pool_in.is_zero() || pool_out.is_zero() {
         return Ok(None);
+    }
+
+    // AMM-vs-CLOB interleave gate (rippled `BookStep`): when the order book holds
+    // an offer whose quality strictly beats the AMM's fee-adjusted spot price,
+    // rippled crosses that CLOB offer first, not the pool. Defer to the CLOB
+    // (`cross_book_payment`) in that case instead of consuming the AMM here. The
+    // spot must be fee-adjusted — the taker pays the trading fee on the input, so
+    // the effective in/out is spot / (1 - fee) — matching `amm_hop`'s band gate.
+    if let Some(cq) =
+        best_book_dir_quality(ctx, user_id, &in_cur, &in_iss, &out_cur, &out_iss, out_xrp)
+    {
+        let q_iou = |n: &Number, is_xrp: bool| {
+            if is_xrp {
+                rxrpl_amount::IOUAmount::from_decimal_string(&n.to_xrp_drops().to_string())
+                    .unwrap_or(rxrpl_amount::IOUAmount::ZERO)
+            } else {
+                n.to_iou()
+            }
+        };
+        let one_minus_fee = rxrpl_amount::IOUAmount::divide(
+            &rxrpl_amount::IOUAmount::from_decimal_string(
+                &(100_000u32 - u32::from(tfee)).to_string(),
+            )
+            .unwrap_or(rxrpl_amount::IOUAmount::ZERO),
+            &rxrpl_amount::IOUAmount::from_decimal_string("100000")
+                .unwrap_or(rxrpl_amount::IOUAmount::ZERO),
+        )
+        .unwrap_or(rxrpl_amount::IOUAmount::ZERO);
+        let out_q = q_iou(&pool_out, out_xrp);
+        let out_adj = rxrpl_amount::IOUAmount::multiply(&out_q, &one_minus_fee).unwrap_or(out_q);
+        if let Ok(spq) = rxrpl_amount::get_rate(&q_iou(&pool_in, in_xrp), &out_adj) {
+            if !rxrpl_amount::is_better_quality(spq, cq)
+                || rxrpl_amount::within_relative_distance(spq, cq)
+            {
+                return Ok(None);
+            }
+        }
     }
 
     // Target output (Amount).
