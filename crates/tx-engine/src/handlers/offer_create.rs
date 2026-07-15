@@ -3136,15 +3136,22 @@ fn pay_out_gross(
         amount.iou
     };
     // Debit the owner the full gross it provides (the offer's TakerGets move).
-    credit_line(
-        ctx,
-        owner,
-        &amount.issuer,
-        &amount.currency,
-        &amount.iou.negate(),
-        round,
-    )?;
-    if !skip_recipient_credit {
+    // When a party to the delivery is itself the output issuer it has no trust
+    // line on its side to move — it issues (owner) or redeems (recipient) its own
+    // IOU directly (rippled's rippleCredit skips the issuer self-line). Debiting a
+    // nonexistent self-line otherwise fails the crossing with tecPATH_DRY, exactly
+    // as `pay_out` did for issuer-owned offers before the guard.
+    if amount.issuer != *owner {
+        credit_line(
+            ctx,
+            owner,
+            &amount.issuer,
+            &amount.currency,
+            &amount.iou.negate(),
+            round,
+        )?;
+    }
+    if !skip_recipient_credit && amount.issuer != *recipient {
         credit_line(
             ctx,
             recipient,
