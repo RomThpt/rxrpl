@@ -855,14 +855,13 @@ fn cross_offers(
                 // remainder unsold and diverge the maker's residual TakerPays.
                 (take_out.clone(), remaining_in.clone())
             } else {
+                // Demand-limited partial fill: the taker pays the CEIL price for
+                // the delivered output (`in = out * rate` rounded up), never more
+                // than the resting offer — matching rippled's `mulRound(roundUp)`
+                // and the multi-hop `cross_book_hop` path (`in_for_out`). The plain
+                // `Amount::multiply` fudge left the taker's spend 1 drop short.
                 let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
-                let computed = rxrpl_amount::Amount::multiply(
-                    &leg_to_amount(&take_out),
-                    &rxrpl_amount::Amount::Iou(rate),
-                    in_leg.is_xrp,
-                )
-                .map_err(|_| TransactionResult::TefInternal)?;
-                let order_in = leg_min(&amount_to_leg(&computed, &offer_in), &offer_in);
+                let order_in = leg_min(&in_for_out(&take_out, &rate, &offer_in), &offer_in);
                 (take_out.clone(), order_in)
             };
 
@@ -3061,14 +3060,21 @@ fn pay_out(
     }
     let rate = transfer_rate(ctx, &amount.issuer);
     let gross = grossed(&amount.iou, &rate);
-    credit_line(
-        ctx,
-        owner,
-        &amount.issuer,
-        &amount.currency,
-        &gross.negate(),
-        round,
-    )?;
+    // When the offer owner is itself the output issuer it has no trust line on
+    // its side to debit — it issues its own IOU directly (rippled's rippleCredit
+    // skips the issuer's self-line). Debiting the nonexistent self-line otherwise
+    // fails the whole crossing with tecPATH_DRY and the taker's offer rests
+    // uncrossed instead of consuming the issuer's resting offers.
+    if owner != &amount.issuer {
+        credit_line(
+            ctx,
+            owner,
+            &amount.issuer,
+            &amount.currency,
+            &gross.negate(),
+            round,
+        )?;
+    }
     credit_line(
         ctx,
         recipient,
