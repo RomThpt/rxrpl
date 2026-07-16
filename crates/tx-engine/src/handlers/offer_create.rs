@@ -1051,7 +1051,13 @@ fn leg_from_magnitude(mag: &IOUAmount, template: &Leg) -> Leg {
     if template.is_xrp {
         let s = mag.to_decimal_string();
         let whole = s.split('.').next().unwrap_or("0");
-        out.drops = whole.parse::<i64>().unwrap_or(0);
+        // Saturate rather than collapse to 0 on overflow: a magnitude beyond
+        // i64::MAX drops only arises from the unbounded-budget sentinel converted
+        // to XRP (an interior hop's `out_for_in(unbounded_in, rate)` in the
+        // reverse pass). It means "no budget cap", so it must read as huge —
+        // `unwrap_or(0)` made the budget bind to zero and starved the hop. No real
+        // XRP amount exceeds i64::MAX (max supply ~1e17 drops), so fills unchanged.
+        out.drops = whole.parse::<i64>().unwrap_or(i64::MAX);
     } else {
         out.iou = *mag;
     }
@@ -1495,9 +1501,14 @@ fn unbounded_leg(template: &Leg) -> Leg {
     if template.is_xrp {
         out.drops = i64::MAX;
     } else {
-        // rippled's STAmount max mantissa/exponent — far above any book size.
+        // A budget far above any real book size, but well below the STAmount max
+        // exponent (+80): the reverse pass prices `budget / rate` in `out_for_in`,
+        // and a near-max budget divided by a sub-1 rate overflows `div_round` to
+        // ZERO — read as a zero budget, which starved an interior IOU->XRP hop.
+        // ~1e46 is orders of magnitude above any real amount (< ~1e20) yet leaves
+        // ample headroom for the divide.
         out.iou =
-            IOUAmount::from_parts(9_999_999_999_999_999, 80, false).unwrap_or(IOUAmount::ZERO);
+            IOUAmount::from_parts(9_999_999_999_999_999, 30, false).unwrap_or(IOUAmount::ZERO);
     }
     out
 }
