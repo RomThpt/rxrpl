@@ -201,7 +201,9 @@ fn preclaim_valid_create_account() {
 
 #[test]
 fn apply_transfer_to_existing_account() {
-    let mut ledger = setup_ledger_with_account(SRC_ADDRESS, 10_000_000);
+    // Source funded above amount + owner reserve (10 XRP base): a payment must
+    // leave the sender its reserve, else it returns tecUNFUNDED_PAYMENT.
+    let mut ledger = setup_ledger_with_account(SRC_ADDRESS, 20_000_000);
     add_account(&mut ledger, DST_ADDRESS, 5_000_000);
 
     let fees = FeeSettings::default();
@@ -227,7 +229,7 @@ fn apply_transfer_to_existing_account() {
     let src_key = keylet::account(&src_id);
     let src_bytes = sandbox.read(&src_key).unwrap();
     let src: serde_json::Value = serde_json::from_slice(&src_bytes).unwrap();
-    assert_eq!(src["Balance"].as_str().unwrap(), "9000000");
+    assert_eq!(src["Balance"].as_str().unwrap(), "19000000");
     assert_eq!(src["Sequence"].as_u64().unwrap(), 2);
 
     // Verify destination balance increased
@@ -249,7 +251,9 @@ fn apply_xrp_payment_with_ticket_consumes_ticket_not_sequence() {
     let src = serde_json::json!({
         "LedgerEntryType": "AccountRoot",
         "Account": SRC_ADDRESS,
-        "Balance": "10000000",
+        // Above amount + owner reserve (base 10 XRP + 1 owned ticket): the
+        // payment must leave the sender its reserve.
+        "Balance": "20000000",
         "Sequence": 9,
         "OwnerCount": 1,
         "Flags": 0,
