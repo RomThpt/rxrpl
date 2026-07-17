@@ -268,6 +268,18 @@ impl Transactor for PaymentTransactor {
             serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
         let src_balance = helpers::get_balance(&src_account);
+        // rippled Payment::doApply (XRP): the source must retain its owner reserve
+        // after sending the amount — `mPriorBalance < saDstAmount +
+        // accountReserve(ownerCount)` yields tecUNFUNDED_PAYMENT (fee charged, no
+        // transfer). `mPriorBalance` is the balance BEFORE the fee, so add the fee
+        // back to this post-fee working balance. Without this the transfer went
+        // through and drove the source below its reserve.
+        let owner_count = helpers::get_owner_count(&src_account);
+        let reserve = ctx.fees.account_reserve(owner_count);
+        let prior_balance = src_balance.saturating_add(helpers::get_fee(ctx.tx));
+        if prior_balance < amount.saturating_add(reserve) {
+            return Err(TransactionResult::TecUnfundedPayment);
+        }
         let new_src_balance = src_balance
             .checked_sub(amount)
             .ok_or(TransactionResult::TecUnfundedPayment)?;
