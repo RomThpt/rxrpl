@@ -520,6 +520,37 @@ impl Transactor for TrustSetTransactor {
                 || amt(&obj, "HighLimit") != 0.0
                 || high_balance > 0.0;
 
+            // rippled SetTrust::doApply: when the SOURCE's side of the line
+            // starts taking a reserve slot it did not hold before (e.g. clearing
+            // noRipple on a non-DefaultRipple account flips the line out of its
+            // default state), the source must fund the extra owner reserve. If
+            // `mPriorBalance` (the XRP balance before the fee) is below
+            // `accountReserve(OwnerCount + 1)`, the whole change is rejected with
+            // tecINSUF_RESERVE_LINE — a CLAIMED tec: fee and sequence charged
+            // centrally, the trust line left untouched. Only the source is
+            // checked; the counterparty never funds a change it did not sign.
+            let sender_takes_reserve = if is_low {
+                low_reserve_set && (flags_in & LSF_LOW_RESERVE) == 0
+            } else {
+                high_reserve_set && (flags_in & LSF_HIGH_RESERVE) == 0
+            };
+            if sender_takes_reserve {
+                let sender = if is_low {
+                    low_acct.as_ref()
+                } else {
+                    high_acct.as_ref()
+                };
+                if let Some(sender) = sender {
+                    let owner_count = helpers::get_owner_count(sender);
+                    let reserve = ctx.fees.account_reserve(owner_count + 1);
+                    let prior_balance =
+                        helpers::get_balance(sender).saturating_add(helpers::get_fee(ctx.tx));
+                    if prior_balance < reserve {
+                        return Err(TransactionResult::TecInsufReserveLine);
+                    }
+                }
+            }
+
             // Only accounts actually mutated here are written back (and thus
             // get their PreviousTxnID restamped) — rippled leaves the
             // counterparty untouched when its reserve state does not change.
