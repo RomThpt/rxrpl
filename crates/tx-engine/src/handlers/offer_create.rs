@@ -1305,6 +1305,43 @@ fn cross_book_hop(
                 }
             }
         }
+        // Interleave the AMM at this quality band BEFORE crossing the resting
+        // CLOB offers, mirroring cross_offers' try_amm_step (rippled BookStep
+        // tryAMM/execOffer): amm_hop's fee-adjusted spot gate admits the pool
+        // only when it strictly beats this band's quality, so it crosses exactly
+        // where the AMM is at least as good as the offers about to fill and is a
+        // no-op on a pure-CLOB book. The output lands on `dest`; interior hops
+        // carry the previous hop's delivery so their input is not funds-capped.
+        if !remaining_out.is_zero() && !remaining_in.is_zero() {
+            let amm_budget = if skip_input_debit {
+                remaining_in.clone()
+            } else {
+                leg_min(&remaining_in, &owner_funds_leg(ctx, taker, budget_in))
+            };
+            if !amm_budget.is_zero() {
+                if let Some((amm_out, amm_spent)) = amm_hop(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    dest,
+                    &remaining_out,
+                    &amm_budget,
+                    skip_input_debit,
+                    skip_output_credit,
+                    /*create_missing_dest_line=*/ true,
+                    /*partial=*/ true,
+                    /*target_quality=*/ Some(dir_quality),
+                )? {
+                    remaining_out = leg_sub_round(&remaining_out, &amm_out);
+                    remaining_in = leg_sub_round(&remaining_in, &amm_spent);
+                    delivered = leg_add(&delivered, &amm_out);
+                    spent = leg_add(&spent, &amm_spent);
+                }
+            }
+            if remaining_out.is_zero() || remaining_in.is_zero() {
+                break 'walk;
+            }
+        }
         let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
         let Some(dir_bytes) = ctx.view.read(&dir_key) else {
             continue;
