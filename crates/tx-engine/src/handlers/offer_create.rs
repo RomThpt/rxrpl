@@ -714,6 +714,22 @@ fn cross_offers(
     let book_prefix = &inverse_book.as_bytes()[0..24];
     let fok = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_FILL_OR_KILL != 0;
 
+    // Autobridge: when NEITHER leg is XRP, the offer also competes an
+    // XRP-intermediate path (`in -> XRP -> out`) against the direct book. Prebuild
+    // that two-hop strand once; `try_bridge_step` crosses it per band by quality.
+    let bridge = if !in_leg.is_xrp && !out_leg.is_xrp {
+        build_flow_strand(
+            ctx,
+            &[
+                taker_gets.clone(),
+                Value::String("0".to_string()),
+                taker_pays.clone(),
+            ],
+        )
+    } else {
+        None
+    };
+
     // The book base for traversal has the quality (low 64 bits) zeroed;
     // `keylet::book_dir` leaves those as hash bytes, so start the walk there.
     let mut probe = book_dir_with_quality(inverse_book, 0);
@@ -733,6 +749,23 @@ fn cross_offers(
         // `dir_quality`, so this fires exactly when the AMM is at least as good
         // as the offers about to cross at this band; it is a no-op otherwise.
         if !remaining_out.is_zero() && !remaining_in.is_zero() {
+            if let Some(b) = &bridge {
+                try_bridge_step(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    b,
+                    &in_leg,
+                    &out_leg,
+                    &mut remaining_out,
+                    &mut remaining_in,
+                    &mut crossed,
+                    dir_quality,
+                )?;
+                if remaining_out.is_zero() || remaining_in.is_zero() {
+                    break 'walk;
+                }
+            }
             try_amm_step(
                 ctx,
                 taker,
@@ -951,6 +984,20 @@ fn cross_offers(
     // rather than gating it on whether any CLOB crossed, so this is NOT `!crossed`
     // gated: a single crossed CLOB offer must not suppress better AMM liquidity.
     if !remaining_out.is_zero() && !remaining_in.is_zero() {
+        if let Some(b) = &bridge {
+            try_bridge_step(
+                ctx,
+                taker,
+                taker_acct,
+                b,
+                &in_leg,
+                &out_leg,
+                &mut remaining_out,
+                &mut remaining_in,
+                &mut crossed,
+                threshold,
+            )?;
+        }
         try_amm_step(
             ctx,
             taker,
@@ -1018,6 +1065,71 @@ fn try_amm_step(
         *remaining_out = leg_sub(remaining_out, &delivered);
         *remaining_in = leg_sub(remaining_in, &spent);
         *crossed = true;
+    }
+    Ok(())
+}
+
+/// Cross the XRP-intermediate autobridge path (`in -> XRP -> out`, a prebuilt
+/// two-hop `bridge` strand) as a competing source in the `cross_offers` walk,
+/// mirroring [`try_amm_step`]: cross bridge passes whose realised quality still
+/// beats `cq` (the current CLOB band, or the taker's overall limit at the tail),
+/// updating the remaining demand/budget in place. Each `execute_strand_pass` is
+/// checkpointed and rolled back when its quality is worse than `cq`, so the
+/// bridge only wins the bands where it is genuinely better — matching rippled's
+/// per-band interleave of the direct book and the autobridge path.
+#[allow(clippy::too_many_arguments)]
+fn try_bridge_step(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    bridge: &FlowStrand,
+    in_leg: &Leg,
+    out_leg: &Leg,
+    remaining_out: &mut Leg,
+    remaining_in: &mut Leg,
+    crossed: &mut bool,
+    cq: u64,
+) -> Result<(), TransactionResult> {
+    let taker_funds = owner_funds_leg(ctx, taker, in_leg);
+    let mut budget = leg_min(remaining_in, &taker_funds);
+    loop {
+        if remaining_out.is_zero() || budget.is_zero() {
+            break;
+        }
+        let cp = ctx.view.checkpoint();
+        let mut amm_ctx = AmmContext::new(false);
+        let ro = leg_to_number(remaining_out);
+        let ri = leg_to_number(&budget);
+        match execute_strand_pass(
+            ctx,
+            taker,
+            taker_acct,
+            taker,
+            bridge,
+            &ri,
+            &ro,
+            &mut amm_ctx,
+        ) {
+            Some(res) if !res.out_amt.is_zero() && !res.in_amt.is_zero() => {
+                let in_q = num_quality_iou(&res.in_amt, in_leg.is_xrp);
+                let out_q = num_quality_iou(&res.out_amt, out_leg.is_xrp);
+                let eff_q = rxrpl_amount::get_rate(&in_q, &out_q).unwrap_or(u64::MAX);
+                if !rxrpl_amount::is_better_quality(eff_q, cq) {
+                    ctx.view.rollback(cp);
+                    break;
+                }
+                let d = leg_from_magnitude(&res.out_amt.to_iou(), out_leg);
+                let s = leg_from_magnitude(&res.in_amt.to_iou(), in_leg);
+                *remaining_out = leg_sub(remaining_out, &d);
+                *remaining_in = leg_sub(remaining_in, &s);
+                budget = leg_sub(&budget, &s);
+                *crossed = true;
+            }
+            _ => {
+                ctx.view.rollback(cp);
+                break;
+            }
+        }
     }
     Ok(())
 }
@@ -1268,11 +1380,31 @@ fn cross_book_hop(
             }
 
             let full_take = leg_ge(&take_out, &offer_out);
+            let funds_limited = !full_take && !budget_binds && leg_ge(&take_out, &avail_out);
             let (order_out, order_in) = if full_take {
                 (offer_out.clone(), offer_in.clone())
             } else if budget_binds {
                 // Input-limited: spend the whole remaining budget, deliver floor.
                 (take_out.clone(), remaining_in.clone())
+            } else if funds_limited {
+                // Funds-limited (owner partially unfunded): rippled scales the
+                // resting offer — TakerPays * funded_TakerGets / TakerGets, rounded
+                // DOWN — rather than re-pricing the funded output at the book's
+                // bucket rate (which ceils and over-charges by up to 1 drop). The
+                // over-charge cascades through an interior bridge hop; a
+                // demand-limited take (below) still pays the ceil price.
+                let ratio = IOUAmount::divide(
+                    &leg_as_quality_iou(&avail_out),
+                    &leg_as_quality_iou(&offer_out),
+                )
+                .unwrap_or(IOUAmount::ZERO);
+                let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
+                    .unwrap_or(IOUAmount::ZERO);
+                let order_in = leg_min(
+                    &leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in),
+                    &remaining_in,
+                );
+                (take_out.clone(), order_in)
             } else {
                 // Demand-limited: pay the ceil price for the delivered output,
                 // never exceeding the resting offer or the remaining budget.
