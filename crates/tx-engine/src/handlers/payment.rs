@@ -549,6 +549,16 @@ fn get_deliver_min_iou(tx: &serde_json::Value) -> Option<(&str, &str, &str)> {
     ))
 }
 
+/// `DeliverMin` as a raw magnitude — XRP drops for an amount string, IOU value
+/// for an object — regardless of the asset. `None` when the field is absent.
+fn get_deliver_min_value(tx: &serde_json::Value) -> Option<f64> {
+    let dm = tx.get("DeliverMin")?;
+    if let Some(s) = dm.as_str() {
+        return s.parse().ok();
+    }
+    dm.get("value").and_then(|v| v.as_str())?.parse().ok()
+}
+
 /// Read the issuer's TransferRate as a multiplier (1.0 = no fee).
 fn issuer_transfer_rate(ctx: &ApplyContext<'_>, issuer_id: &rxrpl_primitives::AccountId) -> f64 {
     let key = keylet::account(issuer_id);
@@ -673,8 +683,19 @@ fn apply_conversion(
 
     const TF_PARTIAL_PAYMENT: u32 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT;
     let partial = helpers::get_flags(ctx.tx) & TF_PARTIAL_PAYMENT != 0;
-    if !partial && !delivered_meets_target(&delivered, &amount) {
-        return Err(TransactionResult::TecPathPartial);
+    if !partial {
+        if !delivered_meets_target(&delivered, &amount) {
+            return Err(TransactionResult::TecPathPartial);
+        }
+    } else if let Some(dmin) = get_deliver_min_value(ctx.tx) {
+        // rippled Payment::doApply: under tfPartialPayment the delivery may fall
+        // short of Amount but must still reach DeliverMin. When the AMM/book can
+        // only convert a sub-DeliverMin dust amount, the whole path result is
+        // rejected with tecPATH_PARTIAL — the child sandbox (the swap) is
+        // discarded, so only the fee is charged, matching mainnet.
+        if delivered_amount(&delivered) + 1e-9 < dmin {
+            return Err(TransactionResult::TecPathPartial);
+        }
     }
 
     // rippled Payment::doApply: record sfDeliveredAmount when the delivered
