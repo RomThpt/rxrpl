@@ -43,13 +43,17 @@ impl Transactor for NFTokenModifyTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         helpers::read_account_by_address(ctx.view, account_str)?;
 
-        // Verify token exists in one of the account's pages.
-        let account_id =
-            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        // The NFToken lives in its OWNER's pages. rippled NFTokenModify accepts
+        // an optional `Owner`: when the modifier (the issuer or an authorized
+        // minter) is not the token's holder, the token is located under `Owner`,
+        // not under the sending Account.
+        let owner_str = helpers::get_str_field(ctx.tx, "Owner").unwrap_or(account_str);
+        let owner_id =
+            decode_account_id(owner_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let nftoken_id =
             helpers::get_str_field(ctx.tx, "NFTokenID").ok_or(TransactionResult::TemMalformed)?;
         let nft_hash = nft_hash(nftoken_id)?;
-        let page_key = nftoken::find_owner_page(ctx.view, &account_id, &nft_hash)
+        let page_key = nftoken::find_owner_page(ctx.view, &owner_id, &nft_hash)
             .ok_or(TransactionResult::TecNoEntry)?;
         let page_bytes = ctx
             .view
@@ -77,12 +81,17 @@ impl Transactor for NFTokenModifyTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        // The token is located under its OWNER (the optional `Owner` field),
+        // which may differ from the sending Account (issuer / authorized minter).
+        let owner_str = helpers::get_str_field(ctx.tx, "Owner").unwrap_or(account_str);
+        let owner_id =
+            decode_account_id(owner_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let nftoken_id =
             helpers::get_str_field(ctx.tx, "NFTokenID").ok_or(TransactionResult::TemMalformed)?;
         let nft_hash = nft_hash(nftoken_id)?;
 
-        // Update the token's URI in whichever page holds it.
-        let page_key = nftoken::find_owner_page(ctx.view, &account_id, &nft_hash)
+        // Update the token's URI in whichever of the owner's pages holds it.
+        let page_key = nftoken::find_owner_page(ctx.view, &owner_id, &nft_hash)
             .ok_or(TransactionResult::TecNoEntry)?;
         let page_bytes = ctx
             .view
@@ -232,6 +241,63 @@ mod tests {
         assert_eq!(
             page["NFTokens"][0]["NFToken"]["URI"].as_str().unwrap(),
             "https://new-uri.com"
+        );
+    }
+
+    #[test]
+    fn modify_uri_via_owner_field() {
+        // A modifier that is not the token holder locates the token under the
+        // optional `Owner` field, not under the sending Account.
+        let (mut ledger, nftoken_id) = setup_with_token();
+
+        const MINTER: &str = "rf1BiGeXwwQoi8Z2ueFYTEXSwuJYfV2Jpn";
+        let minter_id = decode_account_id(MINTER).unwrap();
+        let minter = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": MINTER,
+            "Balance": "100000000",
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::account(&minter_id),
+                serde_json::to_vec(&minter).unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenModify",
+            "Account": MINTER,
+            "Owner": OWNER,
+            "NFTokenID": nftoken_id,
+            "URI": "https://minter-updated.com",
+            "Fee": "12",
+            "Sequence": 1,
+        });
+
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+
+        let result = NFTokenModifyTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        let owner_id = decode_account_id(OWNER).unwrap();
+        let page_key = keylet::nftoken_page_max(&owner_id);
+        let page_bytes = sandbox.read(&page_key).unwrap();
+        let page: Value = serde_json::from_slice(&page_bytes).unwrap();
+        assert_eq!(
+            page["NFTokens"][0]["NFToken"]["URI"].as_str().unwrap(),
+            "https://minter-updated.com"
         );
     }
 
