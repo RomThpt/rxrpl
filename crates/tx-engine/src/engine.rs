@@ -571,8 +571,10 @@ impl TxEngine {
 
             // Thread the sender's sfAccountTxnID to this tx id (rippled base
             // Transactor) when the account opted in. Pseudo-transactions have no
-            // sender account and never carry the field.
-            if !is_pseudo {
+            // sender account and never carry the field. rippled advances it only
+            // on tesSUCCESS: a tec discards the doApply changes and re-claims just
+            // the fee and sequence, leaving AccountTxnID untouched.
+            if !is_pseudo && result.is_success() {
                 if let Ok(account_str) = helpers::get_account(tx) {
                     if let Ok(account_id) = decode_account_id(account_str) {
                         changes.thread_account_txn_id(
@@ -1342,6 +1344,58 @@ mod tests {
 
         let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
         assert_eq!(result, TransactionResult::TerPreSeq);
+    }
+
+    #[test]
+    fn account_txn_id_not_advanced_on_tec() {
+        // rippled advances sfAccountTxnID only on tesSUCCESS. A tec (claimed
+        // failure) discards the doApply changes and re-claims just the fee and
+        // sequence, so AccountTxnID must stay at its prior value.
+        const SENTINEL: &str = "00000000000000000000000000000000000000000000000000000000DEADBEEF";
+        let engine = payment_engine();
+        let mut ledger = Ledger::genesis();
+        let account_id = decode_account_id(GENESIS).unwrap();
+        let key = keylet::account(&account_id);
+        let account = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": GENESIS,
+            "Balance": "20000000",
+            "Sequence": 5,
+            "OwnerCount": 0,
+            "Flags": 0,
+            "AccountTxnID": SENTINEL,
+        });
+        let data =
+            rxrpl_ledger::sle_codec::encode_sle(&serde_json::to_vec(&account).unwrap()).unwrap();
+        ledger.put_state(key, data).unwrap();
+        let dest_id = decode_account_id(DEST).unwrap();
+        let dest = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": DEST,
+            "Balance": "10000000",
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        let dest_data =
+            rxrpl_ledger::sle_codec::encode_sle(&serde_json::to_vec(&dest).unwrap()).unwrap();
+        ledger
+            .put_state(keylet::account(&dest_id), dest_data)
+            .unwrap();
+
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+        // Amount far exceeds the spendable balance -> a claimed tec failure.
+        let tx = make_payment(GENESIS, DEST, "999999999999999", 5);
+        let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
+        assert!(result.is_tec(), "expected a claimed tec, got {result:?}");
+
+        let obj: Value =
+            rxrpl_ledger::sle_codec::decode_state(ledger.get_state(&key).unwrap()).unwrap();
+        // Sequence consumed and fee charged, but AccountTxnID left untouched.
+        assert_eq!(obj["Sequence"].as_u64().unwrap(), 6);
+        assert_eq!(obj["Balance"].as_str().unwrap(), "19999990");
+        assert_eq!(obj["AccountTxnID"].as_str().unwrap(), SENTINEL);
     }
 
     #[test]
