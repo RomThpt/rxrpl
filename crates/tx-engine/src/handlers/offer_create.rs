@@ -1644,7 +1644,20 @@ pub(crate) fn cross_path_payment(
         if is_first {
             source_spent = spent;
         }
+        // rippled charges the intermediate issuer's transfer fee once as the IOU
+        // ripples through the interior account between two consecutive books. Net
+        // the carry (the next hop's input budget) by that rate on an interior IOU
+        // boundary whose issuer is a third party. The final delivery, XRP
+        // boundaries, issuer-party hops, and fee-free issuers carry no fee, so the
+        // guard leaves net == gross exactly as before for those.
         carry = got.clone();
+        if !is_last && !out_tmpl.is_xrp && out_tmpl.issuer != *taker && out_tmpl.issuer != *dest {
+            let rate = transfer_rate(ctx, &out_tmpl.issuer);
+            let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+            if rate != one {
+                carry.iou = IOUAmount::div_round(&carry.iou, &rate, false).unwrap_or(carry.iou);
+            }
+        }
         delivered = got;
     }
 
