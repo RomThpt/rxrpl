@@ -410,7 +410,7 @@ impl TxEngine {
             // Under tapRETRY a preclaim tec is deferred, not claimed: return it
             // before any sandbox/fee mutation so the ledger is untouched.
             Err(result) if result.is_claimed() => {
-                if tap_retry {
+                if tap_retry && result.is_retryable_tec() {
                     return Ok(result);
                 }
                 Some(result)
@@ -530,7 +530,7 @@ impl TxEngine {
                     // sandbox (fee + seq consume included) by returning before
                     // the commit, so the ledger is untouched and the caller can
                     // retry it in a later pass.
-                    if tap_retry {
+                    if tap_retry && result.is_retryable_tec() {
                         return Ok(result);
                     }
                     // tec: discard child mutations, keep fee deduction

@@ -404,7 +404,9 @@ pub fn apply_tx_set_multipass(
                 tx_engine.apply(&json, ledger, rules, fees)
             };
             match result {
-                Ok(r) if r.is_retryable() || (certain_retry && r.is_tec()) => deferred.push(json),
+                Ok(r) if r.is_retryable() || (certain_retry && r.is_retryable_tec()) => {
+                    deferred.push(json)
+                }
                 Ok(r) => {
                     if r.is_claimed() {
                         applied += 1;
@@ -4413,7 +4415,7 @@ does not apply to this tx type (e.g. a pure delete/modify)."
                     engine.apply(&json, &mut ledger, &rules, &fees)
                 };
                 if let Ok(r) = result {
-                    if r.is_retryable() || (certain_retry && r.is_tec()) {
+                    if r.is_retryable() || (certain_retry && r.is_retryable_tec()) {
                         deferred.push((txid, json));
                         continue;
                     }
