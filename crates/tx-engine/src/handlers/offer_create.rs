@@ -417,11 +417,11 @@ impl Transactor for OfferCreateTransactor {
         // the count fresh: a cancelled OfferSequence has already decremented it.
         let reserve_count = acct.get("OwnerCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         if !crossed && helpers::get_balance(&acct) < ctx.fees.account_reserve(reserve_count + 1) {
-            let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
-            ctx.view
-                .update(acct_key, nb)
-                .map_err(|_| TransactionResult::TemMalformed)?;
-            return Ok(TransactionResult::TecInsufReserveOffer);
+            // A claimed tec discards the doApply changes and keeps only the fee
+            // and sequence — return Err so the engine rolls the child back (and,
+            // under tapRETRY, defers the whole transaction to a later pass to be
+            // reclaimed there, matching mainnet's TransactionIndex and balances).
+            return Err(TransactionResult::TecInsufReserveOffer);
         }
 
         let offer_key = keylet::offer(&account_id, sequence);

@@ -1027,6 +1027,18 @@ impl TransactionResult {
     pub fn is_tec(&self) -> bool {
         matches!(self.category(), ResultCategory::Tec)
     }
+
+    /// Whether a `tec` should be RETRIED (deferred to a later build-ledger pass)
+    /// rather than claimed at its canonical position. Empirically (mainnet
+    /// 105333100/105460000/105467000/105470000/105472000/105475000/105480000/
+    /// 105490000) rippled claims exactly ONE tec in the retriable passes —
+    /// `tecKILLED` (a FillOrKill/immediate offer that definitively cannot cross)
+    /// — and defers every other tec like a `terRETRY`, since a sibling
+    /// transaction could still fund the path/account/reserve. Mirrors rippled's
+    /// `applyTransaction` under `certainRetry`.
+    pub fn is_retryable_tec(&self) -> bool {
+        self.is_tec() && !matches!(self, Self::TecKilled)
+    }
 }
 
 impl std::fmt::Display for TransactionResult {
