@@ -1189,6 +1189,26 @@ fn in_for_out(out_amt: &Leg, rate: &IOUAmount, in_template: &Leg) -> Leg {
     amount_to_leg(&amt, in_template)
 }
 
+/// Input required for a demand-limited partial take of a resting offer, priced
+/// from the offer's own amounts: `in = ceil(offer_in * out / offer_out)`. For an
+/// XRP input this multiplies before dividing so no drop is lost — rippled's Flow
+/// prices partial takes proportionally on the offer's amounts, whereas the book
+/// directory's quantized quality rate can under-price by a drop. IOU input keeps
+/// the rate-based path (16-digit mantissa, unaffected by the drop truncation).
+fn in_for_out_offer(offer_in: &Leg, out_amt: &Leg, offer_out: &Leg, rate: &IOUAmount) -> Leg {
+    if !offer_in.is_xrp {
+        return in_for_out(out_amt, rate, offer_in);
+    }
+    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode};
+    let priced = Number::from_int(offer_in.drops)
+        .mul(&Number::from_iou(&leg_as_quality_iou(out_amt)))
+        .div(&Number::from_iou(&leg_as_quality_iou(offer_out)));
+    let _g = RoundModeGuard::new(RoundingMode::Upward);
+    let mut out = offer_in.clone();
+    out.drops = priced.to_xrp_drops_mode() as i64;
+    out
+}
+
 /// Cross-currency Payment book crossing under the single-taker conversion model
 /// (the taker both pays the input and receives the output — used for
 /// `Account == Destination` currency conversions). Walks the book of offers
@@ -1445,7 +1465,7 @@ fn cross_book_hop(
             } else {
                 // Demand-limited: pay the ceil price for the delivered output,
                 // never exceeding the resting offer or the remaining budget.
-                let priced = in_for_out(&take_out, &eff_rate, &offer_in);
+                let priced = in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate);
                 let order_in = leg_min(&leg_min(&priced, &offer_in), &remaining_in);
                 (take_out.clone(), order_in)
             };
