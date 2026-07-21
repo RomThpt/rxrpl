@@ -888,13 +888,17 @@ fn cross_offers(
                 // remainder unsold and diverge the maker's residual TakerPays.
                 (take_out.clone(), remaining_in.clone())
             } else {
-                // Demand-limited partial fill: the taker pays the CEIL price for
-                // the delivered output (`in = out * rate` rounded up), never more
-                // than the resting offer — matching rippled's `mulRound(roundUp)`
-                // and the multi-hop `cross_book_hop` path (`in_for_out`). The plain
-                // `Amount::multiply` fudge left the taker's spend 1 drop short.
+                // Demand/funds-limited partial fill: the taker pays the CEIL price
+                // for the delivered output, never more than the resting offer.
+                // Price from the offer's own amounts (`in = ceil(offer_in * out /
+                // offer_out)`), not the book's quantized quality rate — on an
+                // underfunded offer the quantized rate ceils one drop high, which
+                // cascades through the taker's remaining budget.
                 let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
-                let order_in = leg_min(&in_for_out(&take_out, &rate, &offer_in), &offer_in);
+                let order_in = leg_min(
+                    &in_for_out_offer(&offer_in, &take_out, &offer_out, &rate),
+                    &offer_in,
+                );
                 (take_out.clone(), order_in)
             };
 
