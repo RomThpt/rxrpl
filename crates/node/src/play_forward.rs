@@ -468,29 +468,36 @@ pub fn replay_forward(
     })
 }
 
+/// A `TxEngine` with every transactor phase registered and signature checks
+/// disabled — the byte-exact replay engine shared by the play-forward oracle and
+/// the blob-fed segment worker (replayed mainnet txs are already validated).
+pub fn all_handlers_engine() -> TxEngine {
+    use rxrpl_tx_engine::{TransactorRegistry, handlers};
+    let mut r = TransactorRegistry::new();
+    handlers::register_phase_a(&mut r);
+    handlers::register_phase_b(&mut r);
+    handlers::register_phase_c1(&mut r);
+    handlers::register_phase_c2(&mut r);
+    handlers::register_phase_c3(&mut r);
+    handlers::register_phase_d1(&mut r);
+    handlers::register_phase_d2(&mut r);
+    handlers::register_phase_e(&mut r);
+    handlers::register_phase_f(&mut r);
+    handlers::register_pseudo(&mut r);
+    TxEngine::new_without_sig_check(r)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rxrpl_codec::address::classic::{decode_account_id, encode_account_id};
     use rxrpl_primitives::AccountId;
     use rxrpl_protocol::keylet;
-    use rxrpl_tx_engine::{TransactorRegistry, handlers};
 
     const MASTER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
 
     fn full_engine() -> TxEngine {
-        let mut r = TransactorRegistry::new();
-        handlers::register_phase_a(&mut r);
-        handlers::register_phase_b(&mut r);
-        handlers::register_phase_c1(&mut r);
-        handlers::register_phase_c2(&mut r);
-        handlers::register_phase_c3(&mut r);
-        handlers::register_phase_d1(&mut r);
-        handlers::register_phase_d2(&mut r);
-        handlers::register_phase_e(&mut r);
-        handlers::register_phase_f(&mut r);
-        handlers::register_pseudo(&mut r);
-        TxEngine::new_without_sig_check(r)
+        all_handlers_engine()
     }
 
     /// Targeted single-transaction oracle: validate one mainnet transaction
