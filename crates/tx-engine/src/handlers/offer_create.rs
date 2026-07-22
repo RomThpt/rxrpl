@@ -1096,12 +1096,18 @@ fn try_bridge_step(
 ) -> Result<(), TransactionResult> {
     let taker_funds = owner_funds_leg(ctx, taker, in_leg);
     let mut budget = leg_min(remaining_in, &taker_funds);
+    // Persist the AMM fib counter across passes (rippled `AMMContext`): each
+    // committed pass advances `amm_iters`, growing the synthetic AMM offer
+    // geometrically so the strand converges in a handful of passes. A fresh
+    // context per pass would reseed the smallest fib chunk every time, delivering
+    // an identical dust sliver and looping ~10^5 times to drain the budget.
+    let mut amm_ctx = AmmContext::new(false);
     loop {
         if remaining_out.is_zero() || budget.is_zero() {
             break;
         }
         let cp = ctx.view.checkpoint();
-        let mut amm_ctx = AmmContext::new(false);
+        amm_ctx.clear();
         let ro = leg_to_number(remaining_out);
         let ri = leg_to_number(&budget);
         match execute_strand_pass(
@@ -1128,6 +1134,7 @@ fn try_bridge_step(
                 *remaining_in = leg_sub(remaining_in, &s);
                 budget = leg_sub(&budget, &s);
                 *crossed = true;
+                amm_ctx.update();
             }
             _ => {
                 ctx.view.rollback(cp);
