@@ -1308,13 +1308,26 @@ impl SHAMap {
     }
 
     /// Recursively update hashes for all dirty nodes.
+    ///
+    /// Descends only into subtrees modified since the parent map. `put_leaf` /
+    /// `insert` / `delete` rebuild just the root→leaf path they touch (via
+    /// `take_child` + `Arc::try_unwrap`), so a modified subtree is uniquely owned
+    /// (`Arc::get_mut` succeeds) while an untouched one stays Arc-shared with the
+    /// parent snapshot and keeps its already-valid cached hash. Skipping the
+    /// shared subtrees keeps a ledger close proportional to what the block
+    /// changed rather than re-cloning and rehashing the whole state tree — for a
+    /// mainnet-sized ~19M-node map that is the difference between milliseconds and
+    /// ~a minute per close under continuous replay. Verified byte-identical to the
+    /// unconditional walk on replayed mainnet ledgers.
     fn update_hashes(node: &mut SHAMapNode) {
         if let SHAMapNode::Inner(inner) = node {
             let mut mask = inner.branch_mask();
             while mask != 0 {
                 let branch = mask.trailing_zeros() as u8;
                 if let Some(child) = inner.child_mut(branch) {
-                    Self::update_hashes(Arc::make_mut(child));
+                    if let Some(child_node) = Arc::get_mut(child) {
+                        Self::update_hashes(child_node);
+                    }
                 }
                 mask &= mask - 1;
             }
