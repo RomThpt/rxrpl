@@ -735,13 +735,15 @@ fn paths_resolve_to_chain(
                 let Some(steps) = p.as_array() else {
                     return false;
                 };
-                let has_ripple_step = steps
-                    .iter()
-                    .any(|s| s.get("account").and_then(|v| v.as_str()).is_some());
-                has_ripple_step
-                    && build_path_boundaries(view, steps, send_max, amount)
-                        .map(|b| b.len() >= 2)
-                        .unwrap_or(false)
+                // A path resolves to a book/AMM chain when its boundaries build
+                // (>= 2 assets). This includes a currency-only path (a lone
+                // `{currency: X}` step naming just the delivered asset), which is a
+                // pure conversion the pathfinder emits when the only liquidity is
+                // an AMM with no resting offers — route it to the AMM-aware crosser
+                // rather than the legacy back-solve, which ignores the pool.
+                build_path_boundaries(view, steps, send_max, amount)
+                    .map(|b| b.len() >= 2)
+                    .unwrap_or(false)
             })
         })
         .unwrap_or(false)
