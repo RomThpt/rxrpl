@@ -215,7 +215,14 @@ impl Transactor for PaymentTransactor {
                 // Paths that need a genuine DirectStep or multi-path blend the
                 // book/AMM chain cannot represent fall through to the legacy
                 // back-solve (`apply_cross_currency`) below.
-                if paths_resolve_to_chain(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]) {
+                let require_ripple_step = account_str != destination_str;
+                if paths_resolve_to_chain(
+                    ctx.view,
+                    ctx.tx,
+                    send_max,
+                    &ctx.tx["Amount"],
+                    require_ripple_step,
+                ) {
                     return apply_paths_payment(
                         ctx,
                         account_str,
@@ -722,11 +729,19 @@ fn apply_conversion(
 /// keeps the byte-exact engine to the mainnet path shape (Gap 2) and leaves the
 /// legacy back-solve to serve the bare-book synthetic shapes and any path that
 /// needs a genuine cross-issuer `DirectStep` or multi-path quality blend.
+///
+/// `require_ripple_step` keeps that account-ripple gate for genuine payments to
+/// another account. A self-payment conversion (`Account == Destination`) needs
+/// no ripple step: a bare currency-only path already denotes a direct
+/// `SendMax -> Amount` book/AMM swap, and the legacy back-solve rounds that AMM
+/// residual in f64 and under-delivers, so those resolve straight to the
+/// byte-exact chain engine.
 fn paths_resolve_to_chain(
     view: &dyn ReadView,
     tx: &serde_json::Value,
     send_max: &serde_json::Value,
     amount: &serde_json::Value,
+    require_ripple_step: bool,
 ) -> bool {
     tx.get("Paths")
         .and_then(|v| v.as_array())
@@ -738,7 +753,7 @@ fn paths_resolve_to_chain(
                 let has_ripple_step = steps
                     .iter()
                     .any(|s| s.get("account").and_then(|v| v.as_str()).is_some());
-                has_ripple_step
+                (!require_ripple_step || has_ripple_step)
                     && build_path_boundaries(view, steps, send_max, amount)
                         .map(|b| b.len() >= 2)
                         .unwrap_or(false)
