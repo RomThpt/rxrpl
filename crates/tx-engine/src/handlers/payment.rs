@@ -1523,14 +1523,20 @@ fn try_amm_conversion(
             &out_cur,
             &pool_out.sub(&delivered),
         )?;
-        let dst_out = crate::amm_helpers::iou_holding_number(ctx.view, dst_id, &out_iss, &out_cur);
-        crate::amm_helpers::set_iou_holding(
-            ctx.view,
-            dst_id,
-            &out_iss,
-            &out_cur,
-            &dst_out.add(&delivered),
-        )?;
+        // Delivering the output IOU to its own issuer redeems it: the pool's
+        // holding decrease above already reflects the burn, and the issuer holds
+        // no trust line to itself, so there is no destination balance to credit.
+        if dst_id.as_bytes() != out_iss.as_bytes() {
+            let dst_out =
+                crate::amm_helpers::iou_holding_number(ctx.view, dst_id, &out_iss, &out_cur);
+            crate::amm_helpers::set_iou_holding(
+                ctx.view,
+                dst_id,
+                &out_iss,
+                &out_cur,
+                &dst_out.add(&delivered),
+            )?;
+        }
     }
 
     // Delivered amount in the Amount asset's JSON shape (for the partial gate).
