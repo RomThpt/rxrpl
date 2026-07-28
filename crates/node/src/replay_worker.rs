@@ -290,7 +290,18 @@ pub fn replay_segment(
             txs: emitted_meta(&outcome.ledger, &txids),
         });
 
-        parent = outcome.ledger;
+        // Seed the next ledger's parent hash from mainnet's real value rather
+        // than our computed one. rxrpl's canonical-ordering tx_hash artifact
+        // makes our `ledger_hash` differ from the chain's even when the account
+        // state is byte-exact; carried forward, that wrong hash cascades into the
+        // next ledger's `LedgerHashes` skip-list SLE (appended at close with the
+        // parent hash), producing a false `account_hash` divergence for every
+        // subsequent ledger. Pinning the real parent hash isolates genuine state
+        // divergences from that known tx-tree artifact — matching what the
+        // fresh-seed oracle does.
+        let mut carried = outcome.ledger;
+        carried.header.hash = hdr.hash;
+        parent = carried;
     }
 
     Ok(reports)
