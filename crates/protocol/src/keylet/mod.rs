@@ -127,6 +127,32 @@ pub fn book_dir(
     )
 }
 
+/// Book directory base for a PermissionedDEX domain-scoped order book.
+///
+/// rippled's `getBookBase` appends the domain to the same `BookDir` hash when
+/// `book.domain` is set (Indexes.cpp): `indexHash(BookDir, in.currency,
+/// out.currency, in.account, out.account, domain)`. Same namespace as the public
+/// book — the 32-byte `DomainID` is just an extra trailing hash input, so a
+/// domain book lives at a distinct base from the public book of the same pair.
+pub fn book_dir_domain(
+    pays_currency: &[u8; 20],
+    pays_issuer: &AccountId,
+    gets_currency: &[u8; 20],
+    gets_issuer: &AccountId,
+    domain: &Hash256,
+) -> Hash256 {
+    index_hash(
+        LedgerNamespace::BookDir,
+        &[
+            pays_currency,
+            gets_currency,
+            pays_issuer.as_bytes(),
+            gets_issuer.as_bytes(),
+            domain.as_bytes(),
+        ],
+    )
+}
+
 /// Compute the keylet for the *most recent* skip list (ledger hashes).
 ///
 /// The SLE at this index in any closed ledger contains the hashes of the
@@ -427,6 +453,45 @@ mod tests {
         let id = AccountId::from_str("B5F762798A53D543A014CAF8B297CFF8F2F937E8").unwrap();
         let key = offer(&id, 7);
         assert!(!key.is_zero());
+    }
+
+    #[test]
+    fn book_dir_domain_known_answer() {
+        // Mainnet ledger 105500006, tx F1755FC7: a PermissionedDEX domain-scoped
+        // sell offer (TakerPays EUROP, TakerGets XRP) in domain 52CA75D8...; its
+        // BookDirectory RootIndex is 1D20533D...4E22B3F1BA2A8000 (low 8 bytes are
+        // the ExchangeRate/quality 0x4E22B3F1BA2A8000).
+        fn h20(s: &str) -> [u8; 20] {
+            let mut b = [0u8; 20];
+            for i in 0..20 {
+                b[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
+            }
+            b
+        }
+        let pays_currency = h20("4555524F50000000000000000000000000000000"); // EUROP
+        let pays_issuer = AccountId::from_str("E390D7DD0750ED943B144DFF17B3FD9A9FFBA1EF").unwrap();
+        let gets_currency = [0u8; 20]; // XRP
+        let gets_issuer = AccountId::from_str("0000000000000000000000000000000000000000").unwrap();
+        let mut dom = [0u8; 32];
+        let ds = "52CA75D84B10F943CF4918DF5723AEBD585030419A7AC870CA8EC02E6CD4E05D";
+        for i in 0..32 {
+            dom[i] = u8::from_str_radix(&ds[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        let base = book_dir_domain(
+            &pays_currency,
+            &pays_issuer,
+            &gets_currency,
+            &gets_issuer,
+            &Hash256::new(dom),
+        );
+        // Book directory index = base with low 8 bytes overwritten by the quality.
+        let mut idx = *base.as_bytes();
+        idx[24..32].copy_from_slice(&0x4E22B3F1BA2A8000u64.to_be_bytes());
+        let hexed: String = idx.iter().map(|b| format!("{b:02X}")).collect();
+        assert_eq!(
+            hexed,
+            "1D20533D48402376DB3975338745AEB7BEAE52707B5D7A7F4E22B3F1BA2A8000"
+        );
     }
 
     #[test]
