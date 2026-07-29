@@ -186,11 +186,18 @@ fn tick_round_amounts(
         {
             return (new_pays, taker_gets.clone());
         }
-    } else if let Some(new_gets) = IOUAmount::divide(&p_iou, &rate)
-        .ok()
-        .and_then(|g| rebuild_iou(taker_gets, &g))
-    {
-        return (taker_pays.clone(), new_gets);
+    } else {
+        // Recompute TakerGets = TakerPays / rate. Post-fixUniversalNumber rippled
+        // does this divide in `Number` (round half to even), matching the rounding
+        // used for the tick-snapped quality above; the legacy divide truncates.
+        let quot = if number_switchover {
+            IOUAmount::divide_round_even(&p_iou, &rate)
+        } else {
+            IOUAmount::divide(&p_iou, &rate)
+        };
+        if let Some(new_gets) = quot.ok().and_then(|g| rebuild_iou(taker_gets, &g)) {
+            return (taker_pays.clone(), new_gets);
+        }
     }
     (taker_pays.clone(), taker_gets.clone())
 }
