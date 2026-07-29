@@ -250,11 +250,16 @@ impl Transactor for OfferCreateTransactor {
         }
 
         // PermissionedDEX gates only domain-scoped offers (those carrying a
-        // DomainID); an open offer trades on the public book unrestricted. The
-        // credential check applies only when a DomainID is present.
-        if ctx.rules.enabled(&feature_id("PermissionedDEX")) && ctx.tx.get("DomainID").is_some() {
-            check_permissioned_asset(ctx, &account_id, ctx.tx.get("TakerPays"))?;
-            check_permissioned_asset(ctx, &account_id, ctx.tx.get("TakerGets"))?;
+        // DomainID); an open offer trades on the public book unrestricted. rippled
+        // authorises a domain offer only for members of the domain named by the
+        // tx's DomainID (the DomainID is the PermissionedDomain object's index) —
+        // the trader must hold an accepted credential matching the domain's
+        // AcceptedCredentials. This has nothing to do with the traded assets'
+        // issuers.
+        if ctx.rules.enabled(&feature_id("PermissionedDEX")) {
+            if let Some(domain_id) = ctx.tx.get("DomainID").and_then(|v| v.as_str()) {
+                check_domain_membership(ctx, &account_id, domain_id)?;
+            }
         }
 
         Ok(())
@@ -437,10 +442,27 @@ impl Transactor for OfferCreateTransactor {
         // rippled keys the directory on the placed offer's rate.
         let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
         let quality = offer_book_quality(&remaining_pays, &remaining_gets, number_switchover);
-        let book_base =
-            keylet::book_dir(&pays_currency, &pays_issuer, &gets_currency, &gets_issuer);
+        // A DomainID places the resting offer in the permissioned (domain) book
+        // directory rather than the public book — rippled's getBookBase appends
+        // the domain to the same BookDir hash, so a domain book lives at a
+        // distinct base. The directory node is also tagged with the DomainID.
+        let domain_id_hash: Option<rxrpl_primitives::Hash256> = ctx
+            .tx
+            .get("DomainID")
+            .and_then(|v| v.as_str())
+            .and_then(|s| <rxrpl_primitives::Hash256 as std::str::FromStr>::from_str(s).ok());
+        let book_base = match &domain_id_hash {
+            Some(d) => keylet::book_dir_domain(
+                &pays_currency,
+                &pays_issuer,
+                &gets_currency,
+                &gets_issuer,
+                d,
+            ),
+            None => keylet::book_dir(&pays_currency, &pays_issuer, &gets_currency, &gets_issuer),
+        };
         let book_dir_key = book_dir_with_quality(&book_base, quality);
-        let book_describe = [
+        let mut book_describe: Vec<(&str, Value)> = vec![
             ("ExchangeRate", Value::from(u64_hex(quality))),
             ("TakerPaysCurrency", hex::encode_upper(pays_currency).into()),
             (
@@ -453,6 +475,9 @@ impl Transactor for OfferCreateTransactor {
                 hex::encode_upper(gets_issuer.as_bytes()).into(),
             ),
         ];
+        if let Some(d) = &domain_id_hash {
+            book_describe.push(("DomainID", d.to_string().into()));
+        }
         let book_node = add_to_book_dir(ctx.view, &book_dir_key, &offer_key, &book_describe)?;
         let owner_node = add_to_owner_dir(ctx.view, &account_id, &offer_key)?;
 
@@ -467,6 +492,11 @@ impl Transactor for OfferCreateTransactor {
         offer.insert("TakerPays".into(), remaining_pays.clone());
         offer.insert("TakerGets".into(), remaining_gets.clone());
         offer.insert("BookDirectory".into(), book_dir_key.to_string().into());
+        // A domain-scoped offer carries its DomainID so the book/crossing logic
+        // and clients can tell it apart from a public-book offer.
+        if let Some(d) = &domain_id_hash {
+            offer.insert("DomainID".into(), d.to_string().into());
+        }
         // Placeholder PreviousTxnID/LgrSeq — the engine's central stamping fills
         // these with the creating transaction's id and ledger after apply.
         offer.insert(
@@ -3458,84 +3488,58 @@ fn currency_and_issuer(amount: &Value) -> ([u8; 20], AccountId) {
     (currency, issuer)
 }
 
-/// Permissioned DEX flag on an issuer's AccountRoot.
-const LSF_PERMISSIONED_DEX: u32 = 0x0080_0000;
-
-/// Check if an IOU asset's issuer requires permissioned DEX access.
+/// PermissionedDEX domain membership check for a domain-scoped offer.
 ///
-/// If the issuer has `lsfPermissionedDEX` set, verifies the trader holds
-/// accepted credentials from the issuer's PermissionedDomain. XRP assets
-/// are always allowed.
-fn check_permissioned_asset(
+/// rippled: an offer carrying a `DomainID` is authorised only for members of
+/// that domain. The `DomainID` is the `PermissionedDomain` object's ledger
+/// index; membership requires holding an *accepted* credential whose
+/// `(Issuer, CredentialType)` matches one of the domain's `AcceptedCredentials`.
+fn check_domain_membership(
     ctx: &PreclaimContext<'_>,
     trader_id: &AccountId,
-    asset: Option<&Value>,
+    domain_id: &str,
 ) -> Result<(), TransactionResult> {
-    let asset = match asset {
-        Some(v) if v.is_object() => v,
-        _ => return Ok(()), // XRP or missing -- no restriction
-    };
+    use std::str::FromStr;
+    let domain_key = rxrpl_primitives::Hash256::from_str(domain_id)
+        .map_err(|_| TransactionResult::TemMalformed)?;
+    let domain_bytes = ctx
+        .view
+        .read(&domain_key)
+        .ok_or(TransactionResult::TecNoPermission)?; // domain must exist
+    let domain: Value =
+        serde_json::from_slice(&domain_bytes).map_err(|_| TransactionResult::TemMalformed)?;
+    let accepted = domain
+        .get("AcceptedCredentials")
+        .and_then(|v| v.as_array())
+        .ok_or(TransactionResult::TecNoPermission)?;
 
-    // Extract issuer from the IOU object
-    let issuer_str = match asset.get("issuer").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return Ok(()),
-    };
-
-    let issuer_id = decode_account_id(issuer_str).map_err(|_| TransactionResult::TemMalformed)?;
-    let issuer_key = keylet::account(&issuer_id);
-
-    let issuer_bytes = match ctx.view.read(&issuer_key) {
-        Some(b) => b,
-        None => return Ok(()), // Issuer not found -- let other checks handle
-    };
-
-    let issuer_obj: Value =
-        serde_json::from_slice(&issuer_bytes).map_err(|_| TransactionResult::TemMalformed)?;
-
-    let flags = helpers::get_flags(&issuer_obj);
-    if flags & LSF_PERMISSIONED_DEX == 0 {
-        return Ok(()); // Issuer does not require permissioned DEX
-    }
-
-    // Issuer requires PermissionedDEX -- check if trader has credentials.
-    // Look up the issuer's PermissionedDomains (seq 0..9) and verify the
-    // trader holds at least one accepted credential type from any domain.
-    for domain_seq in 0..10u32 {
-        let domain_key = keylet::permissioned_domain(&issuer_id, domain_seq);
-        let domain_bytes = match ctx.view.read(&domain_key) {
-            Some(b) => b,
-            None => break, // No more domains
+    for entry in accepted {
+        // The SLE wraps each pair as `{"Credential": {"Issuer", "CredentialType"}}`.
+        let inner = entry.get("Credential").unwrap_or(entry);
+        let (Some(issuer_str), Some(ct_str)) = (
+            inner.get("Issuer").and_then(|v| v.as_str()),
+            inner.get("CredentialType").and_then(|v| v.as_str()),
+        ) else {
+            continue;
         };
-
-        let domain: Value =
-            serde_json::from_slice(&domain_bytes).map_err(|_| TransactionResult::TemMalformed)?;
-
-        if let Some(accepted) = domain.get("AcceptedCredentials").and_then(|v| v.as_array()) {
-            for entry in accepted {
-                let cred_issuer_str = entry
-                    .get("AcceptedCredential")
-                    .and_then(|c| c.get("Issuer"))
-                    .and_then(|v| v.as_str());
-                let cred_type = entry
-                    .get("AcceptedCredential")
-                    .and_then(|c| c.get("CredentialType"))
-                    .and_then(|v| v.as_str());
-
-                if let (Some(ci_str), Some(ct)) = (cred_issuer_str, cred_type) {
-                    if let Ok(ci_id) = decode_account_id(ci_str) {
-                        let cred_key = keylet::credential(trader_id, &ci_id, ct.as_bytes());
-                        if ctx.view.exists(&cred_key) {
-                            return Ok(()); // Trader holds an accepted credential
-                        }
-                    }
+        let Ok(issuer_id) = decode_account_id(issuer_str) else {
+            continue;
+        };
+        // CredentialType is stored hex-encoded; the keylet hashes the raw bytes.
+        let ct_bytes = hex::decode(ct_str).unwrap_or_else(|_| ct_str.as_bytes().to_vec());
+        let cred_key = keylet::credential(trader_id, &issuer_id, &ct_bytes);
+        if let Some(cred_bytes) = ctx.view.read(&cred_key) {
+            if let Ok(cred) = serde_json::from_slice::<Value>(&cred_bytes) {
+                // The credential must be accepted (lsfAccepted); an issued-but-not-
+                // accepted credential does not confer membership.
+                if helpers::get_flags(&cred) & crate::handlers::credentials::LSF_ACCEPTED != 0 {
+                    return Ok(());
                 }
             }
         }
     }
 
-    // No valid credential found in any domain
-    Err(TransactionResult::TecNoPermission)
+    Err(TransactionResult::TecNoPermission) // not a domain member
 }
 
 /// Test whether `owner` currently holds the `TakerGets` amount in full.
