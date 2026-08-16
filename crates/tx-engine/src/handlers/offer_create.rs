@@ -83,6 +83,7 @@ const TF_IMMEDIATE_OR_CANCEL: u64 = 0x0002_0000;
 const TF_FILL_OR_KILL: u64 = 0x0004_0000;
 /// tfSell flag: the offer is a sell, so TakerGets is the exact amount.
 const TF_SELL: u64 = 0x0008_0000;
+const TF_HYBRID: u64 = 0x0010_0000;
 
 /// Offer ledger-entry flags. rippled translates the transaction `tfPassive` /
 /// `tfSell` flags into these (note `lsfSell` differs from `tfSell`); no other
@@ -362,8 +363,31 @@ impl Transactor for OfferCreateTransactor {
         // our `TakerGets` to receive our `TakerPays` (book keyed by `(gets,
         // pays)`) — best price first, filling crossable offers and reaping
         // unfunded ones (rippled's Taker). Returns the taker's leftover.
-        let inverse_book =
-            keylet::book_dir(&gets_currency, &gets_issuer, &pays_currency, &pays_issuer);
+        //
+        // A domain-scoped OfferCreate (carrying a DomainID, without tfHybrid)
+        // crosses ONLY the permissioned domain book: rippled excludes open-book
+        // offers and AMM liquidity from domain crossing ("AMM doesn't support
+        // domain books"; BookStep's tryAMM skips the pool when the book is
+        // domain-scoped). A hybrid offer (tfHybrid) also trades the public book,
+        // so it keeps the open path.
+        let domain_id_hash: Option<rxrpl_primitives::Hash256> = ctx
+            .tx
+            .get("DomainID")
+            .and_then(|v| v.as_str())
+            .and_then(|s| <rxrpl_primitives::Hash256 as std::str::FromStr>::from_str(s).ok());
+        let tx_is_hybrid =
+            ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_HYBRID != 0;
+        let domain_only = domain_id_hash.is_some() && !tx_is_hybrid;
+        let inverse_book = match &domain_id_hash {
+            Some(d) if domain_only => keylet::book_dir_domain(
+                &gets_currency,
+                &gets_issuer,
+                &pays_currency,
+                &pays_issuer,
+                d,
+            ),
+            _ => keylet::book_dir(&gets_currency, &gets_issuer, &pays_currency, &pays_issuer),
+        };
         let (remaining_pays, remaining_gets, crossed) = cross_offers(
             ctx,
             &account_id,
@@ -372,6 +396,7 @@ impl Transactor for OfferCreateTransactor {
             &taker_gets,
             &inverse_book,
             is_sell,
+            domain_only,
         )?;
 
         // Nothing left to place when either side is exhausted (fully crossed):
@@ -453,11 +478,7 @@ impl Transactor for OfferCreateTransactor {
         // directory rather than the public book — rippled's getBookBase appends
         // the domain to the same BookDir hash, so a domain book lives at a
         // distinct base. The directory node is also tagged with the DomainID.
-        let domain_id_hash: Option<rxrpl_primitives::Hash256> = ctx
-            .tx
-            .get("DomainID")
-            .and_then(|v| v.as_str())
-            .and_then(|s| <rxrpl_primitives::Hash256 as std::str::FromStr>::from_str(s).ok());
+        // (`domain_id_hash` is computed above for the crossing routing.)
         let book_base = match &domain_id_hash {
             Some(d) => keylet::book_dir_domain(
                 &pays_currency,
@@ -707,6 +728,7 @@ fn credit_xrp(
 /// Scope: full takes of funded, crossable offers (the validated path, mainnet
 /// #338500). Partial takes rescale at the resting offer's quality. Unfunded
 /// offers encountered in the walk are reaped, mirroring rippled's dirAdvance.
+#[allow(clippy::too_many_arguments)]
 fn cross_offers(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
@@ -715,6 +737,7 @@ fn cross_offers(
     taker_gets: &Value,
     inverse_book: &rxrpl_primitives::Hash256,
     is_sell: bool,
+    domain_only: bool,
 ) -> Result<(Value, Value, bool), TransactionResult> {
     let out_leg = match Leg::parse(taker_pays) {
         Some(l) => l,
@@ -754,7 +777,9 @@ fn cross_offers(
     // Autobridge: when NEITHER leg is XRP, the offer also competes an
     // XRP-intermediate path (`in -> XRP -> out`) against the direct book. Prebuild
     // that two-hop strand once; `try_bridge_step` crosses it per band by quality.
-    let bridge = if !in_leg.is_xrp && !out_leg.is_xrp {
+    // A domain-only offer never bridges through the AMM (domain books exclude AMM
+    // liquidity).
+    let bridge = if !domain_only && !in_leg.is_xrp && !out_leg.is_xrp {
         build_flow_strand(
             ctx,
             &[
@@ -803,19 +828,21 @@ fn cross_offers(
                     break 'walk;
                 }
             }
-            try_amm_step(
-                ctx,
-                taker,
-                taker_acct,
-                &in_leg,
-                &mut remaining_out,
-                &mut remaining_in,
-                &mut crossed,
-                dir_quality,
-                fok,
-            )?;
-            if remaining_out.is_zero() || remaining_in.is_zero() {
-                break 'walk; // AMM alone met the demand (or exhausted the taker's funds)
+            if !domain_only {
+                try_amm_step(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    &in_leg,
+                    &mut remaining_out,
+                    &mut remaining_in,
+                    &mut crossed,
+                    dir_quality,
+                    fok,
+                )?;
+                if remaining_out.is_zero() || remaining_in.is_zero() {
+                    break 'walk; // AMM alone met the demand (or exhausted the taker's funds)
+                }
             }
         }
         let Some(dir_bytes) = ctx.view.read(&dir_key) else {
@@ -1039,17 +1066,19 @@ fn cross_offers(
                 threshold,
             )?;
         }
-        try_amm_step(
-            ctx,
-            taker,
-            taker_acct,
-            &in_leg,
-            &mut remaining_out,
-            &mut remaining_in,
-            &mut crossed,
-            threshold,
-            fok,
-        )?;
+        if !domain_only {
+            try_amm_step(
+                ctx,
+                taker,
+                taker_acct,
+                &in_leg,
+                &mut remaining_out,
+                &mut remaining_in,
+                &mut crossed,
+                threshold,
+                fok,
+            )?;
+        }
     }
 
     Ok((
