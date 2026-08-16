@@ -500,6 +500,135 @@ mod tests {
         all_handlers_engine()
     }
 
+    /// Forward-sweep oracle: seed a cached checkpoint state (produced by
+    /// `e2e_first_divergent_tx` at `/tmp/e2e_state_<start>.bin`) and replay every
+    /// ledger `start+1..=end`, carrying state forward with the real mainnet parent
+    /// hash pinned (mirrors `replay_segment`). Prints per-ledger account_hash /
+    /// tx_hash match and stops at the first account_hash divergence — the next
+    /// campaign target — amortising one multi-hour state fetch across the range.
+    /// It replays `start+1` first, so a known byte-exact ledger there self-checks
+    /// the sweep against the authoritative single-ledger oracle.
+    ///
+    /// `RXRPL_PLAY_FORWARD_RPC=http://host:5005 RXRPL_SWEEP_START=105500013 \
+    ///  RXRPL_SWEEP_END=105500043 cargo test --release -p rxrpl-node --lib \
+    ///  e2e_sweep_forward -- --ignored --nocapture`
+    #[test]
+    #[ignore = "hits a live mainnet RPC server"]
+    fn e2e_sweep_forward() {
+        let Ok(url) = std::env::var("RXRPL_PLAY_FORWARD_RPC") else {
+            eprintln!("RXRPL_PLAY_FORWARD_RPC unset; skipping");
+            return;
+        };
+        let start: u32 = std::env::var("RXRPL_SWEEP_START")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .expect("RXRPL_SWEEP_START");
+        let end: u32 = std::env::var("RXRPL_SWEEP_END")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .expect("RXRPL_SWEEP_END");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let rpc = |params: serde_json::Value| -> Value {
+            rt.block_on(async {
+                for attempt in 0..12u32 {
+                    if let Ok(resp) = client.post(&url).json(&params).send().await {
+                        if let Ok(v) = resp.json::<Value>().await {
+                            return v;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        500 * u64::from(attempt + 1),
+                    ))
+                    .await;
+                }
+                panic!("rpc failed after retries");
+            })
+        };
+
+        let cache = format!("/tmp/e2e_state_{start}.bin");
+        let data =
+            std::fs::read(&cache).unwrap_or_else(|_| panic!("checkpoint cache {cache} missing"));
+        let mut state = rxrpl_shamap::SHAMap::account_state();
+        let mut off = 0usize;
+        while off + 34 <= data.len() {
+            let key: [u8; 32] = data[off..off + 32].try_into().unwrap();
+            let dlen = u16::from_be_bytes([data[off + 32], data[off + 33]]) as usize;
+            off += 34;
+            state
+                .put(Hash256::new(key), data[off..off + dlen].to_vec())
+                .unwrap();
+            off += dlen;
+        }
+
+        let ck_resp = rpc(serde_json::json!({
+            "method":"ledger","params":[{"ledger_index":start}]
+        }));
+        let ck_header = parse_header(&ck_resp["result"]["ledger"]).expect("checkpoint header");
+        assert_eq!(
+            state.root_hash(),
+            ck_header.account_hash,
+            "checkpoint state root"
+        );
+
+        let mut parent = Ledger::from_catchup(start, ck_header.hash, state);
+        parent.header = ck_header;
+        let engine = all_handlers_engine();
+
+        let mut first_divergent: Option<u32> = None;
+        for seq in (start + 1)..=end {
+            let hdr_resp = rpc(serde_json::json!({
+                "method":"ledger","params":[{"ledger_index":seq}]
+            }));
+            let hdr = parse_header(&hdr_resp["result"]["ledger"]).expect("ledger header");
+            let txs_resp = rpc(serde_json::json!({
+                "method":"ledger","params":[{"ledger_index":seq,"transactions":true,"expand":true,"binary":true}]
+            }));
+            let (set_hash, txs) = parse_tx_set(&txs_resp["result"]).expect("tx set");
+            let fees = fees_for_ledger(&parent);
+            let outcome = replay_forward(&parent, set_hash, txs, &hdr, &engine, &fees)
+                .expect("replay forward");
+            eprintln!(
+                "SWEEP seq={seq} acc={} tx={} applied={} failed={}",
+                outcome.account_hash_match, outcome.tx_hash_match, outcome.applied, outcome.failed
+            );
+            if !outcome.account_hash_match {
+                first_divergent = Some(seq);
+                // Dump the byte-exact parent state (seq-1, carried and validated by
+                // the sweep) in the e2e cache format so the detailed single-ledger
+                // oracle for `seq` loads it instead of a multi-hour state refetch.
+                let pcache = format!("/tmp/e2e_state_{}.bin", seq - 1);
+                if std::fs::metadata(&pcache).is_err() {
+                    let mut buf = Vec::new();
+                    parent.state_map.for_each(&mut |k, v| {
+                        buf.extend_from_slice(k.as_bytes());
+                        buf.extend_from_slice(&(v.len() as u16).to_be_bytes());
+                        buf.extend_from_slice(v);
+                    });
+                    let _ = std::fs::write(&pcache, &buf);
+                    eprintln!("dumped parent state to {pcache}");
+                }
+                eprintln!(
+                    "=== FIRST DIVERGENT seq={seq} ours={} theirs={} ===",
+                    outcome.ledger.header.account_hash, hdr.account_hash
+                );
+                break;
+            }
+            let mut carried = outcome.ledger;
+            carried.header.hash = hdr.hash;
+            parent = carried;
+        }
+        match first_divergent {
+            Some(s) => eprintln!("=== SWEEP done: first divergent = {s} ==="),
+            None => eprintln!("=== SWEEP done: all {}..={end} byte-exact ===", start + 1),
+        }
+    }
+
     /// Targeted single-transaction oracle: validate one mainnet transaction
     /// byte-exact WITHOUT bootstrapping the full ~19M-entry state. Fetches only
     /// the SLEs the tx touches or reads (affected nodes + FeeSettings +
