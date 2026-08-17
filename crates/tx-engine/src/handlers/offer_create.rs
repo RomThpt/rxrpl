@@ -1518,8 +1518,21 @@ fn cross_book_hop(
             let (order_out, order_in) = if full_take {
                 (offer_out.clone(), offer_in.clone())
             } else if budget_binds {
-                // Input-limited: spend the whole remaining budget, deliver floor.
-                (take_out.clone(), remaining_in.clone())
+                // Input-limited: the budget buys only `take_out = floor(budget /
+                // rate)` output, so charge the ceil price for THAT output at the
+                // offer's quality — not the whole remaining budget. rippled's
+                // BookStep leaves the sub-drop remainder (`budget - ceil(take_out *
+                // rate)`) unspent rather than over-charging the maker for dust the
+                // budget can't fully buy; spending the whole budget drifted the
+                // resting offer's TakerPays ~1e-6 high.
+                let order_in = leg_min(
+                    &leg_min(
+                        &in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate),
+                        &offer_in,
+                    ),
+                    &remaining_in,
+                );
+                (take_out.clone(), order_in)
             } else if funds_limited {
                 // Funds-limited (owner partially unfunded): rippled scales the
                 // resting offer — TakerPays * funded_TakerGets / TakerGets, rounded
