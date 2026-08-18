@@ -852,6 +852,7 @@ fn cross_offers(
                     &mut crossed,
                     dir_quality,
                     fok,
+                    is_sell,
                 )?;
                 if remaining_out.is_zero() || remaining_in.is_zero() {
                     break 'walk; // AMM alone met the demand (or exhausted the taker's funds)
@@ -1094,6 +1095,7 @@ fn cross_offers(
                 &mut crossed,
                 threshold,
                 fok,
+                is_sell,
             )?;
         }
     }
@@ -1122,6 +1124,7 @@ fn try_amm_step(
     crossed: &mut bool,
     cq: u64,
     fok: bool,
+    is_sell: bool,
 ) -> Result<(), TransactionResult> {
     // rippled's flowCross limits the crossing input to the taker's funds
     // (`sendMax = min(takerAmount.in, accountFunds)`, OfferCreate.cpp:400): the
@@ -1132,6 +1135,17 @@ fn try_amm_step(
     if budget.is_zero() {
         return Ok(());
     }
+    // A tfSell offer sells its whole TakerGets and accepts any TakerPays (rippled
+    // deliver = kMaxNative), so the AMM crosses the whole input budget rather than
+    // stopping at the TakerPays demand. Capping at `remaining_out` made `amm_hop`
+    // back-solve the input for the TakerPays and leave the rest of the sold asset
+    // unspent (e.g. 105500045 A902BECE: 110.635 OGRE unsold into the OGRE/XRP AMM,
+    // whose marginal quality stayed above the taker's limit the whole way).
+    let demand = if is_sell {
+        unbounded_leg(remaining_out)
+    } else {
+        remaining_out.clone()
+    };
     // partial = !fok: a fill-or-kill offer crosses all-or-nothing, so an AMM that
     // cannot deliver the full demand within budget delivers zero. A per-band spend
     // by a FoK offer that later fails to fully cross is rolled back atomically —
@@ -1141,7 +1155,7 @@ fn try_amm_step(
         taker,
         taker_acct,
         taker,
-        remaining_out,
+        &demand,
         &budget,
         /*skip_input_debit=*/ false,
         /*skip_output_credit=*/ false,
@@ -1149,7 +1163,13 @@ fn try_amm_step(
         /*partial=*/ !fok,
         /*target_quality=*/ Some(cq),
     )? {
-        *remaining_out = leg_sub(remaining_out, &delivered);
+        // A tfSell fill can deliver more than the remaining TakerPays demand;
+        // clamp the demand at zero rather than underflowing the drops/mantissa.
+        *remaining_out = if is_sell && leg_ge(&delivered, remaining_out) {
+            leg_sub(remaining_out, remaining_out)
+        } else {
+            leg_sub(remaining_out, &delivered)
+        };
         *remaining_in = leg_sub(remaining_in, &spent);
         *crossed = true;
     }
