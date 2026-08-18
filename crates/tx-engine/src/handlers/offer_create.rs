@@ -1679,13 +1679,18 @@ pub(crate) fn cross_path_payment(
         return Err(TransactionResult::TecPathDry);
     }
 
-    // First hop budget = SendMax, capped at the source's funds for an IOU leg.
+    // First hop budget = SendMax, capped at the source's spendable funds
+    // (rippled's accountHolds source-funds limit): an IOU leg by the taker's
+    // trust-line balance, an XRP leg by the liquid balance above the owner
+    // reserve. owner_funds_leg returns xrpLiquid for XRP. Without the XRP cap a
+    // reserve-constrained source spent into its reserve and converted far past
+    // what mainnet allows (e.g. 105500025+1 rKAYA1e8: 36k liquid drops, not the
+    // 500k SendMax), delivering above DeliverMin where mainnet returns
+    // tecPATH_PARTIAL.
     let mut carry = Leg::parse(budget_in).ok_or(TransactionResult::TemBadAmount)?;
-    if !carry.is_xrp {
-        let funds = owner_funds_leg(ctx, taker, &carry);
-        if leg_ge(&carry, &funds) {
-            carry = funds;
-        }
+    let funds = owner_funds_leg(ctx, taker, &carry);
+    if leg_ge(&carry, &funds) {
+        carry = funds;
     }
     let final_demand = Leg::parse(target_out).ok_or(TransactionResult::TemBadAmount)?;
 
