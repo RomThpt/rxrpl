@@ -731,19 +731,14 @@ impl SHAMap {
                         // silently dropped. Deleting a key that is absent deep under
                         // a shared prefix would otherwise wipe out every sibling
                         // above the point of divergence.
-                        let data = match Self::delete_from(
-                            &mut inner,
-                            key,
-                            depth + 1,
-                            store,
-                            leaf_ctor,
-                        ) {
-                            Ok(data) => data,
-                            Err(e) => {
-                                node.set_child(branch, SHAMapNode::Inner(inner));
-                                return Err(e);
-                            }
-                        };
+                        let data =
+                            match Self::delete_from(&mut inner, key, depth + 1, store, leaf_ctor) {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    node.set_child(branch, SHAMapNode::Inner(inner));
+                                    return Err(e);
+                                }
+                            };
                         if inner.branch_count() == 0 {
                             // Empty inner, don't re-insert
                         } else if let Some(single) = inner.single_branch() {
@@ -1784,9 +1779,21 @@ mod tests {
         let root0 = map.root_hash();
         let ghost = make_key(&format!("54{}", "F".repeat(62)));
         assert_eq!(map.delete(&ghost), Err(SHAMapError::NotFound));
-        assert_eq!(map.get(&a), Some(&[1][..]), "sibling a dropped by a NotFound delete");
-        assert_eq!(map.get(&b), Some(&[2][..]), "b dropped by a NotFound delete");
-        assert_eq!(map.root_hash(), root0, "NotFound delete must not change the root");
+        assert_eq!(
+            map.get(&a),
+            Some(&[1][..]),
+            "sibling a dropped by a NotFound delete"
+        );
+        assert_eq!(
+            map.get(&b),
+            Some(&[2][..]),
+            "b dropped by a NotFound delete"
+        );
+        assert_eq!(
+            map.root_hash(),
+            root0,
+            "NotFound delete must not change the root"
+        );
     }
 
     #[test]
