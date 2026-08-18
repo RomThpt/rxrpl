@@ -724,7 +724,21 @@ impl SHAMap {
                         }
                     }
                     SHAMapNode::Inner(mut inner) => {
-                        let data = Self::delete_from(&mut inner, key, depth + 1, store, leaf_ctor)?;
+                        // `take_child` above already removed `inner` from `node`.
+                        // When the recursion cannot find the key it leaves `inner`
+                        // untouched, so it must be put back before the error
+                        // propagates — otherwise this whole (unrelated) subtree is
+                        // silently dropped. Deleting a key that is absent deep under
+                        // a shared prefix would otherwise wipe out every sibling
+                        // above the point of divergence.
+                        let data =
+                            match Self::delete_from(&mut inner, key, depth + 1, store, leaf_ctor) {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    node.set_child(branch, SHAMapNode::Inner(inner));
+                                    return Err(e);
+                                }
+                            };
                         if inner.branch_count() == 0 {
                             // Empty inner, don't re-insert
                         } else if let Some(single) = inner.single_branch() {
@@ -1749,6 +1763,37 @@ mod tests {
         let mut map = SHAMap::account_state();
         let key = make_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         assert_eq!(map.update(key, vec![1]), Err(SHAMapError::NotFound));
+    }
+
+    #[test]
+    fn notfound_delete_preserves_siblings() {
+        // Deleting a key that is not in the map must leave every other key
+        // intact. The delete walks down taking each inner out of its parent;
+        // when the recursion reports NotFound the parent must put the inner back,
+        // else the entire path (a large sibling subtree) is dropped.
+        let mut map = SHAMap::account_state();
+        let a = make_key(&format!("50{}", "0".repeat(62)));
+        let b = make_key(&format!("54{}", "1".repeat(62)));
+        map.put(a, vec![1]).unwrap();
+        map.put(b, vec![2]).unwrap();
+        let root0 = map.root_hash();
+        let ghost = make_key(&format!("54{}", "F".repeat(62)));
+        assert_eq!(map.delete(&ghost), Err(SHAMapError::NotFound));
+        assert_eq!(
+            map.get(&a),
+            Some(&[1][..]),
+            "sibling a dropped by a NotFound delete"
+        );
+        assert_eq!(
+            map.get(&b),
+            Some(&[2][..]),
+            "b dropped by a NotFound delete"
+        );
+        assert_eq!(
+            map.root_hash(),
+            root0,
+            "NotFound delete must not change the root"
+        );
     }
 
     #[test]
