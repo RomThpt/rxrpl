@@ -788,6 +788,19 @@ fn cross_offers(
                 taker_pays.clone(),
             ],
         )
+        .map(|mut s| {
+            // rippled's offer-crossing autobridge bridges two RESTING book offers
+            // through XRP; it does not inject AMM liquidity into the synthetic
+            // bridge (the AMM competes only on the DIRECT book). Injecting the AMM
+            // makes the blended two-hop bridge quality marginally better than the
+            // offer's own, so the offer over-crosses a sliver that rippled leaves
+            // resting. Keep the bridge CLOB-only.
+            for hop in &mut s.hops {
+                hop.amm_pool = None;
+                hop.liquidity = None;
+            }
+            s
+        })
     } else {
         None
     };
