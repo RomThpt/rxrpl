@@ -1033,8 +1033,12 @@ fn cross_offers(
                     .map_err(|_| TransactionResult::TefInternal)?;
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
             } else {
-                // Reduce the resting offer in place by the filled amounts.
-                let new_gets = leg_sub(&offer_out, &order_out);
+                // Reduce the resting offer in place by the filled amounts. Both
+                // sides round to nearest (fixUniversalNumber Number semantics):
+                // the legacy truncating subtraction left the leftover TakerGets
+                // 1 ULP high on a partial take (e.g. 105500025 XAH offer
+                // 402E09A9: …638335 vs mainnet …638334).
+                let new_gets = leg_sub_round(&offer_out, &order_out);
                 let new_pays = leg_sub_round(&offer_in, &order_in);
                 let mut reduced = offer.clone();
                 reduced["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
