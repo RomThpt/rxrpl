@@ -1512,6 +1512,16 @@ fn cross_book_hop(
             if budget_binds {
                 take_out = budget_out;
             }
+            // The remaining input budget can no longer buy even one unit of this
+            // book's output (a sub-drop / sub-ULP residual left after the binding
+            // offer took the bulk): the input is exhausted, so the step is done.
+            // rippled's input-limited `BookStep` stops here; walking on would cross
+            // every worse-priced offer for a dust `order_in` that rounds to ~0 and
+            // eventually fault paying an unrepresentable amount (a stuck interior
+            // hop that fails the whole strand).
+            if budget_binds && take_out.is_zero() {
+                break 'walk;
+            }
 
             let full_take = leg_ge(&take_out, &offer_out);
             let funds_limited = !full_take && !budget_binds && leg_ge(&take_out, &avail_out);
