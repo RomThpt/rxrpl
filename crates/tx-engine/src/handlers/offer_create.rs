@@ -388,6 +388,10 @@ impl Transactor for OfferCreateTransactor {
             ),
             _ => keylet::book_dir(&gets_currency, &gets_issuer, &pays_currency, &pays_issuer),
         };
+        // rippled's mPriorBalance for the resting-offer reserve gate: the XRP
+        // balance before the fee and before crossing. The engine deducted the
+        // fee centrally and crossing has not run yet, so add the fee back.
+        let prior_balance = helpers::get_balance(&acct).saturating_add(helpers::get_fee(ctx.tx));
         let (remaining_pays, remaining_gets, crossed) = cross_offers(
             ctx,
             &account_id,
@@ -447,18 +451,25 @@ impl Transactor for OfferCreateTransactor {
             });
         }
 
-        // Owner reserve: a resting offer needs reserve for one more owned
-        // object. rippled returns tecINSUF_RESERVE_OFFER — fee and sequence
-        // charged, no offer placed — when the account cannot afford it AND
-        // nothing crossed (a crossing offer may still place below reserve). Read
-        // the count fresh: a cancelled OfferSequence has already decremented it.
+        // Owner reserve: a resting offer needs reserve for one more owned object.
+        // rippled gates on mPriorBalance (the XRP balance before fee/crossing):
+        // when it cannot cover the reserve for OwnerCount+1 the remainder is not
+        // placed. If nothing crossed that is tecINSUF_RESERVE_OFFER (fee and
+        // sequence charged, offer dropped); if the offer already crossed, the
+        // fills stand and it succeeds without resting the remainder. Read the
+        // count fresh: a cancelled OfferSequence has already decremented it.
         let reserve_count = acct.get("OwnerCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        if !crossed && helpers::get_balance(&acct) < ctx.fees.account_reserve(reserve_count + 1) {
-            // A claimed tec discards the doApply changes and keeps only the fee
-            // and sequence — return Err so the engine rolls the child back (and,
-            // under tapRETRY, defers the whole transaction to a later pass to be
-            // reclaimed there, matching mainnet's TransactionIndex and balances).
-            return Err(TransactionResult::TecInsufReserveOffer);
+        if prior_balance < ctx.fees.account_reserve(reserve_count + 1) {
+            if !crossed {
+                // A claimed tec discards the doApply changes and keeps only the
+                // fee and sequence — return Err so the engine rolls the child
+                // back (and, under tapRETRY, defers the whole transaction to a
+                // later pass to be reclaimed there, matching mainnet's
+                // TransactionIndex and balances).
+                return Err(TransactionResult::TecInsufReserveOffer);
+            }
+            commit_acct(ctx, &acct)?;
+            return Ok(TransactionResult::TesSuccess);
         }
 
         let offer_key = keylet::offer(&account_id, sequence);
