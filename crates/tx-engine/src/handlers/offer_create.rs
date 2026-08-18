@@ -391,8 +391,7 @@ impl Transactor for OfferCreateTransactor {
         // rippled's mPriorBalance for the resting-offer reserve gate: the XRP
         // balance before the fee and before crossing. The engine deducted the
         // fee centrally and crossing has not run yet, so add the fee back.
-        let prior_balance =
-            helpers::get_balance(&acct).saturating_add(helpers::get_fee(ctx.tx));
+        let prior_balance = helpers::get_balance(&acct).saturating_add(helpers::get_fee(ctx.tx));
         let (remaining_pays, remaining_gets, crossed) = cross_offers(
             ctx,
             &account_id,
