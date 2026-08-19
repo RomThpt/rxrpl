@@ -164,7 +164,52 @@ impl Amount {
             0
         };
         let raw = ((m1 as u128) * (m2 as u128) + bias) / TEN_TO_14;
-        Self::round_finish(u128_to_u64(raw)?, e1 + e2 + 14, negative, native, round_up)
+        Self::round_finish(
+            u128_to_u64(raw)?,
+            e1 + e2 + 14,
+            negative,
+            native,
+            round_up,
+            false,
+        )
+    }
+
+    /// `mul_round` with rippled's `canonicalizeRoundStrict` for the drops case —
+    /// `mulRoundStrict`. It tracks the digits dropped while scaling to drops so a
+    /// fractional drop below 0.1 still rounds up, which `mul_round`'s legacy
+    /// canonicalisation misses. rippled prices a resting offer's partial take with
+    /// this (`Quality::ceilOutStrict`). Identical to `mul_round` for an IOU target
+    /// (the IOU canonicalisation is shared), so only XRP-output takes shift.
+    pub fn mul_round_strict(
+        a: &Amount,
+        b: &Amount,
+        native: bool,
+        round_up: bool,
+    ) -> Result<Amount, AmountError> {
+        if a.is_zero() || b.is_zero() {
+            return Ok(round_zero(
+                native,
+                round_up,
+                a.is_negative() || b.is_negative(),
+            ));
+        }
+        let (m1, e1, n1) = a.normalized_parts();
+        let (m2, e2, n2) = b.normalized_parts();
+        let negative = n1 != n2;
+        let bias = if negative != round_up {
+            TEN_TO_14 - 1
+        } else {
+            0
+        };
+        let raw = ((m1 as u128) * (m2 as u128) + bias) / TEN_TO_14;
+        Self::round_finish(
+            u128_to_u64(raw)?,
+            e1 + e2 + 14,
+            negative,
+            native,
+            round_up,
+            true,
+        )
     }
 
     /// Directional quotient. Mirrors `divRound`.
@@ -189,7 +234,14 @@ impl Amount {
             0
         };
         let raw = ((m1 as u128) * TEN_TO_17 + bias) / (m2 as u128);
-        Self::round_finish(u128_to_u64(raw)?, e1 - e2 - 17, negative, native, round_up)
+        Self::round_finish(
+            u128_to_u64(raw)?,
+            e1 - e2 - 17,
+            negative,
+            native,
+            round_up,
+            false,
+        )
     }
 
     /// Shared tail for `mul_round`/`div_round`: apply directional canonicalization,
@@ -200,10 +252,15 @@ impl Amount {
         negative: bool,
         native: bool,
         round_up: bool,
+        strict: bool,
     ) -> Result<Amount, AmountError> {
         if native {
             let drops = if negative != round_up {
-                canonicalize_drops_round(mantissa, exponent)
+                if strict {
+                    canonicalize_drops_round_strict(mantissa, exponent, round_up)
+                } else {
+                    canonicalize_drops_round(mantissa, exponent)
+                }
             } else {
                 scale_to_drops(mantissa, exponent)
             };
@@ -302,6 +359,33 @@ fn canonicalize_drops_round(mut value: u64, mut exponent: i32) -> u128 {
     value as u128
 }
 
+/// rippled's `canonicalizeRoundStrict(native=true)`: tracks whether any digit was
+/// dropped while scaling down, so the last-divide adder is `10` only when a
+/// remainder was lost and we round up (otherwise `9`). Unlike the legacy quirk it
+/// does not key the adder off the loop count, so a fraction below 0.1 drop still
+/// rounds up.
+fn canonicalize_drops_round_strict(mut value: u64, mut exponent: i32, round_up: bool) -> u128 {
+    if value == 0 {
+        return 0;
+    }
+    while exponent > 0 {
+        value = value.saturating_mul(10);
+        exponent -= 1;
+    }
+    if exponent < 0 {
+        let mut had_remainder = false;
+        while exponent < -1 {
+            let next = value / 10;
+            had_remainder |= value != next * 10;
+            value = next;
+            exponent += 1;
+        }
+        let adder = if had_remainder && round_up { 10 } else { 9 };
+        value = (value + adder) / 10;
+    }
+    value as u128
+}
+
 /// rippled's `canonicalizeRound` IOU-overflow branch (mantissa above the
 /// 16-digit range): `value += 9; value /= 10`.
 fn canonicalize_round_iou(value: &mut u64, exponent: &mut i32) {
@@ -359,6 +443,46 @@ mod tests {
         let xrp = Amount::Xrp(44_925_000_000);
         let got = Amount::multiply(&xrp, &one(), true).unwrap();
         assert_eq!(got, Amount::Xrp(44_925_000_000));
+    }
+
+    #[test]
+    fn mul_round_strict_ceils_sub_tenth_drop() {
+        // `Quality::ceilOutStrict` prices an XRP offer take at the book quality.
+        // The 105490000 oracle (rate 913655.0, out 0.0011) needs 1006 drops: the
+        // strict canonicalisation rounds up a fractional drop below 0.1 that the
+        // legacy `mul_round` truncates to 1005.
+        let out = iou(1_100_000_000_000_000, -18, false); // 0.0011 RLUSD
+        let rate = iou(9_136_550_000_000_000, -10, false); // 913655.0
+        assert_eq!(
+            Amount::mul_round_strict(&out, &rate, true, true).unwrap(),
+            Amount::Xrp(1006),
+        );
+        assert_eq!(
+            Amount::mul_round(&out, &rate, true, true).unwrap(),
+            Amount::Xrp(1005),
+        );
+
+        // The 105500098 oracle (rate 897248.8311224256, out 219.730752967) needs
+        // 197153162 drops. Here strict and legacy agree; it was under-priced only
+        // by the older offer-current-amounts path, which the fix drops.
+        let out = iou(2_197_307_529_670_000, -13, false); // 219.730752967 RLUSD
+        let rate = iou(8_972_488_311_224_256, -10, false); // 897248.8311224256
+        assert_eq!(
+            Amount::mul_round_strict(&out, &rate, true, true).unwrap(),
+            Amount::Xrp(197_153_162),
+        );
+    }
+
+    #[test]
+    fn mul_round_strict_matches_legacy_for_iou() {
+        // The strict canonicalisation only changes the drops branch; an IOU target
+        // is unaffected, so the two must agree.
+        let a = iou(1_234_567_890_123_456, -15, false);
+        let b = iou(9_876_543_210_987_654, -14, false);
+        assert_eq!(
+            Amount::mul_round_strict(&a, &b, false, true).unwrap(),
+            Amount::mul_round(&a, &b, false, true).unwrap(),
+        );
     }
 
     #[test]

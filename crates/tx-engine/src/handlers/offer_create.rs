@@ -977,17 +977,24 @@ fn cross_offers(
                 // remainder unsold and diverge the maker's residual TakerPays.
                 (take_out.clone(), remaining_in.clone())
             } else {
-                // Demand/funds-limited partial fill: the taker pays the CEIL price
-                // for the delivered output, never more than the resting offer.
-                // Price from the offer's own amounts (`in = ceil(offer_in * out /
-                // offer_out)`), not the book's quantized quality rate — on an
-                // underfunded offer the quantized rate ceils one drop high, which
-                // cascades through the taker's remaining budget.
                 let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
-                let order_in = leg_min(
-                    &in_for_out_offer(&offer_in, &take_out, &offer_out, &rate),
-                    &offer_in,
-                );
+                let order_in = if !leg_ge(&take_out, &avail_out) {
+                    // Demand-limited (funded offer, take bounded by the taker's
+                    // remaining demand): the taker pays the strict ceil price at
+                    // the offer's original book quality, as rippled's
+                    // `Quality::ceilOutStrict`. Pricing from the offer's current
+                    // (drifted) amounts under-prices an XRP take by a drop.
+                    leg_min(&in_for_out(&take_out, &rate, &offer_in), &offer_in)
+                } else {
+                    // Funds-limited (took all the underfunded owner can give):
+                    // price from the offer's own amounts, since repricing the
+                    // clamped output at the quantized quality rate ceils one drop
+                    // high and cascades through the taker's remaining budget.
+                    leg_min(
+                        &in_for_out_offer(&offer_in, &take_out, &offer_out, &rate),
+                        &offer_in,
+                    )
+                };
                 (take_out.clone(), order_in)
             };
 
@@ -1301,10 +1308,15 @@ fn leg_from_magnitude(mag: &IOUAmount, template: &Leg) -> Leg {
     out
 }
 
-/// Input required for a given output at a book directory's quality rate,
-/// rounded up (`in = out * rate`, the taker pays at least the price).
+/// Input required for a given output at a resting offer's quality rate, priced as
+/// rippled's `Quality::ceilOutStrict`: `in = mulRoundStrict(out, rate, roundUp)`.
+/// The rate is the offer's book-directory quality, fixed when the offer was placed
+/// and unchanged by partial fills (rippled reprices every take at the original
+/// quality, never the drifted current `TakerPays/TakerGets`). The strict
+/// canonicalisation rounds up a fractional drop below 0.1 that the legacy
+/// `mul_round` truncates, so an XRP take is not under-priced by a drop.
 fn in_for_out(out_amt: &Leg, rate: &IOUAmount, in_template: &Leg) -> Leg {
-    let amt = rxrpl_amount::Amount::mul_round(
+    let amt = rxrpl_amount::Amount::mul_round_strict(
         &leg_to_amount(out_amt),
         &rxrpl_amount::Amount::Iou(*rate),
         in_template.is_xrp,
@@ -1314,12 +1326,11 @@ fn in_for_out(out_amt: &Leg, rate: &IOUAmount, in_template: &Leg) -> Leg {
     amount_to_leg(&amt, in_template)
 }
 
-/// Input required for a demand-limited partial take of a resting offer, priced
-/// from the offer's own amounts: `in = ceil(offer_in * out / offer_out)`. For an
-/// XRP input this multiplies before dividing so no drop is lost — rippled's Flow
-/// prices partial takes proportionally on the offer's amounts, whereas the book
-/// directory's quantized quality rate can under-price by a drop. IOU input keeps
-/// the rate-based path (16-digit mantissa, unaffected by the drop truncation).
+/// Input for a take priced from the resting offer's own current amounts (`in =
+/// ceil(offer_in * out / offer_out)`, multiply-before-divide for XRP so no drop is
+/// lost). Used for the input- and funds-limited branches, where repricing the
+/// clamped output at the book's quantized quality rate over-charges by a drop.
+/// IOU input keeps the rate-based path.
 fn in_for_out_offer(offer_in: &Leg, out_amt: &Leg, offer_out: &Leg, rate: &IOUAmount) -> Leg {
     if !offer_in.is_xrp {
         return in_for_out(out_amt, rate, offer_in);
@@ -1611,9 +1622,11 @@ fn cross_book_hop(
                 );
                 (take_out.clone(), order_in)
             } else {
-                // Demand-limited: pay the ceil price for the delivered output,
-                // never exceeding the resting offer or the remaining budget.
-                let priced = in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate);
+                // Demand-limited: pay the strict ceil price at the offer's book
+                // quality (`Quality::ceilOutStrict`), never exceeding the resting
+                // offer or the remaining budget. Pricing from the offer's drifted
+                // current amounts under-prices an XRP take by a drop.
+                let priced = in_for_out(&take_out, &eff_rate, &offer_in);
                 let order_in = leg_min(&leg_min(&priced, &offer_in), &remaining_in);
                 (take_out.clone(), order_in)
             };
