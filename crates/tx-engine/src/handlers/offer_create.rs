@@ -1354,15 +1354,16 @@ pub(crate) fn cross_book_payment(
     let demand_out = Leg::parse(target_out).ok_or(TransactionResult::TemBadAmount)?;
     let in_tmpl = Leg::parse(budget_in).ok_or(TransactionResult::TemBadAmount)?;
 
-    // The source cannot spend more of an IOU than it holds: cap the SendMax
-    // budget at the taker's available balance in the input asset (rippled's
-    // source-funds limit). XRP input is already guarded by `pay_in`.
+    // The source cannot spend more than it holds: cap the SendMax budget at the
+    // taker's spendable balance in the input asset (rippled's source-funds limit
+    // / `accountFunds`). For an IOU that is the trust-line balance; for XRP it is
+    // `owner_funds_leg`'s liquid balance (balance minus the reserve), so a
+    // reserve-constrained source stops at its reserve instead of spending into
+    // it. `pay_in` only prevents a negative balance, not a dip below the reserve.
     let mut budget = in_tmpl.clone();
-    if !in_tmpl.is_xrp {
-        let funds = owner_funds_leg(ctx, taker, &in_tmpl);
-        if leg_ge(&budget, &funds) {
-            budget = funds;
-        }
+    let funds = owner_funds_leg(ctx, taker, &in_tmpl);
+    if leg_ge(&budget, &funds) {
+        budget = funds;
     }
 
     let (delivered, spent) = cross_book_hop(
