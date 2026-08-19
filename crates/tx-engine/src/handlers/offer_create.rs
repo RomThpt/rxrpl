@@ -1556,7 +1556,23 @@ fn cross_book_hop(
             // the remaining input budget can buy at this offer's price.
             let budget_out = out_for_in(&remaining_in, &eff_rate, &offer_out);
             let mut take_out = leg_min(&remaining_out, &avail_out);
-            let budget_binds = leg_ge(&take_out, &budget_out);
+            // rippled forks on the INPUT side (StrandFlow reverse-then-forward,
+            // maxIn < requiredIn at step 0): the SendMax budget binds only when it
+            // cannot afford the ceilOut input cost of the demanded output. Testing
+            // the demanded output against the floored `budget_out` false-positives
+            // on the flooring tie (105500016: budget_out 12.9959 floors to 12, ties
+            // demand 12, though the 0.0000145 budget can pay the 0.0000134 cost).
+            // This step-0 forward re-run only applies to a TERMINAL take with a
+            // bounded demand (single-book conversion). An interior hop carries the
+            // unbounded-demand sentinel, so its ceilOut input cost is meaningless;
+            // keep the output-side test there (the #337 walk-stop relies on it).
+            let terminal = !skip_input_debit && !skip_output_credit;
+            let budget_binds = if terminal {
+                let in_for_take = in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate);
+                !leg_ge(&remaining_in, &in_for_take)
+            } else {
+                leg_ge(&take_out, &budget_out)
+            };
             if budget_binds {
                 take_out = budget_out;
             }
@@ -1576,20 +1592,27 @@ fn cross_book_hop(
             let (order_out, order_in) = if full_take {
                 (offer_out.clone(), offer_in.clone())
             } else if budget_binds {
-                // Input-limited: the budget buys only `take_out = floor(budget /
-                // rate)` output, so charge the ceil price for THAT output at the
-                // offer's quality — not the whole remaining budget. rippled's
-                // BookStep leaves the sub-drop remainder (`budget - ceil(take_out *
-                // rate)`) unspent rather than over-charging the maker for dust the
-                // budget can't fully buy; spending the whole budget drifted the
-                // resting offer's TakerPays ~1e-6 high.
-                let order_in = leg_min(
-                    &leg_min(
-                        &in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate),
-                        &offer_in,
-                    ),
-                    &remaining_in,
-                );
+                let order_in = if terminal {
+                    // ceilIn: the SendMax input is the binding limit (it cannot
+                    // afford the ceilOut cost of the demanded output), so rippled
+                    // re-runs the terminal book forward with `in = maxIn` and spends
+                    // the WHOLE remaining budget — the forward re-run asserts
+                    // `result.in == limit` and ceilIn pins in=limit,
+                    // out=floor(limit/rate). `take_out` is already floor(budget/rate).
+                    leg_min(&remaining_in, &offer_in)
+                } else {
+                    // Interior hop: charge the ceilOut price for the delivered
+                    // output and leave the sub-drop budget remainder unspent, never
+                    // over-charging the maker for dust the budget can't fully buy
+                    // (#336/#337). Spending the whole budget drifts an interior hop.
+                    leg_min(
+                        &leg_min(
+                            &in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate),
+                            &offer_in,
+                        ),
+                        &remaining_in,
+                    )
+                };
                 (take_out.clone(), order_in)
             } else if funds_limited {
                 // Funds-limited (owner partially unfunded): rippled scales the
