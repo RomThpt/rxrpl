@@ -985,9 +985,25 @@ fn cross_offers(
                     // `Quality::ceilOutStrict`. Pricing from the offer's current
                     // (drifted) amounts under-prices an XRP take by a drop.
                     leg_min(&in_for_out(&take_out, &rate, &offer_in), &offer_in)
+                } else if offer_in.is_xrp {
+                    // Funds-limited XRP take: rippled scales the resting offer's
+                    // TakerPays by the funded output fraction rounded DOWN
+                    // (offer_in * avail_out / offer_out, floored to drops) — the
+                    // same scale-down the multi-hop book path uses. Repricing the
+                    // clamped output at the book's quantized rate ceils a drop high
+                    // and over-charges the taker (105500121/122). An IOU take keeps
+                    // the offer-amounts ceil price (105600000).
+                    let ratio = IOUAmount::divide(
+                        &leg_as_quality_iou(&avail_out),
+                        &leg_as_quality_iou(&offer_out),
+                    )
+                    .unwrap_or(IOUAmount::ZERO);
+                    let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
+                        .unwrap_or(IOUAmount::ZERO);
+                    leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in)
                 } else {
-                    // Funds-limited (took all the underfunded owner can give):
-                    // price from the offer's own amounts, since repricing the
+                    // Funds-limited IOU take (took all the underfunded owner can
+                    // give): price from the offer's own amounts, since repricing the
                     // clamped output at the quantized quality rate ceils one drop
                     // high and cascades through the taker's remaining budget.
                     leg_min(
