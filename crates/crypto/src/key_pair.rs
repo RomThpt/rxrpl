@@ -34,9 +34,7 @@ impl KeyPair {
 impl Drop for KeyPair {
     fn drop(&mut self) {
         // Best-effort zeroing of private key material
-        for byte in &mut self.private_key {
-            *byte = 0;
-        }
+        self.private_key.fill(0);
     }
 }
 
