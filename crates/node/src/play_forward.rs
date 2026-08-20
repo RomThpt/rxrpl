@@ -831,8 +831,8 @@ mod tests {
             let mut vsum = 0u64;
             state.for_each(&mut |k, v| {
                 cnt += 1;
-                for i in 0..32 {
-                    kxor[i] ^= k.as_bytes()[i];
+                for (x, kb) in kxor.iter_mut().zip(k.as_bytes()) {
+                    *x ^= kb;
                 }
                 for (j, b) in v.iter().enumerate() {
                     vsum = vsum.wrapping_add((*b as u64).wrapping_mul(j as u64 + 1));
