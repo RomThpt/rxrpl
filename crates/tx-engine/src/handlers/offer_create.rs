@@ -1824,6 +1824,15 @@ pub(crate) fn cross_path_payment(
             } else {
                 d.iou = final_demand.iou;
             }
+            // rippled `creditLimit` (FlowBase.h) caps a strand's final delivery
+            // at the recipient's remaining trust-line headroom: without it the
+            // last hop delivered past what the destination's line can legally
+            // hold (e.g. 105500155: ~19.48G delivered vs ~900M of headroom).
+            if let Some(cap) = dest_headroom(ctx, dest, &out_tmpl) {
+                if cap.iou <= d.iou {
+                    d.iou = cap.iou;
+                }
+            }
             d
         } else {
             unbounded_leg(&out_tmpl)
@@ -1919,6 +1928,56 @@ fn unbounded_leg(template: &Leg) -> Leg {
             IOUAmount::from_parts(9_999_999_999_999_999, 30, false).unwrap_or(IOUAmount::ZERO);
     }
     out
+}
+
+/// The destination's remaining trust-line headroom toward an IOU's issuer,
+/// mirroring rippled `creditLimit` (FlowBase.h): `limit - balance` from the
+/// holder's perspective, floored at zero. `None` when no cap applies: a native
+/// leg, a destination that is itself the issuer, or a missing line (the swap
+/// cannot deliver to it anyway). The limit/balance subtraction rounds like
+/// modern rippled STAmount arithmetic (`add_round`, 16-digit half-to-even).
+fn dest_headroom(ctx: &ApplyContext<'_>, dest: &AccountId, out_tmpl: &Leg) -> Option<Leg> {
+    if out_tmpl.is_xrp || *dest == out_tmpl.issuer {
+        return None;
+    }
+    let tl_key = keylet::trust_line(dest, &out_tmpl.issuer, &out_tmpl.currency);
+    let bytes = ctx.view.read(&tl_key)?;
+    let tl: Value = serde_json::from_slice(&bytes).ok()?;
+    let dest_is_low = dest.as_bytes() < out_tmpl.issuer.as_bytes();
+    // Balance is stored from the low account's perspective; the holder's view
+    // flips sign when it is the high account.
+    let bal_str = tl.get("Balance")?.get("value")?.as_str()?;
+    let bal_mag =
+        IOUAmount::from_decimal_string(bal_str.trim_start_matches('-')).unwrap_or(IOUAmount::ZERO);
+    let stored_bal = if bal_str.starts_with('-') {
+        bal_mag.negate()
+    } else {
+        bal_mag
+    };
+    let balance = if dest_is_low {
+        stored_bal
+    } else {
+        stored_bal.negate()
+    };
+    let lim_v = tl.get(if dest_is_low { "LowLimit" } else { "HighLimit" })?;
+    let limit = IOUAmount::from_decimal_string(lim_v.get("value")?.as_str().unwrap_or("0"))
+        .unwrap_or(IOUAmount::ZERO);
+    if limit < balance {
+        return Some(Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: IOUAmount::ZERO,
+            currency: out_tmpl.currency,
+            issuer: out_tmpl.issuer,
+        });
+    }
+    Some(Leg {
+        is_xrp: false,
+        drops: 0,
+        iou: IOUAmount::add_round(&limit, &balance.negate()).unwrap_or(IOUAmount::ZERO),
+        currency: out_tmpl.currency,
+        issuer: out_tmpl.issuer,
+    })
 }
 
 /// A `Leg`'s magnitude as a `Number` (drops as an integer; IOU as its value).
