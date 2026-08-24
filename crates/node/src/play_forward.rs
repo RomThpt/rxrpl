@@ -629,6 +629,399 @@ mod tests {
         }
     }
 
+    /// Build the mainnet state cache for ledger `to` from the cache for `from`
+    /// (`to == from + 1`) plus only the SLEs ledger `to` actually changed — fetched
+    /// from mainnet at `to` — instead of a full ~19M-entry `ledger_data` crawl. This
+    /// isolates a ledger the replay can't reproduce byte-exact (e.g. a canonical-
+    /// ordering divergence) so `e2e_sweep_forward` can resume past it: the child
+    /// cache is the parent with every affected SLE overwritten (or deleted) to its
+    /// mainnet value at `to`. Asserts the rebuilt state root equals mainnet's
+    /// `account_hash` at `to`, so a missed key fails loudly.
+    ///
+    /// `RXRPL_PLAY_FORWARD_RPC=http://host:5005 RXRPL_BUILD_FROM=105500016 \
+    ///  RXRPL_BUILD_TO=105500017 cargo test --release -p rxrpl-node --lib \
+    ///  e2e_build_cache -- --ignored --nocapture`
+    #[test]
+    #[ignore = "hits a live mainnet RPC server"]
+    fn e2e_build_cache() {
+        let Ok(url) = std::env::var("RXRPL_PLAY_FORWARD_RPC") else {
+            eprintln!("RXRPL_PLAY_FORWARD_RPC unset; skipping");
+            return;
+        };
+        // Spread the hundreds of per-SLE fetches across several full-history
+        // endpoints: a single shared public one (xrplcluster.com) rate-limits the
+        // burst. Round-robin per call and fall through to the next host on retry.
+        let mut urls: Vec<String> = url.split(',').map(|s| s.trim().to_string()).collect();
+        for extra in [
+            "https://s1.ripple.com:51234",
+            "https://s2.ripple.com:51234",
+            "https://xrplcluster.com",
+        ] {
+            if !urls.iter().any(|u| u == extra) {
+                urls.push(extra.to_string());
+            }
+        }
+        let from: u32 = std::env::var("RXRPL_BUILD_FROM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .expect("RXRPL_BUILD_FROM");
+        let to: u32 = std::env::var("RXRPL_BUILD_TO")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .expect("RXRPL_BUILD_TO");
+        assert_eq!(to, from + 1, "build advances one ledger at a time");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let rpc_call = std::sync::atomic::AtomicUsize::new(0);
+        let rpc = |params: serde_json::Value| -> Value {
+            let base = rpc_call.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            rt.block_on(async {
+                for attempt in 0..18u32 {
+                    let target = &urls[(base + attempt as usize) % urls.len()];
+                    if let Ok(resp) = client.post(target).json(&params).send().await {
+                        if let Ok(v) = resp.json::<Value>().await {
+                            if v.get("result").is_some() {
+                                return v;
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        400 * u64::from(attempt + 1),
+                    ))
+                    .await;
+                }
+                panic!("rpc failed after retries");
+            })
+        };
+
+        let src = format!("/tmp/e2e_state_{from}.bin");
+        let data = std::fs::read(&src).unwrap_or_else(|_| panic!("source cache {src} missing"));
+        let mut state = rxrpl_shamap::SHAMap::account_state();
+        let mut off = 0usize;
+        while off + 34 <= data.len() {
+            let key: [u8; 32] = data[off..off + 32].try_into().unwrap();
+            let dlen = u16::from_be_bytes([data[off + 32], data[off + 33]]) as usize;
+            off += 34;
+            state
+                .put(Hash256::new(key), data[off..off + dlen].to_vec())
+                .unwrap();
+            off += dlen;
+        }
+
+        // Every SLE any tx touched at `to`, plus the close-step singletons that
+        // change each ledger (recent LedgerHashes skip-list, FeeSettings,
+        // Amendments) even when no tx lists them.
+        let mut keys: std::collections::BTreeSet<String> = Default::default();
+        let meta_resp = rpc(serde_json::json!({
+            "method":"ledger","params":[{"ledger_index":to,"transactions":true,"expand":true}]
+        }));
+        for t in meta_resp["result"]["ledger"]["transactions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            for an in t["metaData"]["AffectedNodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                for nt in ["ModifiedNode", "CreatedNode", "DeletedNode"] {
+                    if let Some(k) = an.get(nt).and_then(|e| e["LedgerIndex"].as_str()) {
+                        keys.insert(k.to_uppercase());
+                    }
+                }
+            }
+        }
+        let tx_affected = keys.len();
+        let singletons: std::collections::BTreeSet<String> = [
+            rxrpl_protocol::keylet::skip(),
+            rxrpl_protocol::keylet::skip_seq(to),
+            rxrpl_protocol::keylet::fee_settings(),
+            rxrpl_protocol::keylet::amendments(),
+        ]
+        .iter()
+        .map(|k| hex::encode_upper(k.as_bytes()))
+        .collect();
+        keys.extend(singletons.iter().cloned());
+        eprintln!("tx_affected={tx_affected} +singletons={} total={}", singletons.len(), keys.len());
+
+        let mut puts = 0usize;
+        let mut dels = 0usize;
+        let mut deleted_keys: Vec<String> = Vec::new();
+        let iter_keys: Vec<String> = if std::env::var("RXRPL_BUILD_REV").is_ok() {
+            keys.iter().rev().cloned().collect()
+        } else {
+            keys.iter().cloned().collect()
+        };
+        let dbg_h = std::env::var("RXRPL_DBG_KEY").ok().and_then(|s| {
+            hex::decode(&s)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .map(Hash256::new)
+        });
+        let mut dbg_present = dbg_h.as_ref().map(|h| state.get(h).is_some());
+        for key in &iter_keys {
+            let Some(kb) = hex::decode(key)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            else {
+                continue;
+            };
+            let h = Hash256::new(kb);
+            // Throttle the per-SLE fetch: a shared public full-history endpoint
+            // (xrplcluster.com) rate-limits a burst of hundreds of back-to-back
+            // ledger_entry calls, whereas the sweep's two calls per ledger are gentle.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let r = rpc(serde_json::json!({
+                "method":"ledger_entry","params":[{"index":key,"ledger_index":to,"binary":true}]
+            }));
+            let is_singleton = singletons.contains(key);
+            match r["result"]["node_binary"].as_str() {
+                Some(hexbytes) => {
+                    let bytes = hex::decode(hexbytes).expect("node_binary hex");
+                    state.put(h, bytes).unwrap();
+                    puts += 1;
+                    if is_singleton {
+                        eprintln!("singleton PUT {}", &key[..16]);
+                    }
+                }
+                None => {
+                    let _ = state.delete(&h);
+                    dels += 1;
+                    deleted_keys.push(key.clone());
+                    if is_singleton {
+                        eprintln!(
+                            "singleton NOTFOUND {} err={:?}",
+                            &key[..16],
+                            r["result"]["error"].as_str()
+                        );
+                    }
+                }
+            }
+            if let (Some(dh), Some(was)) = (dbg_h.as_ref(), dbg_present) {
+                let now = state.get(dh).is_some();
+                if was != now {
+                    eprintln!(
+                        "DBGKEY flip {} -> {} after op on {} (this op {})",
+                        was,
+                        now,
+                        &key[..24],
+                        if r["result"]["node_binary"].as_str().is_some() { "PUT" } else { "DEL" }
+                    );
+                    dbg_present = Some(now);
+                }
+            }
+        }
+        eprintln!("deleted {} keys: {:?}", dels, &deleted_keys);
+
+        let hdr_resp = rpc(serde_json::json!({"method":"ledger","params":[{"ledger_index":to}]}));
+        let hdr = parse_header(&hdr_resp["result"]["ledger"]).expect("target header");
+        // Order-independent signature of the surviving item set: count + XOR of
+        // keys + XOR of leaf-hashes (key||data). If forward and reverse builds
+        // print the SAME signature but different roots, insert/structure is
+        // order-dependent; different signatures mean delete drops different items.
+        {
+            let mut cnt = 0u64;
+            let mut kxor = [0u8; 32];
+            let mut vsum = 0u64;
+            state.for_each(&mut |k, v| {
+                cnt += 1;
+                for (x, kb) in kxor.iter_mut().zip(k.as_bytes()) {
+                    *x ^= kb;
+                }
+                for (j, b) in v.iter().enumerate() {
+                    vsum = vsum.wrapping_add((*b as u64).wrapping_mul(j as u64 + 1));
+                }
+            });
+            eprintln!("ITEMSET count={cnt} kxor={} vsum={vsum}", hex::encode(kxor));
+            if std::env::var("RXRPL_DUMP_KEYS").is_ok() {
+                let mut keys: Vec<String> = Vec::new();
+                state.for_each(&mut |k, _v| keys.push(hex::encode_upper(k.as_bytes())));
+                keys.sort();
+                let suffix = if std::env::var("RXRPL_BUILD_REV").is_ok() { "rev" } else { "fwd" };
+                let _ = std::fs::write(format!("/tmp/itemset_{suffix}.txt"), keys.join("\n"));
+                eprintln!("dumped {} keys to /tmp/itemset_{suffix}.txt", keys.len());
+            }
+        }
+        let root = state.root_hash();
+        eprintln!(
+            "BUILD to={to} keys={} puts={puts} dels={dels} root={root} expected={}",
+            keys.len(),
+            hdr.account_hash
+        );
+        assert_eq!(
+            root, hdr.account_hash,
+            "rebuilt state root != mainnet account_hash"
+        );
+
+        let dst = format!("/tmp/e2e_state_{to}.bin");
+        let mut buf = Vec::new();
+        state.for_each(&mut |k, v| {
+            buf.extend_from_slice(k.as_bytes());
+            buf.extend_from_slice(&(v.len() as u16).to_be_bytes());
+            buf.extend_from_slice(v);
+        });
+        std::fs::write(&dst, &buf).unwrap();
+        eprintln!("=== BUILD done: wrote {dst} ===");
+    }
+
+    /// Build the mainnet state cache for ledger `to` by REPLAYING its txs in
+    /// mainnet's own applied order (metadata `TransactionIndex`) onto the `from`
+    /// cache, rather than our canonical order. For a ledger whose only divergence
+    /// is transaction ordering (the tec-defer / canonical-ordering class), forcing
+    /// mainnet's order reproduces the byte-exact state, letting the sweep resume
+    /// past it. Robust (only a couple of RPC calls, no 19M-entry crawl) and it
+    /// applies via tx-order put/delete so it sidesteps the order-dependent SHAMap
+    /// delete. Asserts the closed `account_hash` equals mainnet's at `to`.
+    ///
+    /// `RXRPL_PLAY_FORWARD_RPC=http://host:5005 RXRPL_BUILD_FROM=105500016 \
+    ///  RXRPL_BUILD_TO=105500017 cargo test --release -p rxrpl-node --lib \
+    ///  e2e_replay_ordered -- --ignored --nocapture`
+    #[test]
+    #[ignore = "hits a live mainnet RPC server"]
+    fn e2e_replay_ordered() {
+        let Ok(url) = std::env::var("RXRPL_PLAY_FORWARD_RPC") else {
+            eprintln!("RXRPL_PLAY_FORWARD_RPC unset; skipping");
+            return;
+        };
+        let from: u32 = std::env::var("RXRPL_BUILD_FROM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .expect("RXRPL_BUILD_FROM");
+        let to: u32 = std::env::var("RXRPL_BUILD_TO")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .expect("RXRPL_BUILD_TO");
+        assert_eq!(to, from + 1, "replay advances one ledger at a time");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap();
+        let rpc = |params: serde_json::Value| -> Value {
+            rt.block_on(async {
+                for attempt in 0..12u32 {
+                    if let Ok(resp) = client.post(&url).json(&params).send().await {
+                        if let Ok(v) = resp.json::<Value>().await {
+                            return v;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        500 * u64::from(attempt + 1),
+                    ))
+                    .await;
+                }
+                panic!("rpc failed after retries");
+            })
+        };
+
+        let src = format!("/tmp/e2e_state_{from}.bin");
+        let data = std::fs::read(&src).unwrap_or_else(|_| panic!("source cache {src} missing"));
+        let mut state = rxrpl_shamap::SHAMap::account_state();
+        let mut off = 0usize;
+        while off + 34 <= data.len() {
+            let key: [u8; 32] = data[off..off + 32].try_into().unwrap();
+            let dlen = u16::from_be_bytes([data[off + 32], data[off + 33]]) as usize;
+            off += 34;
+            state
+                .put(Hash256::new(key), data[off..off + dlen].to_vec())
+                .unwrap();
+            off += dlen;
+        }
+
+        let parent_resp = rpc(serde_json::json!({"method":"ledger","params":[{"ledger_index":from}]}));
+        let parent_header = parse_header(&parent_resp["result"]["ledger"]).expect("parent header");
+        assert_eq!(state.root_hash(), parent_header.account_hash, "parent state root");
+        let mut parent = Ledger::from_catchup(from, parent_header.hash, state);
+        parent.header = parent_header;
+
+        let txs_resp = rpc(serde_json::json!({
+            "method":"ledger","params":[{"ledger_index":to,"transactions":true,"expand":true,"binary":true}]
+        }));
+        let (_set_hash, txs) = parse_tx_set(&txs_resp["result"]).expect("tx set");
+        let hdr = parse_header(&txs_resp["result"]["ledger"]).unwrap_or_else(|_| {
+            let hr = rpc(serde_json::json!({"method":"ledger","params":[{"ledger_index":to}]}));
+            parse_header(&hr["result"]["ledger"]).expect("target header")
+        });
+
+        let meta_resp = rpc(serde_json::json!({
+            "method":"ledger","params":[{"ledger_index":to,"transactions":true,"expand":true}]
+        }));
+        let mut txindex: std::collections::HashMap<String, u64> = Default::default();
+        for t in meta_resp["result"]["ledger"]["transactions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(h), Some(i)) = (
+                t["hash"].as_str(),
+                t["metaData"]["TransactionIndex"].as_u64(),
+            ) {
+                txindex.insert(h.to_uppercase(), i);
+            }
+        }
+
+        let mut ordered: Vec<(u64, Hash256, Value)> = txs
+            .into_iter()
+            .filter_map(|(id, blob)| {
+                let idx = *txindex.get(&id.to_string().to_uppercase())?;
+                let json = rxrpl_codec::binary::decode(&blob).ok()?;
+                Some((idx, id, json))
+            })
+            .collect();
+        ordered.sort_by_key(|(i, _, _)| *i);
+
+        let mut ledger = Ledger::new_open(&parent);
+        ledger.header.close_time_resolution = hdr.close_time_resolution;
+        ledger.header.close_time =
+            parent.header.close_time + u32::from(hdr.close_time_resolution);
+        let rules = rules_for_ledger(&ledger);
+        let fees = fees_for_ledger(&parent);
+        let engine = all_handlers_engine();
+        for (i, id, json) in &ordered {
+            let ty = json["TransactionType"].as_str().unwrap_or("?");
+            match engine.apply(json, &mut ledger, &rules, &fees) {
+                Ok(r) if r.is_success() || r.is_tec() => {}
+                other => eprintln!(
+                    "TXFAIL idx={i} {} {ty} -> {:?}",
+                    &id.to_string().to_uppercase()[..16],
+                    other
+                ),
+            }
+        }
+        ledger
+            .close(hdr.close_time, hdr.close_flags)
+            .expect("close");
+
+        eprintln!(
+            "REPLAY to={to} txs={} ours={} expected={}",
+            ordered.len(),
+            ledger.header.account_hash,
+            hdr.account_hash
+        );
+        assert_eq!(
+            ledger.header.account_hash, hdr.account_hash,
+            "ordered replay account_hash != mainnet"
+        );
+
+        let dst = format!("/tmp/e2e_state_{to}.bin");
+        let mut buf = Vec::new();
+        ledger.state_map.for_each(&mut |k, v| {
+            buf.extend_from_slice(k.as_bytes());
+            buf.extend_from_slice(&(v.len() as u16).to_be_bytes());
+            buf.extend_from_slice(v);
+        });
+        std::fs::write(&dst, &buf).unwrap();
+        eprintln!("=== REPLAY done: wrote {dst} ===");
+    }
+
     /// Targeted single-transaction oracle: validate one mainnet transaction
     /// byte-exact WITHOUT bootstrapping the full ~19M-entry state. Fetches only
     /// the SLEs the tx touches or reads (affected nodes + FeeSettings +
