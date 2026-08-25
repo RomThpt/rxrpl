@@ -5642,3 +5642,239 @@ mod owner_funds_tests {
         assert!(!maker_usd_deep_frozen(0x0040_0000)); // regular freeze, not deep
     }
 }
+
+// End-to-end synthetic exercise of the legacy Taker XRP AUTOBRIDGE. With an empty
+// `Rules` (FlowCross disabled) an IOU/IOU OfferCreate routes through `taker_cross`
+// -> `bridged_cross`. There is no direct AAA/BBB book, so the taker can only fill
+// by bridging AAA -> XRP (leg1) then XRP -> BBB (leg2). This deterministically
+// covers `do_cross_bridged` (leg equalisation), `fill_bridged` (the discrete
+// owner1 -> owner2 XRP transfer plus the two IOU settlements) and `composed_quality`
+// / `select_path` — the bridge-specific code that the direct-cross oracles do not
+// reach. Real pre-FlowCross autobridge transactions are vanishingly rare on chain,
+// so this synthetic ledger is the practical validation of the bridge legs.
+#[cfg(test)]
+mod taker_bridge_integration {
+    use super::*;
+    use crate::fees::FeeSettings;
+    use crate::transactor::ApplyContext;
+    use crate::view::ledger_view::LedgerView;
+    use crate::view::read_view::ReadView;
+    use crate::view::sandbox::Sandbox;
+    use rxrpl_amendment::Rules;
+    use rxrpl_ledger::Ledger;
+
+    const TAKER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    const O1: &str = "rf1BiGeXwwQoi8Z2ueFYTEXSwuJYfV2Jpn";
+    const O2: &str = "rpP2JgiMyTF5jR5hLG3xHCPi1knBb1v9cM";
+    const ISS: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
+
+    fn ccy(code: &[u8; 3]) -> [u8; 20] {
+        let mut c = [0u8; 20];
+        c[12..15].copy_from_slice(code);
+        c
+    }
+
+    fn put_acct(ledger: &mut Ledger, addr: &str, drops: u64, owner_count: u64) {
+        let id = decode_account_id(addr).unwrap();
+        let acct = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": addr,
+            "Balance": drops.to_string(), "Sequence": 1,
+            "OwnerCount": owner_count, "Flags": 0,
+        });
+        ledger
+            .put_state(keylet::account(&id), serde_json::to_vec(&acct).unwrap())
+            .unwrap();
+    }
+
+    // Seed a RippleState where `holder` holds `bal` of `code` issued by ISS.
+    fn put_line(ledger: &mut Ledger, holder: &str, code: &[u8; 3], bal: i64) {
+        let h = decode_account_id(holder).unwrap();
+        let i = decode_account_id(ISS).unwrap();
+        let cur = ccy(code);
+        let issuer_is_low = i.as_bytes() < h.as_bytes();
+        // Balance is stored from the low account's view: a positive holder shows a
+        // negative low-view value when the issuer is the low account.
+        let value = if bal == 0 {
+            "0".to_string()
+        } else if issuer_is_low {
+            format!("-{bal}")
+        } else {
+            bal.to_string()
+        };
+        let cur_str = currency_code_str(&cur);
+        let (low, high) = if issuer_is_low {
+            (ISS, holder)
+        } else {
+            (holder, ISS)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": cur_str, "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": value},
+            "LowLimit": {"currency": cur_str, "issuer": low, "value": "0"},
+            "HighLimit": {"currency": cur_str, "issuer": high, "value": "1000000000"},
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&h, &i, &cur),
+                serde_json::to_vec(&tl).unwrap(),
+            )
+            .unwrap();
+    }
+
+    // The holder's balance magnitude in `code` (holders are positive here).
+    fn line_bal(sandbox: &Sandbox<'_>, holder: &str, code: &[u8; 3]) -> String {
+        let h = decode_account_id(holder).unwrap();
+        let i = decode_account_id(ISS).unwrap();
+        let b = sandbox
+            .read(&keylet::trust_line(&h, &i, &ccy(code)))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        v["Balance"]["value"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches('-')
+            .to_string()
+    }
+
+    fn xrp_bal(sandbox: &Sandbox<'_>, addr: &str) -> u64 {
+        let id = decode_account_id(addr).unwrap();
+        let b = sandbox.read(&keylet::account(&id)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        v["Balance"].as_str().unwrap().parse().unwrap()
+    }
+
+    fn apply_offer(
+        sandbox: &mut Sandbox<'_>,
+        fees: &FeeSettings,
+        tx: &serde_json::Value,
+    ) -> TransactionResult {
+        let rules = Rules::new(); // empty -> FlowCross disabled -> legacy taker_cross
+        let mut ctx = ApplyContext {
+            tx,
+            view: sandbox,
+            rules: &rules,
+            fees,
+        };
+        OfferCreateTransactor.apply(&mut ctx).unwrap()
+    }
+
+    #[test]
+    fn iou_to_iou_offer_autobridges_through_xrp() {
+        let mut ledger = Ledger::genesis();
+        // Accounts (generous XRP so the reserve never blocks placement).
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 2);
+        put_acct(&mut ledger, O1, 1_000_000_000, 1);
+        put_acct(&mut ledger, O2, 1_000_000_000, 1);
+        // Trust lines: taker holds 100 AAA (to spend) and 0 BBB (to receive);
+        // O1 holds 0 AAA (to receive); O2 holds 100 BBB (to give).
+        put_line(&mut ledger, TAKER, b"AAA", 100);
+        put_line(&mut ledger, TAKER, b"BBB", 0);
+        put_line(&mut ledger, O1, b"AAA", 0);
+        put_line(&mut ledger, O2, b"BBB", 100);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        // leg1: O1 gives 100 XRP for 100 AAA  (book AAA->XRP).
+        let r1 = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": O1, "Fee": "12", "Sequence": 1,
+                "TakerGets": "100000000",
+                "TakerPays": {"currency": "AAA", "issuer": ISS, "value": "100"},
+            }),
+        );
+        assert_eq!(r1, TransactionResult::TesSuccess);
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(O1).unwrap(), 1))
+                .is_some()
+        );
+
+        // leg2: O2 gives 100 BBB for 100 XRP  (book XRP->BBB).
+        let r2 = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": O2, "Fee": "12", "Sequence": 1,
+                "TakerGets": {"currency": "BBB", "issuer": ISS, "value": "100"},
+                "TakerPays": "100000000",
+            }),
+        );
+        assert_eq!(r2, TransactionResult::TesSuccess);
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(O2).unwrap(), 1))
+                .is_some()
+        );
+
+        // Taker: gives 100 AAA, wants 100 BBB. No direct AAA/BBB book -> autobridge.
+        let rt = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "12", "Sequence": 1,
+                "TakerGets": {"currency": "AAA", "issuer": ISS, "value": "100"},
+                "TakerPays": {"currency": "BBB", "issuer": ISS, "value": "100"},
+            }),
+        );
+        assert_eq!(rt, TransactionResult::TesSuccess);
+
+        // The bridge crossed in full at 1:1:1.
+        assert_eq!(
+            line_bal(&sandbox, TAKER, b"AAA"),
+            "0",
+            "taker spent all AAA"
+        );
+        assert_eq!(
+            line_bal(&sandbox, TAKER, b"BBB"),
+            "100",
+            "taker received BBB"
+        );
+        assert_eq!(
+            line_bal(&sandbox, O1, b"AAA"),
+            "100",
+            "leg1 owner received AAA"
+        );
+        assert_eq!(line_bal(&sandbox, O2, b"BBB"), "0", "leg2 owner gave BBB");
+        // XRP flowed leg1 owner -> leg2 owner (100 XRP), taker XRP untouched.
+        assert_eq!(
+            xrp_bal(&sandbox, O1),
+            900_000_000,
+            "leg1 owner paid 100 XRP"
+        );
+        assert_eq!(
+            xrp_bal(&sandbox, O2),
+            1_100_000_000,
+            "leg2 owner got 100 XRP"
+        );
+        assert_eq!(
+            xrp_bal(&sandbox, TAKER),
+            1_000_000_000,
+            "taker XRP untouched"
+        );
+        // Both legs fully consumed; the taker rests no residual.
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(O1).unwrap(), 1))
+                .is_none(),
+            "leg1 consumed"
+        );
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(O2).unwrap(), 1))
+                .is_none(),
+            "leg2 consumed"
+        );
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(TAKER).unwrap(), 1))
+                .is_none(),
+            "no taker residual"
+        );
+    }
+}
