@@ -748,7 +748,11 @@ mod tests {
         .map(|k| hex::encode_upper(k.as_bytes()))
         .collect();
         keys.extend(singletons.iter().cloned());
-        eprintln!("tx_affected={tx_affected} +singletons={} total={}", singletons.len(), keys.len());
+        eprintln!(
+            "tx_affected={tx_affected} +singletons={} total={}",
+            singletons.len(),
+            keys.len()
+        );
 
         let mut puts = 0usize;
         let mut dels = 0usize;
@@ -811,7 +815,11 @@ mod tests {
                         was,
                         now,
                         &key[..24],
-                        if r["result"]["node_binary"].as_str().is_some() { "PUT" } else { "DEL" }
+                        if r["result"]["node_binary"].as_str().is_some() {
+                            "PUT"
+                        } else {
+                            "DEL"
+                        }
                     );
                     dbg_present = Some(now);
                 }
@@ -843,7 +851,11 @@ mod tests {
                 let mut keys: Vec<String> = Vec::new();
                 state.for_each(&mut |k, _v| keys.push(hex::encode_upper(k.as_bytes())));
                 keys.sort();
-                let suffix = if std::env::var("RXRPL_BUILD_REV").is_ok() { "rev" } else { "fwd" };
+                let suffix = if std::env::var("RXRPL_BUILD_REV").is_ok() {
+                    "rev"
+                } else {
+                    "fwd"
+                };
                 let _ = std::fs::write(format!("/tmp/itemset_{suffix}.txt"), keys.join("\n"));
                 eprintln!("dumped {} keys to /tmp/itemset_{suffix}.txt", keys.len());
             }
@@ -936,9 +948,14 @@ mod tests {
             off += dlen;
         }
 
-        let parent_resp = rpc(serde_json::json!({"method":"ledger","params":[{"ledger_index":from}]}));
+        let parent_resp =
+            rpc(serde_json::json!({"method":"ledger","params":[{"ledger_index":from}]}));
         let parent_header = parse_header(&parent_resp["result"]["ledger"]).expect("parent header");
-        assert_eq!(state.root_hash(), parent_header.account_hash, "parent state root");
+        assert_eq!(
+            state.root_hash(),
+            parent_header.account_hash,
+            "parent state root"
+        );
         let mut parent = Ledger::from_catchup(from, parent_header.hash, state);
         parent.header = parent_header;
 
@@ -980,8 +997,7 @@ mod tests {
 
         let mut ledger = Ledger::new_open(&parent);
         ledger.header.close_time_resolution = hdr.close_time_resolution;
-        ledger.header.close_time =
-            parent.header.close_time + u32::from(hdr.close_time_resolution);
+        ledger.header.close_time = parent.header.close_time + u32::from(hdr.close_time_resolution);
         let rules = rules_for_ledger(&ledger);
         let fees = fees_for_ledger(&parent);
         let engine = all_handlers_engine();
@@ -1326,47 +1342,71 @@ mod tests {
                     None => serde_json::json!({"currency": "XRP"}),
                 }
             };
-            let book = if crossed {
+            let fetch_book = |tg: Value, tp: Value| -> Value {
                 rpc(serde_json::json!({
                     "method":"book_offers",
                     "params":[{
-                        "taker_gets": book_asset(&tx_json["TakerPays"]),
-                        "taker_pays": book_asset(&tx_json["TakerGets"]),
+                        "taker_gets": tg,
+                        "taker_pays": tp,
                         "ledger_index": parent,
                         "limit": 30
                     }]
                 }))
-            } else {
-                serde_json::json!({})
             };
-            for off in book["result"]["offers"].as_array().into_iter().flatten() {
-                if let Some(idx) = off["index"].as_str() {
-                    read_keys.insert(idx.to_uppercase());
-                }
-                if let Some(bd) = off["BookDirectory"].as_str() {
-                    read_keys.insert(bd.to_uppercase());
-                }
-                let Some(maker) = off["Account"]
-                    .as_str()
-                    .and_then(|a| decode_account_id(a).ok())
-                else {
-                    continue;
-                };
-                read_keys.insert(keylet::account(&maker).to_string().to_uppercase());
-                for side in ["TakerGets", "TakerPays"] {
-                    if let (Some(iss), Some(cur)) = (
-                        off[side].get("issuer").and_then(|v| v.as_str()),
-                        off[side].get("currency").and_then(|v| v.as_str()),
-                    ) {
-                        if let Ok(iid) = decode_account_id(iss) {
-                            read_keys.insert(keylet::account(&iid).to_string().to_uppercase());
-                            read_keys.insert(
-                                keylet::trust_line(&maker, &iid, &currency_bytes(cur))
-                                    .to_string()
-                                    .to_uppercase(),
-                            );
+            let seed_offers = |book: &Value, read_keys: &mut std::collections::BTreeSet<String>| {
+                for off in book["result"]["offers"].as_array().into_iter().flatten() {
+                    if let Some(idx) = off["index"].as_str() {
+                        read_keys.insert(idx.to_uppercase());
+                    }
+                    if let Some(bd) = off["BookDirectory"].as_str() {
+                        read_keys.insert(bd.to_uppercase());
+                    }
+                    let Some(maker) = off["Account"]
+                        .as_str()
+                        .and_then(|a| decode_account_id(a).ok())
+                    else {
+                        continue;
+                    };
+                    read_keys.insert(keylet::account(&maker).to_string().to_uppercase());
+                    for side in ["TakerGets", "TakerPays"] {
+                        if let (Some(iss), Some(cur)) = (
+                            off[side].get("issuer").and_then(|v| v.as_str()),
+                            off[side].get("currency").and_then(|v| v.as_str()),
+                        ) {
+                            if let Ok(iid) = decode_account_id(iss) {
+                                read_keys.insert(keylet::account(&iid).to_string().to_uppercase());
+                                read_keys.insert(
+                                    keylet::trust_line(&maker, &iid, &currency_bytes(cur))
+                                        .to_string()
+                                        .to_uppercase(),
+                                );
+                            }
                         }
                     }
+                }
+            };
+            if crossed {
+                let xrp = serde_json::json!({"currency": "XRP"});
+                // Direct opposite book (the offers this OfferCreate takes).
+                seed_offers(
+                    &fetch_book(
+                        book_asset(&tx_json["TakerPays"]),
+                        book_asset(&tx_json["TakerGets"]),
+                    ),
+                    &mut read_keys,
+                );
+                // A pre-FlowCross IOU/IOU offer also autobridges through XRP (legacy
+                // Taker `bridged_cross`): seed the two intermediate books so the walk
+                // finds the leg1 (TakerGets -> XRP) and leg2 (XRP -> TakerPays) makers.
+                if tx_json["TakerPays"].is_object() && tx_json["TakerGets"].is_object() {
+                    seed_offers(
+                        &fetch_book(xrp.clone(), book_asset(&tx_json["TakerGets"])),
+                        &mut read_keys,
+                    );
+                    seed_offers(
+                        &fetch_book(book_asset(&tx_json["TakerPays"]), xrp.clone()),
+                        &mut read_keys,
+                    );
                 }
             }
         }
@@ -2928,47 +2968,71 @@ mod tests {
                     None => serde_json::json!({"currency": "XRP"}),
                 }
             };
-            let book = if crossed {
+            let fetch_book = |tg: Value, tp: Value| -> Value {
                 rpc(serde_json::json!({
                     "method":"book_offers",
                     "params":[{
-                        "taker_gets": book_asset(&tx_json["TakerPays"]),
-                        "taker_pays": book_asset(&tx_json["TakerGets"]),
+                        "taker_gets": tg,
+                        "taker_pays": tp,
                         "ledger_index": parent,
                         "limit": 30
                     }]
                 }))
-            } else {
-                serde_json::json!({})
             };
-            for off in book["result"]["offers"].as_array().into_iter().flatten() {
-                if let Some(idx) = off["index"].as_str() {
-                    read_keys.insert(idx.to_uppercase());
-                }
-                if let Some(bd) = off["BookDirectory"].as_str() {
-                    read_keys.insert(bd.to_uppercase());
-                }
-                let Some(maker) = off["Account"]
-                    .as_str()
-                    .and_then(|a| decode_account_id(a).ok())
-                else {
-                    continue;
-                };
-                read_keys.insert(keylet::account(&maker).to_string().to_uppercase());
-                for side in ["TakerGets", "TakerPays"] {
-                    if let (Some(iss), Some(cur)) = (
-                        off[side].get("issuer").and_then(|v| v.as_str()),
-                        off[side].get("currency").and_then(|v| v.as_str()),
-                    ) {
-                        if let Ok(iid) = decode_account_id(iss) {
-                            read_keys.insert(keylet::account(&iid).to_string().to_uppercase());
-                            read_keys.insert(
-                                keylet::trust_line(&maker, &iid, &currency_bytes(cur))
-                                    .to_string()
-                                    .to_uppercase(),
-                            );
+            let seed_offers = |book: &Value, read_keys: &mut std::collections::BTreeSet<String>| {
+                for off in book["result"]["offers"].as_array().into_iter().flatten() {
+                    if let Some(idx) = off["index"].as_str() {
+                        read_keys.insert(idx.to_uppercase());
+                    }
+                    if let Some(bd) = off["BookDirectory"].as_str() {
+                        read_keys.insert(bd.to_uppercase());
+                    }
+                    let Some(maker) = off["Account"]
+                        .as_str()
+                        .and_then(|a| decode_account_id(a).ok())
+                    else {
+                        continue;
+                    };
+                    read_keys.insert(keylet::account(&maker).to_string().to_uppercase());
+                    for side in ["TakerGets", "TakerPays"] {
+                        if let (Some(iss), Some(cur)) = (
+                            off[side].get("issuer").and_then(|v| v.as_str()),
+                            off[side].get("currency").and_then(|v| v.as_str()),
+                        ) {
+                            if let Ok(iid) = decode_account_id(iss) {
+                                read_keys.insert(keylet::account(&iid).to_string().to_uppercase());
+                                read_keys.insert(
+                                    keylet::trust_line(&maker, &iid, &currency_bytes(cur))
+                                        .to_string()
+                                        .to_uppercase(),
+                                );
+                            }
                         }
                     }
+                }
+            };
+            if crossed {
+                let xrp = serde_json::json!({"currency": "XRP"});
+                // Direct opposite book (the offers this OfferCreate takes).
+                seed_offers(
+                    &fetch_book(
+                        book_asset(&tx_json["TakerPays"]),
+                        book_asset(&tx_json["TakerGets"]),
+                    ),
+                    &mut read_keys,
+                );
+                // A pre-FlowCross IOU/IOU offer also autobridges through XRP (legacy
+                // Taker `bridged_cross`): seed the two intermediate books so the walk
+                // finds the leg1 (TakerGets -> XRP) and leg2 (XRP -> TakerPays) makers.
+                if tx_json["TakerPays"].is_object() && tx_json["TakerGets"].is_object() {
+                    seed_offers(
+                        &fetch_book(xrp.clone(), book_asset(&tx_json["TakerGets"])),
+                        &mut read_keys,
+                    );
+                    seed_offers(
+                        &fetch_book(book_asset(&tx_json["TakerPays"]), xrp.clone()),
+                        &mut read_keys,
+                    );
                 }
             }
         }
@@ -4634,6 +4698,21 @@ does not apply to this tx type (e.g. a pure delete/modify)."
             parent_header.account_hash,
             "downloaded parent state root must equal validated account_hash"
         );
+
+        if std::env::var("RXRPL_WRITE_CACHE").is_ok() {
+            let cache = format!("/tmp/e2e_state_{parent_seq}.bin");
+            let mut buf = Vec::new();
+            state.for_each(&mut |k, v| {
+                buf.extend_from_slice(k.as_bytes());
+                buf.extend_from_slice(&(v.len() as u16).to_be_bytes());
+                buf.extend_from_slice(v);
+            });
+            std::fs::write(&cache, &buf).unwrap();
+            eprintln!(
+                "=== wrote bootstrap cache {cache} ({} bytes) ===",
+                buf.len()
+            );
+        }
 
         let mut parent = Ledger::from_catchup(parent_seq, parent_header.hash, state);
         parent.header = parent_header;
