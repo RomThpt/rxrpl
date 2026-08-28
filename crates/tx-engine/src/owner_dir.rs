@@ -406,24 +406,34 @@ pub fn remove_from_owner_dir_page_keep_root(
     dir_remove_page_impl(view, &keylet::owner_dir(account_id), page, entry_key, true, false)
 }
 
-/// Remove an owner-directory entry but leave an emptied non-root page in place
-/// (`Indexes: []`) so a subsequent `dirAdd` in the same transaction can reuse
-/// it. OfferCreate's OfferSequence cancel-and-replace needs this: rippled's
-/// 2017 owner-dir last page is kept empty rather than unlinked.
-pub fn remove_from_owner_dir_page_keep_empty(
+/// Remove an owner-directory entry, walking from the root, but leave an
+/// emptied non-root page in place (`Indexes: []`). OfferCreate OfferSequence
+/// cancel-and-replace needs the last page kept so the subsequent dirAdd
+/// reuses it (rippled 2017).
+pub fn remove_from_owner_dir_keep_empty(
     view: &mut dyn ApplyView,
     account_id: &AccountId,
-    page: u64,
     entry_key: &Hash256,
 ) -> Result<(), TransactionResult> {
-    dir_remove_page_impl(
-        view,
-        &keylet::owner_dir(account_id),
-        page,
-        entry_key,
-        false,
-        true,
-    )
+    let root_key = keylet::owner_dir(account_id);
+    let entry_hex = entry_key.to_string().to_uppercase();
+    let mut page = 0u64;
+    loop {
+        let page_key = keylet::dir_node(&root_key, page);
+        let Some(bytes) = view.read(&page_key) else {
+            return Ok(());
+        };
+        let node: Value =
+            serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let next = read_u64_field(&node, "IndexNext");
+        if dir_page(&node).iter().any(|h| h == &entry_hex) {
+            return dir_remove_page_impl(view, &root_key, page, entry_key, false, true);
+        }
+        if next == 0 {
+            return Ok(());
+        }
+        page = next;
+    }
 }
 
 /// Collect every entry key listed in an account's owner directory, walking the

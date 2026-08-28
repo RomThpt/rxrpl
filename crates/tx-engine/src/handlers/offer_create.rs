@@ -354,19 +354,9 @@ impl Transactor for OfferCreateTransactor {
                 {
                     remove_from_book_dir(ctx.view, &book_dir, &cancel_key)?;
                 }
-                let owner_page = old
-                    .get("OwnerNode")
-                    .and_then(|v| {
-                        v.as_u64().or_else(|| {
-                            v.as_str()
-                                .and_then(|s| u64::from_str_radix(s, 16).ok())
-                        })
-                    })
-                    .unwrap_or(0);
-                crate::owner_dir::remove_from_owner_dir_page_keep_empty(
+                crate::owner_dir::remove_from_owner_dir_keep_empty(
                     ctx.view,
                     &account_id,
-                    owner_page,
                     &cancel_key,
                 )?;
                 let _ = ctx.view.erase(&cancel_key);
