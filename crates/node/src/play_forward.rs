@@ -825,7 +825,7 @@ mod tests {
                 }
             }
         }
-        eprintln!("deleted {} keys: {:?}", dels, &deleted_keys);
+        eprintln!("deleted {} keys: {:?}", dels, deleted_keys);
 
         let hdr_resp = rpc(serde_json::json!({"method":"ledger","params":[{"ledger_index":to}]}));
         let hdr = parse_header(&hdr_resp["result"]["ledger"]).expect("target header");
