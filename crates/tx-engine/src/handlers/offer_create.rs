@@ -450,13 +450,8 @@ impl Transactor for OfferCreateTransactor {
         if crossed {
             if let Some(gets_leg) = Leg::parse(&taker_gets) {
                 let unfunded = if gets_leg.is_xrp {
-                    let oc = acct
-                        .get("OwnerCount")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
-                    helpers::get_balance(&acct) as i64
-                        - ctx.fees.account_reserve(oc) as i64
-                        <= 0
+                    let oc = acct.get("OwnerCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    helpers::get_balance(&acct) as i64 - ctx.fees.account_reserve(oc) as i64 <= 0
                 } else {
                     owner_funds_leg(ctx, &account_id, &gets_leg).is_zero()
                 };
