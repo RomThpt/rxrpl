@@ -5408,7 +5408,6 @@ mod taker_crossing_tests {
         // Payment D091EB7D (30000008): demand-limited take of 18985524 XRP
         // from offer 67FAFA4B. Mainnet leftover TakerPays is 2.512242529714367.
         let offer_in = iou("2.51453731");
-        let offer_out = xrp(20_803_651_115);
         let take_out = xrp(18_985_524);
         let packed: u64 = 0x4B04_4B4E_6621_DCEF;
         let rate = from_rate(packed).unwrap();
