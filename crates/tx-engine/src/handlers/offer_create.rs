@@ -4498,39 +4498,51 @@ fn consume_leg(
     order_in: &Leg,
     avail_out: &Leg,
 ) -> Result<(), TransactionResult> {
+    let _ = avail_out;
     let Some(ob) = ctx.view.read(&t.key) else {
         return Ok(());
     };
     let Ok(mut offer) = serde_json::from_slice::<Value>(&ob) else {
         return Ok(());
     };
-    let exhausted = leg_ge(order_out, avail_out);
-    if exhausted {
-        if leg_ge(order_out, &t.offer_out) {
-            offer["TakerGets"] = t.offer_out.with_amount(&IOUAmount::ZERO, 0);
-            offer["TakerPays"] = t.offer_in.with_amount(&IOUAmount::ZERO, 0);
-        } else {
-            let new_gets = leg_sub(&t.offer_out, order_out);
-            let new_pays = leg_sub(&t.offer_in, order_in);
-            offer["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
-            offer["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
-        }
-        let cb = serde_json::to_vec(&offer).map_err(|_| TransactionResult::TefInternal)?;
-        ctx.view
-            .update(t.key, cb)
-            .map_err(|_| TransactionResult::TefInternal)?;
-        reap_offer(ctx, &t.owner, &t.key, &t.dir)?;
+    let leftover_out = if leg_ge(order_out, &t.offer_out) {
+        zero_leg(&t.offer_out)
     } else {
-        let new_gets = leg_sub(&t.offer_out, order_out);
-        let new_pays = leg_sub(&t.offer_in, order_in);
-        offer["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
-        offer["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
-        let rb = serde_json::to_vec(&offer).map_err(|_| TransactionResult::TefInternal)?;
-        ctx.view
-            .update(t.key, rb)
-            .map_err(|_| TransactionResult::TefInternal)?;
+        leg_sub(&t.offer_out, order_out)
+    };
+    let leftover_in = if leg_ge(order_in, &t.offer_in) {
+        zero_leg(&t.offer_in)
+    } else {
+        leg_sub(&t.offer_in, order_in)
+    };
+    offer["TakerGets"] = leftover_out.with_amount(&leftover_out.iou, leftover_out.drops);
+    offer["TakerPays"] = leftover_in.with_amount(&leftover_in.iou, leftover_in.drops);
+    let cb = serde_json::to_vec(&offer).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(t.key, cb)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    // rippled CreateOffer::dry_offer: fully consumed, or the owner cannot fund
+    // leftover TakerGets (transfer-fee gross drained the line).
+    if leftover_out.is_zero()
+        || leftover_in.is_zero()
+        || owner_funds_leg(ctx, &t.owner, &t.offer_out).is_zero()
+    {
+        reap_offer(ctx, &t.owner, &t.key, &t.dir)?;
     }
     Ok(())
+}
+
+fn offer_is_dry(
+    ctx: &mut ApplyContext<'_>,
+    owner: &AccountId,
+    offer_out: &Leg,
+    order_out: &Leg,
+) -> bool {
+    if leg_ge(order_out, offer_out) {
+        return true;
+    }
+    let leftover = leg_sub(offer_out, order_out);
+    leftover.is_zero() || owner_funds_leg(ctx, owner, offer_out).is_zero()
 }
 
 /// rippled `Taker::fill` input settlement (taker -> owner), a `redeemIOU` plus
@@ -4856,7 +4868,6 @@ fn direct_cross(
             &taker_funds,
         );
         let did = !flow.order_out.is_zero() || !flow.order_in.is_zero();
-        let dry = leg_ge(&flow.order_out, &avail_out);
         if did {
             fill_direct(ctx, taker, taker_acct, &t, &flow, &avail_out, round)?;
             crossed = true;
@@ -4870,7 +4881,7 @@ fn direct_cross(
         if direct_crossings >= 850 {
             break;
         }
-        if !dry {
+        if !offer_is_dry(ctx, &t.owner, &t.offer_out, &flow.order_out) {
             break;
         }
         tip = stream.step(ctx, Some(taker))?;
@@ -4944,7 +4955,6 @@ fn bridged_cross(
                 &taker_funds,
             );
             let did = !flow.order_out.is_zero() || !flow.order_in.is_zero();
-            let dry = leg_ge(&flow.order_out, &avail_out);
             if did {
                 fill_direct(ctx, taker, taker_acct, &t, &flow, &avail_out, round)?;
                 crossed = true;
@@ -4952,7 +4962,7 @@ fn bridged_cross(
             }
             *remaining_out = sell_clamp_sub(remaining_out, &flow.order_out, is_sell);
             *remaining_in = leg_sub(remaining_in, &flow.order_in);
-            if dry {
+            if offer_is_dry(ctx, &t.owner, &t.offer_out, &flow.order_out) {
                 direct_tip = sd.step(ctx, Some(taker))?;
                 advanced = true;
             }
@@ -4966,8 +4976,6 @@ fn bridged_cross(
             let (flow1, flow2) =
                 do_cross_bridged(ctx, taker, &t1, &t2, is_sell, remaining_out, remaining_in);
             let did = !flow1.order_in.is_zero() || !flow2.order_out.is_zero();
-            let dry1 = leg_ge(&flow1.order_out, &avail1);
-            let dry2 = leg_ge(&flow2.order_out, &avail2);
             if did {
                 fill_bridged(
                     ctx, taker, taker_acct, &t1, &flow1, &avail1, &t2, &flow2, &avail2, round,
@@ -4977,11 +4985,11 @@ fn bridged_cross(
             }
             *remaining_out = sell_clamp_sub(remaining_out, &flow2.order_out, is_sell);
             *remaining_in = leg_sub(remaining_in, &flow1.order_in);
-            if dry1 {
+            if offer_is_dry(ctx, &t1.owner, &t1.offer_out, &flow1.order_out) {
                 leg1_tip = s1.step(ctx, None)?;
                 advanced = true;
             }
-            if dry2 {
+            if offer_is_dry(ctx, &t2.owner, &t2.offer_out, &flow2.order_out) {
                 leg2_tip = s2.step(ctx, None)?;
                 advanced = true;
             }
@@ -5097,8 +5105,8 @@ fn taker_cross(
 mod taker_crossing_tests {
     use super::{
         Leg, TakerCrossType, composed_quality, flow_iou_to_iou, flow_iou_to_xrp, flow_xrp_to_iou,
-        leg_gt, leg_max, pack_rate, parity_rate, qual_div, qual_mul, remaining_offer, select_path,
-        sell_clamp_sub,
+        leg_gt, leg_max, pack_rate, parity_rate, qual_div, qual_mul, reject_quality, remaining_offer,
+        select_path, sell_clamp_sub,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate};
     use rxrpl_primitives::AccountId;
@@ -5132,6 +5140,43 @@ mod taker_crossing_tests {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn ledger_30000004_taker_threshold_vs_maker_qualities() {
+        let taker_q = get_rate(
+            &IOUAmount::from_decimal_string("30658943169").unwrap(),
+            &IOUAmount::from_decimal_string("9063").unwrap(),
+        )
+        .unwrap();
+        let m1 = get_rate(
+            &IOUAmount::from_decimal_string("409126752").unwrap(),
+            &IOUAmount::from_decimal_string("120.9419652590728").unwrap(),
+        )
+        .unwrap();
+        let m2 = get_rate(
+            &IOUAmount::from_decimal_string("166222442").unwrap(),
+            &IOUAmount::from_decimal_string("49.13701852804732").unwrap(),
+        )
+        .unwrap();
+        let m3 = get_rate(
+            &IOUAmount::from_decimal_string("1008259326").unwrap(),
+            &IOUAmount::from_decimal_string("298.0515540012705").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(m3, 0x5b0c_04ab_b9f8_8eed);
+        assert!(
+            !reject_quality(m1, taker_q),
+            "m1 {m1:#x} should pass threshold {taker_q:#x}"
+        );
+        assert!(
+            !reject_quality(m2, taker_q),
+            "m2 {m2:#x} should pass threshold {taker_q:#x}"
+        );
+        assert!(
+            !reject_quality(m3, taker_q),
+            "m3 {m3:#x} should pass threshold {taker_q:#x} (mainnet crossed F02D74BB)"
+        );
     }
 
     // select_path picks the better (smaller packed rate) of the direct tip and the
