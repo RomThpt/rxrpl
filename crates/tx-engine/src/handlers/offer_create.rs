@@ -498,13 +498,14 @@ impl Transactor for OfferCreateTransactor {
         // issuers) with its low 64 bits replaced by the offer's quality (rate),
         // so offers sort by price. rippled stores this as the offer's
         // BookDirectory and tags the directory with the rate + book assets.
-        // The book directory quality is the rate of the offer AS PLACED — the
-        // leftover amounts after crossing (remaining_pays/remaining_gets), which
-        // are what the Offer SLE carries — not the original tx amounts. A partial
-        // cross that trims TakerGets but leaves TakerPays shifts the rate, and
-        // rippled keys the directory on the placed offer's rate.
+        // rippled computes the offer's book rate (`uRate`) from the ORIGINAL
+        // offer amounts before crossing and keys the resting offer's directory on
+        // it; the residual carries the leftover but stays in the original-rate
+        // directory. Re-deriving the rate from the (proportionally reduced)
+        // leftover drifts by a divide ULP on the pre-`fixUniversalNumber`
+        // truncating path (mainnet 30000004), so key on the original amounts.
         let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
-        let quality = offer_book_quality(&remaining_pays, &remaining_gets, number_switchover);
+        let quality = offer_book_quality(&taker_pays, &taker_gets, number_switchover);
         // A DomainID places the resting offer in the permissioned (domain) book
         // directory rather than the public book — rippled's getBookBase appends
         // the domain to the same BookDir hash, so a domain book lives at a
@@ -600,7 +601,7 @@ impl Transactor for OfferCreateTransactor {
 }
 
 /// One side of an offer: native XRP (drops) or an IOU with its issuer/currency.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Leg {
     is_xrp: bool,
     drops: i64,
@@ -3934,7 +3935,7 @@ fn remove_from_book_dir(
 // rounding the Flow path uses.
 // ============================================================================
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TakerCrossType {
     XrpToIou,
     IouToXrp,
@@ -4570,6 +4571,15 @@ fn settle_in_legacy(
             &issuers_in.iou.negate(),
             round,
         )?;
+        // rippled's rippleCredit deletes the payer's line when it drains to a
+        // default zero-balance state (View.cpp:994) — the taker just paid out.
+        crate::handlers::trust_set::maybe_delete_drained_trust_line(
+            ctx,
+            taker,
+            taker_acct,
+            &issuer,
+            &order_in.currency,
+        )?;
     }
     if owner != &issuer {
         credit_line(
@@ -4616,8 +4626,32 @@ fn settle_out_legacy(
             &issuers_out.iou.negate(),
             round,
         )?;
+        // Owner paid the IOU out; rippleCredit deletes a drained default line.
+        let owner_key = keylet::account(owner);
+        if let Some(ob) = ctx.view.read(&owner_key) {
+            let mut oacct: Value =
+                serde_json::from_slice(&ob).map_err(|_| TransactionResult::TefInternal)?;
+            if crate::handlers::trust_set::maybe_delete_drained_trust_line(
+                ctx,
+                owner,
+                &mut oacct,
+                &issuer,
+                &order_out.currency,
+            )? {
+                let nb = serde_json::to_vec(&oacct).map_err(|_| TransactionResult::TefInternal)?;
+                ctx.view
+                    .update(owner_key, nb)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+            }
+        }
     }
     if taker != &issuer {
+        // rippleCredit createOnDemand: first delivery of an IOU the taker
+        // has never held writes a CreatedNode RippleState.
+        let tl_key = keylet::trust_line(taker, &issuer, &order_out.currency);
+        if ctx.view.read(&tl_key).is_none() {
+            create_iou_trust_line(ctx, taker, taker_acct, &issuer, &order_out.currency)?;
+        }
         credit_line(
             ctx,
             taker,
@@ -5398,13 +5432,12 @@ mod tick_round_tests {
 mod book_directory_quality_tests {
     use super::offer_book_quality;
 
-    // Mainnet tx DFF0E4CB (ledger 105333100): an offer selling XRP for
-    // 140.55304742187 ZRP partially crosses, leaving TakerGets = 3654430 drops
-    // (the original tx amount was 3654519). The book directory quality must be
-    // the rate of the PLACED (leftover) amounts, so its low 64 bits are
-    // 0x500DAA02090C875D, not the original-amount 0x500DA9EC3A23F7E9.
+    // Known-answer vectors for the helper (mainnet DFF0E4CB / 105333100).
+    // apply() keys BookDirectory on the ORIGINAL tick-snapped amounts (rippled
+    // uRate); leftover vs original still hash-differ when TakerPays is not
+    // scaled with TakerGets.
     #[test]
-    fn book_quality_uses_placed_leftover_amounts() {
+    fn book_quality_known_answers_original_and_leftover() {
         let zrp = serde_json::json!({
             "currency": "ZRP",
             "issuer": "rZapJ1PZ297QAEXRGu3SZkAiwXbA7BNoe",
@@ -5419,6 +5452,22 @@ mod book_directory_quality_tests {
         assert_eq!(
             offer_book_quality(&zrp, &original_gets, true),
             0x500DA9EC3A23F7E9
+        );
+    }
+
+    // Mainnet 30000004 / 681FEF4C: pre-fixUniversalNumber getRate of the
+    // original TakerPays/TakerGets. Placement must use this, not the leftover.
+    #[test]
+    fn pre_number_original_rate_pins_30000004() {
+        let usd = serde_json::json!({
+            "currency": "USD",
+            "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+            "value": "9063"
+        });
+        let xrp = serde_json::json!("30658943169");
+        assert_eq!(
+            offer_book_quality(&usd, &xrp, false),
+            5_623_448_405_541_126_236
         );
     }
 }
@@ -5875,6 +5924,155 @@ mod taker_bridge_integration {
                 .read(&keylet::offer(&decode_account_id(TAKER).unwrap(), 1))
                 .is_none(),
             "no taker residual"
+        );
+    }
+
+    fn has_line(sandbox: &Sandbox<'_>, holder: &str, code: &[u8; 3]) -> bool {
+        let h = decode_account_id(holder).unwrap();
+        let i = decode_account_id(ISS).unwrap();
+        sandbox
+            .read(&keylet::trust_line(&h, &i, &ccy(code)))
+            .is_some()
+    }
+
+    fn owner_count(sandbox: &Sandbox<'_>, addr: &str) -> u64 {
+        let id = decode_account_id(addr).unwrap();
+        let b = sandbox.read(&keylet::account(&id)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        v["OwnerCount"].as_u64().unwrap()
+    }
+
+    // Seed a default (limit-0) RippleState so drain-to-zero is deletable.
+    fn put_default_line(ledger: &mut Ledger, holder: &str, code: &[u8; 3], bal: i64) {
+        let h = decode_account_id(holder).unwrap();
+        let i = decode_account_id(ISS).unwrap();
+        let cur = ccy(code);
+        let issuer_is_low = i.as_bytes() < h.as_bytes();
+        let value = if bal == 0 {
+            "0".to_string()
+        } else if issuer_is_low {
+            format!("-{bal}")
+        } else {
+            bal.to_string()
+        };
+        let cur_str = currency_code_str(&cur);
+        let (low, high) = if issuer_is_low {
+            (ISS, holder)
+        } else {
+            (holder, ISS)
+        };
+        // Reserve on the holder side only; no NoRipple so DefaultRipple-off
+        // still treats the drained line as deletable (View.cpp:994).
+        const LSF_LOW_RESERVE: u64 = 0x0001_0000;
+        const LSF_HIGH_RESERVE: u64 = 0x0002_0000;
+        let flags = if issuer_is_low {
+            LSF_HIGH_RESERVE
+        } else {
+            LSF_LOW_RESERVE
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": cur_str, "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": value},
+            "LowLimit": {"currency": cur_str, "issuer": low, "value": "0"},
+            "HighLimit": {"currency": cur_str, "issuer": high, "value": "0"},
+            "Flags": flags,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&h, &i, &cur),
+                serde_json::to_vec(&tl).unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn taker_without_output_line_creates_trust_line() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 0);
+        put_acct(&mut ledger, O1, 1_000_000_000, 0);
+        put_line(&mut ledger, O1, b"AAA", 100);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        let r1 = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": O1, "Fee": "12", "Sequence": 1,
+                "TakerGets": {"currency": "AAA", "issuer": ISS, "value": "100"},
+                "TakerPays": "100000000",
+            }),
+        );
+        assert_eq!(r1, TransactionResult::TesSuccess);
+        assert!(!has_line(&sandbox, TAKER, b"AAA"));
+
+        let rt = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "12", "Sequence": 1,
+                "TakerGets": "100000000",
+                "TakerPays": {"currency": "AAA", "issuer": ISS, "value": "100"},
+            }),
+        );
+        assert_eq!(rt, TransactionResult::TesSuccess);
+        assert!(
+            has_line(&sandbox, TAKER, b"AAA"),
+            "rippleCredit createOnDemand must write the taker's AAA line"
+        );
+        assert_eq!(line_bal(&sandbox, TAKER, b"AAA"), "100");
+        assert_eq!(line_bal(&sandbox, O1, b"AAA"), "0");
+        assert!(
+            owner_count(&sandbox, TAKER) >= 1,
+            "taker bears the new line's reserve"
+        );
+    }
+
+    #[test]
+    fn drained_default_trust_line_is_deleted() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 1);
+        put_acct(&mut ledger, O1, 1_000_000_000, 0);
+        put_default_line(&mut ledger, TAKER, b"AAA", 100);
+        put_line(&mut ledger, O1, b"AAA", 0);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        let r1 = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": O1, "Fee": "12", "Sequence": 1,
+                "TakerGets": "100000000",
+                "TakerPays": {"currency": "AAA", "issuer": ISS, "value": "100"},
+            }),
+        );
+        assert_eq!(r1, TransactionResult::TesSuccess);
+
+        let rt = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "12", "Sequence": 1,
+                "TakerGets": {"currency": "AAA", "issuer": ISS, "value": "100"},
+                "TakerPays": "100000000",
+            }),
+        );
+        assert_eq!(rt, TransactionResult::TesSuccess);
+        assert!(
+            !has_line(&sandbox, TAKER, b"AAA"),
+            "drained default line must be trustDeleted"
+        );
+        assert_eq!(
+            owner_count(&sandbox, TAKER),
+            0,
+            "sender OwnerCount drops with the deleted line"
         );
     }
 }
