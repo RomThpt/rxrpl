@@ -440,12 +440,22 @@ impl Transactor for OfferCreateTransactor {
 
         // rippled clears the leftover offer when crossing exhausted the taker's
         // funds in the asset it sells: an offer it cannot fund at all is not
-        // placed (OfferCreate.cpp:481, `takerInBalance <= 0`). Applied to an IOU
-        // gets side, whose post-crossing balance is already committed to the
-        // view; an XRP gets side is reserve-gated below instead.
+        // placed (`flowCross`, OfferCreate.cpp:481-499, `takerInBalance <= 0`,
+        // where takerInBalance = accountFunds on the post-crossing sandbox =
+        // liquid balance above the owner reserve). An IOU gets side's
+        // post-crossing balance is committed to the view by crossing, so
+        // `owner_funds_leg` reads the live value; the taker's XRP balance moves
+        // through the working copy and is only written back on commit, so its
+        // post-crossing liquid funds are computed from `acct`.
         if crossed {
             if let Some(gets_leg) = Leg::parse(&taker_gets) {
-                if !gets_leg.is_xrp && owner_funds_leg(ctx, &account_id, &gets_leg).is_zero() {
+                let unfunded = if gets_leg.is_xrp {
+                    let oc = acct.get("OwnerCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    helpers::get_balance(&acct) as i64 - ctx.fees.account_reserve(oc) as i64 <= 0
+                } else {
+                    owner_funds_leg(ctx, &account_id, &gets_leg).is_zero()
+                };
+                if unfunded {
                     commit_acct(ctx, &acct)?;
                     return Ok(TransactionResult::TesSuccess);
                 }
