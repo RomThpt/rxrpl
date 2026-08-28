@@ -1077,8 +1077,9 @@ fn cross_offers(
                     consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
                     consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
                 } else {
-                    let new_gets = leg_sub(&offer_out, &order_out);
-                    let new_pays = leg_sub_round(&offer_in, &order_in);
+                    let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+                    let new_gets = leftover_leg(&offer_out, &order_out, number_switchover);
+                    let new_pays = leftover_leg(&offer_in, &order_in, number_switchover);
                     consumed["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
                     consumed["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
                 }
@@ -1090,12 +1091,14 @@ fn cross_offers(
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
             } else {
                 // Reduce the resting offer in place by the filled amounts. Both
-                // sides round to nearest (fixUniversalNumber Number semantics):
-                // the legacy truncating subtraction left the leftover TakerGets
-                // 1 ULP high on a partial take (e.g. 105500025 XAH offer
-                // 402E09A9: …638335 vs mainnet …638334).
-                let new_gets = leg_sub_round(&offer_out, &order_out);
-                let new_pays = leg_sub_round(&offer_in, &order_in);
+                // sides round to nearest once fixUniversalNumber is on (Number
+                // semantics); the legacy truncating subtraction left the leftover
+                // TakerGets 1 ULP high on a partial take (e.g. 105500025 XAH offer
+                // 402E09A9: …638335 vs mainnet …638334) and 1 ULP low on 2017
+                // TakerPays (30000008: …366 vs mainnet …367).
+                let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+                let new_gets = leftover_leg(&offer_out, &order_out, number_switchover);
+                let new_pays = leftover_leg(&offer_in, &order_in, number_switchover);
                 let mut reduced = offer.clone();
                 reduced["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
                 reduced["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
@@ -1727,8 +1730,9 @@ fn cross_book_hop(
                     .map_err(|_| TransactionResult::TefInternal)?;
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
             } else {
-                let new_gets = leg_sub_round(&offer_out, &order_out);
-                let new_pays = leg_sub_round(&offer_in, &order_in);
+                let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+                let new_gets = leftover_leg(&offer_out, &order_out, number_switchover);
+                let new_pays = leftover_leg(&offer_in, &order_in, number_switchover);
                 let mut reduced = offer.clone();
                 reduced["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
                 reduced["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
@@ -3422,6 +3426,18 @@ fn leg_sub_round(a: &Leg, b: &Leg) -> Leg {
     out
 }
 
+/// Resting-offer leftover after a partial take. Pre-`fixUniversalNumber` STAmount
+/// subtraction truncates; post-amendment Number rounds to nearest. Ledger
+/// 30000008's leftover TakerPays is one ULP higher under truncation
+/// (`2.512242529714367` vs `…366`).
+fn leftover_leg(a: &Leg, b: &Leg, number_switchover: bool) -> Leg {
+    if number_switchover {
+        leg_sub_round(a, b)
+    } else {
+        leg_sub(a, b)
+    }
+}
+
 /// Move the taker's input to the offer owner: XRP via balances, IOU via the
 /// grossed trust-line debit / net credit.
 fn pay_in(
@@ -5105,8 +5121,8 @@ fn taker_cross(
 mod taker_crossing_tests {
     use super::{
         Leg, TakerCrossType, composed_quality, flow_iou_to_iou, flow_iou_to_xrp, flow_xrp_to_iou,
-        leg_gt, leg_max, pack_rate, parity_rate, qual_div, qual_mul, reject_quality,
-        remaining_offer, select_path, sell_clamp_sub,
+        in_for_out, leftover_leg, leg_gt, leg_max, pack_rate, parity_rate, qual_div, qual_mul,
+        reject_quality, remaining_offer, select_path, sell_clamp_sub,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate};
     use rxrpl_primitives::AccountId;
@@ -5384,6 +5400,26 @@ mod taker_crossing_tests {
         // buy: pays = remaining_out = 30; gets = mulRound(30, gets/pays=2.0) = 60.
         assert_eq!(pays["value"], "30");
         assert_eq!(gets["value"], "60");
+    }
+
+    #[test]
+    fn ledger_30000008_payment_leftover_taker_pays() {
+        // Payment D091EB7D (30000008): demand-limited take of 18985524 XRP
+        // from offer 67FAFA4B. Mainnet leftover TakerPays is 2.512242529714367.
+        let offer_in = iou("2.51453731");
+        let offer_out = xrp(20_803_651_115);
+        let take_out = xrp(18_985_524);
+        let packed: u64 = 0x4B04_4B4E_6621_DCEF;
+        let rate = from_rate(packed).unwrap();
+        let priced = in_for_out(&take_out, &rate, &offer_in);
+        let leftover_trunc = leftover_leg(&offer_in, &priced, false);
+        let leftover_round = leftover_leg(&offer_in, &priced, true);
+        let want = IOUAmount::from_decimal_string("2.512242529714367").unwrap();
+        assert_eq!(
+            leftover_trunc.iou.to_decimal_string(),
+            want.to_decimal_string()
+        );
+        assert_eq!(leftover_round.iou.to_decimal_string(), "2.512242529714366");
     }
 
     #[test]
