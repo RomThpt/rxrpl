@@ -916,6 +916,8 @@ fn apply_paths_payment(
     // quality-ranked pass — is not yet modelled; a single path covers the
     // validated repro shape.)
     let mut delivered: Option<serde_json::Value> = None;
+    let limit_quality =
+        helpers::get_flags(ctx.tx) & rxrpl_protocol::flags::payment::TF_LIMIT_QUALITY != 0;
     for path in paths {
         let Some(path) = path.as_array() else {
             continue;
@@ -931,6 +933,7 @@ fn apply_paths_payment(
             &boundaries,
             &amount,
             &send_max,
+            limit_quality,
         ) {
             Ok((got, _spent)) => {
                 delivered = Some(got);

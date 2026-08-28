@@ -1783,6 +1783,7 @@ pub(crate) fn cross_path_payment(
     boundaries: &[Value],
     target_out: &Value,
     budget_in: &Value,
+    limit_quality: bool,
 ) -> Result<(Value, Value), TransactionResult> {
     let n = boundaries.len();
     if n < 2 {
@@ -1864,9 +1865,20 @@ pub(crate) fn cross_path_payment(
             unbounded_leg(&out_tmpl)
         };
 
+        // tfLimitQuality: do not walk worse-priced offers than the first filled
+        // quality on each hop. 30000010 Payment 3C89AD0B spends 10 CNY on the
+        // best CNY/XRP band then 4.2 XRP on XLM; unbounded hop-0 demand ate the
+        // rest of SendMax and over-credited the XRP maker.
         let (clob_out, clob_spent) = cross_book_hop(
-            ctx, taker, taker_acct, dest, &demand, &budget, /*skip_input_debit=*/ !is_first,
-            /*skip_output_credit=*/ !is_last, /*single_band=*/ false,
+            ctx,
+            taker,
+            taker_acct,
+            dest,
+            &demand,
+            &budget,
+            /*skip_input_debit=*/ !is_first,
+            /*skip_output_credit=*/ !is_last,
+            /*single_band=*/ limit_quality,
         )?;
 
         // Residual liquidity from the AMM pool for this pair, on the budget not
