@@ -354,11 +354,7 @@ impl Transactor for OfferCreateTransactor {
                 {
                     remove_from_book_dir(ctx.view, &book_dir, &cancel_key)?;
                 }
-                crate::owner_dir::remove_from_owner_dir_keep_empty(
-                    ctx.view,
-                    &account_id,
-                    &cancel_key,
-                )?;
+                crate::owner_dir::remove_from_owner_dir(ctx.view, &account_id, &cancel_key)?;
                 let _ = ctx.view.erase(&cancel_key);
                 helpers::adjust_owner_count(&mut acct, -1);
             }
