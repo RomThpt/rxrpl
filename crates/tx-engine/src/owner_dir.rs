@@ -191,7 +191,7 @@ pub fn dir_remove_page(
     page: u64,
     entry_key: &Hash256,
 ) -> Result<(), TransactionResult> {
-    dir_remove_page_impl(view, root_key, page, entry_key, false)
+    dir_remove_page_impl(view, root_key, page, entry_key, false, false)
 }
 
 /// As `dir_remove_page`, but when the removal empties the whole directory the
@@ -205,6 +205,7 @@ fn dir_remove_page_impl(
     page: u64,
     entry_key: &Hash256,
     keep_root: bool,
+    keep_empty_nonroot: bool,
 ) -> Result<(), TransactionResult> {
     let entry_hex = entry_key.to_string().to_uppercase();
     let order_preserving = view.sorted_directories();
@@ -227,7 +228,7 @@ fn dir_remove_page_impl(
     } else {
         indexes.swap_remove(pos);
     }
-    if indexes.is_empty() && page != 0 {
+    if indexes.is_empty() && page != 0 && !keep_empty_nonroot {
         // Unlink this page from the chain, then erase it.
         let prev = read_u64_field(&node, "IndexPrevious");
         relink(view, root_key, prev, next)?;
@@ -370,7 +371,7 @@ pub fn remove_from_owner_dir_keep_root(
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
         let next = read_u64_field(&node, "IndexNext");
         if dir_page(&node).iter().any(|h| h == &entry_hex) {
-            return dir_remove_page_impl(view, &root_key, page, entry_key, true);
+            return dir_remove_page_impl(view, &root_key, page, entry_key, true, false);
         }
         if next == 0 {
             return Ok(());
@@ -402,7 +403,27 @@ pub fn remove_from_owner_dir_page_keep_root(
     page: u64,
     entry_key: &Hash256,
 ) -> Result<(), TransactionResult> {
-    dir_remove_page_impl(view, &keylet::owner_dir(account_id), page, entry_key, true)
+    dir_remove_page_impl(view, &keylet::owner_dir(account_id), page, entry_key, true, false)
+}
+
+/// Remove an owner-directory entry but leave an emptied non-root page in place
+/// (`Indexes: []`) so a subsequent `dirAdd` in the same transaction can reuse
+/// it. OfferCreate's OfferSequence cancel-and-replace needs this: rippled's
+/// 2017 owner-dir last page is kept empty rather than unlinked.
+pub fn remove_from_owner_dir_page_keep_empty(
+    view: &mut dyn ApplyView,
+    account_id: &AccountId,
+    page: u64,
+    entry_key: &Hash256,
+) -> Result<(), TransactionResult> {
+    dir_remove_page_impl(
+        view,
+        &keylet::owner_dir(account_id),
+        page,
+        entry_key,
+        false,
+        true,
+    )
 }
 
 /// Collect every entry key listed in an account's owner directory, walking the
