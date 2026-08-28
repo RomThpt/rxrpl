@@ -1461,6 +1461,7 @@ fn cross_book_hop(
     skip_output_credit: bool,
     single_band: bool,
 ) -> Result<(Leg, Leg), TransactionResult> {
+    let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
     let inverse_book = keylet::book_dir(
         &budget_in.currency,
         &budget_in.issuer,
@@ -1701,7 +1702,7 @@ fn cross_book_hop(
                 taker_acct,
                 &owner,
                 &order_in,
-                true,
+                number_switchover,
                 skip_input_debit,
             )?;
             // `order_out` is the GROSS the offer/owner gives (the TakerGets it
@@ -1715,7 +1716,7 @@ fn cross_book_hop(
                 &owner,
                 dest,
                 &order_out,
-                true,
+                number_switchover,
                 skip_output_credit,
             )?;
 
