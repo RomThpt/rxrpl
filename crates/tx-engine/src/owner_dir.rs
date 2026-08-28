@@ -154,8 +154,9 @@ pub fn dir_insert(
 }
 
 /// Remove `entry_key` from a paginated directory, walking the page chain from
-/// the root. Empties non-root pages are unlinked and erased; an empty root with
-/// no successor is erased. No-op if the entry is absent.
+/// the root. Empty intermediate pages are unlinked and erased. Pre-SortedDirectories
+/// leaves an emptied last page in place; SortedDirectories unlinks it. An empty
+/// root with no successor is erased. No-op if the entry is absent.
 pub fn dir_remove(
     view: &mut dyn ApplyView,
     root_key: &Hash256,
@@ -228,13 +229,35 @@ fn dir_remove_page_impl(
         indexes.swap_remove(pos);
     }
     if indexes.is_empty() && page != 0 {
-        // Unlink this page from the chain, then erase it.
         let prev = read_u64_field(&node, "IndexPrevious");
+        // Pre-SortedDirectories dirDelete (2017) leaves an emptied last page
+        // linked when the directory has overflowed, so a later dirAdd reuses
+        // it. Intermediate empty pages are still unlinked. SortedDirectories
+        // always unlinks empty non-root pages.
+        if !order_preserving && next == 0 {
+            let root_has_entries = view
+                .read(root_key)
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .map(|root| !dir_page(&root).is_empty())
+                .unwrap_or(false);
+            if keep_root || prev != 0 || root_has_entries {
+                node["Indexes"] = Value::Array(vec![]);
+                let nb = serde_json::to_vec(&node).map_err(|_| TransactionResult::TefInternal)?;
+                view.update(page_key, nb)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+                return Ok(());
+            }
+            view.erase(&page_key)
+                .map_err(|_| TransactionResult::TefInternal)?;
+            if !keep_root {
+                view.erase(root_key)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+            }
+            return Ok(());
+        }
         relink(view, root_key, prev, next)?;
         view.erase(&page_key)
             .map_err(|_| TransactionResult::TefInternal)?;
-        // If that emptied the whole directory, drop the now-empty root too
-        // (unless the caller asked to keep it).
         if !keep_root {
             if let Some(b) = view.read(root_key) {
                 if let Ok(root) = serde_json::from_slice::<Value>(&b) {
@@ -714,11 +737,73 @@ mod tests {
             1
         );
 
-        // Remove directly via the page hint; page 1 held a single entry so it
-        // unlinks without walking from the root.
+        // Page 1 is the last page and the root still has entries: pre-SD
+        // dirDelete keeps that emptied last page so a later dirAdd reuses it.
+        remove_from_owner_dir_page(&mut sandbox, &account, 1, &spilled).unwrap();
+        let page1 = keylet::dir_node(&keylet::owner_dir(&account), 1);
+        let kept: Value = serde_json::from_slice(&sandbox.read(&page1).unwrap()).unwrap();
+        assert!(dir_page(&kept).is_empty());
+    }
+
+    #[test]
+    fn sorted_directories_unlinks_empty_last_page() {
+        let (ledger, fees) = fresh_sandbox();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let mut sandbox = Sandbox::new(&view);
+        sandbox.set_sorted_directories(true);
+
+        let account = id();
+        for i in 0..MAX_ENTRIES_PER_PAGE {
+            add_to_owner_dir(&mut sandbox, &account, &entry(i as u8)).unwrap();
+        }
+        let spilled = entry(0xff);
+        assert_eq!(
+            add_to_owner_dir(&mut sandbox, &account, &spilled).unwrap(),
+            1
+        );
+
         remove_from_owner_dir_page(&mut sandbox, &account, 1, &spilled).unwrap();
         let page1 = keylet::dir_node(&keylet::owner_dir(&account), 1);
         assert!(sandbox.read(&page1).is_none());
+    }
+
+    #[test]
+    fn legacy_keeps_empty_last_page_on_overflowed_chain() {
+        let (ledger, fees) = fresh_sandbox();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let mut sandbox = Sandbox::new(&view);
+
+        let account = id();
+        for i in 0u8..64 {
+            add_to_owner_dir(&mut sandbox, &account, &entry(i)).unwrap();
+        }
+        let last = entry(64);
+        assert_eq!(add_to_owner_dir(&mut sandbox, &account, &last).unwrap(), 2);
+
+        remove_from_owner_dir(&mut sandbox, &account, &last).unwrap();
+        let page2 = keylet::dir_node(&keylet::owner_dir(&account), 2);
+        let kept: Value = serde_json::from_slice(&sandbox.read(&page2).unwrap()).unwrap();
+        assert!(dir_page(&kept).is_empty());
+        assert_eq!(read_u64_field(&kept, "IndexPrevious"), 1);
+    }
+
+    #[test]
+    fn legacy_unlinks_empty_middle_page() {
+        let (ledger, fees) = fresh_sandbox();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let mut sandbox = Sandbox::new(&view);
+
+        let account = id();
+        for i in 0u8..65 {
+            add_to_owner_dir(&mut sandbox, &account, &entry(i)).unwrap();
+        }
+        for i in 32u8..64 {
+            remove_from_owner_dir(&mut sandbox, &account, &entry(i)).unwrap();
+        }
+        let page1 = keylet::dir_node(&keylet::owner_dir(&account), 1);
+        assert!(sandbox.read(&page1).is_none());
+        let page2 = keylet::dir_node(&keylet::owner_dir(&account), 2);
+        assert!(sandbox.read(&page2).is_some());
     }
 
     #[test]

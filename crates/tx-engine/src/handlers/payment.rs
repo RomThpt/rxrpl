@@ -1,3 +1,4 @@
+use rxrpl_amendment::feature::feature_id;
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::{TransactionResult, keylet};
 
@@ -326,10 +327,16 @@ impl Transactor for PaymentTransactor {
                 return Err(TransactionResult::TecNoDstInsuf);
             }
 
-            // New / resurrected accounts get Sequence = current ledger seq
-            // (rippled convention; preserves uniqueness of OfferIDs etc. across
-            // delete/recreate cycles within the same ledger history).
-            let new_seq = ctx.view.seq().max(1);
+            // Pre-DeletableAccounts, a brand-new AccountRoot starts at
+            // Sequence 1 (30000008 Payment 5703AAB5). After the amendment,
+            // Sequence is the current ledger seq so a resurrected account
+            // cannot replay offers from a previous incarnation.
+            let ledger_seq = ctx.view.seq().max(1);
+            let new_seq = if ctx.rules.enabled(&feature_id("DeletableAccounts")) {
+                ledger_seq
+            } else {
+                1
+            };
             // PreviousTxnID + PreviousTxnLgrSeq are SOE_REQUIRED on rippled's
             // AccountRoot SOTemplate. Omitting them produced parse-time
             // throws ("Field 'PreviousTxnID' is required but missing.") on
@@ -348,7 +355,7 @@ impl Transactor for PaymentTransactor {
                 "OwnerCount": 0,
                 "Flags": 0,
                 "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
-                "PreviousTxnLgrSeq": new_seq,
+                "PreviousTxnLgrSeq": ledger_seq,
             });
 
             let dst_data =
