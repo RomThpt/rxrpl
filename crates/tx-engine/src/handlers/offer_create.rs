@@ -5105,8 +5105,8 @@ fn taker_cross(
 mod taker_crossing_tests {
     use super::{
         Leg, TakerCrossType, composed_quality, flow_iou_to_iou, flow_iou_to_xrp, flow_xrp_to_iou,
-        leg_gt, leg_max, pack_rate, parity_rate, qual_div, qual_mul, reject_quality, remaining_offer,
-        select_path, sell_clamp_sub,
+        leg_gt, leg_max, pack_rate, parity_rate, qual_div, qual_mul, reject_quality,
+        remaining_offer, select_path, sell_clamp_sub,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate};
     use rxrpl_primitives::AccountId;

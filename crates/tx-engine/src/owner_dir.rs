@@ -741,8 +741,7 @@ mod tests {
         // dirDelete keeps that emptied last page so a later dirAdd reuses it.
         remove_from_owner_dir_page(&mut sandbox, &account, 1, &spilled).unwrap();
         let page1 = keylet::dir_node(&keylet::owner_dir(&account), 1);
-        let kept: Value =
-            serde_json::from_slice(&sandbox.read(&page1).unwrap()).unwrap();
+        let kept: Value = serde_json::from_slice(&sandbox.read(&page1).unwrap()).unwrap();
         assert!(dir_page(&kept).is_empty());
     }
 
@@ -783,8 +782,7 @@ mod tests {
 
         remove_from_owner_dir(&mut sandbox, &account, &last).unwrap();
         let page2 = keylet::dir_node(&keylet::owner_dir(&account), 2);
-        let kept: Value =
-            serde_json::from_slice(&sandbox.read(&page2).unwrap()).unwrap();
+        let kept: Value = serde_json::from_slice(&sandbox.read(&page2).unwrap()).unwrap();
         assert!(dir_page(&kept).is_empty());
         assert_eq!(read_u64_field(&kept, "IndexPrevious"), 1);
     }
