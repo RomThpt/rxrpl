@@ -208,7 +208,6 @@ fn dir_remove_page_impl(
     keep_root: bool,
 ) -> Result<(), TransactionResult> {
     let entry_hex = entry_key.to_string().to_uppercase();
-    let order_preserving = view.sorted_directories();
     let page_key = keylet::dir_node(root_key, page);
     let Some(bytes) = view.read(&page_key) else {
         return Ok(());
@@ -220,9 +219,14 @@ fn dir_remove_page_impl(
     let Some(pos) = indexes.iter().position(|h| h == &entry_hex) else {
         return Ok(());
     };
-    // SortedDirectories preserves relative order on removal; the legacy
-    // dirDelete swapped the entry with the last and popped. Gating on the
-    // amendment replays both eras' page ordering byte-for-byte.
+    // 2017 offerDelete: bStable=true on the book directory (order-preserving
+    // erase) and false on the owner directory (swap-with-last). SortedDirectories
+    // later made every dirRemove preserve order. 30000013 OfferCancel D816C698
+    // left book Indexes [80BA, E382]; swap_remove produced [E382, 80BA].
+    let is_book = node.get("ExchangeRate").is_some()
+        || node.get("TakerPaysCurrency").is_some()
+        || node.get("TakerGetsCurrency").is_some();
+    let order_preserving = view.sorted_directories() || is_book;
     if order_preserving {
         indexes.remove(pos);
     } else {
@@ -234,7 +238,7 @@ fn dir_remove_page_impl(
         // linked when the directory has overflowed, so a later dirAdd reuses
         // it. Intermediate empty pages are still unlinked. SortedDirectories
         // always unlinks empty non-root pages.
-        if !order_preserving && next == 0 {
+        if !view.sorted_directories() && next == 0 {
             let root_has_entries = view
                 .read(root_key)
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
@@ -680,6 +684,25 @@ mod tests {
         assert_eq!(
             dir(&sandbox),
             [entry(2), entry(1)].map(|e| e.to_string().to_uppercase())
+        );
+    }
+
+    #[test]
+    fn book_dir_remove_preserves_index_order() {
+        // 2017 offerDelete passes bStable=true for the book directory.
+        let (ledger, fees) = fresh_sandbox();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let mut sandbox = Sandbox::new(&view);
+        let book = Hash256::new([0x2A; 32]);
+        let describe = [("ExchangeRate", Value::from("4E079EDDBB572DD4"))];
+        for b in [1u8, 2, 3] {
+            add_to_book_dir(&mut sandbox, &book, &entry(b), &describe).unwrap();
+        }
+        dir_remove(&mut sandbox, &book, &entry(1)).unwrap();
+        let v: Value = serde_json::from_slice(&sandbox.read(&book).unwrap()).unwrap();
+        assert_eq!(
+            dir_page(&v),
+            [entry(2), entry(3)].map(|e| e.to_string().to_uppercase())
         );
     }
 
