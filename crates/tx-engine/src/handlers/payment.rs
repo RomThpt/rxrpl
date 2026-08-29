@@ -943,7 +943,11 @@ fn apply_paths_payment(
         }
     }
     let Some(delivered) = delivered else {
-        return Err(TransactionResult::TecPathPartial);
+        return Err(if limit_quality {
+            TransactionResult::TecPathDry
+        } else {
+            TransactionResult::TecPathPartial
+        });
     };
 
     // A path that delivers exactly zero is dry (tecPATH_DRY), even under
