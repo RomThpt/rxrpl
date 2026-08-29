@@ -1,5 +1,7 @@
 use rxrpl_amendment::feature::feature_id;
-use rxrpl_amount::{IOUAmount, from_rate, offer_quality, offer_quality_round_even, round_quality};
+use rxrpl_amount::{
+    IOUAmount, from_rate, get_rate, offer_quality, offer_quality_round_even, round_quality,
+};
 use rxrpl_codec::address::classic::{decode_account_id, encode_account_id};
 use rxrpl_primitives::{AccountId, Hash256};
 use rxrpl_protocol::TransactionResult;
@@ -21,6 +23,48 @@ pub(crate) fn book_dir_with_quality(book_base: &Hash256, quality: u64) -> Hash25
     let mut bytes = *book_base.as_bytes();
     bytes[24..32].copy_from_slice(&quality.to_be_bytes());
     Hash256::new(bytes)
+}
+
+/// Packed quality of the best (lowest-rate) funded page on the inverse book,
+/// or `None` if the book is empty. Used by `tfLimitQuality` to reject a path
+/// whose composite rate is worse than SendMax/Amount before any hop mutates.
+fn peek_best_book_quality(
+    view: &dyn crate::view::read_view::ReadView,
+    budget_in: &Leg,
+    demand_out: &Leg,
+) -> Option<u64> {
+    let inverse_book = keylet::book_dir(
+        &budget_in.currency,
+        &budget_in.issuer,
+        &demand_out.currency,
+        &demand_out.issuer,
+    );
+    let book_prefix = inverse_book.as_bytes()[0..24].to_vec();
+    let mut probe = book_dir_with_quality(&inverse_book, 0);
+    while let Some(dir_key) = view.succ(&probe) {
+        if dir_key.as_bytes()[0..24] != book_prefix[..] {
+            return None;
+        }
+        probe = dir_key;
+        let Some(bytes) = view.read(&dir_key) else {
+            continue;
+        };
+        let Ok(dir) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let empty = dir
+            .get("Indexes")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true);
+        if empty {
+            continue;
+        }
+        return Some(u64::from_be_bytes(
+            dir_key.as_bytes()[24..32].try_into().ok()?,
+        ));
+    }
+    None
 }
 
 /// Parse a decimal value string (e.g. `"277.167203027"`) into an `IOUAmount`,
@@ -1833,6 +1877,37 @@ pub(crate) fn cross_path_payment(
         &carry,
     )? {
         return Ok(res);
+    }
+
+    // tfLimitQuality: refuse the path when the composed best-offer quality is
+    // worse than SendMax/Amount. After 30000010 consumed the 10 CNY CNY/XRP
+    // band, 30000012 Payment AE4D4DEA (same conversion) is tecPATH_DRY on
+    // mainnet; walking the leftover band over-filled maker r4aqu2zb.
+    if limit_quality {
+        let send_max_leg = Leg::parse(budget_in).ok_or(TransactionResult::TemBadAmount)?;
+        let limit_q = get_rate(
+            &leg_as_quality_iou(&send_max_leg),
+            &leg_as_quality_iou(&final_demand),
+        )
+        .unwrap_or(0);
+        let mut path_q: Option<u64> = None;
+        for hop in 0..(n - 1) {
+            let in_tmpl = Leg::parse(&boundaries[hop]).ok_or(TransactionResult::TemBadAmount)?;
+            let out_tmpl =
+                Leg::parse(&boundaries[hop + 1]).ok_or(TransactionResult::TemBadAmount)?;
+            let Some(hq) = peek_best_book_quality(ctx.view, &in_tmpl, &out_tmpl) else {
+                return Err(TransactionResult::TecPathDry);
+            };
+            path_q = Some(match path_q {
+                None => hq,
+                Some(prev) => composed_quality(prev, hq),
+            });
+        }
+        if let Some(pq) = path_q {
+            if limit_q != 0 && pq > limit_q {
+                return Err(TransactionResult::TecPathDry);
+            }
+        }
     }
 
     let mut delivered = final_demand.clone();
@@ -5308,6 +5383,43 @@ mod taker_crossing_tests {
         )
         .unwrap();
         assert_eq!(composed_quality(q2, q3), q6);
+    }
+
+    #[test]
+    fn limit_quality_rejects_composed_path_worse_than_sendmax_amount() {
+        // 30000012 AE4D4DEA: SendMax 600.06 CNY / Amount 1482.4567 XLM.
+        // After 30000010 took the 10 CNY band, leftover hop quality composes
+        // strictly worse than that limit.
+        let limit = get_rate(
+            &IOUAmount::from_decimal_string("600.06").unwrap(),
+            &IOUAmount::from_decimal_string("1482.456705882353").unwrap(),
+        )
+        .unwrap();
+        let first_band = get_rate(
+            &IOUAmount::from_decimal_string("10").unwrap(),
+            &IOUAmount::from_decimal_string("4.200294").unwrap(),
+        )
+        .unwrap();
+        let xlm_band = get_rate(
+            &IOUAmount::from_decimal_string("4.200294").unwrap(),
+            &IOUAmount::from_decimal_string("24.707884").unwrap(),
+        )
+        .unwrap();
+        let ok = composed_quality(first_band, xlm_band);
+        assert!(
+            ok <= limit,
+            "30000010 fill {ok:#x} must pass limit {limit:#x}"
+        );
+        let worse_cny = get_rate(
+            &IOUAmount::from_decimal_string("20").unwrap(),
+            &IOUAmount::from_decimal_string("4.200294").unwrap(),
+        )
+        .unwrap();
+        let dry = composed_quality(worse_cny, xlm_band);
+        assert!(
+            dry > limit,
+            "leftover band {dry:#x} must miss limit {limit:#x}"
+        );
     }
 
     #[test]
