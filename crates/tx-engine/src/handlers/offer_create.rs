@@ -4309,9 +4309,16 @@ fn flow_xrp_to_iou(
         order_in = qual_mul(&order_out, rate, &order_in);
     }
     if !is_sell && !leg_ge(remaining_out, &order_out) {
-        order_out = remaining_out.clone();
-        order_in = qual_mul(&order_out, rate, &order_in);
-        issuers_out = gross_leg(&order_out, out_rate);
+        // 30000020: remaining 50.0000000012541 vs offer 50.00000000125411 is
+        // one STAmount ULP. Clamping leaves a dust leftover and the offer
+        // survives; taking the whole offer matches mainnet (OwnerCount 48).
+        if leftover_is_dust(&leg_sub(&order_out, remaining_out), &order_out) {
+            // remaining covers the offer at canonical precision
+        } else {
+            order_out = remaining_out.clone();
+            order_in = qual_mul(&order_out, rate, &order_in);
+            issuers_out = gross_leg(&order_out, out_rate);
+        }
     }
     if !leg_ge(taker_funds, &order_in) {
         order_in = taker_funds.clone();
@@ -4712,9 +4719,7 @@ fn consume_leg(
     // rippled CreateOffer::dry_offer: fully consumed, or the owner cannot fund
     // leftover TakerGets (transfer-fee gross drained the line).
     if leftover_out.is_zero()
-        || leftover_is_dust(&leftover_out, &t.offer_out)
         || leftover_in.is_zero()
-        || leftover_is_dust(&leftover_in, &t.offer_in)
         || owner_funds_leg(ctx, &t.owner, &t.offer_out).is_zero()
     {
         reap_offer(ctx, &t.owner, &t.key, &t.dir)?;
@@ -4732,9 +4737,7 @@ fn offer_is_dry(
         return true;
     }
     let leftover = leg_sub(offer_out, order_out);
-    leftover.is_zero()
-        || leftover_is_dust(&leftover, offer_out)
-        || owner_funds_leg(ctx, owner, offer_out).is_zero()
+    leftover.is_zero() || owner_funds_leg(ctx, owner, offer_out).is_zero()
 }
 
 /// rippled `Taker::fill` input settlement (taker -> owner), a `redeemIOU` plus
