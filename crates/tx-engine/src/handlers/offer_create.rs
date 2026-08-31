@@ -1722,23 +1722,28 @@ fn cross_book_hop(
                 };
                 (take_out.clone(), order_in)
             } else if funds_limited {
-                // Funds-limited (owner partially unfunded): rippled scales the
-                // resting offer — TakerPays * funded_TakerGets / TakerGets, rounded
-                // DOWN — rather than re-pricing the funded output at the book's
-                // bucket rate (which ceils and over-charges by up to 1 drop). The
-                // over-charge cascades through an interior bridge hop; a
-                // demand-limited take (below) still pays the ceil price.
-                let ratio = IOUAmount::divide(
-                    &leg_as_quality_iou(&avail_out),
-                    &leg_as_quality_iou(&offer_out),
-                )
-                .unwrap_or(IOUAmount::ZERO);
-                let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
+                // Interior hops: scale TakerPays * funded / TakerGets rounded
+                // DOWN so a ceil-priced IOU does not over-charge the next book.
+                // Terminal hops (30000046 rMTDcus ETC line): BookStep ceils
+                // that IOU (`Quality::ceilOutStrict`) onto the new RippleState.
+                let order_in = if terminal && !offer_in.is_xrp {
+                    leg_min(
+                        &leg_min(&in_for_out(&take_out, &eff_rate, &offer_in), &offer_in),
+                        &remaining_in,
+                    )
+                } else {
+                    let ratio = IOUAmount::divide(
+                        &leg_as_quality_iou(&avail_out),
+                        &leg_as_quality_iou(&offer_out),
+                    )
                     .unwrap_or(IOUAmount::ZERO);
-                let order_in = leg_min(
-                    &leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in),
-                    &remaining_in,
-                );
+                    let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
+                        .unwrap_or(IOUAmount::ZERO);
+                    leg_min(
+                        &leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in),
+                        &remaining_in,
+                    )
+                };
                 (take_out.clone(), order_in)
             } else {
                 // Demand-limited: pay the strict ceil price at the offer's book
