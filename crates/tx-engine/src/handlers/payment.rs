@@ -887,7 +887,18 @@ fn build_path_boundaries(
     // Append the destination asset (Amount) unless the last step already lands
     // on it.
     let (amt_cur, amt_iss) = boundary_asset(amount);
-    if (cur, iss) != (amt_cur, amt_iss) {
+    if cur == amt_cur && iss != amt_iss {
+        // Same currency, different issuer: dest is credited the path IOU
+        // (30000046 Payment 63B72EB4: book XRP->JPY@rB3g, Amount names dest).
+        // Pushing Amount would add a JPY@rB3g->JPY@self hop with no book.
+        if let Some(last) = out.last_mut() {
+            if let Some(obj) = last.as_object_mut() {
+                if let Some(v) = amount.get("value") {
+                    obj.insert("value".into(), v.clone());
+                }
+            }
+        }
+    } else if (cur, iss) != (amt_cur, amt_iss) {
         out.push(amount.clone());
     } else {
         // Replace the trailing interior boundary with the real Amount object so
