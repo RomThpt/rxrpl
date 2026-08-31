@@ -4693,15 +4693,20 @@ fn consume_leg(
     let Ok(mut offer) = serde_json::from_slice::<Value>(&ob) else {
         return Ok(());
     };
-    let leftover_out = if leg_ge(order_out, &t.offer_out) {
-        zero_leg(&t.offer_out)
+    // `OfferTip` is the first-seen snapshot. Bridged_cross reuses the same
+    // leg1 (or leg2) tip across the other stream's fills, so leftover must
+    // subtract this fill from the current SLE, not from that snapshot.
+    let current_out = Leg::parse(&offer["TakerGets"]).unwrap_or_else(|| t.offer_out.clone());
+    let current_in = Leg::parse(&offer["TakerPays"]).unwrap_or_else(|| t.offer_in.clone());
+    let leftover_out = if leg_ge(order_out, &current_out) {
+        zero_leg(&current_out)
     } else {
-        leg_sub(&t.offer_out, order_out)
+        leg_sub(&current_out, order_out)
     };
-    let leftover_in = if leg_ge(order_in, &t.offer_in) {
-        zero_leg(&t.offer_in)
+    let leftover_in = if leg_ge(order_in, &current_in) {
+        zero_leg(&current_in)
     } else {
-        leg_sub(&t.offer_in, order_in)
+        leg_sub(&current_in, order_in)
     };
     offer["TakerGets"] = leftover_out.with_amount(&leftover_out.iou, leftover_out.drops);
     offer["TakerPays"] = leftover_in.with_amount(&leftover_in.iou, leftover_in.drops);
@@ -6104,6 +6109,7 @@ mod taker_bridge_integration {
     const TAKER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
     const O1: &str = "rf1BiGeXwwQoi8Z2ueFYTEXSwuJYfV2Jpn";
     const O2: &str = "rpP2JgiMyTF5jR5hLG3xHCPi1knBb1v9cM";
+    const O3: &str = "r3kmLJN5D28dHuH8vZNUZpMC43pEHpaocV";
     const ISS: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
 
     fn ccy(code: &[u8; 3]) -> [u8; 20] {
@@ -6313,6 +6319,97 @@ mod taker_bridge_integration {
                 .read(&keylet::offer(&decode_account_id(TAKER).unwrap(), 1))
                 .is_none(),
             "no taker residual"
+        );
+    }
+
+    #[test]
+    fn bridged_cross_accumulates_leg1_leftover_across_leg2_fills() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 2);
+        put_acct(&mut ledger, O1, 1_000_000_000, 1);
+        put_acct(&mut ledger, O2, 1_000_000_000, 1);
+        put_acct(&mut ledger, O3, 1_000_000_000, 1);
+        put_line(&mut ledger, TAKER, b"AAA", 200);
+        put_line(&mut ledger, TAKER, b"BBB", 0);
+        put_line(&mut ledger, O1, b"AAA", 0);
+        put_line(&mut ledger, O2, b"BBB", 100);
+        put_line(&mut ledger, O3, b"BBB", 100);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O1, "Fee": "12", "Sequence": 1,
+                    "TakerGets": "300000000",
+                    "TakerPays": {"currency": "AAA", "issuer": ISS, "value": "300"},
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O2, "Fee": "12", "Sequence": 1,
+                    "TakerGets": {"currency": "BBB", "issuer": ISS, "value": "100"},
+                    "TakerPays": "100000000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O3, "Fee": "12", "Sequence": 1,
+                    "TakerGets": {"currency": "BBB", "issuer": ISS, "value": "100"},
+                    "TakerPays": "100000000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "12", "Sequence": 1,
+                    "TakerGets": {"currency": "AAA", "issuer": ISS, "value": "200"},
+                    "TakerPays": {"currency": "BBB", "issuer": ISS, "value": "200"},
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+
+        assert_eq!(xrp_bal(&sandbox, O1), 800_000_000, "leg1 paid 200 XRP");
+        let leftover = sandbox
+            .read(&keylet::offer(&decode_account_id(O1).unwrap(), 1))
+            .expect("leg1 still resting");
+        let leftover: serde_json::Value = serde_json::from_slice(&leftover).unwrap();
+        assert_eq!(
+            leftover["TakerGets"].as_str(),
+            Some("100000000"),
+            "leg1 leftover is original minus every fill, not minus the last fill"
+        );
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(O2).unwrap(), 1))
+                .is_none(),
+            "leg2a consumed"
+        );
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(O3).unwrap(), 1))
+                .is_none(),
+            "leg2b consumed"
         );
     }
 
