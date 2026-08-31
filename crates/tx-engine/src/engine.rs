@@ -506,30 +506,27 @@ impl TxEngine {
             let child_changes = child.into_changes();
 
             match handler_result {
-                Ok(result) => {
+                Ok(result) if result.is_success() => {
                     // tes: merge child mutations into parent
                     sandbox.merge_child_changes(child_changes);
 
                     // Execute hooks on the destination account (if any)
-                    if result == TransactionResult::TesSuccess {
-                        let tx_hash = rxrpl_protocol::tx::compute_tx_hash(tx).unwrap_or_default();
-                        if let Some(hook_result) =
-                            crate::hooks::execute_hooks_for_tx(tx, &tx_hash, &sandbox)
-                        {
-                            if hook_result.rollback {
-                                // A hook called rollback -- revert the transaction
-                                return Ok(TransactionResult::TecHookRejected);
-                            }
+                    let tx_hash = rxrpl_protocol::tx::compute_tx_hash(tx).unwrap_or_default();
+                    if let Some(hook_result) =
+                        crate::hooks::execute_hooks_for_tx(tx, &tx_hash, &sandbox)
+                    {
+                        if hook_result.rollback {
+                            return Ok(TransactionResult::TecHookRejected);
                         }
                     }
 
                     (result, true)
                 }
-                Err(result) if result.is_claimed() => {
-                    // Under tapRETRY a tec is deferred: discard the parent
-                    // sandbox (fee + seq consume included) by returning before
-                    // the commit, so the ledger is untouched and the caller can
-                    // retry it in a later pass.
+                Ok(result) | Err(result) if result.is_claimed() => {
+                    // Handler `Ok(tec)` (e.g. OfferCreate tecUNFUNDED_OFFER) must
+                    // not merge doApply mutations or consume Sequence under
+                    // tapRETRY. 30000015: claiming unfunded seq 12484071 on pass
+                    // 0 let 08A0101C cancel offer 17043C3E before 512120C8 took it.
                     if tap_retry && result.is_retryable_tec() {
                         return Ok(result);
                     }
@@ -539,6 +536,10 @@ impl TxEngine {
                 Err(result) => {
                     // tem/tef/ter: discard everything
                     return Ok(result);
+                }
+                Ok(result) => {
+                    sandbox.merge_child_changes(child_changes);
+                    (result, true)
                 }
             }
         };
@@ -769,6 +770,24 @@ mod tests {
         }
     }
 
+    /// Handler returns `Ok(tecUNFUNDED_OFFER)` like OfferCreate's apply path.
+    struct OkTecUnfundedTransactor;
+
+    impl Transactor for OkTecUnfundedTransactor {
+        fn preflight(&self, _ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
+            Ok(())
+        }
+        fn preclaim(&self, _ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
+            Ok(())
+        }
+        fn apply(
+            &self,
+            _ctx: &mut ApplyContext<'_>,
+        ) -> Result<TransactionResult, TransactionResult> {
+            Ok(TransactionResult::TecUnfundedOffer)
+        }
+    }
+
     /// A test transactor that fails with tec (claimed cost).
     struct TecTransactor;
 
@@ -920,6 +939,46 @@ mod tests {
         assert_eq!(
             check_seq_proxy(&ticket_tx(addr, 10), &view),
             Err(TransactionResult::TerPreTicket)
+        );
+    }
+
+    #[test]
+    fn tap_retry_defers_ok_tec_without_consuming_sequence() {
+        let engine = test_engine_with(TransactionType::AccountSet, OkTecUnfundedTransactor);
+        let mut ledger = setup_ledger_with_account("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh", 1_000_000);
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+        let tx = make_tx("AccountSet");
+        let result = engine
+            .apply_retriable(&tx, &mut ledger, &rules, &fees)
+            .unwrap();
+        assert_eq!(result, TransactionResult::TecUnfundedOffer);
+        let id = decode_account_id("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh").unwrap();
+        let data = ledger.get_state(&keylet::account(&id)).unwrap();
+        let obj: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
+        assert_eq!(obj["Sequence"].as_u64().unwrap(), 1);
+        assert_eq!(
+            obj["Balance"].as_str().unwrap().parse::<u64>().unwrap(),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn claimed_ok_tec_consumes_sequence_without_doapply_mutations() {
+        let engine = test_engine_with(TransactionType::AccountSet, OkTecUnfundedTransactor);
+        let mut ledger = setup_ledger_with_account("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh", 1_000_000);
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+        let tx = make_tx("AccountSet");
+        let result = engine.apply(&tx, &mut ledger, &rules, &fees).unwrap();
+        assert_eq!(result, TransactionResult::TecUnfundedOffer);
+        let id = decode_account_id("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh").unwrap();
+        let data = ledger.get_state(&keylet::account(&id)).unwrap();
+        let obj: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
+        assert_eq!(obj["Sequence"].as_u64().unwrap(), 2);
+        assert_eq!(
+            obj["Balance"].as_str().unwrap().parse::<u64>().unwrap(),
+            1_000_000 - 10
         );
     }
 
