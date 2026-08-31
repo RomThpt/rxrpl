@@ -4767,6 +4767,25 @@ fn settle_in_legacy(
         )?;
     }
     if owner != &issuer {
+        // rippleCredit createOnDemand for the maker: 30000015 OfferCreate
+        // 512120C8 delivers Gatehub BTC to rH3uSRUJ who had no BTC line.
+        // Missing-line TecPathDry left that take unapplied, so later
+        // IOU-selling OfferCreates (BBA2D098) were tecUNFUNDED.
+        let tl_key = keylet::trust_line(owner, &issuer, &order_in.currency);
+        if ctx.view.read(&tl_key).is_none() {
+            let owner_key = keylet::account(owner);
+            let ob = ctx
+                .view
+                .read(&owner_key)
+                .ok_or(TransactionResult::TefInternal)?;
+            let mut oacct: Value =
+                serde_json::from_slice(&ob).map_err(|_| TransactionResult::TefInternal)?;
+            create_iou_trust_line(ctx, owner, &mut oacct, &issuer, &order_in.currency)?;
+            let nb = serde_json::to_vec(&oacct).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(owner_key, nb)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
         credit_line(
             ctx,
             owner,
@@ -5281,8 +5300,9 @@ mod taker_crossing_tests {
         in_for_out, leftover_leg, leg_gt, leg_max, pack_rate, parity_rate, qual_div, qual_mul,
         reject_quality, remaining_offer, select_path, sell_clamp_sub,
     };
-    use rxrpl_amount::{IOUAmount, from_rate, get_rate};
+    use rxrpl_amount::{IOUAmount, from_rate, get_rate, offer_quality};
     use rxrpl_primitives::AccountId;
+    use rxrpl_protocol::keylet;
 
     fn iou(v: &str) -> Leg {
         Leg {
@@ -5313,6 +5333,53 @@ mod taker_crossing_tests {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn ledger_30000015_threshold_rejects_best_inverse_btc_xrp() {
+        // OfferCreate 7C16EAE4: TakerGets 23048078497 XRP / TakerPays 7.6826 BTC.
+        // Inverse book tip rhK6GEk 8688 is ~70000 XRP/BTC; we must not take it.
+        let threshold = get_rate(
+            &IOUAmount::from_decimal_string("23048078497").unwrap(),
+            &IOUAmount::from_decimal_string("7.68261600540501").unwrap(),
+        )
+        .unwrap();
+        let inverse_tip = 0x5F18_DE4D_4B80_5BD1u64;
+        assert!(
+            reject_quality(inverse_tip, threshold),
+            "inverse tip {inverse_tip:#x} must miss threshold {threshold:#x}"
+        );
+        let our_book = 0x4B0B_D79E_626E_0800u64;
+        assert_eq!(
+            offer_quality(
+                &IOUAmount::from_decimal_string("7.68261600540501").unwrap(),
+                &IOUAmount::from_decimal_string("23048078497").unwrap(),
+            )
+            .unwrap(),
+            our_book
+        );
+        let btc = {
+            let mut c = [0u8; 20];
+            c[12..15].copy_from_slice(b"BTC");
+            c
+        };
+        let issuer =
+            rxrpl_codec::address::classic::decode_account_id("rLEsXccBGNR3UPuPu2hUXPjziKC3qKSBun")
+                .unwrap();
+        let xrp = [0u8; 20];
+        let zero = AccountId::from([0u8; 20]);
+        let inverse = keylet::book_dir(&xrp, &zero, &btc, &issuer);
+        let same = keylet::book_dir(&btc, &issuer, &xrp, &zero);
+        assert!(
+            inverse.to_string().to_uppercase().starts_with("16CAFBAC"),
+            "inverse {}",
+            inverse
+        );
+        assert!(
+            same.to_string().to_uppercase().starts_with("101FE75F"),
+            "same {}",
+            same
+        );
     }
 
     #[test]
@@ -6302,6 +6369,52 @@ mod taker_bridge_integration {
         assert!(
             owner_count(&sandbox, TAKER) >= 1,
             "taker bears the new line's reserve"
+        );
+    }
+
+    #[test]
+    fn maker_without_input_line_creates_trust_line() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 0);
+        put_acct(&mut ledger, O1, 1_000_000_000, 0);
+        put_line(&mut ledger, TAKER, b"AAA", 100);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        let r1 = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": O1, "Fee": "12", "Sequence": 1,
+                "TakerGets": "100000000",
+                "TakerPays": {"currency": "AAA", "issuer": ISS, "value": "100"},
+            }),
+        );
+        assert_eq!(r1, TransactionResult::TesSuccess);
+        assert!(!has_line(&sandbox, O1, b"AAA"));
+
+        let rt = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "12", "Sequence": 1,
+                "TakerGets": {"currency": "AAA", "issuer": ISS, "value": "100"},
+                "TakerPays": "100000000",
+            }),
+        );
+        assert_eq!(rt, TransactionResult::TesSuccess);
+        assert!(
+            has_line(&sandbox, O1, b"AAA"),
+            "rippleCredit createOnDemand must write the maker's AAA line"
+        );
+        assert_eq!(line_bal(&sandbox, O1, b"AAA"), "100");
+        assert_eq!(line_bal(&sandbox, TAKER, b"AAA"), "0");
+        assert!(
+            owner_count(&sandbox, O1) >= 1,
+            "maker bears the new line's reserve"
         );
     }
 
