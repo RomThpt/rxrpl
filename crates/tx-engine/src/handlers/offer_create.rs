@@ -3559,6 +3559,21 @@ fn leg_ge(a: &Leg, b: &Leg) -> bool {
     }
 }
 
+/// True when `part` is below one ULP of a 16-digit `whole` (STAmount). 30000020
+/// IOC 4F0BD7AA leftover 1e-14 EUR on a 50 EUR offer; mainnet stores 0 and reaps.
+fn leftover_is_dust(part: &Leg, whole: &Leg) -> bool {
+    if part.is_zero() {
+        return true;
+    }
+    if part.is_xrp || whole.is_xrp || whole.is_zero() {
+        return false;
+    }
+    match IOUAmount::divide(&part.iou, &whole.iou) {
+        Ok(q) => q.is_zero() || q.exponent() <= -16,
+        Err(_) => false,
+    }
+}
+
 /// `a - b` for like-typed legs (same currency).
 fn leg_sub(a: &Leg, b: &Leg) -> Leg {
     let mut out = a.clone();
@@ -4698,6 +4713,9 @@ fn consume_leg(
     // leftover TakerGets (transfer-fee gross drained the line).
     if leftover_out.is_zero()
         || leftover_in.is_zero()
+        || (leftover_in.is_xrp
+            && leftover_in.drops <= 1
+            && leftover_is_dust(&leftover_out, &t.offer_out))
         || owner_funds_leg(ctx, &t.owner, &t.offer_out).is_zero()
     {
         reap_offer(ctx, &t.owner, &t.key, &t.dir)?;
@@ -5297,8 +5315,8 @@ fn taker_cross(
 mod taker_crossing_tests {
     use super::{
         Leg, TakerCrossType, composed_quality, flow_iou_to_iou, flow_iou_to_xrp, flow_xrp_to_iou,
-        in_for_out, leftover_leg, leg_gt, leg_max, pack_rate, parity_rate, qual_div, qual_mul,
-        reject_quality, remaining_offer, select_path, sell_clamp_sub,
+        in_for_out, leftover_is_dust, leftover_leg, leg_gt, leg_max, pack_rate, parity_rate,
+        qual_div, qual_mul, reject_quality, remaining_offer, select_path, sell_clamp_sub,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, offer_quality};
     use rxrpl_primitives::AccountId;
@@ -5333,6 +5351,36 @@ mod taker_crossing_tests {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn ledger_30000020_eur_leftover_is_canonical_zero() {
+        // IOC 4F0BD7AA: taker wants 50.0000000012541 EUR, maker has
+        // 50.00000000125411. Mainnet leftover TakerGets is 0 and the offer is
+        // deleted. STAmount 16-digit leftover must be zero.
+        let offer = IOUAmount::from_decimal_string("50.00000000125411").unwrap();
+        let take = IOUAmount::from_decimal_string("50.0000000012541").unwrap();
+        let leftover = IOUAmount::sub(&offer, &take).unwrap();
+        let part = Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: leftover,
+            currency: [0u8; 20],
+            issuer: AccountId::from([0u8; 20]),
+        };
+        let whole = Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: offer,
+            currency: [0u8; 20],
+            issuer: AccountId::from([0u8; 20]),
+        };
+        assert!(
+            leftover_is_dust(&part, &whole),
+            "leftover {} must be dust vs {}",
+            leftover.to_decimal_string(),
+            offer.to_decimal_string()
+        );
     }
 
     #[test]
