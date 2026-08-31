@@ -1779,10 +1779,17 @@ fn cross_book_hop(
                 skip_output_credit,
             )?;
 
-            if full_take {
+            if full_take || funds_limited {
                 let mut consumed = offer.clone();
-                consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
-                consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
+                if full_take {
+                    consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
+                    consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
+                } else {
+                    let new_gets = leftover_leg(&offer_out, &order_out, number_switchover);
+                    let new_pays = leftover_leg(&offer_in, &order_in, number_switchover);
+                    consumed["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
+                    consumed["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
+                }
                 let cb =
                     serde_json::to_vec(&consumed).map_err(|_| TransactionResult::TefInternal)?;
                 ctx.view
