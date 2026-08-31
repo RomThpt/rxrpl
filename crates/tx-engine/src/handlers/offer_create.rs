@@ -3643,6 +3643,23 @@ fn pay_in(
             round,
         )?;
     }
+    if owner != &amount.issuer {
+        let tl_key = keylet::trust_line(owner, &amount.issuer, &amount.currency);
+        if ctx.view.read(&tl_key).is_none() {
+            let owner_key = keylet::account(owner);
+            let ob = ctx
+                .view
+                .read(&owner_key)
+                .ok_or(TransactionResult::TefInternal)?;
+            let mut oacct: Value =
+                serde_json::from_slice(&ob).map_err(|_| TransactionResult::TefInternal)?;
+            create_iou_trust_line(ctx, owner, &mut oacct, &amount.issuer, &amount.currency)?;
+            let nb = serde_json::to_vec(&oacct).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(owner_key, nb)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
+    }
     credit_line(
         ctx,
         owner,
