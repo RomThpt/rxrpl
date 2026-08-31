@@ -1723,10 +1723,10 @@ fn cross_book_hop(
                 (take_out.clone(), order_in)
             } else if funds_limited {
                 // Interior hops: scale TakerPays * funded / TakerGets rounded
-                // DOWN so a ceil-priced IOU does not over-charge the next book.
-                // Terminal hops (30000046 rMTDcus ETC line): BookStep ceils
-                // that IOU (`Quality::ceilOutStrict`) onto the new RippleState.
-                let order_in = if terminal && !offer_in.is_xrp {
+                // DOWN so a ceil-priced input does not over-charge the next book.
+                // Terminal hops: BookStep ceils (`Quality::ceilOutStrict`) —
+                // 30000046 rMTDcus ETC line and r4aqu2zb's 1-drop XRP TakerPays.
+                let order_in = if terminal {
                     leg_min(
                         &leg_min(&in_for_out(&take_out, &eff_rate, &offer_in), &offer_in),
                         &remaining_in,
