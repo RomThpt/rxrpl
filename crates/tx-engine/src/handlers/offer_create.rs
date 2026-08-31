@@ -3809,14 +3809,10 @@ fn pay_out_gross(
         )?;
     }
     if !skip_recipient_credit && amount.issuer != *recipient {
-        credit_line(
-            ctx,
-            recipient,
-            &amount.issuer,
-            &amount.currency,
-            &net,
-            round,
-        )?;
+        // Dest credit uses STAmount round-to-nearest even pre-Number: 63B72EB4
+        // JPY line was 1 ULP short (`-25842.99999999994` vs `-25842.99999999999`)
+        // when the transfer-fee net was added with truncating `add`.
+        credit_line(ctx, recipient, &amount.issuer, &amount.currency, &net, true)?;
     }
     let mut net_leg = amount.clone();
     net_leg.iou = net;
