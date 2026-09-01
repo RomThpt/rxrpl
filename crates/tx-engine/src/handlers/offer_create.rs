@@ -1758,10 +1758,28 @@ fn cross_book_hop(
                     .unwrap_or(IOUAmount::ZERO);
                     let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
                         .unwrap_or(IOUAmount::ZERO);
-                    leg_min(
+                    let mut floor = leg_min(
                         &leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in),
                         &remaining_in,
-                    )
+                    );
+                    // 63B72EB4 r4aqu2zb: 283 JPY / 7488687.62 drops. Truncate is
+                    // 1 short. Half-up on the ~25k JPY fill (or dust) over-spent
+                    // 2127 drops. Only half-up a small IOU take with a real XRP
+                    // floor and first fractional digit >= 5.
+                    if terminal && offer_in.is_xrp && floor.drops > 0 && !take_out.is_xrp {
+                        if let Ok(small) = IOUAmount::from_decimal_string("1000") {
+                            if take_out.iou < small {
+                                if let Some((_, frac)) = scaled.to_decimal_string().split_once('.')
+                                {
+                                    if frac.chars().next().is_some_and(|c| c >= '5') {
+                                        floor.drops = floor.drops.saturating_add(1);
+                                        floor = leg_min(&leg_min(&floor, &offer_in), &remaining_in);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    floor
                 };
                 (take_out.clone(), order_in)
             } else {
