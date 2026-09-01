@@ -1745,18 +1745,7 @@ fn cross_book_hop(
                 // Terminal hops: BookStep ceils IOU input (`Quality::ceilOutStrict`)
                 // — 30000046 rMTDcus ETC line. XRP TakerPays stays scale-down:
                 // ceiling it over-spent 2127 drops on 63B72EB4.
-                let order_in = if terminal && offer_in.is_xrp {
-                    // 63B72EB4 r4aqu2zb: scale-down is 1 drop short; in_for_out
-                    // (strict ceil) over-spent 2127 on the large fill. Price from
-                    // the resting offer amounts with Number ceil.
-                    leg_min(
-                        &leg_min(
-                            &in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate),
-                            &offer_in,
-                        ),
-                        &remaining_in,
-                    )
-                } else if terminal && !offer_in.is_xrp {
+                let order_in = if terminal && !offer_in.is_xrp {
                     leg_min(
                         &leg_min(&in_for_out(&take_out, &eff_rate, &offer_in), &offer_in),
                         &remaining_in,
@@ -1769,10 +1758,26 @@ fn cross_book_hop(
                     .unwrap_or(IOUAmount::ZERO);
                     let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
                         .unwrap_or(IOUAmount::ZERO);
-                    leg_min(
+                    let mut floor = leg_min(
                         &leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in),
                         &remaining_in,
-                    )
+                    );
+                    // 63B72EB4 r4aqu2zb: scale-down is 1 drop short. Ceil-all
+                    // over-spent 2127 on the large fill — only bump when the
+                    // offer-priced Number ceil is exactly one drop above floor.
+                    if terminal && offer_in.is_xrp {
+                        let ceil = leg_min(
+                            &leg_min(
+                                &in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate),
+                                &offer_in,
+                            ),
+                            &remaining_in,
+                        );
+                        if ceil.drops == floor.drops + 1 {
+                            floor = ceil;
+                        }
+                    }
+                    floor
                 };
                 (take_out.clone(), order_in)
             } else {
