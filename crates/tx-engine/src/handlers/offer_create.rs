@@ -1758,10 +1758,23 @@ fn cross_book_hop(
                     .unwrap_or(IOUAmount::ZERO);
                     let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
                         .unwrap_or(IOUAmount::ZERO);
-                    leg_min(
+                    let mut floor = leg_min(
                         &leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in),
                         &remaining_in,
-                    )
+                    );
+                    // 63B72EB4 r4aqu2zb: scale is 7488687.62 drops. Truncating
+                    // the decimal is 1 short of mainnet. Round any fraction up.
+                    // Book-rate in_for_out ceil over-spent 2127 drops.
+                    if terminal && offer_in.is_xrp {
+                        let s = scaled.to_decimal_string();
+                        if s.split_once('.')
+                            .is_some_and(|(_, f)| f.chars().any(|c| c != '0'))
+                        {
+                            floor.drops = floor.drops.saturating_add(1);
+                            floor = leg_min(&leg_min(&floor, &offer_in), &remaining_in);
+                        }
+                    }
+                    floor
                 };
                 (take_out.clone(), order_in)
             } else {
