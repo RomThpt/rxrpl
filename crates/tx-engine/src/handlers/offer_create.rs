@@ -1832,16 +1832,27 @@ fn cross_book_hop(
     }
 
     // Per-fill dest credits truncate; their sum sat 5e-14 below Amount on
-    // 63B72EB4. Rewrite the dest line as one add of delivered onto the
-    // pre-hop balance (same as a single STAmount add of the total net).
+    // 63B72EB4. When remaining is zero or dust, rewrite dest as one add of
+    // Amount, not the truncated delivered sum.
     if let Some(before_s) = dest_line_before {
         if dest != &demand_out.issuer {
+            let leftover_dust = !remaining_out.is_xrp
+                && !remaining_out.is_zero()
+                && !demand_out.is_zero()
+                && IOUAmount::divide(&remaining_out.iou, &demand_out.iou)
+                    .map(|q| q.exponent() <= -30)
+                    .unwrap_or(false);
+            let credit = if remaining_out.is_zero() || leftover_dust {
+                demand_out.iou
+            } else {
+                delivered.iou
+            };
             if let Ok(before) = IOUAmount::from_decimal_string(&before_s) {
                 let holder_is_high = dest.as_bytes() > demand_out.issuer.as_bytes();
                 let delta = if holder_is_high {
-                    delivered.iou.negate()
+                    credit.negate()
                 } else {
-                    delivered.iou
+                    credit
                 };
                 if let Ok(expected) = IOUAmount::add(&before, &delta) {
                     if let Some(bytes) = ctx.view.read(&dest_line_key) {
