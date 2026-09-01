@@ -1765,7 +1765,7 @@ fn cross_book_hop(
                     // 63B72EB4 r4aqu2zb: scale is 7488687.62 drops. Truncating
                     // the decimal is 1 short of mainnet. Round any fraction up.
                     // Book-rate in_for_out ceil over-spent 2127 drops.
-                    if terminal && offer_in.is_xrp && floor.drops > 0 {
+                    if terminal && offer_in.is_xrp {
                         let s = scaled.to_decimal_string();
                         if s.split_once('.')
                             .is_some_and(|(_, f)| f.chars().any(|c| c != '0'))
