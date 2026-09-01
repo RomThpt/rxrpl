@@ -1573,7 +1573,10 @@ fn cross_book_hop(
         // where the AMM is at least as good as the offers about to fill and is a
         // no-op on a pure-CLOB book. The output lands on `dest`; interior hops
         // carry the previous hop's delivery so their input is not funds-capped.
-        if !remaining_out.is_zero() && !remaining_in.is_zero() {
+        if !remaining_out.is_zero()
+            && !remaining_in.is_zero()
+            && (skip_output_credit || !remaining_is_filled(&remaining_out, demand_out))
+        {
             let amm_budget = if skip_input_debit {
                 remaining_in.clone()
             } else {
@@ -1599,7 +1602,10 @@ fn cross_book_hop(
                     spent = leg_add(&spent, &amm_spent);
                 }
             }
-            if remaining_out.is_zero() || remaining_in.is_zero() {
+            if remaining_out.is_zero()
+                || remaining_in.is_zero()
+                || (!skip_output_credit && remaining_is_filled(&remaining_out, demand_out))
+            {
                 break 'walk;
             }
         }
@@ -1621,7 +1627,10 @@ fn cross_book_hop(
             .unwrap_or_default();
 
         for offer_key in offers {
-            if remaining_out.is_zero() || remaining_in.is_zero() {
+            if remaining_out.is_zero()
+                || remaining_in.is_zero()
+                || (!skip_output_credit && remaining_is_filled(&remaining_out, demand_out))
+            {
                 break 'walk;
             }
             let Some(ob) = ctx.view.read(&offer_key) else {
@@ -3619,6 +3628,18 @@ fn leg_ge(a: &Leg, b: &Leg) -> bool {
 
 /// True when `part` is below one ULP of a 16-digit `whole` (STAmount). 30000020
 /// IOC 4F0BD7AA leftover 1e-14 EUR on a 50 EUR offer; mainnet stores 0 and reaps.
+fn remaining_is_filled(remaining: &Leg, demand: &Leg) -> bool {
+    if remaining.is_zero() {
+        return true;
+    }
+    if remaining.is_xrp || demand.is_xrp || demand.is_zero() {
+        return false;
+    }
+    IOUAmount::divide(&remaining.iou, &demand.iou)
+        .map(|q| q.exponent() <= -30)
+        .unwrap_or(false)
+}
+
 fn leftover_is_dust(part: &Leg, whole: &Leg) -> bool {
     if part.is_zero() {
         return true;
