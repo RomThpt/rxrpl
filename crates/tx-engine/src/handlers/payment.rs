@@ -761,9 +761,15 @@ fn paths_resolve_to_chain(
                     .iter()
                     .any(|s| s.get("account").and_then(|v| v.as_str()).is_some());
                 (!require_ripple_step || has_ripple_step)
-                    && build_path_boundaries(view, steps, send_max, amount)
-                        .map(|b| b.len() >= 2)
-                        .unwrap_or(false)
+                    && build_path_boundaries(
+                        view,
+                        steps,
+                        send_max,
+                        amount,
+                        tx.get("Account").and_then(|v| v.as_str()).unwrap_or(""),
+                    )
+                    .map(|b| b.len() >= 2)
+                    .unwrap_or(false)
             })
         })
         .unwrap_or(false)
@@ -797,6 +803,7 @@ fn build_path_boundaries(
     path: &[serde_json::Value],
     send_max: &serde_json::Value,
     amount: &serde_json::Value,
+    source: &str,
 ) -> Option<Vec<serde_json::Value>> {
     let boundary_asset = |v: &serde_json::Value| -> (String, String) { asset_of(v) };
 
@@ -829,10 +836,24 @@ fn build_path_boundaries(
             //     (same currency, different issuer obligations) that this
             //     book/AMM-chain engine does not model — fall back to another path
             //     (or the legacy IOU<->IOU back-solve).
-            if step_cur.is_none()
-                && step_iss.is_none()
-                && (account == iss || account_has_ammid(view, account))
-            {
+            if step_cur.is_none() && step_iss.is_none() {
+                if account == iss || account_has_ammid(view, account) {
+                    continue;
+                }
+                // DirectStep: ripple into `account` keeping the currency, so
+                // the next book hop spends that account's IOU. 30000046 path
+                // `{account: rDAN} -> {currency: XRP}` must become ETC@rDAN
+                // -> XRP, not fall off the book/AMM engine.
+                if iss.is_empty() || iss != source {
+                    return None;
+                }
+                iss = account.to_string();
+                if let Some(obj) = out.last_mut().and_then(|v| v.as_object_mut()) {
+                    obj.insert(
+                        "issuer".into(),
+                        serde_json::Value::String(account.to_string()),
+                    );
+                }
                 continue;
             }
             return None;
@@ -866,7 +887,18 @@ fn build_path_boundaries(
     // Append the destination asset (Amount) unless the last step already lands
     // on it.
     let (amt_cur, amt_iss) = boundary_asset(amount);
-    if (cur, iss) != (amt_cur, amt_iss) {
+    if cur == amt_cur && iss != amt_iss {
+        // Same currency, different issuer: dest is credited the path IOU
+        // (30000046 Payment 63B72EB4: book XRP->JPY@rB3g, Amount names dest).
+        // Pushing Amount would add a JPY@rB3g->JPY@self hop with no book.
+        if let Some(last) = out.last_mut() {
+            if let Some(obj) = last.as_object_mut() {
+                if let Some(v) = amount.get("value") {
+                    obj.insert("value".into(), v.clone());
+                }
+            }
+        }
+    } else if (cur, iss) != (amt_cur, amt_iss) {
         out.push(amount.clone());
     } else {
         // Replace the trailing interior boundary with the real Amount object so
@@ -922,7 +954,9 @@ fn apply_paths_payment(
         let Some(path) = path.as_array() else {
             continue;
         };
-        let Some(boundaries) = build_path_boundaries(ctx.view, path, &send_max, &amount) else {
+        let Some(boundaries) =
+            build_path_boundaries(ctx.view, path, &send_max, &amount, account_str)
+        else {
             continue;
         };
         match crate::handlers::offer_create::cross_path_payment(
@@ -1011,7 +1045,15 @@ fn count_flow_strands(
         .iter()
         .filter(|p| {
             p.as_array()
-                .and_then(|steps| build_path_boundaries(view, steps, send_max, amount))
+                .and_then(|steps| {
+                    build_path_boundaries(
+                        view,
+                        steps,
+                        send_max,
+                        amount,
+                        tx.get("Account").and_then(|v| v.as_str()).unwrap_or(""),
+                    )
+                })
                 .map(|b| b.len() >= 2)
                 .unwrap_or(false)
         })
@@ -1042,7 +1084,13 @@ fn flow_strands_have_amm(
         let Some(steps) = p.as_array() else {
             continue;
         };
-        let Some(boundaries) = build_path_boundaries(view, steps, send_max, amount) else {
+        let Some(boundaries) = build_path_boundaries(
+            view,
+            steps,
+            send_max,
+            amount,
+            tx.get("Account").and_then(|v| v.as_str()).unwrap_or(""),
+        ) else {
             continue;
         };
         for pair in boundaries.windows(2) {
@@ -1115,7 +1163,9 @@ fn apply_paths_payment_multi(
         let Some(steps) = path.as_array() else {
             continue;
         };
-        let Some(boundaries) = build_path_boundaries(ctx.view, steps, &send_max, &amount) else {
+        let Some(boundaries) =
+            build_path_boundaries(ctx.view, steps, &send_max, &amount, account_str)
+        else {
             continue;
         };
         if boundaries.len() < 2 {

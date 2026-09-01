@@ -600,6 +600,151 @@ fn apply_cross_currency_consumes_offer() {
     assert!((holder_balance(&sandbox, MM, ISSUER, "EUR") - 80.0).abs() < 1e-6);
 }
 
+#[test]
+fn apply_cross_currency_creates_maker_trust_line_on_demand() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, ALICE, "50000000", None);
+    put_account(&mut ledger, BOB, "50000000", None);
+    put_account(&mut ledger, MM, "50000000", None);
+
+    put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+    put_trust_line(&mut ledger, BOB, ISSUER, "EUR", 0.0);
+    put_trust_line(&mut ledger, MM, ISSUER, "EUR", 100.0);
+
+    let mm_id = decode_account_id(MM).unwrap();
+    let offer_key = keylet::offer(&mm_id, 1);
+    let offer = serde_json::json!({
+        "LedgerEntryType": "Offer",
+        "Account": MM,
+        "Sequence": 1,
+        "TakerPays": iou("USD", ISSUER, "50"),
+        "TakerGets": iou("EUR", ISSUER, "50"),
+        "Flags": 0,
+    });
+    ledger
+        .put_state(offer_key, serde_json::to_vec(&offer).unwrap())
+        .unwrap();
+
+    let usd = helpers::currency_to_bytes("USD");
+    let eur = helpers::currency_to_bytes("EUR");
+    let issuer_id = decode_account_id(ISSUER).unwrap();
+    let book_root = keylet::book_dir(&usd, &issuer_id, &eur, &issuer_id);
+    let quality = rxrpl_amount::get_rate(
+        &rxrpl_amount::IOUAmount::from_decimal_string("50").unwrap(),
+        &rxrpl_amount::IOUAmount::from_decimal_string("50").unwrap(),
+    )
+    .unwrap();
+    let book_dir_key = crate::handlers::offer_create::book_dir_with_quality(&book_root, quality);
+    let dir = serde_json::json!({
+        "LedgerEntryType": "DirectoryNode",
+        "Indexes": [offer_key.to_string()],
+        "IndexNext": 0,
+    });
+    ledger
+        .put_state(book_dir_key, serde_json::to_vec(&dir).unwrap())
+        .unwrap();
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let usd_line = keylet::trust_line(&mm_id, &issuer_id, &usd);
+    assert!(sandbox.read(&usd_line).is_none());
+
+    let tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": BOB,
+        "Amount": iou("EUR", ISSUER, "20"),
+        "SendMax": iou("USD", ISSUER, "20"),
+        "Fee": "10",
+    });
+    let rules = Rules::new();
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    let result = PaymentTransactor.apply(&mut ctx).unwrap();
+    assert_eq!(result, TransactionResult::TesSuccess);
+    assert!(
+        sandbox.read(&usd_line).is_some(),
+        "rippleCredit createOnDemand must write the maker's USD line"
+    );
+    assert!((holder_balance(&sandbox, MM, ISSUER, "USD") - 20.0).abs() < 1e-6);
+    assert!((holder_balance(&sandbox, BOB, ISSUER, "EUR") - 20.0).abs() < 1e-6);
+}
+
+#[test]
+fn apply_paths_payment_direct_step_then_xrp_book() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, ALICE, "50000000", None);
+    put_account(&mut ledger, MM, "150000000", None);
+
+    put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+    put_trust_line(&mut ledger, MM, ISSUER, "USD", 0.0);
+
+    let mm_id = decode_account_id(MM).unwrap();
+    let offer_key = keylet::offer(&mm_id, 1);
+    let offer = serde_json::json!({
+        "LedgerEntryType": "Offer",
+        "Account": MM,
+        "Sequence": 1,
+        "TakerPays": iou("USD", ISSUER, "50"),
+        "TakerGets": "50000000",
+        "Flags": 0,
+    });
+    ledger
+        .put_state(offer_key, serde_json::to_vec(&offer).unwrap())
+        .unwrap();
+
+    let usd = helpers::currency_to_bytes("USD");
+    let xrp = [0u8; 20];
+    let issuer_id = decode_account_id(ISSUER).unwrap();
+    let zero = rxrpl_primitives::AccountId::from([0u8; 20]);
+    let book_root = keylet::book_dir(&usd, &issuer_id, &xrp, &zero);
+    let quality = rxrpl_amount::get_rate(
+        &rxrpl_amount::IOUAmount::from_decimal_string("50").unwrap(),
+        &rxrpl_amount::IOUAmount::from_decimal_string("50000000").unwrap(),
+    )
+    .unwrap();
+    let book_dir_key = crate::handlers::offer_create::book_dir_with_quality(&book_root, quality);
+    let dir = serde_json::json!({
+        "LedgerEntryType": "DirectoryNode",
+        "Indexes": [offer_key.to_string()],
+        "IndexNext": 0,
+    });
+    ledger
+        .put_state(book_dir_key, serde_json::to_vec(&dir).unwrap())
+        .unwrap();
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": "50000000",
+        "SendMax": iou("USD", ALICE, "50"),
+        "Paths": [[{ "account": ISSUER, "type": 1 }, { "currency": "XRP", "type": 16 }]],
+        "Fee": "10",
+    });
+    let rules = Rules::new();
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    let result = PaymentTransactor.apply(&mut ctx).unwrap();
+    assert_eq!(result, TransactionResult::TesSuccess);
+    assert!((holder_balance(&sandbox, ALICE, ISSUER, "USD") - 50.0).abs() < 1e-6);
+    assert!(sandbox.read(&keylet::offer(&mm_id, 1)).is_none());
+}
+
 // -- multi-hop walker --
 //
 // A USD→EUR→GBP payment with no direct USD/GBP book walks two book

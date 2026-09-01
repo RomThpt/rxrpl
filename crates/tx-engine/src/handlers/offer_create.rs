@@ -1525,6 +1525,15 @@ fn cross_book_hop(
 
     let mut remaining_out = demand_out.clone();
     let mut remaining_in = budget_in.clone();
+    let dest_line_key = keylet::trust_line(dest, &demand_out.issuer, &demand_out.currency);
+    let dest_line_before = if !skip_output_credit && !demand_out.is_xrp {
+        ctx.view.read(&dest_line_key).and_then(|b| {
+            let v: Value = serde_json::from_slice(&b).ok()?;
+            v.get("Balance")?.get("value")?.as_str().map(str::to_string)
+        })
+    } else {
+        None
+    };
     // When `single_band`, the walk consumes only ONE quality level (the first
     // page on which a funded offer is actually filled). rippled's `forEachOffer`
     // processes one quality band per `BookStep::rev/fwd`; the multi-path Flow loop
@@ -1564,7 +1573,10 @@ fn cross_book_hop(
         // where the AMM is at least as good as the offers about to fill and is a
         // no-op on a pure-CLOB book. The output lands on `dest`; interior hops
         // carry the previous hop's delivery so their input is not funds-capped.
-        if !remaining_out.is_zero() && !remaining_in.is_zero() {
+        if !remaining_out.is_zero()
+            && !remaining_in.is_zero()
+            && (skip_output_credit || !remaining_is_filled(&remaining_out, demand_out))
+        {
             let amm_budget = if skip_input_debit {
                 remaining_in.clone()
             } else {
@@ -1590,7 +1602,10 @@ fn cross_book_hop(
                     spent = leg_add(&spent, &amm_spent);
                 }
             }
-            if remaining_out.is_zero() || remaining_in.is_zero() {
+            if remaining_out.is_zero()
+                || remaining_in.is_zero()
+                || (!skip_output_credit && remaining_is_filled(&remaining_out, demand_out))
+            {
                 break 'walk;
             }
         }
@@ -1612,7 +1627,10 @@ fn cross_book_hop(
             .unwrap_or_default();
 
         for offer_key in offers {
-            if remaining_out.is_zero() || remaining_in.is_zero() {
+            if remaining_out.is_zero()
+                || remaining_in.is_zero()
+                || (!skip_output_credit && remaining_is_filled(&remaining_out, demand_out))
+            {
                 break 'walk;
             }
             let Some(ob) = ctx.view.read(&offer_key) else {
@@ -1722,23 +1740,29 @@ fn cross_book_hop(
                 };
                 (take_out.clone(), order_in)
             } else if funds_limited {
-                // Funds-limited (owner partially unfunded): rippled scales the
-                // resting offer — TakerPays * funded_TakerGets / TakerGets, rounded
-                // DOWN — rather than re-pricing the funded output at the book's
-                // bucket rate (which ceils and over-charges by up to 1 drop). The
-                // over-charge cascades through an interior bridge hop; a
-                // demand-limited take (below) still pays the ceil price.
-                let ratio = IOUAmount::divide(
-                    &leg_as_quality_iou(&avail_out),
-                    &leg_as_quality_iou(&offer_out),
-                )
-                .unwrap_or(IOUAmount::ZERO);
-                let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
+                // Interior hops: scale TakerPays * funded / TakerGets rounded
+                // DOWN so a ceil-priced input does not over-charge the next book.
+                // Terminal hops: BookStep ceils IOU input (`Quality::ceilOutStrict`)
+                // — 30000046 rMTDcus ETC line. XRP TakerPays stays scale-down:
+                // ceiling it over-spent 2127 drops on 63B72EB4.
+                let order_in = if terminal && !offer_in.is_xrp {
+                    leg_min(
+                        &leg_min(&in_for_out(&take_out, &eff_rate, &offer_in), &offer_in),
+                        &remaining_in,
+                    )
+                } else {
+                    let ratio = IOUAmount::divide(
+                        &leg_as_quality_iou(&avail_out),
+                        &leg_as_quality_iou(&offer_out),
+                    )
                     .unwrap_or(IOUAmount::ZERO);
-                let order_in = leg_min(
-                    &leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in),
-                    &remaining_in,
-                );
+                    let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
+                        .unwrap_or(IOUAmount::ZERO);
+                    leg_min(
+                        &leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in),
+                        &remaining_in,
+                    )
+                };
                 (take_out.clone(), order_in)
             } else {
                 // Demand-limited: pay the strict ceil price at the offer's book
@@ -1774,10 +1798,17 @@ fn cross_book_hop(
                 skip_output_credit,
             )?;
 
-            if full_take {
+            if full_take || funds_limited {
                 let mut consumed = offer.clone();
-                consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
-                consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
+                if full_take {
+                    consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
+                    consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
+                } else {
+                    let new_gets = leftover_leg(&offer_out, &order_out, number_switchover);
+                    let new_pays = leftover_leg(&offer_in, &order_in, number_switchover);
+                    consumed["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
+                    consumed["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
+                }
                 let cb =
                     serde_json::to_vec(&consumed).map_err(|_| TransactionResult::TefInternal)?;
                 ctx.view
@@ -1806,6 +1837,43 @@ fn cross_book_hop(
             // quality are not consumed this call.
             if single_band {
                 band_quality = Some(dir_quality);
+            }
+        }
+    }
+
+    // Per-fill dest credits truncate; their sum sat 5e-14 below Amount on
+    // 63B72EB4. When remaining is zero or dust, rewrite dest as one add of
+    // Amount, not the truncated delivered sum.
+    if let Some(before_s) = dest_line_before {
+        if dest != &demand_out.issuer {
+            let leftover_dust = !remaining_out.is_xrp
+                && !remaining_out.is_zero()
+                && !demand_out.is_zero()
+                && IOUAmount::divide(&remaining_out.iou, &demand_out.iou)
+                    .map(|q| q.exponent() <= -30)
+                    .unwrap_or(false);
+            let credit = if remaining_out.is_zero() || leftover_dust {
+                demand_out.iou
+            } else {
+                delivered.iou
+            };
+            if let Ok(before) = IOUAmount::from_decimal_string(&before_s) {
+                let holder_is_high = dest.as_bytes() > demand_out.issuer.as_bytes();
+                let delta = if holder_is_high {
+                    credit.negate()
+                } else {
+                    credit
+                };
+                if let Ok(expected) = IOUAmount::add(&before, &delta) {
+                    if let Some(bytes) = ctx.view.read(&dest_line_key) {
+                        if let Ok(mut line) = serde_json::from_slice::<Value>(&bytes) {
+                            line["Balance"]["value"] = Value::String(expected.to_decimal_string());
+                            if let Ok(nb) = serde_json::to_vec(&line) {
+                                let _ = ctx.view.update(dest_line_key, nb);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -3561,6 +3629,18 @@ fn leg_ge(a: &Leg, b: &Leg) -> bool {
 
 /// True when `part` is below one ULP of a 16-digit `whole` (STAmount). 30000020
 /// IOC 4F0BD7AA leftover 1e-14 EUR on a 50 EUR offer; mainnet stores 0 and reaps.
+fn remaining_is_filled(remaining: &Leg, demand: &Leg) -> bool {
+    if remaining.is_zero() {
+        return true;
+    }
+    if remaining.is_xrp || demand.is_xrp || demand.is_zero() {
+        return false;
+    }
+    IOUAmount::divide(&remaining.iou, &demand.iou)
+        .map(|q| q.exponent() <= -30)
+        .unwrap_or(false)
+}
+
 fn leftover_is_dust(part: &Leg, whole: &Leg) -> bool {
     if part.is_zero() {
         return true;
@@ -3642,6 +3722,23 @@ fn pay_in(
             &gross.negate(),
             round,
         )?;
+    }
+    if owner != &amount.issuer {
+        let tl_key = keylet::trust_line(owner, &amount.issuer, &amount.currency);
+        if ctx.view.read(&tl_key).is_none() {
+            let owner_key = keylet::account(owner);
+            let ob = ctx
+                .view
+                .read(&owner_key)
+                .ok_or(TransactionResult::TefInternal)?;
+            let mut oacct: Value =
+                serde_json::from_slice(&ob).map_err(|_| TransactionResult::TefInternal)?;
+            create_iou_trust_line(ctx, owner, &mut oacct, &amount.issuer, &amount.currency)?;
+            let nb = serde_json::to_vec(&oacct).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(owner_key, nb)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
     }
     credit_line(
         ctx,
