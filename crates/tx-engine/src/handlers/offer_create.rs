@@ -1745,7 +1745,18 @@ fn cross_book_hop(
                 // Terminal hops: BookStep ceils IOU input (`Quality::ceilOutStrict`)
                 // — 30000046 rMTDcus ETC line. XRP TakerPays stays scale-down:
                 // ceiling it over-spent 2127 drops on 63B72EB4.
-                let order_in = if terminal && !offer_in.is_xrp {
+                let order_in = if terminal && offer_in.is_xrp {
+                    // 63B72EB4 r4aqu2zb: scale-down is 1 drop short; in_for_out
+                    // (strict ceil) over-spent 2127 on the large fill. Price from
+                    // the resting offer amounts with Number ceil.
+                    leg_min(
+                        &leg_min(
+                            &in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate),
+                            &offer_in,
+                        ),
+                        &remaining_in,
+                    )
+                } else if terminal && !offer_in.is_xrp {
                     leg_min(
                         &leg_min(&in_for_out(&take_out, &eff_rate, &offer_in), &offer_in),
                         &remaining_in,
