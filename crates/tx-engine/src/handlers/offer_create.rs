@@ -1525,6 +1525,15 @@ fn cross_book_hop(
 
     let mut remaining_out = demand_out.clone();
     let mut remaining_in = budget_in.clone();
+    let dest_line_key = keylet::trust_line(dest, &demand_out.issuer, &demand_out.currency);
+    let dest_line_before = if !skip_output_credit && !demand_out.is_xrp {
+        ctx.view.read(&dest_line_key).and_then(|b| {
+            let v: Value = serde_json::from_slice(&b).ok()?;
+            v.get("Balance")?.get("value")?.as_str().map(str::to_string)
+        })
+    } else {
+        None
+    };
     // When `single_band`, the walk consumes only ONE quality level (the first
     // page on which a funded offer is actually filled). rippled's `forEachOffer`
     // processes one quality band per `BookStep::rev/fwd`; the multi-path Flow loop
@@ -1818,6 +1827,32 @@ fn cross_book_hop(
             // quality are not consumed this call.
             if single_band {
                 band_quality = Some(dir_quality);
+            }
+        }
+    }
+
+    // Per-fill dest credits truncate; their sum sat 5e-14 below Amount on
+    // 63B72EB4. Rewrite the dest line as one add of delivered onto the
+    // pre-hop balance (same as a single STAmount add of the total net).
+    if let Some(before_s) = dest_line_before {
+        if dest != &demand_out.issuer {
+            if let Ok(before) = IOUAmount::from_decimal_string(&before_s) {
+                let holder_is_high = dest.as_bytes() > demand_out.issuer.as_bytes();
+                let delta = if holder_is_high {
+                    delivered.iou.negate()
+                } else {
+                    delivered.iou
+                };
+                if let Ok(expected) = IOUAmount::add(&before, &delta) {
+                    if let Some(bytes) = ctx.view.read(&dest_line_key) {
+                        if let Ok(mut line) = serde_json::from_slice::<Value>(&bytes) {
+                            line["Balance"]["value"] = Value::String(expected.to_decimal_string());
+                            if let Ok(nb) = serde_json::to_vec(&line) {
+                                let _ = ctx.view.update(dest_line_key, nb);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
