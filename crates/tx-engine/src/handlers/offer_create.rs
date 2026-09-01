@@ -1822,29 +1822,6 @@ fn cross_book_hop(
         }
     }
 
-    // Last-hop dest: transfer-fee nets can leave ~1e-14 of Amount undelivered
-    // (63B72EB4: -25842.99999999994 vs -25842.99999999999). Credit that dust
-    // so dest hits Amount; do not take another maker drop. Ratio exponent
-    // <= -30 is < ~1e-15 of demand — leftover_is_dust's -16 threshold is a
-    // false positive on 0.5 (20 of 40).
-    let dest_dust = !remaining_out.is_xrp
-        && !remaining_out.is_zero()
-        && !demand_out.is_zero()
-        && IOUAmount::divide(&remaining_out.iou, &demand_out.iou)
-            .map(|q| q.exponent() <= -30)
-            .unwrap_or(false);
-    if !skip_output_credit && dest_dust && dest != &remaining_out.issuer {
-        credit_line(
-            ctx,
-            dest,
-            &remaining_out.issuer,
-            &remaining_out.currency,
-            &remaining_out.iou,
-            number_switchover,
-        )?;
-        delivered = leg_add(&delivered, &remaining_out);
-    }
-
     Ok((delivered, spent))
 }
 
