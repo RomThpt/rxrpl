@@ -1525,6 +1525,7 @@ fn cross_book_hop(
 
     let mut remaining_out = demand_out.clone();
     let mut remaining_in = budget_in.clone();
+    let mut xrp_half_up: Vec<AccountId> = Vec::new();
     let dest_line_key = keylet::trust_line(dest, &demand_out.issuer, &demand_out.currency);
     let dest_line_before = if !skip_output_credit && !demand_out.is_xrp {
         ctx.view.read(&dest_line_key).and_then(|b| {
@@ -1758,19 +1759,18 @@ fn cross_book_hop(
                     .unwrap_or(IOUAmount::ZERO);
                     let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
                         .unwrap_or(IOUAmount::ZERO);
-                    let mut floor = leg_min(
+                    let floor = leg_min(
                         &leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in),
                         &remaining_in,
                     );
                     // 63B72EB4 r4aqu2zb: 7488687.62 drops. Truncate is 1 short.
-                    // Round-up-any-fraction turned 0.x-drop dust into 1-drop
-                    // takes (2127 extra). Half-up only a real fill (floor > 0)
-                    // whose first fractional digit is >= 5 (0.28 stays floor).
+                    // Bumping order_in during the walk over-spent 2127 drops on
+                    // later fills. Record the maker and credit 1 drop after the
+                    // hop so remaining_out / remaining_in stay truncated.
                     if terminal && offer_in.is_xrp && floor.drops > 0 {
                         if let Some((_, frac)) = scaled.to_decimal_string().split_once('.') {
                             if frac.chars().next().is_some_and(|c| c >= '5') {
-                                floor.drops = floor.drops.saturating_add(1);
-                                floor = leg_min(&leg_min(&floor, &offer_in), &remaining_in);
+                                xrp_half_up.push(owner);
                             }
                         }
                     }
@@ -1887,6 +1887,20 @@ fn cross_book_hop(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    if !skip_input_debit {
+        for owner in &xrp_half_up {
+            credit_xrp(ctx, owner, 1)?;
+            let bal = helpers::get_balance(taker_acct) as i64 - 1;
+            if bal < 0 {
+                return Err(TransactionResult::TecUnfundedOffer);
+            }
+            helpers::set_balance(taker_acct, bal as u64);
+            if spent.is_xrp {
+                spent.drops += 1;
             }
         }
     }
