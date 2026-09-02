@@ -1767,13 +1767,13 @@ fn cross_book_hop(
                     // Bumping order_in during the walk over-spent 2127 drops on
                     // later fills. Record the maker and credit 1 drop after the
                     // hop so remaining_out / remaining_in stay truncated.
-                    if terminal && offer_in.is_xrp && floor.drops > 0 {
+                    if terminal && offer_in.is_xrp && floor.drops >= 1_000_000 {
                         if let (Ok(whole), Ok(half)) = (
                             IOUAmount::from_decimal_string(&floor.drops.to_string()),
                             IOUAmount::from_decimal_string("0.5"),
                         ) {
-                            if let Ok(threshold) = IOUAmount::add(&whole, &half) {
-                                if scaled >= threshold {
+                            if let Ok(frac) = IOUAmount::add(&scaled, &whole.negate()) {
+                                if frac >= half {
                                     xrp_half_up.push(owner);
                                 }
                             }
