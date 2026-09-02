@@ -1768,9 +1768,14 @@ fn cross_book_hop(
                     // later fills. Record the maker and credit 1 drop after the
                     // hop so remaining_out / remaining_in stay truncated.
                     if terminal && offer_in.is_xrp && floor.drops > 0 {
-                        if let Some((_, frac)) = scaled.to_decimal_string().split_once('.') {
-                            if frac.chars().next().is_some_and(|c| c >= '5') {
-                                xrp_half_up.push(owner);
+                        if let (Ok(whole), Ok(half)) = (
+                            IOUAmount::from_decimal_string(&floor.drops.to_string()),
+                            IOUAmount::from_decimal_string("0.5"),
+                        ) {
+                            if let Ok(threshold) = IOUAmount::add(&whole, &half) {
+                                if scaled >= threshold {
+                                    xrp_half_up.push(owner);
+                                }
                             }
                         }
                     }
