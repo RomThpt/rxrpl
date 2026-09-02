@@ -1897,15 +1897,16 @@ fn cross_book_hop(
     }
 
     if !skip_input_debit {
+        const HALF_UP_DROPS: i64 = 1;
         for owner in &xrp_half_up {
-            credit_xrp(ctx, owner, 1)?;
-            let bal = helpers::get_balance(taker_acct) as i64 - 1;
+            credit_xrp(ctx, owner, HALF_UP_DROPS)?;
+            let bal = helpers::get_balance(taker_acct) as i64 - HALF_UP_DROPS;
             if bal < 0 {
                 return Err(TransactionResult::TecUnfundedOffer);
             }
             helpers::set_balance(taker_acct, bal as u64);
             if spent.is_xrp {
-                spent.drops += 1;
+                spent.drops += HALF_UP_DROPS;
             }
         }
     }
