@@ -1525,6 +1525,7 @@ fn cross_book_hop(
 
     let mut remaining_out = demand_out.clone();
     let mut remaining_in = budget_in.clone();
+    let mut xrp_half_up: Option<AccountId> = None;
     let dest_line_key = keylet::trust_line(dest, &demand_out.issuer, &demand_out.currency);
     let dest_line_before = if !skip_output_credit && !demand_out.is_xrp {
         ctx.view.read(&dest_line_key).and_then(|b| {
@@ -1758,10 +1759,31 @@ fn cross_book_hop(
                     .unwrap_or(IOUAmount::ZERO);
                     let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
                         .unwrap_or(IOUAmount::ZERO);
-                    leg_min(
+                    let floor = leg_min(
                         &leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in),
                         &remaining_in,
-                    )
+                    );
+                    // 63B72EB4 r4aqu2zb: 7488687.62 drops. Truncate is 1 short.
+                    // Do not bump order_in or returned `spent` (caller residual
+                    // AMM/CLOB would over-take ~0.08 JPY / 2127 drops). Credit
+                    // the maker after the hop.
+                    if terminal
+                        && offer_in.is_xrp
+                        && floor.drops >= 1_000_000
+                        && xrp_half_up.is_none()
+                    {
+                        if let (Ok(whole), Ok(half)) = (
+                            IOUAmount::from_decimal_string(&floor.drops.to_string()),
+                            IOUAmount::from_decimal_string("0.5"),
+                        ) {
+                            if let Ok(frac) = IOUAmount::add(&scaled, &whole.negate()) {
+                                if frac >= half {
+                                    xrp_half_up = Some(owner);
+                                }
+                            }
+                        }
+                    }
+                    floor
                 };
                 (take_out.clone(), order_in)
             } else {
@@ -1875,6 +1897,18 @@ fn cross_book_hop(
                     }
                 }
             }
+        }
+    }
+
+    if !skip_input_debit {
+        if let Some(owner) = xrp_half_up {
+            const HALF_UP_DROPS: i64 = 1;
+            credit_xrp(ctx, &owner, HALF_UP_DROPS)?;
+            let bal = helpers::get_balance(taker_acct) as i64 - HALF_UP_DROPS;
+            if bal < 0 {
+                return Err(TransactionResult::TecUnfundedOffer);
+            }
+            helpers::set_balance(taker_acct, bal as u64);
         }
     }
 
@@ -5916,6 +5950,20 @@ mod tick_round_tests {
         assert_eq!(round_drops_half_even("10.5000001"), Some(11));
         assert_eq!(round_drops_half_even("10.4999999"), Some(10));
         assert_eq!(round_drops_half_even("42"), Some(42));
+    }
+
+    #[test]
+    fn funds_limited_xrp_scale_fraction_vs_half() {
+        let half = IOUAmount::from_decimal_string("0.5").unwrap();
+        let scaled = IOUAmount::from_decimal_string("7488687.62").unwrap();
+        let whole = IOUAmount::from_decimal_string("7488687").unwrap();
+        let frac = IOUAmount::add(&scaled, &whole.negate()).unwrap();
+        assert!(frac >= half);
+
+        let scaled = IOUAmount::from_decimal_string("667138214.28").unwrap();
+        let whole = IOUAmount::from_decimal_string("667138214").unwrap();
+        let frac = IOUAmount::add(&scaled, &whole.negate()).unwrap();
+        assert!(frac < half);
     }
 }
 
