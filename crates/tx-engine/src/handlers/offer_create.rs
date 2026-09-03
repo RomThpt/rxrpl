@@ -1606,7 +1606,6 @@ fn cross_book_hop(
             if remaining_out.is_zero()
                 || remaining_in.is_zero()
                 || (!skip_output_credit && remaining_is_filled(&remaining_out, demand_out))
-                || (!skip_output_credit && remaining_is_filled_at(&remaining_out, demand_out, -21))
             {
                 break 'walk;
             }
@@ -1632,7 +1631,6 @@ fn cross_book_hop(
             if remaining_out.is_zero()
                 || remaining_in.is_zero()
                 || (!skip_output_credit && remaining_is_filled(&remaining_out, demand_out))
-                || (!skip_output_credit && remaining_is_filled_at(&remaining_out, demand_out, -21))
             {
                 break 'walk;
             }
@@ -1682,8 +1680,24 @@ fn cross_book_hop(
 
             // Output capped by remaining demand, funded availability, and what
             // the remaining input budget can buy at this offer's price.
+            // Last-hop remaining is NET dest credit; TakerGets is GROSS. When a
+            // transfer fee applies, cap take_out at remaining*rate so dest nets
+            // remaining (30000046 63B72EB4: 1.002 left a 50 JPY shortfall that
+            // walked worse JPY/XRP offers).
+            let terminal = !skip_input_debit && !skip_output_credit;
+            let fee_applies = terminal
+                && !offer_out.is_xrp
+                && offer_out.issuer != owner
+                && offer_out.issuer != *dest;
+            let remaining_out_cap = if fee_applies {
+                let mut cap = remaining_out.clone();
+                cap.iou = grossed(&remaining_out.iou, &transfer_rate(ctx, &offer_out.issuer));
+                cap
+            } else {
+                remaining_out.clone()
+            };
             let budget_out = out_for_in(&remaining_in, &eff_rate, &offer_out);
-            let mut take_out = leg_min(&remaining_out, &avail_out);
+            let mut take_out = leg_min(&remaining_out_cap, &avail_out);
             // rippled forks on the INPUT side (StrandFlow reverse-then-forward,
             // maxIn < requiredIn at step 0): the SendMax budget binds only when it
             // cannot afford the ceilOut input cost of the demanded output. Testing
@@ -1694,7 +1708,6 @@ fn cross_book_hop(
             // bounded demand (single-book conversion). An interior hop carries the
             // unbounded-demand sentinel, so its ceilOut input cost is meaningless;
             // keep the output-side test there (the #337 walk-stop relies on it).
-            let terminal = !skip_input_debit && !skip_output_credit;
             let budget_binds = if terminal {
                 let in_for_take = in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate);
                 !leg_ge(&remaining_in, &in_for_take)
@@ -1857,7 +1870,7 @@ fn cross_book_hop(
     // Amount, not the truncated delivered sum.
     if let Some(before_s) = dest_line_before {
         if dest != &demand_out.issuer {
-            let leftover_dust = remaining_is_filled_at(&remaining_out, demand_out, -21);
+            let leftover_dust = remaining_is_filled(&remaining_out, demand_out);
             let credit = if remaining_out.is_zero() || leftover_dust {
                 demand_out.iou
             } else {

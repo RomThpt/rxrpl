@@ -2523,3 +2523,91 @@ fn conversion_crosses_multiple_offers_best_price_first() {
     assert_eq!(read_xrp(ISSUER2), 225_000_000);
     assert_eq!(read_xrp(BOB), 218_000_000);
 }
+
+#[test]
+fn conversion_transfer_fee_grosses_up_last_hop_take() {
+    // 30000046 63B72EB4: remaining is NET dest-JPY; TakerGets is GROSS. With
+    // TransferRate 1.002 the demand-limited maker must give remaining*1.002 so
+    // dest nets Amount. Capping take_out at remaining leaves a fee shortfall
+    // that walks worse-quality offers (2126 extra drops on mainnet).
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", Some(1_002_000_000));
+    put_account(&mut ledger, BOB, "200000000", None);
+    put_account(&mut ledger, MM, "400000000", None);
+    put_account(&mut ledger, ALICE, "300000000", None);
+    put_trust_line(&mut ledger, BOB, ISSUER, "USD", 10.0);
+    put_trust_line(&mut ledger, MM, ISSUER, "USD", 1000.0);
+    put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 0.0);
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let bob_offer = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": BOB,
+        "TakerGets": iou("USD", ISSUER, "10"),
+        "TakerPays": "10000000",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &bob_offer,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    crate::handlers::offer_create::OfferCreateTransactor
+        .apply(&mut octx)
+        .unwrap();
+
+    let mm_offer = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM,
+        "TakerGets": iou("USD", ISSUER, "200"),
+        "TakerPays": "200000000",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &mm_offer,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    crate::handlers::offer_create::OfferCreateTransactor
+        .apply(&mut octx)
+        .unwrap();
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": iou("USD", ISSUER, "100"),
+        "SendMax": "150000000",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let dest = holder_balance(&sandbox, ALICE, ISSUER, "USD");
+    assert!(
+        (dest - 100.0).abs() < 1e-6,
+        "dest nets Amount after the 1.002 fee, got {dest}"
+    );
+    let mm = holder_balance(&sandbox, MM, ISSUER, "USD");
+    assert!(
+        mm < 1000.0 - 90.1,
+        "demand-limited maker gives remaining*1.002 gross, left {mm}"
+    );
+}
