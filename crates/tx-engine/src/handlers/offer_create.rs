@@ -1606,9 +1606,7 @@ fn cross_book_hop(
             if remaining_out.is_zero()
                 || remaining_in.is_zero()
                 || (!skip_output_credit && remaining_is_filled(&remaining_out, demand_out))
-                || (!skip_output_credit
-                    && xrp_half_up.is_some()
-                    && remaining_is_filled_at(&remaining_out, demand_out, -21))
+                || (!skip_output_credit && remaining_is_filled_at(&remaining_out, demand_out, -21))
             {
                 break 'walk;
             }
@@ -1634,9 +1632,7 @@ fn cross_book_hop(
             if remaining_out.is_zero()
                 || remaining_in.is_zero()
                 || (!skip_output_credit && remaining_is_filled(&remaining_out, demand_out))
-                || (!skip_output_credit
-                    && xrp_half_up.is_some()
-                    && remaining_is_filled_at(&remaining_out, demand_out, -21))
+                || (!skip_output_credit && remaining_is_filled_at(&remaining_out, demand_out, -21))
             {
                 break 'walk;
             }
@@ -5443,7 +5439,8 @@ mod taker_crossing_tests {
     use super::{
         Leg, TakerCrossType, composed_quality, flow_iou_to_iou, flow_iou_to_xrp, flow_xrp_to_iou,
         in_for_out, leftover_is_dust, leftover_leg, leg_gt, leg_max, pack_rate, parity_rate,
-        qual_div, qual_mul, reject_quality, remaining_offer, select_path, sell_clamp_sub,
+        qual_div, qual_mul, reject_quality, remaining_is_filled, remaining_is_filled_at,
+        remaining_offer, select_path, sell_clamp_sub,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, offer_quality};
     use rxrpl_primitives::AccountId;
@@ -5507,6 +5504,29 @@ mod taker_crossing_tests {
             "leftover {} must be dust vs {}",
             leftover.to_decimal_string(),
             offer.to_decimal_string()
+        );
+    }
+
+    #[test]
+    fn ledger_30000046_jpy_tail_is_filled_at_minus_21_not_at_hop_start() {
+        let demand = iou("25450");
+        assert!(
+            !remaining_is_filled_at(&demand, &demand, -21),
+            "remaining=Amount must keep walking (B19E first)"
+        );
+        let after_b19e = iou("25166.91826601741");
+        assert!(
+            !remaining_is_filled_at(&after_b19e, &demand, -21),
+            "after the 283 JPY B19E take the book still has work"
+        );
+        let tail = iou("0.08");
+        assert!(
+            remaining_is_filled_at(&tail, &demand, -21),
+            "0.08/25450 is the extra-offer tail"
+        );
+        assert!(
+            !remaining_is_filled(&tail, &demand),
+            "0.08/25450 is not 1e-15 STAmount dust"
         );
     }
 
