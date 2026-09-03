@@ -1690,9 +1690,20 @@ fn cross_book_hop(
                 && offer_out.issuer != owner
                 && offer_out.issuer != *dest;
             let remaining_out_cap = if fee_applies {
-                let mut cap = remaining_out.clone();
-                cap.iou = grossed(&remaining_out.iou, &transfer_rate(ctx, &offer_out.issuer));
-                cap
+                let rate = transfer_rate(ctx, &offer_out.issuer);
+                let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+                if rate > one {
+                    let mut cap = remaining_out.clone();
+                    cap.iou = grossed(&remaining_out.iou, &rate);
+                    if let Ok(bumped) =
+                        IOUAmount::from_parts(cap.iou.mantissa() + 1, cap.iou.exponent(), false)
+                    {
+                        cap.iou = bumped;
+                    }
+                    cap
+                } else {
+                    remaining_out.clone()
+                }
             } else {
                 remaining_out.clone()
             };
@@ -1829,7 +1840,10 @@ fn cross_book_hop(
                     consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
                 } else {
                     let new_gets = leftover_leg(&offer_out, &order_out, number_switchover);
-                    let new_pays = leftover_leg(&offer_in, &order_in, number_switchover);
+                    let mut new_pays = leftover_leg(&offer_in, &order_in, number_switchover);
+                    if xrp_half_up == Some(owner) && new_pays.is_xrp && new_pays.drops > 0 {
+                        new_pays.drops -= 1;
+                    }
                     consumed["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
                     consumed["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
                 }
