@@ -1525,6 +1525,7 @@ fn cross_book_hop(
 
     let mut remaining_out = demand_out.clone();
     let mut remaining_in = budget_in.clone();
+    let mut xrp_half_up: Option<AccountId> = None;
     let dest_line_key = keylet::trust_line(dest, &demand_out.issuer, &demand_out.currency);
     let dest_line_before = if !skip_output_credit && !demand_out.is_xrp {
         ctx.view.read(&dest_line_key).and_then(|b| {
@@ -1605,6 +1606,9 @@ fn cross_book_hop(
             if remaining_out.is_zero()
                 || remaining_in.is_zero()
                 || (!skip_output_credit && remaining_is_filled(&remaining_out, demand_out))
+                || (!skip_output_credit
+                    && xrp_half_up.is_some()
+                    && remaining_is_filled_at(&remaining_out, demand_out, -21))
             {
                 break 'walk;
             }
@@ -1630,6 +1634,9 @@ fn cross_book_hop(
             if remaining_out.is_zero()
                 || remaining_in.is_zero()
                 || (!skip_output_credit && remaining_is_filled(&remaining_out, demand_out))
+                || (!skip_output_credit
+                    && xrp_half_up.is_some()
+                    && remaining_is_filled_at(&remaining_out, demand_out, -21))
             {
                 break 'walk;
             }
@@ -1758,10 +1765,18 @@ fn cross_book_hop(
                     .unwrap_or(IOUAmount::ZERO);
                     let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
                         .unwrap_or(IOUAmount::ZERO);
-                    leg_min(
+                    let floor = leg_min(
                         &leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in),
                         &remaining_in,
-                    )
+                    );
+                    if terminal
+                        && offer_in.is_xrp
+                        && floor.drops >= 1_000_000
+                        && xrp_half_up.is_none()
+                    {
+                        xrp_half_up = Some(owner);
+                    }
+                    floor
                 };
                 (take_out.clone(), order_in)
             } else {
@@ -1846,12 +1861,7 @@ fn cross_book_hop(
     // Amount, not the truncated delivered sum.
     if let Some(before_s) = dest_line_before {
         if dest != &demand_out.issuer {
-            let leftover_dust = !remaining_out.is_xrp
-                && !remaining_out.is_zero()
-                && !demand_out.is_zero()
-                && IOUAmount::divide(&remaining_out.iou, &demand_out.iou)
-                    .map(|q| q.exponent() <= -30)
-                    .unwrap_or(false);
+            let leftover_dust = remaining_is_filled_at(&remaining_out, demand_out, -21);
             let credit = if remaining_out.is_zero() || leftover_dust {
                 demand_out.iou
             } else {
@@ -1875,6 +1885,17 @@ fn cross_book_hop(
                     }
                 }
             }
+        }
+    }
+
+    if !skip_input_debit {
+        if let Some(owner) = xrp_half_up {
+            credit_xrp(ctx, &owner, 1)?;
+            let bal = helpers::get_balance(taker_acct) as i64 - 1;
+            if bal < 0 {
+                return Err(TransactionResult::TecUnfundedOffer);
+            }
+            helpers::set_balance(taker_acct, bal as u64);
         }
     }
 
@@ -3630,6 +3651,10 @@ fn leg_ge(a: &Leg, b: &Leg) -> bool {
 /// True when `part` is below one ULP of a 16-digit `whole` (STAmount). 30000020
 /// IOC 4F0BD7AA leftover 1e-14 EUR on a 50 EUR offer; mainnet stores 0 and reaps.
 fn remaining_is_filled(remaining: &Leg, demand: &Leg) -> bool {
+    remaining_is_filled_at(remaining, demand, -30)
+}
+
+fn remaining_is_filled_at(remaining: &Leg, demand: &Leg, max_exp: i32) -> bool {
     if remaining.is_zero() {
         return true;
     }
@@ -3637,7 +3662,7 @@ fn remaining_is_filled(remaining: &Leg, demand: &Leg) -> bool {
         return false;
     }
     IOUAmount::divide(&remaining.iou, &demand.iou)
-        .map(|q| q.exponent() <= -30)
+        .map(|q| q.exponent() <= max_exp)
         .unwrap_or(false)
 }
 
