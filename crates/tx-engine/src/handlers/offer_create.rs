@@ -1758,10 +1758,28 @@ fn cross_book_hop(
                     .unwrap_or(IOUAmount::ZERO);
                     let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
                         .unwrap_or(IOUAmount::ZERO);
-                    leg_min(
+                    let mut floor = leg_min(
                         &leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in),
                         &remaining_in,
-                    )
+                    );
+                    // 63B72EB4 r4aqu2zb: 7488687.62 drops. Truncate is 1 short.
+                    // Half-up sub-XRP dust (0.x -> 1) over-spent 2127 drops.
+                    // Half-up only a take of >= 1 XRP whose fraction is >= 0.5
+                    // (667138214.28 stays floor).
+                    if terminal && offer_in.is_xrp && floor.drops >= 1_000_000 {
+                        if let (Ok(whole), Ok(half)) = (
+                            IOUAmount::from_decimal_string(&floor.drops.to_string()),
+                            IOUAmount::from_decimal_string("0.5"),
+                        ) {
+                            if let Ok(frac) = IOUAmount::add(&scaled, &whole.negate()) {
+                                if frac >= half {
+                                    floor.drops = floor.drops.saturating_add(1);
+                                    floor = leg_min(&leg_min(&floor, &offer_in), &remaining_in);
+                                }
+                            }
+                        }
+                    }
+                    floor
                 };
                 (take_out.clone(), order_in)
             } else {
@@ -5916,6 +5934,20 @@ mod tick_round_tests {
         assert_eq!(round_drops_half_even("10.5000001"), Some(11));
         assert_eq!(round_drops_half_even("10.4999999"), Some(10));
         assert_eq!(round_drops_half_even("42"), Some(42));
+    }
+
+    #[test]
+    fn funds_limited_xrp_scale_fraction_vs_half() {
+        let half = IOUAmount::from_decimal_string("0.5").unwrap();
+        let scaled = IOUAmount::from_decimal_string("7488687.62").unwrap();
+        let whole = IOUAmount::from_decimal_string("7488687").unwrap();
+        let frac = IOUAmount::add(&scaled, &whole.negate()).unwrap();
+        assert!(frac >= half);
+
+        let scaled = IOUAmount::from_decimal_string("667138214.28").unwrap();
+        let whole = IOUAmount::from_decimal_string("667138214").unwrap();
+        let frac = IOUAmount::add(&scaled, &whole.negate()).unwrap();
+        assert!(frac < half);
     }
 }
 
