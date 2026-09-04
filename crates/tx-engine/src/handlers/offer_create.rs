@@ -1525,6 +1525,7 @@ fn cross_book_hop(
 
     let mut remaining_out = demand_out.clone();
     let mut remaining_in = budget_in.clone();
+    let mut xrp_half_up: Option<AccountId> = None;
     let dest_line_key = keylet::trust_line(dest, &demand_out.issuer, &demand_out.currency);
     let dest_line_before = if !skip_output_credit && !demand_out.is_xrp {
         ctx.view.read(&dest_line_key).and_then(|b| {
@@ -1679,8 +1680,35 @@ fn cross_book_hop(
 
             // Output capped by remaining demand, funded availability, and what
             // the remaining input budget can buy at this offer's price.
+            // Last-hop remaining is NET dest credit; TakerGets is GROSS. When a
+            // transfer fee applies, cap take_out at remaining*rate so dest nets
+            // remaining (30000046 63B72EB4: 1.002 left a 50 JPY shortfall that
+            // walked worse JPY/XRP offers).
+            let terminal = !skip_input_debit && !skip_output_credit;
+            let fee_applies = terminal
+                && !offer_out.is_xrp
+                && offer_out.issuer != owner
+                && offer_out.issuer != *dest;
+            let remaining_out_cap = if fee_applies {
+                let rate = transfer_rate(ctx, &offer_out.issuer);
+                let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+                if rate > one {
+                    let mut cap = remaining_out.clone();
+                    cap.iou = grossed(&remaining_out.iou, &rate);
+                    if let Ok(bumped) =
+                        IOUAmount::from_parts(cap.iou.mantissa() + 1, cap.iou.exponent(), false)
+                    {
+                        cap.iou = bumped;
+                    }
+                    cap
+                } else {
+                    remaining_out.clone()
+                }
+            } else {
+                remaining_out.clone()
+            };
             let budget_out = out_for_in(&remaining_in, &eff_rate, &offer_out);
-            let mut take_out = leg_min(&remaining_out, &avail_out);
+            let mut take_out = leg_min(&remaining_out_cap, &avail_out);
             // rippled forks on the INPUT side (StrandFlow reverse-then-forward,
             // maxIn < requiredIn at step 0): the SendMax budget binds only when it
             // cannot afford the ceilOut input cost of the demanded output. Testing
@@ -1691,7 +1719,6 @@ fn cross_book_hop(
             // bounded demand (single-book conversion). An interior hop carries the
             // unbounded-demand sentinel, so its ceilOut input cost is meaningless;
             // keep the output-side test there (the #337 walk-stop relies on it).
-            let terminal = !skip_input_debit && !skip_output_credit;
             let budget_binds = if terminal {
                 let in_for_take = in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate);
                 !leg_ge(&remaining_in, &in_for_take)
@@ -1758,10 +1785,18 @@ fn cross_book_hop(
                     .unwrap_or(IOUAmount::ZERO);
                     let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
                         .unwrap_or(IOUAmount::ZERO);
-                    leg_min(
+                    let floor = leg_min(
                         &leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in),
                         &remaining_in,
-                    )
+                    );
+                    if terminal
+                        && offer_in.is_xrp
+                        && floor.drops >= 1_000_000
+                        && xrp_half_up.is_none()
+                    {
+                        xrp_half_up = Some(owner);
+                    }
+                    floor
                 };
                 (take_out.clone(), order_in)
             } else {
@@ -1805,7 +1840,10 @@ fn cross_book_hop(
                     consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
                 } else {
                     let new_gets = leftover_leg(&offer_out, &order_out, number_switchover);
-                    let new_pays = leftover_leg(&offer_in, &order_in, number_switchover);
+                    let mut new_pays = leftover_leg(&offer_in, &order_in, number_switchover);
+                    if xrp_half_up == Some(owner) && new_pays.is_xrp && new_pays.drops > 0 {
+                        new_pays.drops -= 1;
+                    }
                     consumed["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
                     consumed["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
                 }
@@ -1846,12 +1884,7 @@ fn cross_book_hop(
     // Amount, not the truncated delivered sum.
     if let Some(before_s) = dest_line_before {
         if dest != &demand_out.issuer {
-            let leftover_dust = !remaining_out.is_xrp
-                && !remaining_out.is_zero()
-                && !demand_out.is_zero()
-                && IOUAmount::divide(&remaining_out.iou, &demand_out.iou)
-                    .map(|q| q.exponent() <= -30)
-                    .unwrap_or(false);
+            let leftover_dust = remaining_is_filled(&remaining_out, demand_out);
             let credit = if remaining_out.is_zero() || leftover_dust {
                 demand_out.iou
             } else {
@@ -1875,6 +1908,17 @@ fn cross_book_hop(
                     }
                 }
             }
+        }
+    }
+
+    if !skip_input_debit {
+        if let Some(owner) = xrp_half_up {
+            credit_xrp(ctx, &owner, 1)?;
+            let bal = helpers::get_balance(taker_acct) as i64 - 1;
+            if bal < 0 {
+                return Err(TransactionResult::TecUnfundedOffer);
+            }
+            helpers::set_balance(taker_acct, bal as u64);
         }
     }
 
@@ -3630,6 +3674,10 @@ fn leg_ge(a: &Leg, b: &Leg) -> bool {
 /// True when `part` is below one ULP of a 16-digit `whole` (STAmount). 30000020
 /// IOC 4F0BD7AA leftover 1e-14 EUR on a 50 EUR offer; mainnet stores 0 and reaps.
 fn remaining_is_filled(remaining: &Leg, demand: &Leg) -> bool {
+    remaining_is_filled_at(remaining, demand, -30)
+}
+
+fn remaining_is_filled_at(remaining: &Leg, demand: &Leg, max_exp: i32) -> bool {
     if remaining.is_zero() {
         return true;
     }
@@ -3637,7 +3685,7 @@ fn remaining_is_filled(remaining: &Leg, demand: &Leg) -> bool {
         return false;
     }
     IOUAmount::divide(&remaining.iou, &demand.iou)
-        .map(|q| q.exponent() <= -30)
+        .map(|q| q.exponent() <= max_exp)
         .unwrap_or(false)
 }
 
@@ -5418,7 +5466,8 @@ mod taker_crossing_tests {
     use super::{
         Leg, TakerCrossType, composed_quality, flow_iou_to_iou, flow_iou_to_xrp, flow_xrp_to_iou,
         in_for_out, leftover_is_dust, leftover_leg, leg_gt, leg_max, pack_rate, parity_rate,
-        qual_div, qual_mul, reject_quality, remaining_offer, select_path, sell_clamp_sub,
+        qual_div, qual_mul, reject_quality, remaining_is_filled, remaining_is_filled_at,
+        remaining_offer, select_path, sell_clamp_sub,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, offer_quality};
     use rxrpl_primitives::AccountId;
@@ -5482,6 +5531,29 @@ mod taker_crossing_tests {
             "leftover {} must be dust vs {}",
             leftover.to_decimal_string(),
             offer.to_decimal_string()
+        );
+    }
+
+    #[test]
+    fn ledger_30000046_jpy_tail_is_filled_at_minus_21_not_at_hop_start() {
+        let demand = iou("25450");
+        assert!(
+            !remaining_is_filled_at(&demand, &demand, -21),
+            "remaining=Amount must keep walking (B19E first)"
+        );
+        let after_b19e = iou("25166.91826601741");
+        assert!(
+            !remaining_is_filled_at(&after_b19e, &demand, -21),
+            "after the 283 JPY B19E take the book still has work"
+        );
+        let tail = iou("0.08");
+        assert!(
+            remaining_is_filled_at(&tail, &demand, -21),
+            "0.08/25450 is the extra-offer tail"
+        );
+        assert!(
+            !remaining_is_filled(&tail, &demand),
+            "0.08/25450 is not 1e-15 STAmount dust"
         );
     }
 
