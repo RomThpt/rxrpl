@@ -1696,7 +1696,7 @@ fn cross_book_hop(
             // remaining (30000046 63B72EB4: 1.002 left a 50 JPY shortfall that
             // walked worse JPY/XRP offers).
             let terminal = !skip_input_debit && !skip_output_credit;
-            let fee_applies = terminal
+            let fee_applies = !skip_output_credit
                 && !offer_out.is_xrp
                 && offer_out.issuer != owner
                 && offer_out.issuer != *dest;
@@ -2033,6 +2033,13 @@ pub(crate) fn cross_path_payment(
         }
     }
 
+    let reverse_amts = reverse_clob_amounts(ctx, dest, boundaries, &final_demand);
+    if let Some(ref amts) = reverse_amts {
+        if amts.len() == n && leg_ge(&carry, &amts[0]) {
+            carry = amts[0].clone();
+        }
+    }
+
     let mut delivered = final_demand.clone();
     let mut source_spent = carry.clone();
     for hop in 0..(n - 1) {
@@ -2050,8 +2057,10 @@ pub(crate) fn cross_path_payment(
             budget.iou = carry.iou;
         }
 
-        // Demand: the final hop is capped by the requested Amount; interior hops
-        // deliver as much as the budget can buy (unbounded demand).
+        // Demand: the final hop is capped by the requested Amount. Interior hops
+        // used to be unbounded, which spent the whole SendMax on CNY and then
+        // failed `legs_eq` on the ETH hop (30000051 B6E7A0DC). When a reverse
+        // CLOB quote exists, use that intermediate size instead.
         let demand = if is_last {
             let mut d = out_tmpl.clone();
             if d.is_xrp {
@@ -2069,6 +2078,8 @@ pub(crate) fn cross_path_payment(
                 }
             }
             d
+        } else if let Some(d) = reverse_amts.as_ref().and_then(|a| a.get(hop + 1)) {
+            d.clone()
         } else {
             unbounded_leg(&out_tmpl)
         };
@@ -2753,6 +2764,49 @@ fn apply_amm_move(
 /// present or no AMM pool exists), the pool cannot meet the demand, or the
 /// required input exceeds `budget` (input-limited). The caller's forward-only
 /// flow then handles those cases.
+fn reverse_clob_amounts(
+    ctx: &ApplyContext<'_>,
+    dest: &AccountId,
+    boundaries: &[Value],
+    target_out: &Leg,
+) -> Option<Vec<Leg>> {
+    let n = boundaries.len();
+    if n < 3 {
+        return None;
+    }
+    let mut amts = vec![target_out.clone()];
+    for hop in (0..n - 1).rev() {
+        let in_tmpl = Leg::parse(&boundaries[hop])?;
+        let out_tmpl = Leg::parse(&boundaries[hop + 1])?;
+        let q = peek_best_book_quality(ctx.view, &in_tmpl, &out_tmpl)?;
+        let rate = rxrpl_amount::from_rate(q).ok()?;
+        if rate.is_zero() {
+            return None;
+        }
+        let mut out_need = amts[0].clone();
+        if hop == n - 2 && !out_tmpl.is_xrp && out_tmpl.issuer != *dest {
+            let tr = transfer_rate(ctx, &out_tmpl.issuer);
+            let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+            if tr > one {
+                out_need.iou = grossed(&out_need.iou, &tr);
+                if let Ok(bumped) = IOUAmount::from_parts(
+                    out_need.iou.mantissa() + 1,
+                    out_need.iou.exponent(),
+                    false,
+                ) {
+                    out_need.iou = bumped;
+                }
+            }
+        }
+        let in_need = in_for_out(&out_need, &rate, &in_tmpl);
+        if in_need.is_zero() {
+            return None;
+        }
+        amts.insert(0, in_need);
+    }
+    (amts.len() == n).then_some(amts)
+}
+
 fn reverse_amm_strand(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
