@@ -2611,3 +2611,121 @@ fn conversion_transfer_fee_grosses_up_last_hop_take() {
         "demand-limited maker gives remaining*1.002 gross, left {mm}"
     );
 }
+
+/// 30000051 B6E7A0DC: conversion XRP SendMax -> CNY book -> ETH book.
+/// Mainnet delivers 0.03667 ETH; a dry/partial strand only charges the fee.
+#[test]
+fn ledger_30000051_xrp_cny_eth_two_hop_delivers() {
+    const TF_SELL: u64 = 0x0008_0000;
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "1000000000", None);
+    put_account(&mut ledger, ISSUER2, "1000000000", Some(1_003_000_000));
+    put_account(&mut ledger, ALICE, "1000000000", None);
+    put_account(&mut ledger, MM, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_trust_line(&mut ledger, MM, ISSUER, "CNY", 1000.0);
+    put_trust_line(&mut ledger, MM2, ISSUER2, "ETH", 10.0);
+    put_trust_line(&mut ledger, MM2, ISSUER, "CNY", 0.0);
+    put_trust_line(&mut ledger, ALICE, ISSUER2, "ETH", 0.0);
+    {
+        let alice_id = decode_account_id(ALICE).unwrap();
+        let iss2 = decode_account_id(ISSUER2).unwrap();
+        let cur = helpers::currency_to_bytes("ETH");
+        let key = keylet::trust_line(&alice_id, &iss2, &cur);
+        let alice_is_low = alice_id.as_bytes() < iss2.as_bytes();
+        let (low, high) = if alice_is_low {
+            (ALICE, ISSUER2)
+        } else {
+            (ISSUER2, ALICE)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": "ETH", "issuer": ISSUER2, "value": "0" },
+            "LowLimit": { "currency": "ETH", "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": "ETH", "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let eth_offer = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM2,
+        "Flags": TF_SELL,
+        "TakerGets": iou("ETH", ISSUER2, "1"),
+        "TakerPays": iou("CNY", ISSUER, "1570"),
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &eth_offer,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess,
+        "ETH offer"
+    );
+
+    let cny_offer = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM,
+        "TakerGets": iou("CNY", ISSUER, "100"),
+        "TakerPays": "40000000",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &cny_offer,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess,
+        "CNY offer"
+    );
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": iou("ETH", ISSUER2, "0.03666999476872078"),
+        "SendMax": "24411839",
+        "Paths": [[
+            { "currency": "CNY", "issuer": ISSUER },
+            { "currency": "ETH", "issuer": ISSUER2 }
+        ]],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess,
+        "XRP->CNY->ETH conversion must cross"
+    );
+    let dest = holder_balance(&sandbox, ALICE, ISSUER2, "ETH");
+    assert!(dest > 0.03, "dest must receive ETH, got {dest}");
+    let mm2_cny = holder_balance(&sandbox, MM2, ISSUER, "CNY");
+    assert!(mm2_cny > 50.0, "ETH maker must be paid CNY, got {mm2_cny}");
+}
