@@ -4,6 +4,7 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext};
 use crate::view::ledger_view::LedgerView;
 use crate::view::sandbox::Sandbox;
 use rxrpl_amendment::Rules;
+use rxrpl_amount::IOUAmount;
 use rxrpl_ledger::Ledger;
 
 const SRC_ADDRESS: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
@@ -2728,4 +2729,106 @@ fn ledger_30000051_xrp_cny_eth_two_hop_delivers() {
     assert!(dest > 0.03, "dest must receive ETH, got {dest}");
     let mm2_cny = holder_balance(&sandbox, MM2, ISSUER, "CNY");
     assert!(mm2_cny > 50.0, "ETH maker must be paid CNY, got {mm2_cny}");
+}
+
+/// 30000054 E60BA9E1: dest nets Amount; offer leftover TakerGets is 1 ULP
+/// higher than remaining*rate+1 (the extra mantissa bump over-takes).
+#[test]
+fn ledger_30000054_eth_offer_leftover_truncates() {
+    const TF_SELL: u64 = 0x0008_0000;
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER2, "1000000000", Some(1_003_000_000));
+    put_account(&mut ledger, ALICE, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_trust_line(&mut ledger, MM2, ISSUER2, "ETH", 10.0);
+    {
+        let alice_id = decode_account_id(ALICE).unwrap();
+        let iss2 = decode_account_id(ISSUER2).unwrap();
+        let cur = helpers::currency_to_bytes("ETH");
+        let key = keylet::trust_line(&alice_id, &iss2, &cur);
+        let alice_is_low = alice_id.as_bytes() < iss2.as_bytes();
+        let (low, high) = if alice_is_low {
+            (ALICE, ISSUER2)
+        } else {
+            (ISSUER2, ALICE)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": "ETH", "issuer": ISSUER2, "value": "0" },
+            "LowLimit": { "currency": "ETH", "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": "ETH", "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let eth_offer = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM2,
+        "Flags": TF_SELL,
+        "TakerGets": iou("ETH", ISSUER2, "1.438681906732764"),
+        "TakerPays": "935341445",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &eth_offer,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": iou("ETH", ISSUER2, "0.0283226784131625"),
+        "SendMax": "18487353",
+        "Paths": [[{ "currency": "ETH", "issuer": ISSUER2 }]],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let mm2_id = decode_account_id(MM2).unwrap();
+    let offer: serde_json::Value =
+        serde_json::from_slice(&sandbox.read(&keylet::offer(&mm2_id, 1)).unwrap()).unwrap();
+    let leftover = offer["TakerGets"]["value"].as_str().unwrap();
+    assert_eq!(
+        leftover, "1.410274260284363",
+        "leftover TakerGets 1 ULP above remaining*rate+1, got {leftover}"
+    );
+}
+
+#[test]
+fn ledger_30000054_xlm_take_vs_offer_leftover() {
+    let offer = IOUAmount::from_decimal_string("1372.070869049977").unwrap();
+    let take57 = IOUAmount::from_decimal_string("24.70842771705957").unwrap();
+    let take58 = IOUAmount::from_decimal_string("24.70842771705958").unwrap();
+    let lo57 = IOUAmount::sub(&offer, &take57).unwrap().to_decimal_string();
+    let lo58 = IOUAmount::sub(&offer, &take58).unwrap().to_decimal_string();
+    assert_eq!(lo57, "1347.362441332918", "take57 leftover {lo57}");
+    assert_eq!(lo58, "1347.362441332918", "take58 leftover {lo58}");
 }

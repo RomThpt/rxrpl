@@ -1706,10 +1706,15 @@ fn cross_book_hop(
                 if rate > one {
                     let mut cap = remaining_out.clone();
                     cap.iou = grossed(&remaining_out.iou, &rate);
-                    if let Ok(bumped) =
-                        IOUAmount::from_parts(cap.iou.mantissa() + 1, cap.iou.exponent(), false)
-                    {
-                        cap.iou = bumped;
+                    // Multi-hop last hop: +1 ULP so dest nets Amount (30000051).
+                    // Single-book (`terminal`) already matches leftover without it
+                    // (30000054 E60BA9E1).
+                    if !terminal {
+                        if let Ok(bumped) =
+                            IOUAmount::from_parts(cap.iou.mantissa() + 1, cap.iou.exponent(), false)
+                        {
+                            cap.iou = bumped;
+                        }
                     }
                     cap
                 } else {
@@ -1898,6 +1903,9 @@ fn cross_book_hop(
             let leftover_dust = remaining_is_filled(&remaining_out, demand_out);
             let credit = if remaining_out.is_zero() || leftover_dust {
                 demand_out.iou
+            } else if skip_input_debit {
+                let d = delivered.iou;
+                IOUAmount::from_parts(d.mantissa() + 1, d.exponent(), false).unwrap_or(d)
             } else {
                 delivered.iou
             };
@@ -3969,7 +3977,12 @@ fn pay_out_gross(
         !skip_recipient_credit && amount.issuer != *owner && amount.issuer != *recipient;
     let net = if fee_applies {
         let rate = transfer_rate(ctx, &amount.issuer);
-        IOUAmount::div_round(&amount.iou, &rate, /*round_up*/ false).unwrap_or(amount.iou)
+        let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+        if rate > one {
+            IOUAmount::div_round(&amount.iou, &rate, /*round_up*/ false).unwrap_or(amount.iou)
+        } else {
+            amount.iou
+        }
     } else {
         amount.iou
     };
