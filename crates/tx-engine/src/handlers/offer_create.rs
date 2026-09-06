@@ -433,6 +433,7 @@ impl Transactor for OfferCreateTransactor {
             ),
             _ => keylet::book_dir(&gets_currency, &gets_issuer, &pays_currency, &pays_issuer),
         };
+        reap_own_unfunded_inverse_tip(ctx, &account_id, &mut acct, &inverse_book)?;
         // rippled's mPriorBalance for the resting-offer reserve gate: the XRP
         // balance before the fee and before crossing. The engine deducted the
         // fee centrally and crossing has not run yet, so add the fee back.
@@ -901,7 +902,14 @@ fn cross_offers(
         probe = dir_key;
         let dir_quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
         if dir_quality > threshold {
-            break; // worse than the taker will accept
+            // Taker OfferStream still advances to the next fundable tip past
+            // the threshold, reaping unfunded (including short lsfSell) on the
+            // way, then reject_quality stops. FlowCross used to break here and
+            // left 30000048's own underfunded BTC sell in the book.
+            if reap_unfunded_on_page(ctx, taker, taker_acct, &dir_key)? {
+                break;
+            }
+            continue;
         }
         // Interleave the AMM at this quality band BEFORE the resting CLOB offers.
         // rippled crosses whichever of the synthetic AMM offer / CLOB tip is
@@ -1023,9 +1031,12 @@ fn cross_offers(
             // Owner-funds clamp: an offer can give at most what its owner
             // holds. Fully funded → the whole offer is available; underfunded
             // but positive → fill against the funded amount; zero → reap.
+            // lsfSell must deliver the whole TakerGets; shortfall is unfunded
+            // (30000048 45874350: 0.008 BTC vs 2.011).
             let funds = owner_funds_leg(ctx, &owner, &offer_out);
-            if funds.is_zero() {
-                reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+            let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+            if offer_cannot_pay(&funds, &offer_out, flags, &owner == taker) {
+                reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, &dir_key)?;
                 continue;
             }
             let avail_out = leg_min(&offer_out, &funds);
@@ -3954,6 +3965,83 @@ fn grossed(amount: &IOUAmount, rate: &IOUAmount) -> IOUAmount {
 /// Remove an offer: owner dir, its quality book dir, erase the SLE, decrement
 /// OwnerCount. `book_dir` is the offer's own `BookDirectory` (the quality
 /// directory it lives in), not the book base.
+fn reap_unfunded_on_page(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dir_key: &rxrpl_primitives::Hash256,
+) -> Result<bool, TransactionResult> {
+    let Some(dir_bytes) = ctx.view.read(dir_key) else {
+        return Ok(false);
+    };
+    let Ok(dir) = serde_json::from_slice::<Value>(&dir_bytes) else {
+        return Ok(false);
+    };
+    let offers: Vec<rxrpl_primitives::Hash256> = dir
+        .get("Indexes")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().and_then(|s| s.parse().ok()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut fundable = false;
+    for offer_key in offers {
+        let Some(ob) = ctx.view.read(&offer_key) else {
+            continue;
+        };
+        let Ok(offer) = serde_json::from_slice::<Value>(&ob) else {
+            continue;
+        };
+        if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+            continue;
+        }
+        let owner_str = offer.get("Account").and_then(|v| v.as_str()).unwrap_or("");
+        let Ok(owner) = decode_account_id(owner_str) else {
+            continue;
+        };
+        let Some(offer_out) = Leg::parse(&offer["TakerGets"]) else {
+            continue;
+        };
+        let Some(offer_in) = Leg::parse(&offer["TakerPays"]) else {
+            continue;
+        };
+        let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+        let expired = offer
+            .get("Expiration")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|exp| exp <= ctx.view.parent_close_time() as u64);
+        let funds = owner_funds_leg(ctx, &owner, &offer_out);
+        if expired
+            || offer_out.is_zero()
+            || offer_in.is_zero()
+            || is_deep_frozen(ctx, &owner, &offer_in)
+            || offer_cannot_pay(&funds, &offer_out, flags, &owner == taker)
+        {
+            reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, dir_key)?;
+        } else {
+            fundable = true;
+        }
+    }
+    Ok(fundable)
+}
+
+fn reap_walk_offer(
+    ctx: &mut ApplyContext<'_>,
+    owner: &AccountId,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    offer_key: &rxrpl_primitives::Hash256,
+    book_dir: &rxrpl_primitives::Hash256,
+) -> Result<(), TransactionResult> {
+    reap_offer(ctx, owner, offer_key, book_dir)?;
+    if owner == taker {
+        helpers::adjust_owner_count(taker_acct, -1);
+    }
+    Ok(())
+}
+
 fn reap_offer(
     ctx: &mut ApplyContext<'_>,
     owner: &AccountId,
@@ -4090,6 +4178,87 @@ fn is_deep_frozen(ctx: &mut ApplyContext<'_>, account: &AccountId, asset: &Leg) 
     };
     let flags = tl.get("Flags").and_then(Value::as_u64).unwrap_or(0);
     flags & (LSF_LOW_DEEP_FREEZE | LSF_HIGH_DEEP_FREEZE) != 0
+}
+
+fn offer_cannot_pay(funds: &Leg, offer_out: &Leg, flags: u64, is_self: bool) -> bool {
+    if funds.is_zero() {
+        return true;
+    }
+    is_self && flags & LSF_SELL != 0 && !leg_ge(funds, offer_out)
+}
+
+fn reap_own_unfunded_inverse_tip(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    inverse_book: &Hash256,
+) -> Result<(), TransactionResult> {
+    let prefix = inverse_book.as_bytes()[0..24].to_vec();
+    let mut probe = book_dir_with_quality(inverse_book, 0);
+    let mut best_dir: Option<Hash256> = None;
+    while let Some(dir_key) = ctx.view.succ(&probe) {
+        if dir_key.as_bytes()[0..24] != prefix[..] {
+            break;
+        }
+        probe = dir_key;
+        let Some(bytes) = ctx.view.read(&dir_key) else {
+            continue;
+        };
+        let Ok(dir) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let empty = dir
+            .get("Indexes")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true);
+        if empty {
+            continue;
+        }
+        best_dir = Some(dir_key);
+        break;
+    }
+    let Some(best_dir) = best_dir else {
+        return Ok(());
+    };
+    let entries = crate::owner_dir::collect_owner_dir_entries(ctx.view, taker);
+    for s in entries {
+        let Ok(key) = s.parse::<Hash256>() else {
+            continue;
+        };
+        let Some(bytes) = ctx.view.read(&key) else {
+            continue;
+        };
+        let Ok(offer) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+            continue;
+        }
+        let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+        if flags & LSF_SELL == 0 {
+            continue;
+        }
+        let Some(book) = offer
+            .get("BookDirectory")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Hash256>().ok())
+        else {
+            continue;
+        };
+        if book != best_dir {
+            continue;
+        }
+        let Some(offer_out) = Leg::parse(&offer["TakerGets"]) else {
+            continue;
+        };
+        let funds = owner_funds_leg(ctx, taker, &offer_out);
+        if !leg_ge(&funds, &offer_out) {
+            reap_offer(ctx, taker, &key, &book)?;
+            helpers::adjust_owner_count(taker_acct, -1);
+        }
+    }
+    Ok(())
 }
 
 fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) -> Leg {
@@ -4613,7 +4782,7 @@ impl OfferStream {
     fn step(
         &mut self,
         ctx: &mut ApplyContext<'_>,
-        skip_self: Option<&AccountId>,
+        mut skip_self: Option<(&AccountId, &mut Value)>,
     ) -> Result<Option<OfferTip>, TransactionResult> {
         loop {
             if self.page.is_empty() {
@@ -4679,14 +4848,22 @@ impl OfferStream {
                 reap_offer(ctx, &owner, &offer_key, &self.dir)?;
                 continue;
             }
-            if owner_funds_leg(ctx, &owner, &offer_out).is_zero() {
+            let funds = owner_funds_leg(ctx, &owner, &offer_out);
+            let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+            let is_self = skip_self.as_ref().is_some_and(|(t, _)| *t == &owner);
+            if funds.is_zero() {
                 reap_offer(ctx, &owner, &offer_key, &self.dir)?;
                 continue;
             }
-            if let Some(t) = skip_self {
-                if &owner == t {
-                    continue;
+            if is_self && flags & LSF_SELL != 0 && !leg_ge(&funds, &offer_out) {
+                reap_offer(ctx, &owner, &offer_key, &self.dir)?;
+                if let Some((_, acct)) = skip_self.as_mut() {
+                    helpers::adjust_owner_count(acct, -1);
                 }
+                continue;
+            }
+            if is_self {
+                continue;
             }
             return Ok(Some(OfferTip {
                 key: offer_key,
@@ -5208,7 +5385,7 @@ fn direct_cross(
     let mut stream = OfferStream::new(book);
     let mut crossed = false;
     let mut direct_crossings: u32 = 0;
-    let mut tip = stream.step(ctx, Some(taker))?;
+    let mut tip = stream.step(ctx, Some((taker, taker_acct)))?;
     while let Some(t) = tip.take() {
         if reject_quality(t.quality, threshold) {
             break;
@@ -5244,7 +5421,7 @@ fn direct_cross(
         if !offer_is_dry(ctx, &t.owner, &t.offer_out, &flow.order_out) {
             break;
         }
-        tip = stream.step(ctx, Some(taker))?;
+        tip = stream.step(ctx, Some((taker, taker_acct)))?;
     }
     Ok(crossed)
 }
@@ -5275,7 +5452,7 @@ fn bridged_cross(
     let mut crossed = false;
     let mut direct_crossings: u32 = 0;
     let mut bridge_crossings: u32 = 0;
-    let mut direct_tip = sd.step(ctx, Some(taker))?;
+    let mut direct_tip = sd.step(ctx, Some((taker, taker_acct)))?;
     let mut leg1_tip = s1.step(ctx, None)?;
     let mut leg2_tip = s2.step(ctx, None)?;
     loop {
@@ -5323,7 +5500,7 @@ fn bridged_cross(
             *remaining_out = sell_clamp_sub(remaining_out, &flow.order_out, is_sell);
             *remaining_in = leg_sub(remaining_in, &flow.order_in);
             if offer_is_dry(ctx, &t.owner, &t.offer_out, &flow.order_out) {
-                direct_tip = sd.step(ctx, Some(taker))?;
+                direct_tip = sd.step(ctx, Some((taker, taker_acct)))?;
                 advanced = true;
             }
         } else {
@@ -6775,5 +6952,249 @@ mod taker_bridge_integration {
             0,
             "sender OwnerCount drops with the deleted line"
         );
+    }
+}
+
+#[cfg(test)]
+mod flow_cross_own_unfunded {
+    use super::*;
+    use crate::fees::FeeSettings;
+    use crate::transactor::ApplyContext;
+    use crate::view::apply_view::ApplyView;
+    use crate::view::ledger_view::LedgerView;
+    use crate::view::read_view::ReadView;
+    use crate::view::sandbox::Sandbox;
+    use rxrpl_amendment::Rules;
+    use rxrpl_ledger::Ledger;
+
+    const TAKER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    const ISS: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
+
+    fn apply_flow(
+        sandbox: &mut Sandbox<'_>,
+        fees: &FeeSettings,
+        tx: &serde_json::Value,
+    ) -> TransactionResult {
+        let rules = Rules::from_enabled([feature_id("FlowCross")]);
+        let mut ctx = ApplyContext {
+            tx,
+            view: sandbox,
+            rules: &rules,
+            fees,
+        };
+        OfferCreateTransactor.apply(&mut ctx).unwrap()
+    }
+
+    fn owner_count(sandbox: &Sandbox<'_>, addr: &str) -> u64 {
+        let id = decode_account_id(addr).unwrap();
+        let b = sandbox.read(&keylet::account(&id)).unwrap();
+        let v: Value = serde_json::from_slice(&b).unwrap();
+        v["OwnerCount"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn ledger_30000048_inverse_book_prefix_matches_dcbe() {
+        let xrp = [0u8; 20];
+        let xrp_iss = AccountId::from([0u8; 20]);
+        let mut btc = [0u8; 20];
+        btc[12..15].copy_from_slice(b"BTC");
+        let iss = decode_account_id("rchGBxcD1A1C2tdxF6papQYZ8kjRKMYcL").unwrap();
+        let book = keylet::book_dir(&xrp, &xrp_iss, &btc, &iss);
+        let prefix = hex::encode_upper(&book.as_bytes()[0..24]);
+        assert_eq!(prefix, "DCBE2F8E6D6301D83DA0FB697299BFEECD45EF73EFD3EC72");
+        let page_q =
+            u64::from_be_bytes(hex::decode("5E1DFD8B851B2CA9").unwrap().try_into().unwrap());
+        let pays = IOUAmount::from_decimal_string("1.404741775486649").unwrap();
+        let gets = IOUAmount::from_decimal_string("11375915323").unwrap();
+        let threshold = get_rate(&gets, &pays).unwrap();
+        assert!(
+            page_q > threshold,
+            "45874350 should be past the new offer's quality"
+        );
+    }
+
+    #[test]
+    fn ledger_30000048_reaps_own_underfunded_sell() {
+        // 45874350: lsfSell, TakerGets 2.011 BTC, owner holds 0.008. Not zero so
+        // the old is_zero() path left it; rippled treats a sell that cannot
+        // deliver its whole TakerGets as unfunded.
+        let mut ledger = Ledger::genesis();
+        let taker_id = decode_account_id(TAKER).unwrap();
+        let iss_id = decode_account_id(ISS).unwrap();
+        for (addr, drops) in [(ISS, "1000000000"), (TAKER, "1000000000")] {
+            let id = decode_account_id(addr).unwrap();
+            let acct = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": addr,
+                "Balance": drops, "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&acct).unwrap())
+                .unwrap();
+        }
+        let usd = helpers::currency_to_bytes("USD");
+        let holder_is_low = taker_id.as_bytes() < iss_id.as_bytes();
+        let stored = if holder_is_low { "10" } else { "-10" };
+        let (low, high) = if holder_is_low {
+            (TAKER, ISS)
+        } else {
+            (ISS, TAKER)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": ISS, "value": stored},
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "0"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "1000"},
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&taker_id, &iss_id, &usd),
+                serde_json::to_vec(&tl).unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        let r1 = apply_flow(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "10", "Sequence": 1,
+                "Flags": TF_SELL,
+                "TakerGets": {"currency": "USD", "issuer": ISS, "value": "10"},
+                "TakerPays": "2000000000",
+            }),
+        );
+        assert_eq!(r1, TransactionResult::TesSuccess);
+        assert_eq!(owner_count(&sandbox, TAKER), 1);
+
+        let mut line: Value = serde_json::from_slice(
+            &sandbox
+                .read(&keylet::trust_line(&taker_id, &iss_id, &usd))
+                .unwrap(),
+        )
+        .unwrap();
+        let drained = if holder_is_low { "1" } else { "-1" };
+        line["Balance"]["value"] = Value::String(drained.into());
+        sandbox
+            .update(
+                keylet::trust_line(&taker_id, &iss_id, &usd),
+                serde_json::to_vec(&line).unwrap(),
+            )
+            .unwrap();
+
+        let r2 = apply_flow(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "10", "Sequence": 2,
+                "TakerGets": "100000000",
+                "TakerPays": {"currency": "USD", "issuer": ISS, "value": "1"},
+            }),
+        );
+        assert_eq!(r2, TransactionResult::TesSuccess);
+        assert_eq!(
+            owner_count(&sandbox, TAKER),
+            1,
+            "underfunded lsfSell own inverse offer must be reaped"
+        );
+        assert!(
+            sandbox.read(&keylet::offer(&taker_id, 1)).is_none(),
+            "seq 1 sell offer deleted"
+        );
+    }
+
+    #[test]
+    fn ledger_30000048_taker_path_reaps_own_underfunded_sell() {
+        let mut ledger = Ledger::genesis();
+        let taker_id = decode_account_id(TAKER).unwrap();
+        let iss_id = decode_account_id(ISS).unwrap();
+        for (addr, drops) in [(ISS, "1000000000"), (TAKER, "1000000000")] {
+            let id = decode_account_id(addr).unwrap();
+            let acct = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": addr,
+                "Balance": drops, "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&acct).unwrap())
+                .unwrap();
+        }
+        let usd = helpers::currency_to_bytes("USD");
+        let holder_is_low = taker_id.as_bytes() < iss_id.as_bytes();
+        let stored = if holder_is_low { "10" } else { "-10" };
+        let (low, high) = if holder_is_low {
+            (TAKER, ISS)
+        } else {
+            (ISS, TAKER)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": ISS, "value": stored},
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "0"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "1000"},
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&taker_id, &iss_id, &usd),
+                serde_json::to_vec(&tl).unwrap(),
+            )
+            .unwrap();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules_flow = Rules::from_enabled([feature_id("FlowCross")]);
+        let mut ctx = ApplyContext {
+            tx: &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "10", "Sequence": 1,
+                "Flags": TF_SELL,
+                "TakerGets": {"currency": "USD", "issuer": ISS, "value": "10"},
+                "TakerPays": "2000000000",
+            }),
+            view: &mut sandbox,
+            rules: &rules_flow,
+            fees: &fees,
+        };
+        assert_eq!(
+            OfferCreateTransactor.apply(&mut ctx).unwrap(),
+            TransactionResult::TesSuccess
+        );
+        let mut line: Value = serde_json::from_slice(
+            &sandbox
+                .read(&keylet::trust_line(&taker_id, &iss_id, &usd))
+                .unwrap(),
+        )
+        .unwrap();
+        line["Balance"]["value"] = Value::String(if holder_is_low { "1" } else { "-1" }.into());
+        sandbox
+            .update(
+                keylet::trust_line(&taker_id, &iss_id, &usd),
+                serde_json::to_vec(&line).unwrap(),
+            )
+            .unwrap();
+        let rules_taker = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "10", "Sequence": 2,
+                "TakerGets": "100000000",
+                "TakerPays": {"currency": "USD", "issuer": ISS, "value": "1"},
+            }),
+            view: &mut sandbox,
+            rules: &rules_taker,
+            fees: &fees,
+        };
+        assert_eq!(
+            OfferCreateTransactor.apply(&mut ctx).unwrap(),
+            TransactionResult::TesSuccess
+        );
+        let still = sandbox.read(&keylet::offer(&taker_id, 1)).is_some();
+        let oc = owner_count(&sandbox, TAKER);
+        assert!(
+            !still,
+            "taker path must delete underfunded lsfSell, oc={oc}"
+        );
+        assert_eq!(oc, 1, "OwnerCount after reap+place");
     }
 }
