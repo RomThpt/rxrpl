@@ -1431,6 +1431,20 @@ fn in_for_out(out_amt: &Leg, rate: &IOUAmount, in_template: &Leg) -> Leg {
     amount_to_leg(&amt, in_template)
 }
 
+/// Taker-era `Quality::ceilOut`: `mulRound`, not `mulRoundStrict`. A fractional
+/// drop below 0.1 truncates; FlowCross `ceilOutStrict` would still ceil it
+/// (30000057 502E1318 over-spent 1 drop, while 30000054 E60 fraction 0.88 agrees).
+fn in_for_out_taker(out_amt: &Leg, rate: &IOUAmount, in_template: &Leg) -> Leg {
+    let amt = rxrpl_amount::Amount::mul_round(
+        &leg_to_amount(out_amt),
+        &rxrpl_amount::Amount::Iou(*rate),
+        in_template.is_xrp,
+        true,
+    )
+    .unwrap_or(leg_to_amount(in_template));
+    amount_to_leg(&amt, in_template)
+}
+
 /// Input for a take priced from the resting offer's own current amounts (`in =
 /// ceil(offer_in * out / offer_out)`, multiply-before-divide for XRP so no drop is
 /// lost). Used for the input- and funds-limited branches, where repricing the
@@ -1816,11 +1830,17 @@ fn cross_book_hop(
                 };
                 (take_out.clone(), order_in)
             } else {
-                // Demand-limited: pay the strict ceil price at the offer's book
-                // quality (`Quality::ceilOutStrict`), never exceeding the resting
-                // offer or the remaining budget. Pricing from the offer's drifted
-                // current amounts under-prices an XRP take by a drop.
-                let priced = in_for_out(&take_out, &eff_rate, &offer_in);
+                // Demand-limited: price at the offer's book quality, never
+                // exceeding the resting offer or the remaining budget. Pricing
+                // from the offer's drifted current amounts under-prices an XRP
+                // take by a drop. Pre-FlowCross Taker uses `mulRound` (fraction
+                // below 0.1 drop truncates); FlowCross BookStep uses
+                // `ceilOutStrict`.
+                let priced = if ctx.rules.enabled(&feature_id("FlowCross")) {
+                    in_for_out(&take_out, &eff_rate, &offer_in)
+                } else {
+                    in_for_out_taker(&take_out, &eff_rate, &offer_in)
+                };
                 let order_in = leg_min(&leg_min(&priced, &offer_in), &remaining_in);
                 (take_out.clone(), order_in)
             };
