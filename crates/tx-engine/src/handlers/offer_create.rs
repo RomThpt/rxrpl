@@ -4935,6 +4935,7 @@ impl OfferStream {
         &mut self,
         ctx: &mut ApplyContext<'_>,
         mut skip_self: Option<(&AccountId, &mut Value)>,
+        threshold: u64,
     ) -> Result<Option<OfferTip>, TransactionResult> {
         loop {
             if self.page.is_empty() {
@@ -5001,20 +5002,22 @@ impl OfferStream {
                 continue;
             }
             let funds = owner_funds_leg(ctx, &owner, &offer_out);
-            let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
             let is_self = skip_self.as_ref().is_some_and(|(t, _)| *t == &owner);
             if funds.is_zero() {
                 reap_offer(ctx, &owner, &offer_key, &self.dir)?;
                 continue;
             }
-            if is_self && flags & LSF_SELL != 0 && !leg_ge(&funds, &offer_out) {
+            if is_self {
+                // Taker::unfunded is true for owner==taker: cancel self-crossing
+                // inverse offers instead of skipping them (30000073 3D88107D).
+                // Only within the new offer's quality; worse-page own offers stay.
+                if reject_quality(self.quality, threshold) {
+                    return Ok(None);
+                }
                 reap_offer(ctx, &owner, &offer_key, &self.dir)?;
                 if let Some((_, acct)) = skip_self.as_mut() {
                     helpers::adjust_owner_count(acct, -1);
                 }
-                continue;
-            }
-            if is_self {
                 continue;
             }
             return Ok(Some(OfferTip {
@@ -5537,7 +5540,7 @@ fn direct_cross(
     let mut stream = OfferStream::new(book);
     let mut crossed = false;
     let mut direct_crossings: u32 = 0;
-    let mut tip = stream.step(ctx, Some((taker, taker_acct)))?;
+    let mut tip = stream.step(ctx, Some((taker, taker_acct)), threshold)?;
     while let Some(t) = tip.take() {
         if reject_quality(t.quality, threshold) {
             break;
@@ -5576,7 +5579,7 @@ fn direct_cross(
         if !offer_is_dry(ctx, &t.owner, &t.offer_out, &flow.order_out) {
             break;
         }
-        tip = stream.step(ctx, Some((taker, taker_acct)))?;
+        tip = stream.step(ctx, Some((taker, taker_acct)), threshold)?;
     }
     Ok(crossed)
 }
@@ -5607,9 +5610,9 @@ fn bridged_cross(
     let mut crossed = false;
     let mut direct_crossings: u32 = 0;
     let mut bridge_crossings: u32 = 0;
-    let mut direct_tip = sd.step(ctx, Some((taker, taker_acct)))?;
-    let mut leg1_tip = s1.step(ctx, None)?;
-    let mut leg2_tip = s2.step(ctx, None)?;
+    let mut direct_tip = sd.step(ctx, Some((taker, taker_acct)), threshold)?;
+    let mut leg1_tip = s1.step(ctx, None, threshold)?;
+    let mut leg2_tip = s2.step(ctx, None, threshold)?;
     loop {
         let have_direct = direct_tip.is_some();
         let have_bridge = leg1_tip.is_some() && leg2_tip.is_some();
@@ -5655,7 +5658,7 @@ fn bridged_cross(
             *remaining_out = sell_clamp_sub(remaining_out, &flow.order_out, is_sell);
             *remaining_in = leg_sub(remaining_in, &flow.order_in);
             if offer_is_dry(ctx, &t.owner, &t.offer_out, &flow.order_out) {
-                direct_tip = sd.step(ctx, Some((taker, taker_acct)))?;
+                direct_tip = sd.step(ctx, Some((taker, taker_acct)), threshold)?;
                 advanced = true;
             }
         } else {
@@ -5678,11 +5681,11 @@ fn bridged_cross(
             *remaining_out = sell_clamp_sub(remaining_out, &flow2.order_out, is_sell);
             *remaining_in = leg_sub(remaining_in, &flow1.order_in);
             if offer_is_dry(ctx, &t1.owner, &t1.offer_out, &flow1.order_out) {
-                leg1_tip = s1.step(ctx, None)?;
+                leg1_tip = s1.step(ctx, None, threshold)?;
                 advanced = true;
             }
             if offer_is_dry(ctx, &t2.owner, &t2.offer_out, &flow2.order_out) {
-                leg2_tip = s2.step(ctx, None)?;
+                leg2_tip = s2.step(ctx, None, threshold)?;
                 advanced = true;
             }
         }
@@ -7185,6 +7188,72 @@ mod taker_bridge_integration {
             "worse lsfSell unfunded after the take must be reaped"
         );
         assert_eq!(oc(&sandbox, O1), 0, "both maker offers deleted");
+    }
+
+    /// 30000073 3D88107D: placing a buy of XID for XRP must reap the taker's
+    /// own inverse Flags=0 offers that would self-cross (OwnerCount 1672→1670).
+    #[test]
+    fn ledger_30000073_reaps_own_inverse_offers_that_self_cross() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, O1, 10_000_000_000, 0);
+        put_line(&mut ledger, O1, b"XID", 400);
+        let o1 = decode_account_id(O1).unwrap();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O1, "Fee": "10", "Sequence": 1,
+                    "TakerGets": {"currency": "XID", "issuer": ISS, "value": "199"},
+                    "TakerPays": "1000301600",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O1, "Fee": "10", "Sequence": 2,
+                    "TakerGets": {"currency": "XID", "issuer": ISS, "value": "199"},
+                    "TakerPays": "997863470",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert_eq!(oc(&sandbox, O1), 2);
+
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O1, "Fee": "10", "Sequence": 3,
+                    "TakerGets": "1002105230",
+                    "TakerPays": {"currency": "XID", "issuer": ISS, "value": "199"},
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert!(
+            sandbox.read(&keylet::offer(&o1, 1)).is_none(),
+            "own inverse seq 1 must be reaped"
+        );
+        assert!(
+            sandbox.read(&keylet::offer(&o1, 2)).is_none(),
+            "own inverse seq 2 must be reaped"
+        );
+        assert!(
+            sandbox.read(&keylet::offer(&o1, 3)).is_some(),
+            "new buy leftover is placed"
+        );
+        assert_eq!(oc(&sandbox, O1), 1, "two inverse offers reaped, one placed");
     }
 }
 
