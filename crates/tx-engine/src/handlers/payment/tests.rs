@@ -3050,3 +3050,68 @@ fn ledger_30000054_xlm_take_vs_offer_leftover() {
     assert_eq!(lo57, "1347.362441332918", "take57 leftover {lo57}");
     assert_eq!(lo58, "1347.362441332918", "take58 leftover {lo58}");
 }
+
+/// 30000071 51FF9B2E: same-currency Payment to the issuer with SendMax
+/// issued by the sender is a redeem, not a book conversion. Mainnet
+/// debits 25842 JPY off the line (`-25842.99999999999` → `-0.99999999999`).
+#[test]
+fn ledger_30000071_redeems_iou_to_issuer_with_self_issued_sendmax() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, ALICE, "100000000", None);
+    {
+        let hid = decode_account_id(ALICE).unwrap();
+        let iid = decode_account_id(ISSUER).unwrap();
+        let key = keylet::trust_line(&hid, &iid, &helpers::currency_to_bytes("JPY"));
+        let holder_is_low = hid.as_bytes() < iid.as_bytes();
+        let stored = if holder_is_low {
+            "25842.99999999999"
+        } else {
+            "-25842.99999999999"
+        };
+        let (low, high) = if holder_is_low {
+            (ALICE, ISSUER)
+        } else {
+            (ISSUER, ALICE)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": "JPY", "issuer": ISSUER, "value": stored },
+            "LowLimit": { "currency": "JPY", "issuer": low, "value": "0" },
+            "HighLimit": { "currency": "JPY", "issuer": high, "value": "10000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ISSUER,
+        "Amount": iou("JPY", ISSUER, "25842"),
+        "SendMax": iou("JPY", ALICE, "26100.42"),
+        "Fee": "10",
+        "Sequence": 1,
+    });
+    let rules = Rules::new();
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut ctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+    let left = holder_balance(&sandbox, ALICE, ISSUER, "JPY");
+    assert!(
+        (left - 0.99999999999).abs() < 1e-8,
+        "redeem leftover, got {left}"
+    );
+}
