@@ -167,70 +167,78 @@ impl Transactor for PaymentTransactor {
         // (Account == Destination) or a direct payment to another account.
         if let Some(send_max) = ctx.tx.get("SendMax") {
             if cross_assets_differ(send_max, &ctx.tx["Amount"]) {
-                // Multi-path Flow: a Payment with two or more alternative `Paths`
-                // that each resolve to a pure book/AMM boundary chain. rippled
-                // runs these through the multi-pass Flow loop, consuming any
-                // shared AMM pool in fibonacci-sized chunks clamped to the
-                // competing CLOB quality; a single full swap over-delivers. Gated
-                // narrowly (>= 2 resolvable boundary chains) so single-path
-                // cross-currency and AMM-routed payments keep their existing
-                // byte-exact single-strand engine.
-                if count_flow_strands(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]) >= 2
-                    && flow_strands_have_amm(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"])
-                {
-                    return apply_paths_payment_multi(
-                        ctx,
-                        account_str,
-                        destination_str,
-                        ctx.tx["Amount"].clone(),
-                        send_max.clone(),
-                    );
-                }
-                if ctx.tx.get("Paths").is_none() {
-                    // Single-book shape.
-                    return apply_conversion(
-                        ctx,
-                        account_str,
-                        destination_str,
-                        ctx.tx["Amount"].clone(),
-                        send_max.clone(),
-                    );
-                }
-                // Multi-hop `Paths` with a native (XRP) source or destination
-                // leg: the legacy IOU-only back-solve below cannot represent the
-                // native leg, so route to the byte-exact book-chain crossing
-                // built on the shared Taker engine. IOU<->IOU multi-hop keeps its
-                // existing dispatch (apply_cross_currency) further down.
-                if send_max.is_string() || ctx.tx["Amount"].is_string() {
-                    return apply_paths_payment(
-                        ctx,
-                        account_str,
-                        destination_str,
-                        ctx.tx["Amount"].clone(),
-                        send_max.clone(),
-                    );
-                }
-                // IOU<->IOU multi-hop `Paths`: when at least one path resolves to
-                // a pure book/AMM chain (no genuine cross-issuer DirectStep), route
-                // it through the same byte-exact engine as the native-leg case.
-                // Paths that need a genuine DirectStep or multi-path blend the
-                // book/AMM chain cannot represent fall through to the legacy
-                // back-solve (`apply_cross_currency`) below.
-                let require_ripple_step = account_str != destination_str;
-                if paths_resolve_to_chain(
-                    ctx.view,
-                    ctx.tx,
-                    send_max,
-                    &ctx.tx["Amount"],
-                    require_ripple_step,
-                ) {
-                    return apply_paths_payment(
-                        ctx,
-                        account_str,
-                        destination_str,
-                        ctx.tx["Amount"].clone(),
-                        send_max.clone(),
-                    );
+                // Same-currency SendMax issued by the sender, Amount issued by
+                // the destination, no Paths: redeem/direct IOU spend, not a
+                // book conversion (30000071 51FF9B2E).
+                let (sm_cur, sm_iss) = asset_of(send_max);
+                let (am_cur, am_iss) = asset_of(&ctx.tx["Amount"]);
+                let redeem_to_dest = sm_cur == am_cur
+                    && sm_iss == account_str
+                    && am_iss == destination_str
+                    && ctx.tx.get("Paths").is_none();
+                if !redeem_to_dest {
+                    // Multi-path Flow: a Payment with two or more alternative `Paths`
+                    // that each resolve to a pure book/AMM boundary chain. rippled
+                    // runs these through the multi-pass Flow loop, consuming any
+                    // shared AMM pool in fibonacci-sized chunks clamped to the
+                    // competing CLOB quality; a single full swap over-delivers. Gated
+                    // narrowly (>= 2 resolvable boundary chains) so single-path
+                    // cross-currency and AMM-routed payments keep their existing
+                    // byte-exact single-strand engine.
+                    if count_flow_strands(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]) >= 2
+                        && flow_strands_have_amm(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"])
+                    {
+                        return apply_paths_payment_multi(
+                            ctx,
+                            account_str,
+                            destination_str,
+                            ctx.tx["Amount"].clone(),
+                            send_max.clone(),
+                        );
+                    }
+                    if ctx.tx.get("Paths").is_none() {
+                        return apply_conversion(
+                            ctx,
+                            account_str,
+                            destination_str,
+                            ctx.tx["Amount"].clone(),
+                            send_max.clone(),
+                        );
+                    }
+                    // Multi-hop `Paths` with a native (XRP) source or destination
+                    // leg: the legacy IOU-only back-solve below cannot represent the
+                    // native leg, so route to the byte-exact book-chain crossing
+                    // built on the shared Taker engine. IOU<->IOU multi-hop keeps its
+                    // existing dispatch (apply_cross_currency) further down.
+                    if send_max.is_string() || ctx.tx["Amount"].is_string() {
+                        return apply_paths_payment(
+                            ctx,
+                            account_str,
+                            destination_str,
+                            ctx.tx["Amount"].clone(),
+                            send_max.clone(),
+                        );
+                    }
+                    // IOU<->IOU multi-hop `Paths`: when at least one path resolves to
+                    // a pure book/AMM chain (no genuine DirectStep), route it through
+                    // the same byte-exact engine as the native-leg case. Paths that
+                    // need a genuine DirectStep fall through to apply_cross_currency.
+                    let require_ripple_step = account_str != destination_str;
+                    if paths_resolve_to_chain(
+                        ctx.view,
+                        ctx.tx,
+                        send_max,
+                        &ctx.tx["Amount"],
+                        require_ripple_step,
+                    ) {
+                        return apply_paths_payment(
+                            ctx,
+                            account_str,
+                            destination_str,
+                            ctx.tx["Amount"].clone(),
+                            send_max.clone(),
+                        );
+                    }
                 }
             }
         }
