@@ -1894,7 +1894,10 @@ fn cross_book_hop(
                 let mut new_gets = leftover_leg(&offer_out, &order_out, number_switchover);
                 // Last-hop input-limited: `out_for_in` floors 1 ULP below the
                 // consumed Gets (30000066 33FB4822 leftover `…6341` vs `…634`).
-                if skip_input_debit && budget_binds && !new_gets.is_xrp && new_gets.iou.mantissa() > 0
+                if skip_input_debit
+                    && budget_binds
+                    && !new_gets.is_xrp
+                    && new_gets.iou.mantissa() > 0
                 {
                     if let Ok(trimmed) = IOUAmount::from_parts(
                         new_gets.iou.mantissa() - 1,
