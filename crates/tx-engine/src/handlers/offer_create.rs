@@ -4348,6 +4348,56 @@ fn reap_own_unfunded_inverse_tip(
     Ok(())
 }
 
+/// After an exhausted take, reap the maker's other lsfSell offers of the same
+/// asset that can no longer deliver TakerGets (30000060 D995194A seq 258).
+fn reap_maker_short_sells(
+    ctx: &mut ApplyContext<'_>,
+    owner: &AccountId,
+    sold: &Leg,
+) -> Result<(), TransactionResult> {
+    let entries = crate::owner_dir::collect_owner_dir_entries(ctx.view, owner);
+    for s in entries {
+        let Ok(key) = s.parse::<Hash256>() else {
+            continue;
+        };
+        let Some(bytes) = ctx.view.read(&key) else {
+            continue;
+        };
+        let Ok(offer) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+            continue;
+        }
+        let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+        if flags & LSF_SELL == 0 {
+            continue;
+        }
+        let Some(offer_out) = Leg::parse(&offer["TakerGets"]) else {
+            continue;
+        };
+        if offer_out.is_xrp != sold.is_xrp
+            || offer_out.currency != sold.currency
+            || offer_out.issuer != sold.issuer
+        {
+            continue;
+        }
+        let funds = owner_funds_leg(ctx, owner, &offer_out);
+        if !funds.is_zero() && leg_ge(&funds, &offer_out) {
+            continue;
+        }
+        let Some(book) = offer
+            .get("BookDirectory")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Hash256>().ok())
+        else {
+            continue;
+        };
+        reap_offer(ctx, owner, &key, &book)?;
+    }
+    Ok(())
+}
+
 fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) -> Leg {
     let zero = Leg {
         is_xrp: gets.is_xrp,
@@ -5499,6 +5549,9 @@ fn direct_cross(
         }
         *remaining_out = sell_clamp_sub(remaining_out, &flow.order_out, is_sell);
         *remaining_in = leg_sub(remaining_in, &flow.order_in);
+        if offer_is_dry(ctx, &t.owner, &t.offer_out, &flow.order_out) {
+            reap_maker_short_sells(ctx, &t.owner, &t.offer_out)?;
+        }
         if taker_done(is_sell, remaining_out, remaining_in) {
             break;
         }
@@ -7039,6 +7092,84 @@ mod taker_bridge_integration {
             0,
             "sender OwnerCount drops with the deleted line"
         );
+    }
+
+    fn oc(sandbox: &Sandbox<'_>, addr: &str) -> u64 {
+        let id = decode_account_id(addr).unwrap();
+        let b = sandbox.read(&keylet::account(&id)).unwrap();
+        let v: Value = serde_json::from_slice(&b).unwrap();
+        v["OwnerCount"].as_u64().unwrap()
+    }
+
+    /// 30000060 D995194A: after filling the better lsfSell, OfferStream must
+    /// still step and reap the maker's worse-page lsfSell that can no longer
+    /// deliver its whole TakerGets (OwnerCount 6→4, not 6→5).
+    #[test]
+    fn ledger_30000060_reaps_maker_short_lsfsell_after_fill() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 10_000_000_000, 0);
+        put_acct(&mut ledger, O1, 1_000_000_000, 0);
+        put_line(&mut ledger, TAKER, b"BTC", 0);
+        put_line(&mut ledger, O1, b"BTC", 1);
+        let o1 = decode_account_id(O1).unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O1, "Fee": "10", "Sequence": 1,
+                    "Flags": TF_SELL,
+                    "TakerGets": {"currency": "BTC", "issuer": ISS, "value": "1"},
+                    "TakerPays": "840000000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O1, "Fee": "10", "Sequence": 2,
+                    "Flags": TF_SELL,
+                    "TakerGets": {"currency": "BTC", "issuer": ISS, "value": "1"},
+                    "TakerPays": "845000000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert_eq!(oc(&sandbox, O1), 2);
+        assert!(sandbox.read(&keylet::offer(&o1, 1)).is_some());
+        assert!(sandbox.read(&keylet::offer(&o1, 2)).is_some());
+
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "12", "Sequence": 1,
+                    "Flags": TF_IMMEDIATE_OR_CANCEL,
+                    "TakerGets": "841000000",
+                    "TakerPays": {"currency": "BTC", "issuer": ISS, "value": "1"},
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert!(
+            sandbox.read(&keylet::offer(&o1, 1)).is_none(),
+            "better lsfSell consumed"
+        );
+        assert!(
+            sandbox.read(&keylet::offer(&o1, 2)).is_none(),
+            "worse lsfSell unfunded after the take must be reaped"
+        );
+        assert_eq!(oc(&sandbox, O1), 0, "both maker offers deleted");
     }
 }
 
