@@ -1891,7 +1891,19 @@ fn cross_book_hop(
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
             } else {
                 let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
-                let new_gets = leftover_leg(&offer_out, &order_out, number_switchover);
+                let mut new_gets = leftover_leg(&offer_out, &order_out, number_switchover);
+                // Last-hop input-limited: `out_for_in` floors 1 ULP below the
+                // consumed Gets (30000066 33FB4822 leftover `…6341` vs `…634`).
+                if skip_input_debit && budget_binds && !new_gets.is_xrp && new_gets.iou.mantissa() > 0
+                {
+                    if let Ok(trimmed) = IOUAmount::from_parts(
+                        new_gets.iou.mantissa() - 1,
+                        new_gets.iou.exponent(),
+                        false,
+                    ) {
+                        new_gets.iou = trimmed;
+                    }
+                }
                 let new_pays = leftover_leg(&offer_in, &order_in, number_switchover);
                 let mut reduced = offer.clone();
                 reduced["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);

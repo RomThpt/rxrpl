@@ -2918,6 +2918,128 @@ fn ledger_30000057_eth_xrp_demand_limited_does_not_overpay_one_drop() {
     );
 }
 
+/// 30000066 33FB4822: last hop is input-limited (XLM from hop 0). leftover
+/// TakerGets is 1 ULP high (`119.1853156456341` vs `…634`); TakerPays matches.
+#[test]
+fn ledger_30000066_cny_leftover_gets_truncates() {
+    const TF_SELL: u64 = 0x0008_0000;
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "1000000000", None);
+    put_account(&mut ledger, ALICE, "10000000000", None);
+    put_account(&mut ledger, MM, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_trust_line(&mut ledger, MM, ISSUER, "XLM", 200.0);
+    put_trust_line(&mut ledger, MM2, ISSUER, "CNY", 200.0);
+    for (holder, cur) in [(MM2, "XLM"), (ALICE, "CNY")] {
+        let hid = decode_account_id(holder).unwrap();
+        let iid = decode_account_id(ISSUER).unwrap();
+        let key = keylet::trust_line(&hid, &iid, &helpers::currency_to_bytes(cur));
+        let holder_is_low = hid.as_bytes() < iid.as_bytes();
+        let (low, high) = if holder_is_low {
+            (holder, ISSUER)
+        } else {
+            (ISSUER, holder)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": cur, "issuer": ISSUER, "value": "0" },
+            "LowLimit": { "currency": cur, "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": cur, "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let xlm_offer = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM,
+        "Flags": TF_SELL,
+        "TakerGets": iou("XLM", ISSUER, "99.029847449557"),
+        "TakerPays": "16736045",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &xlm_offer,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let cny_offer = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM2,
+        "TakerGets": iou("CNY", ISSUER, "159.203277"),
+        "TakerPays": iou("XLM", ISSUER, "393.97"),
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &cny_offer,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Flags": TF_PARTIAL_PAYMENT_TEST,
+        "Amount": iou("CNY", ISSUER, "1433.8566"),
+        "SendMax": "600000000",
+        "Paths": [[
+            { "currency": "XLM", "issuer": ISSUER },
+            { "currency": "CNY", "issuer": ISSUER }
+        ]],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let mm2_id = decode_account_id(MM2).unwrap();
+    let offer: serde_json::Value =
+        serde_json::from_slice(&sandbox.read(&keylet::offer(&mm2_id, 1)).unwrap()).unwrap();
+    let leftover_gets = offer["TakerGets"]["value"].as_str().unwrap();
+    assert_eq!(
+        leftover_gets, "119.185315645634",
+        "33FB leftover TakerGets, got {leftover_gets}"
+    );
+    let leftover_pays = offer["TakerPays"]["value"].as_str().unwrap();
+    assert_eq!(
+        leftover_pays, "294.940152550443",
+        "33FB leftover TakerPays, got {leftover_pays}"
+    );
+}
+
 #[test]
 fn ledger_30000054_xlm_take_vs_offer_leftover() {
     let offer = IOUAmount::from_decimal_string("1372.070869049977").unwrap();
