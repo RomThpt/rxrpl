@@ -2820,6 +2820,102 @@ fn ledger_30000054_eth_offer_leftover_truncates() {
         leftover, "1.410274260284363",
         "leftover TakerGets 1 ULP above remaining*rate+1, got {leftover}"
     );
+    let leftover_pays = offer["TakerPays"].as_str().unwrap();
+    assert_eq!(
+        leftover_pays, "916872561",
+        "E60 leftover TakerPays, got {leftover_pays}"
+    );
+}
+
+/// 30000057 502E1318: same ETH/XRP book as E60; demand-limited ceil over-spends
+/// 1 drop (taker 10493839936 vs 10493839937, offer TakerPays 896953642 vs 643).
+#[test]
+fn ledger_30000057_eth_xrp_demand_limited_does_not_overpay_one_drop() {
+    const TF_SELL: u64 = 0x0008_0000;
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER2, "1000000000", Some(1_003_000_000));
+    put_account(&mut ledger, ALICE, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_trust_line(&mut ledger, MM2, ISSUER2, "ETH", 10.0);
+    {
+        let alice_id = decode_account_id(ALICE).unwrap();
+        let iss2 = decode_account_id(ISSUER2).unwrap();
+        let cur = helpers::currency_to_bytes("ETH");
+        let key = keylet::trust_line(&alice_id, &iss2, &cur);
+        let alice_is_low = alice_id.as_bytes() < iss2.as_bytes();
+        let (low, high) = if alice_is_low {
+            (ALICE, ISSUER2)
+        } else {
+            (ISSUER2, ALICE)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": "ETH", "issuer": ISSUER2, "value": "0" },
+            "LowLimit": { "currency": "ETH", "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": "ETH", "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let eth_offer = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM2,
+        "Flags": TF_SELL,
+        "TakerGets": iou("ETH", ISSUER2, "1.410274260284363"),
+        "TakerPays": "916872561",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &eth_offer,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": iou("ETH", ISSUER2, "0.03054635640390767"),
+        "SendMax": "19938837",
+        "Paths": [[{ "currency": "ETH", "issuer": ISSUER2 }]],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let mm2_id = decode_account_id(MM2).unwrap();
+    let offer: serde_json::Value =
+        serde_json::from_slice(&sandbox.read(&keylet::offer(&mm2_id, 1)).unwrap()).unwrap();
+    let leftover_pays = offer["TakerPays"].as_str().unwrap();
+    assert_eq!(
+        leftover_pays, "896953643",
+        "502E leftover TakerPays, got {leftover_pays}"
+    );
 }
 
 #[test]
