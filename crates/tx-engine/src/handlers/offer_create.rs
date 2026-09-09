@@ -67,6 +67,67 @@ fn peek_best_book_quality(
     None
 }
 
+/// TakerGets of the best resting offer on the inverse book, used to cap a
+/// reverse CLOB quote when PartialPayment Amount exceeds book size.
+fn peek_best_book_gets(
+    ctx: &mut ApplyContext<'_>,
+    budget_in: &Leg,
+    demand_out: &Leg,
+) -> Option<Leg> {
+    let inverse_book = keylet::book_dir(
+        &budget_in.currency,
+        &budget_in.issuer,
+        &demand_out.currency,
+        &demand_out.issuer,
+    );
+    let book_prefix = inverse_book.as_bytes()[0..24].to_vec();
+    let mut probe = book_dir_with_quality(&inverse_book, 0);
+    while let Some(dir_key) = ctx.view.succ(&probe) {
+        if dir_key.as_bytes()[0..24] != book_prefix[..] {
+            return None;
+        }
+        probe = dir_key;
+        let Some(bytes) = ctx.view.read(&dir_key) else {
+            continue;
+        };
+        let Ok(dir) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let page: Vec<Hash256> = dir
+            .get("Indexes")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().and_then(|s| s.parse().ok()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for key in page {
+            let Some(ob) = ctx.view.read(&key) else {
+                continue;
+            };
+            let Ok(offer) = serde_json::from_slice::<Value>(&ob) else {
+                continue;
+            };
+            let Some(gets) = Leg::parse(&offer["TakerGets"]) else {
+                continue;
+            };
+            let Some(owner_s) = offer.get("Account").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok(owner) = decode_account_id(owner_s) else {
+                continue;
+            };
+            let funds = owner_funds_leg(ctx, &owner, &gets);
+            if funds.is_zero() {
+                continue;
+            }
+            return Some(if leg_ge(&funds, &gets) { gets } else { funds });
+        }
+    }
+    None
+}
+
 /// Parse a decimal value string (e.g. `"277.167203027"`) into an `IOUAmount`,
 /// normalising the mantissa into rippled's `[10^15, 10^16)` range.
 fn iou_from_decimal(s: &str) -> Option<IOUAmount> {
@@ -2066,7 +2127,11 @@ pub(crate) fn cross_path_payment(
             };
             path_q = Some(match path_q {
                 None => hq,
-                Some(prev) => composed_quality(prev, hq),
+                // LimitQuality compares the path to SendMax/Amount. Path-select
+                // `composed_quality` rounds the product UP (worse); that 1-ULP
+                // bump rejects a legal partial (30000095 256D45D9, composed
+                // 0.997 of the limit).
+                Some(prev) => composed_quality_exact(prev, hq),
             });
         }
         if let Some(pq) = path_q {
@@ -2173,7 +2238,7 @@ pub(crate) fn cross_path_payment(
 
         // An interior hop must fully consume what the previous hop delivered, or
         // the intermediate currency does not balance across the two books.
-        if !is_first && !legs_eq(&spent, &carry) {
+        if !is_first && !legs_eq_or_one_ulp(&spent, &carry) {
             return Err(TransactionResult::TecPathPartial);
         }
         if is_first {
@@ -2209,6 +2274,19 @@ fn legs_eq(a: &Leg, b: &Leg) -> bool {
     } else {
         a.iou == b.iou
     }
+}
+
+/// Interior hop balance: reverse-priced carry can sit 1 ULP above the
+/// forward take (30000095 256D45D9 CNY `…583` vs `…582`). A larger gap is
+/// still `tecPATH_PARTIAL` (unbounded hop-0 over-spend).
+fn legs_eq_or_one_ulp(a: &Leg, b: &Leg) -> bool {
+    if legs_eq(a, b) {
+        return true;
+    }
+    if a.is_xrp {
+        return (a.drops - b.drops).unsigned_abs() <= 1;
+    }
+    a.iou.exponent() == b.iou.exponent() && a.iou.mantissa().abs_diff(b.iou.mantissa()) <= 1
 }
 
 /// A `Leg` in `template`'s asset carrying an effectively unbounded magnitude,
@@ -2808,7 +2886,7 @@ fn apply_amm_move(
 /// required input exceeds `budget` (input-limited). The caller's forward-only
 /// flow then handles those cases.
 fn reverse_clob_amounts(
-    ctx: &ApplyContext<'_>,
+    ctx: &mut ApplyContext<'_>,
     dest: &AccountId,
     boundaries: &[Value],
     target_out: &Leg,
@@ -2817,7 +2895,28 @@ fn reverse_clob_amounts(
     if n < 3 {
         return None;
     }
-    let mut amts = vec![target_out.clone()];
+    // Cap dest demand at last-hop book size so a PartialPayment Amount larger
+    // than resting liquidity does not reverse-price a hop-0 take that then
+    // fails `legs_eq` (30000095 256D45D9: 601 USD Amount vs 9.84 USD offer).
+    let last_in = Leg::parse(&boundaries[n - 2])?;
+    let last_out = Leg::parse(&boundaries[n - 1])?;
+    let mut target = target_out.clone();
+    if let Some(mut avail) = peek_best_book_gets(ctx, &last_in, &last_out) {
+        // TakerGets is gross; dest Amount is net. Capping at Gets then
+        // re-grossing the last hop double-counts the issuer fee (30000095
+        // bitstamp TransferRate 1.002: 9.84 Gets -> 9.82 net).
+        if !avail.is_xrp && last_out.issuer != *dest {
+            let tr = transfer_rate(ctx, &last_out.issuer);
+            let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+            if tr > one {
+                avail.iou = IOUAmount::div_round(&avail.iou, &tr, false).unwrap_or(avail.iou);
+            }
+        }
+        if !leg_ge(&avail, &target) {
+            target = avail;
+        }
+    }
+    let mut amts = vec![target];
     for hop in (0..n - 1).rev() {
         let in_tmpl = Leg::parse(&boundaries[hop])?;
         let out_tmpl = Leg::parse(&boundaries[hop + 1])?;
@@ -4699,13 +4798,21 @@ fn pack_rate(rate: &IOUAmount) -> u64 {
 /// round-UP (worse) matches rippled's Quality.cpp:135 and keeps the bridge from
 /// looking marginally better than it is at a band boundary.
 fn composed_quality(q1: u64, q2: u64) -> u64 {
+    compose_packed_rates(q1, q2, true)
+}
+
+fn composed_quality_exact(q1: u64, q2: u64) -> u64 {
+    compose_packed_rates(q1, q2, false)
+}
+
+fn compose_packed_rates(q1: u64, q2: u64, round_up: bool) -> u64 {
     let r1 = from_rate(q1).unwrap_or(IOUAmount::ZERO);
     let r2 = from_rate(q2).unwrap_or(IOUAmount::ZERO);
     match rxrpl_amount::Amount::mul_round(
         &rxrpl_amount::Amount::Iou(r1),
         &rxrpl_amount::Amount::Iou(r2),
         false,
-        true,
+        round_up,
     ) {
         Ok(rxrpl_amount::Amount::Iou(v)) => pack_rate(&v),
         _ => 0,
