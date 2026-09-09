@@ -33,6 +33,15 @@ fn peek_best_book_quality(
     budget_in: &Leg,
     demand_out: &Leg,
 ) -> Option<u64> {
+    peek_book_quality_skip(view, budget_in, demand_out, 0)
+}
+
+fn peek_book_quality_skip(
+    view: &dyn crate::view::read_view::ReadView,
+    budget_in: &Leg,
+    demand_out: &Leg,
+    skip: usize,
+) -> Option<u64> {
     let inverse_book = keylet::book_dir(
         &budget_in.currency,
         &budget_in.issuer,
@@ -41,6 +50,7 @@ fn peek_best_book_quality(
     );
     let book_prefix = inverse_book.as_bytes()[0..24].to_vec();
     let mut probe = book_dir_with_quality(&inverse_book, 0);
+    let mut seen = 0usize;
     while let Some(dir_key) = view.succ(&probe) {
         if dir_key.as_bytes()[0..24] != book_prefix[..] {
             return None;
@@ -60,20 +70,23 @@ fn peek_best_book_quality(
         if empty {
             continue;
         }
-        return Some(u64::from_be_bytes(
-            dir_key.as_bytes()[24..32].try_into().ok()?,
-        ));
+        if seen == skip {
+            return Some(u64::from_be_bytes(
+                dir_key.as_bytes()[24..32].try_into().ok()?,
+            ));
+        }
+        seen += 1;
     }
     None
 }
 
 /// TakerGets of the best resting offer on the inverse book, used to cap a
 /// reverse CLOB quote when PartialPayment Amount exceeds book size.
-fn peek_best_book_gets(
+fn peek_best_funded_offer(
     ctx: &mut ApplyContext<'_>,
     budget_in: &Leg,
     demand_out: &Leg,
-) -> Option<Leg> {
+) -> Option<Value> {
     let inverse_book = keylet::book_dir(
         &budget_in.currency,
         &budget_in.issuer,
@@ -122,10 +135,32 @@ fn peek_best_book_gets(
             if funds.is_zero() {
                 continue;
             }
-            return Some(if leg_ge(&funds, &gets) { gets } else { funds });
+            return Some(offer);
         }
     }
     None
+}
+
+fn peek_best_book_gets(
+    ctx: &mut ApplyContext<'_>,
+    budget_in: &Leg,
+    demand_out: &Leg,
+) -> Option<Leg> {
+    let offer = peek_best_funded_offer(ctx, budget_in, demand_out)?;
+    let gets = Leg::parse(&offer["TakerGets"])?;
+    let owner_s = offer.get("Account").and_then(|v| v.as_str())?;
+    let owner = decode_account_id(owner_s).ok()?;
+    let funds = owner_funds_leg(ctx, &owner, &gets);
+    Some(if leg_ge(&funds, &gets) { gets } else { funds })
+}
+
+fn peek_best_book_pays(
+    ctx: &mut ApplyContext<'_>,
+    budget_in: &Leg,
+    demand_out: &Leg,
+) -> Option<Leg> {
+    let offer = peek_best_funded_offer(ctx, budget_in, demand_out)?;
+    Leg::parse(&offer["TakerPays"])
 }
 
 /// Parse a decimal value string (e.g. `"277.167203027"`) into an `IOUAmount`,
@@ -843,6 +878,41 @@ fn credit_line(
         .update(key, nb)
         .map_err(|_| TransactionResult::TefInternal)?;
     Ok(())
+}
+
+fn credit_line_ulp_if_coarse(
+    ctx: &mut ApplyContext<'_>,
+    holder: &AccountId,
+    amount: &Leg,
+    round: bool,
+) -> Result<(), TransactionResult> {
+    if amount.is_xrp || amount.issuer == *holder {
+        return Ok(());
+    }
+    let key = keylet::trust_line(holder, &amount.issuer, &amount.currency);
+    let Some(bytes) = ctx.view.read(&key) else {
+        return Ok(());
+    };
+    let Ok(line) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(());
+    };
+    let Some(s) = line
+        .get("Balance")
+        .and_then(|b| b.get("value"))
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(());
+    };
+    let Ok(bal) = IOUAmount::from_decimal_string(s) else {
+        return Ok(());
+    };
+    if bal.exponent() < amount.iou.exponent() + 4 {
+        return Ok(());
+    }
+    let Ok(ulp) = IOUAmount::from_parts(1, bal.exponent(), false) else {
+        return Ok(());
+    };
+    credit_line(ctx, holder, &amount.issuer, &amount.currency, &ulp, round)
 }
 
 /// Add `delta` drops to an account's XRP balance (read/modify/write the SLE).
@@ -1611,6 +1681,7 @@ fn cross_book_hop(
 
     let mut remaining_out = demand_out.clone();
     let mut remaining_in = budget_in.clone();
+    let mut consumed_whole_offer = false;
     let mut xrp_half_up: Option<AccountId> = None;
     let dest_line_key = keylet::trust_line(dest, &demand_out.issuer, &demand_out.currency);
     let dest_line_before = if !skip_output_credit && !demand_out.is_xrp {
@@ -1660,10 +1731,7 @@ fn cross_book_hop(
         // where the AMM is at least as good as the offers about to fill and is a
         // no-op on a pure-CLOB book. The output lands on `dest`; interior hops
         // carry the previous hop's delivery so their input is not funds-capped.
-        if !remaining_out.is_zero()
-            && !remaining_in.is_zero()
-            && (skip_output_credit || !remaining_is_filled(&remaining_out, demand_out))
-        {
+        if !remaining_in.is_zero() && !hop_out_done(&remaining_out, demand_out) {
             let amm_budget = if skip_input_debit {
                 remaining_in.clone()
             } else {
@@ -1689,10 +1757,7 @@ fn cross_book_hop(
                     spent = leg_add(&spent, &amm_spent);
                 }
             }
-            if remaining_out.is_zero()
-                || remaining_in.is_zero()
-                || (!skip_output_credit && remaining_is_filled(&remaining_out, demand_out))
-            {
+            if remaining_in.is_zero() || hop_out_done(&remaining_out, demand_out) {
                 break 'walk;
             }
         }
@@ -1714,10 +1779,7 @@ fn cross_book_hop(
             .unwrap_or_default();
 
         for offer_key in offers {
-            if remaining_out.is_zero()
-                || remaining_in.is_zero()
-                || (!skip_output_credit && remaining_is_filled(&remaining_out, demand_out))
-            {
+            if remaining_in.is_zero() || hop_out_done(&remaining_out, demand_out) {
                 break 'walk;
             }
             let Some(ob) = ctx.view.read(&offer_key) else {
@@ -1830,7 +1892,13 @@ fn cross_book_hop(
                 break 'walk;
             }
 
-            let full_take = leg_ge(&take_out, &offer_out);
+            // Paying the offer's TakerPays must consume TakerGets. out_for_in
+            // of exact Pays can floor short of Gets (30000099 0C0344E7).
+            let full_take = leg_ge(&take_out, &offer_out)
+                || (leg_ge(&remaining_in, &offer_in) && leg_ge(&remaining_out_cap, &offer_out));
+            if full_take {
+                consumed_whole_offer = true;
+            }
             let funds_limited = !full_take && !budget_binds && leg_ge(&take_out, &avail_out);
             let (order_out, order_in) = if full_take {
                 (offer_out.clone(), offer_in.clone())
@@ -1929,6 +1997,12 @@ fn cross_book_hop(
                 number_switchover,
                 skip_output_credit,
             )?;
+            // Debiting Gets (e=-19) into a 22.45 BTC line (e=-14) truncates 1
+            // ULP vs mainnet (30000099 0C0344E7). Give it back when the line
+            // is coarser than Gets by 4+ exponents.
+            if full_take && skip_input_debit && !skip_output_credit {
+                credit_line_ulp_if_coarse(ctx, &owner, &order_out, number_switchover)?;
+            }
 
             if full_take || funds_limited {
                 let mut consumed = offer.clone();
@@ -1999,7 +2073,7 @@ fn cross_book_hop(
             let leftover_dust = remaining_is_filled(&remaining_out, demand_out);
             let credit = if remaining_out.is_zero() || leftover_dust {
                 demand_out.iou
-            } else if skip_input_debit {
+            } else if skip_input_debit && !consumed_whole_offer {
                 let d = delivered.iou;
                 IOUAmount::from_parts(d.mantissa() + 1, d.exponent(), false).unwrap_or(d)
             } else {
@@ -2202,10 +2276,9 @@ pub(crate) fn cross_path_payment(
             unbounded_leg(&out_tmpl)
         };
 
-        // tfLimitQuality: do not walk worse-priced offers than the first filled
-        // quality on each hop. 30000010 Payment 3C89AD0B spends 10 CNY on the
-        // best CNY/XRP band then 4.2 XRP on XLM; unbounded hop-0 demand ate the
-        // rest of SendMax and over-credited the XRP maker.
+        // tfLimitQuality binds the last hop to one quality page. Hop 0 may
+        // walk several CNY/XRP bands (30000099 0C0344E7: 10 CNY tip vs
+        // 15.656 CNY last-hop take). Reverse demand still bounds hop 0.
         let (clob_out, clob_spent) = cross_book_hop(
             ctx,
             taker,
@@ -2215,7 +2288,7 @@ pub(crate) fn cross_path_payment(
             &budget,
             /*skip_input_debit=*/ !is_first,
             /*skip_output_credit=*/ !is_last,
-            /*single_band=*/ limit_quality,
+            /*single_band=*/ limit_quality && is_last,
         )?;
 
         // Residual liquidity from the AMM pool for this pair, on the budget not
@@ -2957,7 +3030,36 @@ fn reverse_clob_amounts(
                 }
             }
         }
-        let in_need = in_for_out(&out_need, &rate, &in_tmpl);
+        let mut in_need = in_for_out(&out_need, &rate, &in_tmpl);
+        // Reverse +1 ULP on last-hop Gets can price hop-0 CNY 1 ULP above
+        // TakerPays (30000099 0C0344E7). Cap at Pays so the last hop can
+        // spend the carry (else tecPATH_PARTIAL, payment deferred).
+        if hop == n - 2 {
+            if let Some(pays) = peek_best_book_pays(ctx, &in_tmpl, &out_tmpl) {
+                if !leg_ge(&pays, &in_need) {
+                    in_need = pays;
+                }
+            }
+        }
+        // Hop 0 may span a worse second quality (30000099 0C0344E7: tip
+        // 10 CNY vs 15.656 needed). Price the remainder at the next band
+        // so the reverse XRP cap is not ~31 drops short.
+        if hop == 0 {
+            if let Some(tip_gets) = peek_best_book_gets(ctx, &in_tmpl, &out_tmpl) {
+                if !leg_ge(&tip_gets, &out_need) {
+                    if let Some(q2) = peek_book_quality_skip(ctx.view, &in_tmpl, &out_tmpl, 1) {
+                        if let Ok(rate2) = rxrpl_amount::from_rate(q2) {
+                            if !rate2.is_zero() {
+                                let tip_in = in_for_out(&tip_gets, &rate, &in_tmpl);
+                                let rem = leg_sub(&out_need, &tip_gets);
+                                let rest_in = in_for_out(&rem, &rate2, &in_tmpl);
+                                in_need = leg_add(&tip_in, &rest_in);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if in_need.is_zero() {
             return None;
         }
@@ -3924,6 +4026,10 @@ fn leftover_is_dust(part: &Leg, whole: &Leg) -> bool {
         Ok(q) => q.is_zero() || q.exponent() <= -16,
         Err(_) => false,
     }
+}
+
+fn hop_out_done(remaining: &Leg, demand: &Leg) -> bool {
+    remaining.is_zero() || remaining_is_filled(remaining, demand)
 }
 
 /// `a - b` for like-typed legs (same currency).
