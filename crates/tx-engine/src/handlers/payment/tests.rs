@@ -3231,3 +3231,234 @@ fn ledger_30000095_limit_quality_two_hop_delivers() {
         "256D45 dest nets Gets/1.002, got {usd}"
     );
 }
+
+/// 30000096 2DDBE66F: same strand as 256D45D9 after that offer is gone. Best
+/// USD/CNY rest is an exact 10 USD Gets (fully consumed). Dest nets 10/1.002.
+#[test]
+fn ledger_30000096_fully_consumes_ten_usd_last_hop() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "1000000000", None);
+    put_account(&mut ledger, ISSUER2, "1000000000", Some(1_002_000_000));
+    put_account(&mut ledger, ALICE, "10000000000", None);
+    put_account(&mut ledger, MM, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_trust_line(&mut ledger, MM, ISSUER, "CNY", 4000.0);
+    put_trust_line(&mut ledger, MM2, ISSUER2, "USD", 20.0);
+    put_trust_line(&mut ledger, MM2, ISSUER, "CNY", 0.0);
+    for (holder, iss, cur) in [(ALICE, ISSUER2, "USD"), (MM2, ISSUER, "CNY")] {
+        let hid = decode_account_id(holder).unwrap();
+        let iid = decode_account_id(iss).unwrap();
+        let key = keylet::trust_line(&hid, &iid, &helpers::currency_to_bytes(cur));
+        let holder_is_low = hid.as_bytes() < iid.as_bytes();
+        let (low, high) = if holder_is_low {
+            (holder, iss)
+        } else {
+            (iss, holder)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": cur, "issuer": iss, "value": "0" },
+            "LowLimit": { "currency": cur, "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": cur, "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let cny_xrp = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM,
+        "TakerGets": iou("CNY", ISSUER, "3034.591686672686"),
+        "TakerPays": "1284866469",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &cny_xrp,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let usd_cny = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM2,
+        "TakerGets": iou("USD", ISSUER2, "10"),
+        "TakerPays": iou("CNY", ISSUER, "80.16949519383243"),
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &usd_cny,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Flags": 458752,
+        "Amount": iou("USD", ISSUER2, "684.3637483553164"),
+        "SendMax": "2328400037",
+        "Paths": [[
+            { "currency": "CNY", "issuer": ISSUER },
+            { "account": ISSUER },
+            { "currency": "USD", "issuer": ISSUER2 },
+            { "account": ISSUER2 }
+        ]],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+    let usd = holder_balance(&sandbox, ALICE, ISSUER2, "USD");
+    assert!(
+        (usd - 9.98003992015968).abs() < 1e-8,
+        "2DDB dest nets 10/1.002, got {usd}"
+    );
+    let mm2_id = decode_account_id(MM2).unwrap();
+    assert!(
+        sandbox.read(&keylet::offer(&mm2_id, 1)).is_none(),
+        "10 USD offer must be fully consumed"
+    );
+}
+
+/// 30000095 4C4D82CA: same 10 USD last hop as 2DDBE66F but tighter
+/// SendMax/Amount. Mainnet tecPATH_DRY (LimitQuality). Must stay Dry so
+/// skip-ulp for 96 does not extra-fill this payment.
+#[test]
+fn ledger_30000095_4c4d82ca_stays_path_dry() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "1000000000", None);
+    put_account(&mut ledger, ISSUER2, "1000000000", Some(1_002_000_000));
+    put_account(&mut ledger, ALICE, "10000000000", None);
+    put_account(&mut ledger, MM, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_trust_line(&mut ledger, MM, ISSUER, "CNY", 4000.0);
+    put_trust_line(&mut ledger, MM2, ISSUER2, "USD", 20.0);
+    put_trust_line(&mut ledger, MM2, ISSUER, "CNY", 0.0);
+    for (holder, iss, cur) in [(ALICE, ISSUER2, "USD"), (MM2, ISSUER, "CNY")] {
+        let hid = decode_account_id(holder).unwrap();
+        let iid = decode_account_id(iss).unwrap();
+        let key = keylet::trust_line(&hid, &iid, &helpers::currency_to_bytes(cur));
+        let holder_is_low = hid.as_bytes() < iid.as_bytes();
+        let (low, high) = if holder_is_low {
+            (holder, iss)
+        } else {
+            (iss, holder)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": cur, "issuer": iss, "value": "0" },
+            "LowLimit": { "currency": cur, "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": cur, "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let cny_xrp = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM,
+        "TakerGets": iou("CNY", ISSUER, "3034.591686672686"),
+        "TakerPays": "1284866469",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &cny_xrp,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let usd_cny = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM2,
+        "TakerGets": iou("USD", ISSUER2, "10"),
+        "TakerPays": iou("CNY", ISSUER, "80.16949519383243"),
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &usd_cny,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Flags": 458752,
+        "Amount": iou("USD", ISSUER2, "73.17423733766798"),
+        "SendMax": "248735473",
+        "Paths": [[
+            { "currency": "CNY", "issuer": ISSUER },
+            { "account": ISSUER },
+            { "currency": "USD", "issuer": ISSUER2 },
+            { "account": ISSUER2 }
+        ]],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx),
+        Err(TransactionResult::TecPathDry)
+    );
+}
