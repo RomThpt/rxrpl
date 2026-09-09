@@ -3115,3 +3115,119 @@ fn ledger_30000071_redeems_iou_to_issuer_with_self_issued_sendmax() {
         "redeem leftover, got {left}"
     );
 }
+
+/// 30000095 256D45D9: XRP→CNY→USD conversion with tfLimitQuality + tfPartialPayment
+/// and issuer account-rippling path steps. Mainnet delivers ~9.82 USD; we used
+/// to tecPATH_DRY and leave the CNY/USD book offer standing.
+#[test]
+fn ledger_30000095_limit_quality_two_hop_delivers() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "1000000000", None);
+    put_account(&mut ledger, ISSUER2, "1000000000", Some(1_002_000_000));
+    put_account(&mut ledger, ALICE, "10000000000", None);
+    put_account(&mut ledger, MM, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_trust_line(&mut ledger, MM, ISSUER, "CNY", 4000.0);
+    put_trust_line(&mut ledger, MM2, ISSUER2, "USD", 20.0);
+    put_trust_line(&mut ledger, MM2, ISSUER, "CNY", 0.0);
+    for (holder, iss, cur) in [(ALICE, ISSUER2, "USD"), (MM2, ISSUER, "CNY")] {
+        let hid = decode_account_id(holder).unwrap();
+        let iid = decode_account_id(iss).unwrap();
+        let key = keylet::trust_line(&hid, &iid, &helpers::currency_to_bytes(cur));
+        let holder_is_low = hid.as_bytes() < iid.as_bytes();
+        let (low, high) = if holder_is_low {
+            (holder, iss)
+        } else {
+            (iss, holder)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": cur, "issuer": iss, "value": "0" },
+            "LowLimit": { "currency": cur, "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": cur, "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let cny_xrp = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM,
+        "TakerGets": iou("CNY", ISSUER, "3113.399661968121"),
+        "TakerPays": "1318234295",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &cny_xrp,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let usd_cny = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM2,
+        "TakerGets": iou("USD", ISSUER2, "9.840000000000018"),
+        "TakerPays": iou("CNY", ISSUER, "78.80797529543582"),
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &usd_cny,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Flags": 458752,
+        "Amount": iou("USD", ISSUER2, "601.9866384119105"),
+        "SendMax": "2046286188",
+        "Paths": [[
+            { "currency": "CNY", "issuer": ISSUER },
+            { "account": ISSUER },
+            { "currency": "USD", "issuer": ISSUER2 },
+            { "account": ISSUER2 }
+        ]],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+    let usd = holder_balance(&sandbox, ALICE, ISSUER2, "USD");
+    assert!(
+        (usd - 9.820359281437143).abs() < 1e-8,
+        "256D45 dest nets Gets/1.002, got {usd}"
+    );
+}
