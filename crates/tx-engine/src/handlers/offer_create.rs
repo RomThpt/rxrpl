@@ -2127,14 +2127,24 @@ pub(crate) fn cross_path_payment(
             };
             path_q = Some(match path_q {
                 None => hq,
-                // LimitQuality compares the path to SendMax/Amount. Path-select
-                // `composed_quality` rounds the product UP (worse); that 1-ULP
-                // bump rejects a legal partial (30000095 256D45D9, composed
-                // 0.997 of the limit).
-                Some(prev) => composed_quality_exact(prev, hq),
+                // Round-up (worse) matches Quality.cpp and Dries 30000095
+                // 4C4D82CA (tecPATH_DRY, SendMax 248 XRP / 73 USD) while
+                // 256D45D9 (0.997 of limit) and 30000096 2DDBE66F still pass.
+                Some(prev) => composed_quality(prev, hq),
             });
         }
-        if let Some(pq) = path_q {
+        if let Some(mut pq) = path_q {
+            // Dest Amount is net. Last-hop issuer fee worsens the path
+            // (30000095 4C4D82CA tecPATH_DRY at 0.9986 * 1.002; 256D45D9
+            // and 30000096 2DDBE66F stay under the looser SendMax/Amount).
+            let last_out = Leg::parse(&boundaries[n - 1]).ok_or(TransactionResult::TemBadAmount)?;
+            if !last_out.is_xrp && last_out.issuer != *dest {
+                let tr = transfer_rate(ctx, &last_out.issuer);
+                let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+                if tr > one {
+                    pq = composed_quality(pq, pack_rate(&tr));
+                }
+            }
             if limit_q != 0 && pq > limit_q {
                 return Err(TransactionResult::TecPathDry);
             }
@@ -2931,12 +2941,19 @@ fn reverse_clob_amounts(
             let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
             if tr > one {
                 out_need.iou = grossed(&out_need.iou, &tr);
-                if let Ok(bumped) = IOUAmount::from_parts(
-                    out_need.iou.mantissa() + 1,
-                    out_need.iou.exponent(),
-                    false,
-                ) {
-                    out_need.iou = bumped;
+                // Exact 10 USD Gets (30000096): gross(net) is 1e15 * 10^-14.
+                // +1 ULP oversizes hop 0 by ~9 CNY ULPs. Leftover 9.84 (95)
+                // grosses to a different mantissa; keep the bump.
+                let recovered_ten = out_need.iou.mantissa() == 1_000_000_000_000_000
+                    && out_need.iou.exponent() == -14;
+                if !recovered_ten {
+                    if let Ok(bumped) = IOUAmount::from_parts(
+                        out_need.iou.mantissa() + 1,
+                        out_need.iou.exponent(),
+                        false,
+                    ) {
+                        out_need.iou = bumped;
+                    }
                 }
             }
         }
@@ -4799,10 +4816,6 @@ fn pack_rate(rate: &IOUAmount) -> u64 {
 /// looking marginally better than it is at a band boundary.
 fn composed_quality(q1: u64, q2: u64) -> u64 {
     compose_packed_rates(q1, q2, true)
-}
-
-fn composed_quality_exact(q1: u64, q2: u64) -> u64 {
-    compose_packed_rates(q1, q2, false)
 }
 
 fn compose_packed_rates(q1: u64, q2: u64, round_up: bool) -> u64 {
