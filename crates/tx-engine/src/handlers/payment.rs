@@ -951,19 +951,24 @@ fn apply_paths_payment(
         .and_then(|v| v.as_array())
         .ok_or(TransactionResult::TemBadPath)?;
 
-    // Try each alternative path in order; the first that resolves to a pure
-    // book chain and crosses is used. (Multi-path blending — rippled's greedy
-    // quality-ranked pass — is not yet modelled; a single path covers the
-    // validated repro shape.)
+    // Fill every viable path in order with remaining Amount/SendMax.
+    // 30000103 70135FCE: path 0 (XLM) delivers 912 CNY then path 1 (JPY)
+    // consumes the leftover JPY/CNY book; stopping at the first Ok left
+    // BookDirectory 042607ED in place.
     let mut delivered: Option<serde_json::Value> = None;
+    let mut remain_out = amount.clone();
+    let mut remain_in = send_max.clone();
     let limit_quality =
         helpers::get_flags(ctx.tx) & rxrpl_protocol::flags::payment::TF_LIMIT_QUALITY != 0;
     for path in paths {
+        if delivered_amount(&remain_out) <= 0.0 {
+            break;
+        }
         let Some(path) = path.as_array() else {
             continue;
         };
         let Some(boundaries) =
-            build_path_boundaries(ctx.view, path, &send_max, &amount, account_str)
+            build_path_boundaries(ctx.view, path, &remain_in, &remain_out, account_str)
         else {
             continue;
         };
@@ -973,13 +978,24 @@ fn apply_paths_payment(
             &mut acct,
             &dst_id,
             &boundaries,
-            &amount,
-            &send_max,
+            &remain_out,
+            &remain_in,
             limit_quality,
         ) {
-            Ok((got, _spent)) => {
-                delivered = Some(got);
-                break;
+            Ok((got, spent)) => {
+                if delivered_amount(&got) <= 0.0 {
+                    continue;
+                }
+                delivered = Some(match delivered {
+                    Some(prev) => json_add_amounts(&prev, &got).unwrap_or_else(|| got.clone()),
+                    None => got.clone(),
+                });
+                if let Some(next) = json_sub_amounts(&remain_out, &got) {
+                    remain_out = next;
+                }
+                if let Some(next) = json_sub_amounts(&remain_in, &spent) {
+                    remain_in = next;
+                }
             }
             Err(_) => continue,
         }
@@ -1640,6 +1656,58 @@ fn delivered_amount(v: &serde_json::Value) -> f64 {
 
 fn delivered_meets_target(delivered: &serde_json::Value, target: &serde_json::Value) -> bool {
     delivered_amount(delivered) + 1e-9 >= delivered_amount(target)
+}
+
+fn json_sub_amounts(
+    whole: &serde_json::Value,
+    part: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if let (Some(w), Some(p)) = (whole.as_str(), part.as_str()) {
+        let a: u64 = w.parse().ok()?;
+        let b: u64 = p.parse().ok()?;
+        return Some(serde_json::Value::String(a.saturating_sub(b).to_string()));
+    }
+    let wv = whole.get("value")?.as_str()?;
+    let pv = part.get("value")?.as_str()?;
+    let w = rxrpl_amount::IOUAmount::from_decimal_string(wv).ok()?;
+    let p = rxrpl_amount::IOUAmount::from_decimal_string(pv).ok()?;
+    let rem = rxrpl_amount::IOUAmount::add(&w, &p.negate()).ok()?;
+    if rem.is_negative() || rem.is_zero() {
+        let mut z = whole.clone();
+        if let Some(obj) = z.as_object_mut() {
+            obj.insert("value".into(), serde_json::Value::String("0".into()));
+        }
+        return Some(z);
+    }
+    let mut out = whole.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "value".into(),
+            serde_json::Value::String(rem.to_decimal_string()),
+        );
+    }
+    Some(out)
+}
+
+fn json_add_amounts(a: &serde_json::Value, b: &serde_json::Value) -> Option<serde_json::Value> {
+    if let (Some(as_), Some(bs)) = (a.as_str(), b.as_str()) {
+        let x: u64 = as_.parse().ok()?;
+        let y: u64 = bs.parse().ok()?;
+        return Some(serde_json::Value::String(x.saturating_add(y).to_string()));
+    }
+    let av = a.get("value")?.as_str()?;
+    let bv = b.get("value")?.as_str()?;
+    let x = rxrpl_amount::IOUAmount::from_decimal_string(av).ok()?;
+    let y = rxrpl_amount::IOUAmount::from_decimal_string(bv).ok()?;
+    let sum = rxrpl_amount::IOUAmount::add(&x, &y).ok()?;
+    let mut out = a.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "value".into(),
+            serde_json::Value::String(sum.to_decimal_string()),
+        );
+    }
+    Some(out)
 }
 
 /// Apply a cross-currency Payment: the source pays `send_max` (currency A)

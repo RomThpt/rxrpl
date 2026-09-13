@@ -3619,3 +3619,159 @@ fn ledger_30000099_hop0_walks_second_cny_band() {
         "worse 10 CNY band after rJ2XL must not be taken"
     );
 }
+
+/// 30000103 70135FCE: first path (XLM) fills, second path (JPY) must still
+/// consume the JPY/CNY book. Stopping at the first Ok left the tip offer.
+#[test]
+fn ledger_30000103_second_path_consumes_jpy_cny_book() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "1000000000", None);
+    put_account(&mut ledger, ISSUER2, "1000000000", None);
+    put_account(&mut ledger, ALICE, "10000000000", None);
+    put_account(&mut ledger, MM, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_account(&mut ledger, MM3, "1000000000", None);
+    put_account(&mut ledger, BOB, "1000000000", None);
+    put_trust_line(&mut ledger, MM, ISSUER, "CNY", 20.0);
+    put_trust_line(&mut ledger, MM, ISSUER, "XLM", 0.0);
+    put_trust_line(&mut ledger, MM2, ISSUER, "XLM", 100.0);
+    put_trust_line(&mut ledger, MM3, ISSUER2, "JPY", 1000.0);
+    put_trust_line(&mut ledger, MM3, ISSUER, "CNY", 20.0);
+    put_trust_line(&mut ledger, BOB, ISSUER, "CNY", 5.0);
+    put_trust_line(&mut ledger, BOB, ISSUER2, "JPY", 0.0);
+    for (holder, iss, cur) in [
+        (ALICE, ISSUER, "CNY"),
+        (MM, ISSUER, "XLM"),
+        (BOB, ISSUER2, "JPY"),
+    ] {
+        let hid = decode_account_id(holder).unwrap();
+        let iid = decode_account_id(iss).unwrap();
+        let key = keylet::trust_line(&hid, &iid, &helpers::currency_to_bytes(cur));
+        let holder_is_low = hid.as_bytes() < iid.as_bytes();
+        let (low, high) = if holder_is_low {
+            (holder, iss)
+        } else {
+            (iss, holder)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": cur, "issuer": iss, "value": "0" },
+            "LowLimit": { "currency": cur, "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": cur, "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    for (acct, seq, gets, pays) in [
+        (
+            MM2,
+            1u32,
+            iou("XLM", ISSUER, "50"),
+            serde_json::json!("10000000"),
+        ),
+        (MM, 1u32, iou("CNY", ISSUER, "10"), iou("XLM", ISSUER, "20")),
+        (
+            MM3,
+            1u32,
+            iou("JPY", ISSUER2, "500"),
+            serde_json::json!("20000000"),
+        ),
+        (
+            BOB,
+            1u32,
+            iou("CNY", ISSUER, "2.197112403109713"),
+            iou("JPY", ISSUER2, "34.98586629155595"),
+        ),
+        (
+            MM3,
+            2u32,
+            iou("CNY", ISSUER, "10.85800235643242"),
+            iou("JPY", ISSUER2, "173.1738812828137"),
+        ),
+    ] {
+        let tx = serde_json::json!({
+            "TransactionType": "OfferCreate",
+            "Account": acct,
+            "TakerGets": gets,
+            "TakerPays": pays,
+            "Sequence": seq,
+            "Fee": "10",
+        });
+        let mut octx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            crate::handlers::offer_create::OfferCreateTransactor
+                .apply(&mut octx)
+                .unwrap(),
+            TransactionResult::TesSuccess
+        );
+    }
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": iou("CNY", ISSUER, "1000"),
+        "SendMax": "1000000000",
+        "Flags": 458752,
+        "Paths": [
+            [
+                { "currency": "XLM", "issuer": ISSUER },
+                { "account": ISSUER },
+                { "currency": "CNY", "issuer": ISSUER },
+                { "account": ISSUER }
+            ],
+            [
+                { "currency": "JPY", "issuer": ISSUER2 },
+                { "account": ISSUER2 },
+                { "currency": "CNY", "issuer": ISSUER },
+                { "account": ISSUER }
+            ]
+        ],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+    let cny = holder_balance(&sandbox, ALICE, ISSUER, "CNY");
+    assert!(
+        (cny - 23.055114759542133).abs() < 0.02,
+        "path1 10 + path2 13.055 CNY, got {cny}"
+    );
+    let bob_id = decode_account_id(BOB).unwrap();
+    assert!(
+        sandbox.read(&keylet::offer(&bob_id, 1)).is_none(),
+        "best JPY/CNY offer must be consumed"
+    );
+    let mm3_id = decode_account_id(MM3).unwrap();
+    match sandbox.read(&keylet::offer(&mm3_id, 2)) {
+        None => {}
+        Some(b) => {
+            let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            panic!(
+                "second JPY/CNY leftover Gets={:?} Pays={:?} dest={cny}",
+                v["TakerGets"], v["TakerPays"]
+            );
+        }
+    }
+}
