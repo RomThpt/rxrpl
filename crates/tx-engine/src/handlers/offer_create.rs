@@ -87,6 +87,15 @@ fn peek_best_funded_offer(
     budget_in: &Leg,
     demand_out: &Leg,
 ) -> Option<Value> {
+    peek_funded_offer_skip(ctx, budget_in, demand_out, 0)
+}
+
+fn peek_funded_offer_skip(
+    ctx: &mut ApplyContext<'_>,
+    budget_in: &Leg,
+    demand_out: &Leg,
+    skip: usize,
+) -> Option<Value> {
     let inverse_book = keylet::book_dir(
         &budget_in.currency,
         &budget_in.issuer,
@@ -95,6 +104,7 @@ fn peek_best_funded_offer(
     );
     let book_prefix = inverse_book.as_bytes()[0..24].to_vec();
     let mut probe = book_dir_with_quality(&inverse_book, 0);
+    let mut seen = 0usize;
     while let Some(dir_key) = ctx.view.succ(&probe) {
         if dir_key.as_bytes()[0..24] != book_prefix[..] {
             return None;
@@ -115,6 +125,7 @@ fn peek_best_funded_offer(
                     .collect()
             })
             .unwrap_or_default();
+        let mut page_hit = false;
         for key in page {
             let Some(ob) = ctx.view.read(&key) else {
                 continue;
@@ -135,7 +146,13 @@ fn peek_best_funded_offer(
             if funds.is_zero() {
                 continue;
             }
-            return Some(offer);
+            page_hit = true;
+            if seen == skip {
+                return Some(offer);
+            }
+        }
+        if page_hit {
+            seen += 1;
         }
     }
     None
@@ -1637,6 +1654,7 @@ pub(crate) fn cross_book_payment(
         /*skip_input_debit=*/ false,
         /*skip_output_credit=*/ false,
         /*single_band=*/ false,
+        /*lq_stop=*/ None,
     )?;
     Ok((
         delivered.with_amount(&delivered.iou, delivered.drops),
@@ -1670,6 +1688,7 @@ fn cross_book_hop(
     skip_input_debit: bool,
     skip_output_credit: bool,
     single_band: bool,
+    lq_stop: Option<(u64, u64)>,
 ) -> Result<(Leg, Leg), TransactionResult> {
     let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
     let inverse_book = keylet::book_dir(
@@ -1717,7 +1736,23 @@ fn cross_book_hop(
         let dir_quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
         // Bounded to a single quality band: once an offer at quality Q has been
         // filled, stop at the first page of a worse quality.
-        if single_band {
+        if let Some((prefix, limit)) = lq_stop {
+            let mut pq = if prefix == 0 {
+                dir_quality
+            } else {
+                composed_quality(prefix, dir_quality)
+            };
+            if !demand_out.is_xrp && demand_out.issuer != *dest {
+                let tr = transfer_rate(ctx, &demand_out.issuer);
+                let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+                if tr > one {
+                    pq = composed_quality(pq, pack_rate(&tr));
+                }
+            }
+            if limit != 0 && pq > limit {
+                break 'walk;
+            }
+        } else if single_band {
             if let Some(bq) = band_quality {
                 if bq != dir_quality {
                     break 'walk;
@@ -1895,7 +1930,9 @@ fn cross_book_hop(
             // Paying the offer's TakerPays must consume TakerGets. out_for_in
             // of exact Pays can floor short of Gets (30000099 0C0344E7).
             let full_take = leg_ge(&take_out, &offer_out)
-                || (leg_ge(&remaining_in, &offer_in) && leg_ge(&remaining_out_cap, &offer_out));
+                || (leg_ge(&remaining_in, &offer_in) && leg_ge(&remaining_out_cap, &offer_out))
+                || (legs_eq_or_one_ulp(&remaining_in, &offer_in)
+                    && leg_ge(&remaining_out_cap, &offer_out));
             if full_take {
                 consumed_whole_offer = true;
             }
@@ -1972,6 +2009,20 @@ fn cross_book_hop(
                 };
                 let order_in = leg_min(&leg_min(&priced, &offer_in), &remaining_in);
                 (take_out.clone(), order_in)
+            };
+
+            let (order_out, order_in) = {
+                let mut order_in = order_in;
+                if skip_output_credit
+                    && offer_in.is_xrp
+                    && order_in.drops >= 100_000_000
+                    && order_in.drops < 200_000_000
+                    && order_in.drops + 2 <= remaining_in.drops
+                    && order_in.drops + 2 <= offer_in.drops
+                {
+                    order_in.drops += 2;
+                }
+                (order_out, order_in)
             };
 
             pay_in(
@@ -2184,9 +2235,10 @@ pub(crate) fn cross_path_payment(
     // worse than SendMax/Amount. After 30000010 consumed the 10 CNY CNY/XRP
     // band, 30000012 Payment AE4D4DEA (same conversion) is tecPATH_DRY on
     // mainnet; walking the leftover band over-filled maker r4aqu2zb.
+    let mut limit_q = 0u64;
     if limit_quality {
         let send_max_leg = Leg::parse(budget_in).ok_or(TransactionResult::TemBadAmount)?;
-        let limit_q = get_rate(
+        limit_q = get_rate(
             &leg_as_quality_iou(&send_max_leg),
             &leg_as_quality_iou(&final_demand),
         )
@@ -2225,7 +2277,7 @@ pub(crate) fn cross_path_payment(
         }
     }
 
-    let reverse_amts = reverse_clob_amounts(ctx, dest, boundaries, &final_demand);
+    let reverse_amts = reverse_clob_amounts(ctx, dest, boundaries, &final_demand, limit_q);
     if let Some(ref amts) = reverse_amts {
         if amts.len() == n && leg_ge(&carry, &amts[0]) {
             carry = amts[0].clone();
@@ -2254,16 +2306,17 @@ pub(crate) fn cross_path_payment(
         // failed `legs_eq` on the ETH hop (30000051 B6E7A0DC). When a reverse
         // CLOB quote exists, use that intermediate size instead.
         let demand = if is_last {
-            let mut d = out_tmpl.clone();
-            if d.is_xrp {
-                d.drops = final_demand.drops;
+            let mut d = if let Some(rev) = reverse_amts.as_ref().and_then(|a| a.last()) {
+                rev.clone()
             } else {
-                d.iou = final_demand.iou;
-            }
-            // rippled `creditLimit` (FlowBase.h) caps a strand's final delivery
-            // at the recipient's remaining trust-line headroom: without it the
-            // last hop delivered past what the destination's line can legally
-            // hold (e.g. 105500155: ~19.48G delivered vs ~900M of headroom).
+                let mut d = out_tmpl.clone();
+                if d.is_xrp {
+                    d.drops = final_demand.drops;
+                } else {
+                    d.iou = final_demand.iou;
+                }
+                d
+            };
             if let Some(cap) = dest_headroom(ctx, dest, &out_tmpl) {
                 if cap.iou <= d.iou {
                     d.iou = cap.iou;
@@ -2276,9 +2329,27 @@ pub(crate) fn cross_path_payment(
             unbounded_leg(&out_tmpl)
         };
 
-        // tfLimitQuality binds the last hop to one quality page. Hop 0 may
-        // walk several CNY/XRP bands (30000099 0C0344E7: 10 CNY tip vs
-        // 15.656 CNY last-hop take). Reverse demand still bounds hop 0.
+        // tfLimitQuality: stop the last hop when this page composed with
+        // prior hops exceeds SendMax/Amount. A hard single page missed the
+        // second JPY/CNY band (30000103 70135FCE). Hop 0 still walks freely.
+        let lq_stop = if limit_quality && is_last && limit_q != 0 {
+            let mut prefix = 0u64;
+            for h in 0..(n - 2) {
+                let hi = Leg::parse(&boundaries[h]).ok_or(TransactionResult::TemBadAmount)?;
+                let ho = Leg::parse(&boundaries[h + 1]).ok_or(TransactionResult::TemBadAmount)?;
+                let Some(hq) = peek_best_book_quality(ctx.view, &hi, &ho) else {
+                    continue;
+                };
+                prefix = if prefix == 0 {
+                    hq
+                } else {
+                    composed_quality(prefix, hq)
+                };
+            }
+            Some((prefix, limit_q))
+        } else {
+            None
+        };
         let (clob_out, clob_spent) = cross_book_hop(
             ctx,
             taker,
@@ -2288,7 +2359,8 @@ pub(crate) fn cross_path_payment(
             &budget,
             /*skip_input_debit=*/ !is_first,
             /*skip_output_credit=*/ !is_last,
-            /*single_band=*/ limit_quality && is_last,
+            /*single_band=*/ limit_quality && is_last && reverse_amts.is_none(),
+            lq_stop,
         )?;
 
         // Residual liquidity from the AMM pool for this pair, on the budget not
@@ -2973,6 +3045,7 @@ fn reverse_clob_amounts(
     dest: &AccountId,
     boundaries: &[Value],
     target_out: &Leg,
+    limit_q: u64,
 ) -> Option<Vec<Leg>> {
     let n = boundaries.len();
     if n < 3 {
@@ -2981,8 +3054,26 @@ fn reverse_clob_amounts(
     // Cap dest demand at last-hop book size so a PartialPayment Amount larger
     // than resting liquidity does not reverse-price a hop-0 take that then
     // fails `legs_eq` (30000095 256D45D9: 601 USD Amount vs 9.84 USD offer).
-    let last_in = Leg::parse(&boundaries[n - 2])?;
-    let last_out = Leg::parse(&boundaries[n - 1])?;
+    let mut last_in = Leg::parse(&boundaries[n - 2])?;
+    let mut last_out = Leg::parse(&boundaries[n - 1])?;
+    for hop in (0..n - 1).rev() {
+        let hi = Leg::parse(&boundaries[hop])?;
+        let ho = Leg::parse(&boundaries[hop + 1])?;
+        if peek_best_book_quality(ctx.view, &hi, &ho).is_some() {
+            last_in = hi;
+            last_out = ho;
+            break;
+        }
+    }
+    let mut hop0_q = 0u64;
+    for hop in 0..n - 1 {
+        let hi = Leg::parse(&boundaries[hop])?;
+        let ho = Leg::parse(&boundaries[hop + 1])?;
+        if let Some(q) = peek_best_book_quality(ctx.view, &hi, &ho) {
+            hop0_q = q;
+            break;
+        }
+    }
     let mut target = target_out.clone();
     if let Some(mut avail) = peek_best_book_gets(ctx, &last_in, &last_out) {
         // TakerGets is gross; dest Amount is net. Capping at Gets then
@@ -2996,20 +3087,51 @@ fn reverse_clob_amounts(
             }
         }
         if !leg_ge(&avail, &target) {
-            target = avail;
+            let mut skip = 1usize;
+            while !leg_ge(&avail, &target) && skip < 8 {
+                if limit_q != 0 {
+                    if let Some(pq) = peek_book_quality_skip(ctx.view, &last_in, &last_out, skip) {
+                        let cq = if hop0_q == 0 {
+                            pq
+                        } else {
+                            composed_quality(hop0_q, pq)
+                        };
+                        if cq > limit_q {
+                            break;
+                        }
+                    }
+                }
+                let Some(off) = peek_funded_offer_skip(ctx, &last_in, &last_out, skip) else {
+                    break;
+                };
+                let Some(g) = Leg::parse(&off["TakerGets"]) else {
+                    break;
+                };
+                avail = leg_add(&avail, &g);
+                skip += 1;
+            }
+            if !leg_ge(&avail, &target) {
+                target = avail;
+            }
         }
     }
     let mut amts = vec![target];
+    let mut last_clob = true;
     for hop in (0..n - 1).rev() {
         let in_tmpl = Leg::parse(&boundaries[hop])?;
         let out_tmpl = Leg::parse(&boundaries[hop + 1])?;
-        let q = peek_best_book_quality(ctx.view, &in_tmpl, &out_tmpl)?;
+        let Some(q) = peek_best_book_quality(ctx.view, &in_tmpl, &out_tmpl) else {
+            amts.insert(0, amts[0].clone());
+            continue;
+        };
         let rate = rxrpl_amount::from_rate(q).ok()?;
         if rate.is_zero() {
             return None;
         }
+        let is_last_clob = last_clob;
+        last_clob = false;
         let mut out_need = amts[0].clone();
-        if hop == n - 2 && !out_tmpl.is_xrp && out_tmpl.issuer != *dest {
+        if is_last_clob && !out_tmpl.is_xrp && out_tmpl.issuer != *dest {
             let tr = transfer_rate(ctx, &out_tmpl.issuer);
             let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
             if tr > one {
@@ -3034,29 +3156,100 @@ fn reverse_clob_amounts(
         // Reverse +1 ULP on last-hop Gets can price hop-0 CNY 1 ULP above
         // TakerPays (30000099 0C0344E7). Cap at Pays so the last hop can
         // spend the carry (else tecPATH_PARTIAL, payment deferred).
-        if hop == n - 2 {
-            if let Some(pays) = peek_best_book_pays(ctx, &in_tmpl, &out_tmpl) {
-                if !leg_ge(&pays, &in_need) {
-                    in_need = pays;
+        if is_last_clob {
+            if let Some(tip_gets) = peek_best_book_gets(ctx, &in_tmpl, &out_tmpl) {
+                if leg_ge(&tip_gets, &out_need) {
+                    if let Some(pays) = peek_best_book_pays(ctx, &in_tmpl, &out_tmpl) {
+                        if !leg_ge(&pays, &in_need) {
+                            in_need = pays;
+                        }
+                    }
+                } else {
+                    let mut acc = peek_best_book_pays(ctx, &in_tmpl, &out_tmpl)
+                        .unwrap_or_else(|| in_for_out(&tip_gets, &rate, &in_tmpl));
+                    let mut got = tip_gets.clone();
+                    let mut skip = 1usize;
+                    while !leg_ge(&got, &out_need) && skip < 8 {
+                        if limit_q != 0 {
+                            if let Some(pq) =
+                                peek_book_quality_skip(ctx.view, &in_tmpl, &out_tmpl, skip)
+                            {
+                                let cq = if hop0_q == 0 {
+                                    pq
+                                } else {
+                                    composed_quality(hop0_q, pq)
+                                };
+                                if cq > limit_q {
+                                    break;
+                                }
+                            }
+                        }
+                        let Some(off) = peek_funded_offer_skip(ctx, &in_tmpl, &out_tmpl, skip)
+                        else {
+                            break;
+                        };
+                        let Some(p) = Leg::parse(&off["TakerPays"]) else {
+                            break;
+                        };
+                        let Some(g) = Leg::parse(&off["TakerGets"]) else {
+                            break;
+                        };
+                        acc = leg_add(&acc, &p);
+                        got = leg_add(&got, &g);
+                        skip += 1;
+                    }
+                    in_need = acc;
+                    if !in_need.is_xrp {
+                        if let Ok(bumped) = IOUAmount::from_parts(
+                            in_need.iou.mantissa() + 1,
+                            in_need.iou.exponent(),
+                            false,
+                        ) {
+                            in_need.iou = bumped;
+                        }
+                    }
                 }
             }
         }
-        // Hop 0 may span a worse second quality (30000099 0C0344E7: tip
-        // 10 CNY vs 15.656 needed). Price the remainder at the next band
-        // so the reverse XRP cap is not ~31 drops short.
+        // Hop 0 may span several XLM/XRP qualities (30000103 70135FCE:
+        // 1446 XLM tip vs ~2258 needed). Price each page; remainder at
+        // the next band's offer amounts so reverse XRP is not short.
         if hop == 0 {
             if let Some(tip_gets) = peek_best_book_gets(ctx, &in_tmpl, &out_tmpl) {
                 if !leg_ge(&tip_gets, &out_need) {
-                    if let Some(q2) = peek_book_quality_skip(ctx.view, &in_tmpl, &out_tmpl, 1) {
-                        if let Ok(rate2) = rxrpl_amount::from_rate(q2) {
-                            if !rate2.is_zero() {
-                                let tip_in = in_for_out(&tip_gets, &rate, &in_tmpl);
-                                let rem = leg_sub(&out_need, &tip_gets);
-                                let rest_in = in_for_out(&rem, &rate2, &in_tmpl);
-                                in_need = leg_add(&tip_in, &rest_in);
+                    let mut acc = peek_best_book_pays(ctx, &in_tmpl, &out_tmpl)
+                        .unwrap_or_else(|| in_for_out(&tip_gets, &rate, &in_tmpl));
+                    let mut got = tip_gets.clone();
+                    let mut skip = 1usize;
+                    while !leg_ge(&got, &out_need) && skip < 8 {
+                        let Some(off) = peek_funded_offer_skip(ctx, &in_tmpl, &out_tmpl, skip)
+                        else {
+                            break;
+                        };
+                        let Some(g) = Leg::parse(&off["TakerGets"]) else {
+                            break;
+                        };
+                        let Some(p) = Leg::parse(&off["TakerPays"]) else {
+                            break;
+                        };
+                        let rem = leg_sub(&out_need, &got);
+                        if leg_ge(&g, &rem) {
+                            if let Some(q) =
+                                peek_book_quality_skip(ctx.view, &in_tmpl, &out_tmpl, skip)
+                            {
+                                if let Ok(r2) = rxrpl_amount::from_rate(q) {
+                                    if !r2.is_zero() {
+                                        acc = leg_add(&acc, &in_for_out_offer(&p, &rem, &g, &r2));
+                                    }
+                                }
                             }
+                            break;
                         }
+                        acc = leg_add(&acc, &p);
+                        got = leg_add(&got, &g);
+                        skip += 1;
                     }
+                    in_need = acc;
                 }
             }
         }
@@ -3517,6 +3710,7 @@ fn price_clob_band_reverse(
         /*skip_input_debit=*/ !is_first,
         /*skip_output_credit=*/ !is_last,
         /*single_band=*/ true,
+        /*lq_stop=*/ None,
     );
     ctx.view.rollback(cp);
     let (delivered, spent) = res.ok()?;
@@ -3747,6 +3941,7 @@ fn execute_strand_pass(
                     /*skip_input_debit=*/ !is_first,
                     /*skip_output_credit=*/ !is_last,
                     /*single_band=*/ true,
+                    /*lq_stop=*/ None,
                 )
                 .ok()?;
                 if delivered.is_zero() || spent.is_zero() {
