@@ -86,7 +86,7 @@ pub enum Commands {
         /// Node run mode
         #[arg(short, long, default_value = "standalone", value_enum)]
         mode: RunMode,
-        /// Genesis account address
+        /// Genesis account address (standalone mode only)
         #[arg(long, default_value = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")]
         genesis_account: String,
         /// Ledger close interval in seconds

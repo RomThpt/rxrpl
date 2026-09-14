@@ -1,6 +1,7 @@
 # rxrpl testnet (altnet) node configuration template
 #
 # Connects to rippletest.net and uses the testnet UNL.
+# Start with: rxrpl run --config config/rxrpl-testnet.toml --network
 
 [server]
 bind = "127.0.0.1:5005"

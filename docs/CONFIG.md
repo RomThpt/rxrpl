@@ -18,7 +18,7 @@ field omitted from the file uses the built-in default listed below.
 rxrpl run --config /etc/rxrpl/config.toml
 
 # Testnet
-rxrpl run --config config/rxrpl-testnet.toml
+rxrpl run --config config/rxrpl-testnet.toml --network
 
 # Standalone (no P2P, in-memory)
 rxrpl run --config config/rxrpl-standalone.toml --standalone
