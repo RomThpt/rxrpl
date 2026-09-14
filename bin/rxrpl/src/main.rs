@@ -123,7 +123,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 RunMode::Network => {
                     return cmd_network_run(
                         config,
-                        &genesis_account,
                         close_interval,
                         sync_rpc.as_deref(),
                         parsed_starting,
@@ -444,15 +443,13 @@ async fn cmd_node_run(
 
 async fn cmd_network_run(
     config: rxrpl_config::NodeConfig,
-    genesis_account: &str,
     close_interval: u64,
     sync_rpc_url: Option<&str>,
     starting_ledger: Option<rxrpl_node::StartingLedger>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let node = rxrpl_node::Node::new_standalone(config, genesis_account)?;
+    let node = rxrpl_node::Node::new(config)?;
 
     eprintln!("Starting networked node...");
-    eprintln!("  Genesis account: {genesis_account}");
     eprintln!("  Close interval: {close_interval}s");
     match sync_rpc_url {
         Some(url) => eprintln!("  Sync RPC: {url}"),

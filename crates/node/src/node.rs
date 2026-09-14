@@ -263,16 +263,20 @@ impl Node {
         // store-backed variant propagates hashes via a different path and
         // produces a different root for identical content).
         let _ = &node_store; // SHAMap store attached lazily during close().
-        // Networked genesis MUST match what peers will reconstruct from
-        // their own genesis bootstrap. xrpl-confluence sets rippled
-        // `genesis_amendments_disabled = true`, so kurtosis rippled
-        // genesis contains ONLY the canonical XRPL master AccountRoot
-        // (`rHb9CJAW…`, 100B drops) — no FeeSettings SLE and no
-        // Amendments SLE. Adding either makes our account_hash diverge
-        // from rippled, every close after #1 produces a mismatching
-        // hash, and rxrpl falls into the catchup feedback loop seen on
-        // 2026-05-12.
-        let ledger = Self::genesis_with_master_account_only("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")?;
+        // Networked genesis MUST match the topology's configured bootstrap.
+        // xrpl-confluence sets rippled `genesis_amendments_disabled = true`,
+        // which produces only the canonical master AccountRoot. Public XRPL
+        // networks use rippled's stock genesis instead, including FeeSettings
+        // and Amendments. Selecting the wrong layout changes the SHAMap root
+        // bytes and prevents consensus convergence after bootstrap.
+        let ledger = if config.network.genesis_amendments_disabled {
+            Self::genesis_with_master_account_only("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")?
+        } else {
+            Self::genesis_with_funded_account_and_store(
+                "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+                &node_store,
+            )?
+        };
 
         // Initialize transaction queue
         let tx_queue = TxQueue::new(2000);
