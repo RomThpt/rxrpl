@@ -11,6 +11,7 @@ prost = "0.13"
 bytes.workspace = true
 tokio-util = { version = "0.7", features = ["codec"] }
 thiserror.workspace = true
+lz4_flex.workspace = true
 
 [build-dependencies]
 prost-build = "0.13"
