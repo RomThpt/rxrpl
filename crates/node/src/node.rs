@@ -1119,6 +1119,7 @@ impl Node {
             // dynamic VL actually drives consensus instead of leaving the
             // engine in solo mode.
             let vl_consensus_tx = peer_mgr.consensus_sender();
+            let vl_overlay_command_tx = cmd_tx_catchup.clone();
             tokio::spawn(async move {
                 let fetcher = match VlFetcher::new(
                     sites_for_fetcher,
@@ -1132,7 +1133,9 @@ impl Node {
                         return;
                     }
                 };
-                let fetcher = fetcher.with_consensus_sender(vl_consensus_tx);
+                let fetcher = fetcher
+                    .with_consensus_sender(vl_consensus_tx)
+                    .with_overlay_command_sender(vl_overlay_command_tx);
                 // Bridge the typed status snapshot into the JSON value the
                 // RPC handler reads from `ctx.validator_list_status`.
                 let publish_handle = Arc::clone(&fetcher_status_for_publish);

@@ -331,6 +331,47 @@ fn make_test_peer_manager_with_consensus() -> (PeerManager, mpsc::Receiver<Conse
     (mgr, consensus_rx)
 }
 
+#[test]
+fn validator_list_manifest_command_updates_ephemeral_mapping() {
+    use crate::command::OverlayCommand;
+    use crate::identity::ValidatorIdentity;
+    use crate::manifest::parse_and_verify;
+
+    let (mut manager, mut consensus_rx) = make_test_peer_manager_with_consensus();
+    let identity = ValidatorIdentity::two_key(
+        &rxrpl_crypto::Seed::from_passphrase("vl-manifest-master"),
+        &rxrpl_crypto::Seed::from_passphrase("vl-manifest-ephemeral"),
+    );
+    let raw = identity
+        .sign_manifest(1, None)
+        .expect("test manifest signs");
+    let expected = parse_and_verify(&raw).expect("test manifest verifies");
+    let expected_ephemeral = expected
+        .ephemeral_public_key
+        .clone()
+        .expect("test manifest has an ephemeral key");
+
+    manager.handle_command(OverlayCommand::ApplyValidatorListManifests {
+        manifests: vec![raw],
+    });
+
+    assert_eq!(
+        manager
+            .manifest_store
+            .master_key_for_ephemeral(&expected_ephemeral),
+        Some(&expected.master_public_key)
+    );
+    assert!(matches!(
+        consensus_rx.try_recv(),
+        Ok(ConsensusMessage::ManifestApplied {
+            master_key,
+            ephemeral_key: Some(ephemeral_key),
+            revoked: false,
+            ..
+        }) if master_key == expected.master_public_key && ephemeral_key == expected_ephemeral
+    ));
+}
+
 #[tokio::test]
 async fn consensus_channel_sheds_when_consumer_stalled() {
     // A stalled consumer (consensus_rx never drained) must not let the bounded

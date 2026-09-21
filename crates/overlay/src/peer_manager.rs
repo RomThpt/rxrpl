@@ -786,6 +786,35 @@ impl PeerManager {
                     );
                 }
             }
+            OverlayCommand::ApplyValidatorListManifests { manifests } => {
+                let mut applied = 0usize;
+                for raw in manifests {
+                    match manifest::parse_and_verify(&raw) {
+                        Ok(manifest) => {
+                            let master_key = manifest.master_public_key.clone();
+                            let ephemeral_key = manifest.ephemeral_public_key.clone();
+                            let revoked = manifest.is_revoked();
+                            let old_ephemeral_key = self
+                                .manifest_store
+                                .current_ephemeral_key(&master_key)
+                                .cloned();
+                            if self.manifest_store.apply(manifest) {
+                                applied += 1;
+                                self.forward_to_consensus(ConsensusMessage::ManifestApplied {
+                                    master_key,
+                                    ephemeral_key,
+                                    old_ephemeral_key,
+                                    revoked,
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!("validator-list manifest verify failed: {error}");
+                        }
+                    }
+                }
+                tracing::debug!("applied {applied} manifests from verified validator list");
+            }
             OverlayCommand::ConnectTo { addr } => {
                 let identity = Arc::clone(&self.identity);
                 let network_id = self.config.network_id;
