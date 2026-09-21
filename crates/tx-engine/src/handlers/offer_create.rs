@@ -581,6 +581,40 @@ impl Transactor for OfferCreateTransactor {
                 )?
             };
 
+        // Flow returns the independently consumed input and output amounts. A
+        // resting remainder must nevertheless retain the offer's original
+        // quality: CreateOffer::flowCross first keeps the remaining output, then
+        // re-derives the input with mulRound. Subtracting both flow amounts
+        // independently drifts an offer after crossing price-improving liquidity
+        // (Testnet 20934193 / 9B345F1A).
+        let (remaining_pays, remaining_gets) = if ctx.rules.enabled(&feature_id("FlowCross")) {
+            let pays_leg = Leg::parse(&taker_pays).ok_or(TransactionResult::TemBadOffer)?;
+            let gets_leg = Leg::parse(&taker_gets).ok_or(TransactionResult::TemBadOffer)?;
+            let orig_quality = if ctx.rules.enabled(&feature_id("fixUniversalNumber")) {
+                rxrpl_amount::get_rate_round_even(
+                    &leg_as_quality_iou(&gets_leg),
+                    &leg_as_quality_iou(&pays_leg),
+                )
+            } else {
+                rxrpl_amount::get_rate(
+                    &leg_as_quality_iou(&gets_leg),
+                    &leg_as_quality_iou(&pays_leg),
+                )
+            }
+            .unwrap_or(0);
+            remaining_offer(
+                is_sell,
+                orig_quality,
+                &Leg::parse(&remaining_pays).ok_or(TransactionResult::TefInternal)?,
+                &Leg::parse(&remaining_gets).ok_or(TransactionResult::TefInternal)?,
+                &pays_leg,
+                &gets_leg,
+                crossed,
+            )
+        } else {
+            (remaining_pays, remaining_gets)
+        };
+
         // Nothing left to place when either side is exhausted (fully crossed):
         // rippled places no resting offer. Commit the taker's mutations.
         let commit_acct =
@@ -6639,6 +6673,34 @@ mod taker_crossing_tests {
         // buy: pays = remaining_out = 30; gets = mulRound(30, gets/pays=2.0) = 60.
         assert_eq!(pays["value"], "30");
         assert_eq!(gets["value"], "60");
+    }
+
+    #[test]
+    fn remaining_offer_buy_preserves_tick_snapped_testnet_quality() {
+        // Testnet 20934193 / 9B345F1A: TickSize=6 snaps TakerGets to
+        // 6.03172688340672 WAR. Two crossed offers leave 1,000,018 drops XRP.
+        // Flow must derive the WAR remainder at the snapped original quality,
+        // rather than subtracting the two makers' nominal WAR amounts.
+        let gets = iou("6.03172688340672");
+        let pays = xrp(12_000_000);
+        let orig_q = get_rate(
+            &gets.iou,
+            &IOUAmount::from_parts(12_000_000, 0, false).unwrap(),
+        )
+        .unwrap();
+        let (remaining_pays, remaining_gets) = remaining_offer(
+            false,
+            orig_q,
+            &xrp(1_000_018),
+            // `cross_offers`' independent subtraction produces this positive
+            // value; the rescaling path intentionally ignores it for a buy.
+            &iou("0.50768279238949"),
+            &pays,
+            &gets,
+            true,
+        );
+        assert_eq!(remaining_pays, serde_json::json!("1000018"));
+        assert_eq!(remaining_gets["value"], "0.5026529545408852");
     }
 
     #[test]
