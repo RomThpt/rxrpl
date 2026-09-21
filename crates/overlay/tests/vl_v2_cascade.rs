@@ -116,9 +116,10 @@ fn sign_v2_blob(
         "validators": validator_entries,
         "delegates": delegate_entries,
     });
-    let blob_b64 =
-        base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&blob_json).unwrap());
-    let sig = rxrpl_crypto::ed25519::sign(blob_b64.as_bytes(), &eph_kp.private_key).unwrap();
+    let blob_raw = serde_json::to_vec(&blob_json).unwrap();
+    let blob_b64 = base64::engine::general_purpose::STANDARD.encode(&blob_raw);
+    // v2 retains v1's signature preimage: the decoded JSON bytes.
+    let sig = rxrpl_crypto::ed25519::sign(&blob_raw, &eph_kp.private_key).unwrap();
     BlobV2Wire {
         effective_start,
         effective_expiration,

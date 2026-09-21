@@ -235,14 +235,15 @@ pub fn verify_and_parse_v2(
     for entry in blobs_v2 {
         let sig_bytes = hex::decode(&entry.signature_hex)
             .map_err(|e| ValidatorListError::BlobDecode(format!("signature hex: {}", e)))?;
-        if !verify_blob_signature(&entry.blob_base64, ephemeral_pk.as_bytes(), &sig_bytes) {
-            return Err(ValidatorListError::BlobSignatureInvalid);
-        }
-
         use base64::Engine;
         let blob_json = base64::engine::general_purpose::STANDARD
             .decode(&entry.blob_base64)
             .map_err(|e| ValidatorListError::BlobDecode(format!("base64: {}", e)))?;
+        // Like v1, v2 signatures cover the decoded JSON bytes. Retaining the
+        // transport Base64 bytes here would reject rippled-compatible lists.
+        if !verify_blob_signature(&blob_json, ephemeral_pk.as_bytes(), &sig_bytes) {
+            return Err(ValidatorListError::BlobSignatureInvalid);
+        }
         let parsed = parse_blob_json(&blob_json, &publisher_manifest.master_public_key)?;
 
         let v2 = ValidatorListDataV2 {
@@ -267,9 +268,9 @@ pub fn verify_and_parse_v2(
 pub struct BlobV2Wire {
     pub effective_start: u64,
     pub effective_expiration: u64,
-    /// Base64-encoded blob bytes (NOT decoded; signature is over these bytes).
+    /// Base64-encoded blob bytes. The signature is over their decoded JSON.
     pub blob_base64: Vec<u8>,
-    /// Hex-encoded ephemeral signature over `blob_base64`.
+    /// Hex-encoded ephemeral signature over the decoded blob JSON.
     pub signature_hex: Vec<u8>,
 }
 
@@ -980,10 +981,9 @@ mod tests {
                 "validators": validator_entries,
                 "delegates": delegate_entries,
             });
-            let blob_b64 = base64::engine::general_purpose::STANDARD
-                .encode(serde_json::to_vec(&blob_json).unwrap());
-            let blob_sig =
-                rxrpl_crypto::ed25519::sign(blob_b64.as_bytes(), &eph_kp.private_key).unwrap();
+            let blob_json = serde_json::to_vec(&blob_json).unwrap();
+            let blob_b64 = base64::engine::general_purpose::STANDARD.encode(&blob_json);
+            let blob_sig = rxrpl_crypto::ed25519::sign(&blob_json, &eph_kp.private_key).unwrap();
             wire.push(BlobV2Wire {
                 effective_start: *start,
                 effective_expiration: *end,
