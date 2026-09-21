@@ -87,8 +87,8 @@ fn sign_v1_blob(
 /// Build one BlobV2Wire signed with `eph_kp`.
 fn sign_v2_blob(
     eph_kp: &rxrpl_crypto::KeyPair,
-    effective_start: u64,
-    effective_expiration: u64,
+    effective: u64,
+    expiration: u64,
     sequence: u64,
     validator_seeds: &[&str],
     delegates: &[PublicKey],
@@ -112,7 +112,8 @@ fn sign_v2_blob(
         .collect();
     let blob_json = serde_json::json!({
         "sequence": sequence,
-        "expiration": effective_expiration,
+        "effective": effective,
+        "expiration": expiration,
         "validators": validator_entries,
         "delegates": delegate_entries,
     });
@@ -121,8 +122,7 @@ fn sign_v2_blob(
     // v2 retains v1's signature preimage: the decoded JSON bytes.
     let sig = rxrpl_crypto::ed25519::sign(&blob_raw, &eph_kp.private_key).unwrap();
     BlobV2Wire {
-        effective_start,
-        effective_expiration,
+        manifest: None,
         blob_base64: blob_b64.into_bytes(),
         signature_hex: hex::encode(sig.as_bytes()).into_bytes(),
     }
