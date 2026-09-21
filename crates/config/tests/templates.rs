@@ -29,6 +29,15 @@ fn testnet_template_parses() {
     assert_eq!(cfg.network.network_id, 1);
     assert_eq!(cfg.database.backend, "rocksdb");
     assert!(cfg.peer.tls_enabled);
+    assert_eq!(
+        cfg.validators.validator_list_sites,
+        ["https://vl.altnet.rippletest.net"]
+    );
+    assert_eq!(
+        cfg.validators.validator_list_keys,
+        ["ED264807102805220DA0F312E71FC2C69E1552C9C5790F6C25E3729DEB573D5860"]
+    );
+    assert!(cfg.validators.require_trusted_validators);
 }
 
 #[test]
