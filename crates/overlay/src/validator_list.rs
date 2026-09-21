@@ -145,49 +145,8 @@ pub fn verify_and_parse(
         return Err(ValidatorListError::BlobSignatureInvalid);
     }
 
-    // Parse the blob JSON
-    let blob: serde_json::Value = serde_json::from_slice(&blob_json)
-        .map_err(|e| ValidatorListError::BlobDecode(format!("json: {}", e)))?;
-
-    let sequence = blob.get("sequence").and_then(|v| v.as_u64()).unwrap_or(0);
-
-    let expiration = blob.get("expiration").and_then(|v| v.as_u64()).unwrap_or(0);
-
-    let validators_arr = blob
-        .get("validators")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| ValidatorListError::BlobDecode("missing validators array".into()))?;
-
-    let mut validators = Vec::with_capacity(validators_arr.len());
-    let mut validator_manifests = Vec::new();
-
-    for entry in validators_arr {
-        // Extract master public key
-        if let Some(pk_hex) = entry.get("validation_public_key").and_then(|v| v.as_str()) {
-            if let Ok(pk_bytes) = hex::decode(pk_hex) {
-                if let Ok(pk) = PublicKey::from_slice(&pk_bytes) {
-                    validators.push(pk);
-                }
-            }
-        }
-
-        // Extract individual validator manifest
-        if let Some(manifest_b64) = entry.get("manifest").and_then(|v| v.as_str()) {
-            if let Ok(manifest_bytes) =
-                base64::engine::general_purpose::STANDARD.decode(manifest_b64)
-            {
-                validator_manifests.push(manifest_bytes);
-            }
-        }
-    }
-
-    Ok(ValidatorListData {
-        sequence,
-        expiration,
-        validators,
-        validator_manifests,
-        publisher_master_key: publisher_manifest.master_public_key,
-    })
+    let (list, _) = parse_blob_json(&blob_json, &publisher_manifest.master_public_key)?;
+    Ok(list)
 }
 
 /// Verify and parse a v2 ValidatorList payload.
@@ -283,8 +242,14 @@ fn parse_blob_json(
     let blob: serde_json::Value = serde_json::from_slice(blob_json)
         .map_err(|e| ValidatorListError::BlobDecode(format!("json: {}", e)))?;
 
-    let sequence = blob.get("sequence").and_then(|v| v.as_u64()).unwrap_or(0);
-    let expiration = blob.get("expiration").and_then(|v| v.as_u64()).unwrap_or(0);
+    let sequence = blob
+        .get("sequence")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ValidatorListError::BlobDecode("missing or invalid sequence".into()))?;
+    let expiration = blob
+        .get("expiration")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ValidatorListError::BlobDecode("missing or invalid expiration".into()))?;
 
     let validators_arr = blob
         .get("validators")
@@ -772,6 +737,22 @@ mod tests {
         assert_eq!(vl.validators.len(), 3);
         assert_eq!(vl.sequence, 1);
         assert_eq!(vl.expiration, 999999999);
+    }
+
+    #[test]
+    fn rejects_blobs_without_required_fields() {
+        let publisher = PublicKey::from_slice(&[0xED; 33]).expect("test publisher key");
+        for blob in [
+            br#"{}"#.as_slice(),
+            br#"{"sequence":1,"validators":[]}"#.as_slice(),
+            br#"{"expiration":1,"validators":[]}"#.as_slice(),
+            br#"{"sequence":1,"expiration":1}"#.as_slice(),
+        ] {
+            assert!(matches!(
+                parse_blob_json(blob, &publisher),
+                Err(ValidatorListError::BlobDecode(_))
+            ));
+        }
     }
 
     #[test]
