@@ -20,4 +20,6 @@ pub enum OverlayCommand {
     RequestLedger { seq: u32, hash: Option<Hash256> },
     /// Request download of a specific shard index from peers.
     RequestShard { shard_index: u32 },
+    /// Apply manifests obtained from a verified validator list.
+    ApplyValidatorListManifests { manifests: Vec<Vec<u8>> },
 }

@@ -23,7 +23,7 @@
 //!
 //! The `blob` field is a base64-encoded JSON document with a `validators`
 //! array of master public keys (and per-validator manifests). The signature
-//! covers the *base64-encoded* blob bytes, not the decoded JSON.
+//! covers the decoded JSON bytes, not the Base64 transport encoding.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -33,6 +33,7 @@ use rxrpl_primitives::PublicKey;
 use serde::Deserialize;
 use tokio::sync::{RwLock, mpsc};
 
+use crate::command::OverlayCommand;
 use crate::manifest::ManifestStore;
 use crate::peer_manager::ConsensusMessage;
 use crate::validator_list::{self, ValidatorListData, ValidatorListTracker};
@@ -89,6 +90,7 @@ pub struct VlFetcher {
     /// path has. Without this, an HTTP-only dynamic VL populates the
     /// aggregator trust filter but leaves the consensus engine in solo mode.
     consensus_tx: Option<mpsc::Sender<ConsensusMessage>>,
+    overlay_command_tx: Option<mpsc::UnboundedSender<OverlayCommand>>,
 }
 
 impl VlFetcher {
@@ -118,6 +120,7 @@ impl VlFetcher {
             timeout: DEFAULT_TIMEOUT,
             http,
             consensus_tx: None,
+            overlay_command_tx: None,
         })
     }
 
@@ -126,6 +129,17 @@ impl VlFetcher {
     /// track an HTTP-fetched dynamic list, not just the aggregator trust filter.
     pub fn with_consensus_sender(mut self, tx: mpsc::Sender<ConsensusMessage>) -> Self {
         self.consensus_tx = Some(tx);
+        self
+    }
+
+    /// Apply validator manifests from each verified list through the overlay
+    /// owner of the manifest store. This binds validators' ephemeral signing
+    /// keys to their UNL-trusted master keys before validations are counted.
+    pub fn with_overlay_command_sender(
+        mut self,
+        tx: mpsc::UnboundedSender<OverlayCommand>,
+    ) -> Self {
+        self.overlay_command_tx = Some(tx);
         self
     }
 
@@ -255,6 +269,19 @@ impl VlFetcher {
             parsed.validators.len(),
         );
         drop(guard);
+
+        if !parsed.validator_manifests.is_empty() {
+            if let Some(tx) = &self.overlay_command_tx {
+                if tx
+                    .send(OverlayCommand::ApplyValidatorListManifests {
+                        manifests: parsed.validator_manifests.clone(),
+                    })
+                    .is_err()
+                {
+                    tracing::warn!("could not apply validator-list manifests to overlay");
+                }
+            }
+        }
 
         // Feed the verified list into the consensus engine (UNL + quorum +
         // validations-trie), mirroring the P2P `ValidatorListVerified` path.
@@ -406,5 +433,35 @@ mod tests {
         )
         .unwrap();
         fetcher2.publish(&parsed).await;
+    }
+
+    #[tokio::test]
+    async fn forwards_validator_manifests_to_overlay() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let publisher = test_pubkey(0);
+        let fetcher = VlFetcher::new(
+            vec!["http://localhost/vl".into()],
+            vec![publisher.clone()],
+            new_trusted_keys(),
+            Arc::new(RwLock::new(Vec::new())),
+        )
+        .unwrap()
+        .with_overlay_command_sender(command_tx);
+        let manifests = vec![vec![1, 2, 3], vec![4, 5, 6]];
+        let parsed = ValidatorListData {
+            sequence: 7,
+            expiration: 999,
+            validators: vec![test_pubkey(1)],
+            validator_manifests: manifests.clone(),
+            publisher_master_key: publisher,
+        };
+
+        fetcher.publish(&parsed).await;
+
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(OverlayCommand::ApplyValidatorListManifests { manifests: received })
+                if received == manifests
+        ));
     }
 }
