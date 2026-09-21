@@ -56,6 +56,12 @@ pub enum ValidatorListError {
     RotationSignatureInvalid,
     #[error("unsupported VL version: {0}")]
     UnsupportedVersion(u64),
+    #[error("v2 validator list has more than five blobs")]
+    TooManyV2Blobs,
+    #[error("v2 blob expiration {expiration} is not after effective time {effective}")]
+    InvalidV2Window { effective: u64, expiration: u64 },
+    #[error("v2 blob manifest belongs to a different publisher")]
+    V2ManifestPublisherMismatch,
     #[error("no v2 blob is currently within its effective window")]
     NoEffectiveBlob,
     #[error("cascade depth limit exceeded (limit={0})")]
@@ -71,16 +77,16 @@ pub enum ValidatorListError {
 }
 
 /// A v2 VL data record: a v1-style ValidatorListData enriched with the
-/// effective time window (`effective_start..effective_expiration`) under
+/// effective time window (`effective..expiration`) under
 /// which this blob is considered authoritative, and any optional delegate
 /// publishers referenced by this blob (cascade trust, see B3).
 #[derive(Clone, Debug)]
 pub struct ValidatorListDataV2 {
     pub base: ValidatorListData,
-    /// Window start (unix seconds) inclusive.
-    pub effective_start: u64,
-    /// Window end (unix seconds) exclusive.
-    pub effective_expiration: u64,
+    /// Window start (Ripple-epoch seconds) inclusive.
+    pub effective: u64,
+    /// Window end (Ripple-epoch seconds) exclusive.
+    pub expiration: u64,
     /// Optional delegate publisher master keys referenced by this blob.
     /// Used by the cascade resolver in B3.
     pub delegates: Vec<PublicKey>,
@@ -145,7 +151,7 @@ pub fn verify_and_parse(
         return Err(ValidatorListError::BlobSignatureInvalid);
     }
 
-    let (list, _) = parse_blob_json(&blob_json, &publisher_manifest.master_public_key)?;
+    let (list, _, _) = parse_blob_json(&blob_json, &publisher_manifest.master_public_key)?;
     Ok(list)
 }
 
@@ -157,41 +163,58 @@ pub fn verify_and_parse(
 /// {
 ///   "version": 2,
 ///   "manifest": "<base64>",
-///   "blobs_v2": [
-///     { "effective_start": u64, "effective_expiration": u64,
-///       "blob": "<base64>", "signature": "<hex>" },
+///   "blobs-v2": [
+///     { "manifest": "<optional base64>", "blob": "<base64>",
+///       "signature": "<hex>" },
 ///     ...
 ///   ]
 /// }
 /// ```
 ///
-/// Each blob signature is verified against the publisher's ephemeral key
-/// (extracted from the manifest, exactly as in v1). Blobs whose window
-/// does not contain `now_unix` are returned in `inactive`; in-window
-/// blobs are returned in `active`.
+/// The `effective` and `expiration` times are inside each signed, decoded
+/// blob, in Ripple-epoch seconds. Each blob signature is verified against the
+/// publisher's ephemeral key extracted from its optional override manifest (or
+/// the top-level manifest when no override is present). Blobs whose window
+/// does not contain `now_ripple` are returned in `inactive`; in-window blobs
+/// are returned in `active`.
 ///
-/// `now_unix` is taken as a parameter (not pulled from the system clock)
+/// `now_ripple` is taken as a parameter (not pulled from the system clock)
 /// so consensus and tests can drive deterministic time.
 pub fn verify_and_parse_v2(
     publisher_manifest_bytes: &[u8],
     blobs_v2: &[BlobV2Wire],
     manifest_store: &mut ManifestStore,
-    now_unix: u64,
+    now_ripple: u64,
 ) -> Result<ValidatorListV2Bundle, ValidatorListError> {
+    if blobs_v2.len() > 5 {
+        return Err(ValidatorListError::TooManyV2Blobs);
+    }
     let publisher_manifest = manifest::parse_and_verify(publisher_manifest_bytes)?;
     if manifest_store.is_revoked(&publisher_manifest.master_public_key) {
         return Err(ValidatorListError::PublisherRevoked);
     }
     manifest_store.apply(publisher_manifest.clone());
 
-    let ephemeral_pk = publisher_manifest
-        .ephemeral_public_key
-        .as_ref()
-        .ok_or(ValidatorListError::MissingData)?;
-
     let mut bundle = ValidatorListV2Bundle::default();
 
     for entry in blobs_v2 {
+        let signing_manifest = if let Some(override_manifest_bytes) = &entry.manifest {
+            let override_manifest = manifest::parse_and_verify(override_manifest_bytes)?;
+            if override_manifest.master_public_key != publisher_manifest.master_public_key {
+                return Err(ValidatorListError::V2ManifestPublisherMismatch);
+            }
+            if manifest_store.is_revoked(&override_manifest.master_public_key) {
+                return Err(ValidatorListError::PublisherRevoked);
+            }
+            manifest_store.apply(override_manifest.clone());
+            override_manifest
+        } else {
+            publisher_manifest.clone()
+        };
+        let ephemeral_pk = signing_manifest
+            .ephemeral_public_key
+            .as_ref()
+            .ok_or(ValidatorListError::MissingData)?;
         let sig_bytes = hex::decode(&entry.signature_hex)
             .map_err(|e| ValidatorListError::BlobDecode(format!("signature hex: {}", e)))?;
         use base64::Engine;
@@ -203,16 +226,24 @@ pub fn verify_and_parse_v2(
         if !verify_blob_signature(&blob_json, ephemeral_pk.as_bytes(), &sig_bytes) {
             return Err(ValidatorListError::BlobSignatureInvalid);
         }
-        let parsed = parse_blob_json(&blob_json, &publisher_manifest.master_public_key)?;
+        let (base, delegates, effective) =
+            parse_blob_json(&blob_json, &publisher_manifest.master_public_key)?;
+        let effective = effective.unwrap_or(0);
+        if base.expiration <= effective {
+            return Err(ValidatorListError::InvalidV2Window {
+                effective,
+                expiration: base.expiration,
+            });
+        }
 
         let v2 = ValidatorListDataV2 {
-            base: parsed.0,
-            effective_start: entry.effective_start,
-            effective_expiration: entry.effective_expiration,
-            delegates: parsed.1,
+            expiration: base.expiration,
+            base,
+            effective,
+            delegates,
         };
 
-        if now_unix >= v2.effective_start && now_unix < v2.effective_expiration {
+        if now_ripple >= v2.effective && now_ripple < v2.expiration {
             bundle.active.push(v2);
         } else {
             bundle.inactive.push(v2);
@@ -222,11 +253,12 @@ pub fn verify_and_parse_v2(
     Ok(bundle)
 }
 
-/// Wire-level v2 blob entry (one element of `blobs_v2`).
+/// Wire-level v2 blob entry (one element of `blobs-v2`).
 #[derive(Clone, Debug)]
 pub struct BlobV2Wire {
-    pub effective_start: u64,
-    pub effective_expiration: u64,
+    /// Optional base64-decoded publisher manifest for the blob's signature.
+    /// When absent, the enclosing list's top-level manifest is used.
+    pub manifest: Option<Vec<u8>>,
     /// Base64-encoded blob bytes. The signature is over their decoded JSON.
     pub blob_base64: Vec<u8>,
     /// Hex-encoded ephemeral signature over the decoded blob JSON.
@@ -234,11 +266,12 @@ pub struct BlobV2Wire {
 }
 
 /// Parse the inner blob JSON for both v1 and v2. Returns the
-/// ValidatorListData and (for v2) optional delegate publisher master keys.
+/// ValidatorListData, optional delegate publisher master keys, and the
+/// optional v2 effective time carried by the signed blob.
 fn parse_blob_json(
     blob_json: &[u8],
     publisher_master_key: &PublicKey,
-) -> Result<(ValidatorListData, Vec<PublicKey>), ValidatorListError> {
+) -> Result<(ValidatorListData, Vec<PublicKey>, Option<u64>), ValidatorListError> {
     let blob: serde_json::Value = serde_json::from_slice(blob_json)
         .map_err(|e| ValidatorListError::BlobDecode(format!("json: {}", e)))?;
 
@@ -250,6 +283,14 @@ fn parse_blob_json(
         .get("expiration")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| ValidatorListError::BlobDecode("missing or invalid expiration".into()))?;
+    let effective = match blob.get("effective") {
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or_else(|| ValidatorListError::BlobDecode("invalid effective".into()))?,
+        ),
+        None => None,
+    };
 
     let validators_arr = blob
         .get("validators")
@@ -298,6 +339,7 @@ fn parse_blob_json(
             publisher_master_key: publisher_master_key.clone(),
         },
         delegates,
+        effective,
     ))
 }
 
@@ -897,8 +939,8 @@ mod tests {
         );
     }
 
-    /// Helper: build a v2 payload (publisher manifest + blobs_v2 entries).
-    /// Each blob entry takes (effective_start, effective_expiration, sequence,
+    /// Helper: build a v2 payload (publisher manifest + blobs-v2 entries).
+    /// Each blob entry takes (effective, expiration, sequence,
     /// validators, delegates).
     #[allow(clippy::type_complexity)]
     fn make_test_vl_v2(
@@ -958,6 +1000,7 @@ mod tests {
 
             let blob_json = serde_json::json!({
                 "sequence": *seq,
+                "effective": *start,
                 "expiration": *end,
                 "validators": validator_entries,
                 "delegates": delegate_entries,
@@ -966,8 +1009,7 @@ mod tests {
             let blob_b64 = base64::engine::general_purpose::STANDARD.encode(&blob_json);
             let blob_sig = rxrpl_crypto::ed25519::sign(&blob_json, &eph_kp.private_key).unwrap();
             wire.push(BlobV2Wire {
-                effective_start: *start,
-                effective_expiration: *end,
+                manifest: None,
                 blob_base64: blob_b64.into_bytes(),
                 signature_hex: hex::encode(blob_sig.as_bytes()).into_bytes(),
             });
@@ -1001,9 +1043,76 @@ mod tests {
         assert_eq!(bundle.active.len(), 1, "exactly one blob is in window");
         assert_eq!(bundle.inactive.len(), 2, "two blobs are out of window");
         assert_eq!(bundle.active[0].base.sequence, 1);
-        assert_eq!(bundle.active[0].effective_start, 50);
-        assert_eq!(bundle.active[0].effective_expiration, 150);
+        assert_eq!(bundle.active[0].effective, 50);
+        assert_eq!(bundle.active[0].expiration, 150);
         assert_eq!(bundle.active[0].base.validators.len(), 1);
+    }
+
+    #[test]
+    fn v2_rejects_non_increasing_effective_window() {
+        let validators = ["v2_invalid_window_validator"];
+        let no_delegates: Vec<PublicKey> = vec![];
+        let (manifest, wire) = make_test_vl_v2(
+            "v2_invalid_window_publisher",
+            "v2_invalid_window_signing",
+            &[(100, 100, 1, &validators, &no_delegates)],
+        );
+
+        let mut store = ManifestStore::new();
+        let result = verify_and_parse_v2(&manifest, &wire, &mut store, 100);
+        assert!(matches!(
+            result,
+            Err(ValidatorListError::InvalidV2Window {
+                effective: 100,
+                expiration: 100,
+            })
+        ));
+    }
+
+    #[test]
+    fn v2_rejects_more_than_five_blobs() {
+        let validators = ["v2_blob_limit_validator"];
+        let no_delegates: Vec<PublicKey> = vec![];
+        let (manifest, wire) = make_test_vl_v2(
+            "v2_blob_limit_publisher",
+            "v2_blob_limit_signing",
+            &[
+                (0, 1000, 1, &validators, &no_delegates),
+                (0, 1000, 2, &validators, &no_delegates),
+                (0, 1000, 3, &validators, &no_delegates),
+                (0, 1000, 4, &validators, &no_delegates),
+                (0, 1000, 5, &validators, &no_delegates),
+                (0, 1000, 6, &validators, &no_delegates),
+            ],
+        );
+
+        let mut store = ManifestStore::new();
+        let result = verify_and_parse_v2(&manifest, &wire, &mut store, 100);
+        assert!(matches!(result, Err(ValidatorListError::TooManyV2Blobs)));
+    }
+
+    #[test]
+    fn v2_rejects_override_manifest_for_another_publisher() {
+        let validators = ["v2_manifest_mismatch_validator"];
+        let no_delegates: Vec<PublicKey> = vec![];
+        let (manifest, mut wire) = make_test_vl_v2(
+            "v2_manifest_mismatch_publisher",
+            "v2_manifest_mismatch_signing",
+            &[(0, 1000, 1, &validators, &no_delegates)],
+        );
+        let (other_manifest, _) = make_test_vl_v2(
+            "v2_other_publisher",
+            "v2_other_signing",
+            &[(0, 1000, 1, &validators, &no_delegates)],
+        );
+        wire[0].manifest = Some(other_manifest);
+
+        let mut store = ManifestStore::new();
+        let result = verify_and_parse_v2(&manifest, &wire, &mut store, 100);
+        assert!(matches!(
+            result,
+            Err(ValidatorListError::V2ManifestPublisherMismatch)
+        ));
     }
 
     /// In-memory DelegateResolver for tests. Maps publisher master key
