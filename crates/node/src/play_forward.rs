@@ -504,7 +504,7 @@ mod tests {
     /// `e2e_first_divergent_tx` at `/tmp/e2e_state_<start>.bin`) and replay every
     /// ledger `start+1..=end`, carrying state forward with the real mainnet parent
     /// hash pinned (mirrors `replay_segment`). Prints per-ledger account_hash /
-    /// tx_hash match and stops at the first account_hash divergence — the next
+    /// tx_hash match and stops at the first four-root divergence — the next
     /// campaign target — amortising one multi-hour state fetch across the range.
     /// It replays `start+1` first, so a known byte-exact ledger there self-checks
     /// the sweep against the authoritative single-ledger oracle.
@@ -597,7 +597,7 @@ mod tests {
                 "SWEEP seq={seq} acc={} tx={} applied={} failed={}",
                 outcome.account_hash_match, outcome.tx_hash_match, outcome.applied, outcome.failed
             );
-            if !outcome.account_hash_match {
+            if !outcome.is_faithful() {
                 first_divergent = Some(seq);
                 // Dump the byte-exact parent state (seq-1, carried and validated by
                 // the sweep) in the e2e cache format so the detailed single-ledger
@@ -614,8 +614,11 @@ mod tests {
                     eprintln!("dumped parent state to {pcache}");
                 }
                 eprintln!(
-                    "=== FIRST DIVERGENT seq={seq} ours={} theirs={} ===",
-                    outcome.ledger.header.account_hash, hdr.account_hash
+                    "=== FIRST DIVERGENT seq={seq} account={} tx={} drops={} ledger={} ===",
+                    outcome.account_hash_match,
+                    outcome.tx_hash_match,
+                    outcome.drops_match,
+                    outcome.ledger_hash_match,
                 );
                 break;
             }
