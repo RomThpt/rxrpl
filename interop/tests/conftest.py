@@ -88,6 +88,25 @@ def get_account_info(url: str, account: str) -> dict | None:
         return None
 
 
+def wait_for_account_info(
+    url: str, account: str, timeout: int = TIMEOUT
+) -> dict | None:
+    """Wait until an AccountRoot is visible on a node.
+
+    A node can already be past the ledger sequence that contained a payment
+    while its RPC read path is still catching up with the newly validated
+    state. Poll the state itself instead of treating a ledger-index threshold
+    as proof that the destination is visible.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        info = get_account_info(url, account)
+        if info is not None:
+            return info
+        time.sleep(2)
+    return None
+
+
 def get_ledger_hash(url: str, seq: int) -> str | None:
     """Get the validated ledger hash at a specific sequence."""
     try:

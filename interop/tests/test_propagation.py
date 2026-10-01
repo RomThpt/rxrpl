@@ -13,6 +13,7 @@ from conftest import (
     RXRPL_URLS,
     get_account_info,
     submit_payment,
+    wait_for_account_info,
     wait_for_ledger,
 )
 
@@ -45,7 +46,7 @@ class TestPropagation:
         wait_for_ledger(target, current + 2, timeout=60)
 
         # Verify the account exists on the rxrpl node
-        info = get_account_info(target, DEST_RIPPLED_TO_RXRPL)
+        info = wait_for_account_info(target, DEST_RIPPLED_TO_RXRPL, timeout=60)
         assert info is not None, \
             f"Account {DEST_RIPPLED_TO_RXRPL} not found on rxrpl after propagation"
         assert int(info.get("Balance", "0")) > 0
@@ -66,7 +67,7 @@ class TestPropagation:
         wait_for_ledger(target, current + 2, timeout=60)
 
         # Verify the account exists on the rippled node
-        info = get_account_info(target, DEST_RXRPL_TO_RIPPLED)
+        info = wait_for_account_info(target, DEST_RXRPL_TO_RIPPLED, timeout=60)
         assert info is not None, \
             f"Account {DEST_RXRPL_TO_RIPPLED} not found on rippled after propagation"
         assert int(info.get("Balance", "0")) > 0
@@ -79,6 +80,6 @@ class TestPropagation:
         from conftest import ALL_URLS
         for url in ALL_URLS:
             for dest in [DEST_RIPPLED_TO_RXRPL, DEST_RXRPL_TO_RIPPLED]:
-                info = get_account_info(url, dest)
+                info = wait_for_account_info(url, dest, timeout=60)
                 assert info is not None, \
                     f"Account {dest} not found on {url}"

@@ -16,6 +16,7 @@ from conftest import (
     get_account_info,
     rpc,
     submit_payment,
+    wait_for_account_info,
     wait_for_ledger,
     wait_for_ledger_hash,
 )
@@ -58,7 +59,7 @@ class TestSync:
         # Verify all nodes see the same balance
         balances = {}
         for url in ALL_URLS:
-            info = get_account_info(url, DEST_PRESYNC)
+            info = wait_for_account_info(url, DEST_PRESYNC, timeout=60)
             assert info is not None, f"Account not found on {url}"
             balances[url] = info.get("Balance", "0")
 
@@ -118,7 +119,8 @@ class TestSync:
             )
 
             account_data = {
-                url: get_account_info(url, DEST_LATE_JOIN) for url in ALL_URLS
+                url: wait_for_account_info(url, DEST_LATE_JOIN, timeout=120)
+                for url in ALL_URLS
             }
             assert all(account_data.values()), (
                 f"late-join account state missing: {account_data}"

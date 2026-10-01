@@ -22,7 +22,7 @@ use rxrpl_overlay::{
     ConsensusMessage, LedgerProvider, NetworkConsensusAdapter, NodeIdentity, OverlayCommand,
     PeerManager, PeerManagerConfig, VlFetcher, new_trusted_keys,
 };
-use rxrpl_primitives::Hash256;
+use rxrpl_primitives::{Hash256, PublicKey};
 use rxrpl_protocol::{TransactionResult, keylet};
 use rxrpl_rpc_server::{ServerContext, ServerEvent};
 use rxrpl_shamap::{NodeStore, SHAMap};
@@ -39,6 +39,19 @@ use crate::pruner::LedgerPruner;
 /// LedgerProvider implementation backed by the node's closed ledger history.
 struct ClosedLedgerAccess {
     closed_ledgers: Arc<RwLock<VecDeque<Ledger>>>,
+    pruner: Arc<LedgerPruner>,
+}
+
+/// Return whether a preferred branch tip is already available locally.
+///
+/// A stale peer proposal can reference an older parent while this node is
+/// already carrying that ledger in its closed history. In that case rippled
+/// keeps the current branch and does not enter catch-up merely because the
+/// proposal arrived through a different event path.
+fn closed_history_contains(history: &VecDeque<Ledger>, preferred_ledger: Hash256) -> bool {
+    history
+        .iter()
+        .any(|ledger| ledger.header.hash == preferred_ledger)
 }
 
 impl LedgerProvider for ClosedLedgerAccess {
@@ -55,6 +68,10 @@ impl LedgerProvider for ClosedLedgerAccess {
     fn latest_closed(&self) -> Option<Ledger> {
         let history = self.closed_ledgers.try_read().ok()?;
         history.back().cloned()
+    }
+
+    fn earliest_fetch(&self) -> Option<u32> {
+        Some(self.pruner.earliest_seq())
     }
 }
 
@@ -100,6 +117,32 @@ impl Node {
                 let db = PersistentNodeDatabase::new(kv);
                 let cached = CachedNodeStore::with_defaults(db);
                 Ok(Some(Arc::new(cached)))
+            }
+            "none" => Ok(None),
+            other => Err(NodeError::Config(format!(
+                "unknown database backend: {other}"
+            ))),
+        }
+    }
+
+    /// Create the transaction history index that backs `tx` and `account_tx`.
+    ///
+    /// The ledger SHAMap and the transaction index have different lifetimes:
+    /// the former is content-addressed, while the latter is a query-oriented
+    /// projection. Keep the projection persistent whenever the node store is
+    /// persistent, otherwise a validator restart would silently lose the
+    /// transaction history RPCs even though ledger state survived.
+    fn create_tx_store(config: &NodeConfig) -> Result<Option<Arc<dyn TxStore>>, NodeError> {
+        match config.database.backend.as_str() {
+            "memory" => Ok(Some(Arc::new(
+                SqliteStore::in_memory().map_err(|e| NodeError::Config(e.to_string()))?,
+            ))),
+            "rocksdb" => {
+                std::fs::create_dir_all(&config.database.path).map_err(|e| {
+                    NodeError::Config(format!("failed to create transaction store directory: {e}"))
+                })?;
+                let path = config.database.path.join("transactions.sqlite");
+                Ok(Some(Arc::new(SqliteStore::open(path)?)))
             }
             "none" => Ok(None),
             other => Err(NodeError::Config(format!(
@@ -225,6 +268,7 @@ impl Node {
 
         // Initialize node store
         let node_store = Self::create_node_store(&config)?;
+        let tx_store = Self::create_tx_store(&config)?;
 
         // Initialize amendment registry
         let registry = FeatureRegistry::with_known_amendments();
@@ -290,7 +334,7 @@ impl Node {
             tx_queue: Arc::new(RwLock::new(tx_queue)),
             amendment_table: Arc::new(RwLock::new(amendment_table)),
             fees: Arc::new(FeeSettings::default()),
-            tx_store: None,
+            tx_store,
             node_store,
             pruner,
             validation_seed,
@@ -401,7 +445,7 @@ impl Node {
     /// Starts the RPC server and a ledger close loop that closes the
     /// ledger every `close_interval_secs` seconds. Blocks until ctrl+c.
     pub async fn run_standalone(&self, close_interval_secs: u64) -> Result<(), NodeError> {
-        let ctx = ServerContext::with_node_state_and_pruner(
+        let mut ctx = ServerContext::with_node_state_and_pruner(
             self.config.server.clone(),
             Arc::clone(&self.ledger),
             Arc::clone(&self.closed_ledgers),
@@ -413,6 +457,9 @@ impl Node {
             self.pruner.shared_state(),
             Some(rxrpl_rpc_server::metrics::global_handle()),
         );
+        if let Some(store) = self.node_store.as_ref() {
+            ctx.attach_persistent_history(Arc::clone(store), self.config.database.path.clone());
+        }
         let event_tx = ctx.event_sender().clone();
 
         // Clone ctx for gRPC before moving into RPC router
@@ -743,9 +790,45 @@ impl Node {
     /// This MUST run before any port bind or async task spawn so that a
     /// misconfiguration is reported deterministically rather than racing
     /// `EADDRINUSE` against another process bound to the same port.
+    fn decode_validator_list_keys(keys: &[String]) -> Result<Vec<PublicKey>, NodeError> {
+        keys.iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let trimmed = value.trim();
+                let bytes = hex::decode(trimmed).map_err(|error| {
+                    NodeError::Config(format!(
+                        "invalid validators.validator_list_keys[{index}]: {error}"
+                    ))
+                })?;
+                let key = match PublicKey::from_slice(&bytes) {
+                    Ok(key) => key,
+                    Err(rxrpl_primitives::error::PrimitivesError::InvalidPublicKeyPrefix {
+                        ..
+                    }) => {
+                        return Err(NodeError::Config(format!(
+                            "invalid validators.validator_list_keys[{index}]: unsupported public-key type"
+                        )));
+                    }
+                    Err(error) => {
+                        return Err(NodeError::Config(format!(
+                            "invalid validators.validator_list_keys[{index}]: {error}"
+                        )));
+                    }
+                };
+                if !key.is_ed25519() && !key.is_secp256k1() {
+                    return Err(NodeError::Config(format!(
+                        "invalid validators.validator_list_keys[{index}]: unsupported public-key type"
+                    )));
+                }
+                Ok(key)
+            })
+            .collect()
+    }
+
     fn validate_starting_ledger_unl(
         &self,
         starting_ledger: Option<&crate::checkpoint::StartingLedger>,
+        publisher_keys: &[PublicKey],
     ) -> Result<(), NodeError> {
         if matches!(
             starting_ledger,
@@ -753,7 +836,7 @@ impl Node {
                 | Some(crate::checkpoint::StartingLedger::Recent)
         ) {
             let has_unl = !self.config.validators.validator_list_sites.is_empty()
-                && !self.config.validators.validator_list_keys.is_empty()
+                && !publisher_keys.is_empty()
                 && self.config.validators.require_trusted_validators;
             if !has_unl {
                 return Err(NodeError::Config(
@@ -810,7 +893,9 @@ impl Node {
         // 0. SECURITY: validate UNL/checkpoint guard BEFORE any port bind or
         // task spawn so a misconfiguration is reported deterministically
         // rather than racing `EADDRINUSE` (port collision in parallel tests).
-        self.validate_starting_ledger_unl(starting_ledger.as_ref())?;
+        let vl_publisher_keys =
+            Self::decode_validator_list_keys(&self.config.validators.validator_list_keys)?;
+        self.validate_starting_ledger_unl(starting_ledger.as_ref(), &vl_publisher_keys)?;
         self.validate_validating_unl()?;
 
         // 1. Generate/load node identity. node_seed accepts either:
@@ -1022,6 +1107,7 @@ impl Node {
         );
         peer_mgr.set_ledger_provider(Arc::new(ClosedLedgerAccess {
             closed_ledgers: Arc::clone(&self.closed_ledgers),
+            pruner: Arc::clone(&self.pruner),
         }));
         if let Some(ref store) = self.node_store {
             peer_mgr.set_node_store(Arc::clone(store));
@@ -1091,17 +1177,6 @@ impl Node {
         let vl_status: Arc<RwLock<serde_json::Value>> =
             Arc::new(RwLock::new(serde_json::Value::Array(Vec::new())));
         let vl_sites = self.config.validators.validator_list_sites.clone();
-        let vl_publisher_keys: Vec<rxrpl_primitives::PublicKey> = self
-            .config
-            .validators
-            .validator_list_keys
-            .iter()
-            .filter_map(|hex_key| {
-                hex::decode(hex_key)
-                    .ok()
-                    .and_then(|b| rxrpl_primitives::PublicKey::from_slice(&b).ok())
-            })
-            .collect();
         if !vl_sites.is_empty() && !vl_publisher_keys.is_empty() {
             let trusted_clone = Arc::clone(&trusted_validators);
             let status_clone = Arc::clone(&vl_status);
@@ -1172,6 +1247,9 @@ impl Node {
             self.pruner.shared_state(),
             Some(rxrpl_rpc_server::metrics::global_handle()),
         );
+        if let Some(store) = self.node_store.as_ref() {
+            ctx.attach_persistent_history(Arc::clone(store), self.config.database.path.clone());
+        }
         ctx.attach_validator_list_status(Arc::clone(&vl_status));
         ctx.attach_network_id(self.config.network.network_id);
         // Peer set: shared with the overlay so `server_info.peers` reads the
@@ -1574,11 +1652,12 @@ impl Node {
         }
 
         let validator_id_for_loop = validator_id.clone();
-        // Set of amendment ids this build knows how to apply. Captured by the
-        // consensus loop so each close can detect an on-ledger amendment it
-        // does not understand and trip the amendment-blocked halt.
+        // Set of amendment ids this build actually implements. Forward-
+        // registered amendments are intentionally excluded, so an enabled
+        // feature with only structural/type support trips the
+        // amendment-blocked halt instead of allowing divergent validation.
         let known_amendment_ids: HashSet<Hash256> = FeatureRegistry::with_known_amendments()
-            .known_ids()
+            .implemented_ids()
             .copied()
             .collect();
         let amendment_blocked_for_loop = Arc::clone(&amendment_blocked);
@@ -1587,6 +1666,14 @@ impl Node {
         let fee_vote_cfg = self.config.fee_vote.clone();
         tokio::spawn(async move {
             let node_id = NodeId(identity.node_id);
+            // Seed the adaptive tracker from the current open ledger rather
+            // than ConsensusParams' default.  The open header carries the
+            // parent ledger's close-time resolution; rippled feeds that
+            // value into getNextLedgerTimeResolution when the round starts.
+            let initial_close_time_resolution = {
+                let l = ledger.read().await;
+                u32::from(l.header.close_time_resolution)
+            };
             // Networked mode: enforce a minimum Establish-phase duration
             // (~rippled `ledgerMIN_CONSENSUS`) so a round is not finalized
             // before peer ProposeSets have had time to propagate. Solo mode
@@ -1600,6 +1687,7 @@ impl Node {
             let consensus_params = ConsensusParams {
                 min_consensus_time_ms: 1_950,
                 converge_poll_interval_ms: 250,
+                close_time_resolution: initial_close_time_resolution,
                 ..ConsensusParams::default()
             };
             let mut timer = ConsensusTimer::new(&consensus_params);
@@ -1824,6 +1912,8 @@ impl Node {
                                     let prev_hash = l.header.parent_hash;
                                     let seq = l.header.sequence;
                                     let parent_close_time = l.header.parent_close_time;
+                                    let parent_close_time_resolution =
+                                        u32::from(l.header.close_time_resolution);
                                     drop(l);
 
                                     // Close-time alignment gate: in mixed-validator topologies,
@@ -1914,6 +2004,28 @@ impl Node {
                                         round_started_at = Some(tokio::time::Instant::now());
                                     }
 
+                                    // Start the round only after reading the
+                                    // current ledger header.  The consensus
+                                    // engine advances its resolution from the
+                                    // parent resolution using rippled's
+                                    // getNextLedgerTimeResolution cadence.
+                                    consensus.set_parent_close_time_resolution(
+                                        parent_close_time_resolution,
+                                    );
+                                    consensus.start_round_with_prior(
+                                        prev_hash,
+                                        seq,
+                                        parent_close_time,
+                                    );
+                                    let resolution = consensus.close_time_resolution();
+                                    tracing::debug!(
+                                        target: "consensus",
+                                        seq,
+                                        parent_close_time_resolution,
+                                        round_close_time_resolution = resolution,
+                                        "consensus round close-time resolution"
+                                    );
+
                                     // Propose our own wall-clock floored to the resolution
                                     // grid. Using `latest_peer_close_time` here was a
                                     // cross-impl footgun: that value spans ALL rounds, so
@@ -1926,7 +2038,6 @@ impl Node {
                                     // the no-consensus fallback in `effective_close_time`
                                     // (→ `parent + 1` without a strict majority) keeps a
                                     // 1-bucket split converging byte-for-byte cross-impl.
-                                    let resolution = consensus.close_time_resolution();
                                     let raw_close_time = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
@@ -2009,13 +2120,6 @@ impl Node {
                                     let tx_set = Node::collect_consensus_tx_set(&l);
                                     drop(l);
 
-                                    // Pass parent_close_time so the engine's
-                                    // eff_close_time monotonicity clamp lands at
-                                    // parent+1 — matching rippled. With the legacy
-                                    // start_round (prior=0), the clamp is inactive
-                                    // and rxrpl forks 1 bucket from rippled every
-                                    // round (CT_DUMP empirical, 2026-05-21).
-                                    consensus.start_round_with_prior(prev_hash, seq, parent_close_time);
                                     if let Err(e) = consensus.close_ledger(tx_set, close_time, seq) {
                                         tracing::error!("consensus close_ledger failed: {}", e);
                                         continue;
@@ -2146,9 +2250,10 @@ impl Node {
                                     let wrong_prev_is_known_history = match wrong_prev.as_ref() {
                                         Some(detected) => {
                                             let history = closed_ledgers.read().await;
-                                            history
-                                                .iter()
-                                                .any(|l| l.header.hash == detected.preferred_ledger)
+                                            closed_history_contains(
+                                                &history,
+                                                detected.preferred_ledger,
+                                            )
                                         }
                                         None => false,
                                     };
@@ -2343,6 +2448,20 @@ impl Node {
                                     .unwrap_or(true);
                                 if cooldown_ok {
                                     if let Some(detected) = consensus.check_wrong_prev_ledger() {
+                                        let preferred_is_known = {
+                                            let history = closed_ledgers.read().await;
+                                            closed_history_contains(
+                                                &history,
+                                                detected.preferred_ledger,
+                                            )
+                                        };
+                                        if preferred_is_known {
+                                            tracing::debug!(
+                                                preferred_ledger = %detected.preferred_ledger,
+                                                "ignoring wrong_prev recovery for known closed ledger"
+                                            );
+                                            continue;
+                                        }
                                         tracing::warn!(
                                             "wrong prev_ledger detected: {}/{} trusted peers reference {}, \
                                              ours is {}. Triggering recovery.",
@@ -2938,7 +3057,14 @@ impl Node {
                                                     let _ = cmd_tx_catchup.send(
                                                         OverlayCommand::RequestLedger {
                                                             seq: seq - 1,
-                                                            hash: Some(parent_hash),
+                                                            // Request by sequence when the local
+                                                            // parent diverges. The peer may have
+                                                            // pruned the exact hash even though it
+                                                            // still serves that sequence; keep the
+                                                            // exact-hash behavior at the server
+                                                            // boundary and avoid relying on a
+                                                            // hash-to-sequence substitution there.
+                                                            hash: None,
                                                         },
                                                     );
                                                     tracing::debug!(
@@ -2956,8 +3082,42 @@ impl Node {
                                             //    (cross-impl yield path: we asked for peer's #N
                                             //    while our open=#N to follow peer's chain).
                                             let our_open_seq = ledger_seq_shared.load(Ordering::Relaxed);
-                                            let should_adopt = syncing || seq == our_open_seq;
+                                            // LedgerData replies may arrive out of order when a
+                                            // catch-up request fan-outs across peers. Never move
+                                            // the open ledger backwards: an older response still
+                                            // belongs in closed history (and can repair a stale
+                                            // header), but adopting it would rewind state and
+                                            // leave the node on a divergent branch after rejoin.
+                                            let should_adopt = if syncing {
+                                                seq >= our_open_seq
+                                            } else {
+                                                seq == our_open_seq
+                                            };
+                                            if syncing && seq < our_open_seq {
+                                                tracing::debug!(
+                                                    "catchup: retaining open ledger #{} while backfilling older ledger #{}",
+                                                    our_open_seq, seq
+                                                );
+                                            }
                                             if should_adopt {
+                                                if let Some(ref store) = tx_store {
+                                                    Node::index_ledger_transactions(
+                                                        store.as_ref(),
+                                                        &reconstructed,
+                                                    );
+                                                }
+                                                if let Some(dir) = resume_dir_for_loop.as_deref() {
+                                                    if let Err(e) = rxrpl_rpc_server::persistent_history::append_header(
+                                                        dir,
+                                                        &reconstructed.header,
+                                                    ) {
+                                                        tracing::warn!(
+                                                            "failed to persist catchup ledger header #{}: {}",
+                                                            reconstructed.header.sequence,
+                                                            e
+                                                        );
+                                                    }
+                                                }
                                                 // Adopt the reconstructed ledger: open ledger becomes N+1
                                                 let new_open = Ledger::new_open(&reconstructed);
                                                 let new_seq = new_open.header.sequence;
@@ -3050,6 +3210,24 @@ impl Node {
                                                         msg_type: rxrpl_p2p_proto::MessageType::Validation,
                                                         payload,
                                                     });
+
+                                                    // Count the catch-up validation locally as well as
+                                                    // broadcasting it. The peer never loops our wire
+                                                    // broadcast back through the consensus channel, so
+                                                    // omitting this self-injection leaves the local
+                                                    // validation aggregator one vote short after an
+                                                    // adopted ledger (and prevents the network-validated
+                                                    // tip from advancing in a two-validator Hive run).
+                                                    if let Err(e) = self_validation_tx.try_send(
+                                                        rxrpl_overlay::ConsensusMessage::Validation(
+                                                            validation,
+                                                        ),
+                                                    ) {
+                                                        tracing::warn!(
+                                                            "could not self-inject catch-up validation: {}",
+                                                            e
+                                                        );
+                                                    }
                                                     self_validation_guard.record_validation(seq, reconstructed.header.hash);
                                                     self_validation_guard.record_signing_time(sign_time);
                                                     tracing::debug!(
@@ -3368,6 +3546,21 @@ impl Node {
         let _nunl_results = Node::apply_negative_unl(consensus, &mut l, tx_engine, fees, nunl_seq);
         consensus.on_ledger_close_for_tracker();
 
+        // Store the resolution selected for this round in the closed header.
+        // Ledger::new_open copies it to the next open ledger, making the
+        // current header the authoritative parent input for the next
+        // getNextLedgerTimeResolution step.
+        l.header.close_time_resolution = resolution as u8;
+
+        // Networked genesis intentionally starts store-less to preserve the
+        // canonical fresh-network root. Attach the persistent store only at
+        // the close boundary, after all consensus mutations are complete, so
+        // locally produced ledgers are actually recoverable after restart.
+        if let Some(store) = node_store {
+            l.state_map.set_store(Arc::clone(store));
+            l.tx_map.set_store(Arc::clone(store));
+        }
+
         if let Err(e) = l.close(effective_close_time, close_flags) {
             tracing::error!("failed to close ledger: {}", e);
             return;
@@ -3381,6 +3574,15 @@ impl Node {
                 if let Some(dir) = resume_dir {
                     if let Err(e) = crate::resume_ledger_store::save(dir, &l.header) {
                         tracing::warn!("failed to persist resume pointer: {}", e);
+                    }
+                    if let Err(e) =
+                        rxrpl_rpc_server::persistent_history::append_header(dir, &l.header)
+                    {
+                        tracing::warn!(
+                            "failed to persist ledger header #{}: {}",
+                            l.header.sequence,
+                            e
+                        );
                     }
                 }
             }
@@ -4508,7 +4710,6 @@ impl Node {
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
-            .danger_accept_invalid_certs(true)
             .build()?;
 
         let resp = client
@@ -4565,7 +4766,6 @@ impl Node {
     ) -> Result<rxrpl_ledger::LedgerHeader, Box<dyn std::error::Error + Send + Sync>> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
-            .danger_accept_invalid_certs(true)
             .build()?;
         let resp = client
             .post(rpc_url)
@@ -4627,7 +4827,6 @@ impl Node {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .connect_timeout(std::time::Duration::from_secs(10))
-            .danger_accept_invalid_certs(true)
             .build()?;
 
         let mut state_map = SHAMap::account_state_with_store(Arc::clone(&store));

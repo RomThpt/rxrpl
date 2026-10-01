@@ -651,3 +651,11 @@ Pending request registration no longer resets the timeout clock; successful send
 ## [OPEN] Full network/amendment/state-compare matrix remains to be executed — 2026-10-01T05:15:26Z
 
 The maintained mixed network against rippled 3.1.3 has passed its sync suite, and Testnet replay is byte-exact for the current checkpoint window. Mainnet, Testnet, standalone, amendment-by-amendment, XRPL Hive, and XRPL Commons State Compare coverage are not yet a complete proof of validator parity. ConfidentialMPT remains fail-closed pending its cryptographic backend.
+
+The Testnet checkpoint window now extends through ledger 20934252 with four-root equality and no divergence; broader network and amendment coverage remains open.
+
+## [UPDATE] Mixed-validator recovery now uses a retention-safe historical assertion — 2026-10-01T06:29:19Z
+
+The first post-fix full run reached 23/24. The only failure was `test_rippled_crash_and_recover`: after the long suite had advanced to the 400s, the test queried the original `baseline+2` sequence (ledger 43), which was outside the restarted rippled node's bounded history window. The five-node network had already reconverged at the live tip, and no divergent hash was observed.
+
+The test now records each node's recovered tip and compares the minimum recent tip, then the targeted chaos matrix passes 6/6 in 170.98 seconds. A full 24-test rerun after this test-only correction is still pending. Broader network/amendment coverage, real XRPL Commons State Compare datasets, and ConfidentialMPT execution remain open.

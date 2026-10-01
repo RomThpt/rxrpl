@@ -62,15 +62,20 @@ class TestFlakyRippled:
         time.sleep(5)
 
         recovery_seq = baseline_seq + 5
+        recovery_tips = []
         for url in ALL_URLS:
             seq = wait_for_ledger(url, recovery_seq, timeout=240)
+            recovery_tips.append(seq)
             assert seq >= recovery_seq, (
                 f"node {url} failed to advance after rippled recovery: "
                 f"reached {seq}, expected >= {recovery_seq}"
             )
 
-        # 6. Hash agreement at a ledger closed *after* recovery.
-        check_seq = baseline_seq + 2
+        # 6. Hash agreement at a recent ledger closed *after* recovery.
+        # The harness can run long enough for rippled's bounded history
+        # window to prune the original baseline+2 ledger before this check.
+        # Compare the newest sequence observed across all nodes instead.
+        check_seq = min(recovery_tips)
         hashes = {url: wait_for_ledger_hash(url, check_seq) for url in ALL_URLS}
         for url, h in hashes.items():
             assert h is not None, f"{url} missing hash for ledger {check_seq}"
