@@ -1,10 +1,9 @@
 """B5: Flaky rippled — kill one rippled, rxrpl + remaining rippled defer
 quorum without panic, then resume once rippled comes back.
 
-In a 2-of-3 quorum with 2 rippled + 1 rxrpl, killing one rippled leaves
-1 rippled + 1 rxrpl = 2 votes available. Whether quorum still forms or
-not depends on the exact UNL/quorum configuration: the important
-invariant for this test is that **no node panics** and that the network
+In a 4-of-5 quorum with 3 rippled + 2 rxrpl, killing one rippled leaves
+four validators, exactly enough to keep closing ledgers. The important
+invariant is that the network continues without a divergent solo close and
 fully reconverges once the missing rippled returns.
 """
 
@@ -47,10 +46,8 @@ class TestFlakyRippled:
         stop_container(target)
 
         # 3. Give the network up to ~30s of partition time. The remaining
-        #    rxrpl + rippled-1 may or may not form quorum depending on the
-        #    quorum threshold; either way, no node should panic, and we
-        #    expect the rxrpl yield-to-peer logic to defer rather than
-        #    solo-close at a divergent hash.
+        #    four validators remain, so the configured 4/5 quorum stays
+        #    viable while the stopped validator is unavailable.
         time.sleep(30)
 
         # 4. Surviving nodes must still respond to RPC and not have panicked.
@@ -59,7 +56,7 @@ class TestFlakyRippled:
             # wait_for_ledger short timeout: we just want the node alive.
             wait_for_ledger(url, baseline_seq, timeout=15)
 
-        # 5. Restart rippled-0. Quorum must reform and all 3 must advance.
+        # 5. Restart rippled-0. Quorum must reform and all 5 must advance.
         start_container(target)
         wait_until_running(target)
         time.sleep(5)

@@ -42,7 +42,10 @@ if ! docker image inspect rxrpl:interop >/dev/null 2>&1; then
 fi
 
 NET="rxrpl-quick-net"
-docker network create --subnet=172.31.0.0/16 "$NET" 2>/dev/null || true
+# Reuse the addresses in the generated configs. The previous 172.31/16
+# network made every configured 172.30.x fixed peer unreachable, while the
+# script still returned success with an empty peer list.
+docker network create --subnet=172.30.0.0/24 "$NET" 2>/dev/null || true
 
 cleanup() {
     echo "==> Cleanup"
@@ -51,14 +54,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> Starting rippled at 172.31.0.10"
-docker run -d --name rippled-quick --network "$NET" --ip 172.31.0.10 \
+echo "==> Starting rippled at 172.30.0.10"
+docker run -d --name rippled-quick --network "$NET" --ip 172.30.0.10 \
     -v "$INTEROP_DIR/configs/rippled-0.cfg:/etc/opt/ripple/rippled.cfg:ro" \
     -v "$INTEROP_DIR/configs/validators.txt:/etc/opt/ripple/validators.txt:ro" \
     "$RIPPLED_IMAGE" >/dev/null
 
-echo "==> Starting rxrpl at 172.31.0.20"
-docker run -d --name rxrpl-quick --network "$NET" --ip 172.31.0.20 \
+echo "==> Starting rxrpl at 172.30.0.20"
+docker run -d --name rxrpl-quick --network "$NET" --ip 172.30.0.20 \
     -p 5005:5005 \
     -v "$INTEROP_DIR/configs/rxrpl-0.toml:/etc/rxrpl/node.toml:ro" \
     rxrpl:interop run --mode network --config /etc/rxrpl/node.toml \
@@ -69,15 +72,20 @@ for _ in $(seq 1 30); do
     if curl -fsS -X POST http://127.0.0.1:5005/ \
         -H 'Content-Type: application/json' \
         -d '{"method":"peers","params":[{}]}' 2>/dev/null \
-        | grep -q '"status":"success"'; then
+        | grep -Eq '"peer_count"[[:space:]]*:[[:space:]]*[1-9]'; then
         break
     fi
     sleep 1
 done
 
 echo "==> rxrpl peers response:"
-curl -sS -X POST http://127.0.0.1:5005/ \
+PEERS_RESPONSE="$(curl -sS -X POST http://127.0.0.1:5005/ \
     -H 'Content-Type: application/json' \
-    -d '{"method":"peers","params":[{}]}' | python3 -m json.tool
+    -d '{"method":"peers","params":[{}]}')"
+printf '%s\n' "$PEERS_RESPONSE" | python3 -m json.tool
+if ! printf '%s\n' "$PEERS_RESPONSE" | grep -Eq '"peer_count"[[:space:]]*:[[:space:]]*[1-9]'; then
+    echo "==> Handshake failed: rxrpl has no connected peers" >&2
+    exit 1
+fi
 
 echo "==> Done. Logs: docker logs rippled-quick / rxrpl-quick"

@@ -71,6 +71,35 @@ fn full_validation_flags_set_canonical_and_full_bits() {
     );
 }
 
+#[test]
+fn partial_validation_flags_keep_canonical_bit_only() {
+    let id = NodeIdentity::generate();
+    let mut validation = Validation {
+        node_id: NodeId(Hash256::new(id.node_id.0)),
+        public_key: id.public_key_bytes().to_vec(),
+        ledger_hash: Hash256::new([0xCD; 32]),
+        ledger_seq: 42,
+        full: false,
+        close_time: 0,
+        sign_time: 770_000_001,
+        signature: None,
+        amendments: vec![],
+        signing_payload: None,
+        ..Default::default()
+    };
+    id.sign_validation(&mut validation);
+
+    let wire = encode_validation(&validation, id.public_key_bytes());
+    let stobj = stobject_bytes(&wire);
+    let flags = u32::from_be_bytes([stobj[1], stobj[2], stobj[3], stobj[4]]);
+    assert_eq!(flags, 0x8000_0000);
+    assert!(verify_validation_signature(&validation));
+
+    let decoded = decode_validation(&wire).expect("partial validation must decode");
+    assert!(!decoded.full);
+    assert!(verify_validation_signature(&decoded));
+}
+
 /// (2) Canonical type-then-field ordering of every field in the encoded
 /// blob.  `STObject::add()` in rippled sorts on `fieldCode ascending`; the
 /// goXRPL serializer emits in the same order.  Walking the wire bytes in

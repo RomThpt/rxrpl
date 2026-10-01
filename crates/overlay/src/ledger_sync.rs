@@ -90,7 +90,7 @@ const HASH_PREFIX_TX_ID: [u8; 4] = [b'T', b'X', b'N', 0]; // HashPrefix::transac
 /// - Leaf account state: `SHA512Half(HASH_PREFIX_LEAF || data || key)`
 /// - Leaf tx with meta: `SHA512Half(HASH_PREFIX_TX_NODE || data || key)`
 /// - Leaf tx no meta: `SHA512Half(HASH_PREFIX_TX_ID || data)`
-fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
+pub(crate) fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
     if node_data.len() < 2 {
         return None;
     }
@@ -229,6 +229,11 @@ struct IncrementalSync {
 /// Tracks in-flight ledger sync requests and manages retries/timeouts.
 pub struct LedgerSyncer {
     pending: HashMap<u32, PendingRequest>,
+    /// Ledger sequences whose final liBASE request expired.  These tombstones
+    /// keep a late response from being treated as unsolicited data after the
+    /// request lifecycle has ended.  A fresh request for the same sequence
+    /// removes the tombstone.
+    retired_base: HashSet<u32>,
     max_concurrent: usize,
     timeout: Duration,
     /// Active incremental syncs keyed by ledger sequence.
@@ -266,6 +271,7 @@ impl LedgerSyncer {
     pub fn new() -> Self {
         Self {
             pending: HashMap::new(),
+            retired_base: HashSet::new(),
             max_concurrent: MAX_CONCURRENT_REQUESTS,
             timeout: REQUEST_TIMEOUT,
             incremental: HashMap::new(),
@@ -282,6 +288,7 @@ impl LedgerSyncer {
     /// Called by `PeerManager::send_get_ledger` to ensure the response handler
     /// can match incoming `LedgerData` to a pending request.
     pub fn register_request(&mut self, seq: u32, hash: Option<Hash256>) {
+        self.retired_base.remove(&seq);
         self.pending.entry(seq).or_insert_with(|| PendingRequest {
             hash,
             sent_at: Instant::now(),
@@ -307,6 +314,7 @@ impl LedgerSyncer {
 
         while seq < target_seq && self.pending.len() < self.max_concurrent {
             if let std::collections::hash_map::Entry::Vacant(e) = self.pending.entry(seq) {
+                self.retired_base.remove(&seq);
                 e.insert(PendingRequest {
                     hash: None,
                     sent_at: Instant::now(),
@@ -327,30 +335,66 @@ impl LedgerSyncer {
         hash: Hash256,
         nodes: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Option<SyncedLedgerData> {
-        if self.pending.remove(&seq).is_some() {
+        let matches = self
+            .pending
+            .get(&seq)
+            .is_some_and(|request| request.hash.is_none_or(|expected| expected == hash));
+        if matches {
+            self.pending.remove(&seq);
             Some(SyncedLedgerData { seq, hash, nodes })
         } else {
             None
         }
     }
 
+    /// Return whether a response is compatible with the request tracked for
+    /// `seq`. Untracked responses remain admissible because rippled can send
+    /// unsolicited catch-up data after a status transition.
+    pub fn response_matches_pending(&self, seq: u32, hash: Hash256) -> bool {
+        self.pending
+            .get(&seq)
+            .is_none_or(|request| request.hash.is_none_or(|expected| expected == hash))
+    }
+
+    /// Return whether an incoming liBASE response may be accepted.
+    ///
+    /// Unlike [`Self::response_matches_pending`], this rejects sequences whose
+    /// request was retired after exhausting retries.  Other untracked
+    /// responses remain admissible for rippled-compatible unsolicited relay
+    /// traffic.
+    pub fn response_matches_base(&self, seq: u32, hash: Hash256) -> bool {
+        !self.retired_base.contains(&seq) && self.response_matches_pending(seq, hash)
+    }
+
     /// Check for timed-out requests and return their sequence numbers for retry.
     pub fn check_timeouts(&mut self, now: Instant) -> Vec<u32> {
+        self.check_timeouts_with_hashes(now)
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .collect()
+    }
+
+    /// Check for timed-out requests and return their sequence plus expected
+    /// ledger hash for production retry. A request is removed after its final
+    /// retry; callers can use [`Self::is_pending`] to distinguish that case.
+    pub fn check_timeouts_with_hashes(&mut self, now: Instant) -> Vec<(u32, Option<Hash256>)> {
         let mut timed_out = Vec::new();
+        let mut retired = Vec::new();
 
         self.pending.retain(|seq, req| {
             if now.duration_since(req.sent_at) > self.timeout {
+                timed_out.push((*seq, req.hash));
                 if req.retries >= 3 {
                     // Give up after 3 retries
-                    timed_out.push(*seq);
+                    retired.push(*seq);
                     return false;
                 }
-                timed_out.push(*seq);
                 req.retries += 1;
                 req.sent_at = now;
             }
             true
         });
+        self.retired_base.extend(retired);
 
         timed_out
     }
@@ -358,6 +402,11 @@ impl LedgerSyncer {
     /// Number of currently pending requests.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Return whether a request is still tracked after timeout processing.
+    pub fn is_pending(&self, seq: u32) -> bool {
+        self.pending.contains_key(&seq)
     }
 
     /// Store the ledger hash for a given sequence (used for liAS_NODE requests).
@@ -373,6 +422,7 @@ impl LedgerSyncer {
     /// Clear all pending requests (e.g., on full sync reset).
     pub fn clear(&mut self) {
         self.pending.clear();
+        self.retired_base.clear();
         self.incremental.clear();
         self.ledger_hashes.clear();
         self.synced_seqs.clear();
@@ -935,6 +985,21 @@ mod tests {
     }
 
     #[test]
+    fn handle_response_keeps_pending_on_hash_mismatch() {
+        let mut syncer = LedgerSyncer::new();
+        let expected = Hash256::new([0x11; 32]);
+        let actual = Hash256::new([0x22; 32]);
+        syncer.register_request(7, Some(expected));
+
+        assert!(!syncer.response_matches_pending(7, actual));
+        assert!(syncer.handle_response(7, actual, vec![]).is_none());
+        assert_eq!(syncer.pending_count(), 1);
+        assert!(syncer.response_matches_pending(7, expected));
+        assert!(syncer.handle_response(7, expected, vec![]).is_some());
+        assert_eq!(syncer.pending_count(), 0);
+    }
+
+    #[test]
     fn check_timeouts_retries() {
         let mut syncer = LedgerSyncer::new();
         syncer.request_missing(0, 3);
@@ -952,12 +1017,45 @@ mod tests {
     }
 
     #[test]
+    fn check_timeouts_returns_expected_hash_for_retry() {
+        let mut syncer = LedgerSyncer::new();
+        let expected = Hash256::new([0xAB; 32]);
+        syncer.register_request(7, Some(expected));
+
+        let timed_out = syncer.check_timeouts_with_hashes(
+            Instant::now() + Duration::from_secs(REQUEST_TIMEOUT.as_secs() + 1),
+        );
+        assert_eq!(timed_out, vec![(7, Some(expected))]);
+        assert!(syncer.is_pending(7));
+    }
+
+    #[test]
+    fn final_timeout_retires_late_base_response_until_re_registered() {
+        let mut syncer = LedgerSyncer::new();
+        let hash = Hash256::new([0xCD; 32]);
+        syncer.register_request(7, Some(hash));
+
+        let start = Instant::now();
+        for retry in 1..=4 {
+            let timeout = start + Duration::from_secs((REQUEST_TIMEOUT.as_secs() + 1) * retry);
+            let _ = syncer.check_timeouts_with_hashes(timeout);
+        }
+
+        assert!(!syncer.is_pending(7));
+        assert!(!syncer.response_matches_base(7, hash));
+
+        syncer.register_request(7, Some(hash));
+        assert!(syncer.response_matches_base(7, hash));
+    }
+
+    #[test]
     fn clear_removes_all() {
         let mut syncer = LedgerSyncer::new();
         syncer.request_missing(0, 10);
         assert!(syncer.pending_count() > 0);
         syncer.clear();
         assert_eq!(syncer.pending_count(), 0);
+        assert!(syncer.response_matches_base(7, Hash256::new([0xCD; 32])));
     }
 
     /// A GetObjectByHash inner NodeObject (`MIN\0 || 16*32 child hashes`)

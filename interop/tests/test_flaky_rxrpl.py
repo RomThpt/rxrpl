@@ -1,9 +1,9 @@
 """B4: Flaky rxrpl — kill, network continues, rxrpl rejoins.
 
-Scenario: with 2 rippled + 1 rxrpl on a 2-of-3 quorum, killing rxrpl
-leaves rippled-0 + rippled-1 as a viable 2-of-3 quorum. The remaining
-rippled validators must continue advancing ledgers, and rxrpl must catch
-up and re-converge once it returns.
+Scenario: with 3 rippled + 2 rxrpl on a 4-of-5 quorum, killing one rxrpl
+leaves four validators, which is the minimum viable quorum. The remaining
+validators must continue advancing ledgers, and rxrpl must catch up and
+re-converge once it returns.
 """
 
 import time
@@ -42,8 +42,7 @@ class TestFlakyRxrpl:
             wait_for_ledger(url, 8, timeout=10) for url in RIPPLED_URLS
         )
 
-        # 2. Kill rxrpl-0. With 2-of-3 quorum and 2 rippled remaining,
-        #    rippled must keep closing ledgers without the rxrpl signature.
+        # 2. Kill rxrpl-0. Four validators remain, exactly meeting 4/5.
         target = RXRPL_CONTAINERS[0]
         stop_container(target)
 
@@ -71,7 +70,7 @@ class TestFlakyRxrpl:
                 f"reached {seq}, expected >= {catchup_seq}"
             )
 
-        # 4. All 3 nodes agree on a settled ledger after recovery.
+        # 4. All 5 nodes agree on a settled ledger after recovery.
         check_seq = baseline_seq + 1
         hashes = {url: wait_for_ledger_hash(url, check_seq) for url in ALL_URLS}
         for url, h in hashes.items():

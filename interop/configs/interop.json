@@ -1,0 +1,7 @@
+{
+  "rippled": 3,
+  "rxrpl": 2,
+  "validators": 5,
+  "quorum": 4,
+  "profile": "full-quorum"
+}

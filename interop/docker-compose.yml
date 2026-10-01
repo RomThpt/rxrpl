@@ -22,8 +22,10 @@ services:
     image: ${RIPPLED_IMAGE:-rippleci/rippled:2.3.0}
     container_name: interop-rippled-0
     volumes:
-      - ./configs/rippled-0.cfg:/etc/opt/ripple/rippled.cfg:ro
-      - ./configs/validators.txt:/etc/opt/ripple/validators.txt:ro
+      # Legacy rippled images normalize rippled.cfg in place. Mount a private
+      # directory per validator so that sed can rename its temporary file
+      # without mutating the checked-in fixtures or sharing config state.
+      - ${RIPPLED_CONFIG_DIR_0:-./configs}:/opt/ripple/etc:rw
     ports:
       - "15005:5005"
     networks:
@@ -34,8 +36,7 @@ services:
     image: ${RIPPLED_IMAGE:-rippleci/rippled:2.3.0}
     container_name: interop-rippled-1
     volumes:
-      - ./configs/rippled-1.cfg:/etc/opt/ripple/rippled.cfg:ro
-      - ./configs/validators.txt:/etc/opt/ripple/validators.txt:ro
+      - ${RIPPLED_CONFIG_DIR_1:-./configs}:/opt/ripple/etc:rw
     networks:
       xrpl-net:
         ipv4_address: 172.30.0.11
@@ -44,8 +45,7 @@ services:
     image: ${RIPPLED_IMAGE:-rippleci/rippled:2.3.0}
     container_name: interop-rippled-2
     volumes:
-      - ./configs/rippled-2.cfg:/etc/opt/ripple/rippled.cfg:ro
-      - ./configs/validators.txt:/etc/opt/ripple/validators.txt:ro
+      - ${RIPPLED_CONFIG_DIR_2:-./configs}:/opt/ripple/etc:rw
     networks:
       xrpl-net:
         ipv4_address: 172.30.0.12

@@ -93,3 +93,44 @@ class TestConfigsB1:
         assert m, "trusted = [...] block not found"
         entries = [s for s in re.findall(r'"([^"]+)"', m.group(1))]
         assert len(entries) == 5, f"expected 5 trusted keys, got {len(entries)}"
+
+    def test_full_quorum_is_explicit(self, regenerate_configs):
+        """The default five-validator profile really configures a 4/5 quorum."""
+        path = os.path.join(CONFIGS_DIR, "interop.json")
+        with open(path) as f:
+            metadata = json.load(f)
+        assert metadata == {
+            "rippled": 3,
+            "rxrpl": 2,
+            "validators": 5,
+            "quorum": 4,
+            "profile": "full-quorum",
+        }
+
+        for name in ("rippled-0.cfg", "rippled-1.cfg", "rippled-2.cfg"):
+            with open(os.path.join(CONFIGS_DIR, name)) as f:
+                assert "[validation_quorum]\n4\n" in f.read()
+        for name in ("rxrpl-0.toml", "rxrpl-1.toml"):
+            with open(os.path.join(CONFIGS_DIR, name)) as f:
+                assert "quorum = 4" in f.read()
+
+    def test_rxrpl_interop_uses_persistent_full_history_storage(self, regenerate_configs):
+        """A restarted validator must retain SHAMap nodes for historical RPCs."""
+        path = os.path.join(CONFIGS_DIR, "rxrpl-0.toml")
+        with open(path) as f:
+            content = f.read()
+        assert 'backend = "rocksdb"' in content
+        assert "online_delete = 0" in content
+
+    def test_rxrpl_validator_identities_use_distinct_signing_seeds(self, regenerate_configs):
+        """Each RXRPL validator must bind a distinct ephemeral key in its manifest."""
+        for name in ("rxrpl-0.toml", "rxrpl-1.toml"):
+            path = os.path.join(CONFIGS_DIR, name)
+            with open(path) as f:
+                content = f.read()
+            values = dict(
+                line.split(" = ", 1)
+                for line in content.splitlines()
+                if line.startswith(("master_secret = ", "ephemeral_seed = "))
+            )
+            assert values["master_secret"] != values["ephemeral_seed"]

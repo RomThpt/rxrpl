@@ -35,6 +35,9 @@ docker build -t rxrpl:interop -f Dockerfile .
 # Or just the consensus suite
 ./interop/scripts/run_interop.sh --suite consensus
 
+# Or the mixed-voter and crash/rejoin resilience checks
+./interop/scripts/run_interop.sh --suite chaos
+
 # Cleanup
 docker compose -f interop/docker-compose.yml down -v
 ```

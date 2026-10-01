@@ -5,18 +5,18 @@
 /// sequence number; a sequence of `u32::MAX` revokes the master key.
 ///
 /// Wire format (rippled STObject binary):
-///   - sfSequence    (UINT32, field 1)  -- manifest sequence
+///   - sfSequence    (UINT32, field 4)  -- manifest sequence
 ///   - sfPublicKey   (VL,     field 1)  -- master public key (33 bytes)
 ///   - sfSigningPubKey (VL,   field 3)  -- ephemeral public key (33 bytes)
 ///   - sfSignature   (VL,     field 6)  -- ephemeral signature over inner data
-///   - sfMasterSignature (VL, field 4, extended type 16) -- master signature
+///   - sfMasterSignature (VL, field 18) -- master signature
 ///   - Optional: sfDomain (VL, field 7) -- domain string
 ///
 /// Verification:
 ///   The manifest body (everything except sfMasterSignature) prefixed with
 ///   `HashPrefix::MANIFEST` is signed by both the ephemeral key (sfSignature)
 ///   and the master key (sfMasterSignature).
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rxrpl_primitives::PublicKey;
 
@@ -24,12 +24,13 @@ use crate::stobject;
 
 /// Revocation sequence: master key permanently revoked.
 pub const MANIFEST_REVOKED_SEQ: u32 = u32::MAX;
+const MAX_MANIFEST_BYTES: usize = 358;
 
 // SField identifiers used in manifest STObjects (for reference):
-//   sfSequence:         STI_UINT32(2), field 1
+//   sfSequence:         STI_UINT32(2), field 4
 //   sfPublicKey:        STI_VL(7),     field 1  (master)
 //   sfSigningPubKey:    STI_VL(7),     field 3  (ephemeral)
-//   sfMasterSignature:  STI_VL(7),     field 4
+//   sfMasterSignature:  STI_VL(7),     field 18
 //   sfSignature:        STI_VL(7),     field 6  (ephemeral sig)
 //   sfDomain:           STI_VL(7),     field 7
 
@@ -59,6 +60,8 @@ impl Manifest {
 /// Errors during manifest parsing or verification.
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
+    #[error("manifest exceeds the maximum size")]
+    TooLarge,
     #[error("truncated manifest data")]
     Truncated,
     #[error("missing required field: {0}")]
@@ -71,8 +74,18 @@ pub enum ManifestError {
     MasterSigInvalid,
     #[error("manifest revoked")]
     Revoked,
-    #[error("sfDomain field is not valid UTF-8")]
+    #[error("sfDomain field is not a valid TOML domain")]
     InvalidDomain,
+    #[error("unsupported manifest version")]
+    InvalidVersion,
+    #[error("revocation manifest contains ephemeral fields")]
+    RevocationHasEphemeralFields,
+    #[error("master and ephemeral public keys must differ")]
+    IdenticalKeys,
+    #[error("unsupported manifest field ({0},{1})")]
+    UnsupportedField(u8, u16),
+    #[error("duplicate manifest field")]
+    DuplicateField,
     #[error("cannot sign a manifest without the master secret (token-loaded identity)")]
     NoMasterSecret,
 }
@@ -91,6 +104,12 @@ struct RawManifest {
 
 /// Parse raw manifest bytes into fields without verifying signatures.
 fn parse_raw(data: &[u8]) -> Result<RawManifest, ManifestError> {
+    if data.is_empty() {
+        return Err(ManifestError::Truncated);
+    }
+    if data.len() > MAX_MANIFEST_BYTES {
+        return Err(ManifestError::TooLarge);
+    }
     let mut pos = 0;
     let mut sequence: Option<u32> = None;
     let mut master_pk: Option<Vec<u8>> = None;
@@ -102,17 +121,39 @@ fn parse_raw(data: &[u8]) -> Result<RawManifest, ManifestError> {
     // We need to track which byte ranges belong to non-master-signature fields
     // to reconstruct signing_data.  The signing_data is the manifest bytes with
     // the sfMasterSignature field stripped out.
-    let mut signing_ranges: Vec<(usize, usize)> = Vec::new();
-    let mut master_sig_range: Option<(usize, usize)> = None;
+    let mut signing_ranges: Vec<(u32, usize, usize)> = Vec::new();
+    let mut seen_fields = HashSet::new();
 
     while pos < data.len() {
         let field_start = pos;
         let Some((type_id, field_id, consumed)) = stobject::decode_field_id(&data[pos..]) else {
-            break;
+            return Err(ManifestError::Truncated);
         };
+        let field_key = ((type_id as u32) << 16) | field_id as u32;
+        if !seen_fields.insert(field_key) {
+            return Err(ManifestError::DuplicateField);
+        }
+        if !matches!(
+            (type_id, field_id),
+            (1, 16) | (2, 4) | (7, 1) | (7, 3) | (7, 6) | (7, 7) | (7, 18)
+        ) {
+            return Err(ManifestError::UnsupportedField(type_id, field_id));
+        }
         pos += consumed;
 
         match (type_id, field_id) {
+            // sfVersion: UInt16, nth=16. Rippled currently accepts only 0.
+            (1, 16) => {
+                if pos + 2 > data.len() {
+                    return Err(ManifestError::Truncated);
+                }
+                let version = u16::from_be_bytes([data[pos], data[pos + 1]]);
+                if version != 0 {
+                    return Err(ManifestError::InvalidVersion);
+                }
+                pos += 2;
+                signing_ranges.push((field_key, field_start, pos));
+            }
             // sfSequence: UInt32, nth=4 (per XRPL definitions.json)
             (2, 4) => {
                 if pos + 4 > data.len() {
@@ -125,7 +166,7 @@ fn parse_raw(data: &[u8]) -> Result<RawManifest, ManifestError> {
                     data[pos + 3],
                 ]));
                 pos += 4;
-                signing_ranges.push((field_start, pos));
+                signing_ranges.push((field_key, field_start, pos));
             }
             // VL fields (type 7)
             (7, fid) => {
@@ -143,17 +184,16 @@ fn parse_raw(data: &[u8]) -> Result<RawManifest, ManifestError> {
                     1 => {
                         // sfPublicKey (master), Blob nth=1
                         master_pk = Some(value);
-                        signing_ranges.push((field_start, pos));
+                        signing_ranges.push((field_key, field_start, pos));
                     }
                     3 => {
                         // sfSigningPubKey (ephemeral), Blob nth=3
                         ephemeral_pk = Some(value);
-                        signing_ranges.push((field_start, pos));
+                        signing_ranges.push((field_key, field_start, pos));
                     }
                     18 => {
                         // sfMasterSignature, Blob nth=18 — excluded from signing data
                         master_signature = Some(value);
-                        master_sig_range = Some((field_start, pos));
                     }
                     6 => {
                         // sfSignature (ephemeral sig), Blob nth=6 — excluded
@@ -166,44 +206,12 @@ fn parse_raw(data: &[u8]) -> Result<RawManifest, ManifestError> {
                             String::from_utf8(value.to_vec())
                                 .map_err(|_| ManifestError::InvalidDomain)?,
                         );
-                        signing_ranges.push((field_start, pos));
+                        signing_ranges.push((field_key, field_start, pos));
                     }
-                    _ => {
-                        // Unknown VL field, include in signing data
-                        signing_ranges.push((field_start, pos));
-                    }
+                    _ => unreachable!("manifest VL field allow-list checked above"),
                 }
             }
-            // Unknown UINT32 field
-            (2, _) => {
-                if pos + 4 > data.len() {
-                    return Err(ManifestError::Truncated);
-                }
-                pos += 4;
-                signing_ranges.push((field_start, pos));
-            }
-            // Unknown UINT64 field (type 3)
-            (3, _) => {
-                if pos + 8 > data.len() {
-                    return Err(ManifestError::Truncated);
-                }
-                pos += 8;
-                signing_ranges.push((field_start, pos));
-            }
-            // Unknown UINT256 field (type 5)
-            (5, _) => {
-                if pos + 32 > data.len() {
-                    return Err(ManifestError::Truncated);
-                }
-                pos += 32;
-                signing_ranges.push((field_start, pos));
-            }
-            // Other VL-like extended types
-            _ => {
-                // If this is a VL type (type >= 16 mapped through extended), try VL decode
-                // For safety, break on unknown types to avoid infinite loops
-                break;
-            }
+            _ => return Err(ManifestError::UnsupportedField(type_id, field_id)),
         }
     }
 
@@ -211,13 +219,10 @@ fn parse_raw(data: &[u8]) -> Result<RawManifest, ManifestError> {
     let prefix = rxrpl_crypto::hash_prefix::HashPrefix::MANIFEST.to_bytes();
     let mut signing_data = Vec::with_capacity(data.len() + 4);
     signing_data.extend_from_slice(&prefix);
-    for (start, end) in &signing_ranges {
+    signing_ranges.sort_unstable_by_key(|(key, _, _)| *key);
+    for (_, start, end) in &signing_ranges {
         signing_data.extend_from_slice(&data[*start..*end]);
     }
-
-    // If there's no explicit master_sig_range but we have a master_signature,
-    // it was already excluded from signing_ranges.
-    let _ = master_sig_range;
 
     Ok(RawManifest {
         sequence: sequence.ok_or(ManifestError::MissingField("sfSequence"))?,
@@ -246,6 +251,18 @@ fn verify_signature(message: &[u8], public_key: &[u8], signature: &[u8]) -> bool
 /// Returns the verified `Manifest` on success.
 pub fn parse_and_verify(data: &[u8]) -> Result<Manifest, ManifestError> {
     let raw = parse_raw(data)?;
+
+    if let Some(domain) = raw.domain.as_deref() {
+        if !is_properly_formed_toml_domain(domain) {
+            return Err(ManifestError::InvalidDomain);
+        }
+    }
+
+    if raw.sequence == MANIFEST_REVOKED_SEQ
+        && (!raw.ephemeral_public_key.is_empty() || !raw.signature.is_empty())
+    {
+        return Err(ManifestError::RevocationHasEphemeralFields);
+    }
 
     // Verify master signature over signing_data
     if !verify_signature(
@@ -277,6 +294,10 @@ pub fn parse_and_verify(data: &[u8]) -> Result<Manifest, ManifestError> {
     let master_pk = PublicKey::from_slice(&raw.master_public_key)
         .map_err(|_| ManifestError::InvalidKeyLength)?;
 
+    if ephemeral_pk.as_ref().is_some_and(|key| key == &master_pk) {
+        return Err(ManifestError::IdenticalKeys);
+    }
+
     Ok(Manifest {
         sequence: raw.sequence,
         master_public_key: master_pk,
@@ -284,6 +305,32 @@ pub fn parse_and_verify(data: &[u8]) -> Result<Manifest, ManifestError> {
         domain: raw.domain,
         raw: data.to_vec(),
     })
+}
+
+/// Match rippled's deliberately conservative TOML-domain admission check.
+fn is_properly_formed_toml_domain(domain: &str) -> bool {
+    if !(4..=128).contains(&domain.len()) || !domain.is_ascii() {
+        return false;
+    }
+
+    let mut labels = domain.split('.').peekable();
+    let mut count = 0;
+    while let Some(label) = labels.next() {
+        if label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        if !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return false;
+        }
+        count += 1;
+        if labels.peek().is_none() && !(2..=63).contains(&label.len()) {
+            return false;
+        }
+    }
+    count >= 2
 }
 
 /// Build a manifest STObject from parts (for testing).
@@ -850,7 +897,7 @@ mod tests {
         let prefix = rxrpl_crypto::hash_prefix::HashPrefix::MANIFEST.to_bytes();
         let mut signing_data = Vec::with_capacity(256);
         signing_data.extend_from_slice(&prefix);
-        stobject::put_uint32(&mut signing_data, 1, 1);
+        stobject::put_uint32(&mut signing_data, 4, 1);
         stobject::put_vl(&mut signing_data, 1, master_kp.public_key.as_bytes());
         stobject::put_vl(&mut signing_data, 3, eph_kp.public_key.as_bytes());
         stobject::put_vl(&mut signing_data, 7, invalid_domain);
@@ -861,7 +908,7 @@ mod tests {
 
         // Build the wire-format manifest with the invalid-UTF-8 domain bytes.
         let mut buf = Vec::with_capacity(256);
-        stobject::put_uint32(&mut buf, 1, 1);
+        stobject::put_uint32(&mut buf, 4, 1);
         stobject::put_vl(&mut buf, 1, master_kp.public_key.as_bytes());
         stobject::put_vl(&mut buf, 3, eph_kp.public_key.as_bytes());
         stobject::put_vl(&mut buf, 7, invalid_domain);
@@ -875,6 +922,85 @@ mod tests {
                 other.map(|_| "Ok").map_err(|e| format!("{:?}", e))
             ),
         }
+    }
+
+    #[test]
+    fn parse_rejects_rippled_manifest_boundary_cases() {
+        let oversized = vec![0u8; MAX_MANIFEST_BYTES + 1];
+        assert!(matches!(
+            parse_raw(&oversized),
+            Err(ManifestError::TooLarge)
+        ));
+
+        let mut unsupported_version = Vec::new();
+        stobject::put_uint32(&mut unsupported_version, 4, 1);
+        unsupported_version.extend_from_slice(&[0x10, 0x10, 0, 1]);
+        assert!(matches!(
+            parse_raw(&unsupported_version),
+            Err(ManifestError::InvalidVersion)
+        ));
+
+        let invalid_domain = build_manifest_bytes(1, &[], &[], &[], &[], Some("a.b"));
+        assert!(matches!(
+            parse_and_verify(&invalid_domain),
+            Err(ManifestError::InvalidDomain)
+        ));
+
+        let revoked_with_ephemeral = build_manifest_bytes(
+            MANIFEST_REVOKED_SEQ,
+            &[0xED; 33],
+            &[0xED; 33],
+            &[0xAA; 64],
+            &[0xBB; 64],
+            None,
+        );
+        assert!(matches!(
+            parse_and_verify(&revoked_with_ephemeral),
+            Err(ManifestError::RevocationHasEphemeralFields)
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_identical_master_and_ephemeral_keys() {
+        let key = rxrpl_crypto::KeyPair::from_seed(
+            &rxrpl_crypto::Seed::from_passphrase("identical_manifest_keys"),
+            rxrpl_crypto::KeyType::Ed25519,
+        );
+        let raw = create_signed(&key, &key, 1, None).expect("create_signed");
+        assert!(matches!(
+            parse_and_verify(&raw),
+            Err(ManifestError::IdenticalKeys)
+        ));
+    }
+
+    #[test]
+    fn parse_canonicalizes_permuted_fields_and_rejects_duplicates() {
+        let (raw, _, _) = make_test_manifest(1, "permuted-master", "permuted-eph");
+
+        // The helper emits: sequence, master key, ephemeral key, ephemeral
+        // signature, master signature. Rippled accepts another input order
+        // and serializes the non-signature fields canonically for verification.
+        let sequence = &raw[..5];
+        let master = &raw[5..40];
+        let ephemeral = &raw[40..75];
+        let signature = &raw[75..141];
+        let master_signature = &raw[141..];
+        let permuted = [master, sequence, signature, ephemeral, master_signature].concat();
+        assert!(parse_and_verify(&permuted).is_ok());
+
+        let mut duplicate = raw.clone();
+        duplicate.extend_from_slice(sequence);
+        assert!(matches!(
+            parse_raw(&duplicate),
+            Err(ManifestError::DuplicateField)
+        ));
+
+        let mut unknown = raw.clone();
+        stobject::put_uint32(&mut unknown, 2, 1);
+        assert!(matches!(
+            parse_raw(&unknown),
+            Err(ManifestError::UnsupportedField(2, 2))
+        ));
     }
 
     /// `set_local` registers a manifest as our own AND indexes it in the

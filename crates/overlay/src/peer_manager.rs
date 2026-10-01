@@ -11,7 +11,8 @@ use rxrpl_consensus::types::{Proposal, TxSet, Validation};
 use rxrpl_p2p_proto::MessageType;
 use rxrpl_p2p_proto::codec::{PeerCodec, PeerMessage};
 use rxrpl_primitives::Hash256;
-use rxrpl_shamap::NodeId as ShamapNodeId;
+use rxrpl_primitives::PublicKey;
+use rxrpl_shamap::{NodeId as ShamapNodeId, STORE_TAG_INNER, STORE_TAG_LEAF};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
@@ -47,6 +48,7 @@ const LI_BASE: i32 = 0;
 const LI_TX_NODE: i32 = 1;
 const LI_AS_NODE: i32 = 2;
 const LI_TS_CANDIDATE: i32 = 3;
+const OT_TRANSACTION_NODE: i32 = 3;
 
 /// Peers a delta-sync round fans its missing-node requests across. With fat
 /// subtrees served per id, more parallel peers cut catchup round-trips once the
@@ -227,7 +229,6 @@ pub struct PeerManager {
     ledger_provider: Option<Arc<dyn LedgerProvider>>,
     node_store: Option<Arc<dyn rxrpl_shamap::NodeStore>>,
     ledger_syncer: LedgerSyncer,
-    next_cookie: AtomicU64,
     discovery: Option<Arc<PeerDiscovery>>,
     server_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
     /// Shared cache of known transaction sets (shared with NetworkConsensusAdapter).
@@ -326,7 +327,6 @@ impl PeerManager {
             ledger_provider: None,
             node_store: None,
             ledger_syncer: LedgerSyncer::new(),
-            next_cookie: AtomicU64::new(1),
             discovery: None,
             server_event_tx: None,
             tx_sets: None,
@@ -1070,13 +1070,13 @@ impl PeerManager {
                 }
             }
             MessageType::ProposeSet => match proto_convert::decode_propose_set(payload) {
-                Ok(proposal) => {
+                Ok(proposal) if proposal_is_authenticated(&proposal) => {
                     if let Some(ref info) = peer_info {
                         info.reputation.record_valid_message(payload_len);
                     }
                     self.forward_to_consensus(ConsensusMessage::Proposal(proposal));
                 }
-                Err(_) => {
+                Ok(_) | Err(_) => {
                     if let Some(ref info) = peer_info {
                         info.reputation.record_invalid_message();
                     }
@@ -1249,16 +1249,168 @@ impl PeerManager {
                             info.reputation.record_useful_contribution();
                         }
                         let ledger_hash_bytes = msg.ledger_hash;
-                        let hash =
-                            Hash256::new(ledger_hash_bytes[..32].try_into().unwrap_or([0u8; 32]));
-                        let nodes: Vec<(Vec<u8>, Vec<u8>)> = msg
-                            .nodes
-                            .into_iter()
-                            .map(|n| (n.nodeid.unwrap_or_default(), n.nodedata.unwrap_or_default()))
-                            .collect();
-
-                        let ledger_seq = msg.ledger_seq;
+                        if ledger_hash_bytes.len() != 32 {
+                            tracing::warn!(
+                                "rejecting LedgerData from {} with invalid ledger hash length {}",
+                                from,
+                                ledger_hash_bytes.len()
+                            );
+                            if let Some(ref info) = peer_info {
+                                info.reputation.record_invalid_message();
+                            }
+                            return;
+                        }
+                        let hash = Hash256::new(ledger_hash_bytes.try_into().unwrap());
                         let info_type = msg.ledger_info_type;
+                        if !matches!(
+                            info_type,
+                            LI_BASE | LI_TX_NODE | LI_AS_NODE | LI_TS_CANDIDATE
+                        ) {
+                            tracing::warn!(
+                                "rejecting LedgerData from {} with unknown info type {}",
+                                from,
+                                info_type
+                            );
+                            if let Some(ref info) = peer_info {
+                                info.reputation.record_invalid_message();
+                            }
+                            return;
+                        }
+                        if msg.nodes.is_empty() {
+                            tracing::warn!("rejecting empty LedgerData from {}", from);
+                            if let Some(ref info) = peer_info {
+                                info.reputation.record_invalid_message();
+                            }
+                            return;
+                        }
+                        let ledger_seq = msg.ledger_seq;
+                        let mut nodes = Vec::with_capacity(msg.nodes.len());
+                        for node in msg.nodes {
+                            let Some(node_data) = node.nodedata else {
+                                tracing::warn!(
+                                    "rejecting LedgerData from {} with missing node data",
+                                    from
+                                );
+                                if let Some(ref info) = peer_info {
+                                    info.reputation.record_invalid_message();
+                                }
+                                return;
+                            };
+                            if node_data.is_empty() {
+                                tracing::warn!(
+                                    "rejecting LedgerData from {} with empty node data",
+                                    from
+                                );
+                                if let Some(ref info) = peer_info {
+                                    info.reputation.record_invalid_message();
+                                }
+                                return;
+                            }
+
+                            let node_id = if info_type == LI_BASE {
+                                if node.nodeid.is_some() {
+                                    tracing::warn!(
+                                        "rejecting liBASE LedgerData from {} with node id",
+                                        from
+                                    );
+                                    if let Some(ref info) = peer_info {
+                                        info.reputation.record_invalid_message();
+                                    }
+                                    return;
+                                }
+                                Vec::new()
+                            } else {
+                                let Some(node_id) = node.nodeid else {
+                                    tracing::warn!(
+                                        "rejecting LedgerData from {} with missing node id",
+                                        from
+                                    );
+                                    if let Some(ref info) = peer_info {
+                                        info.reputation.record_invalid_message();
+                                    }
+                                    return;
+                                };
+                                if !ledger_node_wire_is_valid(&node_id, &node_data) {
+                                    tracing::warn!(
+                                        "rejecting LedgerData from {} with invalid node id/data",
+                                        from
+                                    );
+                                    if let Some(ref info) = peer_info {
+                                        info.reputation.record_invalid_message();
+                                    }
+                                    return;
+                                }
+                                node_id
+                            };
+                            nodes.push((node_id, node_data));
+                        }
+
+                        if info_type == LI_BASE {
+                            let Some(header) =
+                                rxrpl_ledger::LedgerHeader::from_raw_bytes(&nodes[0].1)
+                            else {
+                                tracing::warn!(
+                                    "rejecting liBASE LedgerData from {} with invalid header",
+                                    from
+                                );
+                                if let Some(ref info) = peer_info {
+                                    info.reputation.record_invalid_message();
+                                }
+                                return;
+                            };
+                            if header.hash != hash
+                                || (ledger_seq != 0 && header.sequence != ledger_seq)
+                            {
+                                tracing::warn!(
+                                    "rejecting liBASE LedgerData from {} with header mismatch",
+                                    from
+                                );
+                                if let Some(ref info) = peer_info {
+                                    info.reputation.record_invalid_message();
+                                }
+                                return;
+                            }
+                        }
+
+                        if info_type != LI_TS_CANDIDATE
+                            && self
+                                .ledger_syncer
+                                .get_ledger_hash(ledger_seq)
+                                .is_some_and(|expected| expected != hash)
+                        {
+                            tracing::warn!(
+                                "rejecting LedgerData from {} with hash not matching ledger {}",
+                                from,
+                                ledger_seq
+                            );
+                            if let Some(ref info) = peer_info {
+                                info.reputation.record_invalid_message();
+                            }
+                            return;
+                        }
+
+                        // Only a liBASE header retires the base-ledger request.
+                        // Node deltas use the same sequence/hash but are a
+                        // separate acquisition phase; allowing them to consume
+                        // the base pending entry makes a node-only response
+                        // look like a completed header request.
+                        if info_type == LI_BASE {
+                            if !self.ledger_syncer.response_matches_base(ledger_seq, hash) {
+                                tracing::warn!(
+                                    "rejecting LedgerData from {} with unexpected hash {} for seq {}",
+                                    from,
+                                    hash,
+                                    ledger_seq
+                                );
+                                if let Some(ref info) = peer_info {
+                                    info.reputation.record_invalid_message();
+                                }
+                                return;
+                            }
+                            let _ =
+                                self.ledger_syncer
+                                    .handle_response(ledger_seq, hash, nodes.clone());
+                        }
                         tracing::info!(
                             "decoded LedgerData seq={} hash={} itype={} nodes={}",
                             ledger_seq,
@@ -1356,23 +1508,14 @@ impl PeerManager {
                                     );
                                     if !missing.is_empty() {
                                         self.send_get_ledger_as_node(header.sequence);
-                                    } else if let Some(leaves) =
-                                        self.ledger_syncer.try_complete_sync(header.sequence)
-                                    {
+                                    } else {
                                         // Target state already fully resolvable from the
                                         // local store (e.g. early ledgers whose state still
                                         // matches genesis). Dispatch leaves to consensus.
-                                        tracing::info!(
-                                            "incremental sync immediate-complete for ledger #{} ({} leaves)",
+                                        self.complete_incremental_sync(
                                             header.sequence,
-                                            leaves.len()
+                                            header.hash,
                                         );
-                                        self.ledger_syncer.mark_synced(header.sequence);
-                                        self.forward_to_consensus(ConsensusMessage::LedgerData {
-                                            hash: header.hash,
-                                            seq: header.sequence,
-                                            nodes: leaves,
-                                        });
                                     }
                                 }
                             } else {
@@ -1564,6 +1707,15 @@ impl PeerManager {
                 match proto_convert::decode_get_objects(payload) {
                     Ok(msg) => {
                         let is_response = !msg.query.unwrap_or(true);
+                        if is_response && msg.r#type == Some(6) {
+                            // FetchPack replies contain prefix-serialized
+                            // ledger headers and SHAMap nodes. They are not
+                            // ordinary GetObjectByHash node replies: feeding
+                            // LWR headers through object_blob_to_wire would
+                            // silently discard the header and strand catch-up.
+                            self.handle_fetch_pack_response(from, msg);
+                            return;
+                        }
                         if is_response && !msg.objects.is_empty() {
                             // This is a response to our TMGetObjectByHash request.
                             // Extract (hash, data) pairs and feed into incremental sync.
@@ -2185,6 +2337,20 @@ impl PeerManager {
     fn check_sync(&mut self) {
         let our_seq = self.ledger_seq.load(Ordering::Relaxed);
 
+        // A lost liBASE response otherwise leaves `pending` non-empty forever,
+        // and the guard below then suppresses every new catch-up request. Retry
+        // each timed-out request on the same production tick; once the retry
+        // budget is exhausted LedgerSyncer drops it and the normal logic below
+        // can select a fresh peer/tip.
+        let timed_out = self
+            .ledger_syncer
+            .check_timeouts_with_hashes(std::time::Instant::now());
+        for (seq, hash) in timed_out {
+            if self.ledger_syncer.is_pending(seq) {
+                self.send_get_ledger(seq, hash);
+            }
+        }
+
         // Find the highest peer sequence
         let max_peer_seq = self
             .peer_handles
@@ -2221,6 +2387,32 @@ impl PeerManager {
                 self.send_get_ledger(max_peer_seq, None);
             }
         }
+    }
+
+    /// Finish an incremental state sync when the target root is already
+    /// resolvable from the shared NodeStore. FetchPack can discover that state
+    /// before any `liAS_NODE` round-trip is sent, so the completion path must
+    /// be shared with the ordinary LedgerData handler.
+    fn complete_incremental_sync(&mut self, seq: u32, fallback_hash: Hash256) -> bool {
+        let Some(leaves) = self.ledger_syncer.try_complete_sync(seq) else {
+            return false;
+        };
+        self.ledger_syncer.mark_synced(seq);
+        let hash = self
+            .ledger_syncer
+            .get_ledger_hash(seq)
+            .unwrap_or(fallback_hash);
+        tracing::info!(
+            "incremental sync immediate-complete for ledger #{} ({} leaves)",
+            seq,
+            leaves.len()
+        );
+        self.forward_to_consensus(ConsensusMessage::LedgerData {
+            hash,
+            seq,
+            nodes: leaves,
+        });
+        true
     }
 
     /// Disconnect peers whose reputation has dropped below the threshold.
@@ -2445,16 +2637,15 @@ impl PeerManager {
         );
 
         let object_type = msg.r#type.unwrap_or(0);
-        // rippled `TMGetObjectByHash::ObjectType` -> SHAMap leaf wireType:
-        //   otTRANSACTION_NODE (3) -> tx-with-meta leaf, wireType 0x04
-        //   otSTATE_NODE       (4) -> account-state leaf, wireType 0x01
+        // rippled `TMGetObjectByHash::ObjectType` -> SHAMap prefix:
+        //   otTRANSACTION_NODE (3) -> HashPrefix::txNode (`SND\0`)
+        //   otSTATE_NODE       (4) -> HashPrefix::leafNode (`MLN\0`)
         //   otFETCH_PACK       (6) -> handled separately; rippled uses fetch
         //                              packs to backfill ledger ancestors
         //                              after acquiring a validated head.
         //   anything else (otUNKNOWN, otLEDGER, otTRANSACTION) defaults to
         //   account-state, which is what rxrpl historically returned.
         // Inner nodes (16*32 bytes) always serialize with wireType 0x02.
-        const OT_TRANSACTION_NODE: i32 = 3;
         const OT_FETCH_PACK: i32 = 6;
         if object_type == OT_FETCH_PACK {
             // Fetch packs are served from the ledger provider (header chain),
@@ -2471,11 +2662,6 @@ impl PeerManager {
             }
         };
 
-        let leaf_wire_type = if object_type == OT_TRANSACTION_NODE {
-            WIRE_TYPE_TX_WITH_META
-        } else {
-            WIRE_TYPE_ACCOUNT_STATE
-        };
         let ledger_seq = msg.seq.unwrap_or(0);
         let ledger_hash_bytes = msg.ledger_hash.as_deref().unwrap_or(&[]);
         let ledger_hash = if ledger_hash_bytes.len() >= 32 {
@@ -2502,19 +2688,21 @@ impl PeerManager {
 
             match store.fetch(&hash) {
                 Ok(Some(raw)) => {
-                    // Storage holds rxrpl's internal node form (no wireType
-                    // byte); rippled expects TMLedgerNode-style wire form.
-                    // Wrap before sending so peers can decode the response. The
-                    // node store is untyped, so inner-ness is inferred from the
-                    // 16×32 layout here -- the one path where the node type is
-                    // genuinely unavailable (a 480-byte leaf collides; rare).
-                    let is_inner = raw.len() == 16 * 32;
-                    let wire = encode_shamap_wire_node(&raw, is_inner, leaf_wire_type);
-                    let entry_size = 32 + wire.len();
+                    // Storage records carry an explicit type tag. Convert them
+                    // to rippled's prefix-serialized NodeObject form; the
+                    // prefix is required by TMGetObjectByHash responses.
+                    let Some(blob) = encode_store_record_with_prefix(&raw, object_type) else {
+                        tracing::trace!(
+                            "GetObjectByHash: ignoring malformed store record for {}",
+                            hash
+                        );
+                        continue;
+                    };
+                    let entry_size = 32 + blob.len();
                     if total_size + entry_size > MAX_RESPONSE_SIZE {
                         break;
                     }
-                    found.push((hash, wire));
+                    found.push((hash, blob));
                     total_size += entry_size;
                 }
                 Ok(None) => {}
@@ -2574,6 +2762,7 @@ impl PeerManager {
         reply_tx: mpsc::Sender<PeerMessage>,
     ) {
         const MAX_FETCH_PACK_LEDGERS: usize = 32;
+        const MAX_FETCH_PACK_OBJECTS: usize = 512;
         const MAX_RESPONSE_SIZE: usize = 256 * 1024;
         // rippled `HashPrefix::ledgerMaster` ('L','W','R',0).
         const HASH_PREFIX_LEDGER_MASTER: [u8; 4] = [b'L', b'W', b'R', 0];
@@ -2587,8 +2776,12 @@ impl PeerManager {
         };
 
         let ledger_hash_bytes = msg.ledger_hash.as_deref().unwrap_or(&[]);
-        if ledger_hash_bytes.len() < 32 {
-            tracing::debug!("FetchPack from {}: missing or short ledger_hash", from);
+        if ledger_hash_bytes.len() != 32 {
+            tracing::debug!(
+                "FetchPack from {}: missing or invalid ledger_hash length {}",
+                from,
+                ledger_hash_bytes.len()
+            );
             return;
         }
         let arr: [u8; 32] = match ledger_hash_bytes[..32].try_into() {
@@ -2611,10 +2804,47 @@ impl PeerManager {
                 return;
             }
         };
+        if !head.is_closed() {
+            tracing::debug!(
+                "FetchPack from {}: requested ledger {} is still open",
+                from,
+                requested_ledger_hash
+            );
+            return;
+        }
+        if provider
+            .earliest_fetch()
+            .is_some_and(|earliest| head.header.sequence < earliest)
+        {
+            tracing::debug!(
+                "FetchPack from {}: requested ledger {} predates earliest available ledger",
+                from,
+                requested_ledger_hash
+            );
+            return;
+        }
+        if head.header.parent_hash == Hash256::ZERO
+            || provider.get_by_hash(&head.header.parent_hash).is_none()
+        {
+            tracing::debug!(
+                "FetchPack from {}: requested ledger {} has no available parent",
+                from,
+                requested_ledger_hash
+            );
+            return;
+        }
 
         let mut objects: Vec<(Hash256, u32, Vec<u8>)> = Vec::new();
         let mut total_size = 0usize;
         let mut current_parent_hash = head.header.parent_hash;
+        // Rippled compares each ancestor with the state map already held at
+        // that step, rather than with the original head forever. Advancing
+        // this set avoids re-emitting nodes shared by adjacent parents.
+        let mut have_state: HashSet<Hash256> = head
+            .state_map
+            .collect_all_node_hashes()
+            .into_iter()
+            .collect();
         for _ in 0..MAX_FETCH_PACK_LEDGERS {
             if current_parent_hash == Hash256::ZERO {
                 break;
@@ -2623,20 +2853,56 @@ impl PeerManager {
                 Some(p) => p,
                 None => break,
             };
-            let raw = parent.header.to_raw_bytes();
-            let mut data = Vec::with_capacity(4 + raw.len());
-            data.extend_from_slice(&HASH_PREFIX_LEDGER_MASTER);
-            data.extend_from_slice(&raw);
-
-            let entry_size = 32 + data.len();
-            if total_size + entry_size > MAX_RESPONSE_SIZE {
-                break;
-            }
-            total_size += entry_size;
             let parent_hash = parent.header.hash;
             let parent_seq = parent.header.sequence;
             current_parent_hash = parent.header.parent_hash;
-            objects.push((parent_hash, parent_seq, data));
+
+            let mut add_object = |hash: Hash256, data: Vec<u8>| {
+                if objects.len() >= MAX_FETCH_PACK_OBJECTS {
+                    return;
+                }
+                let entry_size = 32 + data.len();
+                if total_size + entry_size > MAX_RESPONSE_SIZE {
+                    return;
+                }
+                total_size += entry_size;
+                objects.push((hash, parent_seq, data));
+            };
+
+            let mut header = Vec::with_capacity(4 + parent.header.to_raw_bytes().len());
+            header.extend_from_slice(&HASH_PREFIX_LEDGER_MASTER);
+            header.extend_from_slice(&parent.header.to_raw_bytes());
+            add_object(parent_hash, header);
+
+            // rippled's populateFetchPack sends only state nodes absent from
+            // the already-held head state map. Hash filtering preserves that
+            // delta behavior while the SHAMap traversal emits exact prefix
+            // bytes for inner and leaf nodes.
+            parent
+                .state_map
+                .for_each_serialized_with_prefix(&mut |hash, data| {
+                    if !have_state.contains(&hash) {
+                        add_object(hash, data);
+                    }
+                });
+
+            have_state = parent
+                .state_map
+                .collect_all_node_hashes()
+                .into_iter()
+                .collect();
+
+            if !parent.header.tx_hash.is_zero() {
+                parent
+                    .tx_map
+                    .for_each_serialized_with_prefix(&mut |hash, data| {
+                        add_object(hash, data);
+                    });
+            }
+
+            if objects.len() >= MAX_FETCH_PACK_OBJECTS || total_size >= MAX_RESPONSE_SIZE {
+                break;
+            }
         }
 
         if objects.is_empty() {
@@ -2652,7 +2918,7 @@ impl PeerManager {
             proto_convert::encode_fetch_pack_response(&requested_ledger_hash, objects.clone());
 
         tracing::debug!(
-            "FetchPack response to {}: {} ancestor headers ({} bytes) for {}",
+            "FetchPack response to {}: {} objects ({} bytes) for {}",
             from,
             objects.len(),
             response.len(),
@@ -2663,6 +2929,162 @@ impl PeerManager {
             msg_type: MessageType::GetObjects,
             payload: response,
         });
+    }
+
+    /// Consume a rippled-compatible FetchPack reply.
+    ///
+    /// `LWR\0` entries establish the ledger header and state-map root for each
+    /// sequence. `MLN\0` and `MIN\0` entries are converted to the regular
+    /// `TMLedgerData` wire form and fed into the active state sync. Transaction
+    /// prefixes are intentionally ignored here: ledger adoption reconstructs
+    /// the account state from the state map, while transaction history is
+    /// requested through the normal transaction-map path.
+    fn handle_fetch_pack_response(
+        &mut self,
+        from: Hash256,
+        msg: rxrpl_p2p_proto::proto::TmGetObjectByHash,
+    ) {
+        const HASH_PREFIX_LEDGER_MASTER: &[u8; 4] = b"LWR\0";
+        const HASH_PREFIX_INNER: &[u8; 4] = b"MIN\0";
+        const HASH_PREFIX_LEAF: &[u8; 4] = b"MLN\0";
+        const HASH_PREFIX_TX_NODE: &[u8; 4] = b"SND\0";
+        const HASH_PREFIX_TX_ID: &[u8; 4] = b"TXN\0";
+
+        let mut accepted = 0usize;
+        for object in msg.objects {
+            let Some(seq) = object.ledger_seq else {
+                continue;
+            };
+            let Some(hash_bytes) = object.hash else {
+                continue;
+            };
+            let Ok(hash) = <[u8; 32]>::try_from(hash_bytes.as_slice()) else {
+                tracing::warn!("ignoring FetchPack object with invalid hash from {}", from);
+                continue;
+            };
+            let hash = Hash256::new(hash);
+            let data = object.data.unwrap_or_default();
+
+            if data.starts_with(HASH_PREFIX_LEDGER_MASTER) {
+                let Some(header) = rxrpl_ledger::LedgerHeader::from_raw_bytes(&data[4..]) else {
+                    tracing::warn!(
+                        "ignoring FetchPack ledger header with invalid bytes from {}",
+                        from
+                    );
+                    continue;
+                };
+                if header.hash != hash || header.sequence != seq {
+                    tracing::warn!(
+                        "ignoring FetchPack header mismatch from {}: object={} seq={} header={} #{}",
+                        from,
+                        hash,
+                        seq,
+                        header.hash,
+                        header.sequence
+                    );
+                    continue;
+                }
+
+                self.ledger_syncer.set_ledger_hash(seq, header.hash);
+                self.forward_to_consensus(ConsensusMessage::LedgerHeader {
+                    seq,
+                    header: header.clone(),
+                });
+                if let Some(store) = self.get_node_store() {
+                    let missing =
+                        self.ledger_syncer
+                            .start_incremental_sync(seq, header.account_hash, store);
+                    if !missing.is_empty() {
+                        self.send_get_ledger_as_node(seq);
+                    } else {
+                        self.complete_incremental_sync(seq, header.hash);
+                    }
+                }
+                accepted += 1;
+                continue;
+            }
+
+            let Some(wire) = crate::ledger_sync::object_blob_to_wire(&data) else {
+                tracing::warn!(
+                    "ignoring FetchPack object with unknown prefix from {}",
+                    from
+                );
+                continue;
+            };
+            let Some((decoded_hash, storage)) = crate::ledger_sync::decode_wire_node(&wire) else {
+                tracing::warn!(
+                    "ignoring FetchPack object with invalid node data from {}",
+                    from
+                );
+                continue;
+            };
+            if decoded_hash != hash {
+                tracing::warn!(
+                    "ignoring FetchPack object hash mismatch from {}: object={} decoded={}",
+                    from,
+                    hash,
+                    decoded_hash
+                );
+                continue;
+            }
+
+            if data.starts_with(HASH_PREFIX_TX_NODE) || data.starts_with(HASH_PREFIX_TX_ID) {
+                let Some(store) = self.get_node_store() else {
+                    tracing::debug!(
+                        "FetchPack transaction node {} received without a node store",
+                        hash
+                    );
+                    continue;
+                };
+                if let Err(error) = store.store_batch(&[(&hash, storage.as_slice())]) {
+                    tracing::warn!(
+                        "failed to persist FetchPack transaction node {}: {}",
+                        hash,
+                        error
+                    );
+                    continue;
+                }
+                accepted += 1;
+                continue;
+            }
+
+            if !(data.starts_with(HASH_PREFIX_INNER) || data.starts_with(HASH_PREFIX_LEAF)) {
+                continue;
+            }
+            if !self.ledger_syncer.has_incremental_sync(seq) {
+                continue;
+            }
+            let feed = self
+                .ledger_syncer
+                .feed_nodes(seq, &[(hash.as_bytes().to_vec(), wire)]);
+            match feed {
+                crate::ledger_sync::FeedResult::Complete(leaves) => {
+                    self.ledger_syncer.mark_synced(seq);
+                    self.forward_to_consensus(ConsensusMessage::LedgerData {
+                        hash: self
+                            .ledger_syncer
+                            .get_ledger_hash(seq)
+                            .unwrap_or(Hash256::ZERO),
+                        seq,
+                        nodes: leaves,
+                    });
+                }
+                crate::ledger_sync::FeedResult::Continue => {
+                    self.send_get_ledger_as_node(seq);
+                }
+                crate::ledger_sync::FeedResult::FallbackToHashFetch(hashes) => {
+                    self.send_get_objects_by_hash(seq, &hashes);
+                }
+                crate::ledger_sync::FeedResult::Removed => {}
+            }
+            accepted += 1;
+        }
+
+        tracing::info!(
+            "received FetchPack response from {} ({} verified state/tx/header objects)",
+            from,
+            accepted
+        );
     }
 
     /// Send TMGetObjectByHash requests to fetch missing nodes by content hash.
@@ -2731,16 +3153,9 @@ impl PeerManager {
         // Register request in the syncer so responses can be correlated.
         self.ledger_syncer.register_request(seq, hash);
 
-        let cookie = self.next_cookie.fetch_add(1, Ordering::Relaxed);
-
         // liBASE requests fetch the ledger header only -- no delta node_ids.
-        let payload = proto_convert::encode_get_ledger_with_nodes(
-            LI_BASE,
-            hash.as_ref(),
-            seq,
-            cookie,
-            Vec::new(),
-        );
+        let payload =
+            proto_convert::encode_get_ledger_with_nodes(LI_BASE, hash.as_ref(), seq, 0, Vec::new());
 
         // Send to a single peer.
         let best = self.peer_set.best_peers_for_ledger(seq, 1);
@@ -2784,6 +3199,50 @@ impl PeerManager {
                 return;
             }
         };
+        const LT_CLOSED: i32 = 2;
+        const QT_INDIRECT: i32 = 0;
+        const REQUEST_MAX_QUERY_DEPTH: u32 = 3;
+        const HARD_MAX_NODE_IDS: usize = 12_288;
+
+        // Match PeerImp::onMessage(TMGetLedger) before doing any ledger or
+        // SHAMap work. Invalid requests must be dropped rather than silently
+        // downgraded to a latest-closed or full-state request.
+        if !(LI_BASE..=LI_TS_CANDIDATE).contains(&req.itype)
+            || req
+                .ltype
+                .is_some_and(|ltype| !(0..=LT_CLOSED).contains(&ltype))
+            || req
+                .query_type
+                .is_some_and(|query_type| query_type != QT_INDIRECT)
+            || req
+                .query_depth
+                .is_some_and(|depth| depth > REQUEST_MAX_QUERY_DEPTH || req.itype == LI_BASE)
+        {
+            tracing::debug!("GetLedger from {} rejected invalid request fields", from);
+            return;
+        }
+
+        let has_hash = req.ledger_hash.is_some();
+        let has_seq = req.ledger_seq.is_some();
+        let invalid_hash = req
+            .ledger_hash
+            .as_ref()
+            .is_some_and(|hash| hash.len() != 32);
+        let missing_selector = !has_hash && !has_seq && req.ltype != Some(LT_CLOSED);
+        let invalid_node_count = req.node_ids.is_empty() || req.node_ids.len() > HARD_MAX_NODE_IDS;
+        if invalid_hash
+            || (req.itype == LI_TS_CANDIDATE && !has_hash)
+            || (req.itype != LI_TS_CANDIDATE && missing_selector)
+            || (req.itype != LI_BASE && invalid_node_count)
+        {
+            tracing::debug!("GetLedger from {} rejected invalid selectors", from);
+            return;
+        }
+
+        if req.itype != LI_BASE && req.node_ids.iter().any(|node_id| node_id.len() != 33) {
+            tracing::debug!("GetLedger from {} rejected invalid node id", from);
+            return;
+        }
         tracing::debug!(
             "GetLedger from {} type={} seq={:?} hash_len={} node_ids={}",
             from,
@@ -2823,36 +3282,35 @@ impl PeerManager {
         }
 
         // Resolve the requested ledger. Selectors:
-        // - hash present  -> try by-hash; if miss AND seq present, fall back to by-seq
-        //   (peer may be probing; let it discover the divergence rather than timing out)
+        // - hash present  -> resolve by hash exactly
         // - else if seq>0 -> by-seq
         // - else          -> latest closed
-        let ledger = if req_ledger_hash.len() >= 32 {
-            let hash = Hash256::new(req_ledger_hash[..32].try_into().unwrap_or([0u8; 32]));
-            match provider.get_by_hash(&hash) {
-                Some(l) => Some(l),
-                None if req_ledger_seq > 0 => {
+        let ledger = if !req_ledger_hash.is_empty() {
+            if req_ledger_hash.len() != 32 {
+                tracing::debug!(
+                    "GetLedger from {} has invalid hash length {}; dropping",
+                    from,
+                    req_ledger_hash.len()
+                );
+                None
+            } else {
+                let hash = Hash256::new(req_ledger_hash[..32].try_into().unwrap_or([0u8; 32]));
+                let result = provider.get_by_hash(&hash);
+                if result.is_none() {
                     tracing::debug!(
-                        "GetLedger from {} hash={} not found, falling back to seq={}",
-                        from,
-                        hash,
-                        req_ledger_seq
-                    );
-                    provider.get_by_seq(req_ledger_seq)
-                }
-                None => {
-                    tracing::debug!(
-                        "GetLedger from {} hash={} not found, no seq fallback",
+                        "GetLedger from {} hash={} not found; refusing seq substitution",
                         from,
                         hash
                     );
-                    None
                 }
+                result
             }
         } else if req_ledger_seq > 0 {
             provider.get_by_seq(req_ledger_seq)
-        } else {
+        } else if req.ltype == Some(LT_CLOSED) {
             provider.latest_closed()
+        } else {
+            None
         };
         // req_ledger_type tells us *which* SHAMap to serve from — base /
         // tx_node / as_node — handled below when we serialise the response.
@@ -2884,7 +3342,7 @@ impl PeerManager {
         // trigger up to MAX_DEPTH (64) lazy `store.fetch` calls via the
         // SHAMap path-walk; without this bound a single peer can pin the
         // request handler with O(n × 64) disk I/O per message.
-        const MAX_GET_LEDGER_NODES: usize = 128;
+        const MAX_GET_LEDGER_NODES: usize = 8_192;
         // Match rippled's TMLedgerData reply caps (overlay Tuning.h): stop
         // pulling new requested ids once the reply reaches the soft cap, and
         // never emit past the hard cap within a single fat expansion.
@@ -2909,25 +3367,47 @@ impl PeerManager {
         let request_node_ids: Vec<ShamapNodeId> = raw_node_ids
             .iter()
             .take(MAX_GET_LEDGER_NODES)
-            .filter_map(|id_bytes| {
-                if id_bytes.len() == 33 {
-                    let path: [u8; 32] = id_bytes[..32].try_into().ok()?;
-                    let depth = id_bytes[32];
-                    Some(ShamapNodeId::new(depth, &Hash256::new(path)))
-                } else {
-                    None
-                }
+            .map(|id_bytes| {
+                let path: [u8; 32] = id_bytes[..32]
+                    .try_into()
+                    .expect("validated GetLedger node id length");
+                ShamapNodeId::new(id_bytes[32], &Hash256::new(path))
             })
             .collect();
 
-        // For liBASE (itype=0) requests with no specific node ids, the
-        // protocol expects a single node entry containing the raw 118-byte
-        // ledger header — that's what the late joiner parses to set up
-        // its incremental sync. Returning state-map leaves here makes the
-        // late joiner discard the response (header parse fails).
+        // For liBASE (itype=0) requests, rippled sends the raw ledger header
+        // followed by the account-state and transaction-map roots when they
+        // are non-empty. The roots are wire nodes without node ids; sending
+        // only the header forces an avoidable extra round trip and diverges
+        // from `PeerImp::sendLedgerBase`.
         if request_node_ids.is_empty() && req_ledger_type == LI_BASE {
             let header_bytes = ledger.header.to_raw_bytes();
             nodes.push((vec![], header_bytes));
+
+            for (map, leaf_wire_type, expected_root) in [
+                (
+                    &ledger.state_map,
+                    WIRE_TYPE_ACCOUNT_STATE,
+                    ledger.header.account_hash,
+                ),
+                (
+                    &ledger.tx_map,
+                    WIRE_TYPE_TX_WITH_META,
+                    ledger.header.tx_hash,
+                ),
+            ] {
+                if expected_root.is_zero() {
+                    continue;
+                }
+                if let Some((root_hash, raw, is_inner)) = map.node_at(rxrpl_shamap::NodeId::ROOT) {
+                    if root_hash == expected_root {
+                        nodes.push((
+                            vec![],
+                            encode_shamap_wire_node(&raw, is_inner, leaf_wire_type),
+                        ));
+                    }
+                }
+            }
 
             let response = proto_convert::encode_ledger_data(
                 &ledger.header.hash,
@@ -3200,9 +3680,16 @@ impl PeerManager {
 
     /// Send a TMGetLedger request with itype=liTS_CANDIDATE to fetch a tx-set.
     fn send_get_tx_set(&self, peer: Hash256, tx_set_hash: Hash256) {
-        let cookie = self.next_cookie.fetch_add(1, Ordering::Relaxed);
-        let payload =
-            proto_convert::encode_get_ledger(LI_TS_CANDIDATE, Some(&tx_set_hash), 0, cookie);
+        // rippled's non-liBASE GetLedger validation requires at least one
+        // SHAMap node id. The candidate tree starts at the root, so request
+        // that 33-byte path/depth identifier explicitly.
+        let payload = proto_convert::encode_get_ledger_with_nodes(
+            LI_TS_CANDIDATE,
+            Some(&tx_set_hash),
+            0,
+            0,
+            vec![rxrpl_shamap::NodeId::ROOT.to_wire_bytes()],
+        );
         if let Some(handle) = self.peer_handles.get(&peer) {
             match handle.tx.try_send(PeerMessage {
                 msg_type: MessageType::GetLedger,
@@ -3234,8 +3721,6 @@ impl PeerManager {
     /// the blob is the canonical transaction. Reconstruct a blob-carrying
     /// TxSet, store it in the shared cache, and notify the consensus engine.
     fn handle_tx_set_response(&mut self, set_hash: Hash256, nodes: &[(Vec<u8>, Vec<u8>)]) {
-        self.pending_tx_set_fetches.remove(&set_hash);
-
         if nodes.is_empty() {
             tracing::debug!("empty tx-set response for {}", set_hash);
             return;
@@ -3269,8 +3754,13 @@ impl PeerManager {
                 tx_set.hash,
                 tx_set.len()
             );
-            // Store under the computed hash anyway so consensus can still find it.
+            return;
         }
+
+        // Retire the request only after a non-empty response has reconstructed
+        // the exact requested transaction-set hash. Empty or malformed
+        // responses remain retryable, matching rippled's TransactionAcquire.
+        self.pending_tx_set_fetches.remove(&set_hash);
 
         tracing::info!(
             "acquired tx-set {} with {} transactions",
@@ -3446,6 +3936,7 @@ async fn try_accept_inbound(
 ///
 /// rippled SHAMap node wire-type bytes (trailing tag in TMLedgerNode payloads).
 const WIRE_TYPE_INNER: u8 = 2;
+const WIRE_TYPE_COMPRESSED_INNER: u8 = 3;
 const WIRE_TYPE_ACCOUNT_STATE: u8 = 1;
 const WIRE_TYPE_TX_WITH_META: u8 = 4;
 /// Trailing tag for a transaction-no-metadata leaf (consensus candidate set).
@@ -3488,6 +3979,43 @@ fn encode_tx_no_meta_wire_node(storage: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Validate the structural relationship between a `TMLedgerNode`'s 33-byte
+/// path/depth identifier and its wire node. This mirrors rippled's
+/// `getSHAMapNodeID`: malformed ids must be rejected before a response can
+/// consume a pending request or enter the incremental SHAMap.
+fn ledger_node_wire_is_valid(node_id: &[u8], node_data: &[u8]) -> bool {
+    if node_id.len() != 33 {
+        return false;
+    }
+    let depth = node_id[32];
+    if depth > rxrpl_shamap::MAX_DEPTH {
+        return false;
+    }
+    let path = match <[u8; 32]>::try_from(&node_id[..32]) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    let path_hash = Hash256::new(path);
+    if ShamapNodeId::new(depth, &path_hash).to_wire_bytes() != node_id {
+        return false;
+    }
+
+    let Some((_content_hash, storage)) = crate::ledger_sync::decode_wire_node(node_data) else {
+        return false;
+    };
+    if storage.first() != Some(&STORE_TAG_LEAF) {
+        return true;
+    }
+    if storage.len() < 1 + 32 {
+        return false;
+    }
+    let key = match <[u8; 32]>::try_from(&storage[1..33]) {
+        Ok(key) => Hash256::new(key),
+        Err(_) => return false,
+    };
+    ShamapNodeId::new(depth, &key).to_wire_bytes() == node_id
+}
+
 /// Wrap a node's internal storage bytes in rippled's TMLedgerNode wire form.
 ///
 /// `is_inner` MUST come from the node's actual type (e.g. `SHAMap::node_at`),
@@ -3496,6 +4024,23 @@ fn encode_tx_no_meta_wire_node(storage: &[u8]) -> Vec<u8> {
 /// as an inner and corrupt the peer's catchup.
 fn encode_shamap_wire_node(storage: &[u8], is_inner: bool, leaf_wire_type: u8) -> Vec<u8> {
     if is_inner {
+        if storage.len() == 16 * 32 {
+            let branch_count = storage
+                .chunks_exact(32)
+                .filter(|hash| hash.iter().any(|byte| *byte != 0))
+                .count();
+            if branch_count < 12 {
+                let mut wire = Vec::with_capacity(branch_count * 33 + 1);
+                for (branch, hash) in storage.chunks_exact(32).enumerate() {
+                    if hash.iter().any(|byte| *byte != 0) {
+                        wire.extend_from_slice(hash);
+                        wire.push(branch as u8);
+                    }
+                }
+                wire.push(WIRE_TYPE_COMPRESSED_INNER);
+                return wire;
+            }
+        }
         let mut wire = Vec::with_capacity(storage.len() + 1);
         wire.extend_from_slice(storage);
         wire.push(WIRE_TYPE_INNER);
@@ -3512,6 +4057,72 @@ fn encode_shamap_wire_node(storage: &[u8], is_inner: bool, leaf_wire_type: u8) -
         // Malformed; emit untyped passthrough so the receiver discards.
         storage.to_vec()
     }
+}
+
+/// Decode a persisted SHAMap node record into the untagged representation
+/// consumed by [`encode_shamap_wire_node`]. New records are explicitly tagged;
+/// the untagged fallback keeps stores written before type tags readable, with
+/// the historical 512-byte ambiguity necessarily remaining for those records.
+fn decode_store_record_for_wire(raw: &[u8]) -> Option<(bool, &[u8])> {
+    match raw.split_first() {
+        Some((&STORE_TAG_INNER, body)) if body.len() == 16 * 32 => Some((true, body)),
+        Some((&STORE_TAG_LEAF, body)) if body.len() >= 32 => Some((false, body)),
+        Some((&tag, _)) if tag == STORE_TAG_INNER || tag == STORE_TAG_LEAF => None,
+        _ if raw.len() == 16 * 32 => Some((true, raw)),
+        _ if raw.len() >= 32 => Some((false, raw)),
+        _ => None,
+    }
+}
+
+/// Convert a persisted SHAMap node record to rippled's
+/// `TMGetObjectByHash`/`NodeObject` form: `HashPrefix || content`.
+fn encode_store_record_with_prefix(raw: &[u8], object_type: i32) -> Option<Vec<u8>> {
+    let (is_inner, storage) = decode_store_record_for_wire(raw)?;
+    if is_inner {
+        let mut blob = Vec::with_capacity(4 + storage.len());
+        blob.extend_from_slice(b"MIN\0");
+        blob.extend_from_slice(storage);
+        return Some(blob);
+    }
+
+    if storage.len() < 32 {
+        return None;
+    }
+    let key = &storage[..32];
+    let data = &storage[32..];
+    let prefix = if object_type == OT_TRANSACTION_NODE {
+        b"SND\0"
+    } else {
+        b"MLN\0"
+    };
+    let mut blob = Vec::with_capacity(4 + data.len() + 32);
+    blob.extend_from_slice(prefix);
+    blob.extend_from_slice(data);
+    blob.extend_from_slice(key);
+    Some(blob)
+}
+
+/// Accept a peer proposal only after authenticating both its signer and the
+/// identity bound to the advertised public key. Consensus still applies its
+/// UNL, freshness and sequence filters after this network-boundary check.
+fn proposal_is_authenticated(proposal: &Proposal) -> bool {
+    if proposal.public_key.is_empty() || proposal.signature.is_none() {
+        return false;
+    }
+
+    // rippled's PeerImp accepts only compressed secp256k1 keys for
+    // TMProposeSet. Keep the generic consensus verifier capable of
+    // Ed25519 for local/unit use, but enforce the overlay wire contract
+    // before a peer proposal reaches consensus.
+    let Ok(public_key) = PublicKey::from_slice(&proposal.public_key) else {
+        return false;
+    };
+    if !public_key.is_secp256k1() {
+        return false;
+    }
+
+    proposal.node_id == rxrpl_consensus::types::NodeId::from_public_key(&proposal.public_key)
+        && proposal.verify(&proposal.public_key)
 }
 
 /// Split a framed connection and spawn read/write loops.

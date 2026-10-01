@@ -1,11 +1,11 @@
 """B3: Mixed validator consensus — rxrpl as voting validator.
 
-These tests prove that, in a 2 rippled + 1 rxrpl network, rxrpl's signed
+These tests prove that, in a 3 rippled + 2 rxrpl network, rxrpl's signed
 validations contribute to quorum. Concretely:
 
 - The network advances past ledger 20 (no consensus stall).
 - All three nodes converge on the same hash for a settled ledger.
-- rxrpl logs report network-validated ledgers with `validation_count >= 2`,
+- rxrpl logs report network-validated ledgers with `validation_count >= 4`,
   which proves rxrpl is observing peer validations on top of its own and
   that quorum is being met by the mixed UNL — not by a single rippled
   declaring victory alone.
@@ -55,12 +55,12 @@ class TestMixedVoterConsensus:
         )
 
     def test_rxrpl_observes_quorum(self):
-        """rxrpl logs at least one ledger validated by >= 2 signatures.
+        """rxrpl logs at least one ledger validated by the 4/5 quorum.
 
-        With a 2-of-3 mixed UNL, a `validation_count >= 2` line proves the
-        rxrpl node received and aggregated validations from at least one
-        peer in addition to its own — i.e. rxrpl participates in consensus
-        as a voter, and rippled's signatures are accepted on its side.
+        With a 4-of-5 mixed UNL, a `validation_count >= 4` line proves the
+        rxrpl node received and aggregated the full configured quorum — i.e.
+        rxrpl participates in consensus as a voter, and rippled's signatures
+        are accepted on its side.
         """
         if not RXRPL_CONTAINERS:
             pytest.skip("RXRPL_CONTAINERS not set; cannot scrape rxrpl logs")
@@ -79,8 +79,8 @@ class TestMixedVoterConsensus:
                     max_count = count
                     sample_line = match.group(0)
 
-        assert max_count >= 2, (
-            "rxrpl never observed a ledger with validation_count >= 2; "
+        assert max_count >= 4, (
+            "rxrpl never observed a ledger with validation_count >= 4; "
             "either rippled rejects rxrpl's validations or rxrpl rejects "
             "rippled's. Best line seen: "
             + (sample_line or "<no `network validated ledger` line at all>")

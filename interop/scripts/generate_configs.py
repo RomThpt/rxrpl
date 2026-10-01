@@ -13,7 +13,9 @@ The validator keys below are real, pre-harvested fixtures — not stubs:
     `n...` NodePublic was read back from `server_info.pubkey_validator`
     of a rippled started with that seed.
   * The rxrpl seed feeds `[validator_identity]`; its `n...` key was read
-    from the running node's loaded validator identity.
+    from the running node's loaded master identity. Each validator also has
+    a separate deterministic ephemeral signing seed, matching rippled's
+    manifest-backed two-key validator model.
 
 Because the keys are fixed, the generated configs are reproducible and
 can be committed as fixtures. To rotate them, re-harvest (start each node
@@ -22,6 +24,7 @@ table below.
 """
 
 import argparse
+import json
 import os
 
 CONFIGS_DIR = os.path.join(os.path.dirname(__file__), "..", "configs")
@@ -50,12 +53,14 @@ RXRPL_VALIDATORS = [
         "public_key": "n9Lc8w5xK1kJE4AiHX9kvDQF6shMBWoz8pEXp95xRo227ZMnUPt2",
         "ip": "172.30.0.20",
         "node_seed": "a1f33f544dbae3d90db16b1bc9e821e9",
+        "ephemeral_seed": "FFEEDDCCBBAA99887766554433221100",
     },
     {
         "seed": "shVHki9rwyRX52LWJkUqcH2H17bhh",
         "public_key": "n9J5N9HSH3cYmJmJDxjq3JPwxFDo62CakvCCZkjn2crcgxs3dztj",
         "ip": "172.30.0.21",
         "node_seed": "57c2cb534e657e81da3dc09c69a33607",
+        "ephemeral_seed": "00112233445566778899AABBCCDDEEFF",
     },
 ]
 
@@ -72,7 +77,7 @@ def unl_keys():
     return [v["public_key"] for v in RIPPLED_VALIDATORS + RXRPL_VALIDATORS]
 
 
-def write_rippled_config(path, seed, fixed_peers):
+def write_rippled_config(path, seed, fixed_peers, quorum):
     peers_section = "\n".join(fixed_peers)
     config = f"""[server]
 port_rpc_admin_local
@@ -135,21 +140,17 @@ full
 [consensus]
 minimum_duration_ms=200
 
-# Match rxrpl's explicit quorum so the 3-validator UNL only needs 2
-# validations to advance. Without this, rippled defaults to
-# ceil(3 * 0.8) = 3 and requires ALL 3 validators (us + the other
-# rippled + rxrpl) to validate every ledger. With cross-impl manifest
-# propagation taking ~30s to settle at boot, the strict-3 quorum
-# leaves rippled `complete_ledgers: empty` for the whole 5-minute
-# pytest timeout window.
+# The default profile uses the full five-validator UNL and its 80% quorum.
+# A lower value is available only for diagnostic runs; it must be explicit
+# so a passing low-quorum run cannot be mistaken for validator evidence.
 [validation_quorum]
-2
+{quorum}
 """
     with open(path, "w") as f:
         f.write(config)
 
 
-def write_rxrpl_config(path, validator, fixed_peers):
+def write_rxrpl_config(path, validator, fixed_peers, quorum):
     peers_toml = ", ".join(f'"{p}"' for p in fixed_peers)
     trusted_toml = ", ".join(f'"{k}"' for k in unl_keys())
     config = f"""[server]
@@ -166,17 +167,19 @@ tls_enabled = false
 
 [database]
 path = "/var/lib/rxrpl/data"
-backend = "memory"
-online_delete = 256
+# A validator must retain its SHAMap nodes across a crash/rejoin. Memory is
+# useful for unit tests but cannot serve historical ledgers after restart.
+backend = "rocksdb"
+online_delete = 0
 
 [validators]
 enabled = true
 trusted = [{trusted_toml}]
-quorum = 2
+quorum = {quorum}
 
 [validator_identity]
 master_secret = "{validator['seed']}"
-ephemeral_seed = "{validator['seed']}"
+ephemeral_seed = "{validator['ephemeral_seed']}"
 
 [network]
 network_id = {NETWORK_ID}
@@ -245,12 +248,23 @@ def main():
     parser = argparse.ArgumentParser(description="Generate interop test configs")
     parser.add_argument("--rippled", type=int, default=3)
     parser.add_argument("--rxrpl", type=int, default=2)
+    parser.add_argument(
+        "--quorum",
+        type=int,
+        default=int(os.environ.get("INTEROP_QUORUM", "4")),
+        help="validation quorum (default: 4 for the full five-validator topology)",
+    )
     args = parser.parse_args()
     if args.rippled != len(RIPPLED_VALIDATORS) or args.rxrpl != len(RXRPL_VALIDATORS):
         parser.error(
             f"fixed-fixture topology is "
             f"{len(RIPPLED_VALIDATORS)} rippled + {len(RXRPL_VALIDATORS)} rxrpl; "
             f"re-harvest keys to change it"
+        )
+    validator_count = args.rippled + args.rxrpl
+    if not 1 <= args.quorum <= validator_count:
+        parser.error(
+            f"quorum must be between 1 and {validator_count}, got {args.quorum}"
         )
 
     os.makedirs(CONFIGS_DIR, exist_ok=True)
@@ -262,6 +276,7 @@ def main():
             os.path.join(CONFIGS_DIR, f"rippled-{i}.cfg"),
             v["seed"],
             [p for p in peers if p != own],
+            args.quorum,
         )
 
     for i, v in enumerate(RXRPL_VALIDATORS):
@@ -270,11 +285,25 @@ def main():
             os.path.join(CONFIGS_DIR, f"rxrpl-{i}.toml"),
             v,
             [p for p in peers if p != own],
+            args.quorum,
         )
 
     write_validators_txt(os.path.join(CONFIGS_DIR, "validators.txt"))
     write_publisher_key(os.path.join(CONFIGS_DIR, "publisher.json"))
     write_publisher_manifest(os.path.join(CONFIGS_DIR, "manifest.json"))
+    with open(os.path.join(CONFIGS_DIR, "interop.json"), "w") as f:
+        json.dump(
+            {
+                "rippled": args.rippled,
+                "rxrpl": args.rxrpl,
+                "validators": validator_count,
+                "quorum": args.quorum,
+                "profile": "full-quorum" if args.quorum == 4 else "diagnostic",
+            },
+            f,
+            indent=2,
+        )
+        f.write("\n")
 
     print(
         f"Generated configs for {len(RIPPLED_VALIDATORS)} rippled "
@@ -282,6 +311,7 @@ def main():
     )
     print(f"  Configs:    {CONFIGS_DIR}/")
     print(f"  UNL keys:   {len(unl_keys())}")
+    print(f"  Quorum:     {args.quorum}/{validator_count}")
 
 
 if __name__ == "__main__":

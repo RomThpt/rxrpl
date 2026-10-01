@@ -136,11 +136,9 @@ fn sign_validation_with_keypair(
     let mut stripped = Vec::with_capacity(192);
 
     // (2,2) sfFlags — always
-    let flags: u32 = if validation.full {
-        0x80000001
-    } else {
-        0x00000000
-    };
+    // rippled always marks signatures fully canonical; the full-validation
+    // bit is independent and only follows `Validation::full`.
+    let flags = 0x8000_0000 | u32::from(validation.full);
     stobject::put_uint32(&mut stripped, 2, flags);
 
     // (2,6) sfLedgerSequence — always
@@ -260,11 +258,7 @@ pub fn verify_validation_signature(validation: &rxrpl_consensus::types::Validati
             // legacy `sign_validation` produced with these 5 fields.
             let mut signing_data = Vec::with_capacity(128);
             signing_data.extend_from_slice(&HASH_PREFIX_VALIDATION);
-            let flags: u32 = if validation.full {
-                0x80000001
-            } else {
-                0x00000000
-            };
+            let flags = 0x8000_0000 | u32::from(validation.full);
             stobject::put_uint32(&mut signing_data, 2, flags);
             stobject::put_uint32(&mut signing_data, 6, validation.ledger_seq);
             stobject::put_uint32(&mut signing_data, 9, validation.sign_time);
@@ -274,12 +268,13 @@ pub fn verify_validation_signature(validation: &rxrpl_consensus::types::Validati
         }
     };
 
-    let is_ed25519 = validation.public_key.first() == Some(&0xED);
-    if is_ed25519 {
-        rxrpl_crypto::ed25519::verify(&signing_data, &validation.public_key, sig)
-    } else {
-        rxrpl_crypto::secp256k1::verify(&signing_data, &validation.public_key, sig)
+    let Ok(public_key) = rxrpl_primitives::PublicKey::from_slice(&validation.public_key) else {
+        return false;
+    };
+    if !public_key.is_secp256k1() {
+        return false;
     }
+    rxrpl_crypto::secp256k1::verify(&signing_data, &validation.public_key, sig)
 }
 
 impl std::fmt::Debug for NodeIdentity {

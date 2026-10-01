@@ -16,6 +16,9 @@ fn fetch_pack_query_replies_with_ancestor_headers() {
     let mut g = rxrpl_ledger::Ledger::genesis();
     g.close(0, 0).unwrap();
     let mut l1 = rxrpl_ledger::Ledger::new_open(&g);
+    l1.tx_map
+        .put(Hash256::new([0x22; 32]), vec![0x33, 0x44])
+        .expect("insert transaction leaf");
     l1.close(g.header.close_time + 4, 0).unwrap();
     let mut l2 = rxrpl_ledger::Ledger::new_open(&l1);
     l2.close(l1.header.close_time + 4, 0).unwrap();
@@ -54,8 +57,28 @@ fn fetch_pack_query_replies_with_ancestor_headers() {
     let reply = proto_convert::decode_get_objects(&msg.payload).expect("decode reply");
     assert_eq!(reply.r#type, Some(6));
     assert_eq!(reply.query, Some(false));
-    // Two ancestors: l1 then g.
-    assert_eq!(reply.objects.len(), 2);
+    assert_eq!(reply.fat, None);
+    // Two ancestor headers: l1 then g. FetchPack also carries the serialized
+    // transaction-map nodes for l1, so the response is larger than the
+    // header-only legacy behavior.
+    let header_count = reply
+        .objects
+        .iter()
+        .filter(|object| {
+            object
+                .data
+                .as_deref()
+                .is_some_and(|data| data.starts_with(b"LWR\0"))
+        })
+        .count();
+    assert_eq!(header_count, 2);
+    assert!(reply.objects.len() > header_count);
+    assert!(reply.objects.iter().any(|object| {
+        object
+            .data
+            .as_deref()
+            .is_some_and(|data| data.starts_with(b"SND\0"))
+    }));
     let first = &reply.objects[0];
     assert_eq!(first.ledger_seq, Some(l1.header.sequence));
     assert_eq!(
@@ -72,6 +95,92 @@ fn fetch_pack_query_replies_with_ancestor_headers() {
 }
 
 #[test]
+fn fetch_pack_transaction_nodes_are_persisted_after_hash_validation() {
+    use rxrpl_p2p_proto::proto::{TmGetObjectByHash, TmIndexedObject};
+    use rxrpl_shamap::NodeStore;
+
+    let (mut mgr, peer_id, _rx) = make_test_peer_manager();
+    let store = Arc::new(rxrpl_shamap::InMemoryNodeStore::new());
+    mgr.set_node_store(Arc::clone(&store) as Arc<dyn rxrpl_shamap::NodeStore>);
+
+    let key = [0x11; 32];
+    let transaction = [0x22, 0x33, 0x44];
+    let mut blob = b"SND\0".to_vec();
+    blob.extend_from_slice(&transaction);
+    blob.extend_from_slice(&key);
+    let hash = rxrpl_crypto::sha512_half::sha512_half(&[b"SND\0", &transaction, &key]);
+
+    mgr.handle_fetch_pack_response(
+        peer_id,
+        TmGetObjectByHash {
+            r#type: Some(6),
+            query: Some(false),
+            seq: None,
+            ledger_hash: None,
+            fat: None,
+            objects: vec![TmIndexedObject {
+                hash: Some(hash.as_bytes().to_vec()),
+                node_id: None,
+                index: None,
+                data: Some(blob),
+                ledger_seq: Some(7),
+            }],
+        },
+    );
+
+    let stored = store.fetch(&hash).expect("fetch stored node");
+    let mut expected = vec![rxrpl_shamap::STORE_TAG_LEAF];
+    expected.extend_from_slice(&key);
+    expected.extend_from_slice(&transaction);
+    assert_eq!(stored, Some(expected));
+}
+
+#[test]
+fn fetch_pack_state_root_already_in_store_completes_immediately() {
+    use rxrpl_shamap::NodeStore;
+
+    let (mut mgr, _peer_id, _rx) = make_test_peer_manager();
+    let store = Arc::new(rxrpl_shamap::InMemoryNodeStore::new());
+    let mut map = rxrpl_shamap::SHAMap::account_state_with_store(
+        Arc::clone(&store) as Arc<dyn rxrpl_shamap::NodeStore>
+    );
+    let key = Hash256::new([0x55; 32]);
+    map.put(key, vec![0x66, 0x77]).expect("state leaf");
+    let root = map.root_hash();
+    map.flush().expect("persist state root");
+
+    let missing =
+        mgr.ledger_syncer
+            .start_incremental_sync(7, root, Arc::clone(&store) as Arc<dyn NodeStore>);
+    assert!(missing.is_empty());
+    assert!(mgr.complete_incremental_sync(7, Hash256::new([0x99; 32])));
+    assert!(mgr.ledger_syncer.is_synced(7));
+}
+
+#[test]
+fn fetch_pack_query_rejects_non_32_byte_ledger_hash() {
+    use rxrpl_p2p_proto::proto::TmGetObjectByHash;
+
+    let (mut mgr, peer_id, mut rx) = make_test_peer_manager();
+    mgr.set_ledger_provider(Arc::new(GenesisLedgerProvider));
+    mgr.handle_get_objects_query(
+        peer_id,
+        TmGetObjectByHash {
+            r#type: Some(6),
+            query: Some(true),
+            seq: None,
+            ledger_hash: Some(vec![0xAA; 33]),
+            fat: None,
+            objects: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
 fn encode_shamap_wire_node_inner_appends_inner_tag() {
     // Inner node storage = 16*32 child hashes; wire = same || 0x02.
     // Tagged byte must NOT depend on the leaf wireType argument since
@@ -84,6 +193,21 @@ fn encode_shamap_wire_node_inner_appends_inner_tag() {
 
     let wire_tx = encode_shamap_wire_node(&storage, true, WIRE_TYPE_TX_WITH_META);
     assert_eq!(*wire_tx.last().unwrap(), WIRE_TYPE_INNER);
+}
+
+#[test]
+fn encode_shamap_wire_node_sparse_inner_uses_compressed_format() {
+    let mut storage = vec![0u8; 16 * 32];
+    storage[2 * 32] = 0xAA;
+    storage[11 * 32 + 31] = 0xBB;
+
+    let wire = encode_shamap_wire_node(&storage, true, WIRE_TYPE_ACCOUNT_STATE);
+    assert_eq!(wire.len(), 2 * 33 + 1);
+    assert_eq!(*wire.last().unwrap(), WIRE_TYPE_COMPRESSED_INNER);
+    assert_eq!(&wire[..32], &storage[2 * 32..3 * 32]);
+    assert_eq!(wire[32], 2);
+    assert_eq!(&wire[33..65], &storage[11 * 32..12 * 32]);
+    assert_eq!(wire[65], 11);
 }
 
 /// A leaf whose data is exactly 480 bytes serializes to 512 storage bytes,
@@ -135,6 +259,45 @@ fn encode_shamap_wire_node_tx_leaf_uses_with_meta_tag() {
     assert_eq!(&wire[..80], &data[..]);
     assert_eq!(&wire[80..112], &key[..]);
     assert_eq!(*wire.last().unwrap(), WIRE_TYPE_TX_WITH_META);
+}
+
+#[test]
+fn decode_store_record_for_wire_honors_explicit_node_type() {
+    let inner = std::iter::once(rxrpl_shamap::STORE_TAG_INNER)
+        .chain(std::iter::repeat_n(0xAB, 16 * 32))
+        .collect::<Vec<_>>();
+    let (is_inner, storage) = decode_store_record_for_wire(&inner).expect("inner record");
+    assert!(is_inner);
+    assert_eq!(storage.len(), 16 * 32);
+
+    let mut leaf = vec![rxrpl_shamap::STORE_TAG_LEAF];
+    leaf.extend_from_slice(&[0x11; 32]);
+    leaf.extend_from_slice(&[0x22; 480]);
+    let (is_inner, storage) = decode_store_record_for_wire(&leaf).expect("leaf record");
+    assert!(!is_inner);
+    assert_eq!(storage.len(), 32 + 480);
+}
+
+#[test]
+fn encode_store_record_with_prefix_matches_get_objects_wire() {
+    let mut inner = vec![rxrpl_shamap::STORE_TAG_INNER];
+    inner.extend_from_slice(&[0xAB; 16 * 32]);
+    let inner_blob = encode_store_record_with_prefix(&inner, 4).expect("inner blob");
+    assert_eq!(&inner_blob[..4], b"MIN\0");
+    assert_eq!(inner_blob.len(), 4 + 16 * 32);
+
+    let mut leaf = vec![rxrpl_shamap::STORE_TAG_LEAF];
+    leaf.extend_from_slice(&[0x11; 32]);
+    leaf.extend_from_slice(&[0x22; 3]);
+    let state_blob = encode_store_record_with_prefix(&leaf, 4).expect("state blob");
+    assert_eq!(&state_blob[..4], b"MLN\0");
+    assert_eq!(&state_blob[4..7], &[0x22; 3]);
+    assert_eq!(&state_blob[7..], &[0x11; 32]);
+
+    let tx_blob = encode_store_record_with_prefix(&leaf, OT_TRANSACTION_NODE).expect("tx blob");
+    assert_eq!(&tx_blob[..4], b"SND\0");
+    assert_eq!(&tx_blob[4..7], &[0x22; 3]);
+    assert_eq!(&tx_blob[7..], &[0x11; 32]);
 }
 
 #[test]
@@ -413,6 +576,34 @@ async fn peer_manager_get_ledger_unknown_returns_no_response() {
     }
 }
 
+struct SeqOnlyLedgerProvider;
+impl crate::ledger_provider::LedgerProvider for SeqOnlyLedgerProvider {
+    fn get_by_hash(&self, _: &Hash256) -> Option<rxrpl_ledger::Ledger> {
+        None
+    }
+    fn get_by_seq(&self, _: u32) -> Option<rxrpl_ledger::Ledger> {
+        Some(rxrpl_ledger::Ledger::genesis())
+    }
+    fn latest_closed(&self) -> Option<rxrpl_ledger::Ledger> {
+        Some(rxrpl_ledger::Ledger::genesis())
+    }
+}
+
+#[tokio::test]
+async fn peer_manager_get_ledger_does_not_substitute_sequence_for_hash() {
+    let (mut mgr, peer_id, mut rx) = make_test_peer_manager();
+    mgr.set_ledger_provider(Arc::new(SeqOnlyLedgerProvider));
+
+    let requested_hash = Hash256::new([0xAB; 32]);
+    let payload = proto_convert::encode_get_ledger(0, Some(&requested_hash), 1, 42);
+    mgr.handle_get_ledger(peer_id, &payload);
+
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
 #[tokio::test]
 async fn peer_manager_get_tx_set_unknown_returns_no_response() {
     let (mgr, peer_id, mut rx) = make_test_peer_manager();
@@ -431,6 +622,81 @@ async fn peer_manager_get_tx_set_unknown_returns_no_response() {
     }
 }
 
+#[test]
+fn send_get_tx_set_requests_root_node() {
+    let (mgr, peer_id, mut rx) = make_test_peer_manager();
+    let tx_set_hash = Hash256::new([0x44; 32]);
+
+    mgr.send_get_tx_set(peer_id, tx_set_hash);
+
+    let message = rx.try_recv().expect("candidate request");
+    assert_eq!(message.msg_type, MessageType::GetLedger);
+    let request = proto_convert::decode_get_ledger(&message.payload).expect("decode request");
+    assert_eq!(request.itype, LI_TS_CANDIDATE);
+    assert!(request.request_cookie.is_none());
+    assert_eq!(
+        request.node_ids,
+        vec![rxrpl_shamap::NodeId::ROOT.to_wire_bytes()]
+    );
+}
+
+#[test]
+fn handle_get_ledger_rejects_rippled_invalid_requests() {
+    use prost::Message;
+    use rxrpl_p2p_proto::proto::TmGetLedger;
+
+    for request in [
+        TmGetLedger {
+            itype: 99,
+            ltype: None,
+            ledger_hash: Some(vec![0x11; 32]),
+            ledger_seq: None,
+            node_ids: Vec::new(),
+            request_cookie: None,
+            query_type: None,
+            query_depth: None,
+        },
+        TmGetLedger {
+            itype: LI_AS_NODE,
+            ltype: None,
+            ledger_hash: Some(vec![0x11; 32]),
+            ledger_seq: None,
+            node_ids: Vec::new(),
+            request_cookie: None,
+            query_type: None,
+            query_depth: None,
+        },
+        TmGetLedger {
+            itype: LI_AS_NODE,
+            ltype: None,
+            ledger_hash: Some(vec![0x11; 32]),
+            ledger_seq: None,
+            node_ids: vec![vec![0; 32]],
+            request_cookie: None,
+            query_type: None,
+            query_depth: None,
+        },
+        TmGetLedger {
+            itype: LI_BASE,
+            ltype: None,
+            ledger_hash: None,
+            ledger_seq: None,
+            node_ids: Vec::new(),
+            request_cookie: None,
+            query_type: None,
+            query_depth: Some(1),
+        },
+    ] {
+        let (mut mgr, peer_id, mut rx) = make_test_peer_manager();
+        mgr.set_ledger_provider(Arc::new(GenesisLedgerProvider));
+        mgr.handle_get_ledger(peer_id, &request.encode_to_vec());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+}
+
 /// LedgerProvider that always returns the genesis ledger — lets us drive
 /// the liBASE response path of `handle_get_ledger`.
 struct GenesisLedgerProvider;
@@ -444,15 +710,56 @@ impl crate::ledger_provider::LedgerProvider for GenesisLedgerProvider {
     fn latest_closed(&self) -> Option<rxrpl_ledger::Ledger> {
         Some(rxrpl_ledger::Ledger::genesis())
     }
+
+    fn earliest_fetch(&self) -> Option<u32> {
+        Some(u32::MAX)
+    }
+}
+
+#[test]
+fn fetch_pack_query_rejects_ledger_before_earliest_available() {
+    use rxrpl_p2p_proto::proto::TmGetObjectByHash;
+
+    let (mut mgr, peer_id, mut rx) = make_test_peer_manager();
+    mgr.set_ledger_provider(Arc::new(GenesisLedgerProvider));
+    let genesis_hash = rxrpl_ledger::Ledger::genesis().header.hash;
+    mgr.handle_get_objects_query(
+        peer_id,
+        TmGetObjectByHash {
+            r#type: Some(6),
+            query: Some(true),
+            seq: None,
+            ledger_hash: Some(genesis_hash.as_bytes().to_vec()),
+            fat: None,
+            objects: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]
 async fn handle_get_ledger_propagates_cookie_when_present() {
+    use prost::Message;
+    use rxrpl_p2p_proto::proto::TmGetLedger;
+
     let (mut mgr, peer_id, mut rx) = make_test_peer_manager();
     mgr.set_ledger_provider(Arc::new(GenesisLedgerProvider));
 
     // liBASE request (itype=0) with explicit cookie 123.
-    let payload = proto_convert::encode_get_ledger(0, None, 0, 123);
+    let payload = TmGetLedger {
+        itype: LI_BASE,
+        ltype: Some(2),
+        ledger_hash: None,
+        ledger_seq: None,
+        node_ids: Vec::new(),
+        request_cookie: Some(123),
+        query_type: None,
+        query_depth: None,
+    }
+    .encode_to_vec();
     mgr.handle_get_ledger(peer_id, &payload);
 
     let msg = rx.try_recv().expect("expected TMLedgerData response");
@@ -463,11 +770,24 @@ async fn handle_get_ledger_propagates_cookie_when_present() {
 
 #[tokio::test]
 async fn handle_get_ledger_omits_cookie_when_absent_in_request() {
+    use prost::Message;
+    use rxrpl_p2p_proto::proto::TmGetLedger;
+
     let (mut mgr, peer_id, mut rx) = make_test_peer_manager();
     mgr.set_ledger_provider(Arc::new(GenesisLedgerProvider));
 
     // liBASE request with no cookie (encode_get_ledger drops cookie==0).
-    let payload = proto_convert::encode_get_ledger(0, None, 0, 0);
+    let payload = TmGetLedger {
+        itype: LI_BASE,
+        ltype: Some(2),
+        ledger_hash: None,
+        ledger_seq: None,
+        node_ids: Vec::new(),
+        request_cookie: None,
+        query_type: None,
+        query_depth: None,
+    }
+    .encode_to_vec();
     mgr.handle_get_ledger(peer_id, &payload);
 
     let msg = rx.try_recv().expect("expected TMLedgerData response");
@@ -478,6 +798,106 @@ async fn handle_get_ledger_omits_cookie_when_absent_in_request() {
         "cookie must be absent on wire when source request had no cookie; \
              rippled drops payload with set-but-unknown cookie via 'Unable to route'"
     );
+}
+
+struct RootLedgerProvider;
+impl crate::ledger_provider::LedgerProvider for RootLedgerProvider {
+    fn get_by_hash(&self, _hash: &Hash256) -> Option<rxrpl_ledger::Ledger> {
+        Some(Self::ledger())
+    }
+
+    fn get_by_seq(&self, _seq: u32) -> Option<rxrpl_ledger::Ledger> {
+        Some(Self::ledger())
+    }
+
+    fn latest_closed(&self) -> Option<rxrpl_ledger::Ledger> {
+        Some(Self::ledger())
+    }
+}
+
+impl RootLedgerProvider {
+    fn ledger() -> rxrpl_ledger::Ledger {
+        let mut genesis = rxrpl_ledger::Ledger::genesis();
+        genesis
+            .state_map
+            .put(Hash256::new([0x11; 32]), vec![0x22, 0x33])
+            .expect("state leaf");
+        genesis
+            .tx_map
+            .put(Hash256::new([0x44; 32]), vec![0x55, 0x66])
+            .expect("transaction leaf");
+        genesis.close(10, 0).expect("close ledger");
+        genesis
+    }
+}
+
+#[test]
+fn handle_get_ledger_base_includes_nonempty_map_roots() {
+    use prost::Message;
+    use rxrpl_p2p_proto::proto::TmGetLedger;
+
+    let (mut mgr, peer_id, mut rx) = make_test_peer_manager();
+    mgr.set_ledger_provider(Arc::new(RootLedgerProvider));
+
+    let request = TmGetLedger {
+        itype: LI_BASE,
+        ltype: Some(2),
+        ledger_hash: None,
+        ledger_seq: None,
+        node_ids: Vec::new(),
+        request_cookie: None,
+        query_type: None,
+        query_depth: None,
+    };
+    mgr.handle_get_ledger(peer_id, &request.encode_to_vec());
+
+    let msg = rx.try_recv().expect("expected TMLedgerData response");
+    let decoded = proto_convert::decode_ledger_data(&msg.payload).expect("decode response");
+    assert_eq!(decoded.nodes.len(), 3, "header plus state and tx roots");
+    assert!(decoded.nodes[0].nodeid.is_none());
+    assert!(decoded.nodes[1].nodeid.is_none());
+    assert!(decoded.nodes[2].nodeid.is_none());
+
+    let header = rxrpl_ledger::LedgerHeader::from_raw_bytes(
+        decoded.nodes[0].nodedata.as_deref().expect("header bytes"),
+    )
+    .expect("header");
+    for node in decoded.nodes.iter().skip(1) {
+        let wire = node.nodedata.as_deref().expect("root bytes");
+        let (hash, _storage) = crate::ledger_sync::decode_wire_node(wire).expect("root wire");
+        assert!(hash == header.account_hash || hash == header.tx_hash);
+    }
+}
+
+#[test]
+fn tx_set_pending_request_survives_empty_or_mismatched_response() {
+    let (mut mgr, mut consensus_rx) = make_test_peer_manager_with_consensus();
+    let requested = Hash256::new([0xA1; 32]);
+    mgr.pending_tx_set_fetches.insert(requested);
+
+    mgr.handle_tx_set_response(requested, &[]);
+    assert!(mgr.pending_tx_set_fetches.contains(&requested));
+    assert!(matches!(
+        consensus_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    let blob = vec![0x10, 0x20, 0x30];
+    let prefix = rxrpl_crypto::hash_prefix::HashPrefix::TRANSACTION_ID.to_bytes();
+    let tx_id = rxrpl_crypto::sha512_half::sha512_half(&[&prefix, &blob]);
+    let expected = TxSet::from_items(vec![(tx_id, blob.clone())]).hash;
+    let mut wire = blob;
+    wire.push(WIRE_TYPE_TX_NO_META);
+    mgr.pending_tx_set_fetches.insert(expected);
+    mgr.handle_tx_set_response(
+        expected,
+        &[(rxrpl_shamap::NodeId::ROOT.to_wire_bytes(), wire)],
+    );
+    assert!(!mgr.pending_tx_set_fetches.contains(&expected));
+    assert!(matches!(
+        consensus_rx.try_recv(),
+        Ok(ConsensusMessage::TxSetAcquired(set)) if set.hash == expected
+    ));
 }
 
 #[test]
@@ -499,6 +919,99 @@ fn ledger_data_round_trip_preserves_node_payload() {
     assert_eq!(decoded.ledger_seq, 12345);
     assert_eq!(decoded.ledger_info_type, 1);
     assert_eq!(decoded.request_cookie, Some(99));
+}
+
+#[test]
+fn malformed_ledger_data_hash_is_rejected_before_slicing() {
+    use prost::Message;
+
+    let (mut mgr, peer_id, mut rx) = make_test_peer_manager();
+    let hash = Hash256::new([0x11; 32]);
+    let valid =
+        proto_convert::encode_ledger_data(&hash, 12345, 0, vec![(vec![], vec![0x42])], None);
+    let mut message = rxrpl_p2p_proto::proto::TmLedgerData::decode(valid.as_slice()).unwrap();
+    message.ledger_hash = vec![0x01];
+    let malformed = message.encode_to_vec();
+
+    mgr.dispatch_message(peer_id, MessageType::LedgerData, &malformed);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn ledger_node_wire_validation_checks_id_and_payload() {
+    let inner_wire = vec![0x11; 16 * 32]
+        .into_iter()
+        .chain(std::iter::once(WIRE_TYPE_INNER))
+        .collect::<Vec<_>>();
+    assert!(ledger_node_wire_is_valid(
+        &rxrpl_shamap::NodeId::ROOT.to_wire_bytes(),
+        &inner_wire
+    ));
+
+    let key = Hash256::new([0xA0; 32]);
+    let mut leaf_wire = vec![0x22; 3];
+    leaf_wire.extend_from_slice(key.as_bytes());
+    leaf_wire.push(WIRE_TYPE_ACCOUNT_STATE);
+    let leaf_id = rxrpl_shamap::NodeId::new(64, &key).to_wire_bytes();
+    assert!(ledger_node_wire_is_valid(&leaf_id, &leaf_wire));
+
+    let mut noncanonical_id = leaf_id.clone();
+    noncanonical_id[0] = 0xA1;
+    assert!(!ledger_node_wire_is_valid(&noncanonical_id, &leaf_wire));
+
+    let mut invalid_wire = leaf_wire;
+    *invalid_wire.last_mut().unwrap() = 0x7F;
+    assert!(!ledger_node_wire_is_valid(&leaf_id, &invalid_wire));
+}
+
+#[test]
+fn ledger_data_rejects_hash_not_matching_active_ledger() {
+    let (mut mgr, mut consensus_rx) = make_test_peer_manager_with_consensus();
+    let expected = Hash256::new([0x11; 32]);
+    let actual = Hash256::new([0x22; 32]);
+    mgr.ledger_syncer.set_ledger_hash(7, expected);
+
+    let node_data = vec![0u8; 16 * 32]
+        .into_iter()
+        .chain(std::iter::once(WIRE_TYPE_INNER))
+        .collect::<Vec<_>>();
+    let payload = proto_convert::encode_ledger_data(
+        &actual,
+        7,
+        LI_AS_NODE,
+        vec![(rxrpl_shamap::NodeId::ROOT.to_wire_bytes(), node_data)],
+        None,
+    );
+    mgr.dispatch_message(Hash256::new([0xAB; 32]), MessageType::LedgerData, &payload);
+    assert!(matches!(
+        consensus_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn ledger_data_node_does_not_retire_base_request() {
+    let (mut mgr, _consensus_rx) = make_test_peer_manager_with_consensus();
+    let expected = Hash256::new([0x21; 32]);
+    mgr.ledger_syncer.register_request(7, Some(expected));
+    mgr.ledger_syncer.set_ledger_hash(7, expected);
+
+    let node_data = vec![0u8; 16 * 32]
+        .into_iter()
+        .chain(std::iter::once(WIRE_TYPE_INNER))
+        .collect::<Vec<_>>();
+    let payload = proto_convert::encode_ledger_data(
+        &expected,
+        7,
+        LI_AS_NODE,
+        vec![(rxrpl_shamap::NodeId::ROOT.to_wire_bytes(), node_data)],
+        None,
+    );
+    mgr.dispatch_message(Hash256::new([0xAC; 32]), MessageType::LedgerData, &payload);
+    assert_eq!(mgr.ledger_syncer.pending_count(), 1);
 }
 
 /// B2: when a local manifest is set, `send_local_manifest_to(peer)`
@@ -829,6 +1342,34 @@ async fn validation_dispatch_offloads_signature_verify() {
 }
 
 #[tokio::test]
+async fn validation_dispatch_rejects_ed25519_consensus_validation() {
+    use prost::Message;
+
+    let (mut mgr, mut consensus_rx) = make_test_peer_manager_with_consensus();
+    let mut stobj = Vec::new();
+    crate::stobject::put_uint32(&mut stobj, 2, 0x80000001);
+    crate::stobject::put_uint32(&mut stobj, 6, 42);
+    crate::stobject::put_uint32(&mut stobj, 9, 770_000_001);
+    crate::stobject::put_hash256(&mut stobj, 1, &[0xCD; 32]);
+    crate::stobject::put_vl(&mut stobj, 3, &[0xED; 33]);
+
+    let payload = rxrpl_p2p_proto::proto::TmValidation {
+        validation: Some(stobj),
+    }
+    .encode_to_vec();
+    mgr.dispatch_message(Hash256::new([0xAB; 32]), MessageType::Validation, &payload);
+
+    assert!(consensus_rx.try_recv().is_err());
+    assert!(
+        mgr.validation_verify_rx
+            .as_mut()
+            .unwrap()
+            .try_recv()
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn validation_offload_removes_verify_from_event_loop() {
     // The event loop's per-validation cost drops from "decode + verify" to
     // "decode + enqueue": the signature verify now runs on the worker. This
@@ -859,4 +1400,103 @@ async fn validation_offload_removes_verify_from_event_loop() {
         offload < inline,
         "offloading the verify must make the event-loop path cheaper: offload={offload:?} inline={inline:?}"
     );
+}
+
+fn unsigned_test_proposal(identity: &crate::identity::NodeIdentity) -> Proposal {
+    Proposal {
+        node_id: rxrpl_consensus::types::NodeId(identity.node_id),
+        public_key: identity.public_key_bytes().to_vec(),
+        tx_set_hash: Hash256::new([0x11; 32]),
+        close_time: 100,
+        prop_seq: 1,
+        ledger_seq: 2,
+        prev_ledger: Hash256::new([0x22; 32]),
+        signature: None,
+    }
+}
+
+#[tokio::test]
+async fn propose_set_dispatch_rejects_unsigned_proposal() {
+    let identity = crate::identity::NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase(
+        "unsigned-proposal",
+    ));
+    let proposal = unsigned_test_proposal(&identity);
+    let payload = proto_convert::encode_propose_set(&proposal);
+    let (mut mgr, mut consensus_rx) = make_test_peer_manager_with_consensus();
+
+    mgr.dispatch_message(Hash256::new([0xAB; 32]), MessageType::ProposeSet, &payload);
+
+    assert!(consensus_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn propose_set_dispatch_rejects_invalid_signature() {
+    let identity = crate::identity::NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase(
+        "invalid-proposal",
+    ));
+    let mut proposal = unsigned_test_proposal(&identity);
+    identity.sign_proposal(&mut proposal);
+    proposal.signature.as_mut().unwrap()[0] ^= 1;
+    let payload = proto_convert::encode_propose_set(&proposal);
+    let (mut mgr, mut consensus_rx) = make_test_peer_manager_with_consensus();
+
+    mgr.dispatch_message(Hash256::new([0xAB; 32]), MessageType::ProposeSet, &payload);
+
+    assert!(consensus_rx.try_recv().is_err());
+}
+
+#[test]
+fn propose_set_authentication_rejects_valid_ed25519_key() {
+    let key_pair = rxrpl_crypto::KeyPair::from_seed(
+        &rxrpl_crypto::Seed::from_passphrase("ed25519-proposal"),
+        rxrpl_crypto::KeyType::Ed25519,
+    );
+    let mut proposal = Proposal {
+        node_id: rxrpl_consensus::types::NodeId::from_public_key(key_pair.public_key.as_bytes()),
+        public_key: key_pair.public_key.as_bytes().to_vec(),
+        tx_set_hash: Hash256::new([0x11; 32]),
+        close_time: 100,
+        prop_seq: 1,
+        ledger_seq: 2,
+        prev_ledger: Hash256::new([0x22; 32]),
+        signature: None,
+    };
+    proposal.sign(&key_pair.private_key, rxrpl_crypto::KeyType::Ed25519);
+
+    assert!(proposal.verify(&proposal.public_key));
+    assert!(!proposal_is_authenticated(&proposal));
+}
+
+#[test]
+fn propose_set_authentication_rejects_node_id_key_mismatch() {
+    let identity = crate::identity::NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase(
+        "mismatched-proposal",
+    ));
+    let mut proposal = unsigned_test_proposal(&identity);
+    identity.sign_proposal(&mut proposal);
+    proposal.node_id = rxrpl_consensus::types::NodeId(Hash256::new([0xEE; 32]));
+
+    assert!(!proposal_is_authenticated(&proposal));
+}
+
+#[tokio::test]
+async fn propose_set_dispatch_forwards_only_a_validly_signed_proposal() {
+    let identity = crate::identity::NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase(
+        "valid-proposal",
+    ));
+    let mut proposal = unsigned_test_proposal(&identity);
+    identity.sign_proposal(&mut proposal);
+    let payload = proto_convert::encode_propose_set(&proposal);
+    let (mut mgr, mut consensus_rx) = make_test_peer_manager_with_consensus();
+
+    mgr.dispatch_message(Hash256::new([0xAB; 32]), MessageType::ProposeSet, &payload);
+
+    match consensus_rx.try_recv() {
+        Ok(ConsensusMessage::Proposal(received)) => {
+            assert_eq!(received.node_id, proposal.node_id);
+            assert_eq!(received.public_key, proposal.public_key);
+            assert_eq!(received.signature, proposal.signature);
+        }
+        _ => panic!("expected authenticated proposal"),
+    }
 }

@@ -12,17 +12,19 @@ tls_enabled = false
 
 [database]
 path = "/var/lib/rxrpl/data"
-backend = "memory"
-online_delete = 256
+# A validator must retain its SHAMap nodes across a crash/rejoin. Memory is
+# useful for unit tests but cannot serve historical ledgers after restart.
+backend = "rocksdb"
+online_delete = 0
 
 [validators]
 enabled = true
 trusted = ["n9KXX4mAWwFeEBemh5Kg4e4o41pcmmhrCGFycMSdLx3yFSXZyvyf", "n9Ki1vBTxo26iszNVRoGK1nFMsrfx68xnYcrBEUY62XsgHM7FCM5", "n9KXHLvP8vsxhNLNFKxUDqziUMbqoLikk3Y2jHh1dnaqMCb3gnn4", "n9Lc8w5xK1kJE4AiHX9kvDQF6shMBWoz8pEXp95xRo227ZMnUPt2", "n9J5N9HSH3cYmJmJDxjq3JPwxFDo62CakvCCZkjn2crcgxs3dztj"]
-quorum = 2
+quorum = 4
 
 [validator_identity]
 master_secret = "sEdVZKfQYfinxEpnzyLmQZfSYNV2teD"
-ephemeral_seed = "sEdVZKfQYfinxEpnzyLmQZfSYNV2teD"
+ephemeral_seed = "FFEEDDCCBBAA99887766554433221100"
 
 [network]
 network_id = 99

@@ -51,9 +51,33 @@ pub fn decode_propose_set(data: &[u8]) -> Result<Proposal, OverlayError> {
         .map_err(|e| OverlayError::Codec(format!("decode ProposeSet: {e}")))?;
 
     let pubkey_bytes = msg.node_pub_key.unwrap_or_default();
+    let public_key = rxrpl_primitives::PublicKey::from_slice(&pubkey_bytes).map_err(|_| {
+        OverlayError::Codec("ProposeSet requires a compressed secp256k1 key".into())
+    })?;
+    if !public_key.is_secp256k1() {
+        return Err(OverlayError::Codec(
+            "ProposeSet requires a compressed secp256k1 key".into(),
+        ));
+    }
+    let signature = msg
+        .signature
+        .ok_or_else(|| OverlayError::Codec("ProposeSet requires a signature".into()))?;
+    if !(64..=72).contains(&signature.len()) {
+        return Err(OverlayError::Codec(
+            "ProposeSet signature must be 64 to 72 bytes".into(),
+        ));
+    }
     let node_id = NodeId(rxrpl_crypto::sha512_half::sha512_half(&[&pubkey_bytes]));
-    let tx_set_hash = hash256_from_bytes(&msg.current_tx_hash.unwrap_or_default())?;
-    let prev_ledger = hash256_from_bytes(&msg.previousledger.unwrap_or_default())?;
+    let tx_set_hash = strict_hash256_from_bytes(
+        msg.current_tx_hash
+            .as_deref()
+            .ok_or_else(|| OverlayError::Codec("ProposeSet requires current_tx_hash".into()))?,
+    )?;
+    let prev_ledger = strict_hash256_from_bytes(
+        msg.previousledger
+            .as_deref()
+            .ok_or_else(|| OverlayError::Codec("ProposeSet requires previousledger".into()))?,
+    )?;
 
     Ok(Proposal {
         node_id,
@@ -63,10 +87,7 @@ pub fn decode_propose_set(data: &[u8]) -> Result<Proposal, OverlayError> {
         prop_seq: msg.propose_seq.unwrap_or(0),
         ledger_seq: 0,
         prev_ledger,
-        signature: {
-            let sig = msg.signature.unwrap_or_default();
-            if sig.is_empty() { None } else { Some(sig) }
-        },
+        signature: Some(signature),
     })
 }
 
@@ -116,11 +137,7 @@ pub fn encode_validation(validation: &Validation, public_key: &[u8]) -> Vec<u8> 
         stobj.extend_from_slice(&stripped[split..]);
     } else {
         // Legacy 5-field fallback. Matches the pre-T09 byte image.
-        let flags: u32 = if validation.full {
-            0x80000001
-        } else {
-            0x00000000
-        };
+        let flags = 0x8000_0000 | u32::from(validation.full);
         stobject::put_uint32(&mut stobj, 2, flags);
         stobject::put_uint32(&mut stobj, 6, validation.ledger_seq);
         stobject::put_uint32(&mut stobj, 9, validation.sign_time);
@@ -226,7 +243,12 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
     let msg = TmValidation::decode(data)
         .map_err(|e| OverlayError::Codec(format!("decode Validation: {e}")))?;
 
-    let payload = msg.validation.unwrap_or_default();
+    let payload = msg
+        .validation
+        .ok_or_else(|| OverlayError::Codec("Validation STObject is missing".into()))?;
+    if payload.is_empty() {
+        return Err(OverlayError::Codec("Validation STObject is empty".into()));
+    }
 
     // H9: reject grossly oversized payloads up front (peer-controlled).
     // We use a factor-of-2 leniency over MAX_STVALIDATION_BYTES so that
@@ -254,6 +276,12 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
     // "no opinion on close time" sentinel that engine::eff_close_time
     // pattern-matches on). See H13.
     let mut seen_close_time = false;
+    let mut seen_flags = false;
+    let mut seen_ledger_hash = false;
+    let mut seen_ledger_sequence = false;
+    let mut seen_signing_time = false;
+    let mut seen_signing_pub_key = false;
+    let mut seen_signature = false;
     // Track the canonical sort key of the previous field so we can enforce
     // strict `(type_code << 16) | field_code` ascending order. This mirrors
     // rippled's `STObject::checkSorting` (src/libxrpl/protocol/STObject.cpp),
@@ -281,6 +309,21 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
         last_key = Some(key);
         pos += hdr_len;
 
+        let allowed = match type_id {
+            2 => matches!(field_id, 2 | 6 | 7 | 9 | 24 | 31 | 32),
+            3 => matches!(field_id, 5 | 10 | 11),
+            5 => matches!(field_id, 1 | 23 | 25),
+            6 => matches!(field_id, 22..=24),
+            7 => matches!(field_id, 3 | 6),
+            19 => field_id == 3,
+            _ => false,
+        };
+        if !allowed {
+            return Err(OverlayError::Codec(format!(
+                "field ({type_id},{field_id}) is not allowed in TMValidation"
+            )));
+        }
+
         // Decode the value and advance `pos` past it. We dispatch on
         // type_id and use the matching stobject helper. The total
         // bytes consumed for this field (header + value, including any
@@ -293,13 +336,22 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
                 let (v, consumed) = stobject::decode_uint32(&payload[pos..])
                     .ok_or_else(|| OverlayError::Codec("truncated UINT32".into()))?;
                 match field_id {
-                    2 => validation.full = (v & 0x80000001) == 0x80000001,
-                    6 => validation.ledger_seq = v,
+                    2 => {
+                        validation.full = (v & 0x80000001) == 0x80000001;
+                        seen_flags = true;
+                    }
+                    6 => {
+                        validation.ledger_seq = v;
+                        seen_ledger_sequence = true;
+                    }
                     7 => {
                         validation.close_time = v;
                         seen_close_time = true;
                     }
-                    9 => validation.sign_time = v,
+                    9 => {
+                        validation.sign_time = v;
+                        seen_signing_time = true;
+                    }
                     24 => validation.load_fee = Some(v),
                     31 => validation.reserve_base = Some(v),
                     32 => validation.reserve_increment = Some(v),
@@ -325,7 +377,10 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
                     .ok_or_else(|| OverlayError::Codec("truncated UINT256".into()))?;
                 let hash = Hash256::new(h);
                 match field_id {
-                    1 => validation.ledger_hash = hash,
+                    1 => {
+                        validation.ledger_hash = hash;
+                        seen_ledger_hash = true;
+                    }
                     23 => validation.consensus_hash = Some(hash),
                     25 => validation.validated_hash = Some(hash),
                     _ => {}
@@ -351,12 +406,15 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
                 let (bytes, consumed) = stobject::decode_vl(&payload[pos..])
                     .ok_or_else(|| OverlayError::Codec("invalid VL Blob".into()))?;
                 match field_id {
-                    3 => signing_pub_key = bytes,
-                    6 => validation.signature = Some(bytes),
-                    // 18 (sfMasterSignature) is intentionally not stored
-                    // by `Validation`; we still consume it and exclude
-                    // it from the signing payload below.
-                    _ => {}
+                    3 => {
+                        signing_pub_key = bytes;
+                        seen_signing_pub_key = true;
+                    }
+                    6 => {
+                        validation.signature = Some(bytes);
+                        seen_signature = true;
+                    }
+                    _ => unreachable!("TMValidation VL field allow-list checked above"),
                 }
                 pos + consumed
             }
@@ -369,16 +427,7 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
                 }
                 pos + consumed
             }
-            // Unknown type — we cannot determine its length, so we cannot
-            // continue parsing safely. Stop and keep what we already have.
-            _ => {
-                tracing::debug!(
-                    "decode_validation: unknown STObject type_id={} field_id={}, stopping parse",
-                    type_id,
-                    field_id
-                );
-                break;
-            }
+            _ => unreachable!("TMValidation field allow-list checked above"),
         };
 
         // Append this field's full bytes (header + VL prefix + value) to
@@ -401,6 +450,27 @@ pub fn decode_validation(data: &[u8]) -> Result<Validation, OverlayError> {
     };
     validation.node_id = node_id;
     validation.public_key = signing_pub_key;
+    let public_key =
+        rxrpl_primitives::PublicKey::from_slice(&validation.public_key).map_err(|_| {
+            OverlayError::Codec("Validation requires a compressed secp256k1 key".into())
+        })?;
+    if !public_key.is_secp256k1() {
+        return Err(OverlayError::Codec(
+            "Validation requires a compressed secp256k1 key".into(),
+        ));
+    }
+    if !seen_flags
+        || !seen_ledger_hash
+        || !seen_ledger_sequence
+        || !seen_signing_time
+        || !seen_signing_pub_key
+        || !seen_signature
+        || validation.signature.as_ref().is_none_or(Vec::is_empty)
+    {
+        return Err(OverlayError::Codec(
+            "Validation is missing a required STValidation field".into(),
+        ));
+    }
     validation.signing_payload = Some(signing_payload);
     // Fall back to `sign_time` ONLY when sfCloseTime was absent on the
     // wire. A field that was present-but-zero is the rippled "no
@@ -618,7 +688,10 @@ pub fn encode_ledger_data(
         nodes: nodes
             .into_iter()
             .map(|(id, data)| TmLedgerNode {
-                nodeid: Some(id),
+                // liBASE carries the header without a SHAMap node id. An
+                // empty protobuf bytes field is not equivalent on the
+                // rippled wire: nodeid must be absent in that case.
+                nodeid: (!id.is_empty()).then_some(id),
                 nodedata: Some(data),
             })
             .collect(),
@@ -800,9 +873,9 @@ pub fn encode_get_objects_response(
     let msg = TmGetObjectByHash {
         r#type: Some(object_type),
         query: Some(false),
-        seq: Some(ledger_seq),
+        seq: None,
         ledger_hash: ledger_hash.map(|h| h.as_bytes().to_vec()),
-        fat: Some(false),
+        fat: None,
         objects: indexed,
     };
     msg.encode_to_vec()
@@ -877,7 +950,7 @@ pub fn encode_fetch_pack_response(
         query: Some(false),
         seq: None,
         ledger_hash: Some(requested_ledger_hash.as_bytes().to_vec()),
-        fat: Some(false),
+        fat: None,
         objects: indexed,
     };
     msg.encode_to_vec()
@@ -987,6 +1060,13 @@ fn hash256_from_bytes(bytes: &[u8]) -> Result<Hash256, OverlayError> {
     Ok(Hash256::new(arr))
 }
 
+fn strict_hash256_from_bytes(bytes: &[u8]) -> Result<Hash256, OverlayError> {
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| OverlayError::Codec("invalid hash256 length".into()))?;
+    Ok(Hash256::new(arr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1018,6 +1098,126 @@ mod tests {
         assert_eq!(decoded.ledger_seq, 0); // ledger_seq removed from proto
         assert_eq!(decoded.prev_ledger, proposal.prev_ledger);
         assert_eq!(decoded.signature, proposal.signature);
+    }
+
+    #[test]
+    fn propose_set_rejects_non_secp256k1_key() {
+        let proposal = TmProposeSet {
+            node_pub_key: Some(vec![0xED; 33]),
+            current_tx_hash: Some(vec![0x11; 32]),
+            previousledger: Some(vec![0x22; 32]),
+            ..Default::default()
+        };
+
+        let err = decode_propose_set(&proposal.encode_to_vec()).unwrap_err();
+        assert!(err.to_string().contains("secp256k1"));
+    }
+
+    #[test]
+    fn propose_set_rejects_missing_or_malformed_signature() {
+        let base = TmProposeSet {
+            node_pub_key: Some(vec![0x02; 33]),
+            current_tx_hash: Some(vec![0x11; 32]),
+            previousledger: Some(vec![0x22; 32]),
+            ..Default::default()
+        };
+
+        for signature in [None, Some(vec![0; 63]), Some(vec![0; 73])] {
+            let mut proposal = base.clone();
+            proposal.signature = signature;
+            assert!(decode_propose_set(&proposal.encode_to_vec()).is_err());
+        }
+    }
+
+    #[test]
+    fn propose_set_rejects_noncanonical_hash_lengths() {
+        for length in [0usize, 31, 33, 64] {
+            let proposal = TmProposeSet {
+                node_pub_key: Some(vec![0x02; 33]),
+                current_tx_hash: Some(vec![0x11; length]),
+                previousledger: Some(vec![0x22; 32]),
+                signature: Some(vec![0xAA; 64]),
+                ..Default::default()
+            };
+            assert!(decode_propose_set(&proposal.encode_to_vec()).is_err());
+        }
+    }
+
+    #[test]
+    fn validation_rejects_non_secp256k1_key() {
+        use crate::stobject;
+
+        let mut stobj = Vec::new();
+        stobject::put_uint32(&mut stobj, 2, 0x80000001);
+        stobject::put_uint32(&mut stobj, 6, 42);
+        stobject::put_uint32(&mut stobj, 9, 770_000_001);
+        stobject::put_hash256(&mut stobj, 1, &[0xCD; 32]);
+        stobject::put_vl(&mut stobj, 3, &[0xED; 33]);
+
+        let wire = TmValidation {
+            validation: Some(stobj),
+        }
+        .encode_to_vec();
+
+        let err = decode_validation(&wire).unwrap_err();
+        assert!(err.to_string().contains("secp256k1"));
+    }
+
+    #[test]
+    fn validation_rejects_missing_signature() {
+        use crate::stobject;
+
+        let mut stobj = Vec::new();
+        stobject::put_uint32(&mut stobj, 2, 0x80000001);
+        stobject::put_uint32(&mut stobj, 6, 42);
+        stobject::put_uint32(&mut stobj, 9, 770_000_001);
+        stobject::put_hash256(&mut stobj, 1, &[0xCD; 32]);
+        stobject::put_vl(&mut stobj, 3, &[0x02; 33]);
+
+        let wire = TmValidation {
+            validation: Some(stobj),
+        }
+        .encode_to_vec();
+        let err = decode_validation(&wire).unwrap_err();
+        assert!(err.to_string().contains("required STValidation field"));
+    }
+
+    #[test]
+    fn validation_rejects_master_signature_and_unknown_fields() {
+        use crate::stobject;
+
+        let mut with_master_signature = Vec::new();
+        stobject::put_uint32(&mut with_master_signature, 2, 0x80000001);
+        stobject::put_uint32(&mut with_master_signature, 6, 42);
+        stobject::put_uint32(&mut with_master_signature, 9, 770_000_001);
+        stobject::put_hash256(&mut with_master_signature, 1, &[0xCD; 32]);
+        stobject::put_vl(&mut with_master_signature, 3, &[0x02; 33]);
+        stobject::put_vl(&mut with_master_signature, 18, &[0xAA; 64]);
+        let master_err = decode_validation(
+            &TmValidation {
+                validation: Some(with_master_signature),
+            }
+            .encode_to_vec(),
+        )
+        .unwrap_err();
+        assert!(master_err.to_string().contains("not allowed"));
+
+        let mut with_unknown = Vec::new();
+        stobject::put_uint32(&mut with_unknown, 2, 0x80000001);
+        stobject::put_uint32(&mut with_unknown, 6, 42);
+        stobject::put_uint32(&mut with_unknown, 9, 770_000_001);
+        stobject::put_uint32(&mut with_unknown, 33, 1);
+        stobject::put_hash256(&mut with_unknown, 1, &[0xCD; 32]);
+        stobject::put_vl(&mut with_unknown, 3, &[0x02; 33]);
+        stobject::put_vl(&mut with_unknown, 6, &[0xAA; 64]);
+        let unknown_err = decode_validation(
+            &TmValidation {
+                validation: Some(with_unknown),
+            }
+            .encode_to_vec(),
+        )
+        .unwrap_err();
+        assert!(unknown_err.to_string().contains("not allowed"));
     }
 
     #[test]
@@ -1178,6 +1378,16 @@ mod tests {
     }
 
     #[test]
+    fn ledger_data_base_header_omits_empty_node_id() {
+        let hash = Hash256::new([0x0D; 32]);
+        let encoded = encode_ledger_data(&hash, 1, 0, vec![(vec![], vec![1, 2, 3])], None);
+        let decoded = decode_ledger_data(&encoded).unwrap();
+        assert_eq!(decoded.nodes.len(), 1);
+        assert!(decoded.nodes[0].nodeid.is_none());
+        assert_eq!(decoded.nodes[0].nodedata.as_deref(), Some(&[1, 2, 3][..]));
+    }
+
+    #[test]
     fn encode_ledger_data_preserves_explicit_cookie() {
         let hash = Hash256::new([0x0D; 32]);
         let bytes = encode_ledger_data(&hash, 1, 0, vec![], Some(42));
@@ -1223,7 +1433,8 @@ mod tests {
 
         assert_eq!(decoded.query, Some(false));
         assert_eq!(decoded.r#type, Some(OT_LEDGER_NODE));
-        assert_eq!(decoded.seq, Some(100));
+        assert_eq!(decoded.seq, None);
+        assert_eq!(decoded.fat, None);
         assert_eq!(
             decoded.ledger_hash.as_deref().unwrap_or(&[]),
             ledger_hash.as_bytes()
@@ -1247,7 +1458,8 @@ mod tests {
         let decoded = decode_get_objects(&encoded).unwrap();
 
         assert_eq!(decoded.query, Some(false));
-        assert_eq!(decoded.seq, Some(50));
+        assert_eq!(decoded.seq, None);
+        assert_eq!(decoded.fat, None);
         assert!(decoded.objects.is_empty());
     }
 
@@ -1471,6 +1683,7 @@ mod tests {
         stobject::put_uint32(&mut stobj, 9, 770_000_001); // sfSigningTime
         stobject::put_hash256(&mut stobj, 1, &[0xCD; 32]); // sfLedgerHash
         stobject::put_vl(&mut stobj, 3, &[0x02u8; 33]); // sfSigningPubKey
+        stobject::put_vl(&mut stobj, 6, &[0xAA; 64]); // sfSignature
 
         let msg = TmValidation {
             validation: Some(stobj),
@@ -1507,6 +1720,7 @@ mod tests {
         stobject::put_uint32(&mut stobj, 9, 770_000_001); // sfSigningTime
         stobject::put_hash256(&mut stobj, 1, &[0xCD; 32]); // sfLedgerHash
         stobject::put_vl(&mut stobj, 3, &[0x02u8; 33]); // sfSigningPubKey
+        stobject::put_vl(&mut stobj, 6, &[0xAA; 64]); // sfSignature
 
         let msg = TmValidation {
             validation: Some(stobj),
