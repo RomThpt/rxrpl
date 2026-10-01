@@ -1145,7 +1145,7 @@ impl PeerManager {
                                 // Kick the tip now so we don't wait for the next
                                 // check_sync tick; check_sync re-targets to max_peer_seq.
                                 if !self.ledger_syncer.has_any_incremental_sync() {
-                                    self.send_get_ledger(ledger_seq, None);
+                                    self.send_get_ledger(ledger_seq, Some(ledger_hash));
                                 }
                             } else {
                                 let requests =
@@ -1395,10 +1395,12 @@ impl PeerManager {
                         // the base pending entry makes a node-only response
                         // look like a completed header request.
                         if info_type == LI_BASE {
-                            if !self
-                                .ledger_syncer
-                                .response_matches_base(ledger_seq, hash, from)
-                            {
+                            if !self.ledger_syncer.response_matches_base(
+                                ledger_seq,
+                                hash,
+                                from,
+                                msg.request_cookie,
+                            ) {
                                 tracing::warn!(
                                     "rejecting LedgerData from {} with unexpected hash {} for seq {}",
                                     from,
@@ -3178,6 +3180,7 @@ impl PeerManager {
                     payload,
                 }) {
                     Ok(_) => {
+                        self.ledger_syncer.mark_request_sent(seq, Some(node_id));
                         tracing::info!(
                             "sent GetLedger seq={} hash={} itype=liBASE to {}",
                             seq,
