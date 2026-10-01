@@ -639,3 +639,15 @@ The successful run proves this maintained 3.1.3 sync topology only. Full amendme
 Pending requests were keyed by sequence and optional ledger hash only. After timeout retirement, a fresh request for the same sequence could accept a late response from the peer serving the old generation. The syncer now tracks a local generation and direct peer affinity; the request sender rotates to a different ranked peer when available, and inbound liBASE checks the source peer before consuming the pending request. Focused lifecycle/peer-manager tests and overlay all-targets pass.
 
 When only one peer is available, the wire protocol still provides no request id; the implementation preserves compatibility and can only enforce hash/sequence plus the available peer context.
+
+## [RESOLVED] AMM tranche left the following issuer-owned CLOB offer dry — 2026-10-01T05:15:26Z
+
+The bounded AMM tranche for Testnet ledger 20934251 was correct, but the subsequent CLOB fill returned `tecPATH_DRY` because `pay_in` attempted to update the issuer's nonexistent trustline. Issuer-owned offers now receive their own IOU by issuance, matching rippled's `rippleCredit` behavior. Both targeted OfferCreate oracles and the two-ledger forward replay are byte-exact.
+
+## [RESOLVED] liBASE timeout and relay correlation remained incomplete — 2026-10-01T05:15:26Z
+
+Pending request registration no longer resets the timeout clock; successful sends explicitly mark the request as sent. Hash-compatible cookie-less relays are accepted, stale peers from previous generations and cookie-bearing mismatches are rejected, and no-hash requests remain peer-affine. New regressions cover all cases; 33 LedgerSyncer and 48 PeerManager tests pass.
+
+## [OPEN] Full network/amendment/state-compare matrix remains to be executed — 2026-10-01T05:15:26Z
+
+The maintained mixed network against rippled 3.1.3 has passed its sync suite, and Testnet replay is byte-exact for the current checkpoint window. Mainnet, Testnet, standalone, amendment-by-amendment, XRPL Hive, and XRPL Commons State Compare coverage are not yet a complete proof of validator parity. ConfidentialMPT remains fail-closed pending its cryptographic backend.

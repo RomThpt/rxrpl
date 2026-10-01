@@ -59,7 +59,7 @@ fn peek_book_quality_skip(
         let Some(bytes) = view.read(&dir_key) else {
             continue;
         };
-        let Ok(dir) = serde_json::from_slice::<Value>(&bytes) else {
+        let Ok(dir) = helpers::decode_state_value(&bytes) else {
             continue;
         };
         let empty = dir
@@ -113,7 +113,7 @@ fn peek_funded_offer_skip(
         let Some(bytes) = ctx.view.read(&dir_key) else {
             continue;
         };
-        let Ok(dir) = serde_json::from_slice::<Value>(&bytes) else {
+        let Ok(dir) = helpers::decode_state_value(&bytes) else {
             continue;
         };
         let page: Vec<Hash256> = dir
@@ -130,7 +130,7 @@ fn peek_funded_offer_skip(
             let Some(ob) = ctx.view.read(&key) else {
                 continue;
             };
-            let Ok(offer) = serde_json::from_slice::<Value>(&ob) else {
+            let Ok(offer) = helpers::decode_state_value(&ob) else {
                 continue;
             };
             let Some(gets) = Leg::parse(&offer["TakerGets"]) else {
@@ -309,7 +309,7 @@ fn tick_round_amounts(
         };
         ctx.view
             .read(&keylet::account(&id))
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|b| helpers::decode_state_value(&b).ok())
             .and_then(|a| a.get("TickSize").and_then(|v| v.as_u64()))
             .map(|t| t as u8)
             .unwrap_or(MAX_TICK_SIZE)
@@ -442,8 +442,7 @@ impl Transactor for OfferCreateTransactor {
             .view
             .read(&acct_key)
             .ok_or(TransactionResult::TerNoAccount)?;
-        let mut acct: Value =
-            serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
+        let mut acct: Value = helpers::decode_state_value(&bytes)?;
 
         // The offer's Sequence (and its keylet) is rippled's `getSeqProxy()`
         // value: the TicketSequence when the transaction spends a ticket,
@@ -501,7 +500,7 @@ impl Transactor for OfferCreateTransactor {
             if let Some(old) = ctx
                 .view
                 .read(&cancel_key)
-                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .and_then(|b| helpers::decode_state_value(&b).ok())
                 .filter(|o| o.get("LedgerEntryType").and_then(|v| v.as_str()) == Some("Offer"))
             {
                 if let Some(book_dir) = old
@@ -848,7 +847,7 @@ fn transfer_rate(ctx: &ApplyContext<'_>, issuer: &AccountId) -> IOUAmount {
     let rate = ctx
         .view
         .read(&key)
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|b| helpers::decode_state_value(&b).ok())
         .and_then(|a| a.get("TransferRate").and_then(|v| v.as_u64()));
     match rate {
         Some(r) if r > 1_000_000_000 => IOUAmount::from_parts(r, -9, false).unwrap_or(one),
@@ -870,8 +869,7 @@ fn credit_line(
 ) -> Result<(), TransactionResult> {
     let key = keylet::trust_line(holder, issuer, currency);
     let bytes = ctx.view.read(&key).ok_or(TransactionResult::TecPathDry)?;
-    let mut line: Value =
-        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let mut line: Value = helpers::decode_state_value(&bytes)?;
     let cur = line
         .get("Balance")
         .and_then(|b| b.get("value"))
@@ -910,7 +908,7 @@ fn credit_line_ulp_if_coarse(
     let Some(bytes) = ctx.view.read(&key) else {
         return Ok(());
     };
-    let Ok(line) = serde_json::from_slice::<Value>(&bytes) else {
+    let Ok(line) = helpers::decode_state_value(&bytes) else {
         return Ok(());
     };
     let Some(s) = line
@@ -940,8 +938,7 @@ fn credit_xrp(
 ) -> Result<(), TransactionResult> {
     let key = keylet::account(account);
     let bytes = ctx.view.read(&key).ok_or(TransactionResult::TecPathDry)?;
-    let mut acct: Value =
-        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let mut acct: Value = helpers::decode_state_value(&bytes)?;
     let bal = helpers::get_balance(&acct) as i64 + delta;
     if bal < 0 {
         return Err(TransactionResult::TecUnfundedOffer);
@@ -1104,7 +1101,7 @@ fn cross_offers(
         let Some(dir_bytes) = ctx.view.read(&dir_key) else {
             continue;
         };
-        let Ok(dir) = serde_json::from_slice::<Value>(&dir_bytes) else {
+        let Ok(dir) = helpers::decode_state_value(&dir_bytes) else {
             continue;
         };
         let offers: Vec<rxrpl_primitives::Hash256> = dir
@@ -1132,7 +1129,7 @@ fn cross_offers(
             let Some(ob) = ctx.view.read(&offer_key) else {
                 continue;
             };
-            let Ok(offer) = serde_json::from_slice::<Value>(&ob) else {
+            let Ok(offer) = helpers::decode_state_value(&ob) else {
                 continue;
             };
             if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
@@ -1705,7 +1702,7 @@ fn cross_book_hop(
     let dest_line_key = keylet::trust_line(dest, &demand_out.issuer, &demand_out.currency);
     let dest_line_before = if !skip_output_credit && !demand_out.is_xrp {
         ctx.view.read(&dest_line_key).and_then(|b| {
-            let v: Value = serde_json::from_slice(&b).ok()?;
+            let v: Value = helpers::decode_state_value(&b).ok()?;
             v.get("Balance")?.get("value")?.as_str().map(str::to_string)
         })
     } else {
@@ -1800,7 +1797,7 @@ fn cross_book_hop(
         let Some(dir_bytes) = ctx.view.read(&dir_key) else {
             continue;
         };
-        let Ok(dir) = serde_json::from_slice::<Value>(&dir_bytes) else {
+        let Ok(dir) = helpers::decode_state_value(&dir_bytes) else {
             continue;
         };
         let offers: Vec<rxrpl_primitives::Hash256> = dir
@@ -1820,7 +1817,7 @@ fn cross_book_hop(
             let Some(ob) = ctx.view.read(&offer_key) else {
                 continue;
             };
-            let Ok(offer) = serde_json::from_slice::<Value>(&ob) else {
+            let Ok(offer) = helpers::decode_state_value(&ob) else {
                 continue;
             };
             if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
@@ -2139,7 +2136,7 @@ fn cross_book_hop(
                 };
                 if let Ok(expected) = IOUAmount::add(&before, &delta) {
                     if let Some(bytes) = ctx.view.read(&dest_line_key) {
-                        if let Ok(mut line) = serde_json::from_slice::<Value>(&bytes) {
+                        if let Ok(mut line) = helpers::decode_state_value(&bytes) {
                             line["Balance"]["value"] = Value::String(expected.to_decimal_string());
                             if let Ok(nb) = serde_json::to_vec(&line) {
                                 let _ = ctx.view.update(dest_line_key, nb);
@@ -2475,7 +2472,7 @@ fn dest_headroom(ctx: &ApplyContext<'_>, dest: &AccountId, out_tmpl: &Leg) -> Op
     }
     let tl_key = keylet::trust_line(dest, &out_tmpl.issuer, &out_tmpl.currency);
     let bytes = ctx.view.read(&tl_key)?;
-    let tl: Value = serde_json::from_slice(&bytes).ok()?;
+    let tl: Value = helpers::decode_state_value(&bytes).ok()?;
     let dest_is_low = dest.as_bytes() < out_tmpl.issuer.as_bytes();
     // Balance is stored from the low account's perspective; the holder's view
     // flips sign when it is the high account.
@@ -2562,7 +2559,7 @@ fn pool_balance_number(
         let bal = ctx
             .view
             .read(&key)
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|b| helpers::decode_state_value(&b).ok())
             .map(|a| helpers::get_balance(&a))
             .unwrap_or(0);
         Number::from_int(bal as i64)
@@ -2612,7 +2609,7 @@ fn create_iou_trust_line(
     let holder_lacks_default_ripple = ctx
         .view
         .read(&keylet::account(holder))
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|b| helpers::decode_state_value(&b).ok())
         .map(|a| helpers::get_flags(&a) & LSF_DEFAULT_RIPPLE == 0)
         .unwrap_or(true);
 
@@ -2713,7 +2710,7 @@ fn amm_hop(
     let Some(amm_bytes) = ctx.view.read(&amm_key) else {
         return Ok(None);
     };
-    let Ok(amm): Result<Value, _> = serde_json::from_slice(&amm_bytes) else {
+    let Ok(amm): Result<Value, _> = helpers::decode_state_value(&amm_bytes) else {
         return Ok(None);
     };
     let Some(pool_str) = amm.get("Account").and_then(|v| v.as_str()) else {
@@ -2742,20 +2739,39 @@ fn amm_hop(
         return Ok(None);
     }
 
-    let budget_num = leg_to_number(budget_in);
+    let mut budget_num = leg_to_number(budget_in);
     let demand_num = leg_to_number(demand_out);
     if budget_num.is_zero() || budget_num.negative() {
         return Ok(None);
     }
 
+    // With a CLOB tip, rippled seats a bounded single-path AMM offer at that
+    // quality before executing it. Spending the whole budget here would let
+    // the constant-product curve undercut the book and diverge in both pool
+    // balances and offer metadata.
+    if let Some(cq) = target_quality {
+        if out_xrp {
+            if let Ok(rate) = rxrpl_amount::from_rate(cq) {
+                let quality = rxrpl_amount::number::Number::from_iou(&rate);
+                if let Some((offer_in, _offer_out)) =
+                    crate::amm_helpers::offer_at_quality_xrp_output(
+                        &pool_in, &pool_out, &quality, tfee,
+                    )
+                {
+                    if offer_in.sub(&budget_num).negative() {
+                        budget_num = offer_in;
+                    }
+                }
+            }
+        }
+    }
+
     // Spot-price-quality gate (rippled AMMLiquidity::getOffer, AMMLiquidity.cpp:
-    // 184-190): an offer crossing may consume the AMM only when its spot quality
-    // STRICTLY beats the taker's limit quality and is not within 1e-7 of it —
-    // otherwise deliver nothing so cross_offers rests the full offer. The spot
-    // must be FEE-ADJUSTED: the taker pays the trading fee on the input, so the
-    // effective in/out is spot / (1 - fee) (worse than the fee-free spot). An AMM
-    // whose raw spot beats the limit but whose fee-adjusted price does not must
-    // not cross. Payments pass None (any quality is acceptable,
+    // 184-190): CLOB wins when the AMM spot is better than or equal to the
+    // CLOB tip. The AMM is admitted only for a strictly worse spot, and never
+    // within 1e-7 of the tip, so the book is consumed before synthetic
+    // liquidity. The spot is fee-adjusted because the taker pays the trading
+    // fee on the input. Payments pass None (any quality is acceptable,
     // BookPaymentStep::checkQualityThreshold == true).
     if let Some(cq) = target_quality {
         let one_minus_fee = IOUAmount::divide(
@@ -3303,7 +3319,7 @@ fn reverse_amm_strand(
         let Some(amm_bytes) = ctx.view.read(&amm_key) else {
             return Ok(None);
         };
-        let Ok(amm): Result<Value, _> = serde_json::from_slice(&amm_bytes) else {
+        let Ok(amm): Result<Value, _> = helpers::decode_state_value(&amm_bytes) else {
             return Ok(None);
         };
         let Some(pool_str) = amm.get("Account").and_then(|v| v.as_str()) else {
@@ -3493,7 +3509,7 @@ pub(crate) fn build_flow_strand(
         let (amm_pool, amm_tfee, liquidity) = match ctx
             .view
             .read(&amm_key)
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|b| helpers::decode_state_value(&b).ok())
         {
             Some(amm) => {
                 let pool_id = amm
@@ -4304,14 +4320,20 @@ fn pay_in(
                 .view
                 .read(&owner_key)
                 .ok_or(TransactionResult::TefInternal)?;
-            let mut oacct: Value =
-                serde_json::from_slice(&ob).map_err(|_| TransactionResult::TefInternal)?;
+            let mut oacct: Value = helpers::decode_state_value(&ob)?;
             create_iou_trust_line(ctx, owner, &mut oacct, &amount.issuer, &amount.currency)?;
             let nb = serde_json::to_vec(&oacct).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
                 .update(owner_key, nb)
                 .map_err(|_| TransactionResult::TefInternal)?;
         }
+    }
+    // The issuer receives its own IOU by issuance; it has no trust line to
+    // mutate. This is the input-side counterpart of the issuer guard in
+    // `pay_out`. Without it, an issuer-owned CLOB offer returns tecPATH_DRY
+    // when an AMM tranche is crossed before the offer.
+    if owner == &amount.issuer {
+        return Ok(());
     }
     credit_line(
         ctx,
@@ -4493,7 +4515,7 @@ fn reap_unfunded_on_page(
     let Some(dir_bytes) = ctx.view.read(dir_key) else {
         return Ok(false);
     };
-    let Ok(dir) = serde_json::from_slice::<Value>(&dir_bytes) else {
+    let Ok(dir) = helpers::decode_state_value(&dir_bytes) else {
         return Ok(false);
     };
     let offers: Vec<rxrpl_primitives::Hash256> = dir
@@ -4510,7 +4532,7 @@ fn reap_unfunded_on_page(
         let Some(ob) = ctx.view.read(&offer_key) else {
             continue;
         };
-        let Ok(offer) = serde_json::from_slice::<Value>(&ob) else {
+        let Ok(offer) = helpers::decode_state_value(&ob) else {
             continue;
         };
         if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
@@ -4572,7 +4594,7 @@ fn reap_offer(
     let _ = ctx.view.erase(offer_key);
     let owner_key = keylet::account(owner);
     if let Some(b) = ctx.view.read(&owner_key) {
-        if let Ok(mut acct) = serde_json::from_slice::<Value>(&b) {
+        if let Ok(mut acct) = helpers::decode_state_value(&b) {
             helpers::adjust_owner_count(&mut acct, -1);
             if let Ok(nb) = serde_json::to_vec(&acct) {
                 let _ = ctx.view.update(owner_key, nb);
@@ -4632,8 +4654,7 @@ fn check_domain_membership(
         .view
         .read(&domain_key)
         .ok_or(TransactionResult::TecNoPermission)?; // domain must exist
-    let domain: Value =
-        serde_json::from_slice(&domain_bytes).map_err(|_| TransactionResult::TemMalformed)?;
+    let domain: Value = helpers::decode_state_value(&domain_bytes)?;
     let accepted = domain
         .get("AcceptedCredentials")
         .and_then(|v| v.as_array())
@@ -4655,7 +4676,7 @@ fn check_domain_membership(
         let ct_bytes = hex::decode(ct_str).unwrap_or_else(|_| ct_str.as_bytes().to_vec());
         let cred_key = keylet::credential(trader_id, &issuer_id, &ct_bytes);
         if let Some(cred_bytes) = ctx.view.read(&cred_key) {
-            if let Ok(cred) = serde_json::from_slice::<Value>(&cred_bytes) {
+            if let Ok(cred) = helpers::decode_state_value(&cred_bytes) {
                 // The credential must be accepted (lsfAccepted); an issued-but-not-
                 // accepted credential does not confer membership.
                 if helpers::get_flags(&cred) & crate::handlers::credentials::LSF_ACCEPTED != 0 {
@@ -4692,7 +4713,7 @@ fn is_deep_frozen(ctx: &mut ApplyContext<'_>, account: &AccountId, asset: &Leg) 
     else {
         return false;
     };
-    let Ok(tl) = serde_json::from_slice::<Value>(&tl_bytes) else {
+    let Ok(tl) = helpers::decode_state_value(&tl_bytes) else {
         return false;
     };
     let flags = tl.get("Flags").and_then(Value::as_u64).unwrap_or(0);
@@ -4723,7 +4744,7 @@ fn reap_own_unfunded_inverse_tip(
         let Some(bytes) = ctx.view.read(&dir_key) else {
             continue;
         };
-        let Ok(dir) = serde_json::from_slice::<Value>(&bytes) else {
+        let Ok(dir) = helpers::decode_state_value(&bytes) else {
             continue;
         };
         let empty = dir
@@ -4748,7 +4769,7 @@ fn reap_own_unfunded_inverse_tip(
         let Some(bytes) = ctx.view.read(&key) else {
             continue;
         };
-        let Ok(offer) = serde_json::from_slice::<Value>(&bytes) else {
+        let Ok(offer) = helpers::decode_state_value(&bytes) else {
             continue;
         };
         if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
@@ -4795,7 +4816,7 @@ fn reap_maker_short_sells(
         let Some(bytes) = ctx.view.read(&key) else {
             continue;
         };
-        let Ok(offer) = serde_json::from_slice::<Value>(&bytes) else {
+        let Ok(offer) = helpers::decode_state_value(&bytes) else {
             continue;
         };
         if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
@@ -4843,7 +4864,7 @@ fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) ->
         let acct = ctx
             .view
             .read(&key)
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+            .and_then(|b| helpers::decode_state_value(&b).ok());
         let bal = acct
             .as_ref()
             .and_then(|a| {
@@ -4876,7 +4897,7 @@ fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) ->
     let Some(tl_bytes) = ctx.view.read(&tl_key) else {
         return zero;
     };
-    let Ok(tl) = serde_json::from_slice::<Value>(&tl_bytes) else {
+    let Ok(tl) = helpers::decode_state_value(&tl_bytes) else {
         return zero;
     };
     let raw_str = tl
@@ -4911,7 +4932,7 @@ fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) ->
     let issuer_flags = ctx
         .view
         .read(&keylet::account(&gets.issuer))
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|b| helpers::decode_state_value(&b).ok())
         .and_then(|a| a.get("Flags").and_then(Value::as_u64))
         .unwrap_or(0);
     let line_frozen = if issuer_is_low {
@@ -4960,8 +4981,7 @@ fn remove_from_book_dir(
             Some(b) => b,
             None => return Ok(()),
         };
-        let mut dir: Value =
-            serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let mut dir: Value = helpers::decode_state_value(&bytes)?;
         let next_page = dir.get("IndexNext").and_then(|v| v.as_u64()).unwrap_or(0);
         let removed = if let Some(indexes) = dir.get_mut("Indexes").and_then(|v| v.as_array_mut()) {
             let original = indexes.len();
@@ -5372,7 +5392,7 @@ impl OfferStream {
                 let Some(bytes) = ctx.view.read(&dir_key) else {
                     continue;
                 };
-                let Ok(dir) = serde_json::from_slice::<Value>(&bytes) else {
+                let Ok(dir) = helpers::decode_state_value(&bytes) else {
                     continue;
                 };
                 self.page = dir
@@ -5392,7 +5412,7 @@ impl OfferStream {
             let Some(ob) = ctx.view.read(&offer_key) else {
                 continue;
             };
-            let Ok(offer) = serde_json::from_slice::<Value>(&ob) else {
+            let Ok(offer) = helpers::decode_state_value(&ob) else {
                 continue;
             };
             if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
@@ -5588,7 +5608,7 @@ fn consume_leg(
     let Some(ob) = ctx.view.read(&t.key) else {
         return Ok(());
     };
-    let Ok(mut offer) = serde_json::from_slice::<Value>(&ob) else {
+    let Ok(mut offer) = helpers::decode_state_value(&ob) else {
         return Ok(());
     };
     // `OfferTip` is the first-seen snapshot. Bridged_cross reuses the same
@@ -5699,8 +5719,7 @@ fn settle_in_legacy(
                 .view
                 .read(&owner_key)
                 .ok_or(TransactionResult::TefInternal)?;
-            let mut oacct: Value =
-                serde_json::from_slice(&ob).map_err(|_| TransactionResult::TefInternal)?;
+            let mut oacct: Value = helpers::decode_state_value(&ob)?;
             create_iou_trust_line(ctx, owner, &mut oacct, &issuer, &order_in.currency)?;
             let nb = serde_json::to_vec(&oacct).map_err(|_| TransactionResult::TefInternal)?;
             ctx.view
@@ -5754,8 +5773,7 @@ fn settle_out_legacy(
         // Owner paid the IOU out; rippleCredit deletes a drained default line.
         let owner_key = keylet::account(owner);
         if let Some(ob) = ctx.view.read(&owner_key) {
-            let mut oacct: Value =
-                serde_json::from_slice(&ob).map_err(|_| TransactionResult::TefInternal)?;
+            let mut oacct: Value = helpers::decode_state_value(&ob)?;
             if crate::handlers::trust_set::maybe_delete_drained_trust_line(
                 ctx,
                 owner,
@@ -7919,5 +7937,16 @@ mod flow_cross_own_unfunded {
             "taker path must delete underfunded lsfSell, oc={oc}"
         );
         assert_eq!(oc, 1, "OwnerCount after reap+place");
+    }
+
+    #[test]
+    fn ledger_20934251_offer_quality_is_crossable() {
+        let maker_quality = u64::from_str_radix("4F054C9FCA4BE4BA", 16).unwrap();
+        let threshold = get_rate(
+            &IOUAmount::from_decimal_string("29.1794").unwrap(),
+            &IOUAmount::from_decimal_string("18779694").unwrap(),
+        )
+        .unwrap();
+        assert!(maker_quality <= threshold);
     }
 }

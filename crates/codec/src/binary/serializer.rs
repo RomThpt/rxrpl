@@ -46,7 +46,7 @@ impl BinarySerializer {
     }
 
     /// Write a variable-length prefix (VL encoding).
-    fn write_vl_length(&mut self, len: usize) {
+    fn write_vl_length(&mut self, len: usize) -> Result<(), CodecError> {
         if len <= 192 {
             self.write_u8(len as u8);
         } else if len <= 12480 {
@@ -58,7 +58,12 @@ impl BinarySerializer {
             self.write_u8(241 + (adjusted >> 16) as u8);
             self.write_u8(((adjusted >> 8) & 0xFF) as u8);
             self.write_u8((adjusted & 0xFF) as u8);
+        } else {
+            return Err(CodecError::UnsupportedType(format!(
+                "variable-length field too large: {len} bytes (maximum 918744)"
+            )));
         }
+        Ok(())
     }
 
     /// Serialize a JSON object in canonical field order.
@@ -243,6 +248,31 @@ impl BinarySerializer {
             };
             self.write_u64(serialized);
         } else if let Some(obj) = value.as_object() {
+            if let Some(issuance_id) = obj.get("mpt_issuance_id").and_then(Value::as_str) {
+                let value_str = obj.get("value").and_then(Value::as_str).ok_or_else(|| {
+                    CodecError::UnsupportedType("MPT amount missing value".to_string())
+                })?;
+                let signed = value_str.parse::<i128>().map_err(|_| {
+                    CodecError::UnsupportedType("invalid MPT amount value".to_string())
+                })?;
+                let negative = signed < 0;
+                let magnitude = signed.unsigned_abs();
+                let magnitude = u64::try_from(magnitude).map_err(|_| {
+                    CodecError::UnsupportedType("MPT amount exceeds uint64".to_string())
+                })?;
+                let id = hex::decode(issuance_id).map_err(|e| CodecError::Hex(e.to_string()))?;
+                if id.len() != 24 {
+                    return Err(CodecError::InvalidLength {
+                        expected: 24,
+                        got: id.len(),
+                    });
+                }
+                self.write_bytes(&[0x20 | if negative { 0 } else { 0x40 }]);
+                self.write_u64(magnitude);
+                self.write_bytes(&id);
+                return Ok(());
+            }
+
             // IOU amount
             let value_str = obj.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
                 CodecError::UnsupportedType("IOU amount missing value".to_string())
@@ -352,7 +382,7 @@ impl BinarySerializer {
             CodecError::UnsupportedType("expected hex string for blob".to_string())
         })?;
         let bytes = hex::decode(hex_str).map_err(|e| CodecError::Hex(e.to_string()))?;
-        self.write_vl_length(bytes.len());
+        self.write_vl_length(bytes.len())?;
         self.write_bytes(&bytes);
         Ok(())
     }
@@ -367,7 +397,7 @@ impl BinarySerializer {
         // the zero-Account UNLModify pseudo-transaction encodes sfAccount --
         // distinct from an explicit ACCOUNT_ZERO, which is 20 zero bytes.
         if s.is_empty() {
-            self.write_vl_length(0);
+            self.write_vl_length(0)?;
             return Ok(());
         }
 
@@ -379,7 +409,7 @@ impl BinarySerializer {
         };
 
         // AccountID is VL-encoded
-        self.write_vl_length(account_bytes.len());
+        self.write_vl_length(account_bytes.len())?;
         self.write_bytes(&account_bytes);
         Ok(())
     }
@@ -390,19 +420,35 @@ impl BinarySerializer {
             .ok_or_else(|| CodecError::UnsupportedType("expected JSON array".to_string()))?;
 
         for item in arr {
-            // Each array element is a wrapper object with one key
-            if let Some(obj) = item.as_object() {
-                for (key, val) in obj {
-                    if let Some(def) = definitions::get_field(key) {
-                        let id_bytes = field_id::encode_field_id(def.type_code, def.nth);
-                        self.write_bytes(&id_bytes);
-                        self.serialize_object(val, true)?;
-                        // Object end marker
-                        let end = field_id::encode_field_id(14, 1);
-                        self.write_bytes(&end);
-                    }
-                }
+            // Each array element is a wrapper object with exactly one known
+            // STObject field. Silently dropping malformed or unknown wrappers
+            // would produce a different transaction while still returning an
+            // apparently valid blob.
+            let obj = item.as_object().ok_or_else(|| {
+                CodecError::UnsupportedType("expected array element object".to_string())
+            })?;
+            if obj.len() != 1 {
+                return Err(CodecError::UnsupportedType(
+                    "array element must contain exactly one field".to_string(),
+                ));
             }
+
+            let (key, val) = obj.iter().next().expect("array element length checked");
+            let def = definitions::get_field(key)
+                .ok_or_else(|| CodecError::UnknownField(key.to_string()))?;
+            if def.field_type != "STObject" {
+                return Err(CodecError::UnsupportedType(format!(
+                    "array wrapper field {key} must be STObject, got {}",
+                    def.field_type
+                )));
+            }
+
+            let id_bytes = field_id::encode_field_id(def.type_code, def.nth);
+            self.write_bytes(&id_bytes);
+            self.serialize_object(val, true)?;
+            // Object end marker
+            let end = field_id::encode_field_id(14, 1);
+            self.write_bytes(&end);
         }
 
         Ok(())
@@ -414,7 +460,7 @@ impl BinarySerializer {
         })?;
 
         let total_len = arr.len() * 32;
-        self.write_vl_length(total_len);
+        self.write_vl_length(total_len)?;
 
         for item in arr {
             let hex_str = item.as_str().ok_or_else(|| {
@@ -736,6 +782,21 @@ mod tests {
     }
 
     #[test]
+    fn serialize_mpt_amount_matches_rippled_wire_layout() {
+        let mut s = BinarySerializer::new();
+        s.serialize_amount(&serde_json::json!({
+            "mpt_issuance_id": "00E1EA2BCC62AB383FF744C1709EA90E1C6C592BD8256E17",
+            "value": "74",
+        }))
+        .unwrap();
+
+        assert_eq!(
+            hex::encode_upper(s.into_bytes()),
+            "60000000000000004A00E1EA2BCC62AB383FF744C1709EA90E1C6C592BD8256E17"
+        );
+    }
+
+    #[test]
     fn serialize_number_zero() {
         let mut s = BinarySerializer::new();
         s.serialize_number(&Value::String("0".to_string())).unwrap();
@@ -795,6 +856,30 @@ mod tests {
         s.serialize_object(&tx, false)
             .expect("DelegateSet with string PermissionValue must encode");
         assert!(!s.into_bytes().is_empty());
+    }
+
+    #[test]
+    fn array_unknown_wrapper_field_is_rejected() {
+        let value = serde_json::json!({
+            "Signers": [{"UnknownWrapper": {"SignerEntry": {}}}],
+        });
+        let mut s = BinarySerializer::new();
+
+        assert!(matches!(
+            s.serialize_object(&value, true),
+            Err(crate::error::CodecError::UnknownField(field)) if field == "UnknownWrapper"
+        ));
+    }
+
+    #[test]
+    fn variable_length_fields_reject_lengths_above_wire_limit() {
+        let mut s = BinarySerializer::new();
+
+        assert!(matches!(
+            s.write_vl_length(918_745),
+            Err(crate::error::CodecError::UnsupportedType(message))
+                if message.contains("maximum 918744")
+        ));
     }
 
     #[test]

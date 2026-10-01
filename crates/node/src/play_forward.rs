@@ -174,83 +174,143 @@ fn reseed_mid_ledger(
     }
 }
 
-/// Build the amendment `Rules` in force for a ledger from its `Amendments`
-/// state object, the way rippled derives them. Returns empty rules (every
-/// amendment off) when the object is absent — correct for pre-amendment
-/// ledgers. This is the source of truth for amendment-gated apply logic, so
-/// replaying or applying onto a ledger reproduces its era's behaviour.
-pub fn rules_for_ledger(ledger: &Ledger) -> Rules {
-    let enabled = ledger
-        .get_state(&rxrpl_protocol::keylet::amendments())
-        .and_then(|b| rxrpl_ledger::sle_codec::decode_state(b).ok())
-        .and_then(|v| {
-            v.get("Amendments").and_then(|a| a.as_array()).map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_str())
-                    .filter_map(|s| hex::decode(s).ok())
-                    .filter_map(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-                    .map(Hash256::new)
-                    .collect::<Vec<_>>()
-            })
-        })
-        .unwrap_or_default();
-    let mut enabled = enabled;
+fn rules_from_enabled_amendments(mut enabled: Vec<Hash256>) -> Rules {
     // SortedDirectories was retired (permanently baked in) by the time of the
     // modern lending/vault amendments, so it is no longer listed in the
     // Amendments object even though directories are kept sorted. Re-enable it
-    // whenever a clearly post-retirement amendment is active.
-    let single_asset_vault = rxrpl_amendment::feature::feature_id("SingleAssetVault");
+    // whenever a clearly post-retirement amendment is active.  Do not key this
+    // solely off SingleAssetVault: current Testnet ledgers can legitimately
+    // have MPTokensV1/PriceOracle enabled without the vault amendment.
+    let post_retirement = [
+        "fixPreviousTxnID",
+        "MPTokensV1",
+        "PriceOracle",
+        "SingleAssetVault",
+    ]
+    .into_iter()
+    .map(rxrpl_amendment::feature::feature_id)
+    .collect::<Vec<_>>();
     let sorted_directories = rxrpl_amendment::feature::feature_id("SortedDirectories");
-    if enabled.contains(&single_asset_vault) && !enabled.contains(&sorted_directories) {
+    if !enabled.contains(&sorted_directories)
+        && post_retirement.iter().any(|id| enabled.contains(id))
+    {
         enabled.push(sorted_directories);
     }
     Rules::from_enabled(enabled)
 }
 
+/// Build the amendment `Rules` in force for a ledger from its `Amendments`
+/// state object, the way rippled derives them. Missing state is valid for
+/// pre-amendment ledgers, but a present malformed object is fatal to replay:
+/// silently disabling amendments would apply transactions under the wrong
+/// protocol era.
+pub fn try_rules_for_ledger(ledger: &Ledger) -> Result<Rules, NodeError> {
+    let Some(bytes) = ledger.get_state(&rxrpl_protocol::keylet::amendments()) else {
+        return Ok(rules_from_enabled_amendments(Vec::new()));
+    };
+    let value = rxrpl_ledger::sle_codec::decode_state(bytes)
+        .map_err(|e| NodeError::Server(format!("cannot decode Amendments SLE: {e}")))?;
+    let array = value
+        .get("Amendments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| NodeError::Server("Amendments SLE has no Amendments array".into()))?;
+    let mut enabled = Vec::with_capacity(array.len());
+    for (index, amendment) in array.iter().enumerate() {
+        let text = amendment
+            .as_str()
+            .ok_or_else(|| NodeError::Server(format!("Amendments[{index}] is not a hex string")))?;
+        let bytes = hex::decode(text)
+            .map_err(|e| NodeError::Server(format!("Amendments[{index}] has invalid hex: {e}")))?;
+        let bytes: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+            NodeError::Server(format!(
+                "Amendments[{index}] has {} bytes, expected 32",
+                bytes.len()
+            ))
+        })?;
+        enabled.push(Hash256::new(bytes));
+    }
+    Ok(rules_from_enabled_amendments(enabled))
+}
+
+/// Compatibility wrapper for live paths that historically treated malformed
+/// amendment state as no amendments. Critical replay paths use
+/// [`try_rules_for_ledger`] and fail closed instead.
+pub fn rules_for_ledger(ledger: &Ledger) -> Rules {
+    match try_rules_for_ledger(ledger) {
+        Ok(rules) => rules,
+        Err(error) => {
+            tracing::warn!(%error, "using empty amendment rules for malformed ledger state");
+            rules_from_enabled_amendments(Vec::new())
+        }
+    }
+}
+
+fn pre_fee_settings() -> FeeSettings {
+    FeeSettings {
+        base_fee: 10,
+        reserve_base: 200_000_000,
+        reserve_increment: 50_000_000,
+    }
+}
+
 /// Read the era-correct fee and reserve settings from a ledger's `FeeSettings`
 /// SLE. Early ledgers (pre-2014) predate that object, where reserves were the
 /// protocol constants (200 XRP base, 50 XRP per owner).
-pub fn fees_for_ledger(ledger: &Ledger) -> FeeSettings {
-    // XRPFees (2024) stores fees directly in drops as XRP `Amount` fields, which
-    // rxrpl decodes to decimal strings (e.g. ReserveBaseDrops "1000000").
-    fn drops(v: &Value) -> Option<u64> {
-        v.as_str()
-            .and_then(|s| s.parse::<u64>().ok())
-            .or_else(|| v.as_u64())
-    }
-    ledger
+pub fn try_fees_for_ledger(ledger: &Ledger) -> Result<FeeSettings, NodeError> {
+    let Some(bytes) = ledger
         .state_map
         .get(&rxrpl_protocol::keylet::fee_settings())
-        .and_then(|b| rxrpl_codec::binary::decode(b).ok())
-        .map(|fs| FeeSettings {
-            // Post-XRPFees: BaseFeeDrops (drops). Pre-amendment: BaseFee (UInt64 hex).
-            base_fee: fs
-                .get("BaseFeeDrops")
-                .and_then(drops)
-                .or_else(|| {
-                    fs.get("BaseFee")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| u64::from_str_radix(s, 16).ok())
-                })
-                .unwrap_or(10),
-            // Post-XRPFees: ReserveBaseDrops. Pre-amendment: ReserveBase (UInt32 drops).
-            reserve_base: fs
-                .get("ReserveBaseDrops")
-                .and_then(drops)
-                .or_else(|| fs.get("ReserveBase").and_then(|v| v.as_u64()))
-                .unwrap_or(10_000_000),
-            // Post-XRPFees: ReserveIncrementDrops. Pre-amendment: ReserveIncrement.
-            reserve_increment: fs
-                .get("ReserveIncrementDrops")
-                .and_then(drops)
-                .or_else(|| fs.get("ReserveIncrement").and_then(|v| v.as_u64()))
-                .unwrap_or(50_000_000),
-        })
-        .unwrap_or(FeeSettings {
-            base_fee: 10,
-            reserve_base: 200_000_000,
-            reserve_increment: 50_000_000,
-        })
+    else {
+        return Ok(pre_fee_settings());
+    };
+    let fs = rxrpl_ledger::sle_codec::decode_state(bytes)
+        .map_err(|e| NodeError::Server(format!("cannot decode FeeSettings SLE: {e}")))?;
+
+    fn drops(value: Option<&Value>, name: &str) -> Result<u64, NodeError> {
+        value
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+            })
+            .ok_or_else(|| NodeError::Server(format!("FeeSettings field {name} is invalid")))
+    }
+    fn required_drops(fs: &Value, modern: &str, legacy: &str) -> Result<u64, NodeError> {
+        if fs.get(modern).is_some() {
+            drops(fs.get(modern), modern)
+        } else {
+            drops(fs.get(legacy), legacy)
+        }
+    }
+
+    // XRPFees stores drops directly as decimal XRP Amount fields. Older
+    // ledgers use BaseFee as a UInt64 hex string and the two UInt32 fields.
+    let base_fee = if fs.get("BaseFeeDrops").is_some() {
+        drops(fs.get("BaseFeeDrops"), "BaseFeeDrops")?
+    } else {
+        let value = fs.get("BaseFee").and_then(Value::as_str).ok_or_else(|| {
+            NodeError::Server("FeeSettings missing BaseFee or BaseFeeDrops".into())
+        })?;
+        u64::from_str_radix(value, 16)
+            .map_err(|e| NodeError::Server(format!("FeeSettings BaseFee is invalid: {e}")))?
+    };
+    Ok(FeeSettings {
+        base_fee,
+        reserve_base: required_drops(&fs, "ReserveBaseDrops", "ReserveBase")?,
+        reserve_increment: required_drops(&fs, "ReserveIncrementDrops", "ReserveIncrement")?,
+    })
+}
+
+/// Compatibility wrapper for live paths. Replay and state-compare callers use
+/// [`try_fees_for_ledger`] so a malformed FeeSettings object cannot silently
+/// alter transaction application.
+pub fn fees_for_ledger(ledger: &Ledger) -> FeeSettings {
+    match try_fees_for_ledger(ledger) {
+        Ok(fees) => fees,
+        Err(error) => {
+            tracing::warn!(%error, "using pre-amendment fee settings for malformed ledger state");
+            pre_fee_settings()
+        }
+    }
 }
 
 /// Fetch a validated ledger's header, transaction-set root and transaction set
@@ -263,7 +323,6 @@ pub async fn fetch_ledger_for_replay(
 ) -> Result<(LedgerHeader, Hash256, TxSet), Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .danger_accept_invalid_certs(true)
         .build()?;
     let call = |params: Value| {
         let client = client.clone();
@@ -322,7 +381,7 @@ pub async fn catchup_via_replay(
         let (header, set_hash, txs) = fetch_ledger_for_replay(rpc_url, seq)
             .await
             .map_err(|e| NodeError::Server(format!("fetch #{seq} for replay: {e}")))?;
-        let fees = fees_for_ledger(&parent);
+        let fees = try_fees_for_ledger(&parent)?;
         let outcome = replay_forward(&parent, set_hash, txs, &header, tx_engine, &fees)?;
         if !outcome.is_faithful() {
             return Err(NodeError::Server(format!(
@@ -383,12 +442,18 @@ pub fn apply_tx_set_multipass(
     tx_engine: &TxEngine,
     rules: &Rules,
     fees: &FeeSettings,
-) -> (usize, usize) {
+) -> Result<(usize, usize), NodeError> {
     let total = txs.len();
-    let mut pending: Vec<Value> = canonical_order(set_hash, txs)
-        .into_iter()
-        .filter_map(|(_id, blob)| rxrpl_codec::binary::decode(&blob).ok())
-        .collect();
+    let mut pending = Vec::with_capacity(total);
+    for (id, blob) in canonical_order(set_hash, txs) {
+        let json = rxrpl_codec::binary::decode(&blob).map_err(|e| {
+            NodeError::Server(format!(
+                "cannot decode transaction {} during replay: {e}",
+                id
+            ))
+        })?;
+        pending.push(json);
+    }
 
     const LEDGER_TOTAL_PASSES: usize = 3;
     const LEDGER_RETRY_PASSES: usize = 1;
@@ -413,7 +478,7 @@ pub fn apply_tx_set_multipass(
                         changes += 1;
                     }
                 }
-                Err(_) => {}
+                Err(error) => return Err(NodeError::TxEngine(error)),
             }
         }
         pending = deferred;
@@ -424,7 +489,7 @@ pub fn apply_tx_set_multipass(
             certain_retry = false;
         }
     }
-    (applied, total - applied)
+    Ok((applied, total - applied))
 }
 
 pub fn replay_forward(
@@ -446,12 +511,12 @@ pub fn replay_forward(
 
     // Amendments in force are those enabled in the (inherited) parent state, so
     // each replayed ledger applies with its own era's amendment-gated logic.
-    let rules = rules_for_ledger(&ledger);
+    let rules = try_rules_for_ledger(&ledger)?;
 
     // Apply the set in rippled's canonical build order (shared with the live
     // consensus build).
     let (applied, failed) =
-        apply_tx_set_multipass(&mut ledger, set_hash, txs, tx_engine, &rules, fees);
+        apply_tx_set_multipass(&mut ledger, set_hash, txs, tx_engine, &rules, fees)?;
 
     ledger
         .close(header.close_time, header.close_flags)
@@ -483,7 +548,10 @@ pub fn all_handlers_engine() -> TxEngine {
     handlers::register_phase_d2(&mut r);
     handlers::register_phase_e(&mut r);
     handlers::register_phase_f(&mut r);
+    handlers::register_stubs(&mut r);
     handlers::register_pseudo(&mut r);
+    handlers::register_batch(&mut r);
+    handlers::register_hooks(&mut r);
     TxEngine::new_without_sig_check(r)
 }
 
@@ -537,9 +605,21 @@ mod tests {
         let rpc = |params: serde_json::Value| -> Value {
             rt.block_on(async {
                 for attempt in 0..12u32 {
-                    if let Ok(resp) = client.post(&url).json(&params).send().await {
-                        if let Ok(v) = resp.json::<Value>().await {
-                            return v;
+                    match client.post(&url).json(&params).send().await {
+                        Ok(resp) => {
+                            let status = resp.status();
+                            match resp.json::<Value>().await {
+                                Ok(v) => return v,
+                                Err(error) => {
+                                    eprintln!(
+                                        "rpc JSON decode failed attempt={} status={status}: {error}",
+                                        attempt + 1
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("rpc request failed attempt={}: {error}", attempt + 1);
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(
@@ -567,7 +647,7 @@ mod tests {
         }
 
         let ck_resp = rpc(serde_json::json!({
-            "method":"ledger","params":[{"ledger_index":start}]
+            "method":"ledger","params":[{"ledger_index":start,"transactions":false,"expand":false}]
         }));
         let ck_header = parse_header(&ck_resp["result"]["ledger"]).expect("checkpoint header");
         assert_eq!(
@@ -583,7 +663,7 @@ mod tests {
         let mut first_divergent: Option<u32> = None;
         for seq in (start + 1)..=end {
             let hdr_resp = rpc(serde_json::json!({
-                "method":"ledger","params":[{"ledger_index":seq}]
+                "method":"ledger","params":[{"ledger_index":seq,"transactions":false,"expand":false}]
             }));
             let hdr = parse_header(&hdr_resp["result"]["ledger"]).expect("ledger header");
             let txs_resp = rpc(serde_json::json!({
@@ -4363,6 +4443,24 @@ does not apply to this tx type (e.g. a pure delete/modify)."
     }
 
     #[test]
+    fn replay_rejects_undecodable_transaction_blob() {
+        let mut ledger = master_genesis();
+        let result = apply_tx_set_multipass(
+            &mut ledger,
+            Hash256::new([0x42; 32]),
+            vec![(Hash256::new([0x11; 32]), vec![0xff])],
+            &full_engine(),
+            &Rules::new(),
+            &FeeSettings::default(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(NodeError::Server(message)) if message.contains("cannot decode transaction")
+        ));
+    }
+
+    #[test]
     fn parse_tx_set_extracts_blobs_and_salt() {
         let built = [
             payment(1, AccountId([0xaa; 20]), 1_000_000_000),
@@ -4412,6 +4510,74 @@ does not apply to this tx type (e.g. a pure delete/modify)."
             .unwrap();
 
         assert!(rules_for_ledger(&ledger).enabled(&sorted));
+    }
+
+    #[test]
+    fn rules_for_modern_ledger_reenables_retired_sorted_directories() {
+        use rxrpl_amendment::feature::feature_id;
+        let mut ledger = Ledger::genesis();
+        let modern = feature_id("MPTokensV1");
+        let sorted = feature_id("SortedDirectories");
+        let amendments = serde_json::json!({
+            "LedgerEntryType": "Amendments",
+            "Amendments": [hex::encode_upper(modern.as_bytes())],
+            "Flags": 0,
+        });
+        let bytes =
+            rxrpl_ledger::sle_codec::encode_sle(&serde_json::to_vec(&amendments).unwrap()).unwrap();
+        ledger
+            .put_state(rxrpl_protocol::keylet::amendments(), bytes)
+            .unwrap();
+
+        assert!(rules_for_ledger(&ledger).enabled(&sorted));
+    }
+
+    #[test]
+    fn try_rules_for_ledger_rejects_malformed_amendments() {
+        let cases = [
+            serde_json::json!({
+                "LedgerEntryType": "Amendments",
+                "Amendments": [7],
+                "Flags": 0,
+            }),
+            serde_json::json!({
+                "LedgerEntryType": "Amendments",
+                "Amendments": ["not-hex"],
+                "Flags": 0,
+            }),
+            serde_json::json!({
+                "LedgerEntryType": "Amendments",
+                "Amendments": ["ABCD"],
+                "Flags": 0,
+            }),
+        ];
+
+        for amendments in cases {
+            let mut ledger = Ledger::genesis();
+            let bytes = serde_json::to_vec(&amendments).unwrap();
+            ledger
+                .put_state(rxrpl_protocol::keylet::amendments(), bytes)
+                .unwrap();
+            assert!(try_rules_for_ledger(&ledger).is_err(), "{amendments}");
+        }
+    }
+
+    #[test]
+    fn try_fees_for_ledger_rejects_partial_fee_settings() {
+        let mut ledger = Ledger::genesis();
+        let fee_settings = serde_json::json!({
+            "LedgerEntryType": "FeeSettings",
+            "BaseFeeDrops": "10",
+            "ReserveBaseDrops": "10000000",
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                rxrpl_protocol::keylet::fee_settings(),
+                serde_json::to_vec(&fee_settings).unwrap(),
+            )
+            .unwrap();
+        assert!(try_fees_for_ledger(&ledger).is_err());
     }
 
     #[test]

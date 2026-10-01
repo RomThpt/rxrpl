@@ -103,18 +103,18 @@ impl<'a> BinaryParser<'a> {
                 field_id::decode_field_id(&self.data[self.pos..])?;
             self.pos += consumed;
 
-            // Check for object/array end markers
+            // Only an ObjectEndMarker can terminate an STObject. Treating an
+            // ArrayEndMarker as equivalent would accept a truncated array
+            // element whose object wrapper was never closed.
             if type_code == 14 && field_code == 1 {
                 break; // ObjectEndMarker
             }
             if type_code == 15 && field_code == 1 {
-                break; // ArrayEndMarker
+                return Err(unknown_field_error(type_code, field_code));
             }
 
             let Some(def) = definitions::get_field_by_header(type_code, field_code) else {
-                // Skip unknown fields gracefully instead of failing.
-                self.skip_field(type_code)?;
-                continue;
+                return Err(unknown_field_error(type_code, field_code));
             };
 
             let value = self.parse_field_value(&def.field_type, &def.name)?;
@@ -347,6 +347,12 @@ impl<'a> BinaryParser<'a> {
             "STArray" => self.parse_array(),
             "Vector256" => {
                 let len = self.read_vl_length()?;
+                if len % 32 != 0 {
+                    return Err(CodecError::InvalidLength {
+                        expected: 32,
+                        got: len,
+                    });
+                }
                 let count = len / 32;
                 let mut arr = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -398,6 +404,31 @@ impl<'a> BinaryParser<'a> {
     }
 
     fn parse_amount(&mut self) -> Result<Value, CodecError> {
+        // MPT amounts use a one-byte flag/value prefix, an eight-byte signed
+        // magnitude, and a 24-byte issuance id. The prefix is deliberately
+        // checked before reading the XRP/IOU 64-bit word; treating MPT as an
+        // IOU would consume the following fields and report a misleading
+        // unknown field after the stream becomes misaligned.
+        let first = self
+            .data
+            .get(self.pos)
+            .copied()
+            .ok_or(CodecError::UnexpectedEnd)?;
+        if first & 0x20 != 0 {
+            self.pos += 1;
+            let magnitude = self.read_u64()?;
+            let issuance_id = self.read_bytes(24)?;
+            let value = if first & 0x40 != 0 {
+                magnitude.to_string()
+            } else {
+                format!("-{magnitude}")
+            };
+            return Ok(serde_json::json!({
+                "mpt_issuance_id": hex::encode_upper(issuance_id),
+                "value": value,
+            }));
+        }
+
         let raw = self.read_u64()?;
 
         // Check if it's XRP (bit 63 is 0) or IOU (bit 63 is 1)
@@ -448,10 +479,14 @@ impl<'a> BinaryParser<'a> {
             }
 
             let Some(def) = definitions::get_field_by_header(type_code, field_code) else {
-                // Skip unknown array wrapper element
-                self.skip_field(14)?; // array elements are STObject wrappers
-                continue;
+                return Err(unknown_field_error(type_code, field_code));
             };
+            if def.field_type != "STObject" {
+                return Err(CodecError::UnsupportedType(format!(
+                    "array wrapper field {} must be STObject, got {}",
+                    def.name, def.field_type
+                )));
+            }
 
             let inner = self.parse_object()?;
             let mut wrapper = Map::new();
@@ -580,6 +615,10 @@ impl<'a> BinaryParser<'a> {
     }
 }
 
+fn unknown_field_error(type_code: i32, field_code: i32) -> CodecError {
+    CodecError::UnknownField(format!("type_code={type_code}, field_code={field_code}"))
+}
+
 fn decode_currency_code(bytes: &[u8]) -> String {
     if bytes.len() != 20 {
         return hex::encode_upper(bytes);
@@ -665,4 +704,95 @@ fn decode_iou_value(raw: u64) -> Result<String, CodecError> {
         raw_str
     };
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BinaryParser;
+    use crate::error::CodecError;
+
+    #[test]
+    fn unknown_field_id_returns_structured_error() {
+        // UInt16 with field code 255 is not present in definitions.json. The
+        // parser must reject it before attempting to interpret its value.
+        let bytes = [0x10, 0xFF];
+        let error = BinaryParser::new(&bytes).parse_object().unwrap_err();
+
+        assert!(matches!(
+            error,
+            CodecError::UnknownField(message)
+                if message == "type_code=1, field_code=255"
+        ));
+    }
+
+    #[test]
+    fn unknown_array_field_id_returns_structured_error() {
+        // Signers is an STArray (type 15, field 3). Its first wrapper uses an
+        // undefined field id and must not be discarded as an empty element.
+        let bytes = [0xF3, 0x10, 0xFF];
+        let error = BinaryParser::new(&bytes).parse_object().unwrap_err();
+
+        assert!(matches!(
+            error,
+            CodecError::UnknownField(message)
+                if message == "type_code=1, field_code=255"
+        ));
+    }
+
+    #[test]
+    fn truncated_array_object_is_rejected() {
+        // Signers starts an STArray, but its element wrapper is missing the
+        // ObjectEndMarker before the ArrayEndMarker.
+        let bytes = [0xF3, 0xEB, 0xF1];
+        let error = BinaryParser::new(&bytes).parse_object().unwrap_err();
+
+        assert!(matches!(
+            error,
+            CodecError::UnknownField(message)
+                if message == "type_code=15, field_code=1"
+        ));
+    }
+
+    #[test]
+    fn transaction_type_code_71_decodes_to_canonical_batch_name() {
+        // TransactionType is UInt16 (type 1, field 2). Code 71 is the
+        // canonical XLS-0056 Batch transaction type on the wire.
+        let bytes = [0x12, 0x00, 0x47];
+        let value = BinaryParser::new(&bytes).parse_object().unwrap();
+
+        assert_eq!(value["TransactionType"], "Batch");
+    }
+
+    #[test]
+    fn mpt_amount_decodes_its_24_byte_issuance_id() {
+        let bytes =
+            hex::decode("60000000000000004A00E1EA2BCC62AB383FF744C1709EA90E1C6C592BD8256E17")
+                .unwrap();
+        let value = BinaryParser::new(&bytes).parse_amount().unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "mpt_issuance_id": "00E1EA2BCC62AB383FF744C1709EA90E1C6C592BD8256E17",
+                "value": "74",
+            })
+        );
+    }
+
+    #[test]
+    fn vector256_rejects_partial_element() {
+        // CredentialIDs is a Vector256 field (type 19, field 5). A VL payload
+        // that is not a whole number of 32-byte hashes is invalid XRPL wire
+        // data and must not be silently truncated by the parser.
+        let bytes = [0x05, 0x13, 0x01, 0x00];
+        let error = BinaryParser::new(&bytes).parse_object().unwrap_err();
+
+        assert!(matches!(
+            error,
+            CodecError::InvalidLength {
+                expected: 32,
+                got: 1
+            }
+        ));
+    }
 }

@@ -1,4 +1,7 @@
+use rxrpl_amendment::feature::feature_id;
 use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_ledger::sle_codec::decode_state;
+use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
@@ -8,8 +11,80 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transac
 
 pub struct ClawbackTransactor;
 
+const LSFT_MPT_CAN_CLAWBACK: u32 = 0x0040;
+const MAX_MPT_AMOUNT: u64 = 0x7FFF_FFFF_FFFF_FFFF;
+
+struct MptClawback {
+    issuance_key: Hash256,
+    holder_id: rxrpl_primitives::AccountId,
+    requested: u64,
+}
+
+fn parse_mpt_clawback(tx: &Value) -> Result<Option<MptClawback>, TransactionResult> {
+    let Some(amount) = tx.get("Amount").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let Some(issuance_id) = amount.get("mpt_issuance_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let raw = hex::decode(issuance_id).map_err(|_| TransactionResult::TemMalformed)?;
+    if raw.len() != 24 {
+        return Err(TransactionResult::TemMalformed);
+    }
+    let requested = amount
+        .get("value")
+        .and_then(Value::as_str)
+        .ok_or(TransactionResult::TemBadAmount)?
+        .parse::<u64>()
+        .map_err(|_| TransactionResult::TemBadAmount)?;
+    let sequence = u32::from_be_bytes(raw[..4].try_into().unwrap());
+    let issuer = rxrpl_primitives::AccountId::from_slice(&raw[4..])
+        .map_err(|_| TransactionResult::TemMalformed)?;
+    let holder = helpers::get_str_field(tx, "Holder").ok_or(TransactionResult::TemMalformed)?;
+    let holder_id =
+        decode_account_id(holder).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+
+    Ok(Some(MptClawback {
+        issuance_key: keylet::mptoken_issuance(&issuer, sequence),
+        holder_id,
+        requested,
+    }))
+}
+
+fn uint64_field(entry: &Value, field: &str) -> Result<u64, TransactionResult> {
+    entry
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or(TransactionResult::TefInternal)?
+        .parse::<u64>()
+        .map_err(|_| TransactionResult::TefInternal)
+}
+
+fn mpt_amount(entry: &Value) -> Result<u64, TransactionResult> {
+    uint64_field(entry, "MPTAmount")
+}
+
 impl Transactor for ClawbackTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
+        if let Some(mpt) = parse_mpt_clawback(ctx.tx)? {
+            if !ctx.rules.enabled(&feature_id("MPTokensV1")) {
+                return Err(TransactionResult::TemDisabled);
+            }
+            let account = decode_account_id(helpers::get_account(ctx.tx)?)
+                .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+            let holder =
+                helpers::get_str_field(ctx.tx, "Holder").ok_or(TransactionResult::TemMalformed)?;
+            let holder =
+                decode_account_id(holder).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+            if account == holder {
+                return Err(TransactionResult::TemMalformed);
+            }
+            if mpt.requested == 0 || mpt.requested > MAX_MPT_AMOUNT {
+                return Err(TransactionResult::TemBadAmount);
+            }
+            return Ok(());
+        }
+
         // Amount must be an IOU object
         let amount = ctx
             .tx
@@ -51,6 +126,37 @@ impl Transactor for ClawbackTransactor {
         let issuer_str = helpers::get_account(ctx.tx)?;
         let (_, issuer_acct) = helpers::read_account_by_address(ctx.view, issuer_str)?;
 
+        if let Some(mpt) = parse_mpt_clawback(ctx.tx)? {
+            let holder_str =
+                helpers::get_str_field(ctx.tx, "Holder").ok_or(TransactionResult::TemMalformed)?;
+            helpers::read_account_by_address(ctx.view, holder_str)?;
+
+            let issuance_bytes = ctx
+                .view
+                .read(&mpt.issuance_key)
+                .ok_or(TransactionResult::TecNoEntry)?;
+            let issuance =
+                decode_state(&issuance_bytes).map_err(|_| TransactionResult::TefInternal)?;
+            if helpers::get_flags(&issuance) & LSFT_MPT_CAN_CLAWBACK == 0
+                || issuance.get("Issuer").and_then(Value::as_str) != Some(issuer_str)
+            {
+                return Err(TransactionResult::TecNoPermission);
+            }
+
+            let mptoken_key = keylet::mptoken(mpt.issuance_key.as_bytes(), &mpt.holder_id);
+            let mptoken_bytes = ctx
+                .view
+                .read(&mptoken_key)
+                .ok_or(TransactionResult::TecNoEntry)?;
+            if mpt_amount(
+                &decode_state(&mptoken_bytes).map_err(|_| TransactionResult::TefInternal)?,
+            )? == 0
+            {
+                return Err(TransactionResult::TecInsufficientFunds);
+            }
+            return Ok(());
+        }
+
         // Issuer must have lsfAllowTrustLineClawback set on its AccountRoot.
         const LSF_ALLOW_TRUST_LINE_CLAWBACK: u32 = 0x8000_0000;
         let issuer_flags = helpers::get_flags(&issuer_acct);
@@ -81,8 +187,7 @@ impl Transactor for ClawbackTransactor {
             .view
             .read(&tl_key)
             .ok_or(TransactionResult::TecNoEntry)?;
-        let tl: Value =
-            serde_json::from_slice(&tl_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let tl: Value = helpers::decode_state_value(&tl_bytes)?;
 
         let holder_balance = compute_holder_balance(&tl, &issuer_id, &holder_id);
         if holder_balance <= 0.0 {
@@ -96,6 +201,58 @@ impl Transactor for ClawbackTransactor {
         let issuer_str = helpers::get_account(ctx.tx)?;
         let issuer_id =
             decode_account_id(issuer_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+
+        if let Some(mpt) = parse_mpt_clawback(ctx.tx)? {
+            let issuance_bytes = ctx
+                .view
+                .read(&mpt.issuance_key)
+                .ok_or(TransactionResult::TecNoEntry)?;
+            let mut issuance =
+                decode_state(&issuance_bytes).map_err(|_| TransactionResult::TefInternal)?;
+            let mptoken_key = keylet::mptoken(mpt.issuance_key.as_bytes(), &mpt.holder_id);
+            let mptoken_bytes = ctx
+                .view
+                .read(&mptoken_key)
+                .ok_or(TransactionResult::TecNoEntry)?;
+            let mut mptoken =
+                decode_state(&mptoken_bytes).map_err(|_| TransactionResult::TefInternal)?;
+            let held = mpt_amount(&mptoken)?;
+            let actual = mpt.requested.min(held);
+            if actual == 0 {
+                return Err(TransactionResult::TecInsufficientFunds);
+            }
+
+            let remaining = held - actual;
+            if remaining == 0 {
+                mptoken
+                    .as_object_mut()
+                    .ok_or(TransactionResult::TefInternal)?
+                    .remove("MPTAmount");
+            } else {
+                mptoken["MPTAmount"] = Value::String(remaining.to_string());
+            }
+            ctx.view
+                .update(
+                    mptoken_key,
+                    serde_json::to_vec(&mptoken).map_err(|_| TransactionResult::TefInternal)?,
+                )
+                .map_err(|_| TransactionResult::TefInternal)?;
+
+            let outstanding = uint64_field(&issuance, "OutstandingAmount")?;
+            issuance["OutstandingAmount"] = Value::String(
+                outstanding
+                    .checked_sub(actual)
+                    .ok_or(TransactionResult::TefInternal)?
+                    .to_string(),
+            );
+            ctx.view
+                .update(
+                    mpt.issuance_key,
+                    serde_json::to_vec(&issuance).map_err(|_| TransactionResult::TefInternal)?,
+                )
+                .map_err(|_| TransactionResult::TefInternal)?;
+            return Ok(TransactionResult::TesSuccess);
+        }
 
         let amount = ctx.tx.get("Amount").unwrap();
         let holder_str = amount["issuer"]
@@ -120,8 +277,7 @@ impl Transactor for ClawbackTransactor {
             .view
             .read(&tl_key)
             .ok_or(TransactionResult::TecNoEntry)?;
-        let mut tl: Value =
-            serde_json::from_slice(&tl_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let mut tl: Value = helpers::decode_state_value(&tl_bytes)?;
 
         let holder_balance = compute_holder_balance(&tl, &issuer_id, &holder_id);
         if holder_balance <= 0.0 {

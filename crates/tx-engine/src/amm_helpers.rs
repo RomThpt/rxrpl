@@ -172,6 +172,64 @@ pub fn swap_asset_out(
     }
 }
 
+/// Generate the bounded single-path AMM offer used when a CLOB quality is
+/// available. This mirrors rippled's `getAMMOfferStartWithTakerGets` for an
+/// IOU input and an integral output such as XRP: the output is solved at the
+/// requested quality, rounded down to its asset grid, then the exact input is
+/// obtained through the canonical `swapAssetOut` arithmetic.
+pub fn offer_at_quality_xrp_output(
+    pool_in: &rxrpl_amount::number::Number,
+    pool_out: &rxrpl_amount::number::Number,
+    quality: &rxrpl_amount::number::Number,
+    tfee: u16,
+) -> Option<(rxrpl_amount::number::Number, rxrpl_amount::number::Number)> {
+    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode, root2};
+
+    if quality.is_zero() || pool_in.is_zero() || pool_out.is_zero() {
+        return None;
+    }
+    let _nearest = RoundModeGuard::new(RoundingMode::ToNearest);
+    let fee = Number::from_int(tfee as i64).div(&Number::from_int(100_000));
+    let f = Number::from_int(1).sub(&fee);
+    if f.is_zero() {
+        return None;
+    }
+
+    let b = pool_in
+        .mul(&Number::from_int(1).sub(&Number::from_int(1).div(&f)))
+        .div(quality)
+        .sub(&pool_out.mul(&Number::from_int(2)));
+    let c = pool_out
+        .mul(pool_out)
+        .sub(&pool_in.mul(pool_out).div(quality));
+    let discriminant = b.mul(&b).sub(&Number::from_int(4).mul(&c));
+    if discriminant.negative() {
+        return None;
+    }
+    let proposed = Number::from_int(0)
+        .sub(&b)
+        .sub(&root2(discriminant))
+        .div(&Number::from_int(2));
+    let constraint = pool_out.sub(&pool_in.div(&quality.mul(&f)));
+    let output = if constraint.sub(&proposed).negative() {
+        constraint
+    } else {
+        proposed
+    };
+    if output.is_zero() || output.negative() {
+        return None;
+    }
+    let output = {
+        let _down = RoundModeGuard::new(RoundingMode::Downward);
+        Number::from_int(output.to_xrp_drops_mode() as i64)
+    };
+    let input = swap_asset_out(pool_in, pool_out, &output, tfee, false)?;
+    if input.is_zero() {
+        return None;
+    }
+    Some((input, output))
+}
+
 /// Single-asset deposit: LP tokens issued for depositing `deposit` of an asset
 /// whose pool balance is `pool`, against `total_lp` outstanding, with trading
 /// fee `tfee` (1/100000). Mirrors rippled `lpTokensOut` under fixAMMv1_3
@@ -479,7 +537,7 @@ pub fn iou_holding_number(
     let Some(bytes) = view.read(&tl_key) else {
         return Number::ZERO;
     };
-    let Ok(line): Result<Value, _> = serde_json::from_slice(&bytes) else {
+    let Ok(line): Result<Value, _> = crate::helpers::decode_state_value(&bytes) else {
         return Number::ZERO;
     };
     let bal_str = line["Balance"]["value"].as_str().unwrap_or("0");
@@ -508,8 +566,7 @@ pub fn set_iou_holding(
 ) -> Result<(), TransactionResult> {
     let tl_key = keylet::trust_line(account, issuer, currency);
     let bytes = view.read(&tl_key).ok_or(TransactionResult::TecNoEntry)?;
-    let mut line: Value =
-        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let mut line: Value = crate::helpers::decode_state_value(&bytes)?;
     let stored = if account.as_bytes() < issuer.as_bytes() {
         *new_holding
     } else {
@@ -692,7 +749,7 @@ pub fn read_amm(
     amm_key: &rxrpl_primitives::Hash256,
 ) -> Result<Value, TransactionResult> {
     let bytes = view.read(amm_key).ok_or(TransactionResult::TecNoEntry)?;
-    serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)
+    crate::helpers::decode_state_value(&bytes)
 }
 
 /// Get a u64 field stored as a string from a JSON value.
@@ -820,7 +877,7 @@ pub fn lp_balance_of(view: &dyn ReadView, amm_key: &Hash256, holder: &AccountId)
     let Some(bytes) = view.read(&tl_key) else {
         return 0;
     };
-    let Ok(line): Result<Value, _> = serde_json::from_slice(&bytes) else {
+    let Ok(line): Result<Value, _> = crate::helpers::decode_state_value(&bytes) else {
         return 0;
     };
     line.get("Balance")
@@ -861,8 +918,7 @@ pub fn adjust_lp_balance(
     let (existing_balance_signed, mut line, exists): (i128, Value, bool) = match view.read(&tl_key)
     {
         Some(b) => {
-            let v: Value =
-                serde_json::from_slice(&b).map_err(|_| TransactionResult::TefInternal)?;
+            let v: Value = crate::helpers::decode_state_value(&b)?;
             let raw = v
                 .get("Balance")
                 .and_then(|b| b.get("value"))
@@ -937,8 +993,7 @@ pub fn adjust_lp_balance(
         // matching TrustSet's bookkeeping.
         let acct_key = keylet::account(holder);
         if let Some(acct_bytes) = view.read(&acct_key) {
-            let mut acct: Value =
-                serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
+            let mut acct: Value = crate::helpers::decode_state_value(&acct_bytes)?;
             crate::helpers::adjust_owner_count(&mut acct, 1);
             let new_bytes =
                 serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
@@ -960,6 +1015,21 @@ pub fn adjust_lp_balance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offer_at_quality_xrp_output_generates_bounded_tranche() {
+        let pool_in = rxrpl_amount::number::Number::from_iou(
+            &rxrpl_amount::IOUAmount::from_decimal_string("28325.19357149244").unwrap(),
+        );
+        let pool_out = rxrpl_amount::number::Number::from_int(19012739795);
+        let quality = rxrpl_amount::number::Number::from_iou(
+            &rxrpl_amount::from_rate(0x4F054C9FCA4BE4BA).unwrap(),
+        );
+        let (input, output) =
+            offer_at_quality_xrp_output(&pool_in, &pool_out, &quality, 10).unwrap();
+        assert_eq!(output.to_xrp_drops_mode(), 11_623_384);
+        assert_eq!(input.to_iou().to_decimal_string(), "17.32885170464047");
+    }
     use rxrpl_amount::number::Number;
 
     // Mainnet tx 90BC32E8… (ledger 105255844): XRP->BEAR AMM swap, SendMax 100
