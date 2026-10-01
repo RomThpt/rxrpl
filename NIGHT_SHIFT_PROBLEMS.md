@@ -675,3 +675,7 @@ This is version coverage for one maintained mixed-validator fixture. Mainnet/Tes
 ## [RESOLVED] Hive candidate-set and validator transaction parity — 2026-10-01T08:29:52Z
 
 The isolated `sync/late-join-sync` Hive scenario passes 1/1 for rxrpl initial and late validators. The earlier failures were localized to four parity gaps: static-UNL manifest binding, candidate-root responses without transaction leaves, transaction gossip being shed after a genesis validator became live, and RPC submit using default rather than active-ledger amendment rules. The final run produced identical ledger, transaction, and account-state roots at ledger 11 and passed the late-join account-state catch-up to ledger 15. This is not yet proof of the complete Hive suite, all networks, all amendments, or real XRPL Commons State Compare datasets.
+
+## [RESOLVED] Full Hive sync cross-product — 2026-10-01T09:09:13Z
+
+The first full run used a 15-minute global simulation budget and timed out while the second rxrpl-initial scenario was still advancing toward the ledger-15 assertion; its logs showed normal validated progress through ledger 12, so this was an orchestration budget limit rather than a parity failure. With a 60-minute budget, all four `sync/late-join-sync` combinations passed: rxrpl→rxrpl, rxrpl→rippled, rippled→rxrpl, and rippled→rippled. Hive reported `tests=4 failed=0` and cleaned the current run's clients and networks. Broader Hive suites, all network profiles, amendment-by-amendment activation, and real XRPL Commons State Compare data remain open.
