@@ -633,3 +633,9 @@ Manifest parsing now follows the inspected rippled rules for the 358-byte maximu
 The mixed-network generator assigned the same seed to `master_secret` and `ephemeral_seed`, so current rippled-compatible manifest admission correctly rejected both RXRPL validators with `IdenticalKeys`. The fixture now keeps the harvested master keys for the UNL and assigns each validator a distinct deterministic secp256k1 signing seed. Config tests pass 8/8, and the 3-rippled/2-rxrpl sync suite passes 4/4 at quorum 4/5.
 
 The successful run proves this maintained 3.1.3 sync topology only. Full amendment/network coverage, real State Compare datasets, and ConfidentialMPT execution remain open.
+
+## [RESOLVED] LiBASE generation reuse accepted a late response from the previous peer — 2026-10-01T03:39:23Z
+
+Pending requests were keyed by sequence and optional ledger hash only. After timeout retirement, a fresh request for the same sequence could accept a late response from the peer serving the old generation. The syncer now tracks a local generation and direct peer affinity; the request sender rotates to a different ranked peer when available, and inbound liBASE checks the source peer before consuming the pending request. Focused lifecycle/peer-manager tests and overlay all-targets pass.
+
+When only one peer is available, the wire protocol still provides no request id; the implementation preserves compatibility and can only enforce hash/sequence plus the available peer context.

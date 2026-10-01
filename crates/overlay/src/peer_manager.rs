@@ -1395,7 +1395,10 @@ impl PeerManager {
                         // the base pending entry makes a node-only response
                         // look like a completed header request.
                         if info_type == LI_BASE {
-                            if !self.ledger_syncer.response_matches_base(ledger_seq, hash) {
+                            if !self
+                                .ledger_syncer
+                                .response_matches_base(ledger_seq, hash, from)
+                            {
                                 tracing::warn!(
                                     "rejecting LedgerData from {} with unexpected hash {} for seq {}",
                                     from,
@@ -3150,17 +3153,26 @@ impl PeerManager {
     /// sequence, the request includes specific node hashes (delta sync).
     /// Otherwise, falls back to requesting all leaf nodes.
     fn send_get_ledger(&mut self, seq: u32, hash: Option<Hash256>) {
-        // Register request in the syncer so responses can be correlated.
-        self.ledger_syncer.register_request(seq, hash);
-
         // liBASE requests fetch the ledger header only -- no delta node_ids.
         let payload =
             proto_convert::encode_get_ledger_with_nodes(LI_BASE, hash.as_ref(), seq, 0, Vec::new());
 
-        // Send to a single peer.
-        let best = self.peer_set.best_peers_for_ledger(seq, 1);
-        if let Some(node_id) = best.first() {
-            if let Some(handle) = self.peer_handles.get(node_id) {
+        // Send to a single peer. Prefer a different peer on retries or a new
+        // generation for the same sequence, so a late response from the old
+        // peer cannot satisfy the new local request.
+        let previous_peer = self.ledger_syncer.request_peer(seq);
+        let best = self
+            .peer_set
+            .best_peers_for_ledger(seq, if previous_peer.is_some() { 2 } else { 1 });
+        let node_id = best
+            .first()
+            .copied()
+            .filter(|peer| Some(*peer) != previous_peer)
+            .or_else(|| best.first().copied());
+        self.ledger_syncer
+            .register_request_for_peer(seq, hash, node_id);
+        if let Some(node_id) = node_id {
+            if let Some(handle) = self.peer_handles.get(&node_id) {
                 match handle.tx.try_send(PeerMessage {
                     msg_type: MessageType::GetLedger,
                     payload,

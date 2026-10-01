@@ -234,6 +234,11 @@ pub struct LedgerSyncer {
     /// request lifecycle has ended.  A fresh request for the same sequence
     /// removes the tombstone.
     retired_base: HashSet<u32>,
+    /// Last peer used for a direct liBASE request at each sequence. The wire
+    /// message has no request id, so peer affinity is the available local
+    /// discriminator between an old response and a new request generation.
+    last_base_peer: HashMap<u32, Hash256>,
+    next_generation: u64,
     max_concurrent: usize,
     timeout: Duration,
     /// Active incremental syncs keyed by ledger sequence.
@@ -263,6 +268,8 @@ struct PendingRequest {
     /// logic can correlate responses. Not yet read by the syncer.
     #[allow(dead_code)]
     hash: Option<Hash256>,
+    peer_id: Option<Hash256>,
+    generation: u64,
     sent_at: Instant,
     retries: u32,
 }
@@ -272,6 +279,8 @@ impl LedgerSyncer {
         Self {
             pending: HashMap::new(),
             retired_base: HashSet::new(),
+            last_base_peer: HashMap::new(),
+            next_generation: 0,
             max_concurrent: MAX_CONCURRENT_REQUESTS,
             timeout: REQUEST_TIMEOUT,
             incremental: HashMap::new(),
@@ -288,12 +297,56 @@ impl LedgerSyncer {
     /// Called by `PeerManager::send_get_ledger` to ensure the response handler
     /// can match incoming `LedgerData` to a pending request.
     pub fn register_request(&mut self, seq: u32, hash: Option<Hash256>) {
+        self.register_request_for_peer(seq, hash, None);
+    }
+
+    /// Register a direct liBASE request and bind it to the selected peer.
+    /// Retries keep their generation while updating the peer affinity.
+    pub fn register_request_for_peer(
+        &mut self,
+        seq: u32,
+        hash: Option<Hash256>,
+        peer_id: Option<Hash256>,
+    ) {
         self.retired_base.remove(&seq);
-        self.pending.entry(seq).or_insert_with(|| PendingRequest {
-            hash,
-            sent_at: Instant::now(),
-            retries: 0,
-        });
+        if let Some(request) = self.pending.get_mut(&seq) {
+            request.hash = hash.or(request.hash);
+            request.peer_id = peer_id.or(request.peer_id);
+            request.sent_at = Instant::now();
+            if let Some(peer_id) = request.peer_id {
+                self.last_base_peer.insert(seq, peer_id);
+            }
+            return;
+        }
+
+        self.next_generation = self.next_generation.saturating_add(1);
+        let generation = self.next_generation;
+        self.pending.insert(
+            seq,
+            PendingRequest {
+                hash,
+                peer_id,
+                generation,
+                sent_at: Instant::now(),
+                retries: 0,
+            },
+        );
+        if let Some(peer_id) = peer_id {
+            self.last_base_peer.insert(seq, peer_id);
+        }
+    }
+
+    /// Return the peer used by the active or most recently retired generation.
+    pub fn request_peer(&self, seq: u32) -> Option<Hash256> {
+        self.pending
+            .get(&seq)
+            .and_then(|request| request.peer_id)
+            .or_else(|| self.last_base_peer.get(&seq).copied())
+    }
+
+    /// Return the local generation for an active request, when present.
+    pub fn request_generation(&self, seq: u32) -> Option<u64> {
+        self.pending.get(&seq).map(|request| request.generation)
     }
 
     /// Check if we need to sync based on our sequence vs a peer's sequence.
@@ -315,8 +368,11 @@ impl LedgerSyncer {
         while seq < target_seq && self.pending.len() < self.max_concurrent {
             if let std::collections::hash_map::Entry::Vacant(e) = self.pending.entry(seq) {
                 self.retired_base.remove(&seq);
+                self.next_generation = self.next_generation.saturating_add(1);
                 e.insert(PendingRequest {
                     hash: None,
+                    peer_id: None,
+                    generation: self.next_generation,
                     sent_at: Instant::now(),
                     retries: 0,
                 });
@@ -362,8 +418,15 @@ impl LedgerSyncer {
     /// request was retired after exhausting retries.  Other untracked
     /// responses remain admissible for rippled-compatible unsolicited relay
     /// traffic.
-    pub fn response_matches_base(&self, seq: u32, hash: Hash256) -> bool {
-        !self.retired_base.contains(&seq) && self.response_matches_pending(seq, hash)
+    pub fn response_matches_base(&self, seq: u32, hash: Hash256, from: Hash256) -> bool {
+        if self.retired_base.contains(&seq) {
+            return false;
+        }
+        let Some(request) = self.pending.get(&seq) else {
+            return true;
+        };
+        request.peer_id.is_none_or(|expected| expected == from)
+            && self.response_matches_pending(seq, hash)
     }
 
     /// Check for timed-out requests and return their sequence numbers for retry.
@@ -423,6 +486,8 @@ impl LedgerSyncer {
     pub fn clear(&mut self) {
         self.pending.clear();
         self.retired_base.clear();
+        self.last_base_peer.clear();
+        self.next_generation = 0;
         self.incremental.clear();
         self.ledger_hashes.clear();
         self.synced_seqs.clear();
@@ -1033,7 +1098,9 @@ mod tests {
     fn final_timeout_retires_late_base_response_until_re_registered() {
         let mut syncer = LedgerSyncer::new();
         let hash = Hash256::new([0xCD; 32]);
-        syncer.register_request(7, Some(hash));
+        let old_peer = Hash256::new([0x01; 32]);
+        syncer.register_request_for_peer(7, Some(hash), Some(old_peer));
+        let first_generation = syncer.request_generation(7).unwrap();
 
         let start = Instant::now();
         for retry in 1..=4 {
@@ -1042,10 +1109,13 @@ mod tests {
         }
 
         assert!(!syncer.is_pending(7));
-        assert!(!syncer.response_matches_base(7, hash));
+        assert!(!syncer.response_matches_base(7, hash, old_peer));
 
-        syncer.register_request(7, Some(hash));
-        assert!(syncer.response_matches_base(7, hash));
+        let new_peer = Hash256::new([0x02; 32]);
+        syncer.register_request_for_peer(7, Some(hash), Some(new_peer));
+        assert!(syncer.request_generation(7).unwrap() > first_generation);
+        assert!(!syncer.response_matches_base(7, hash, old_peer));
+        assert!(syncer.response_matches_base(7, hash, new_peer));
     }
 
     #[test]
@@ -1055,7 +1125,11 @@ mod tests {
         assert!(syncer.pending_count() > 0);
         syncer.clear();
         assert_eq!(syncer.pending_count(), 0);
-        assert!(syncer.response_matches_base(7, Hash256::new([0xCD; 32])));
+        assert!(syncer.response_matches_base(
+            7,
+            Hash256::new([0xCD; 32]),
+            Hash256::new([0x03; 32]),
+        ));
     }
 
     /// A GetObjectByHash inner NodeObject (`MIN\0 || 16*32 child hashes`)
