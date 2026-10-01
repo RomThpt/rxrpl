@@ -1000,14 +1000,19 @@ impl PeerManager {
             }
         }
 
-        // Shed transaction gossip during initial state catchup: with no base
-        // ledger a cold node cannot apply or usefully relay transactions, and
-        // the mainnet tx flood (~21k/25s) plus its per-peer rebroadcast loop
-        // otherwise starves the SHAMap state sync that shares this single event
-        // loop. Proposals are NOT shed: between rxrpl nodes the peer tip is
-        // announced via proposals (not StatusChange), so they are load-bearing
-        // for the node loop entering sync mode and adopting the acquired state.
-        if matches!(msg_type, MessageType::Transaction) && self.ledger_syncer.in_initial_catchup() {
+        // Shed transaction gossip only while an initial state sync is active:
+        // with no base ledger a cold node cannot apply or usefully relay
+        // transactions, and the mainnet tx flood plus its per-peer rebroadcast
+        // loop otherwise starves the SHAMap state sync that shares this single
+        // event loop. A validator that started from genesis can still report
+        // `in_initial_catchup()` after advancing by consensus, because no
+        // state-sync target has been marked complete. Such a live validator
+        // must continue accepting transaction gossip or a two-node network can
+        // close a different transaction set on each validator.
+        let cold_state_sync = self.ledger_syncer.in_initial_catchup()
+            && (self.ledger_syncer.has_any_incremental_sync()
+                || self.ledger_seq.load(Ordering::Relaxed) <= 1);
+        if matches!(msg_type, MessageType::Transaction) && cold_state_sync {
             return;
         }
 
@@ -3607,9 +3612,21 @@ impl PeerManager {
             });
         } else {
             for node_id in &request_node_ids {
-                if let Some((_h, raw, _is_inner)) = map.node_at(*node_id) {
-                    let wire = encode_tx_no_meta_wire_node(&raw);
-                    nodes.push((node_id.to_wire_bytes(), wire));
+                // A candidate request starts at the root. Returning only the
+                // root inner node leaves the requester with no transaction
+                // blobs to hash, and the current acquisition path has no
+                // separate inner-node walker. Mirror rippled's fat-node
+                // response here so the root and its reachable leaves arrive
+                // in one response.
+                for (fat_id, raw, is_inner) in map.get_node_fat(*node_id, true, 10, 8192) {
+                    let wire = if is_inner {
+                        let mut wire = raw;
+                        wire.push(WIRE_TYPE_INNER);
+                        wire
+                    } else {
+                        encode_tx_no_meta_wire_node(&raw)
+                    };
+                    nodes.push((fat_id.to_wire_bytes(), wire));
                 }
             }
         }

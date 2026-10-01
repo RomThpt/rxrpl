@@ -659,3 +659,19 @@ The Testnet checkpoint window now extends through ledger 20934252 with four-root
 The first post-fix full run reached 23/24. The only failure was `test_rippled_crash_and_recover`: after the long suite had advanced to the 400s, the test queried the original `baseline+2` sequence (ledger 43), which was outside the restarted rippled node's bounded history window. The five-node network had already reconverged at the live tip, and no divergent hash was observed.
 
 The test now records each node's recovered tip and compares the minimum recent tip, then the targeted chaos matrix passes 6/6 in 170.98 seconds. A full 24-test rerun after this test-only correction is still pending. Broader network/amendment coverage, real XRPL Commons State Compare datasets, and ConfidentialMPT execution remain open.
+
+## [RESOLVED] Current-source mixed-validator full interop matrix — 2026-10-01T06:38:10Z
+
+The complete maintained matrix now passes 24/24 in 252.56 seconds against `rippleci/rippled:3.1.3`, with 3 rippled and 2 rxrpl validators at quorum 4/5. It covers configuration admission, consensus/hash agreement, mixed-voter quorum, transaction propagation, state/history synchronization, peer connectivity, rippled crash/recovery, rxrpl crash/rejoin, and no-panic checks. The corrected recovery test compares a recent post-recovery tip, so it is not invalidated by bounded rippled history retention.
+
+Six `PytestUnknownMarkWarning` warnings remain because the container does not register the `network` marker; they do not affect the 24 passing tests. This does not close the broader network/amendment matrix, real XRPL Commons State Compare evidence, or ConfidentialMPT execution gap.
+
+## [RESOLVED] Interop compatibility across maintained rippled versions — 2026-10-01T06:48:01Z
+
+The full 24-test matrix now passes for `rippleci/rippled:2.3.0` (234.27s), `2.4.0` (249.69s), and `3.1.3` (252.56s). The temporary per-validator config directories allow the 2.x images to normalize their configuration without breaking the bind mount. Each run covers the same 3-rippled/2-rxrpl, quorum-4/5 topology and exits with no leftover interop containers.
+
+This is version coverage for one maintained mixed-validator fixture. Mainnet/Testnet/standalone runtime profiles, amendment-by-amendment activation, XRPL Hive full suites, real XRPL Commons State Compare datasets, and ConfidentialMPT execution remain separate open requirements.
+
+## [RESOLVED] Hive candidate-set and validator transaction parity — 2026-10-01T08:29:52Z
+
+The isolated `sync/late-join-sync` Hive scenario passes 1/1 for rxrpl initial and late validators. The earlier failures were localized to four parity gaps: static-UNL manifest binding, candidate-root responses without transaction leaves, transaction gossip being shed after a genesis validator became live, and RPC submit using default rather than active-ledger amendment rules. The final run produced identical ledger, transaction, and account-state roots at ledger 11 and passed the late-join account-state catch-up to ledger 15. This is not yet proof of the complete Hive suite, all networks, all amendments, or real XRPL Commons State Compare datasets.

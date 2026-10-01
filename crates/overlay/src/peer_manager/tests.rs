@@ -623,6 +623,37 @@ async fn peer_manager_get_tx_set_unknown_returns_no_response() {
 }
 
 #[test]
+fn peer_manager_get_tx_set_root_includes_candidate_leaves() {
+    let (mut mgr, peer_id, mut rx) = make_test_peer_manager();
+    let blob = vec![0x10, 0x20, 0x30];
+    let prefix = rxrpl_crypto::hash_prefix::HashPrefix::TRANSACTION_ID.to_bytes();
+    let tx_id = rxrpl_crypto::sha512_half::sha512_half(&[&prefix, &blob]);
+    let tx_set = TxSet::from_items(vec![(tx_id, blob)]);
+    let expected_hash = tx_set.hash;
+
+    let cache = Arc::new(std::sync::RwLock::new(HashMap::from([(
+        expected_hash,
+        tx_set,
+    )])));
+    mgr.set_tx_sets(cache);
+    mgr.handle_get_tx_set(
+        peer_id,
+        expected_hash.as_bytes(),
+        &[rxrpl_shamap::NodeId::ROOT.to_wire_bytes()],
+        None,
+    );
+
+    let msg = rx.try_recv().expect("expected candidate-set response");
+    let decoded = proto_convert::decode_ledger_data(&msg.payload).expect("decode response");
+    assert_eq!(decoded.ledger_info_type, LI_TS_CANDIDATE);
+    assert!(decoded.nodes.iter().any(|node| {
+        node.nodedata
+            .as_deref()
+            .is_some_and(|data| data.last() == Some(&WIRE_TYPE_TX_NO_META))
+    }));
+}
+
+#[test]
 fn send_get_tx_set_requests_root_node() {
     let (mgr, peer_id, mut rx) = make_test_peer_manager();
     let tx_set_hash = Hash256::new([0x44; 32]);

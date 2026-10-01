@@ -3344,23 +3344,23 @@ impl Node {
                                 // Keep the consensus engine's UNL aware of the
                                 // ephemeral->master mapping so trusted proposals
                                 // and validations signed by the ephemeral key
-                                // resolve to their (VL-trusted) master. Gated on
-                                // a dynamic VL so static-config nodes are
-                                // untouched.
-                                if vl_dynamic {
-                                    let unl = consensus.unl_mut();
-                                    if revoked {
-                                        unl.revoke_master_key(&master_key);
-                                        if let Some(ref eph) = ephemeral_key {
-                                            unl.remove_ephemeral_key(eph);
-                                        }
-                                    } else if let Some(ref eph) = ephemeral_key {
-                                        unl.register_ephemeral_key(
-                                            &master_key,
-                                            eph,
-                                            old_ephemeral_key.as_ref(),
-                                        );
+                                // resolve to their (VL-trusted) master. Manifests
+                                // are also required with a statically configured
+                                // UNL: the trust source is static, but the
+                                // signing key binding is still learned from the
+                                // verified manifest.
+                                let unl = consensus.unl_mut();
+                                if revoked {
+                                    unl.revoke_master_key(&master_key);
+                                    if let Some(ref eph) = ephemeral_key {
+                                        unl.remove_ephemeral_key(eph);
                                     }
+                                } else if let Some(ref eph) = ephemeral_key {
+                                    unl.register_ephemeral_key(
+                                        &master_key,
+                                        eph,
+                                        old_ephemeral_key.as_ref(),
+                                    );
                                 }
 
                                 if !revoked {

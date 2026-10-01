@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use rxrpl_amendment::Rules;
 use rxrpl_protocol::tx::compute_tx_hash;
 use rxrpl_txq::{FeeLevel, FeeMetrics, QueueEntry};
 
@@ -132,7 +131,7 @@ pub async fn submit(params: Value, ctx: &Arc<ServerContext>) -> Result<Value, Rp
     }
 
     let mut ledger = ledger.write().await;
-    let rules = Rules::new();
+    let rules = super::common::rules_for_ledger(&ledger)?;
 
     let result = match engine.apply(&tx_json, &mut ledger, &rules, fees) {
         Ok(r) => r,

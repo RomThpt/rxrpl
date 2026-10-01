@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use rxrpl_amendment::Rules;
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_ledger::Ledger;
 use rxrpl_primitives::{AccountId, Hash256};
@@ -25,6 +26,53 @@ pub fn read_state_as_json(ledger: &Ledger, key: &Hash256) -> Result<Option<Value
         return Ok(None);
     };
     decode_state_value(data).map(Some)
+}
+
+/// Build the amendment rules active for a ledger, matching the node's live
+/// transaction and replay paths.
+pub fn rules_for_ledger(ledger: &Ledger) -> Result<Rules, RpcServerError> {
+    let Some(bytes) = ledger.get_state(&keylet::amendments()) else {
+        return Ok(Rules::new());
+    };
+    let value = decode_state_value(bytes)?;
+    let amendments = value
+        .get("Amendments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RpcServerError::Internal("Amendments SLE has no Amendments array".into()))?;
+    let mut enabled = Vec::with_capacity(amendments.len());
+    for (index, amendment) in amendments.iter().enumerate() {
+        let text = amendment.as_str().ok_or_else(|| {
+            RpcServerError::Internal(format!("Amendments[{index}] is not a hex string"))
+        })?;
+        let bytes = hex::decode(text).map_err(|e| {
+            RpcServerError::Internal(format!("Amendments[{index}] has invalid hex: {e}"))
+        })?;
+        let bytes: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+            RpcServerError::Internal(format!(
+                "Amendments[{index}] has {} bytes, expected 32",
+                bytes.len()
+            ))
+        })?;
+        enabled.push(Hash256::new(bytes));
+    }
+
+    // SortedDirectories was retired from the on-ledger amendment list but is
+    // still required by modern directory behavior.
+    let sorted_directories = rxrpl_amendment::feature::feature_id("SortedDirectories");
+    let post_retirement = [
+        "fixPreviousTxnID",
+        "MPTokensV1",
+        "PriceOracle",
+        "SingleAssetVault",
+    ]
+    .into_iter()
+    .map(rxrpl_amendment::feature::feature_id);
+    if !enabled.contains(&sorted_directories)
+        && post_retirement.clone().any(|id| enabled.contains(&id))
+    {
+        enabled.push(sorted_directories);
+    }
+    Ok(Rules::from_enabled(enabled))
 }
 
 /// Result type for paginated directory walks.
