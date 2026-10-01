@@ -679,3 +679,7 @@ The isolated `sync/late-join-sync` Hive scenario passes 1/1 for rxrpl initial an
 ## [RESOLVED] Full Hive sync cross-product — 2026-10-01T09:09:13Z
 
 The first full run used a 15-minute global simulation budget and timed out while the second rxrpl-initial scenario was still advancing toward the ledger-15 assertion; its logs showed normal validated progress through ledger 12, so this was an orchestration budget limit rather than a parity failure. With a 60-minute budget, all four `sync/late-join-sync` combinations passed: rxrpl→rxrpl, rxrpl→rippled, rippled→rxrpl, and rippled→rippled. Hive reported `tests=4 failed=0` and cleaned the current run's clients and networks. Broader Hive suites, all network profiles, amendment-by-amendment activation, and real XRPL Commons State Compare data remain open.
+
+## [RESOLVED] Hive mixed consensus and propagation smoke suites — 2026-10-01T09:14:38Z
+
+The Hive `consensus` suite passed 1/1 for mixed rxrpl/rippled hash agreement, and `propagation` passed 1/1 for a cross-implementation payment. This strengthens the validator evidence beyond late-join state sync; broader Hive suites, network profiles, amendment-by-amendment activation, and real XRPL Commons State Compare data remain open.
