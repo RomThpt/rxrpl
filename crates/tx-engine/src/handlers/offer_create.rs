@@ -248,6 +248,9 @@ const TF_HYBRID: u64 = 0x0010_0000;
 /// transaction flag is persisted on the Offer SLE.
 const LSF_PASSIVE: u64 = 0x0001_0000;
 const LSF_SELL: u64 = 0x0002_0000;
+const LSF_LOW_AUTH: u64 = 0x0004_0000;
+const LSF_HIGH_AUTH: u64 = 0x0008_0000;
+const LSF_REQUIRE_AUTH: u64 = 0x0004_0000;
 
 /// rippled's `Quality::kMaxTickSize` — no rounding at or above 16 digits.
 const MAX_TICK_SIZE: u8 = 16;
@@ -426,6 +429,10 @@ impl Transactor for OfferCreateTransactor {
             if let Some(domain_id) = ctx.tx.get("DomainID").and_then(|v| v.as_str()) {
                 check_domain_membership(ctx, &account_id, domain_id)?;
             }
+        }
+
+        if !account_authorized_for_iou(ctx.view, &account_id, &ctx.tx["TakerPays"]) {
+            return Err(TransactionResult::TecNoAuth);
         }
 
         Ok(())
@@ -4636,6 +4643,42 @@ fn currency_and_issuer(amount: &Value) -> ([u8; 20], AccountId) {
     (currency, issuer)
 }
 
+fn account_authorized_for_iou(
+    view: &dyn crate::view::read_view::ReadView,
+    holder: &AccountId,
+    amount: &Value,
+) -> bool {
+    if amount.is_string() {
+        return true;
+    }
+    let (currency, issuer) = currency_and_issuer(amount);
+    if issuer == AccountId::from([0u8; 20]) || holder == &issuer {
+        return true;
+    }
+
+    let issuer_flags = view
+        .read(&keylet::account(&issuer))
+        .and_then(|b| helpers::decode_state_value(&b).ok())
+        .and_then(|a| a.get("Flags").and_then(Value::as_u64))
+        .unwrap_or(0);
+    if issuer_flags & LSF_REQUIRE_AUTH == 0 {
+        return true;
+    }
+
+    let Some(line) = view
+        .read(&keylet::trust_line(holder, &issuer, &currency))
+        .and_then(|b| helpers::decode_state_value(&b).ok())
+    else {
+        return false;
+    };
+    let flags = line.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+    if issuer.as_bytes() < holder.as_bytes() {
+        flags & LSF_LOW_AUTH != 0
+    } else {
+        flags & LSF_HIGH_AUTH != 0
+    }
+}
+
 /// PermissionedDEX domain membership check for a domain-scoped offer.
 ///
 /// rippled: an offer carrying a `DomainID` is authorised only for members of
@@ -6853,7 +6896,7 @@ mod amm_quality_gate_tests {
 mod owner_funds_tests {
     use super::*;
     use crate::fees::FeeSettings;
-    use crate::transactor::ApplyContext;
+    use crate::transactor::{ApplyContext, PreclaimContext};
     use crate::view::ledger_view::LedgerView;
     use crate::view::sandbox::Sandbox;
     use rxrpl_amendment::Rules;
@@ -6967,6 +7010,77 @@ mod owner_funds_tests {
     #[test]
     fn require_auth_authorized_is_funded() {
         assert!(!maker_usd_funds(auth_flag(), 0x0004_0000).is_zero());
+    }
+
+    fn offer_preclaim_with_auth(line_flags: u64) -> Result<(), TransactionResult> {
+        let maker = decode_account_id(MAKER).unwrap();
+        let issuer = decode_account_id(ISSUER).unwrap();
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+        let issuer_is_low = issuer.as_bytes() < maker.as_bytes();
+        let (low, high) = if issuer_is_low {
+            (ISSUER, MAKER)
+        } else {
+            (MAKER, ISSUER)
+        };
+        let mut ledger = Ledger::genesis();
+        for (addr, id, flags) in [(MAKER, &maker, 0u64), (ISSUER, &issuer, 0x0004_0000)] {
+            let acct = serde_json::json!({
+                "LedgerEntryType": "AccountRoot",
+                "Account": addr,
+                "Balance": "100000000",
+                "Sequence": 1,
+                "OwnerCount": 0,
+                "Flags": flags,
+            });
+            ledger
+                .put_state(keylet::account(id), serde_json::to_vec(&acct).unwrap())
+                .unwrap();
+        }
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": "0"},
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "0"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "1000000"},
+            "Flags": line_flags,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&maker, &issuer, &cur),
+                serde_json::to_vec(&line).unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "OfferCreate",
+            "Account": MAKER,
+            "Fee": "12",
+            "Sequence": 1,
+            "TakerGets": "1000000",
+            "TakerPays": {"currency": "USD", "issuer": ISSUER, "value": "100"},
+        });
+        let ctx = PreclaimContext {
+            tx: &tx,
+            view: &view,
+            rules: &rules,
+        };
+        OfferCreateTransactor.preclaim(&ctx)
+    }
+
+    #[test]
+    fn offer_create_rejects_unauthorized_taker_pays_iou() {
+        assert_eq!(
+            offer_preclaim_with_auth(0),
+            Err(TransactionResult::TecNoAuth)
+        );
+    }
+
+    #[test]
+    fn offer_create_accepts_authorized_taker_pays_iou() {
+        assert_eq!(offer_preclaim_with_auth(auth_flag()), Ok(()));
     }
 
     // Does MAKER's USD line report deep-frozen for the given line flags?

@@ -683,3 +683,15 @@ The first full run used a 15-minute global simulation budget and timed out while
 ## [RESOLVED] Hive mixed consensus and propagation smoke suites — 2026-10-01T09:14:38Z
 
 The Hive `consensus` suite passed 1/1 for mixed rxrpl/rippled hash agreement, and `propagation` passed 1/1 for a cross-implementation payment. This strengthens the validator evidence beyond late-join state sync; broader Hive suites, network profiles, amendment-by-amendment activation, and real XRPL Commons State Compare data remain open.
+
+## [RESOLVED] OfferCreate missed issuer required-auth for acquired IOUs — 2026-10-02T08:46:19Z
+
+The Testnet 20934253 localization showed transaction `2DE8D71C7D1FB624F62A7D9779ECD595BF6F1A47C57C694674E000D9A2F436B3` returning `tesSUCCESS` locally while rippled returned `tecNO_AUTH`. The taker was acquiring an IOU from an issuer with `lsfRequireAuth`, but OfferCreate preclaim did not verify issuer-side trustline authorization for `TakerPays`.
+
+OfferCreate preclaim now checks `lsfRequireAuth` on the IOU issuer and requires the matching trustline auth flag on the issuer side, while preserving XRP, issuer-self, and non-required-auth behavior. Focused OfferCreate coverage, tx-engine library tests, Clippy, rustfmt, and diff checks pass.
+
+## [OPEN] Testnet ledger 20934253 still diverges in OfferCreate crossing/AMM placement — 2026-10-02T08:46:19Z
+
+After the required-auth fix, the cached sweep still diverges at Testnet ledger 20934253. The local account hash changed to `DE5991B6BB240E91677AD06939C910B1325FB6AA4813AF1B07926CFE1C5D3011`; rippled remains `391585B67304024B8743AD87F59E73F30FBC5DA83FEC5DBD85569171AD2207A0`.
+
+The remaining localized real candidates are OfferCreate crossing/AMM placement transactions `B2D9AAB5EB356754F3B77FF5FE01C4AF0465E3277C9341DB8E20D66B5AF63906`, `87ABD72CD8E9A3A2B0AFD96D9AD41707811B1F69FEE617473A532C89B342963F`, and `4B6314012E273D26135CA22655731A262B2801CB9523E7045614963A0B089A36`. The `OracleSet` deltas observed during localization are likely nested JSON normalization noise for `PriceDataSeries.AssetPrice`, not the first causal state divergence.
