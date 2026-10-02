@@ -440,6 +440,17 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.adaptive_close_time.resolution()
     }
 
+    /// Synchronize the engine with the close-time resolution stored in the
+    /// current parent ledger before starting the next round.
+    ///
+    /// A node can adopt a ledger from a peer during catch-up, so the
+    /// resolution carried by the local engine may no longer describe the
+    /// parent ledger. Rippled derives the next resolution from that header;
+    /// callers should invoke this immediately before `start_round_with_prior`.
+    pub fn set_parent_close_time_resolution(&mut self, resolution: u32) {
+        self.adaptive_close_time.set_resolution(resolution);
+    }
+
     /// Number of peer positions observed for the current round.
     /// Used by the node loop to decide whether to extend the OPEN phase
     /// (wait for at least one peer to propose first) — breaks the cross-impl

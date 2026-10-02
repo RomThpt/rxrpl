@@ -8,6 +8,9 @@ pub enum PrimitivesError {
     #[error("invalid length: expected {expected}, got {got}")]
     InvalidLength { expected: usize, got: usize },
 
+    #[error("invalid public key prefix: {got:#04x}")]
+    InvalidPublicKeyPrefix { got: u8 },
+
     #[error("invalid amount: {0}")]
     InvalidAmount(String),
 

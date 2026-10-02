@@ -9,6 +9,13 @@ pub struct Feature {
     pub name: String,
     /// Whether this amendment is retired (always enabled, cannot be voted out).
     pub retired: bool,
+    /// Whether this build implements the amendment's consensus behavior.
+    ///
+    /// A registry can contain amendments that rippled knows about but this
+    /// build deliberately does not execute yet. Such amendments must remain
+    /// visible for ledger/configuration diagnostics, while the node must halt
+    /// validation if one becomes enabled.
+    pub implemented: bool,
     /// Default vote for this amendment (yes/no).
     pub default_vote: bool,
 }
@@ -22,7 +29,21 @@ impl Feature {
             id,
             name,
             retired: false,
+            implemented: true,
             default_vote,
+        }
+    }
+
+    /// Create a known amendment whose consensus behavior is not implemented.
+    pub fn unsupported(name: impl Into<String>) -> Self {
+        let name = name.into();
+        let id = feature_id(&name);
+        Self {
+            id,
+            name,
+            retired: false,
+            implemented: false,
+            default_vote: false,
         }
     }
 
@@ -34,6 +55,7 @@ impl Feature {
             id,
             name,
             retired: true,
+            implemented: true,
             default_vote: true,
         }
     }

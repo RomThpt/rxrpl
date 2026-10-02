@@ -139,6 +139,15 @@ pub fn get_u64_str_field(tx: &Value, field: &str) -> Option<u64> {
         .and_then(|s| s.parse().ok())
 }
 
+/// Decode a state-map value from canonical XRPL binary.
+///
+/// State entries are persisted as canonical XRPL binary. Keeping the
+/// compatibility boundary here prevents transaction code from treating binary
+/// SLE bytes as JSON.
+pub fn decode_state_value(bytes: &[u8]) -> Result<Value, TransactionResult> {
+    rxrpl_ledger::sle_codec::decode_state(bytes).map_err(|_| TransactionResult::TefInternal)
+}
+
 /// Look up an AccountRoot by address and return the keylet + parsed JSON.
 pub fn read_account_by_address(
     view: &dyn crate::view::read_view::ReadView,
@@ -148,6 +157,6 @@ pub fn read_account_by_address(
         .map_err(|_| TransactionResult::TemInvalidAccountId)?;
     let key = rxrpl_protocol::keylet::account(&account_id);
     let bytes = view.read(&key).ok_or(TransactionResult::TerNoAccount)?;
-    let obj: Value = serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let obj = decode_state_value(&bytes)?;
     Ok((key, obj))
 }

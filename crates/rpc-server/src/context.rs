@@ -1,4 +1,5 @@
 use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{Arc, OnceLock};
 
@@ -55,6 +56,11 @@ pub struct ServerContext {
     pub peer_reservations: Arc<RwLock<HashSet<String>>>,
     pub pruner_state: Option<Arc<PrunerState>>,
     pub shard_manager: Option<Arc<RwLock<ShardManager>>>,
+    /// Persistent SHAMap node store used to reconstruct historical ledgers
+    /// after a restart.
+    pub node_store: Option<Arc<dyn rxrpl_shamap::NodeStore>>,
+    /// Database directory containing the persistent ledger-header index.
+    pub persistent_history_dir: Option<PathBuf>,
     /// Ledger store for reporting mode (historical ledger and tx data).
     pub ledger_store: Option<Arc<dyn LedgerStore>>,
     /// Whether the node is running in reporting mode (read-only, no consensus).
@@ -188,6 +194,8 @@ impl ServerContext {
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
             pruner_state: None,
             shard_manager: None,
+            node_store: None,
+            persistent_history_dir: None,
             ledger_store: None,
             reporting_mode: false,
             forward_url: None,
@@ -233,6 +241,8 @@ impl ServerContext {
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
             pruner_state: None,
             shard_manager: None,
+            node_store: None,
+            persistent_history_dir: None,
             ledger_store: None,
             reporting_mode: false,
             forward_url: None,
@@ -279,6 +289,8 @@ impl ServerContext {
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
             pruner_state: None,
             shard_manager: None,
+            node_store: None,
+            persistent_history_dir: None,
             ledger_store: None,
             reporting_mode: false,
             forward_url: None,
@@ -326,6 +338,8 @@ impl ServerContext {
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
             pruner_state: Some(pruner_state),
             shard_manager: None,
+            node_store: None,
+            persistent_history_dir: None,
             ledger_store: None,
             reporting_mode: false,
             forward_url: None,
@@ -365,6 +379,8 @@ impl ServerContext {
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
             pruner_state: None,
             shard_manager: None,
+            node_store: None,
+            persistent_history_dir: None,
             ledger_store: Some(ledger_store),
             reporting_mode: true,
             forward_url: Some(forward_url),
@@ -450,6 +466,19 @@ impl ServerContext {
         }
     }
 
+    /// Attach the persistent SHAMap store and header index used by historical
+    /// ledger RPCs after a validator restart.
+    pub fn attach_persistent_history(
+        self: &mut Arc<Self>,
+        store: Arc<dyn rxrpl_shamap::NodeStore>,
+        database_path: PathBuf,
+    ) {
+        if let Some(ctx) = Arc::get_mut(self) {
+            ctx.node_store = Some(store);
+            ctx.persistent_history_dir = Some(database_path);
+        }
+    }
+
     /// Attach the overlay's PeerSet so `server_info.peers` reflects live
     /// connection count. Standalone mode leaves this `None` → peers=0.
     /// Same Arc::get_mut constraint as `attach_validator_list_status`.
@@ -483,6 +512,14 @@ impl ServerContext {
     /// Current peer count, or 0 when no PeerSet is attached.
     pub fn peer_count(&self) -> usize {
         self.peer_set.as_ref().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Snapshot the live peer records for the rippled-compatible `peers` RPC.
+    pub fn peer_infos(&self) -> Vec<Arc<rxrpl_overlay::peer_set::PeerInfo>> {
+        self.peer_set
+            .as_ref()
+            .map(|set| set.all_peers())
+            .unwrap_or_default()
     }
 
     /// Attach a shared last-close snapshot (populated by Node on each

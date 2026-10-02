@@ -35,6 +35,11 @@ impl FeatureRegistry {
         self.by_id.get(id)
     }
 
+    /// Whether this build can execute the amendment's consensus behavior.
+    pub fn is_implemented(&self, id: &Hash256) -> bool {
+        self.get(id).is_some_and(|feature| feature.implemented)
+    }
+
     /// Look up a feature by name.
     pub fn get_by_name(&self, name: &str) -> Option<&Feature> {
         let id = self.by_name.get(name)?;
@@ -51,11 +56,23 @@ impl FeatureRegistry {
         self.by_id.values()
     }
 
-    /// Iterate the ids of every known amendment (the set this build can apply).
-    /// Used by the amendment-blocked safety halt to detect an on-ledger
-    /// amendment this node does not understand.
+    /// Iterate the ids of every registered amendment, including forward-
+    /// registered features whose behavior is not implemented yet.
     pub fn known_ids(&self) -> impl Iterator<Item = &Hash256> {
         self.by_id.keys()
+    }
+
+    /// Iterate only amendments whose consensus behavior this build applies.
+    ///
+    /// `known_ids` intentionally includes forward-registered amendments so
+    /// configuration and ledger diagnostics can name them. Validator safety
+    /// must use this narrower set: an enabled known-but-unimplemented
+    /// amendment requires the node to stop validating.
+    pub fn implemented_ids(&self) -> impl Iterator<Item = &Hash256> {
+        self.by_id
+            .values()
+            .filter(|feature| feature.implemented)
+            .map(|feature| &feature.id)
     }
 
     /// Number of registered features.

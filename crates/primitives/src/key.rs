@@ -22,6 +22,9 @@ impl PublicKey {
                 got: bytes.len(),
             });
         }
+        if !matches!(bytes[0], Self::ED25519_PREFIX | 0x02 | 0x03) {
+            return Err(PrimitivesError::InvalidPublicKeyPrefix { got: bytes[0] });
+        }
         Ok(Self(bytes))
     }
 

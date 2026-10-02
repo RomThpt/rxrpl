@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use rxrpl_crypto::hash_prefix::HashPrefix;
 use rxrpl_primitives::Hash256;
 
 use crate::error::SHAMapError;
@@ -235,6 +236,61 @@ impl SHAMap {
                 Self::visit_with_id(inner, 1, f, self.store.as_ref(), self.leaf_ctor)
             }
             SHAMapNode::Leaf(leaf) => f(NodeId::new(0, leaf.key()), leaf.key(), leaf.data()),
+        }
+    }
+
+    /// Visit every node using rippled's `serializeWithPrefix` representation.
+    ///
+    /// FetchPack replies carry these prefix-serialized nodes rather than the
+    /// internal store records or the `TMLedgerNode` wire form. The traversal
+    /// resolves lazy children through the backing store, so closed ledgers
+    /// loaded from disk produce the same bytes as in-memory maps.
+    pub fn for_each_serialized_with_prefix(&self, f: &mut impl FnMut(Hash256, Vec<u8>)) {
+        Self::visit_serialized_with_prefix(&self.root, self.store.as_ref(), self.leaf_ctor, f);
+    }
+
+    fn visit_serialized_with_prefix(
+        node: &Arc<SHAMapNode>,
+        store: Option<&Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+        f: &mut impl FnMut(Hash256, Vec<u8>),
+    ) {
+        match node.as_ref() {
+            SHAMapNode::Inner(inner) => {
+                let hash = inner.hash();
+                if !hash.is_zero() {
+                    let mut blob = Vec::with_capacity(4 + 16 * 32);
+                    blob.extend_from_slice(&HashPrefix::INNER_NODE.to_bytes());
+                    for branch in 0..16 {
+                        blob.extend_from_slice(inner.child_hash(branch).as_bytes());
+                    }
+                    f(hash, blob);
+                }
+
+                let mut mask = inner.branch_mask();
+                while mask != 0 {
+                    let branch = mask.trailing_zeros() as u8;
+                    if let Ok(Some(child)) = inner.child_with_store(branch, store, leaf_ctor) {
+                        Self::visit_serialized_with_prefix(child, store, leaf_ctor, f);
+                    }
+                    mask &= mask - 1;
+                }
+            }
+            SHAMapNode::Leaf(leaf) => {
+                let (prefix, include_key) = match leaf {
+                    LeafNode::AccountState(_) => (HashPrefix::LEAF_NODE, true),
+                    LeafNode::TransactionNoMeta(_) => (HashPrefix::TRANSACTION_ID, false),
+                    LeafNode::TransactionWithMeta(_) => (HashPrefix::TX_NODE, true),
+                };
+                let mut blob =
+                    Vec::with_capacity(4 + leaf.data().len() + if include_key { 32 } else { 0 });
+                blob.extend_from_slice(&prefix.to_bytes());
+                blob.extend_from_slice(leaf.data());
+                if include_key {
+                    blob.extend_from_slice(leaf.key().as_bytes());
+                }
+                f(leaf.hash(), blob);
+            }
         }
     }
 

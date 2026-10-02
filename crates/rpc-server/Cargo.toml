@@ -20,6 +20,7 @@ rxrpl-txq = { workspace = true }
 rxrpl-crypto = { workspace = true }
 rxrpl-pathfind = { workspace = true }
 rxrpl-nodestore = { workspace = true }
+rxrpl-shamap = { workspace = true }
 rxrpl-overlay = { workspace = true }
 rand = "0.8"
 metrics = { workspace = true }
