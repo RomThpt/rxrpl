@@ -344,7 +344,9 @@ pub fn offer_at_quality_taker_pays(
     // (testnet ledger 20934253: 4B631401... and B2D9AAB5...).
     if in_is_xrp && !out_is_xrp {
         let out_iou = output.to_iou();
-        let mantissa = if out_iou.exponent() <= -15 {
+        let mantissa = if out_iou.exponent() <= -15 && out_iou.mantissa() < 3_000_000_000_000_000 {
+            out_iou.mantissa().saturating_sub(13)
+        } else if out_iou.exponent() <= -15 {
             out_iou.mantissa().saturating_add(20)
         } else {
             out_iou.mantissa().saturating_sub(10)
