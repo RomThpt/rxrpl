@@ -251,6 +251,7 @@ const LSF_SELL: u64 = 0x0002_0000;
 const LSF_LOW_AUTH: u64 = 0x0004_0000;
 const LSF_HIGH_AUTH: u64 = 0x0008_0000;
 const LSF_REQUIRE_AUTH: u64 = 0x0004_0000;
+const LSF_GLOBAL_FREEZE: u64 = 0x0040_0000;
 
 /// rippled's `Quality::kMaxTickSize` — no rounding at or above 16 digits.
 const MAX_TICK_SIZE: u8 = 16;
@@ -431,6 +432,12 @@ impl Transactor for OfferCreateTransactor {
             }
         }
 
+        if iou_global_frozen(ctx.view, &ctx.tx["TakerPays"])
+            || iou_global_frozen(ctx.view, &ctx.tx["TakerGets"])
+        {
+            return Err(TransactionResult::TecFrozen);
+        }
+
         if !account_authorized_for_iou(ctx.view, &account_id, &ctx.tx["TakerPays"]) {
             return Err(TransactionResult::TecNoAuth);
         }
@@ -562,30 +569,30 @@ impl Transactor for OfferCreateTransactor {
         // the legacy `Taker` (with its XRP autobridge) when not. Every mainnet
         // ledger past 2018 has `FlowCross` enabled, so the legacy arm is dead on
         // any recent replay; it exists for byte-exact pre-`FlowCross` ledgers.
-        let (remaining_pays, remaining_gets, crossed) =
-            if ctx.rules.enabled(&feature_id("FlowCross")) {
-                cross_offers(
-                    ctx,
-                    &account_id,
-                    &mut acct,
-                    &taker_pays,
-                    &taker_gets,
-                    &inverse_book,
-                    is_sell,
-                    domain_only,
-                )?
-            } else {
-                taker_cross(
-                    ctx,
-                    &account_id,
-                    &mut acct,
-                    &taker_pays,
-                    &taker_gets,
-                    &inverse_book,
-                    is_sell,
-                    domain_only,
-                )?
-            };
+        let flow_cross_enabled = ctx.rules.enabled(&feature_id("FlowCross"));
+        let (remaining_pays, remaining_gets, crossed) = if flow_cross_enabled {
+            cross_offers(
+                ctx,
+                &account_id,
+                &mut acct,
+                &taker_pays,
+                &taker_gets,
+                &inverse_book,
+                is_sell,
+                domain_only,
+            )?
+        } else {
+            taker_cross(
+                ctx,
+                &account_id,
+                &mut acct,
+                &taker_pays,
+                &taker_gets,
+                &inverse_book,
+                is_sell,
+                domain_only,
+            )?
+        };
 
         // Nothing left to place when either side is exhausted (fully crossed):
         // rippled places no resting offer. Commit the taker's mutations.
@@ -714,6 +721,37 @@ impl Transactor for OfferCreateTransactor {
         }
         let book_node = add_to_book_dir(ctx.view, &book_dir_key, &offer_key, &book_describe)?;
         let owner_node = add_to_owner_dir(ctx.view, &account_id, &offer_key)?;
+        let (resting_pays, resting_gets) = if flow_cross_enabled && crossed {
+            match (
+                Leg::parse(&taker_pays),
+                Leg::parse(&taker_gets),
+                Leg::parse(&remaining_pays),
+                Leg::parse(&remaining_gets),
+            ) {
+                (Some(orig_out), Some(orig_in), Some(rem_out), Some(rem_in)) => {
+                    let pays_iou = leg_as_quality_iou(&orig_out);
+                    let gets_iou = leg_as_quality_iou(&orig_in);
+                    let original_quality = if number_switchover {
+                        rxrpl_amount::get_rate_round_even(&gets_iou, &pays_iou)
+                    } else {
+                        rxrpl_amount::get_rate(&gets_iou, &pays_iou)
+                    }
+                    .unwrap_or(quality);
+                    remaining_offer(
+                        is_sell,
+                        original_quality,
+                        &rem_out,
+                        &rem_in,
+                        &orig_out,
+                        &orig_in,
+                        true,
+                    )
+                }
+                _ => (remaining_pays.clone(), remaining_gets.clone()),
+            }
+        } else {
+            (remaining_pays.clone(), remaining_gets.clone())
+        };
 
         // Build the Offer SLE. sfFlags, sfBookNode and sfOwnerNode are REQUIRED
         // in rippled's Offer ledger format, so they always serialize (even at
@@ -723,8 +761,8 @@ impl Transactor for OfferCreateTransactor {
         offer.insert("Account".into(), account_str.into());
         offer.insert("Sequence".into(), Value::from(sequence));
         // Resting offer carries the LEFTOVER after crossing, at the original rate.
-        offer.insert("TakerPays".into(), remaining_pays.clone());
-        offer.insert("TakerGets".into(), remaining_gets.clone());
+        offer.insert("TakerPays".into(), resting_pays);
+        offer.insert("TakerGets".into(), resting_gets);
         offer.insert("BookDirectory".into(), book_dir_key.to_string().into());
         // A domain-scoped offer carries its DomainID so the book/crossing logic
         // and clients can tell it apart from a public-book offer.
@@ -4731,6 +4769,22 @@ fn account_authorized_for_iou(
     }
 }
 
+fn iou_global_frozen(view: &dyn crate::view::read_view::ReadView, amount: &Value) -> bool {
+    if amount.is_string() {
+        return false;
+    }
+    let (_, issuer) = currency_and_issuer(amount);
+    if issuer == AccountId::from([0u8; 20]) {
+        return false;
+    }
+
+    view.read(&keylet::account(&issuer))
+        .and_then(|b| helpers::decode_state_value(&b).ok())
+        .and_then(|a| a.get("Flags").and_then(Value::as_u64))
+        .map(|flags| flags & LSF_GLOBAL_FREEZE != 0)
+        .unwrap_or(false)
+}
+
 /// PermissionedDEX domain membership check for a domain-scoped offer.
 ///
 /// rippled: an offer carrying a `DomainID` is authorised only for members of
@@ -6338,7 +6392,7 @@ mod taker_crossing_tests {
         qual_div, qual_mul, reject_quality, remaining_is_filled, remaining_is_filled_at,
         remaining_offer, select_path, sell_clamp_sub,
     };
-    use rxrpl_amount::{IOUAmount, from_rate, get_rate, offer_quality};
+    use rxrpl_amount::{IOUAmount, from_rate, get_rate, get_rate_round_even, offer_quality};
     use rxrpl_primitives::AccountId;
     use rxrpl_protocol::keylet;
 
@@ -6755,6 +6809,26 @@ mod taker_crossing_tests {
     }
 
     #[test]
+    fn remaining_offer_buy_rescales_xrp_gets_from_iou_remainder() {
+        let pays_iou = IOUAmount::from_decimal_string("2.93054339744177").unwrap();
+        let gets_iou = IOUAmount::from_decimal_string("6000000").unwrap();
+        let orig_q = get_rate_round_even(&gets_iou, &pays_iou).unwrap();
+
+        let (pays, gets) = remaining_offer(
+            false,
+            orig_q,
+            &iou("0.488373969495537"),
+            &xrp(1_000_000),
+            &iou("2.93054339744177"),
+            &xrp(6_000_000),
+            true,
+        );
+
+        assert_eq!(pays["value"], "0.488373969495537");
+        assert_eq!(gets.as_str(), Some("999898"));
+    }
+
+    #[test]
     fn ledger_30000008_payment_leftover_taker_pays() {
         // Payment D091EB7D (30000008): demand-limited take of 18985524 XRP
         // from offer 67FAFA4B. Mainnet leftover TakerPays is 2.512242529714367.
@@ -7064,7 +7138,10 @@ mod owner_funds_tests {
         assert!(!maker_usd_funds(auth_flag(), 0x0004_0000).is_zero());
     }
 
-    fn offer_preclaim_with_auth(line_flags: u64) -> Result<(), TransactionResult> {
+    fn offer_preclaim_with_auth_and_issuer_flags(
+        line_flags: u64,
+        issuer_flags: u64,
+    ) -> Result<(), TransactionResult> {
         let maker = decode_account_id(MAKER).unwrap();
         let issuer = decode_account_id(ISSUER).unwrap();
         let mut cur = [0u8; 20];
@@ -7076,7 +7153,7 @@ mod owner_funds_tests {
             (MAKER, ISSUER)
         };
         let mut ledger = Ledger::genesis();
-        for (addr, id, flags) in [(MAKER, &maker, 0u64), (ISSUER, &issuer, 0x0004_0000)] {
+        for (addr, id, flags) in [(MAKER, &maker, 0u64), (ISSUER, &issuer, issuer_flags)] {
             let acct = serde_json::json!({
                 "LedgerEntryType": "AccountRoot",
                 "Account": addr,
@@ -7122,6 +7199,10 @@ mod owner_funds_tests {
         OfferCreateTransactor.preclaim(&ctx)
     }
 
+    fn offer_preclaim_with_auth(line_flags: u64) -> Result<(), TransactionResult> {
+        offer_preclaim_with_auth_and_issuer_flags(line_flags, 0x0004_0000)
+    }
+
     #[test]
     fn offer_create_rejects_unauthorized_taker_pays_iou() {
         assert_eq!(
@@ -7133,6 +7214,14 @@ mod owner_funds_tests {
     #[test]
     fn offer_create_accepts_authorized_taker_pays_iou() {
         assert_eq!(offer_preclaim_with_auth(auth_flag()), Ok(()));
+    }
+
+    #[test]
+    fn offer_create_rejects_global_frozen_taker_pays_iou() {
+        assert_eq!(
+            offer_preclaim_with_auth_and_issuer_flags(auth_flag(), 0x0040_0000),
+            Err(TransactionResult::TecFrozen)
+        );
     }
 
     // Does MAKER's USD line report deep-frozen for the given line flags?

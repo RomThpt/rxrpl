@@ -11,6 +11,30 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transac
 /// as a single owner-reserve item.
 const LSF_ONE_OWNER_COUNT: u32 = 0x0001_0000;
 
+fn sorted_signer_entries(tx: &Value) -> Value {
+    let mut entries = tx
+        .get("SignerEntries")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    entries.sort_by(|a, b| {
+        let account_id = |entry: &Value| {
+            entry
+                .get("SignerEntry")
+                .or(Some(entry))
+                .and_then(|se| se.get("Account"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| decode_account_id(s).ok())
+                .map(|id| *id.as_bytes())
+                .unwrap_or([0u8; 20])
+        };
+        account_id(a).cmp(&account_id(b))
+    });
+
+    Value::Array(entries)
+}
+
 /// SignerListSet transaction handler.
 ///
 /// Sets, updates, or removes the signer list for multi-signing.
@@ -122,7 +146,7 @@ impl Transactor for SignerListSetTransactor {
                 "LedgerEntryType": "SignerList",
                 "Owner": account_str,
                 "SignerQuorum": quorum,
-                "SignerEntries": ctx.tx.get("SignerEntries").cloned().unwrap_or(Value::Array(vec![])),
+                "SignerEntries": sorted_signer_entries(ctx.tx),
                 "Flags": flags,
                 // SoeRequired, default signer-list id.
                 "SignerListID": 0u32,
@@ -177,5 +201,40 @@ impl Transactor for SignerListSetTransactor {
         }
 
         Ok(TransactionResult::TesSuccess)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sorted_signer_entries;
+
+    #[test]
+    fn signer_entries_are_sorted_by_account_id() {
+        let tx = serde_json::json!({
+            "SignerEntries": [
+                {"SignerEntry": {"Account": "rJwHmA9FGMxCCZcTqR9DCrMNGeiTEb71d3", "SignerWeight": 2}},
+                {"SignerEntry": {"Account": "rM25a66hHMzB7zedGBVN1xyjSb7dXzevLz", "SignerWeight": 1}},
+                {"SignerEntry": {"Account": "ruwxgA5zhXDTGamUYNsDUUPuzwidM9CHf", "SignerWeight": 1}},
+                {"SignerEntry": {"Account": "rpi5Wu1ENBkrYzGskbPjNcGUPFJQ267tu9", "SignerWeight": 1}}
+            ]
+        });
+
+        let sorted = sorted_signer_entries(&tx);
+        let accounts: Vec<&str> = sorted
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["SignerEntry"]["Account"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(
+            accounts,
+            vec![
+                "ruwxgA5zhXDTGamUYNsDUUPuzwidM9CHf",
+                "rpi5Wu1ENBkrYzGskbPjNcGUPFJQ267tu9",
+                "rJwHmA9FGMxCCZcTqR9DCrMNGeiTEb71d3",
+                "rM25a66hHMzB7zedGBVN1xyjSb7dXzevLz",
+            ]
+        );
     }
 }
