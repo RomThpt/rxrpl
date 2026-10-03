@@ -1006,7 +1006,6 @@ fn cross_offers(
     if threshold == 0 {
         return Ok((taker_pays.clone(), taker_gets.clone(), false));
     }
-
     let mut remaining_out = out_leg.clone();
     let mut remaining_in = in_leg.clone();
     let mut crossed = false;
@@ -1425,6 +1424,8 @@ fn try_amm_step(
     // cannot deliver the full demand within budget delivers zero. A per-band spend
     // by a FoK offer that later fails to fully cross is rolled back atomically —
     // the transactor returns tecKILLED and the engine discards all mutations.
+    let cp = ctx.view.checkpoint();
+    let taker_acct_before = taker_acct.clone();
     if let Some((delivered, spent)) = amm_hop(
         ctx,
         taker,
@@ -1438,6 +1439,26 @@ fn try_amm_step(
         /*partial=*/ !fok,
         /*target_quality=*/ Some(cq),
     )? {
+        let mut effective_delivered = delivered.clone();
+        if !effective_delivered.is_xrp && effective_delivered.issuer != *taker {
+            let rate = transfer_rate(ctx, &effective_delivered.issuer);
+            let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+            if rate > one {
+                effective_delivered.iou =
+                    IOUAmount::div_round(&effective_delivered.iou, &rate, false)
+                        .unwrap_or(effective_delivered.iou);
+            }
+        }
+        let eff_q = rxrpl_amount::get_rate(
+            &leg_as_quality_iou(&spent),
+            &leg_as_quality_iou(&effective_delivered),
+        )
+        .unwrap_or(u64::MAX);
+        if eff_q > cq && !rxrpl_amount::within_relative_distance(eff_q, cq) {
+            ctx.view.rollback(cp);
+            *taker_acct = taker_acct_before;
+            return Ok(());
+        }
         // A tfSell fill can deliver more than the remaining TakerPays demand;
         // clamp the demand at zero rather than underflowing the drops/mantissa.
         *remaining_out = if is_sell && leg_ge(&delivered, remaining_out) {
@@ -2751,6 +2772,8 @@ fn amm_hop(
     if budget_num.is_zero() || budget_num.negative() {
         return Ok(None);
     }
+    let mut bounded_offer: Option<(rxrpl_amount::number::Number, rxrpl_amount::number::Number)> =
+        None;
 
     // With a CLOB tip, rippled seats a bounded single-path AMM offer at that
     // quality before executing it. Spending the whole budget here would let
@@ -2770,16 +2793,23 @@ fn amm_hop(
                     }
                 }
             }
+        } else if let Ok(rate) = rxrpl_amount::from_rate(cq) {
+            let quality = rxrpl_amount::number::Number::from_iou(&rate);
+            if let Some((debit_in, logical_in, offer_out)) =
+                crate::amm_helpers::offer_at_quality_taker_pays(
+                    &pool_in, &pool_out, &quality, tfee, in_xrp, out_xrp,
+                )
+            {
+                if debit_in.sub(&budget_num).negative() {
+                    budget_num = debit_in;
+                    bounded_offer = Some((logical_in, offer_out));
+                }
+            }
         }
     }
 
-    // Spot-price-quality gate (rippled AMMLiquidity::getOffer, AMMLiquidity.cpp:
-    // 184-190): CLOB wins when the AMM spot is better than or equal to the
-    // CLOB tip. The AMM is admitted only for a strictly worse spot, and never
-    // within 1e-7 of the tip, so the book is consumed before synthetic
-    // liquidity. The spot is fee-adjusted because the taker pays the trading
-    // fee on the input. Payments pass None (any quality is acceptable,
-    // BookPaymentStep::checkQualityThreshold == true).
+    // Spot-price-quality gate: CLOB wins when the AMM spot is better than or
+    // equal to the CLOB tip.
     if let Some(cq) = target_quality {
         let one_minus_fee = IOUAmount::divide(
             &IOUAmount::from_decimal_string(&(100_000u32 - u32::from(tfee)).to_string())
@@ -2805,23 +2835,45 @@ fn amm_hop(
     // (fill-or-kill) crossing is all-or-nothing: it delivers the FULL demand or
     // nothing (never a partial spend), matching rippled's flow() with
     // partialPayment=false.
-    let out_full =
-        crate::amm_helpers::swap_asset_in(&pool_in, &pool_out, &budget_num, tfee, out_xrp);
-    let (spent_num, deliver_num) = if !partial {
+    let out_full = bounded_offer
+        .as_ref()
+        .map(|(_, out)| *out)
+        .unwrap_or_else(|| {
+            crate::amm_helpers::swap_asset_in(&pool_in, &pool_out, &budget_num, tfee, out_xrp)
+        });
+    let (spent_num, deliver_num, logical_spent_num) = if !partial {
         match crate::amm_helpers::swap_asset_out(&pool_in, &pool_out, &demand_num, tfee, in_xrp) {
-            Some(needed) if num_le(&needed, &budget_num) => (needed, demand_num),
+            Some(needed) if num_le(&needed, &budget_num) => (needed, demand_num, needed),
             _ => return Ok(None),
         }
     } else if num_le(&out_full, &demand_num) {
-        (budget_num, out_full)
+        (
+            budget_num,
+            out_full,
+            bounded_offer
+                .map(|(logical_in, _)| logical_in)
+                .unwrap_or(budget_num),
+        )
     } else {
         match crate::amm_helpers::swap_asset_out(&pool_in, &pool_out, &demand_num, tfee, in_xrp) {
-            Some(needed) if num_le(&needed, &budget_num) => (needed, demand_num),
-            _ => (budget_num, out_full),
+            Some(needed) if num_le(&needed, &budget_num) => (needed, demand_num, needed),
+            _ => (budget_num, out_full, budget_num),
         }
     };
     if deliver_num.is_zero() || spent_num.is_zero() {
         return Ok(None);
+    }
+    if let Some(cq) = target_quality
+        && bounded_offer.is_none()
+    {
+        let eff_q = rxrpl_amount::get_rate(
+            &num_quality_iou(&spent_num, in_xrp),
+            &num_quality_iou(&deliver_num, out_xrp),
+        )
+        .unwrap_or(u64::MAX);
+        if eff_q > cq {
+            return Ok(None);
+        }
     }
 
     // --- Apply the input: move `spent` from the source into the pool. ---
@@ -2924,7 +2976,7 @@ fn amm_hop(
 
     Ok(Some((
         number_to_leg(&deliver_num, demand_out),
-        number_to_leg(&spent_num, budget_in),
+        number_to_leg(&logical_spent_num, budget_in),
     )))
 }
 
