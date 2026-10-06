@@ -1135,6 +1135,22 @@ mod tests {
         assert_eq!(output.to_xrp_drops_mode(), 11_623_384);
         assert_eq!(input.to_iou().to_decimal_string(), "17.32885170464047");
     }
+
+    #[test]
+    fn offer_at_quality_xrp_output_ledger_20934271_byte_exact() {
+        let pool_in = rxrpl_amount::number::Number::from_iou(
+            &rxrpl_amount::IOUAmount::from_decimal_string("28271.75798063219").unwrap(),
+        );
+        let pool_out = rxrpl_amount::number::Number::from_int(19_048_681_118);
+        let quality = rxrpl_amount::number::Number::from_iou(
+            &rxrpl_amount::from_rate(0x4F054C9FCA4BE4BA).unwrap(),
+        );
+        let (input, output) =
+            offer_at_quality_xrp_output(&pool_in, &pool_out, &quality, 10).unwrap();
+        assert_eq!(output.to_xrp_drops_mode(), 47_559_963);
+        assert_eq!(input.to_iou().to_decimal_string(), "70.77152060440044");
+    }
+
     use rxrpl_amount::number::Number;
 
     // Mainnet tx 90BC32E8… (ledger 105255844): XRP->BEAR AMM swap, SendMax 100
