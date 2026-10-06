@@ -2860,13 +2860,12 @@ fn amm_hop(
         if out_xrp {
             if let Ok(rate) = rxrpl_amount::from_rate(cq) {
                 let quality = rxrpl_amount::number::Number::from_iou(&rate);
-                if let Some((offer_in, _offer_out)) =
-                    crate::amm_helpers::offer_at_quality_xrp_output(
-                        &pool_in, &pool_out, &quality, tfee,
-                    )
-                {
+                if let Some((offer_in, offer_out)) = crate::amm_helpers::offer_at_quality_xrp_output(
+                    &pool_in, &pool_out, &quality, tfee,
+                ) {
                     if offer_in.sub(&budget_num).negative() {
                         budget_num = offer_in;
+                        bounded_offer = Some((offer_in, offer_out));
                     }
                 }
             }
