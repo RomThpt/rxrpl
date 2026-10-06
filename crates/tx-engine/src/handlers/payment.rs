@@ -1195,7 +1195,9 @@ fn apply_paths_payment_multi(
         if boundaries.len() < 2 {
             continue;
         }
-        if let Some(strand) = crate::handlers::offer_create::build_flow_strand(ctx, &boundaries) {
+        if let Some(strand) =
+            crate::handlers::offer_create::build_flow_strand(ctx, &boundaries, &src_id)
+        {
             strands.push(strand);
         }
     }

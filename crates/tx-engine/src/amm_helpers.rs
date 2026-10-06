@@ -307,9 +307,9 @@ pub fn offer_at_quality_taker_pays(
         .div(&Number::from_int(2).mul(&a));
     let constraint = pool_out.mul(quality).sub(&pool_in.div(&f));
     let raw_input = if constraint.sub(&proposed).negative() {
-        proposed
-    } else {
         constraint
+    } else {
+        proposed
     };
     if raw_input.is_zero() || raw_input.negative() {
         return None;
@@ -324,43 +324,11 @@ pub fn offer_at_quality_taker_pays(
         }
     };
     let logical_input = to_input_grid(&raw_input);
-    let debit_input = if in_is_xrp {
-        let _up = RoundModeGuard::new(RoundingMode::Upward);
-        Number::from_int(raw_input.to_xrp_drops_mode() as i64)
-    } else {
-        logical_input
-    };
+    let debit_input = logical_input;
     if logical_input.is_zero() || debit_input.is_zero() {
         return None;
     }
-    // For XRP input rippled's single-path OfferCreate AMM crossing keeps the
-    // pre-grid `Number` as the conservation input, while the actual XRP debit
-    // is integral. The resting-offer residual uses the down-rounded logical
-    // input, so return both values to the caller.
-    let mut output = swap_asset_in_legacy(pool_in, pool_out, &raw_input, tfee, out_is_xrp);
-    // The legacy Number->IOU grid used by this bounded synthetic offer lands a
-    // few mantissa units away from the generic `to_iou()` conversion on replayed
-    // XRP->IOU OfferCreate AMM crossings. The offset depends on the IOU exponent
-    // (testnet ledger 20934253: 4B631401... and B2D9AAB5...).
-    if in_is_xrp && !out_is_xrp {
-        let out_iou = output.to_iou();
-        let mantissa = if out_iou.exponent() <= -15 && out_iou.mantissa() < 3_000_000_000_000_000 {
-            out_iou.mantissa().saturating_sub(13)
-        } else if out_iou.exponent() <= -15 {
-            out_iou.mantissa().saturating_add(20)
-        } else {
-            out_iou.mantissa().saturating_sub(10)
-        };
-        if mantissa > 0
-            && let Ok(adjusted) = rxrpl_amount::IOUAmount::from_parts(
-                mantissa,
-                out_iou.exponent(),
-                out_iou.sign_bit(),
-            )
-        {
-            output = Number::from_iou(&adjusted);
-        }
-    }
+    let output = swap_asset_in(pool_in, pool_out, &logical_input, tfee, out_is_xrp);
     if output.is_zero() {
         return None;
     }
@@ -1200,6 +1168,22 @@ mod tests {
         let asset_in = Number::from_int(100);
         let out = swap_asset_in(&pool_in, &pool_out, &asset_in, 967, false);
         assert_eq!(out.to_iou().to_decimal_string(), "0.03775571");
+    }
+
+    // Testnet tx F9207C7D… (ledger 20934270): direct XRP->RLUSD OfferCreate
+    // seats a single-path AMM offer at the CLOB tip quality. The bounded input
+    // is the down-rounded `getAMMOfferStartWithTakerPays` amount; applying
+    // `swapAssetIn` to that exact input matches rippled's AMM pool delta.
+    #[test]
+    fn offer_at_quality_taker_pays_xrp_rlusd_byte_exact() {
+        let pool_in = Number::from_int(19_001_116_411); // pool XRP drops
+        let pool_out = Number::from_iou(&parse_iou_value("28342.52242319708")); // pool RLUSD
+        let quality = Number::from_iou(&rxrpl_amount::from_rate(0x5A17EFE892482D80).unwrap());
+        let (debit, logical, out) =
+            offer_at_quality_taker_pays(&pool_in, &pool_out, &quality, 10, true, false).unwrap();
+        assert_eq!(debit.to_xrp_drops(), 47_564_707);
+        assert_eq!(logical.to_xrp_drops(), 47_564_707);
+        assert_eq!(out.to_iou().to_decimal_string(), "70.76444256489");
     }
 
     // Mainnet tx 1BC01A56… (ledger 105255851): PLX->586D65 IOU/IOU swap, input

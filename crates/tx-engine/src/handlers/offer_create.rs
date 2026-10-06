@@ -1063,6 +1063,7 @@ fn cross_offers(
                 Value::String("0".to_string()),
                 taker_pays.clone(),
             ],
+            taker,
         )
         .map(|mut s| {
             // rippled's offer-crossing autobridge bridges two RESTING book offers
@@ -1080,7 +1081,6 @@ fn cross_offers(
     } else {
         None
     };
-
     // The book base for traversal has the quality (low 64 bits) zeroed;
     // `keylet::book_dir` leaves those as hash bytes, so start the walk there.
     let mut probe = book_dir_with_quality(inverse_book, 0);
@@ -2634,6 +2634,45 @@ fn pool_balance_number(
     }
 }
 
+fn amm_trading_fee_for_account(ctx: &ApplyContext<'_>, amm: &Value, account: &AccountId) -> u16 {
+    let trading_fee = amm.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    let Some(slot) = amm.get("AuctionSlot").and_then(|v| v.as_object()) else {
+        return trading_fee;
+    };
+    let Some(discounted_fee) = slot.get("DiscountedFee").and_then(|v| v.as_u64()) else {
+        return trading_fee;
+    };
+    let Some(expiration) = slot.get("Expiration").and_then(|v| v.as_u64()) else {
+        return trading_fee;
+    };
+    if ctx.view.parent_close_time() as u64 >= expiration {
+        return trading_fee;
+    }
+    let account_str = encode_account_id(account);
+    if slot.get("Account").and_then(|v| v.as_str()) == Some(account_str.as_str()) {
+        return discounted_fee as u16;
+    }
+    let authorized = slot
+        .get("AuthAccounts")
+        .and_then(|v| v.as_array())
+        .map(|accounts| {
+            accounts.iter().any(|entry| {
+                entry
+                    .get("AuthAccount")
+                    .and_then(|v| v.get("Account"))
+                    .or_else(|| entry.get("Account"))
+                    .and_then(|v| v.as_str())
+                    == Some(account_str.as_str())
+            })
+        })
+        .unwrap_or(false);
+    if authorized {
+        discounted_fee as u16
+    } else {
+        trading_fee
+    }
+}
+
 /// Swap one hop through an AMM pool for the `(budget_in -> demand_out)` pair,
 /// delivering up to `demand_out` while spending up to `budget_in`. Returns
 /// `Some((delivered, spent))` or `None` when no AMM SLE exists for the pair (the
@@ -2785,7 +2824,7 @@ fn amm_hop(
     let Ok(pool_id) = decode_account_id(pool_str) else {
         return Ok(None);
     };
-    let tfee = amm.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    let tfee = amm_trading_fee_for_account(ctx, &amm, taker);
 
     let pool_in = pool_balance_number(
         ctx,
@@ -3580,6 +3619,7 @@ fn book_tip_quality(ctx: &ApplyContext<'_>, inverse_book: &Hash256) -> Option<u6
 pub(crate) fn build_flow_strand(
     ctx: &ApplyContext<'_>,
     boundaries: &[Value],
+    account: &AccountId,
 ) -> Option<FlowStrand> {
     let n = boundaries.len();
     if n < 2 {
@@ -3613,7 +3653,7 @@ pub(crate) fn build_flow_strand(
                     .get("Account")
                     .and_then(|v| v.as_str())
                     .and_then(|s| decode_account_id(s).ok());
-                let tfee = amm.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                let tfee = amm_trading_fee_for_account(ctx, &amm, account);
                 match pool_id {
                     Some(pid) => {
                         let pool_in = pool_balance_number(
