@@ -5,6 +5,9 @@ use crate::helpers;
 use crate::owner_dir::add_to_owner_dir;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transactor};
 
+const RIPPLE_EPOCH_OFFSET: u64 = 946_684_800;
+const MAX_LAST_UPDATE_TIME_DELTA: u64 = 300;
+
 pub struct OracleSetTransactor;
 
 impl Transactor for OracleSetTransactor {
@@ -37,16 +40,38 @@ impl Transactor for OracleSetTransactor {
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let doc_id = helpers::get_u32_field(ctx.tx, "OracleDocumentID").unwrap();
         let oracle_key = keylet::oracle(&account_id, doc_id);
+        let submitted_update_time =
+            u64::from(helpers::get_u32_field(ctx.tx, "LastUpdateTime").unwrap());
+
+        // rippled interprets LastUpdateTime as Unix time, while ledger close
+        // times use the Ripple epoch. The submitted time must be within five
+        // minutes of the ledger being built.
+        if submitted_update_time < RIPPLE_EPOCH_OFFSET {
+            return Err(TransactionResult::TecInvalidUpdateTime);
+        }
+        let ripple_update_time = submitted_update_time - RIPPLE_EPOCH_OFFSET;
+        let close_time = u64::from(ctx.view.close_time());
+        if close_time < MAX_LAST_UPDATE_TIME_DELTA {
+            return Err(TransactionResult::TecInternalError);
+        }
+        if ripple_update_time < close_time - MAX_LAST_UPDATE_TIME_DELTA
+            || ripple_update_time > close_time + MAX_LAST_UPDATE_TIME_DELTA
+        {
+            return Err(TransactionResult::TecInvalidUpdateTime);
+        }
 
         // On update, Provider cannot change
-        if ctx.view.exists(&oracle_key) {
+        if let Some(entry_bytes) = ctx.view.read(&oracle_key) {
+            let entry: serde_json::Value =
+                serde_json::from_slice(&entry_bytes).map_err(|_| TransactionResult::TefInternal)?;
+            let previous_update_time = entry
+                .get("LastUpdateTime")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(TransactionResult::TefInternal)?;
+            if submitted_update_time <= previous_update_time {
+                return Err(TransactionResult::TecInvalidUpdateTime);
+            }
             if let Some(new_provider) = helpers::get_str_field(ctx.tx, "Provider") {
-                let entry_bytes = ctx
-                    .view
-                    .read(&oracle_key)
-                    .ok_or(TransactionResult::TefInternal)?;
-                let entry: serde_json::Value = serde_json::from_slice(&entry_bytes)
-                    .map_err(|_| TransactionResult::TefInternal)?;
                 if let Some(existing_provider) = entry.get("Provider").and_then(|v| v.as_str()) {
                     if existing_provider != new_provider {
                         return Err(TransactionResult::TemMalformed);
@@ -242,9 +267,11 @@ mod tests {
     use rxrpl_ledger::Ledger;
 
     const ALICE: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    const VALID_UPDATE_TIME: u32 = 946_685_800;
 
     fn setup_account() -> Ledger {
         let mut ledger = Ledger::genesis();
+        ledger.header.close_time = 1_000;
         let id = decode_account_id(ALICE).unwrap();
         let key = keylet::account(&id);
         let account = serde_json::json!({
@@ -342,7 +369,7 @@ mod tests {
             "TransactionType": "OracleSet",
             "Account": ALICE,
             "OracleDocumentID": 1,
-            "LastUpdateTime": 1000,
+            "LastUpdateTime": VALID_UPDATE_TIME,
             "PriceDataSeries": [{"price": 1}],
             "Fee": "12",
         });
@@ -354,6 +381,74 @@ mod tests {
         assert_eq!(
             OracleSetTransactor.preclaim(&ctx),
             Err(TransactionResult::TemMalformed)
+        );
+    }
+
+    #[test]
+    fn preclaim_rejects_update_outside_close_time_window() {
+        let ledger = setup_account();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "OracleSet",
+            "Account": ALICE,
+            "OracleDocumentID": 1,
+            "Provider": "chainlink",
+            "LastUpdateTime": VALID_UPDATE_TIME + 301,
+            "PriceDataSeries": [{"price": 1}],
+            "Fee": "12",
+        });
+        let ctx = PreclaimContext {
+            tx: &tx,
+            view: &view,
+            rules: &rules,
+        };
+
+        assert_eq!(
+            OracleSetTransactor.preclaim(&ctx),
+            Err(TransactionResult::TecInvalidUpdateTime)
+        );
+    }
+
+    #[test]
+    fn preclaim_rejects_non_increasing_update_time() {
+        let mut ledger = setup_account();
+        let id = decode_account_id(ALICE).unwrap();
+        let oracle_key = keylet::oracle(&id, 1);
+        let oracle = serde_json::json!({
+            "LedgerEntryType": "Oracle",
+            "Owner": ALICE,
+            "OracleDocumentID": 1,
+            "Provider": "chainlink",
+            "AssetClass": "currency",
+            "LastUpdateTime": VALID_UPDATE_TIME,
+            "PriceDataSeries": [],
+            "Flags": 0,
+        });
+        ledger
+            .put_state(oracle_key, serde_json::to_vec(&oracle).unwrap())
+            .unwrap();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "OracleSet",
+            "Account": ALICE,
+            "OracleDocumentID": 1,
+            "LastUpdateTime": VALID_UPDATE_TIME,
+            "PriceDataSeries": [{"price": 1}],
+            "Fee": "12",
+        });
+        let ctx = PreclaimContext {
+            tx: &tx,
+            view: &view,
+            rules: &rules,
+        };
+
+        assert_eq!(
+            OracleSetTransactor.preclaim(&ctx),
+            Err(TransactionResult::TecInvalidUpdateTime)
         );
     }
 
