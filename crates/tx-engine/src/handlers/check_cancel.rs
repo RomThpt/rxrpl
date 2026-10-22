@@ -77,37 +77,14 @@ impl Transactor for CheckCancelTransactor {
             serde_json::from_slice(&check_src_bytes).map_err(|_| TransactionResult::TefInternal)?;
         helpers::adjust_owner_count(&mut check_src_account, -1);
 
-        // Increment sequence on tx sender
-        let account_str = helpers::get_account(ctx.tx)?;
-        let account_id =
-            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-
-        if account_id == check_src_id {
-            helpers::increment_sequence(&mut check_src_account);
-        }
-
+        // The canceler's Sequence/Ticket (and fee) are consumed centrally by the
+        // engine (parent sandbox) before doApply — whether or not the canceler is
+        // the check source.
         let check_src_data =
             serde_json::to_vec(&check_src_account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(check_src_key, check_src_data)
             .map_err(|_| TransactionResult::TefInternal)?;
-
-        // If sender is different from check source, increment sender's sequence
-        if account_id != check_src_id {
-            let sender_key = keylet::account(&account_id);
-            let sender_bytes = ctx
-                .view
-                .read(&sender_key)
-                .ok_or(TransactionResult::TerNoAccount)?;
-            let mut sender_account: serde_json::Value = serde_json::from_slice(&sender_bytes)
-                .map_err(|_| TransactionResult::TefInternal)?;
-            helpers::increment_sequence(&mut sender_account);
-            let sender_data =
-                serde_json::to_vec(&sender_account).map_err(|_| TransactionResult::TefInternal)?;
-            ctx.view
-                .update(sender_key, sender_data)
-                .map_err(|_| TransactionResult::TefInternal)?;
-        }
 
         // Unlink from owner directory then delete the check
         remove_from_owner_dir(ctx.view, &check_src_id, &check_key)?;

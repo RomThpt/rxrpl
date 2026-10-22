@@ -11,7 +11,9 @@ pub const MAX_DEPTH: u8 = 64;
 /// Each depth level corresponds to one hex nibble of the key.
 /// Even depths use the upper nibble, odd depths use the lower nibble.
 pub fn select_branch(key: &Hash256, depth: u8) -> u8 {
-    let byte = key.as_bytes()[(depth / 2) as usize];
+    // A depth beyond MAX_DEPTH is invalid (an attacker-supplied wire depth can
+    // exceed it); clamp the byte index so it can never index past the key.
+    let byte = key.as_bytes()[((depth / 2) as usize).min(31)];
     if depth & 1 == 0 {
         byte >> 4
     } else {
@@ -37,9 +39,11 @@ impl NodeId {
 
     /// Create a NodeId for a specific key at a given depth.
     pub fn new(depth: u8, key: &Hash256) -> Self {
-        debug_assert!(depth <= MAX_DEPTH);
+        // Clamp: a wire-supplied depth may exceed MAX_DEPTH; without this the
+        // `full_bytes` slice below would index past the 32-byte key and panic.
+        let depth = depth.min(MAX_DEPTH);
         let mut id = [0u8; 32];
-        let full_bytes = (depth / 2) as usize;
+        let full_bytes = ((depth / 2) as usize).min(32);
         id[..full_bytes].copy_from_slice(&key.as_bytes()[..full_bytes]);
 
         if depth & 1 == 1 && full_bytes < 32 {
@@ -84,6 +88,15 @@ impl NodeId {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn oversized_depth_does_not_panic() {
+        // An attacker-supplied wire depth > MAX_DEPTH must not index past the key.
+        let key = Hash256::new([0xEE; 32]);
+        let _ = super::select_branch(&key, 200);
+        let id = NodeId::new(200, &key);
+        assert_eq!(id.depth(), MAX_DEPTH);
+    }
 
     #[test]
     fn root_node_id() {

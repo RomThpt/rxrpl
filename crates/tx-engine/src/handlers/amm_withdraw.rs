@@ -117,6 +117,7 @@ impl Transactor for AMMWithdrawTransactor {
     }
 
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
+        let _scale = amm_helpers::amm_number_scale_guard(ctx.rules);
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -273,7 +274,6 @@ impl Transactor for AMMWithdrawTransactor {
         };
         let balance = helpers::get_balance(&account);
         helpers::set_balance(&mut account, balance.saturating_add(xrp_payout));
-        helpers::increment_sequence(&mut account);
 
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
@@ -358,7 +358,6 @@ impl AMMWithdrawTransactor {
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
         let bal = helpers::get_balance(&account);
         helpers::set_balance(&mut account, bal + amount_out);
-        helpers::increment_sequence(&mut account);
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
@@ -425,6 +424,31 @@ impl AMMWithdrawTransactor {
         // XRP paid out for burning the holder's entire LP.
         let amount_out = amm_helpers::amm_asset_out_single_xrp(pool, &total_lp, &holder_lp, tfee);
 
+        // tfOneAssetWithdrawAll: sfAmount is a minimum payout; rippled
+        // `singleWithdrawTokens` returns tecAMM_FAILED (no effect) when the full
+        // LP position redeems for fewer drops than requested.
+        let requested = ctx
+            .tx
+            .get("Amount")
+            .and_then(amm_helpers::amount_value_drops_or_iou)
+            .unwrap_or(0);
+        if requested > amount_out {
+            return Ok(TransactionResult::TecAmmFailed);
+        }
+
+        // rippled `withdraw()` (AMMWithdraw.cpp): a single-asset withdraw whose
+        // payout takes the entire XRP side of the pool — `amountWithdrawActual ==
+        // curBalance` with `amount2WithdrawActual == none`, or it redeems the
+        // pool's whole LP supply (`lpTokensWithdrawActual == lpTokensAMMBalance`)
+        // — would strand the other asset, so rippled rejects it with
+        // tecAMM_BALANCE (the `curBalance` / `lptBalance` guards). This fires
+        // when the withdrawer holds 100% of the LP: `ammAssetOut` with
+        // `tokens == totalLP` re-derives `frac == 1`, so `amount_out == pool`.
+        // Return before any mutation so only fee + sequence are charged.
+        if amount_out >= pool {
+            return Ok(TransactionResult::TecAmmBalance);
+        }
+
         // AMM.LPTokenBalance -= holder LP.
         let new_total = Number::from_iou(&total_lp)
             .sub(&Number::from_iou(&holder_lp))
@@ -478,7 +502,6 @@ impl AMMWithdrawTransactor {
         let bal = helpers::get_balance(&account);
         helpers::set_balance(&mut account, bal + amount_out);
         helpers::adjust_owner_count(&mut account, -1);
-        helpers::increment_sequence(&mut account);
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
@@ -517,6 +540,13 @@ impl AMMWithdrawTransactor {
         // singleWithdraw applies min(amount, assetOut); withdraw_all takes the
         // full re-derived payout.
         let payout = if withdraw_all {
+            // tfOneAssetWithdrawAll: rippled `singleWithdrawTokens` treats sfAmount
+            // as a minimum and fails with tecAMM_FAILED (no effect) when redeeming
+            // the full LP position yields less than it.
+            let requested = leg.requested_number(amount);
+            if gt(&requested, &asset_out) {
+                return Ok(TransactionResult::TecAmmFailed);
+            }
             asset_out
         } else {
             let requested = leg.requested_number(amount);
@@ -526,6 +556,14 @@ impl AMMWithdrawTransactor {
                 requested
             }
         };
+
+        // rippled `withdraw()`: a single-asset withdraw-all that would take the
+        // entire IOU side of the pool (sole-LP redemption re-derives `frac == 1`,
+        // so `payout == pool`) strands the other asset and is rejected with
+        // tecAMM_BALANCE — mirror of the XRP guard in `single_xrp_withdraw_all`.
+        if withdraw_all && !gt(&pool, &payout) {
+            return Ok(TransactionResult::TecAmmBalance);
+        }
 
         self.burn_and_update_amm(ctx, amm_key, amm, &ctx_amm, &tokens)?;
         leg.pay_out(ctx, holder, &ctx_amm.account, &pool, &payout, &mut 0)?;
@@ -593,14 +631,22 @@ impl AMMWithdrawTransactor {
         let (tokens, payout1, payout2) = if drains_all {
             (lp_in, pool1, pool2)
         } else {
-            let tokens = amm_helpers::adjust_lp_tokens_withdraw(total, &lp_in);
+            // rippled `adjustLPTokensIn`: tfWithdrawAll burns the holder's full
+            // LP balance unadjusted, so the trust line drains to zero and is
+            // deleted; only a partial LPTokenIn withdraw snaps the burned tokens
+            // onto the pool's LP grid. Adjusting here too would leave a dust LP
+            // balance, so the line (and its owner-directory entry / OwnerCount)
+            // would wrongly survive.
+            let tokens = if withdraw_all {
+                lp_in
+            } else {
+                amm_helpers::adjust_lp_tokens_withdraw(total, &lp_in)
+            };
             // equalWithdrawTokens: frac = divide(tokensAdj, lptAMMBalance,
-            // noIssue()) — rounded onto the IOU grid, not a full-precision ratio.
-            let frac = Number::from_iou(
-                &Number::from_iou(&tokens)
-                    .div(&Number::from_iou(total))
-                    .to_iou(),
-            );
+            // noIssue()) — the STAmount free function (muldiv + `+5`, half-even),
+            // not the plain Number quotient. The `+5` fudge is what rounds a
+            // half-tie up one ULP and reproduces the chain's asset payout.
+            let frac = Number::from_iou(&amm_helpers::stamount_divide_iou(&tokens, total));
             let p1 = leg1.rounded_asset_down(&pool1, &frac);
             let p2 = leg2.rounded_asset_down(&pool2, &frac);
             (tokens, p1, p2)
@@ -741,7 +787,6 @@ impl AMMWithdrawTransactor {
         if drained {
             helpers::adjust_owner_count(&mut account, -1);
         }
-        helpers::increment_sequence(&mut account);
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)

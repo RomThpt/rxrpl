@@ -646,6 +646,34 @@ impl<A: ConsensusAdapter> ConsensusEngine<A> {
         self.validations_trie.remove_trusted(node_id);
     }
 
+    /// Replace the trusted validator set from a verified validator list,
+    /// keeping the validations-trie trusted set in sync and letting the
+    /// UNL's derived quorum follow the new size. A no-op on an empty list,
+    /// so a malformed or empty VL can never wipe the UNL into solo mode.
+    pub fn set_trusted_master_keys(&mut self, master_keys: &[rxrpl_primitives::PublicKey]) {
+        if master_keys.is_empty() {
+            return;
+        }
+        let new_ids: Vec<NodeId> = master_keys
+            .iter()
+            .map(|pk| NodeId::from_public_key(pk.as_bytes()))
+            .collect();
+        let stale: Vec<NodeId> = self
+            .unl
+            .trusted_set()
+            .iter()
+            .filter(|id| !new_ids.contains(id))
+            .copied()
+            .collect();
+        for id in &stale {
+            self.validations_trie.remove_trusted(id);
+        }
+        for id in &new_ids {
+            self.validations_trie.add_trusted(*id);
+        }
+        self.unl.update_from_validator_keys(master_keys);
+    }
+
     /// Get the disputes map.
     pub fn disputes(&self) -> &HashMap<Hash256, DisputedTx> {
         &self.disputes

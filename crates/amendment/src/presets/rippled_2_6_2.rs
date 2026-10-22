@@ -81,13 +81,14 @@ pub const PRESET: &[(&str, bool)] = &[
     ("MPTokensV1", true),
     ("Credentials", true),
     ("AMMClawback", true),
-    ("InvariantsV1_1", true),
     ("PermissionedDomains", true),
     ("DeepFreeze", false),
-    ("TokenKeg", false),
     ("SingleAssetVault", false),
     ("Batch", false),
-    ("Delegate", false),
+    ("PermissionDelegationV1_1", false),
+    ("DynamicNFT", true),
+    ("TokenEscrow", false),
+    ("fixPayChanCancelAfter", false),
     ("fixAMMClawbackRounding", true),
     ("fixDirectoryLimit", true),
     ("fixIncludeKeyletFields", true),
@@ -128,6 +129,36 @@ mod tests {
                 in_preset,
                 "amendment {} is in registry but missing from rippled-2.6.2 preset",
                 feature.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_genesis_amendment_id_is_known() {
+        // The 28 amendments pre-activated in rippled-2.6.2's genesis
+        // (GENESIS_AMENDMENTS_HEX) must ALL be known to the registry. If one is
+        // not, a node booting the amendment-full genesis reads it back from the
+        // Amendments SLE on the first ledger close and trips the
+        // `amendment_blocked` safety halt (node.rs) on an amendment it actually
+        // implements -- a false halt that kills liveness. (67A34F2C… = fix1513
+        // was missing from RETIRED_AMENDMENTS, causing exactly this.)
+        //
+        // Unlike `every_preset_entry_is_a_known_amendment` (which checks the
+        // *vote* PRESET by name), this checks the *genesis-activated* id set by
+        // hash -- the exact set the amendment-blocked halt compares against.
+        use rxrpl_primitives::Hash256;
+        let reg = FeatureRegistry::with_known_amendments();
+        for hex_id in GENESIS_AMENDMENTS_HEX {
+            let bytes = hex::decode(hex_id).expect("GENESIS_AMENDMENTS_HEX must be valid hex");
+            let arr: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .expect("amendment id must be 32 bytes");
+            let id = Hash256::new(arr);
+            assert!(
+                reg.get(&id).is_some(),
+                "genesis amendment {hex_id} is unknown to the registry \
+                 (a node booting genesis-full would false-halt on it)"
             );
         }
     }

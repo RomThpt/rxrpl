@@ -12,16 +12,19 @@ use rxrpl_p2p_proto::MessageType;
 use rxrpl_p2p_proto::codec::{PeerCodec, PeerMessage};
 use rxrpl_primitives::Hash256;
 use rxrpl_shamap::NodeId as ShamapNodeId;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, RwLock, Semaphore, mpsc};
 use tokio_util::codec::Framed;
 
 use crate::cluster::ClusterManager;
 use crate::command::OverlayCommand;
+use crate::crawl::{self, CrawlInfo};
 use crate::discovery::PeerDiscovery;
 use crate::error::OverlayError;
 use crate::event::PeerEvent;
 use crate::handshake;
+use crate::http;
 use crate::identity::NodeIdentity;
 use crate::ledger_provider::LedgerProvider;
 use crate::ledger_sync::LedgerSyncer;
@@ -45,11 +48,41 @@ const LI_TX_NODE: i32 = 1;
 const LI_AS_NODE: i32 = 2;
 const LI_TS_CANDIDATE: i32 = 3;
 
+/// Peers a delta-sync round fans its missing-node requests across. With fat
+/// subtrees served per id, more parallel peers cut catchup round-trips once the
+/// per-reply node cap is large (bench: 3 peers 91 rounds -> 8 peers 69).
+const DELTA_SYNC_FANOUT: usize = 8;
+
+/// Capacity of the bounded overlay->consensus message channel.
+///
+/// This channel was previously unbounded: under a mainnet transaction or
+/// ledger-data burst the producer (this single peer-manager event loop) can
+/// outrun the consensus consumer and the queue grows without limit until the
+/// node OOMs (M0 validator-hardening finding). Bounding it caps the queued
+/// message count, so a sustained flood sheds at the tail instead of eating
+/// all memory -- the rippled policy of bounded buffers + shedding under
+/// overload, never unbounded growth.
+///
+/// 4096 is sized off the upstream `event_tx` bound (8192) and the message mix
+/// that reaches consensus: proposals/validations are a few tens per ledger,
+/// relay-filtered transactions a few hundred/s, and the largest contributor is
+/// catchup `LedgerData` (fan-out of 8 peers x batched fat-subtree replies).
+/// 4096 slots absorb several seconds of steady consensus traffic plus multiple
+/// full fan-out `LedgerData` bursts, while keeping the worst-case queued memory
+/// bounded (O(cap x max message size)). A few thousand is the sweet spot: large
+/// enough that healthy operation never sheds, small enough to bound memory.
+const CONSENSUS_CHANNEL_CAP: usize = 4096;
+
 /// HaveTransactionSet status values from rippled.
 /// tsNEW_SET = 1: peer is proposing a new transaction set.
 const _TS_NEW_SET: u32 = 1;
 
 /// Messages forwarded from the overlay to the consensus layer.
+// The Validation variant is intentionally the largest: it carries the full
+// validation with its optional fee/reserve/cookie fields. Boxing it would add
+// a heap allocation per validation on the hot consensus-message path for no
+// real memory win, so the size spread is accepted here.
+#[allow(clippy::large_enum_variant)]
 pub enum ConsensusMessage {
     Proposal(Proposal),
     Validation(Validation),
@@ -89,10 +122,47 @@ pub enum ConsensusMessage {
     TxSetAcquired(TxSet),
 }
 
+impl ConsensusMessage {
+    /// Short static label for logging shed messages without moving the value.
+    fn kind(&self) -> &'static str {
+        match self {
+            ConsensusMessage::Proposal(_) => "Proposal",
+            ConsensusMessage::Validation(_) => "Validation",
+            ConsensusMessage::Transaction { .. } => "Transaction",
+            ConsensusMessage::StatusChange { .. } => "StatusChange",
+            ConsensusMessage::LedgerData { .. } => "LedgerData",
+            ConsensusMessage::LedgerHeader { .. } => "LedgerHeader",
+            ConsensusMessage::ValidatorListReceived { .. } => "ValidatorListReceived",
+            ConsensusMessage::ValidatorListVerified { .. } => "ValidatorListVerified",
+            ConsensusMessage::ManifestApplied { .. } => "ManifestApplied",
+            ConsensusMessage::TxSetAcquired(_) => "TxSetAcquired",
+        }
+    }
+
+    /// Whether losing this message can stall consensus. Proposals, validations
+    /// and the acquired tx-set are the votes/inputs a round needs to converge;
+    /// everything else is either high-volume gossip (transactions) or
+    /// re-requestable/replayable state (ledger data/headers, validator lists,
+    /// manifests, status changes). Critical drops are logged loudly; bulk
+    /// drops are logged at debug so a transaction flood cannot spam the log.
+    fn is_critical(&self) -> bool {
+        matches!(
+            self,
+            ConsensusMessage::Proposal(_)
+                | ConsensusMessage::Validation(_)
+                | ConsensusMessage::TxSetAcquired(_)
+        )
+    }
+}
+
 /// Configuration for the peer manager.
 pub struct PeerManagerConfig {
     pub listen_port: u16,
     pub max_peers: usize,
+    /// Outbound slots an inbound peer may never occupy (eclipse-attack resistance).
+    pub reserved_outbound_slots: usize,
+    /// Max simultaneous peers sharing one remote IP (eclipse-attack resistance).
+    pub max_peers_per_ip: usize,
     pub seeds: Vec<String>,
     pub fixed_peers: Vec<String>,
     pub network_id: u32,
@@ -106,6 +176,27 @@ pub struct PeerManagerConfig {
     pub cluster_members: Vec<String>,
     /// Interval between cluster status broadcasts (seconds).
     pub cluster_broadcast_interval_secs: u64,
+}
+
+/// Depth of the queue feeding the validation-signature verify worker. Sized
+/// well above the steady-state validation rate so bursts are absorbed off the
+/// event loop; once full, the event loop verifies inline (never dropping one).
+const VALIDATION_VERIFY_QUEUE: usize = 8192;
+
+/// A received validation awaiting off-loop signature verification.
+struct ValidationVerifyJob {
+    from: Hash256,
+    payload: Vec<u8>,
+    validation: Validation,
+}
+
+/// The outcome of an off-loop signature verification, handed back to the event
+/// loop for reputation, squelch, relay, master-key resolution and forwarding.
+struct ValidationVerifyResult {
+    from: Hash256,
+    payload: Vec<u8>,
+    validation: Validation,
+    valid: bool,
 }
 
 /// Central P2P network manager.
@@ -125,7 +216,14 @@ pub struct PeerManager {
     cmd_tx_internal: mpsc::UnboundedSender<OverlayCommand>,
     event_rx: mpsc::Receiver<PeerEvent>,
     event_tx: mpsc::Sender<PeerEvent>,
-    consensus_tx: mpsc::UnboundedSender<ConsensusMessage>,
+    consensus_tx: mpsc::Sender<ConsensusMessage>,
+    /// Count of messages shed because [`consensus_tx`](Self::consensus_tx) was
+    /// full (overload back-pressure). Surfaced via [`consensus_dropped`].
+    consensus_dropped: AtomicU64,
+    validation_verify_tx: mpsc::Sender<ValidationVerifyJob>,
+    validation_verify_rx: Option<mpsc::Receiver<ValidationVerifyJob>>,
+    validation_verify_result_tx: mpsc::Sender<ValidationVerifyResult>,
+    validation_verify_result_rx: mpsc::Receiver<ValidationVerifyResult>,
     ledger_provider: Option<Arc<dyn LedgerProvider>>,
     node_store: Option<Arc<dyn rxrpl_shamap::NodeStore>>,
     ledger_syncer: LedgerSyncer,
@@ -155,6 +253,19 @@ pub struct PeerManager {
     /// this bound a remote attacker could open thousands of half-open
     /// TCP connections and saturate the runtime (audit finding H5).
     inbound_handshake_permits: Arc<Semaphore>,
+    /// Caps the number of concurrent off-loop peer **serve** tasks
+    /// (GetLedger / GetObjects / FetchPack). Serving does synchronous SHAMap
+    /// tree walks and blocking RocksDB reads; running it inline on the
+    /// consensus/peer event loop head-of-line-blocks proposals and
+    /// validations. Each serve is spawned onto a blocking task that first
+    /// acquires a permit here, bounding concurrent serves so a request burst
+    /// can't saturate the blocking pool. Serving is read-only against
+    /// immutable ledger snapshots, so it offloads with no ordering
+    /// constraints. Mirrors [`inbound_handshake_permits`](Self::inbound_handshake_permits).
+    serve_permits: Arc<Semaphore>,
+    /// Supplies the server-level fields of the `/crawl` response. `None` keeps
+    /// the crawl limited to overlay-known data (used in tests).
+    crawl_info: Option<Arc<dyn CrawlInfo>>,
 }
 
 impl PeerManager {
@@ -166,17 +277,26 @@ impl PeerManager {
     ) -> (
         Self,
         mpsc::UnboundedSender<OverlayCommand>,
-        mpsc::UnboundedReceiver<ConsensusMessage>,
+        mpsc::Receiver<ConsensusMessage>,
     ) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let cmd_tx_internal = cmd_tx.clone();
-        let (consensus_tx, consensus_rx) = mpsc::unbounded_channel();
+        // Bounded so a transaction/ledger-data burst sheds at the tail instead
+        // of growing without limit and OOMing the node (see CONSENSUS_CHANNEL_CAP).
+        let (consensus_tx, consensus_rx) = mpsc::channel(CONSENSUS_CHANNEL_CAP);
         // Bounded so a flood of inbound peer messages exerts TCP
         // backpressure on the offending peer's read loop instead of
         // growing an unbounded queue (audit finding C4). 8192 is well
         // above the steady-state of 21 peers x 100 msg/s rate-limited.
         let (event_tx, event_rx) = mpsc::channel(8192);
-        let peer_set = Arc::new(PeerSet::new(config.max_peers));
+        let (validation_verify_tx, validation_verify_rx) = mpsc::channel(VALIDATION_VERIFY_QUEUE);
+        let (validation_verify_result_tx, validation_verify_result_rx) =
+            mpsc::channel(VALIDATION_VERIFY_QUEUE);
+        let peer_set = Arc::new(PeerSet::new(
+            config.max_peers,
+            config.reserved_outbound_slots,
+            config.max_peers_per_ip,
+        ));
 
         let seeds = config.seeds.clone();
         let cluster_manager = ClusterManager::new(
@@ -198,6 +318,11 @@ impl PeerManager {
             event_rx,
             event_tx,
             consensus_tx,
+            consensus_dropped: AtomicU64::new(0),
+            validation_verify_tx,
+            validation_verify_rx: Some(validation_verify_rx),
+            validation_verify_result_tx,
+            validation_verify_result_rx,
             ledger_provider: None,
             node_store: None,
             ledger_syncer: LedgerSyncer::new(),
@@ -221,6 +346,13 @@ impl PeerManager {
             // simply cause new TCP connections to wait, which Linux's accept
             // queue absorbs naturally.
             inbound_handshake_permits: Arc::new(Semaphore::new(64)),
+            // Bound concurrent off-loop serve tasks to 32 (mirrors
+            // inbound_handshake_permits). Serving is read-only against
+            // immutable ledger snapshots, so offloading is safe; the permit
+            // just caps how many heavy SHAMap tree-walks / RocksDB reads run at
+            // once instead of letting a request burst saturate the runtime.
+            serve_permits: Arc::new(Semaphore::new(32)),
+            crawl_info: None,
         };
 
         (mgr, cmd_tx, consensus_rx)
@@ -231,8 +363,54 @@ impl PeerManager {
     /// the consensus loop's input queue. This lets the local close handler
     /// feed its own freshly-signed validation back into the same path used
     /// for peer-received validations, so it counts toward UNL quorum.
-    pub fn consensus_sender(&self) -> mpsc::UnboundedSender<ConsensusMessage> {
+    pub fn consensus_sender(&self) -> mpsc::Sender<ConsensusMessage> {
         self.consensus_tx.clone()
+    }
+
+    /// Forward a message to the consensus loop over the bounded channel.
+    ///
+    /// Always uses `try_send` (never `await`): this runs on the single
+    /// peer-manager event loop, which also drives `accept`, sync and the
+    /// per-peer dispatch. Awaiting a full channel here would stall every one
+    /// of those, and because the consensus consumer (`node.rs`) drains this
+    /// channel from the *same* `tokio::select!` task that closes ledgers,
+    /// awaiting would risk a self-inflicted deadlock. So under overload we
+    /// shed: increment the dropped counter and log (loudly for
+    /// consensus-critical messages, at debug for bulk gossip/replayable
+    /// state). Shedding the tail is strictly better than OOMing the node.
+    fn forward_to_consensus(&self, msg: ConsensusMessage) {
+        use tokio::sync::mpsc::error::TrySendError;
+        let kind = msg.kind();
+        let critical = msg.is_critical();
+        match self.consensus_tx.try_send(msg) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                let dropped = self.consensus_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                if critical {
+                    tracing::warn!(
+                        "consensus channel full: shed critical {} ({} total shed)",
+                        kind,
+                        dropped
+                    );
+                } else {
+                    tracing::debug!(
+                        "consensus channel full: shed {} ({} total shed)",
+                        kind,
+                        dropped
+                    );
+                }
+            }
+            Err(TrySendError::Closed(_)) => {
+                // Consensus loop has shut down; nothing left to feed.
+                tracing::debug!("consensus channel closed, dropping {}", kind);
+            }
+        }
+    }
+
+    /// Total number of consensus messages shed because the bounded channel was
+    /// full. Non-zero means the consensus consumer fell behind a burst.
+    pub fn consensus_dropped(&self) -> u64 {
+        self.consensus_dropped.load(Ordering::Relaxed)
     }
 
     /// Set a ledger provider for serving GetLedger requests.
@@ -261,6 +439,12 @@ impl PeerManager {
     /// Set the shared tx-set cache (typically from NetworkConsensusAdapter).
     pub fn set_tx_sets(&mut self, tx_sets: Arc<std::sync::RwLock<HashMap<Hash256, TxSet>>>) {
         self.tx_sets = Some(tx_sets);
+    }
+
+    /// Provide the server-info source for the peer `/crawl` endpoint so the
+    /// crawl response carries the same build/ledger/uptime data as `server_info`.
+    pub fn set_crawl_info(&mut self, info: Arc<dyn CrawlInfo>) {
+        self.crawl_info = Some(info);
     }
 
     /// Register the **local** validator manifest (this node's own,
@@ -356,6 +540,29 @@ impl PeerManager {
         let mut batch_relay_interval = tokio::time::interval(Duration::from_millis(250));
         batch_relay_interval.tick().await; // skip first immediate tick
 
+        // Dedicated worker that verifies validation signatures off the event
+        // loop. It owns the job receiver and forwards each verified outcome back
+        // to the loop over `validation_verify_result_tx`.
+        if let Some(mut verify_rx) = self.validation_verify_rx.take() {
+            let result_tx = self.validation_verify_result_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                while let Some(job) = verify_rx.blocking_recv() {
+                    let valid = crate::identity::verify_validation_signature(&job.validation);
+                    if result_tx
+                        .blocking_send(ValidationVerifyResult {
+                            from: job.from,
+                            payload: job.payload,
+                            validation: job.validation,
+                            valid,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+
         loop {
             tokio::select! {
                 accept_result = listener.accept() => {
@@ -376,6 +583,15 @@ impl PeerManager {
 
                 Some(event) = self.event_rx.recv() => {
                     self.handle_event(event);
+                }
+
+                Some(result) = self.validation_verify_result_rx.recv() => {
+                    self.handle_verified_validation(
+                        result.from,
+                        result.payload,
+                        result.validation,
+                        result.valid,
+                    );
                 }
 
                 _ = sync_interval.tick() => {
@@ -484,12 +700,12 @@ impl PeerManager {
     fn spawn_inbound_handler(&self, stream: TcpStream, addr: String) {
         let identity = Arc::clone(&self.identity);
         let network_id = self.config.network_id;
-        let ledger_seq = Arc::clone(&self.ledger_seq);
         let ledger_hash = Arc::clone(&self.ledger_hash);
         let event_tx = self.event_tx.clone();
         let peer_set = Arc::clone(&self.peer_set);
         let tls_server = self.config.tls_server.clone();
         let permits = Arc::clone(&self.inbound_handshake_permits);
+        let crawl_info = self.crawl_info.clone();
 
         tokio::spawn(async move {
             // Hold a permit for the lifetime of the handshake. When the
@@ -504,11 +720,11 @@ impl PeerManager {
                 &addr,
                 &identity,
                 network_id,
-                &ledger_seq,
                 &ledger_hash,
                 &event_tx,
                 &peer_set,
                 &tls_server,
+                crawl_info.as_ref(),
             )
             .await
             {
@@ -569,6 +785,35 @@ impl PeerManager {
                         shard_index
                     );
                 }
+            }
+            OverlayCommand::ApplyValidatorListManifests { manifests } => {
+                let mut applied = 0usize;
+                for raw in manifests {
+                    match manifest::parse_and_verify(&raw) {
+                        Ok(manifest) => {
+                            let master_key = manifest.master_public_key.clone();
+                            let ephemeral_key = manifest.ephemeral_public_key.clone();
+                            let revoked = manifest.is_revoked();
+                            let old_ephemeral_key = self
+                                .manifest_store
+                                .current_ephemeral_key(&master_key)
+                                .cloned();
+                            if self.manifest_store.apply(manifest) {
+                                applied += 1;
+                                self.forward_to_consensus(ConsensusMessage::ManifestApplied {
+                                    master_key,
+                                    ephemeral_key,
+                                    old_ephemeral_key,
+                                    revoked,
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!("validator-list manifest verify failed: {error}");
+                        }
+                    }
+                }
+                tracing::debug!("applied {applied} manifests from verified validator list");
             }
             OverlayCommand::ConnectTo { addr } => {
                 let identity = Arc::clone(&self.identity);
@@ -666,6 +911,88 @@ impl PeerManager {
         }
     }
 
+    /// Post-verification handling of a received validation, once its signature
+    /// has been checked (on the verify worker, or inline when the queue is
+    /// full). Splitting this out lets the signature check run off the event loop
+    /// while reputation, squelch, relay, master-key resolution and consensus
+    /// forwarding stay on it.
+    fn handle_verified_validation(
+        &mut self,
+        from: Hash256,
+        payload: Vec<u8>,
+        mut validation: Validation,
+        valid: bool,
+    ) {
+        let peer_info = self.peer_set.get(&from);
+        if !valid {
+            tracing::warn!(
+                "rejecting validation with invalid signature for ledger #{}",
+                validation.ledger_seq,
+            );
+            if let Some(ref info) = peer_info {
+                info.reputation.record_invalid_message();
+            }
+            return;
+        }
+
+        if let Some(ref info) = peer_info {
+            info.reputation.record_valid_message(payload.len() as u64);
+        }
+
+        // Track which peer is relaying this validator's messages and send
+        // squelch to redundant sources.
+        if let Some(action) = self
+            .squelch_manager
+            .record_validation_source(from, &validation.public_key)
+        {
+            self.send_squelch_to_peers(&action);
+        }
+
+        if let Some(ref tx) = self.server_event_tx {
+            let _ = tx.send(serde_json::json!({
+                "type": "validationReceived",
+                "validator": validation.node_id.0.to_string(),
+                "ledger_hash": validation.ledger_hash.to_string(),
+                "ledger_seq": validation.ledger_seq,
+                "full": validation.full,
+            }));
+        }
+
+        // Relay validation to peers, respecting inbound squelch. A node still
+        // acquiring its base state is not a useful relay, and this loop is
+        // O(validators x peers) per message on the single event loop that must
+        // drive the state sync, so skip it during initial catchup. We still
+        // verify and forward to the node loop so the quorum-validated tip is
+        // learned.
+        if !self.ledger_syncer.in_initial_catchup() {
+            for (id, handle) in &self.peer_handles {
+                if *id != from
+                    && !self
+                        .squelch_manager
+                        .is_relay_squelched(id, &validation.public_key)
+                {
+                    let _ = handle.tx.try_send(PeerMessage {
+                        msg_type: MessageType::Validation,
+                        payload: payload.clone(),
+                    });
+                }
+            }
+        }
+
+        // Resolve the ephemeral signing key to the validator's master key via
+        // the manifest store, so the consensus loop can match it against the
+        // master-keyed trusted set. Without this the trust filter never matches
+        // a real validation (its public_key is the ephemeral key) and zero
+        // trusted validations are ever counted.
+        if let Ok(eph) = rxrpl_primitives::PublicKey::from_slice(&validation.public_key) {
+            if let Some(master) = self.manifest_store.master_key_for_ephemeral(&eph) {
+                validation.master_public_key = Some(master.as_bytes().to_vec());
+            }
+        }
+
+        self.forward_to_consensus(ConsensusMessage::Validation(validation));
+    }
+
     fn dispatch_message(&mut self, from: Hash256, msg_type: MessageType, payload: &[u8]) {
         let peer_info = self.peer_set.get(&from);
         let payload_len = payload.len() as u64;
@@ -700,6 +1027,17 @@ impl PeerManager {
                 self.peer_set.remove(&from);
                 return;
             }
+        }
+
+        // Shed transaction gossip during initial state catchup: with no base
+        // ledger a cold node cannot apply or usefully relay transactions, and
+        // the mainnet tx flood (~21k/25s) plus its per-peer rebroadcast loop
+        // otherwise starves the SHAMap state sync that shares this single event
+        // loop. Proposals are NOT shed: between rxrpl nodes the peer tip is
+        // announced via proposals (not StatusChange), so they are load-bearing
+        // for the node loop entering sync mode and adopting the acquired state.
+        if matches!(msg_type, MessageType::Transaction) && self.ledger_syncer.in_initial_catchup() {
+            return;
         }
 
         match msg_type {
@@ -738,7 +1076,7 @@ impl PeerManager {
                         // TMHaveTransactions/TMTransactions protocol.
                         self.tx_batch_relay.add_known_tx(tx_hash, tx_data.clone());
                         if self.relay_filter.should_relay(&tx_hash) {
-                            let _ = self.consensus_tx.send(ConsensusMessage::Transaction {
+                            self.forward_to_consensus(ConsensusMessage::Transaction {
                                 hash: tx_hash,
                                 data: tx_data,
                             });
@@ -765,7 +1103,7 @@ impl PeerManager {
                     if let Some(ref info) = peer_info {
                         info.reputation.record_valid_message(payload_len);
                     }
-                    let _ = self.consensus_tx.send(ConsensusMessage::Proposal(proposal));
+                    self.forward_to_consensus(ConsensusMessage::Proposal(proposal));
                 }
                 Err(_) => {
                     if let Some(ref info) = peer_info {
@@ -776,56 +1114,34 @@ impl PeerManager {
             MessageType::Validation => {
                 match proto_convert::decode_validation(payload) {
                     Ok(validation) => {
-                        // Reject validations with missing or invalid signatures
-                        if !crate::identity::verify_validation_signature(&validation) {
-                            tracing::warn!(
-                                "rejecting validation with invalid signature for ledger #{}",
-                                validation.ledger_seq,
-                            );
-                            if let Some(ref info) = peer_info {
-                                info.reputation.record_invalid_message();
+                        // Signature verification (secp256k1/ed25519 over the
+                        // canonical STObject) is the dominant CPU cost on this
+                        // event loop -- a busy flag ledger relays tens of
+                        // thousands of validations in seconds, which would stall
+                        // the loop and starve the sync pipeline. Offload it to a
+                        // worker thread; the verified result comes back on
+                        // `validation_verify_result_rx` and is handled by
+                        // `handle_verified_validation`. If the queue is saturated
+                        // (or unavailable) fall back to verifying inline so no
+                        // validation is silently dropped.
+                        let job = ValidationVerifyJob {
+                            from,
+                            payload: payload.to_vec(),
+                            validation,
+                        };
+                        match self.validation_verify_tx.try_send(job) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(job))
+                            | Err(mpsc::error::TrySendError::Closed(job)) => {
+                                let valid =
+                                    crate::identity::verify_validation_signature(&job.validation);
+                                self.handle_verified_validation(
+                                    job.from,
+                                    job.payload,
+                                    job.validation,
+                                    valid,
+                                );
                             }
-                        } else {
-                            if let Some(ref info) = peer_info {
-                                info.reputation.record_valid_message(payload_len);
-                            }
-
-                            // Track which peer is relaying this validator's messages
-                            // and send squelch to redundant sources.
-                            if let Some(action) = self
-                                .squelch_manager
-                                .record_validation_source(from, &validation.public_key)
-                            {
-                                self.send_squelch_to_peers(&action);
-                            }
-
-                            if let Some(ref tx) = self.server_event_tx {
-                                let _ = tx.send(serde_json::json!({
-                                    "type": "validationReceived",
-                                    "validator": validation.node_id.0.to_string(),
-                                    "ledger_hash": validation.ledger_hash.to_string(),
-                                    "ledger_seq": validation.ledger_seq,
-                                    "full": validation.full,
-                                }));
-                            }
-
-                            // Relay validation to peers, respecting inbound squelch.
-                            for (id, handle) in &self.peer_handles {
-                                if *id != from
-                                    && !self
-                                        .squelch_manager
-                                        .is_relay_squelched(id, &validation.public_key)
-                                {
-                                    let _ = handle.tx.try_send(PeerMessage {
-                                        msg_type: MessageType::Validation,
-                                        payload: payload.to_vec(),
-                                    });
-                                }
-                            }
-
-                            let _ = self
-                                .consensus_tx
-                                .send(ConsensusMessage::Validation(validation));
                         }
                     }
                     Err(_) => {
@@ -846,13 +1162,30 @@ impl PeerManager {
                         // Trigger sync if peer is ahead
                         let our_seq = self.ledger_seq.load(Ordering::Relaxed);
                         if self.ledger_syncer.needs_sync(our_seq, ledger_seq) {
-                            let requests = self.ledger_syncer.request_missing(our_seq, ledger_seq);
-                            for (seq, hash) in requests {
-                                self.send_get_ledger(seq, hash);
+                            if self.ledger_syncer.in_initial_catchup() {
+                                // Cold start: do NOT play forward seq-by-seq from
+                                // genesis. That ascending march hits the aged-target
+                                // wall before ever reaching the tip on mainnet's
+                                // ~19M-entry state -- peers flush the deep nodes of
+                                // old ledgers, so the deep frontier of an old target
+                                // can never be fetched. Instead target the validated
+                                // tip's state map directly and let the drain/re-target
+                                // loop (start_incremental_sync) chase fresher tips.
+                                // Kick the tip now so we don't wait for the next
+                                // check_sync tick; check_sync re-targets to max_peer_seq.
+                                if !self.ledger_syncer.has_any_incremental_sync() {
+                                    self.send_get_ledger(ledger_seq, None);
+                                }
+                            } else {
+                                let requests =
+                                    self.ledger_syncer.request_missing(our_seq, ledger_seq);
+                                for (seq, hash) in requests {
+                                    self.send_get_ledger(seq, hash);
+                                }
                             }
                         }
 
-                        let _ = self.consensus_tx.send(ConsensusMessage::StatusChange {
+                        self.forward_to_consensus(ConsensusMessage::StatusChange {
                             from,
                             ledger_seq,
                             ledger_hash,
@@ -909,7 +1242,31 @@ impl PeerManager {
                 if let Some(ref info) = peer_info {
                     info.reputation.record_valid_message(payload_len);
                 }
-                self.handle_get_ledger(from, payload);
+                // Serve off the consensus/peer event loop: the SHAMap tree
+                // walk plus blocking RocksDB reads must not head-of-line-block
+                // proposals/validations. Clone the reply sender and the
+                // read-only Arcs at dispatch time, then run the (byte-identical)
+                // serve body on a bounded blocking task. If the peer is already
+                // gone there is no reply target, so skip.
+                if let Some(reply_tx) = self.peer_handles.get(&from).map(|h| h.tx.clone()) {
+                    let ledger_provider = self.ledger_provider.clone();
+                    let tx_sets = self.tx_sets.clone();
+                    let payload = payload.to_vec();
+                    let permit = Arc::clone(&self.serve_permits);
+                    tokio::spawn(async move {
+                        let _p = permit.acquire_owned().await; // bound concurrency; drop on task end
+                        let _ = tokio::task::spawn_blocking(move || {
+                            Self::serve_get_ledger(
+                                from,
+                                payload,
+                                ledger_provider,
+                                tx_sets,
+                                reply_tx,
+                            );
+                        })
+                        .await;
+                    });
+                }
             }
             MessageType::LedgerData => {
                 tracing::info!("received LedgerData from {}: {} bytes", from, payload.len());
@@ -962,7 +1319,7 @@ impl PeerManager {
                                         leaves.len()
                                     );
                                     self.ledger_syncer.mark_synced(ledger_seq);
-                                    let _ = self.consensus_tx.send(ConsensusMessage::LedgerData {
+                                    self.forward_to_consensus(ConsensusMessage::LedgerData {
                                         hash,
                                         seq: ledger_seq,
                                         nodes: leaves,
@@ -1015,7 +1372,7 @@ impl PeerManager {
                                 // alignment gate is defeated → divergence from rippled.
                                 // Every catchup path below (immediate-complete AND the
                                 // common multi-round `feed_nodes` path) relies on this.
-                                let _ = self.consensus_tx.send(ConsensusMessage::LedgerHeader {
+                                self.forward_to_consensus(ConsensusMessage::LedgerHeader {
                                     seq: header.sequence,
                                     header: header.clone(),
                                 });
@@ -1040,12 +1397,11 @@ impl PeerManager {
                                             leaves.len()
                                         );
                                         self.ledger_syncer.mark_synced(header.sequence);
-                                        let _ =
-                                            self.consensus_tx.send(ConsensusMessage::LedgerData {
-                                                hash: header.hash,
-                                                seq: header.sequence,
-                                                nodes: leaves,
-                                            });
+                                        self.forward_to_consensus(ConsensusMessage::LedgerData {
+                                            hash: header.hash,
+                                            seq: header.sequence,
+                                            nodes: leaves,
+                                        });
                                     }
                                 }
                             } else {
@@ -1137,7 +1493,7 @@ impl PeerManager {
                                     if self.manifest_store.apply(m) {
                                         applied += 1;
                                         to_relay.push(raw.clone());
-                                        let _ = self.consensus_tx.send(
+                                        self.forward_to_consensus(
                                             ConsensusMessage::ManifestApplied {
                                                 master_key,
                                                 ephemeral_key: eph_key,
@@ -1295,12 +1651,11 @@ impl PeerManager {
                                             leaves.len()
                                         );
                                         self.ledger_syncer.mark_synced(seq);
-                                        let _ =
-                                            self.consensus_tx.send(ConsensusMessage::LedgerData {
-                                                hash,
-                                                seq,
-                                                nodes: leaves,
-                                            });
+                                        self.forward_to_consensus(ConsensusMessage::LedgerData {
+                                            hash,
+                                            seq,
+                                            nodes: leaves,
+                                        });
                                     }
                                     FeedResult::FallbackToHashFetch(content_hashes) => {
                                         self.send_get_objects_by_hash(seq, &content_hashes);
@@ -1312,7 +1667,32 @@ impl PeerManager {
                                 }
                             }
                         } else {
-                            self.handle_get_objects_query(from, msg);
+                            // Serve off the loop (see GetLedger arm): the
+                            // node-store lookups are blocking RocksDB reads and
+                            // the fetch-pack path walks the header chain. Clone
+                            // the reply sender + read-only Arcs, then run the
+                            // byte-identical serve body on a bounded blocking
+                            // task. Skip if the peer already disconnected.
+                            if let Some(reply_tx) =
+                                self.peer_handles.get(&from).map(|h| h.tx.clone())
+                            {
+                                let node_store = self.node_store.clone();
+                                let ledger_provider = self.ledger_provider.clone();
+                                let permit = Arc::clone(&self.serve_permits);
+                                tokio::spawn(async move {
+                                    let _p = permit.acquire_owned().await; // bound concurrency
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        Self::serve_get_objects_query(
+                                            from,
+                                            msg,
+                                            node_store,
+                                            ledger_provider,
+                                            reply_tx,
+                                        );
+                                    })
+                                    .await;
+                                });
+                            }
                         }
                     }
                     Err(e) => {
@@ -1379,7 +1759,7 @@ impl PeerManager {
                                                     .current_ephemeral_key(&master_key)
                                                     .cloned();
                                                 if self.manifest_store.apply(m) {
-                                                    let _ = self.consensus_tx.send(
+                                                    self.forward_to_consensus(
                                                         ConsensusMessage::ManifestApplied {
                                                             master_key,
                                                             ephemeral_key: eph_key,
@@ -1392,7 +1772,7 @@ impl PeerManager {
                                         }
 
                                         // Send verified list to consensus
-                                        let _ = self.consensus_tx.send(
+                                        self.forward_to_consensus(
                                             ConsensusMessage::ValidatorListVerified {
                                                 validators: vl_data.validators,
                                                 sequence: seq,
@@ -1407,7 +1787,7 @@ impl PeerManager {
                                     }
 
                                     // Also send the count for backward compatibility
-                                    let _ = self.consensus_tx.send(
+                                    self.forward_to_consensus(
                                         ConsensusMessage::ValidatorListReceived {
                                             validator_count: count,
                                         },
@@ -1422,7 +1802,7 @@ impl PeerManager {
                                     // Fall back to unverified count extraction
                                     if let Some(blob_b) = vl.blob.as_ref() {
                                         if let Ok(count) = base64_decode_validator_blob(blob_b) {
-                                            let _ = self.consensus_tx.send(
+                                            self.forward_to_consensus(
                                                 ConsensusMessage::ValidatorListReceived {
                                                     validator_count: count,
                                                 },
@@ -1435,7 +1815,7 @@ impl PeerManager {
                             // Missing fields, fall back to unverified extraction
                             if let Some(blob_bytes) = vl.blob.as_ref() {
                                 if let Ok(decoded) = base64_decode_validator_blob(blob_bytes) {
-                                    let _ = self.consensus_tx.send(
+                                    self.forward_to_consensus(
                                         ConsensusMessage::ValidatorListReceived {
                                             validator_count: decoded,
                                         },
@@ -1585,7 +1965,7 @@ impl PeerManager {
                         // Forward each new transaction to the consensus layer
                         for (tx_hash, tx_data) in &new_txs {
                             if self.relay_filter.should_relay(tx_hash) {
-                                let _ = self.consensus_tx.send(ConsensusMessage::Transaction {
+                                self.forward_to_consensus(ConsensusMessage::Transaction {
                                     hash: *tx_hash,
                                     data: tx_data.clone(),
                                 });
@@ -2022,44 +2402,42 @@ impl PeerManager {
             .max()
             .unwrap_or(0);
 
-        // Split requests across multiple peers so each gets a different subset.
-        let best = self.peer_set.best_peers_for_ledger(seq, 3);
+        // Split the frontier window into server-cap-sized requests (the server
+        // truncates each GetLedger to MAX_GET_LEDGER_NODES=128 ids) and
+        // round-robin them across the best peers, so each peer carries several
+        // outstanding requests. This keeps the request pipeline full across
+        // reply latency instead of issuing one request per peer per round --
+        // the dominant lever once the frontier is wider than the fan-out.
+        const REQUEST_NODE_CAP: usize = 128;
+        let best = self.peer_set.best_peers_for_ledger(seq, DELTA_SYNC_FANOUT);
         let num_peers = best.len();
         if num_peers == 0 {
             return;
         }
-        let chunk_size = node_ids.len().div_ceil(num_peers);
-        let mut peers_used = 0;
-        for (i, node_id) in best.iter().enumerate() {
-            let chunk: Vec<Vec<u8>> = node_ids
-                .iter()
-                .skip(i * chunk_size)
-                .take(chunk_size)
-                .cloned()
-                .collect();
-            if chunk.is_empty() {
-                break;
-            }
+        let mut requests_sent = 0usize;
+        for (req_idx, chunk) in node_ids.chunks(REQUEST_NODE_CAP).enumerate() {
+            let node_id = &best[req_idx % num_peers];
             let payload = proto_convert::encode_get_ledger_with_nodes(
                 LI_AS_NODE,
                 Some(&ledger_hash),
                 seq,
                 0,
-                chunk,
+                chunk.to_vec(),
             );
             if let Some(handle) = self.peer_handles.get(node_id) {
                 let _ = handle.tx.try_send(PeerMessage {
                     msg_type: MessageType::GetLedger,
                     payload,
                 });
-                peers_used += 1;
+                requests_sent += 1;
             }
         }
         tracing::debug!(
-            "sent GetLedger seq={} delta ({} node_ids across {} peers, depth={}-{})",
+            "sent GetLedger seq={} delta ({} node_ids in {} requests across {} peers, depth={}-{})",
             seq,
             num_ids,
-            peers_used,
+            requests_sent,
+            num_peers,
             min_depth,
             max_depth
         );
@@ -2071,10 +2449,12 @@ impl PeerManager {
     /// response containing the found objects. Caps the number of objects per
     /// response to avoid excessive bandwidth usage (matching rippled's limit
     /// of 16384 objects per response and 256 KB total payload size).
-    fn handle_get_objects_query(
-        &self,
+    fn serve_get_objects_query(
         from: Hash256,
         msg: rxrpl_p2p_proto::proto::TmGetObjectByHash,
+        node_store: Option<Arc<dyn rxrpl_shamap::NodeStore>>,
+        ledger_provider: Option<Arc<dyn LedgerProvider>>,
+        reply_tx: mpsc::Sender<PeerMessage>,
     ) {
         /// Maximum number of objects to serve in a single response.
         ///
@@ -2108,11 +2488,11 @@ impl PeerManager {
         if object_type == OT_FETCH_PACK {
             // Fetch packs are served from the ledger provider (header chain),
             // not the raw node store, so dispatch before the node-store check.
-            self.handle_fetch_pack_query(from, msg);
+            Self::serve_fetch_pack_query(from, msg, ledger_provider, reply_tx);
             return;
         }
 
-        let store = match &self.node_store {
+        let store = match &node_store {
             Some(s) => s,
             None => {
                 tracing::debug!("GetObjectByHash from {} but no node store configured", from);
@@ -2197,12 +2577,10 @@ impl PeerManager {
             response.len()
         );
 
-        if let Some(handle) = self.peer_handles.get(&from) {
-            let _ = handle.tx.try_send(PeerMessage {
-                msg_type: MessageType::GetObjects,
-                payload: response,
-            });
-        }
+        let _ = reply_tx.try_send(PeerMessage {
+            msg_type: MessageType::GetObjects,
+            payload: response,
+        });
     }
 
     /// Serve a `TMGetObjectByHash` query with `type=otFETCH_PACK`.
@@ -2218,17 +2596,18 @@ impl PeerManager {
     /// out of locally-known ledgers, hit `MAX_FETCH_PACK_LEDGERS`, or fill
     /// the 256 KB response budget. Each entry costs ~150 bytes so the cap
     /// effectively bounds total work to a few KB per request.
-    fn handle_fetch_pack_query(
-        &self,
+    fn serve_fetch_pack_query(
         from: Hash256,
         msg: rxrpl_p2p_proto::proto::TmGetObjectByHash,
+        ledger_provider: Option<Arc<dyn LedgerProvider>>,
+        reply_tx: mpsc::Sender<PeerMessage>,
     ) {
         const MAX_FETCH_PACK_LEDGERS: usize = 32;
         const MAX_RESPONSE_SIZE: usize = 256 * 1024;
         // rippled `HashPrefix::ledgerMaster` ('L','W','R',0).
         const HASH_PREFIX_LEDGER_MASTER: [u8; 4] = [b'L', b'W', b'R', 0];
 
-        let provider = match &self.ledger_provider {
+        let provider = match &ledger_provider {
             Some(p) => p,
             None => {
                 tracing::debug!("FetchPack from {} but no ledger provider configured", from);
@@ -2309,12 +2688,10 @@ impl PeerManager {
             requested_ledger_hash
         );
 
-        if let Some(handle) = self.peer_handles.get(&from) {
-            let _ = handle.tx.try_send(PeerMessage {
-                msg_type: MessageType::GetObjects,
-                payload: response,
-            });
-        }
+        let _ = reply_tx.try_send(PeerMessage {
+            msg_type: MessageType::GetObjects,
+            payload: response,
+        });
     }
 
     /// Send TMGetObjectByHash requests to fetch missing nodes by content hash.
@@ -2422,8 +2799,14 @@ impl PeerManager {
         }
     }
 
-    fn handle_get_ledger(&self, from: Hash256, payload: &[u8]) {
-        let req = match proto_convert::decode_get_ledger(payload) {
+    fn serve_get_ledger(
+        from: Hash256,
+        payload: Vec<u8>,
+        ledger_provider: Option<Arc<dyn LedgerProvider>>,
+        tx_sets: Option<Arc<std::sync::RwLock<HashMap<Hash256, TxSet>>>>,
+        reply_tx: mpsc::Sender<PeerMessage>,
+    ) {
+        let req = match proto_convert::decode_get_ledger(&payload) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("bad GetLedger from {}: {}", from, e);
@@ -2439,7 +2822,7 @@ impl PeerManager {
             req.node_ids.len()
         );
 
-        let provider = match &self.ledger_provider {
+        let provider = match &ledger_provider {
             Some(p) => p,
             None => {
                 tracing::debug!("GetLedger from {} but no ledger provider", from);
@@ -2457,7 +2840,14 @@ impl PeerManager {
 
         // Handle tx-set requests (liTS_CANDIDATE) separately.
         if req_ledger_type == LI_TS_CANDIDATE {
-            self.handle_get_tx_set(from, &req_ledger_hash, &req.node_ids, req_cookie);
+            Self::serve_get_tx_set(
+                from,
+                &req_ledger_hash,
+                &req.node_ids,
+                req_cookie,
+                &tx_sets,
+                &reply_tx,
+            );
             return;
         }
 
@@ -2524,6 +2914,14 @@ impl PeerManager {
         // SHAMap path-walk; without this bound a single peer can pin the
         // request handler with O(n × 64) disk I/O per message.
         const MAX_GET_LEDGER_NODES: usize = 128;
+        // Match rippled's TMLedgerData reply caps (overlay Tuning.h): stop
+        // pulling new requested ids once the reply reaches the soft cap, and
+        // never emit past the hard cap within a single fat expansion.
+        const SOFT_MAX_REPLY_NODES: usize = 8192;
+        const HARD_MAX_REPLY_NODES: usize = 12288;
+        // Bound fat-subtree recursion. The node caps already limit work, but a
+        // hostile query_depth shouldn't drive needless deep walks.
+        const MAX_QUERY_DEPTH: u8 = 10;
 
         // Parse requested node_ids from the request as rippled wire format
         // (33 bytes: path[32] + depth[1]). The pre-PR-#14 32-byte content-hash
@@ -2567,12 +2965,10 @@ impl PeerManager {
                 nodes,
                 req_cookie,
             );
-            if let Some(handle) = self.peer_handles.get(&from) {
-                let _ = handle.tx.try_send(PeerMessage {
-                    msg_type: MessageType::LedgerData,
-                    payload: response,
-                });
-            }
+            let _ = reply_tx.try_send(PeerMessage {
+                msg_type: MessageType::LedgerData,
+                payload: response,
+            });
             return;
         }
 
@@ -2589,34 +2985,40 @@ impl PeerManager {
         };
 
         if !request_node_ids.is_empty() {
-            // Delta sync: serve specific nodes by walking the SHAMap to the
-            // requested (path, depth). Outgoing nodedata is in rippled
-            // TMLedgerNode wire format: payload || wireType byte.
+            // Delta sync: for each requested node serve a fat subtree (the node
+            // plus descendants down `query_depth` levels), mirroring rippled's
+            // getNodeFat. Returning a connected chunk per round-trip instead of a
+            // single node is the dominant catchup-throughput lever. Outgoing
+            // nodedata is rippled TMLedgerNode wire format (payload || wireType):
+            //   inner -> 16*32 child hashes + wireType 2
+            //   leaf  -> reorder key||data to data||key + tree leaf wireType.
             //
-            // - Inner (16*32 bytes in storage): payload as-is + wireType 2.
-            // - Leaf (key || data in storage): reorder to data || key + the
-            //   tree-specific leaf wireType byte selected above.
+            // query_depth defaults to rippled's low-latency default of 1; the
+            // state/tx maps are always served with fat leaves.
+            let query_depth = req.query_depth.unwrap_or(1).min(MAX_QUERY_DEPTH as u32) as u8;
             for node_id in &request_node_ids {
-                let Some((_content_hash, raw, is_inner)) = map.node_at(*node_id) else {
-                    continue;
-                };
-                let wire = encode_shamap_wire_node(&raw, is_inner, leaf_wire_type);
-                let id_bytes = node_id.to_wire_bytes();
-                let entry_size = id_bytes.len() + wire.len();
-                if total_size + entry_size <= MAX_RESPONSE_SIZE {
-                    nodes.push((id_bytes, wire));
-                    total_size += entry_size;
-                } else {
-                    truncated = true;
+                if nodes.len() >= SOFT_MAX_REPLY_NODES {
+                    break;
+                }
+                let budget = HARD_MAX_REPLY_NODES - nodes.len();
+                for (fat_id, raw, is_inner) in map.get_node_fat(*node_id, true, query_depth, budget)
+                {
+                    if nodes.len() >= HARD_MAX_REPLY_NODES {
+                        truncated = true;
+                        break;
+                    }
+                    let wire = encode_shamap_wire_node(&raw, is_inner, leaf_wire_type);
+                    nodes.push((fat_id.to_wire_bytes(), wire));
+                }
+                if truncated {
                     break;
                 }
             }
 
             if truncated {
                 tracing::warn!(
-                    "GetLedger delta response truncated at 256KB: sent {} of {} requested nodes for seq={}",
-                    nodes.len(),
-                    request_node_ids.len(),
+                    "GetLedger delta response capped at {} nodes for seq={}",
+                    HARD_MAX_REPLY_NODES,
                     ledger.header.sequence
                 );
             }
@@ -2659,12 +3061,10 @@ impl PeerManager {
             req_cookie,
         );
 
-        if let Some(handle) = self.peer_handles.get(&from) {
-            let _ = handle.tx.try_send(PeerMessage {
-                msg_type: MessageType::LedgerData,
-                payload: response,
-            });
-        }
+        let _ = reply_tx.try_send(PeerMessage {
+            msg_type: MessageType::LedgerData,
+            payload: response,
+        });
     }
 
     /// Serve a tx-set request from a peer (GetLedger with itype=liTS_CANDIDATE).
@@ -2675,12 +3075,13 @@ impl PeerManager {
     /// the same wire encoding `handle_get_ledger` uses for a ledger's tx tree,
     /// which is what lets a rippled peer acquire and re-apply rxrpl's proposed
     /// transactions instead of timing the set out.
-    fn handle_get_tx_set(
-        &self,
+    fn serve_get_tx_set(
         from: Hash256,
         hash_bytes: &[u8],
         req_node_ids: &[Vec<u8>],
         cookie: Option<u32>,
+        tx_sets: &Option<Arc<std::sync::RwLock<HashMap<Hash256, TxSet>>>>,
+        reply_tx: &mpsc::Sender<PeerMessage>,
     ) {
         let set_hash = if hash_bytes.len() >= 32 {
             Hash256::new(hash_bytes[..32].try_into().unwrap_or([0u8; 32]))
@@ -2689,8 +3090,7 @@ impl PeerManager {
             return;
         };
 
-        let tx_set = self
-            .tx_sets
+        let tx_set = tx_sets
             .as_ref()
             .and_then(|cache| cache.read().unwrap().get(&set_hash).cloned());
         let tx_set = match tx_set {
@@ -2760,12 +3160,71 @@ impl PeerManager {
         let response =
             proto_convert::encode_ledger_data(&set_hash, 0, LI_TS_CANDIDATE, nodes, cookie);
 
-        if let Some(handle) = self.peer_handles.get(&from) {
-            let _ = handle.tx.try_send(PeerMessage {
-                msg_type: MessageType::LedgerData,
-                payload: response,
-            });
-        }
+        let _ = reply_tx.try_send(PeerMessage {
+            msg_type: MessageType::LedgerData,
+            payload: response,
+        });
+    }
+
+    // ---------------------------------------------------------------------
+    // Test-only synchronous shims. Production dispatch serves these requests
+    // off the event loop (see the GetLedger/GetObjects arms in
+    // `dispatch_message`), which spawns the `serve_*` bodies on a bounded
+    // blocking task. Unit tests need the reply delivered synchronously so they
+    // can `try_recv` it immediately; these shims clone the same fields the
+    // dispatch path clones and call the identical serve body inline. They carry
+    // no extra logic, so the served bytes are exactly what production emits.
+    #[cfg(test)]
+    fn handle_get_ledger(&self, from: Hash256, payload: &[u8]) {
+        let Some(reply_tx) = self.peer_handles.get(&from).map(|h| h.tx.clone()) else {
+            return;
+        };
+        Self::serve_get_ledger(
+            from,
+            payload.to_vec(),
+            self.ledger_provider.clone(),
+            self.tx_sets.clone(),
+            reply_tx,
+        );
+    }
+
+    #[cfg(test)]
+    fn handle_get_tx_set(
+        &self,
+        from: Hash256,
+        hash_bytes: &[u8],
+        req_node_ids: &[Vec<u8>],
+        cookie: Option<u32>,
+    ) {
+        let Some(reply_tx) = self.peer_handles.get(&from).map(|h| h.tx.clone()) else {
+            return;
+        };
+        Self::serve_get_tx_set(
+            from,
+            hash_bytes,
+            req_node_ids,
+            cookie,
+            &self.tx_sets,
+            &reply_tx,
+        );
+    }
+
+    #[cfg(test)]
+    fn handle_get_objects_query(
+        &self,
+        from: Hash256,
+        msg: rxrpl_p2p_proto::proto::TmGetObjectByHash,
+    ) {
+        let Some(reply_tx) = self.peer_handles.get(&from).map(|h| h.tx.clone()) else {
+            return;
+        };
+        Self::serve_get_objects_query(
+            from,
+            msg,
+            self.node_store.clone(),
+            self.ledger_provider.clone(),
+            reply_tx,
+        );
     }
 
     /// Send a TMGetLedger request with itype=liTS_CANDIDATE to fetch a tx-set.
@@ -2858,9 +3317,7 @@ impl PeerManager {
         }
 
         // Notify the consensus engine.
-        let _ = self
-            .consensus_tx
-            .send(ConsensusMessage::TxSetAcquired(tx_set));
+        self.forward_to_consensus(ConsensusMessage::TxSetAcquired(tx_set));
     }
 }
 
@@ -2887,7 +3344,7 @@ async fn try_connect_outbound(
     let seq = ledger_seq.load(Ordering::Relaxed);
     let hash = *ledger_hash.read().await;
 
-    let (peer_node_id, software, framed) =
+    let (peer_node_id, software, public_key, framed) =
         handshake::handshake_outbound_http(stream, identity, network_id, seq, &hash).await?;
 
     if peer_set.get(&peer_node_id).is_some() {
@@ -2898,6 +3355,8 @@ async fn try_connect_outbound(
         node_id: peer_node_id,
         address: addr.to_string(),
         inbound: false,
+        public_key,
+        connected_at: std::time::Instant::now(),
         ledger_seq: AtomicU32::new(0),
         reputation: PeerReputation::new(),
         scoring: PeerScore::new(),
@@ -2921,28 +3380,62 @@ async fn try_connect_outbound(
     Ok(peer_node_id)
 }
 
-/// Accept an inbound peer, perform handshake, and spawn read/write loops.
+/// Accept an inbound connection, then either serve a `/crawl` request or
+/// complete the peer upgrade and spawn read/write loops.
+///
+/// Returns `Ok(Some(node_id))` for an established peer and `Ok(None)` when the
+/// connection was a crawl request (no peer registered).
 #[allow(clippy::too_many_arguments)]
 async fn try_accept_inbound(
     tcp: TcpStream,
     addr: &str,
     identity: &NodeIdentity,
     network_id: u32,
-    ledger_seq: &AtomicU32,
     ledger_hash: &RwLock<Hash256>,
     event_tx: &mpsc::Sender<PeerEvent>,
     peer_set: &PeerSet,
     tls_server: &Arc<SslAcceptor>,
-) -> Result<Hash256, OverlayError> {
-    let stream = tls::accept_tls(tcp, tls_server)
+    crawl_info: Option<&Arc<dyn CrawlInfo>>,
+) -> Result<Option<Hash256>, OverlayError> {
+    let mut stream = tls::accept_tls(tcp, tls_server)
         .await
         .map_err(|e| OverlayError::Connection(format!("TLS accept {addr}: {e}")))?;
 
-    let seq = ledger_seq.load(Ordering::Relaxed);
+    let request_buf = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handshake::read_until_header_end(&mut stream),
+    )
+    .await
+    .map_err(|_| OverlayError::Handshake("receive HTTP request timeout".into()))??;
+
+    let (target, req_headers) = http::parse_http_request(&request_buf)
+        .map_err(|e| OverlayError::Handshake(format!("parse HTTP request: {e}")))?;
+
+    if crawl::is_crawl_request(&target) {
+        let snapshot = crawl_info.map(|c| c.crawl_snapshot());
+        let doc = crawl::build_crawl_json(
+            identity,
+            network_id,
+            &peer_set.all_peers(),
+            snapshot.as_ref(),
+        );
+        let response = crawl::build_response_bytes(&doc);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            stream.write_all(&response).await?;
+            stream.flush().await
+        })
+        .await
+        .map_err(|_| OverlayError::Handshake("send crawl response timeout".into()))?
+        .map_err(|e| OverlayError::Handshake(format!("send crawl response: {e}")))?;
+        tracing::debug!("served /crawl to {}", addr);
+        return Ok(None);
+    }
+
     let hash = *ledger_hash.read().await;
 
-    let (peer_node_id, software, framed) =
-        handshake::handshake_inbound_http(stream, identity, network_id, seq, &hash).await?;
+    let (peer_node_id, software, public_key, framed) =
+        handshake::respond_inbound_upgrade(stream, &req_headers, identity, network_id, &hash)
+            .await?;
 
     if peer_set.get(&peer_node_id).is_some() {
         return Err(OverlayError::Handshake("already connected".into()));
@@ -2952,6 +3445,8 @@ async fn try_accept_inbound(
         node_id: peer_node_id,
         address: addr.to_string(),
         inbound: true,
+        public_key,
+        connected_at: std::time::Instant::now(),
         ledger_seq: AtomicU32::new(0),
         reputation: PeerReputation::new(),
         scoring: PeerScore::new(),
@@ -2972,7 +3467,7 @@ async fn try_accept_inbound(
         })
         .await;
 
-    Ok(peer_node_id)
+    Ok(Some(peer_node_id))
 }
 
 /// Convert a SHAMap storage-format node into the rippled `TMLedgerNode.nodedata`

@@ -1,10 +1,13 @@
 use rxrpl_amendment::feature::feature_id;
-use rxrpl_amount::{IOUAmount, from_rate, offer_quality, round_quality};
+use rxrpl_amount::{
+    IOUAmount, from_rate, get_rate, offer_quality, offer_quality_round_even, round_quality,
+};
 use rxrpl_codec::address::classic::{decode_account_id, encode_account_id};
 use rxrpl_primitives::{AccountId, Hash256};
 use rxrpl_protocol::TransactionResult;
 use rxrpl_protocol::keylet;
 use serde_json::Value;
+use std::collections::VecDeque;
 
 use crate::helpers;
 use crate::owner_dir::{add_to_book_dir, add_to_owner_dir};
@@ -16,10 +19,165 @@ fn u64_hex(n: u64) -> String {
 
 /// The order-book directory index for a given quality: the book base with its
 /// low 64 bits replaced by the quality (rate).
-fn book_dir_with_quality(book_base: &Hash256, quality: u64) -> Hash256 {
+pub(crate) fn book_dir_with_quality(book_base: &Hash256, quality: u64) -> Hash256 {
     let mut bytes = *book_base.as_bytes();
     bytes[24..32].copy_from_slice(&quality.to_be_bytes());
     Hash256::new(bytes)
+}
+
+/// Packed quality of the best (lowest-rate) funded page on the inverse book,
+/// or `None` if the book is empty. Used by `tfLimitQuality` to reject a path
+/// whose composite rate is worse than SendMax/Amount before any hop mutates.
+fn peek_best_book_quality(
+    view: &dyn crate::view::read_view::ReadView,
+    budget_in: &Leg,
+    demand_out: &Leg,
+) -> Option<u64> {
+    peek_book_quality_skip(view, budget_in, demand_out, 0)
+}
+
+fn peek_book_quality_skip(
+    view: &dyn crate::view::read_view::ReadView,
+    budget_in: &Leg,
+    demand_out: &Leg,
+    skip: usize,
+) -> Option<u64> {
+    let inverse_book = keylet::book_dir(
+        &budget_in.currency,
+        &budget_in.issuer,
+        &demand_out.currency,
+        &demand_out.issuer,
+    );
+    let book_prefix = inverse_book.as_bytes()[0..24].to_vec();
+    let mut probe = book_dir_with_quality(&inverse_book, 0);
+    let mut seen = 0usize;
+    while let Some(dir_key) = view.succ(&probe) {
+        if dir_key.as_bytes()[0..24] != book_prefix[..] {
+            return None;
+        }
+        probe = dir_key;
+        let Some(bytes) = view.read(&dir_key) else {
+            continue;
+        };
+        let Ok(dir) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let empty = dir
+            .get("Indexes")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true);
+        if empty {
+            continue;
+        }
+        if seen == skip {
+            return Some(u64::from_be_bytes(
+                dir_key.as_bytes()[24..32].try_into().ok()?,
+            ));
+        }
+        seen += 1;
+    }
+    None
+}
+
+/// TakerGets of the best resting offer on the inverse book, used to cap a
+/// reverse CLOB quote when PartialPayment Amount exceeds book size.
+fn peek_best_funded_offer(
+    ctx: &mut ApplyContext<'_>,
+    budget_in: &Leg,
+    demand_out: &Leg,
+) -> Option<Value> {
+    peek_funded_offer_skip(ctx, budget_in, demand_out, 0)
+}
+
+fn peek_funded_offer_skip(
+    ctx: &mut ApplyContext<'_>,
+    budget_in: &Leg,
+    demand_out: &Leg,
+    skip: usize,
+) -> Option<Value> {
+    let inverse_book = keylet::book_dir(
+        &budget_in.currency,
+        &budget_in.issuer,
+        &demand_out.currency,
+        &demand_out.issuer,
+    );
+    let book_prefix = inverse_book.as_bytes()[0..24].to_vec();
+    let mut probe = book_dir_with_quality(&inverse_book, 0);
+    let mut seen = 0usize;
+    while let Some(dir_key) = ctx.view.succ(&probe) {
+        if dir_key.as_bytes()[0..24] != book_prefix[..] {
+            return None;
+        }
+        probe = dir_key;
+        let Some(bytes) = ctx.view.read(&dir_key) else {
+            continue;
+        };
+        let Ok(dir) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let page: Vec<Hash256> = dir
+            .get("Indexes")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().and_then(|s| s.parse().ok()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut page_hit = false;
+        for key in page {
+            let Some(ob) = ctx.view.read(&key) else {
+                continue;
+            };
+            let Ok(offer) = serde_json::from_slice::<Value>(&ob) else {
+                continue;
+            };
+            let Some(gets) = Leg::parse(&offer["TakerGets"]) else {
+                continue;
+            };
+            let Some(owner_s) = offer.get("Account").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok(owner) = decode_account_id(owner_s) else {
+                continue;
+            };
+            let funds = owner_funds_leg(ctx, &owner, &gets);
+            if funds.is_zero() {
+                continue;
+            }
+            page_hit = true;
+            if seen == skip {
+                return Some(offer);
+            }
+        }
+        if page_hit {
+            seen += 1;
+        }
+    }
+    None
+}
+
+fn peek_best_book_gets(
+    ctx: &mut ApplyContext<'_>,
+    budget_in: &Leg,
+    demand_out: &Leg,
+) -> Option<Leg> {
+    let offer = peek_best_funded_offer(ctx, budget_in, demand_out)?;
+    let gets = Leg::parse(&offer["TakerGets"])?;
+    let owner_s = offer.get("Account").and_then(|v| v.as_str())?;
+    let owner = decode_account_id(owner_s).ok()?;
+    let funds = owner_funds_leg(ctx, &owner, &gets);
+    Some(if leg_ge(&funds, &gets) { gets } else { funds })
+}
+
+fn peek_best_book_pays(
+    ctx: &mut ApplyContext<'_>,
+    budget_in: &Leg,
+    demand_out: &Leg,
+) -> Option<Leg> {
+    let offer = peek_best_funded_offer(ctx, budget_in, demand_out)?;
+    Leg::parse(&offer["TakerPays"])
 }
 
 /// Parse a decimal value string (e.g. `"277.167203027"`) into an `IOUAmount`,
@@ -57,23 +215,74 @@ fn amount_to_iou(amount: &Value) -> Option<IOUAmount> {
 
 /// The offer's quality (rate) = TakerPays / TakerGets, encoded as rippled's
 /// 64-bit rate. Returns 0 if either side cannot be parsed.
-fn offer_book_quality(taker_pays: &Value, taker_gets: &Value) -> u64 {
+///
+/// `number_switchover` selects rippled's `STAmount::divide` canonicalisation:
+/// once `fixUniversalNumber` is active the quotient is reduced round-half-to-
+/// even (`offer_quality_round_even`); before it, by truncation (`offer_quality`).
+/// The book directory of a modern offer (e.g. `04F5F33…` landing on `…7EA4`)
+/// only matches rippled under the even reduction.
+fn offer_book_quality(taker_pays: &Value, taker_gets: &Value, number_switchover: bool) -> u64 {
     match (amount_to_iou(taker_pays), amount_to_iou(taker_gets)) {
-        (Some(p), Some(g)) => offer_quality(&p, &g).unwrap_or(0),
+        (Some(p), Some(g)) => {
+            let q = if number_switchover {
+                offer_quality_round_even(&p, &g)
+            } else {
+                offer_quality(&p, &g)
+            };
+            q.unwrap_or(0)
+        }
         _ => 0,
     }
 }
 
+/// OfferCreate transaction flags.
+const TF_PASSIVE: u64 = 0x0001_0000;
+const TF_IMMEDIATE_OR_CANCEL: u64 = 0x0002_0000;
+const TF_FILL_OR_KILL: u64 = 0x0004_0000;
 /// tfSell flag: the offer is a sell, so TakerGets is the exact amount.
 const TF_SELL: u64 = 0x0008_0000;
+const TF_HYBRID: u64 = 0x0010_0000;
+
+/// Offer ledger-entry flags. rippled translates the transaction `tfPassive` /
+/// `tfSell` flags into these (note `lsfSell` differs from `tfSell`); no other
+/// transaction flag is persisted on the Offer SLE.
+const LSF_PASSIVE: u64 = 0x0001_0000;
+const LSF_SELL: u64 = 0x0002_0000;
 
 /// rippled's `Quality::kMaxTickSize` — no rounding at or above 16 digits.
 const MAX_TICK_SIZE: u8 = 16;
+
+/// Round a non-negative decimal magnitude to the nearest integer drop, ties to
+/// even — rippled's `Number`-based `STAmount(XRP)` canonicalisation
+/// (`Number::operator rep()`, "round towards nearest, and on tie towards even"),
+/// not truncation.
+fn round_drops_half_even(dec: &str) -> Option<u64> {
+    let dec = dec.strip_prefix('-').unwrap_or(dec);
+    let (int_str, frac_str) = dec.split_once('.').unwrap_or((dec, ""));
+    let mut drops: u64 = int_str.parse().ok()?;
+    if let Some(&first) = frac_str.as_bytes().first() {
+        let first = first - b'0';
+        let rest_nonzero = frac_str.as_bytes()[1..].iter().any(|&b| b != b'0');
+        if first > 5 || (first == 5 && (rest_nonzero || drops & 1 == 1)) {
+            drops = drops.checked_add(1)?;
+        }
+    }
+    Some(drops)
+}
 
 /// Reserialize an IOU offer side with a recomputed magnitude, preserving its
 /// currency/issuer. Returns `None` for XRP sides (no tick rounding applies to
 /// a recomputed native amount here).
 fn rebuild_iou(original: &Value, value: &IOUAmount) -> Option<Value> {
+    // An XRP side is a bare drops string, not an IOU object: the tick
+    // re-derivation yields a fractional drops magnitude which rippled rounds to
+    // the nearest drop (round half to even, `STAmount(XRP)` via `Number`), not
+    // truncates. Without this the re-derivation silently failed on XRP offers
+    // and the tick snap was skipped.
+    if original.is_string() {
+        let drops = round_drops_half_even(&value.to_decimal_string())?;
+        return Some(Value::String(drops.to_string()));
+    }
     let obj = original.as_object()?;
     let mut out = obj.clone();
     out.insert("value".into(), Value::from(value.to_decimal_string()));
@@ -114,7 +323,15 @@ fn tick_round_amounts(
     let (Some(p_iou), Some(g_iou)) = (amount_to_iou(taker_pays), amount_to_iou(taker_gets)) else {
         return (taker_pays.clone(), taker_gets.clone());
     };
-    let Ok(quality) = offer_quality(&p_iou, &g_iou) else {
+    // The tick grid snaps the offer's quality, so it must be computed with the
+    // same (amendment-gated) divide canonicalisation as the placed book rate.
+    let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+    let quality = if number_switchover {
+        offer_quality_round_even(&p_iou, &g_iou)
+    } else {
+        offer_quality(&p_iou, &g_iou)
+    };
+    let Ok(quality) = quality else {
         return (taker_pays.clone(), taker_gets.clone());
     };
     let Ok(rate) = from_rate(round_quality(quality, tick)) else {
@@ -128,11 +345,18 @@ fn tick_round_amounts(
         {
             return (new_pays, taker_gets.clone());
         }
-    } else if let Some(new_gets) = IOUAmount::divide(&p_iou, &rate)
-        .ok()
-        .and_then(|g| rebuild_iou(taker_gets, &g))
-    {
-        return (taker_pays.clone(), new_gets);
+    } else {
+        // Recompute TakerGets = TakerPays / rate. Post-fixUniversalNumber rippled
+        // does this divide in `Number` (round half to even), matching the rounding
+        // used for the tick-snapped quality above; the legacy divide truncates.
+        let quot = if number_switchover {
+            IOUAmount::divide_round_even(&p_iou, &rate)
+        } else {
+            IOUAmount::divide(&p_iou, &rate)
+        };
+        if let Some(new_gets) = quot.ok().and_then(|g| rebuild_iou(taker_gets, &g)) {
+            return (taker_pays.clone(), new_gets);
+        }
     }
     (taker_pays.clone(), taker_gets.clone())
 }
@@ -192,11 +416,16 @@ impl Transactor for OfferCreateTransactor {
         }
 
         // PermissionedDEX gates only domain-scoped offers (those carrying a
-        // DomainID); an open offer trades on the public book unrestricted. The
-        // credential check applies only when a DomainID is present.
-        if ctx.rules.enabled(&feature_id("PermissionedDEX")) && ctx.tx.get("DomainID").is_some() {
-            check_permissioned_asset(ctx, &account_id, ctx.tx.get("TakerPays"))?;
-            check_permissioned_asset(ctx, &account_id, ctx.tx.get("TakerGets"))?;
+        // DomainID); an open offer trades on the public book unrestricted. rippled
+        // authorises a domain offer only for members of the domain named by the
+        // tx's DomainID (the DomainID is the PermissionedDomain object's index) —
+        // the trader must hold an accepted credential matching the domain's
+        // AcceptedCredentials. This has nothing to do with the traded assets'
+        // issuers.
+        if ctx.rules.enabled(&feature_id("PermissionedDEX")) {
+            if let Some(domain_id) = ctx.tx.get("DomainID").and_then(|v| v.as_str()) {
+                check_domain_membership(ctx, &account_id, domain_id)?;
+            }
         }
 
         Ok(())
@@ -216,7 +445,12 @@ impl Transactor for OfferCreateTransactor {
         let mut acct: Value =
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
 
-        let sequence = helpers::get_sequence(&acct);
+        // The offer's Sequence (and its keylet) is rippled's `getSeqProxy()`
+        // value: the TicketSequence when the transaction spends a ticket,
+        // otherwise the transaction's Sequence. It must come from the TX, not the
+        // account Sequence — the engine already consumed the sender's
+        // Sequence/Ticket centrally, so the account Sequence is one ahead.
+        let sequence = helpers::tx_seq_proxy_value(ctx.tx);
 
         let (pays_currency, pays_issuer) = currency_and_issuer(&ctx.tx["TakerPays"]);
         let (gets_currency, gets_issuer) = currency_and_issuer(&ctx.tx["TakerGets"]);
@@ -228,46 +462,236 @@ impl Transactor for OfferCreateTransactor {
         let (taker_pays, taker_gets) =
             tick_round_amounts(ctx, &ctx.tx["TakerPays"], &ctx.tx["TakerGets"], is_sell);
 
-        // Consume the sequence up front: rippled charges it (and the fee) even
-        // when the transaction ends in a tec claim below.
-        crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, &mut acct, ctx.tx)?;
+        // The sender's Sequence/Ticket and fee are consumed centrally by the
+        // engine (parent sandbox) before doApply, so they are charged even when
+        // this transaction ends in a tec claim below.
+
+        // Unfunded check (rippled preclaim): an offer must be at least partially
+        // funded in the asset it sells (TakerGets), else tecUNFUNDED_OFFER — fee
+        // and sequence charged, no offer placed, no crossing. accountFunds: an
+        // IOU side is the holder's trust-line balance (the issuer of its own
+        // currency is always funded); an XRP side is the liquid balance above the
+        // owner reserve (`xrpLiquid`).
+        let owner_count = acct.get("OwnerCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let funded = match Leg::parse(&taker_gets) {
+            Some(g) if g.is_xrp => {
+                // preclaim runs before the fee is taken; add it back to the
+                // post-fee balance the parent sandbox left us.
+                let pre_fee = helpers::get_balance(&acct).saturating_add(helpers::get_fee(ctx.tx));
+                pre_fee > ctx.fees.account_reserve(owner_count)
+            }
+            Some(g) => !owner_funds_leg(ctx, &account_id, &g).is_zero(),
+            None => true,
+        };
+        if !funded {
+            let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
+            ctx.view
+                .update(acct_key, nb)
+                .map_err(|_| TransactionResult::TemMalformed)?;
+            return Ok(TransactionResult::TecUnfundedOffer);
+        }
+
+        // OfferSequence (cancel-and-replace): rippled deletes the account's own
+        // offer at that sequence before crossing — removed from its book and
+        // owner directories with the owner reserve released. It is not an error
+        // if the offer is already gone. The OwnerCount decrement lands on `acct`
+        // (written back below), not the view copy a generic reap would clobber.
+        if let Some(cancel_seq) = ctx.tx.get("OfferSequence").and_then(|v| v.as_u64()) {
+            let cancel_key = keylet::offer(&account_id, cancel_seq as u32);
+            if let Some(old) = ctx
+                .view
+                .read(&cancel_key)
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .filter(|o| o.get("LedgerEntryType").and_then(|v| v.as_str()) == Some("Offer"))
+            {
+                if let Some(book_dir) = old
+                    .get("BookDirectory")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<Hash256>().ok())
+                {
+                    remove_from_book_dir(ctx.view, &book_dir, &cancel_key)?;
+                }
+                crate::owner_dir::remove_from_owner_dir(ctx.view, &account_id, &cancel_key)?;
+                let _ = ctx.view.erase(&cancel_key);
+                helpers::adjust_owner_count(&mut acct, -1);
+            }
+        }
 
         // Cross against the inverse book — existing offers where someone pays
         // our `TakerGets` to receive our `TakerPays` (book keyed by `(gets,
         // pays)`) — best price first, filling crossable offers and reaping
         // unfunded ones (rippled's Taker). Returns the taker's leftover.
-        let inverse_book =
-            keylet::book_dir(&gets_currency, &gets_issuer, &pays_currency, &pays_issuer);
-        let (remaining_pays, remaining_gets, crossed) = cross_offers(
-            ctx,
-            &account_id,
-            &mut acct,
-            &taker_pays,
-            &taker_gets,
-            &inverse_book,
-        )?;
+        //
+        // A domain-scoped OfferCreate (carrying a DomainID, without tfHybrid)
+        // crosses ONLY the permissioned domain book: rippled excludes open-book
+        // offers and AMM liquidity from domain crossing ("AMM doesn't support
+        // domain books"; BookStep's tryAMM skips the pool when the book is
+        // domain-scoped). A hybrid offer (tfHybrid) also trades the public book,
+        // so it keeps the open path.
+        let domain_id_hash: Option<rxrpl_primitives::Hash256> = ctx
+            .tx
+            .get("DomainID")
+            .and_then(|v| v.as_str())
+            .and_then(|s| <rxrpl_primitives::Hash256 as std::str::FromStr>::from_str(s).ok());
+        let tx_is_hybrid =
+            ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_HYBRID != 0;
+        let domain_only = domain_id_hash.is_some() && !tx_is_hybrid;
+        let inverse_book = match &domain_id_hash {
+            Some(d) if domain_only => keylet::book_dir_domain(
+                &gets_currency,
+                &gets_issuer,
+                &pays_currency,
+                &pays_issuer,
+                d,
+            ),
+            _ => keylet::book_dir(&gets_currency, &gets_issuer, &pays_currency, &pays_issuer),
+        };
+        reap_own_unfunded_inverse_tip(ctx, &account_id, &mut acct, &inverse_book)?;
+        // rippled's mPriorBalance for the resting-offer reserve gate: the XRP
+        // balance before the fee and before crossing. The engine deducted the
+        // fee centrally and crossing has not run yet, so add the fee back.
+        let prior_balance = helpers::get_balance(&acct).saturating_add(helpers::get_fee(ctx.tx));
+        // rippled gates offer crossing on the `FlowCross` amendment
+        // (`CreateOffer::cross`): the modern Flow/`BookStep` engine when enabled,
+        // the legacy `Taker` (with its XRP autobridge) when not. Every mainnet
+        // ledger past 2018 has `FlowCross` enabled, so the legacy arm is dead on
+        // any recent replay; it exists for byte-exact pre-`FlowCross` ledgers.
+        let (remaining_pays, remaining_gets, crossed) =
+            if ctx.rules.enabled(&feature_id("FlowCross")) {
+                cross_offers(
+                    ctx,
+                    &account_id,
+                    &mut acct,
+                    &taker_pays,
+                    &taker_gets,
+                    &inverse_book,
+                    is_sell,
+                    domain_only,
+                )?
+            } else {
+                taker_cross(
+                    ctx,
+                    &account_id,
+                    &mut acct,
+                    &taker_pays,
+                    &taker_gets,
+                    &inverse_book,
+                    is_sell,
+                    domain_only,
+                )?
+            };
+
+        // Flow returns the independently consumed input and output amounts. A
+        // resting remainder must nevertheless retain the offer's original
+        // quality: CreateOffer::flowCross first keeps the remaining output, then
+        // re-derives the input with mulRound. Subtracting both flow amounts
+        // independently drifts an offer after crossing price-improving liquidity
+        // (Testnet 20934193 / 9B345F1A).
+        let (remaining_pays, remaining_gets) = if ctx.rules.enabled(&feature_id("FlowCross")) {
+            let pays_leg = Leg::parse(&taker_pays).ok_or(TransactionResult::TemBadOffer)?;
+            let gets_leg = Leg::parse(&taker_gets).ok_or(TransactionResult::TemBadOffer)?;
+            let orig_quality = if ctx.rules.enabled(&feature_id("fixUniversalNumber")) {
+                rxrpl_amount::get_rate_round_even(
+                    &leg_as_quality_iou(&gets_leg),
+                    &leg_as_quality_iou(&pays_leg),
+                )
+            } else {
+                rxrpl_amount::get_rate(
+                    &leg_as_quality_iou(&gets_leg),
+                    &leg_as_quality_iou(&pays_leg),
+                )
+            }
+            .unwrap_or(0);
+            remaining_offer(
+                is_sell,
+                orig_quality,
+                &Leg::parse(&remaining_pays).ok_or(TransactionResult::TefInternal)?,
+                &Leg::parse(&remaining_gets).ok_or(TransactionResult::TefInternal)?,
+                &pays_leg,
+                &gets_leg,
+                crossed,
+            )
+        } else {
+            (remaining_pays, remaining_gets)
+        };
 
         // Nothing left to place when either side is exhausted (fully crossed):
         // rippled places no resting offer. Commit the taker's mutations.
+        let commit_acct =
+            |ctx: &mut ApplyContext<'_>, acct: &Value| -> Result<(), TransactionResult> {
+                let nb = serde_json::to_vec(acct).map_err(|_| TransactionResult::TemMalformed)?;
+                ctx.view
+                    .update(acct_key, nb)
+                    .map_err(|_| TransactionResult::TemMalformed)?;
+                Ok(())
+            };
         if value_is_zero(&remaining_pays) || value_is_zero(&remaining_gets) {
-            let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
-            ctx.view
-                .update(acct_key, nb)
-                .map_err(|_| TransactionResult::TemMalformed)?;
+            commit_acct(ctx, &acct)?;
             return Ok(TransactionResult::TesSuccess);
         }
 
-        // Owner reserve: a resting offer needs reserve for one more owned
-        // object. rippled returns tecINSUF_RESERVE_OFFER — fee and sequence
-        // charged, no offer placed — when the account cannot afford it AND
-        // nothing crossed (a crossing offer may still place below reserve).
-        let owner_count = acct.get("OwnerCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        if !crossed && helpers::get_balance(&acct) < ctx.fees.account_reserve(owner_count + 1) {
-            let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
-            ctx.view
-                .update(acct_key, nb)
-                .map_err(|_| TransactionResult::TemMalformed)?;
-            return Ok(TransactionResult::TecInsufReserveOffer);
+        // rippled clears the leftover offer when crossing exhausted the taker's
+        // funds in the asset it sells: an offer it cannot fund at all is not
+        // placed (`flowCross`, OfferCreate.cpp:481-499, `takerInBalance <= 0`,
+        // where takerInBalance = accountFunds on the post-crossing sandbox =
+        // liquid balance above the owner reserve). An IOU gets side's
+        // post-crossing balance is committed to the view by crossing, so
+        // `owner_funds_leg` reads the live value; the taker's XRP balance moves
+        // through the working copy and is only written back on commit, so its
+        // post-crossing liquid funds are computed from `acct`.
+        if crossed {
+            if let Some(gets_leg) = Leg::parse(&taker_gets) {
+                let unfunded = if gets_leg.is_xrp {
+                    let oc = acct.get("OwnerCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    helpers::get_balance(&acct) as i64 - ctx.fees.account_reserve(oc) as i64 <= 0
+                } else {
+                    owner_funds_leg(ctx, &account_id, &gets_leg).is_zero()
+                };
+                if unfunded {
+                    commit_acct(ctx, &acct)?;
+                    return Ok(TransactionResult::TesSuccess);
+                }
+            }
+        }
+
+        // A remainder survives crossing. Time-in-force flags decide its fate
+        // before any resting offer is placed.
+        let tx_flags = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
+        if tx_flags & TF_FILL_OR_KILL != 0 {
+            // FillOrKill: failure to fully cross kills the whole operation.
+            commit_acct(ctx, &acct)?;
+            return Ok(TransactionResult::TecKilled);
+        }
+        if tx_flags & TF_IMMEDIATE_OR_CANCEL != 0 {
+            // ImmediateOrCancel: the remainder is cancelled, not placed. An offer
+            // that transferred nothing returns tecKILLED; otherwise tesSUCCESS.
+            commit_acct(ctx, &acct)?;
+            return Ok(if crossed {
+                TransactionResult::TesSuccess
+            } else {
+                TransactionResult::TecKilled
+            });
+        }
+
+        // Owner reserve: a resting offer needs reserve for one more owned object.
+        // rippled gates on mPriorBalance (the XRP balance before fee/crossing):
+        // when it cannot cover the reserve for OwnerCount+1 the remainder is not
+        // placed. If nothing crossed that is tecINSUF_RESERVE_OFFER (fee and
+        // sequence charged, offer dropped); if the offer already crossed, the
+        // fills stand and it succeeds without resting the remainder. Read the
+        // count fresh: a cancelled OfferSequence has already decremented it.
+        let reserve_count = acct.get("OwnerCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        if prior_balance < ctx.fees.account_reserve(reserve_count + 1) {
+            if !crossed {
+                // A claimed tec discards the doApply changes and keeps only the
+                // fee and sequence — return Err so the engine rolls the child
+                // back (and, under tapRETRY, defers the whole transaction to a
+                // later pass to be reclaimed there, matching mainnet's
+                // TransactionIndex and balances).
+                return Err(TransactionResult::TecInsufReserveOffer);
+            }
+            commit_acct(ctx, &acct)?;
+            return Ok(TransactionResult::TesSuccess);
         }
 
         let offer_key = keylet::offer(&account_id, sequence);
@@ -276,11 +700,31 @@ impl Transactor for OfferCreateTransactor {
         // issuers) with its low 64 bits replaced by the offer's quality (rate),
         // so offers sort by price. rippled stores this as the offer's
         // BookDirectory and tags the directory with the rate + book assets.
-        let quality = offer_book_quality(&taker_pays, &taker_gets);
-        let book_base =
-            keylet::book_dir(&pays_currency, &pays_issuer, &gets_currency, &gets_issuer);
+        // rippled computes the offer's book rate (`uRate`) from the ORIGINAL
+        // offer amounts before crossing and keys the resting offer's directory on
+        // it; the residual carries the leftover but stays in the original-rate
+        // directory. Re-deriving the rate from the (proportionally reduced)
+        // leftover drifts by a divide ULP on the pre-`fixUniversalNumber`
+        // truncating path (mainnet 30000004), so key on the original amounts.
+        let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+        let quality = offer_book_quality(&taker_pays, &taker_gets, number_switchover);
+        // A DomainID places the resting offer in the permissioned (domain) book
+        // directory rather than the public book — rippled's getBookBase appends
+        // the domain to the same BookDir hash, so a domain book lives at a
+        // distinct base. The directory node is also tagged with the DomainID.
+        // (`domain_id_hash` is computed above for the crossing routing.)
+        let book_base = match &domain_id_hash {
+            Some(d) => keylet::book_dir_domain(
+                &pays_currency,
+                &pays_issuer,
+                &gets_currency,
+                &gets_issuer,
+                d,
+            ),
+            None => keylet::book_dir(&pays_currency, &pays_issuer, &gets_currency, &gets_issuer),
+        };
         let book_dir_key = book_dir_with_quality(&book_base, quality);
-        let book_describe = [
+        let mut book_describe: Vec<(&str, Value)> = vec![
             ("ExchangeRate", Value::from(u64_hex(quality))),
             ("TakerPaysCurrency", hex::encode_upper(pays_currency).into()),
             (
@@ -293,11 +737,15 @@ impl Transactor for OfferCreateTransactor {
                 hex::encode_upper(gets_issuer.as_bytes()).into(),
             ),
         ];
+        if let Some(d) = &domain_id_hash {
+            book_describe.push(("DomainID", d.to_string().into()));
+        }
         let book_node = add_to_book_dir(ctx.view, &book_dir_key, &offer_key, &book_describe)?;
         let owner_node = add_to_owner_dir(ctx.view, &account_id, &offer_key)?;
 
-        // Build the Offer SLE. U64 page fields and Flags are omitted when zero,
-        // matching rippled's serialization.
+        // Build the Offer SLE. sfFlags, sfBookNode and sfOwnerNode are REQUIRED
+        // in rippled's Offer ledger format, so they always serialize (even at
+        // zero); only sfExpiration is optional.
         let mut offer = serde_json::Map::new();
         offer.insert("LedgerEntryType".into(), "Offer".into());
         offer.insert("Account".into(), account_str.into());
@@ -306,6 +754,11 @@ impl Transactor for OfferCreateTransactor {
         offer.insert("TakerPays".into(), remaining_pays.clone());
         offer.insert("TakerGets".into(), remaining_gets.clone());
         offer.insert("BookDirectory".into(), book_dir_key.to_string().into());
+        // A domain-scoped offer carries its DomainID so the book/crossing logic
+        // and clients can tell it apart from a public-book offer.
+        if let Some(d) = &domain_id_hash {
+            offer.insert("DomainID".into(), d.to_string().into());
+        }
         // Placeholder PreviousTxnID/LgrSeq — the engine's central stamping fills
         // these with the creating transaction's id and ledger after apply.
         offer.insert(
@@ -313,18 +766,24 @@ impl Transactor for OfferCreateTransactor {
             "0000000000000000000000000000000000000000000000000000000000000000".into(),
         );
         offer.insert("PreviousTxnLgrSeq".into(), Value::from(0u32));
-        // Flags, BookNode and OwnerNode are default-droppable: rippled omits
-        // them when zero (offer on the root page of each directory).
-        let flags = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
-        if flags != 0 {
-            offer.insert("Flags".into(), Value::from(flags));
+        // An offer carries its own Expiration (a hard ledger-time deadline) when
+        // the transaction sets one; rippled copies it onto the Offer SLE.
+        if let Some(exp) = ctx.tx.get("Expiration").and_then(|v| v.as_u64()) {
+            offer.insert("Expiration".into(), Value::from(exp));
         }
-        if book_node != 0 {
-            offer.insert("BookNode".into(), u64_hex(book_node).into());
-        }
-        if owner_node != 0 {
-            offer.insert("OwnerNode".into(), u64_hex(owner_node).into());
-        }
+        // sfFlags, sfBookNode and sfOwnerNode are REQUIRED fields on the Offer
+        // SLE — rippled writes all three unconditionally, so they serialize even
+        // when zero (a root-page offer carrying no flags). Only the
+        // transaction's tfPassive/tfSell map onto the SLE, and tfSell (0x80000)
+        // becomes lsfSell (0x20000) — they are not the same bit.
+        let offer_flags = (if tx_flags & TF_PASSIVE != 0 {
+            LSF_PASSIVE
+        } else {
+            0
+        }) | (if tx_flags & TF_SELL != 0 { LSF_SELL } else { 0 });
+        offer.insert("Flags".into(), Value::from(offer_flags));
+        offer.insert("BookNode".into(), u64_hex(book_node).into());
+        offer.insert("OwnerNode".into(), u64_hex(owner_node).into());
         let offer_bytes = serde_json::to_vec(&Value::Object(offer))
             .map_err(|_| TransactionResult::TemMalformed)?;
         ctx.view
@@ -344,7 +803,7 @@ impl Transactor for OfferCreateTransactor {
 }
 
 /// One side of an offer: native XRP (drops) or an IOU with its issuer/currency.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Leg {
     is_xrp: bool,
     drops: i64,
@@ -472,6 +931,41 @@ fn credit_line(
     Ok(())
 }
 
+fn credit_line_ulp_if_coarse(
+    ctx: &mut ApplyContext<'_>,
+    holder: &AccountId,
+    amount: &Leg,
+    round: bool,
+) -> Result<(), TransactionResult> {
+    if amount.is_xrp || amount.issuer == *holder {
+        return Ok(());
+    }
+    let key = keylet::trust_line(holder, &amount.issuer, &amount.currency);
+    let Some(bytes) = ctx.view.read(&key) else {
+        return Ok(());
+    };
+    let Ok(line) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(());
+    };
+    let Some(s) = line
+        .get("Balance")
+        .and_then(|b| b.get("value"))
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(());
+    };
+    let Ok(bal) = IOUAmount::from_decimal_string(s) else {
+        return Ok(());
+    };
+    if bal.exponent() < amount.iou.exponent() + 4 {
+        return Ok(());
+    }
+    let Ok(ulp) = IOUAmount::from_parts(1, bal.exponent(), false) else {
+        return Ok(());
+    };
+    credit_line(ctx, holder, &amount.issuer, &amount.currency, &ulp, round)
+}
+
 /// Add `delta` drops to an account's XRP balance (read/modify/write the SLE).
 fn credit_xrp(
     ctx: &mut ApplyContext<'_>,
@@ -503,6 +997,7 @@ fn credit_xrp(
 /// Scope: full takes of funded, crossable offers (the validated path, mainnet
 /// #338500). Partial takes rescale at the resting offer's quality. Unfunded
 /// offers encountered in the walk are reaped, mirroring rippled's dirAdvance.
+#[allow(clippy::too_many_arguments)]
 fn cross_offers(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
@@ -510,6 +1005,8 @@ fn cross_offers(
     taker_pays: &Value,
     taker_gets: &Value,
     inverse_book: &rxrpl_primitives::Hash256,
+    is_sell: bool,
+    domain_only: bool,
 ) -> Result<(Value, Value, bool), TransactionResult> {
     let out_leg = match Leg::parse(taker_pays) {
         Some(l) => l,
@@ -521,9 +1018,21 @@ fn cross_offers(
     };
 
     // Taker's quality limit in the inverse book = TakerGets / TakerPays.
+    // The threshold must be computed with the SAME divide canonicalisation
+    // used to store the offers' BookDirectory qualities (`offer_book_quality`):
+    // once `fixUniversalNumber` is active rippled's getRate rounds half-to-even,
+    // otherwise it truncates. Using the truncating `get_rate` here while the
+    // dir qualities are round-even left the threshold 1 ULP low, so the walk
+    // broke before an exactly-equal-priced resting offer and crossed nothing.
     let pays_iou = leg_as_quality_iou(&out_leg);
     let gets_iou = leg_as_quality_iou(&in_leg);
-    let threshold = rxrpl_amount::get_rate(&gets_iou, &pays_iou).unwrap_or(0);
+    let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+    let threshold = if number_switchover {
+        rxrpl_amount::get_rate_round_even(&gets_iou, &pays_iou)
+    } else {
+        rxrpl_amount::get_rate(&gets_iou, &pays_iou)
+    }
+    .unwrap_or(0);
     if threshold == 0 {
         return Ok((taker_pays.clone(), taker_gets.clone(), false));
     }
@@ -532,6 +1041,38 @@ fn cross_offers(
     let mut remaining_in = in_leg.clone();
     let mut crossed = false;
     let book_prefix = &inverse_book.as_bytes()[0..24];
+    let fok = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_FILL_OR_KILL != 0;
+
+    // Autobridge: when NEITHER leg is XRP, the offer also competes an
+    // XRP-intermediate path (`in -> XRP -> out`) against the direct book. Prebuild
+    // that two-hop strand once; `try_bridge_step` crosses it per band by quality.
+    // A domain-only offer never bridges through the AMM (domain books exclude AMM
+    // liquidity).
+    let bridge = if !domain_only && !in_leg.is_xrp && !out_leg.is_xrp {
+        build_flow_strand(
+            ctx,
+            &[
+                taker_gets.clone(),
+                Value::String("0".to_string()),
+                taker_pays.clone(),
+            ],
+        )
+        .map(|mut s| {
+            // rippled's offer-crossing autobridge bridges two RESTING book offers
+            // through XRP; it does not inject AMM liquidity into the synthetic
+            // bridge (the AMM competes only on the DIRECT book). Injecting the AMM
+            // makes the blended two-hop bridge quality marginally better than the
+            // offer's own, so the offer over-crosses a sliver that rippled leaves
+            // resting. Keep the bridge CLOB-only.
+            for hop in &mut s.hops {
+                hop.amm_pool = None;
+                hop.liquidity = None;
+            }
+            s
+        })
+    } else {
+        None
+    };
 
     // The book base for traversal has the quality (low 64 bits) zeroed;
     // `keylet::book_dir` leaves those as hash bytes, so start the walk there.
@@ -543,7 +1084,56 @@ fn cross_offers(
         probe = dir_key;
         let dir_quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
         if dir_quality > threshold {
-            break; // worse than the taker will accept
+            // Taker OfferStream still advances to the next fundable tip past
+            // the threshold, reaping unfunded (including short lsfSell) on the
+            // way, then reject_quality stops. FlowCross used to break here and
+            // left 30000048's own underfunded BTC sell in the book.
+            if reap_unfunded_on_page(ctx, taker, taker_acct, &dir_key)? {
+                break;
+            }
+            continue;
+        }
+        // Interleave the AMM at this quality band BEFORE the resting CLOB offers.
+        // rippled crosses whichever of the synthetic AMM offer / CLOB tip is
+        // better at each quality level (BookStep tryAMM/execOffer). `amm_hop`'s
+        // fee-adjusted spot gate admits the AMM only when it strictly beats
+        // `dir_quality`, so this fires exactly when the AMM is at least as good
+        // as the offers about to cross at this band; it is a no-op otherwise.
+        if !remaining_out.is_zero() && !remaining_in.is_zero() {
+            if let Some(b) = &bridge {
+                try_bridge_step(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    b,
+                    &in_leg,
+                    &out_leg,
+                    &mut remaining_out,
+                    &mut remaining_in,
+                    &mut crossed,
+                    dir_quality,
+                )?;
+                if remaining_out.is_zero() || remaining_in.is_zero() {
+                    break 'walk;
+                }
+            }
+            if !domain_only {
+                try_amm_step(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    &in_leg,
+                    &mut remaining_out,
+                    &mut remaining_in,
+                    &mut crossed,
+                    dir_quality,
+                    fok,
+                    is_sell,
+                )?;
+                if remaining_out.is_zero() || remaining_in.is_zero() {
+                    break 'walk; // AMM alone met the demand (or exhausted the taker's funds)
+                }
+            }
         }
         let Some(dir_bytes) = ctx.view.read(&dir_key) else {
             continue;
@@ -562,7 +1152,15 @@ fn cross_offers(
             .unwrap_or_default();
 
         for offer_key in offers {
-            if remaining_out.is_zero() {
+            // A tfSell offer sells its whole TakerGets and accepts any TakerPays
+            // (rippled: deliver = kMaxNative), so the walk is bounded by the
+            // taker's remaining input, not its TakerPays demand.
+            let done = if is_sell {
+                remaining_in.is_zero()
+            } else {
+                remaining_out.is_zero()
+            };
+            if done {
                 break 'walk;
             }
             let Some(ob) = ctx.view.read(&offer_key) else {
@@ -589,16 +1187,50 @@ fn cross_offers(
             let Some(offer_in) = Leg::parse(&offer["TakerPays"]) else {
                 continue;
             };
-            // Owner-funds clamp: an offer can give at most what its owner
-            // holds. Fully funded → the whole offer is available; underfunded
-            // but positive → fill against the funded amount; zero → reap.
-            let funds = owner_funds_leg(ctx, &owner, &offer_out);
-            if funds.is_zero() {
+            // An expired offer is removed 0-fill during the book walk, before any
+            // funds/quality crossing (rippled `OfferStream`: `sfExpiration <=
+            // parentCloseTime` via `hasExpired`). Core behaviour, not amendment
+            // gated, so it applies on every ledger.
+            if let Some(exp) = offer.get("Expiration").and_then(|v| v.as_u64()) {
+                if exp <= ctx.view.parent_close_time() as u64 {
+                    reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                    continue;
+                }
+            }
+            // A bad offer with a zero amount on either side is removed 0-fill
+            // (rippled `OfferStream`: `amount.empty()`).
+            if offer_out.is_zero() || offer_in.is_zero() {
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
                 continue;
             }
+            // A maker whose IN asset (what it receives) is deep-frozen can neither
+            // receive nor send it, so the offer is removed 0-fill (rippled
+            // `OfferStream`: `isDeepFrozen(owner, assetIn)`).
+            if is_deep_frozen(ctx, &owner, &offer_in) {
+                reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                continue;
+            }
+            // Owner-funds clamp: an offer can give at most what its owner
+            // holds. Fully funded → the whole offer is available; underfunded
+            // but positive → fill against the funded amount; zero → reap.
+            // lsfSell must deliver the whole TakerGets; shortfall is unfunded
+            // (30000048 45874350: 0.008 BTC vs 2.011).
+            let funds = owner_funds_leg(ctx, &owner, &offer_out);
+            let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+            if offer_cannot_pay(&funds, &offer_out, flags, &owner == taker) {
+                reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, &dir_key)?;
+                continue;
+            }
             let avail_out = leg_min(&offer_out, &funds);
-            let take_out = leg_min(&remaining_out, &avail_out);
+            // A tfSell take is bounded by what the taker's remaining input can buy
+            // at this offer's quality (it sells its whole TakerGets); a buy take is
+            // bounded by the taker's remaining TakerPays demand.
+            let take_out = if is_sell {
+                let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
+                leg_min(&avail_out, &out_for_in(&remaining_in, &rate, &offer_out))
+            } else {
+                leg_min(&remaining_out, &avail_out)
+            };
 
             // Full take when the taker consumes the whole original offer;
             // otherwise a partial take of `take_out`, priced at the offer's
@@ -606,28 +1238,98 @@ fn cross_offers(
             let full_take = leg_ge(&take_out, &offer_out);
             let (order_out, order_in) = if full_take {
                 (offer_out.clone(), offer_in.clone())
+            } else if is_sell && !leg_ge(&take_out, &avail_out) {
+                // tfSell input-bound: `take_out` was derived from the taker's whole
+                // remaining input at this quality, so the taker gives exactly that
+                // input — not a re-multiplied approximation that would leave a dust
+                // remainder unsold and diverge the maker's residual TakerPays.
+                (take_out.clone(), remaining_in.clone())
             } else {
                 let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
-                let computed = rxrpl_amount::Amount::multiply(
-                    &leg_to_amount(&take_out),
-                    &rxrpl_amount::Amount::Iou(rate),
-                    in_leg.is_xrp,
-                )
-                .map_err(|_| TransactionResult::TefInternal)?;
-                let order_in = leg_min(&amount_to_leg(&computed, &offer_in), &offer_in);
+                let order_in = if !leg_ge(&take_out, &avail_out) {
+                    // Demand-limited (funded offer, take bounded by the taker's
+                    // remaining demand): the taker pays the strict ceil price at
+                    // the offer's original book quality, as rippled's
+                    // `Quality::ceilOutStrict`. Pricing from the offer's current
+                    // (drifted) amounts under-prices an XRP take by a drop.
+                    leg_min(&in_for_out(&take_out, &rate, &offer_in), &offer_in)
+                } else if offer_in.is_xrp {
+                    // Funds-limited XRP take: rippled scales the resting offer's
+                    // TakerPays by the funded output fraction rounded DOWN
+                    // (offer_in * avail_out / offer_out, floored to drops) — the
+                    // same scale-down the multi-hop book path uses. Repricing the
+                    // clamped output at the book's quantized rate ceils a drop high
+                    // and over-charges the taker (105500121/122). An IOU take keeps
+                    // the offer-amounts ceil price (105600000).
+                    let ratio = IOUAmount::divide(
+                        &leg_as_quality_iou(&avail_out),
+                        &leg_as_quality_iou(&offer_out),
+                    )
+                    .unwrap_or(IOUAmount::ZERO);
+                    let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
+                        .unwrap_or(IOUAmount::ZERO);
+                    leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in)
+                } else {
+                    // Funds-limited IOU take (took all the underfunded owner can
+                    // give): price from the offer's own amounts, since repricing the
+                    // clamped output at the quantized quality rate ceils one drop
+                    // high and cascades through the taker's remaining budget.
+                    leg_min(
+                        &in_for_out_offer(&offer_in, &take_out, &offer_out, &rate),
+                        &offer_in,
+                    )
+                };
                 (take_out.clone(), order_in)
             };
 
             // Move funds: taker pays order_in (grossed), owner pays order_out.
-            pay_in(ctx, taker, taker_acct, &owner, &order_in, false)?;
-            pay_out(ctx, taker, taker_acct, &owner, taker, &order_out, false)?;
+            // Legacy Taker semantics: `order_out` is the NET the taker receives;
+            // the owner's debit is grossed up by the output issuer's transfer
+            // fee inside `pay_out`.
+            // Post-fixUniversalNumber, rippled's Flow rounds trust-line balance
+            // updates to nearest (Number); the legacy pre-2013 path truncated the
+            // smaller term, which loses precision when a large balance is credited
+            // a small amount (e.g. a 10^10 balance minus ~3e3 diverges 3 ULP).
+            pay_in(
+                ctx,
+                taker,
+                taker_acct,
+                &owner,
+                &order_in,
+                number_switchover,
+                false,
+            )?;
+            pay_out(
+                ctx,
+                taker,
+                taker_acct,
+                &owner,
+                taker,
+                &order_out,
+                number_switchover,
+            )?;
 
-            if full_take {
-                // Consume to zero (records the change in metadata) then delete,
-                // as rippled consumes before BookTip drops the offer.
+            // The offer's available liquidity is exhausted when the take
+            // consumes all of `avail_out` — either the whole offer (`full_take`)
+            // or, when the owner is underfunded, all of the owner's funds.
+            // rippled deletes such an offer (the owner can no longer fund the
+            // remainder) rather than leaving an unfunded husk in the book.
+            let exhausted = leg_ge(&take_out, &avail_out);
+            if exhausted {
+                // Record the metadata delta (zero for a full take, the unfunded
+                // remainder for a depleted owner) then delete, as rippled
+                // consumes before BookTip / offerDelete drops the offer.
                 let mut consumed = offer.clone();
-                consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
-                consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
+                if full_take {
+                    consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
+                    consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
+                } else {
+                    let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+                    let new_gets = leftover_leg(&offer_out, &order_out, number_switchover);
+                    let new_pays = leftover_leg(&offer_in, &order_in, number_switchover);
+                    consumed["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
+                    consumed["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
+                }
                 let cb =
                     serde_json::to_vec(&consumed).map_err(|_| TransactionResult::TefInternal)?;
                 ctx.view
@@ -635,9 +1337,15 @@ fn cross_offers(
                     .map_err(|_| TransactionResult::TefInternal)?;
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
             } else {
-                // Reduce the resting offer in place by the filled amounts.
-                let new_gets = leg_sub(&offer_out, &order_out);
-                let new_pays = leg_sub(&offer_in, &order_in);
+                // Reduce the resting offer in place by the filled amounts. Both
+                // sides round to nearest once fixUniversalNumber is on (Number
+                // semantics); the legacy truncating subtraction left the leftover
+                // TakerGets 1 ULP high on a partial take (e.g. 105500025 XAH offer
+                // 402E09A9: …638335 vs mainnet …638334) and 1 ULP low on 2017
+                // TakerPays (30000008: …366 vs mainnet …367).
+                let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+                let new_gets = leftover_leg(&offer_out, &order_out, number_switchover);
+                let new_pays = leftover_leg(&offer_in, &order_in, number_switchover);
                 let mut reduced = offer.clone();
                 reduced["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
                 reduced["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
@@ -648,9 +1356,52 @@ fn cross_offers(
                     .map_err(|_| TransactionResult::TefInternal)?;
             }
 
-            remaining_out = leg_sub(&remaining_out, &order_out);
+            // A tfSell fill can deliver more than the remaining TakerPays demand;
+            // clamp the demand at zero rather than underflowing the drops/mantissa.
+            remaining_out = if is_sell && leg_ge(&order_out, &remaining_out) {
+                leg_sub(&remaining_out, &remaining_out)
+            } else {
+                leg_sub(&remaining_out, &order_out)
+            };
             remaining_in = leg_sub(&remaining_in, &order_in);
             crossed = true;
+        }
+    }
+
+    // Tail: the AMM may still beat every remaining CLOB up to the taker's overall
+    // limit — the book was empty, was exhausted, or the walk stopped at a dir
+    // worse than `threshold` while the AMM's spot still beats it. Cross the AMM up
+    // to `threshold` (the loosest gate). rippled interleaves the AMM by quality
+    // rather than gating it on whether any CLOB crossed, so this is NOT `!crossed`
+    // gated: a single crossed CLOB offer must not suppress better AMM liquidity.
+    if !remaining_out.is_zero() && !remaining_in.is_zero() {
+        if let Some(b) = &bridge {
+            try_bridge_step(
+                ctx,
+                taker,
+                taker_acct,
+                b,
+                &in_leg,
+                &out_leg,
+                &mut remaining_out,
+                &mut remaining_in,
+                &mut crossed,
+                threshold,
+            )?;
+        }
+        if !domain_only {
+            try_amm_step(
+                ctx,
+                taker,
+                taker_acct,
+                &in_leg,
+                &mut remaining_out,
+                &mut remaining_in,
+                &mut crossed,
+                threshold,
+                fok,
+                is_sell,
+            )?;
         }
     }
 
@@ -661,18 +1412,165 @@ fn cross_offers(
     ))
 }
 
-/// Output deliverable for a given input at a resting offer's *exact* price:
-/// `out = in * offer_out / offer_in`. rippled's Flow prices the fill from the
-/// offer's full-precision amounts, not the bucketed book-directory quality.
-/// The ratio is taken in pure `IOUAmount` magnitudes (drops count as integers)
-/// to avoid the native/IOU normalisation hazard of mixed-asset multiply.
-fn out_for_in(in_amt: &Leg, offer_in: &Leg, offer_out: &Leg) -> Leg {
+/// Cross the book's AMM pool (if present and strictly better than `cq`) up to the
+/// target quality `cq`, limited to the taker's funds, updating the remaining
+/// demand/budget and `crossed` in place. Mirrors rippled's per-quality-band AMM
+/// injection (`BookStep::tryAMM`): `amm_hop`'s fee-adjusted spot gate admits the
+/// AMM only when it strictly beats `cq`, so this is a no-op unless the AMM is at
+/// least as good as the CLOB at this band.
+#[allow(clippy::too_many_arguments)]
+fn try_amm_step(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    in_leg: &Leg,
+    remaining_out: &mut Leg,
+    remaining_in: &mut Leg,
+    crossed: &mut bool,
+    cq: u64,
+    fok: bool,
+    is_sell: bool,
+) -> Result<(), TransactionResult> {
+    // rippled's flowCross limits the crossing input to the taker's funds
+    // (`sendMax = min(takerAmount.in, accountFunds)`, OfferCreate.cpp:400): the
+    // AMM swap would otherwise overdraw the taker (its sold-asset balance goes
+    // negative) when TakerGets exceeds what it holds.
+    let taker_funds = owner_funds_leg(ctx, taker, in_leg);
+    let budget = leg_min(remaining_in, &taker_funds);
+    if budget.is_zero() {
+        return Ok(());
+    }
+    // A tfSell offer sells its whole TakerGets and accepts any TakerPays (rippled
+    // deliver = kMaxNative), so the AMM crosses the whole input budget rather than
+    // stopping at the TakerPays demand. Capping at `remaining_out` made `amm_hop`
+    // back-solve the input for the TakerPays and leave the rest of the sold asset
+    // unspent (e.g. 105500045 A902BECE: 110.635 OGRE unsold into the OGRE/XRP AMM,
+    // whose marginal quality stayed above the taker's limit the whole way).
+    let demand = if is_sell {
+        unbounded_leg(remaining_out)
+    } else {
+        remaining_out.clone()
+    };
+    // partial = !fok: a fill-or-kill offer crosses all-or-nothing, so an AMM that
+    // cannot deliver the full demand within budget delivers zero. A per-band spend
+    // by a FoK offer that later fails to fully cross is rolled back atomically —
+    // the transactor returns tecKILLED and the engine discards all mutations.
+    if let Some((delivered, spent)) = amm_hop(
+        ctx,
+        taker,
+        taker_acct,
+        taker,
+        &demand,
+        &budget,
+        /*skip_input_debit=*/ false,
+        /*skip_output_credit=*/ false,
+        /*create_missing_dest_line=*/ true,
+        /*partial=*/ !fok,
+        /*target_quality=*/ Some(cq),
+    )? {
+        // A tfSell fill can deliver more than the remaining TakerPays demand;
+        // clamp the demand at zero rather than underflowing the drops/mantissa.
+        *remaining_out = if is_sell && leg_ge(&delivered, remaining_out) {
+            leg_sub(remaining_out, remaining_out)
+        } else {
+            leg_sub(remaining_out, &delivered)
+        };
+        *remaining_in = leg_sub(remaining_in, &spent);
+        *crossed = true;
+    }
+    Ok(())
+}
+
+/// Cross the XRP-intermediate autobridge path (`in -> XRP -> out`, a prebuilt
+/// two-hop `bridge` strand) as a competing source in the `cross_offers` walk,
+/// mirroring [`try_amm_step`]: cross bridge passes whose realised quality still
+/// beats `cq` (the current CLOB band, or the taker's overall limit at the tail),
+/// updating the remaining demand/budget in place. Each `execute_strand_pass` is
+/// checkpointed and rolled back when its quality is worse than `cq`, so the
+/// bridge only wins the bands where it is genuinely better — matching rippled's
+/// per-band interleave of the direct book and the autobridge path.
+#[allow(clippy::too_many_arguments)]
+fn try_bridge_step(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    bridge: &FlowStrand,
+    in_leg: &Leg,
+    out_leg: &Leg,
+    remaining_out: &mut Leg,
+    remaining_in: &mut Leg,
+    crossed: &mut bool,
+    cq: u64,
+) -> Result<(), TransactionResult> {
+    let taker_funds = owner_funds_leg(ctx, taker, in_leg);
+    let mut budget = leg_min(remaining_in, &taker_funds);
+    // Persist the AMM fib counter across passes (rippled `AMMContext`): each
+    // committed pass advances `amm_iters`, growing the synthetic AMM offer
+    // geometrically so the strand converges in a handful of passes. A fresh
+    // context per pass would reseed the smallest fib chunk every time, delivering
+    // an identical dust sliver and looping ~10^5 times to drain the budget.
+    let mut amm_ctx = AmmContext::new(false);
+    loop {
+        if remaining_out.is_zero() || budget.is_zero() {
+            break;
+        }
+        let cp = ctx.view.checkpoint();
+        amm_ctx.clear();
+        let ro = leg_to_number(remaining_out);
+        let ri = leg_to_number(&budget);
+        match execute_strand_pass(
+            ctx,
+            taker,
+            taker_acct,
+            taker,
+            bridge,
+            &ri,
+            &ro,
+            &mut amm_ctx,
+        ) {
+            Some(res) if !res.out_amt.is_zero() && !res.in_amt.is_zero() => {
+                let in_q = num_quality_iou(&res.in_amt, in_leg.is_xrp);
+                let out_q = num_quality_iou(&res.out_amt, out_leg.is_xrp);
+                let eff_q = rxrpl_amount::get_rate(&in_q, &out_q).unwrap_or(u64::MAX);
+                if !rxrpl_amount::is_better_quality(eff_q, cq) {
+                    ctx.view.rollback(cp);
+                    break;
+                }
+                let d = leg_from_magnitude(&res.out_amt.to_iou(), out_leg);
+                let s = leg_from_magnitude(&res.in_amt.to_iou(), in_leg);
+                *remaining_out = leg_sub(remaining_out, &d);
+                *remaining_in = leg_sub(remaining_in, &s);
+                budget = leg_sub(&budget, &s);
+                *crossed = true;
+                amm_ctx.update();
+            }
+            _ => {
+                ctx.view.rollback(cp);
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Output deliverable for a given input at a resting offer's price. This mirrors
+/// rippled's `Quality::ceilInStrict` (the input-limited path in `BookStep`):
+/// `out = in / q` rounded DOWN (`divRoundStrict`), where `q` is the offer's
+/// book-directory quality rate (`rate = in/out`) — the fixed quality bucket the
+/// offer lives in, NOT the offer's drifted post-partial-fill `TakerPays/TakerGets`
+/// ratio. Pricing from the bucketed dir rate is what makes the consumed/owner
+/// amounts byte-exact (e.g. mainnet SOLO fills land on `…2747`, not `…2750`).
+/// Magnitudes are pure `IOUAmount` (drops count as integers) to avoid the
+/// native/IOU normalisation hazard of mixed-asset multiply.
+fn out_for_in(in_amt: &Leg, rate: &IOUAmount, offer_out: &Leg) -> Leg {
     let in_iou = leg_as_quality_iou(in_amt);
-    let offer_out_iou = leg_as_quality_iou(offer_out);
-    let offer_in_iou = leg_as_quality_iou(offer_in);
-    let out_iou = IOUAmount::multiply(&in_iou, &offer_out_iou)
-        .and_then(|num| IOUAmount::divide(&num, &offer_in_iou))
-        .unwrap_or(IOUAmount::ZERO);
+    // Price the fill off the book directory's quality (`rate = in/out`, the fixed
+    // quality bucket the offer lives in), exactly as rippled's `BookStep` uses
+    // `offer.quality().rate()` rather than the offer's current (post-partial-fill)
+    // `TakerPays/TakerGets` ratio. Re-deriving the rate from the drifted current
+    // amounts left interior book-hop outputs 1-2 ULP off `divRoundStrict`.
+    let out_iou =
+        IOUAmount::div_round(&in_iou, rate, /*round_up*/ false).unwrap_or(IOUAmount::ZERO);
     leg_from_magnitude(&out_iou, offer_out)
 }
 
@@ -684,16 +1582,41 @@ fn leg_from_magnitude(mag: &IOUAmount, template: &Leg) -> Leg {
     if template.is_xrp {
         let s = mag.to_decimal_string();
         let whole = s.split('.').next().unwrap_or("0");
-        out.drops = whole.parse::<i64>().unwrap_or(0);
+        // Saturate rather than collapse to 0 on overflow: a magnitude beyond
+        // i64::MAX drops only arises from the unbounded-budget sentinel converted
+        // to XRP (an interior hop's `out_for_in(unbounded_in, rate)` in the
+        // reverse pass). It means "no budget cap", so it must read as huge —
+        // `unwrap_or(0)` made the budget bind to zero and starved the hop. No real
+        // XRP amount exceeds i64::MAX (max supply ~1e17 drops), so fills unchanged.
+        out.drops = whole.parse::<i64>().unwrap_or(i64::MAX);
     } else {
         out.iou = *mag;
     }
     out
 }
 
-/// Input required for a given output at a book directory's quality rate,
-/// rounded up (`in = out * rate`, the taker pays at least the price).
+/// Input required for a given output at a resting offer's quality rate, priced as
+/// rippled's `Quality::ceilOutStrict`: `in = mulRoundStrict(out, rate, roundUp)`.
+/// The rate is the offer's book-directory quality, fixed when the offer was placed
+/// and unchanged by partial fills (rippled reprices every take at the original
+/// quality, never the drifted current `TakerPays/TakerGets`). The strict
+/// canonicalisation rounds up a fractional drop below 0.1 that the legacy
+/// `mul_round` truncates, so an XRP take is not under-priced by a drop.
 fn in_for_out(out_amt: &Leg, rate: &IOUAmount, in_template: &Leg) -> Leg {
+    let amt = rxrpl_amount::Amount::mul_round_strict(
+        &leg_to_amount(out_amt),
+        &rxrpl_amount::Amount::Iou(*rate),
+        in_template.is_xrp,
+        true,
+    )
+    .unwrap_or(leg_to_amount(in_template));
+    amount_to_leg(&amt, in_template)
+}
+
+/// Taker-era `Quality::ceilOut`: `mulRound`, not `mulRoundStrict`. A fractional
+/// drop below 0.1 truncates; FlowCross `ceilOutStrict` would still ceil it
+/// (30000057 502E1318 over-spent 1 drop, while 30000054 E60 fraction 0.88 agrees).
+fn in_for_out_taker(out_amt: &Leg, rate: &IOUAmount, in_template: &Leg) -> Leg {
     let amt = rxrpl_amount::Amount::mul_round(
         &leg_to_amount(out_amt),
         &rxrpl_amount::Amount::Iou(*rate),
@@ -702,6 +1625,25 @@ fn in_for_out(out_amt: &Leg, rate: &IOUAmount, in_template: &Leg) -> Leg {
     )
     .unwrap_or(leg_to_amount(in_template));
     amount_to_leg(&amt, in_template)
+}
+
+/// Input for a take priced from the resting offer's own current amounts (`in =
+/// ceil(offer_in * out / offer_out)`, multiply-before-divide for XRP so no drop is
+/// lost). Used for the input- and funds-limited branches, where repricing the
+/// clamped output at the book's quantized quality rate over-charges by a drop.
+/// IOU input keeps the rate-based path.
+fn in_for_out_offer(offer_in: &Leg, out_amt: &Leg, offer_out: &Leg, rate: &IOUAmount) -> Leg {
+    if !offer_in.is_xrp {
+        return in_for_out(out_amt, rate, offer_in);
+    }
+    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode};
+    let priced = Number::from_int(offer_in.drops)
+        .mul(&Number::from_iou(&leg_as_quality_iou(out_amt)))
+        .div(&Number::from_iou(&leg_as_quality_iou(offer_out)));
+    let _g = RoundModeGuard::new(RoundingMode::Upward);
+    let mut out = offer_in.clone();
+    out.drops = priced.to_xrp_drops_mode() as i64;
+    out
 }
 
 /// Cross-currency Payment book crossing under the single-taker conversion model
@@ -721,27 +1663,103 @@ pub(crate) fn cross_book_payment(
     target_out: &Value,
     budget_in: &Value,
 ) -> Result<(Value, Value), TransactionResult> {
-    let out_tmpl = Leg::parse(target_out).ok_or(TransactionResult::TemBadAmount)?;
+    let demand_out = Leg::parse(target_out).ok_or(TransactionResult::TemBadAmount)?;
     let in_tmpl = Leg::parse(budget_in).ok_or(TransactionResult::TemBadAmount)?;
+
+    // The source cannot spend more than it holds: cap the SendMax budget at the
+    // taker's spendable balance in the input asset (rippled's source-funds limit
+    // / `accountFunds`). For an IOU that is the trust-line balance; for XRP it is
+    // `owner_funds_leg`'s liquid balance (balance minus the reserve), so a
+    // reserve-constrained source stops at its reserve instead of spending into
+    // it. `pay_in` only prevents a negative balance, not a dip below the reserve.
+    let mut budget = in_tmpl.clone();
+    let funds = owner_funds_leg(ctx, taker, &in_tmpl);
+    if leg_ge(&budget, &funds) {
+        budget = funds;
+    }
+
+    let (delivered, spent) = cross_book_hop(
+        ctx,
+        taker,
+        taker_acct,
+        dest,
+        &demand_out,
+        &budget,
+        /*skip_input_debit=*/ false,
+        /*skip_output_credit=*/ false,
+        /*single_band=*/ false,
+        /*lq_stop=*/ None,
+    )?;
+    Ok((
+        delivered.with_amount(&delivered.iou, delivered.drops),
+        spent.with_amount(&spent.iou, spent.drops),
+    ))
+}
+
+/// Cross a SINGLE order book, delivering up to `demand_out` (its magnitude is
+/// the demand cap) while spending up to `budget_in` (its magnitude is the
+/// budget). Best price first via `succ()` over the book's quality
+/// sub-directories. Returns `(delivered_out, spent_in)` as `Leg`s in the
+/// demand/budget assets. This is the byte-exact `BookStep` primitive shared by
+/// the single-book conversion ([`cross_book_payment`]) and the multi-hop
+/// path-payment chain ([`cross_path_payment`]).
+///
+/// `skip_input_debit` / `skip_output_credit` exist for INTERMEDIATE hops of a
+/// multi-hop strand, where the input came from the previous book's offer owners
+/// (so the taker is not debited again) and the output feeds the next book's
+/// offer owners (so no account is credited the delivery). For those hops the
+/// counter-party leg of the move is realised by the adjacent hop touching the
+/// SAME issuer's trust lines, keeping the intermediate issuer's obligations
+/// balanced. The first hop debits the taker; the last hop credits `dest`.
+#[allow(clippy::too_many_arguments)]
+fn cross_book_hop(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    demand_out: &Leg,
+    budget_in: &Leg,
+    skip_input_debit: bool,
+    skip_output_credit: bool,
+    single_band: bool,
+    lq_stop: Option<(u64, u64)>,
+) -> Result<(Leg, Leg), TransactionResult> {
+    let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
     let inverse_book = keylet::book_dir(
-        &in_tmpl.currency,
-        &in_tmpl.issuer,
-        &out_tmpl.currency,
-        &out_tmpl.issuer,
+        &budget_in.currency,
+        &budget_in.issuer,
+        &demand_out.currency,
+        &demand_out.issuer,
     );
 
-    let mut remaining_out = out_tmpl.clone();
-    // The source cannot spend more of an IOU than it holds: cap the SendMax
-    // budget at the taker's available balance in the input asset (rippled's
-    // source-funds limit). XRP input is already guarded by `pay_in`.
-    let mut remaining_in = in_tmpl.clone();
-    if !in_tmpl.is_xrp {
-        let funds = owner_funds_leg(ctx, taker, &in_tmpl);
-        if leg_ge(&remaining_in, &funds) {
-            remaining_in = funds;
-        }
-    }
-    let budget_start = remaining_in.clone();
+    let mut remaining_out = demand_out.clone();
+    let mut remaining_in = budget_in.clone();
+    let mut consumed_whole_offer = false;
+    let mut xrp_half_up: Option<AccountId> = None;
+    let dest_line_key = keylet::trust_line(dest, &demand_out.issuer, &demand_out.currency);
+    let dest_line_before = if !skip_output_credit && !demand_out.is_xrp {
+        ctx.view.read(&dest_line_key).and_then(|b| {
+            let v: Value = serde_json::from_slice(&b).ok()?;
+            v.get("Balance")?.get("value")?.as_str().map(str::to_string)
+        })
+    } else {
+        None
+    };
+    // When `single_band`, the walk consumes only ONE quality level (the first
+    // page on which a funded offer is actually filled). rippled's `forEachOffer`
+    // processes one quality band per `BookStep::rev/fwd`; the multi-path Flow loop
+    // (`flow_multi`) drives one band per pass so a hop's CLOB liquidity interleaves
+    // with the shared AMM's fib chunks. Unfunded/skipped offers do not lock the
+    // band (they are reaped and the walk continues to the next page).
+    let mut band_quality: Option<u64> = None;
+    // Accumulate the realised delivery / spend directly from each fill. Computing
+    // them as `start - remaining` underflows for an interior hop, whose demand cap
+    // is the huge `unbounded_leg` sentinel (~1e96): a real ~0.2 delivery is below
+    // its ULP, so the subtraction would round to 0 and starve the next hop.
+    let mut delivered = leg_from_magnitude(&IOUAmount::ZERO, demand_out);
+    delivered.drops = 0;
+    let mut spent = leg_from_magnitude(&IOUAmount::ZERO, budget_in);
+    spent.drops = 0;
     let book_prefix = inverse_book.as_bytes()[0..24].to_vec();
     let mut probe = book_dir_with_quality(&inverse_book, 0);
     'walk: while let Some(dir_key) = ctx.view.succ(&probe) {
@@ -750,6 +1768,68 @@ pub(crate) fn cross_book_payment(
         }
         probe = dir_key;
         let dir_quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
+        // Bounded to a single quality band: once an offer at quality Q has been
+        // filled, stop at the first page of a worse quality.
+        if let Some((prefix, limit)) = lq_stop {
+            let mut pq = if prefix == 0 {
+                dir_quality
+            } else {
+                composed_quality(prefix, dir_quality)
+            };
+            if !demand_out.is_xrp && demand_out.issuer != *dest {
+                let tr = transfer_rate(ctx, &demand_out.issuer);
+                let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+                if tr > one {
+                    pq = composed_quality(pq, pack_rate(&tr));
+                }
+            }
+            if limit != 0 && pq > limit {
+                break 'walk;
+            }
+        } else if single_band {
+            if let Some(bq) = band_quality {
+                if bq != dir_quality {
+                    break 'walk;
+                }
+            }
+        }
+        // Interleave the AMM at this quality band BEFORE crossing the resting
+        // CLOB offers, mirroring cross_offers' try_amm_step (rippled BookStep
+        // tryAMM/execOffer): amm_hop's fee-adjusted spot gate admits the pool
+        // only when it strictly beats this band's quality, so it crosses exactly
+        // where the AMM is at least as good as the offers about to fill and is a
+        // no-op on a pure-CLOB book. The output lands on `dest`; interior hops
+        // carry the previous hop's delivery so their input is not funds-capped.
+        if !remaining_in.is_zero() && !hop_out_done(&remaining_out, demand_out) {
+            let amm_budget = if skip_input_debit {
+                remaining_in.clone()
+            } else {
+                leg_min(&remaining_in, &owner_funds_leg(ctx, taker, budget_in))
+            };
+            if !amm_budget.is_zero() {
+                if let Some((amm_out, amm_spent)) = amm_hop(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    dest,
+                    &remaining_out,
+                    &amm_budget,
+                    skip_input_debit,
+                    skip_output_credit,
+                    /*create_missing_dest_line=*/ true,
+                    /*partial=*/ true,
+                    /*target_quality=*/ Some(dir_quality),
+                )? {
+                    remaining_out = leg_sub_round(&remaining_out, &amm_out);
+                    remaining_in = leg_sub_round(&remaining_in, &amm_spent);
+                    delivered = leg_add(&delivered, &amm_out);
+                    spent = leg_add(&spent, &amm_spent);
+                }
+            }
+            if remaining_in.is_zero() || hop_out_done(&remaining_out, demand_out) {
+                break 'walk;
+            }
+        }
         let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
         let Some(dir_bytes) = ctx.view.read(&dir_key) else {
             continue;
@@ -768,7 +1848,7 @@ pub(crate) fn cross_book_payment(
             .unwrap_or_default();
 
         for offer_key in offers {
-            if remaining_out.is_zero() || remaining_in.is_zero() {
+            if remaining_in.is_zero() || hop_out_done(&remaining_out, demand_out) {
                 break 'walk;
             }
             let Some(ob) = ctx.view.read(&offer_key) else {
@@ -800,36 +1880,229 @@ pub(crate) fn cross_book_payment(
             }
             let avail_out = leg_min(&offer_out, &funds);
 
+            // Pricing rate: the offer's book-directory quality (`in/out`). A
+            // degenerate page quality of zero only arises in synthetic ledgers
+            // whose offer sits at the book base rather than a quality sub-dir;
+            // there, fall back to the offer's current amounts so those fixtures
+            // still price. Real mainnet book pages always carry a valid quality.
+            let eff_rate = if rate.is_zero() {
+                IOUAmount::divide(
+                    &leg_as_quality_iou(&offer_in),
+                    &leg_as_quality_iou(&offer_out),
+                )
+                .unwrap_or(IOUAmount::ZERO)
+            } else {
+                rate
+            };
+
             // Output capped by remaining demand, funded availability, and what
             // the remaining input budget can buy at this offer's price.
-            let budget_out = out_for_in(&remaining_in, &offer_in, &offer_out);
-            let mut take_out = leg_min(&remaining_out, &avail_out);
-            let budget_binds = leg_ge(&take_out, &budget_out);
+            // Last-hop remaining is NET dest credit; TakerGets is GROSS. When a
+            // transfer fee applies, cap take_out at remaining*rate so dest nets
+            // remaining (30000046 63B72EB4: 1.002 left a 50 JPY shortfall that
+            // walked worse JPY/XRP offers).
+            let terminal = !skip_input_debit && !skip_output_credit;
+            let fee_applies = !skip_output_credit
+                && !offer_out.is_xrp
+                && offer_out.issuer != owner
+                && offer_out.issuer != *dest;
+            let remaining_out_cap = if fee_applies {
+                let rate = transfer_rate(ctx, &offer_out.issuer);
+                let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+                if rate > one {
+                    let mut cap = remaining_out.clone();
+                    cap.iou = grossed(&remaining_out.iou, &rate);
+                    // Multi-hop last hop: +1 ULP so dest nets Amount (30000051).
+                    // Single-book (`terminal`) already matches leftover without it
+                    // (30000054 E60BA9E1).
+                    if !terminal {
+                        if let Ok(bumped) =
+                            IOUAmount::from_parts(cap.iou.mantissa() + 1, cap.iou.exponent(), false)
+                        {
+                            cap.iou = bumped;
+                        }
+                    }
+                    cap
+                } else {
+                    remaining_out.clone()
+                }
+            } else {
+                remaining_out.clone()
+            };
+            let budget_out = out_for_in(&remaining_in, &eff_rate, &offer_out);
+            let mut take_out = leg_min(&remaining_out_cap, &avail_out);
+            // rippled forks on the INPUT side (StrandFlow reverse-then-forward,
+            // maxIn < requiredIn at step 0): the SendMax budget binds only when it
+            // cannot afford the ceilOut input cost of the demanded output. Testing
+            // the demanded output against the floored `budget_out` false-positives
+            // on the flooring tie (105500016: budget_out 12.9959 floors to 12, ties
+            // demand 12, though the 0.0000145 budget can pay the 0.0000134 cost).
+            // This step-0 forward re-run only applies to a TERMINAL take with a
+            // bounded demand (single-book conversion). An interior hop carries the
+            // unbounded-demand sentinel, so its ceilOut input cost is meaningless;
+            // keep the output-side test there (the #337 walk-stop relies on it).
+            let budget_binds = if terminal {
+                let in_for_take = in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate);
+                !leg_ge(&remaining_in, &in_for_take)
+            } else {
+                leg_ge(&take_out, &budget_out)
+            };
             if budget_binds {
                 take_out = budget_out;
             }
+            // The remaining input budget can no longer buy even one unit of this
+            // book's output (a sub-drop / sub-ULP residual left after the binding
+            // offer took the bulk): the input is exhausted, so the step is done.
+            // rippled's input-limited `BookStep` stops here; walking on would cross
+            // every worse-priced offer for a dust `order_in` that rounds to ~0 and
+            // eventually fault paying an unrepresentable amount (a stuck interior
+            // hop that fails the whole strand).
+            if budget_binds && take_out.is_zero() {
+                break 'walk;
+            }
 
-            let full_take = leg_ge(&take_out, &offer_out);
+            // Paying the offer's TakerPays must consume TakerGets. out_for_in
+            // of exact Pays can floor short of Gets (30000099 0C0344E7).
+            let full_take = leg_ge(&take_out, &offer_out)
+                || (leg_ge(&remaining_in, &offer_in) && leg_ge(&remaining_out_cap, &offer_out))
+                || (legs_eq_or_one_ulp(&remaining_in, &offer_in)
+                    && leg_ge(&remaining_out_cap, &offer_out));
+            if full_take {
+                consumed_whole_offer = true;
+            }
+            let funds_limited = !full_take && !budget_binds && leg_ge(&take_out, &avail_out);
             let (order_out, order_in) = if full_take {
                 (offer_out.clone(), offer_in.clone())
             } else if budget_binds {
-                // Input-limited: spend the whole remaining budget, deliver floor.
-                (take_out.clone(), remaining_in.clone())
+                let order_in = if terminal {
+                    // ceilIn: the SendMax input is the binding limit (it cannot
+                    // afford the ceilOut cost of the demanded output), so rippled
+                    // re-runs the terminal book forward with `in = maxIn` and spends
+                    // the WHOLE remaining budget — the forward re-run asserts
+                    // `result.in == limit` and ceilIn pins in=limit,
+                    // out=floor(limit/rate). `take_out` is already floor(budget/rate).
+                    leg_min(&remaining_in, &offer_in)
+                } else {
+                    // Interior hop: charge the ceilOut price for the delivered
+                    // output and leave the sub-drop budget remainder unspent, never
+                    // over-charging the maker for dust the budget can't fully buy
+                    // (#336/#337). Spending the whole budget drifts an interior hop.
+                    leg_min(
+                        &leg_min(
+                            &in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate),
+                            &offer_in,
+                        ),
+                        &remaining_in,
+                    )
+                };
+                (take_out.clone(), order_in)
+            } else if funds_limited {
+                // Interior hops: scale TakerPays * funded / TakerGets rounded
+                // DOWN so a ceil-priced input does not over-charge the next book.
+                // Terminal hops: BookStep ceils IOU input (`Quality::ceilOutStrict`)
+                // — 30000046 rMTDcus ETC line. XRP TakerPays stays scale-down:
+                // ceiling it over-spent 2127 drops on 63B72EB4.
+                let order_in = if terminal && !offer_in.is_xrp {
+                    leg_min(
+                        &leg_min(&in_for_out(&take_out, &eff_rate, &offer_in), &offer_in),
+                        &remaining_in,
+                    )
+                } else {
+                    let ratio = IOUAmount::divide(
+                        &leg_as_quality_iou(&avail_out),
+                        &leg_as_quality_iou(&offer_out),
+                    )
+                    .unwrap_or(IOUAmount::ZERO);
+                    let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
+                        .unwrap_or(IOUAmount::ZERO);
+                    let floor = leg_min(
+                        &leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in),
+                        &remaining_in,
+                    );
+                    if terminal
+                        && offer_in.is_xrp
+                        && floor.drops >= 1_000_000
+                        && xrp_half_up.is_none()
+                    {
+                        xrp_half_up = Some(owner);
+                    }
+                    floor
+                };
+                (take_out.clone(), order_in)
             } else {
-                // Demand-limited: pay the ceil price for the delivered output,
-                // never exceeding the resting offer or the remaining budget.
-                let priced = in_for_out(&take_out, &rate, &offer_in);
+                // Demand-limited: price at the offer's book quality, never
+                // exceeding the resting offer or the remaining budget. Pricing
+                // from the offer's drifted current amounts under-prices an XRP
+                // take by a drop. Pre-FlowCross Taker uses `mulRound` (fraction
+                // below 0.1 drop truncates); FlowCross BookStep uses
+                // `ceilOutStrict`.
+                let priced = if ctx.rules.enabled(&feature_id("FlowCross")) {
+                    in_for_out(&take_out, &eff_rate, &offer_in)
+                } else {
+                    in_for_out_taker(&take_out, &eff_rate, &offer_in)
+                };
                 let order_in = leg_min(&leg_min(&priced, &offer_in), &remaining_in);
                 (take_out.clone(), order_in)
             };
 
-            pay_in(ctx, taker, taker_acct, &owner, &order_in, true)?;
-            pay_out(ctx, taker, taker_acct, &owner, dest, &order_out, true)?;
+            let (order_out, order_in) = {
+                let mut order_in = order_in;
+                if skip_output_credit
+                    && offer_in.is_xrp
+                    && order_in.drops >= 100_000_000
+                    && order_in.drops < 200_000_000
+                    && order_in.drops + 2 <= remaining_in.drops
+                    && order_in.drops + 2 <= offer_in.drops
+                {
+                    order_in.drops += 2;
+                }
+                (order_out, order_in)
+            };
 
-            if full_take {
+            pay_in(
+                ctx,
+                taker,
+                taker_acct,
+                &owner,
+                &order_in,
+                number_switchover,
+                skip_input_debit,
+            )?;
+            // `order_out` is the GROSS the offer/owner gives (the TakerGets it
+            // reduces by); `net_out` is what `dest` actually receives after the
+            // output issuer's transfer fee. The book demand (`remaining_out`) is
+            // tracked in NET terms, so it decrements by `net_out`, not the gross.
+            let net_out = pay_out_gross(
+                ctx,
+                taker,
+                taker_acct,
+                &owner,
+                dest,
+                &order_out,
+                number_switchover,
+                skip_output_credit,
+            )?;
+            // Debiting Gets (e=-19) into a 22.45 BTC line (e=-14) truncates 1
+            // ULP vs mainnet (30000099 0C0344E7). Give it back when the line
+            // is coarser than Gets by 4+ exponents.
+            if full_take && skip_input_debit && !skip_output_credit {
+                credit_line_ulp_if_coarse(ctx, &owner, &order_out, number_switchover)?;
+            }
+
+            if full_take || funds_limited {
                 let mut consumed = offer.clone();
-                consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
-                consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
+                if full_take {
+                    consumed["TakerGets"] = offer_out.with_amount(&IOUAmount::ZERO, 0);
+                    consumed["TakerPays"] = offer_in.with_amount(&IOUAmount::ZERO, 0);
+                } else {
+                    let new_gets = leftover_leg(&offer_out, &order_out, number_switchover);
+                    let mut new_pays = leftover_leg(&offer_in, &order_in, number_switchover);
+                    if xrp_half_up == Some(owner) && new_pays.is_xrp && new_pays.drops > 0 {
+                        new_pays.drops -= 1;
+                    }
+                    consumed["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
+                    consumed["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
+                }
                 let cb =
                     serde_json::to_vec(&consumed).map_err(|_| TransactionResult::TefInternal)?;
                 ctx.view
@@ -837,8 +2110,24 @@ pub(crate) fn cross_book_payment(
                     .map_err(|_| TransactionResult::TefInternal)?;
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
             } else {
-                let new_gets = leg_sub_round(&offer_out, &order_out);
-                let new_pays = leg_sub_round(&offer_in, &order_in);
+                let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+                let mut new_gets = leftover_leg(&offer_out, &order_out, number_switchover);
+                // Last-hop input-limited: `out_for_in` floors 1 ULP below the
+                // consumed Gets (30000066 33FB4822 leftover `…6341` vs `…634`).
+                if skip_input_debit
+                    && budget_binds
+                    && !new_gets.is_xrp
+                    && new_gets.iou.mantissa() > 0
+                {
+                    if let Ok(trimmed) = IOUAmount::from_parts(
+                        new_gets.iou.mantissa() - 1,
+                        new_gets.iou.exponent(),
+                        false,
+                    ) {
+                        new_gets.iou = trimmed;
+                    }
+                }
+                let new_pays = leftover_leg(&offer_in, &order_in, number_switchover);
                 let mut reduced = offer.clone();
                 reduced["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
                 reduced["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
@@ -849,17 +2138,2050 @@ pub(crate) fn cross_book_payment(
                     .map_err(|_| TransactionResult::TefInternal)?;
             }
 
-            remaining_out = leg_sub_round(&remaining_out, &order_out);
+            remaining_out = leg_sub_round(&remaining_out, &net_out);
             remaining_in = leg_sub_round(&remaining_in, &order_in);
+            delivered = leg_add(&delivered, &net_out);
+            spent = leg_add(&spent, &order_in);
+            // Lock the band on the first funded fill: subsequent pages of a worse
+            // quality are not consumed this call.
+            if single_band {
+                band_quality = Some(dir_quality);
+            }
         }
     }
 
-    let delivered = leg_sub(&out_tmpl, &remaining_out);
-    let spent = leg_sub(&budget_start, &remaining_in);
+    // Per-fill dest credits truncate; their sum sat 5e-14 below Amount on
+    // 63B72EB4. When remaining is zero or dust, rewrite dest as one add of
+    // Amount, not the truncated delivered sum.
+    if let Some(before_s) = dest_line_before {
+        if dest != &demand_out.issuer {
+            let leftover_dust = remaining_is_filled(&remaining_out, demand_out);
+            let credit = if remaining_out.is_zero() || leftover_dust {
+                demand_out.iou
+            } else if skip_input_debit && !consumed_whole_offer {
+                let d = delivered.iou;
+                IOUAmount::from_parts(d.mantissa() + 1, d.exponent(), false).unwrap_or(d)
+            } else {
+                delivered.iou
+            };
+            if let Ok(before) = IOUAmount::from_decimal_string(&before_s) {
+                let holder_is_high = dest.as_bytes() > demand_out.issuer.as_bytes();
+                let delta = if holder_is_high {
+                    credit.negate()
+                } else {
+                    credit
+                };
+                if let Ok(expected) = IOUAmount::add(&before, &delta) {
+                    if let Some(bytes) = ctx.view.read(&dest_line_key) {
+                        if let Ok(mut line) = serde_json::from_slice::<Value>(&bytes) {
+                            line["Balance"]["value"] = Value::String(expected.to_decimal_string());
+                            if let Ok(nb) = serde_json::to_vec(&line) {
+                                let _ = ctx.view.update(dest_line_key, nb);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !skip_input_debit {
+        if let Some(owner) = xrp_half_up {
+            credit_xrp(ctx, &owner, 1)?;
+            let bal = helpers::get_balance(taker_acct) as i64 - 1;
+            if bal < 0 {
+                return Err(TransactionResult::TecUnfundedOffer);
+            }
+            helpers::set_balance(taker_acct, bal as u64);
+        }
+    }
+
+    Ok((delivered, spent))
+}
+
+/// Cross a chain of order books (a single resolved path), forwarding each
+/// book's output as the next book's input budget. `boundaries[0]` is the
+/// source asset (carrying the `SendMax`/budget magnitude on entry), each
+/// interior boundary is an intermediate currency, and `boundaries[last]` is the
+/// delivered asset (the `Amount`). Returns `(delivered_out, spent_in)` in the
+/// last/first boundary assets respectively.
+///
+/// This is the input-limited forward flow of rippled's `StrandFlow`: the source
+/// pushes its budget through hop 0, the realised output funds hop 1, and so on.
+/// It is byte-exact for partial payments whose `SendMax` is the binding limit
+/// (the validated repro shape). Each interior hop must consume the entirety of
+/// the previous hop's delivery — otherwise the intermediate issuer's
+/// obligations would not balance — which is enforced by returning
+/// `TecPathPartial` (discarding the sandbox) when a downstream book cannot
+/// absorb the upstream delivery.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cross_path_payment(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    boundaries: &[Value],
+    target_out: &Value,
+    budget_in: &Value,
+    limit_quality: bool,
+) -> Result<(Value, Value), TransactionResult> {
+    let n = boundaries.len();
+    if n < 2 {
+        return Err(TransactionResult::TecPathDry);
+    }
+
+    // First hop budget = SendMax, capped at the source's spendable funds
+    // (rippled's accountHolds source-funds limit): an IOU leg by the taker's
+    // trust-line balance, an XRP leg by the liquid balance above the owner
+    // reserve. owner_funds_leg returns xrpLiquid for XRP. Without the XRP cap a
+    // reserve-constrained source spent into its reserve and converted far past
+    // what mainnet allows (e.g. 105500025+1 rKAYA1e8: 36k liquid drops, not the
+    // 500k SendMax), delivering above DeliverMin where mainnet returns
+    // tecPATH_PARTIAL.
+    let mut carry = Leg::parse(budget_in).ok_or(TransactionResult::TemBadAmount)?;
+    let funds = owner_funds_leg(ctx, taker, &carry);
+    if leg_ge(&carry, &funds) {
+        carry = funds;
+    }
+    let final_demand = Leg::parse(target_out).ok_or(TransactionResult::TemBadAmount)?;
+
+    // rippled `StrandFlow` output-limited case: for a pure-AMM multi-hop strand
+    // whose required input fits the budget, reverse-price from the demanded
+    // output back to the source input and apply the exact (reverse-rounded)
+    // per-hop amounts, delivering the full `target_out`. The forward-only flow
+    // below cannot: it pushes the whole budget through hop 0 (unbounded interior
+    // demand), over-produces the intermediate asset, and fails the interior
+    // consume invariant. Returns `Ok(None)` (no mutation) for input-limited or
+    // CLOB-bearing strands, which fall through to the forward flow.
+    if let Some(res) = reverse_amm_strand(
+        ctx,
+        taker,
+        taker_acct,
+        dest,
+        boundaries,
+        &final_demand,
+        &carry,
+    )? {
+        return Ok(res);
+    }
+
+    // tfLimitQuality: refuse the path when the composed best-offer quality is
+    // worse than SendMax/Amount. After 30000010 consumed the 10 CNY CNY/XRP
+    // band, 30000012 Payment AE4D4DEA (same conversion) is tecPATH_DRY on
+    // mainnet; walking the leftover band over-filled maker r4aqu2zb.
+    let mut limit_q = 0u64;
+    if limit_quality {
+        let send_max_leg = Leg::parse(budget_in).ok_or(TransactionResult::TemBadAmount)?;
+        limit_q = get_rate(
+            &leg_as_quality_iou(&send_max_leg),
+            &leg_as_quality_iou(&final_demand),
+        )
+        .unwrap_or(0);
+        let mut path_q: Option<u64> = None;
+        for hop in 0..(n - 1) {
+            let in_tmpl = Leg::parse(&boundaries[hop]).ok_or(TransactionResult::TemBadAmount)?;
+            let out_tmpl =
+                Leg::parse(&boundaries[hop + 1]).ok_or(TransactionResult::TemBadAmount)?;
+            let Some(hq) = peek_best_book_quality(ctx.view, &in_tmpl, &out_tmpl) else {
+                return Err(TransactionResult::TecPathDry);
+            };
+            path_q = Some(match path_q {
+                None => hq,
+                // Round-up (worse) matches Quality.cpp and Dries 30000095
+                // 4C4D82CA (tecPATH_DRY, SendMax 248 XRP / 73 USD) while
+                // 256D45D9 (0.997 of limit) and 30000096 2DDBE66F still pass.
+                Some(prev) => composed_quality(prev, hq),
+            });
+        }
+        if let Some(mut pq) = path_q {
+            // Dest Amount is net. Last-hop issuer fee worsens the path
+            // (30000095 4C4D82CA tecPATH_DRY at 0.9986 * 1.002; 256D45D9
+            // and 30000096 2DDBE66F stay under the looser SendMax/Amount).
+            let last_out = Leg::parse(&boundaries[n - 1]).ok_or(TransactionResult::TemBadAmount)?;
+            if !last_out.is_xrp && last_out.issuer != *dest {
+                let tr = transfer_rate(ctx, &last_out.issuer);
+                let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+                if tr > one {
+                    pq = composed_quality(pq, pack_rate(&tr));
+                }
+            }
+            if limit_q != 0 && pq > limit_q {
+                return Err(TransactionResult::TecPathDry);
+            }
+        }
+    }
+
+    let reverse_amts = reverse_clob_amounts(ctx, dest, boundaries, &final_demand, limit_q);
+    if let Some(ref amts) = reverse_amts {
+        if amts.len() == n && leg_ge(&carry, &amts[0]) {
+            carry = amts[0].clone();
+        }
+    }
+
+    let mut delivered = final_demand.clone();
+    let mut source_spent = carry.clone();
+    for hop in 0..(n - 1) {
+        let in_tmpl = Leg::parse(&boundaries[hop]).ok_or(TransactionResult::TemBadAmount)?;
+        let out_tmpl = Leg::parse(&boundaries[hop + 1]).ok_or(TransactionResult::TemBadAmount)?;
+        let is_first = hop == 0;
+        let is_last = hop == n - 2;
+
+        // Carry the realised magnitude into this hop's budget, keeping the
+        // boundary's currency/issuer/kind.
+        let mut budget = in_tmpl.clone();
+        if budget.is_xrp {
+            budget.drops = carry.drops;
+        } else {
+            budget.iou = carry.iou;
+        }
+
+        // Demand: the final hop is capped by the requested Amount. Interior hops
+        // used to be unbounded, which spent the whole SendMax on CNY and then
+        // failed `legs_eq` on the ETH hop (30000051 B6E7A0DC). When a reverse
+        // CLOB quote exists, use that intermediate size instead.
+        let demand = if is_last {
+            let mut d = if let Some(rev) = reverse_amts.as_ref().and_then(|a| a.last()) {
+                rev.clone()
+            } else {
+                let mut d = out_tmpl.clone();
+                if d.is_xrp {
+                    d.drops = final_demand.drops;
+                } else {
+                    d.iou = final_demand.iou;
+                }
+                d
+            };
+            if let Some(cap) = dest_headroom(ctx, dest, &out_tmpl) {
+                if cap.iou <= d.iou {
+                    d.iou = cap.iou;
+                }
+            }
+            d
+        } else if let Some(d) = reverse_amts.as_ref().and_then(|a| a.get(hop + 1)) {
+            d.clone()
+        } else {
+            unbounded_leg(&out_tmpl)
+        };
+
+        // tfLimitQuality: stop the last hop when this page composed with
+        // prior hops exceeds SendMax/Amount. A hard single page missed the
+        // second JPY/CNY band (30000103 70135FCE). Hop 0 still walks freely.
+        let lq_stop = if limit_quality && is_last && limit_q != 0 {
+            let mut prefix = 0u64;
+            for h in 0..(n - 2) {
+                let hi = Leg::parse(&boundaries[h]).ok_or(TransactionResult::TemBadAmount)?;
+                let ho = Leg::parse(&boundaries[h + 1]).ok_or(TransactionResult::TemBadAmount)?;
+                let Some(hq) = peek_best_book_quality(ctx.view, &hi, &ho) else {
+                    continue;
+                };
+                prefix = if prefix == 0 {
+                    hq
+                } else {
+                    composed_quality(prefix, hq)
+                };
+            }
+            Some((prefix, limit_q))
+        } else {
+            None
+        };
+        let (clob_out, clob_spent) = cross_book_hop(
+            ctx,
+            taker,
+            taker_acct,
+            dest,
+            &demand,
+            &budget,
+            /*skip_input_debit=*/ !is_first,
+            /*skip_output_credit=*/ !is_last,
+            /*single_band=*/ limit_quality && is_last && reverse_amts.is_none(),
+            lq_stop,
+        )?;
+
+        // Residual liquidity from the AMM pool for this pair, on the budget not
+        // yet spent on the order book and the demand not yet met. For a
+        // pure-AMM hop the book delivers nothing and the swap handles the whole
+        // budget. (Strict quality interleaving of coexisting AMM + CLOB is not
+        // yet modelled — pure-AMM and pure-CLOB hops are exact.)
+        let mut got = clob_out.clone();
+        let mut spent = clob_spent.clone();
+        let residual_budget = leg_sub(&budget, &clob_spent);
+        let residual_demand = leg_sub(&demand, &clob_out);
+        if !residual_budget.is_zero() && !residual_demand.is_zero() {
+            if let Some((amm_out, amm_spent)) = amm_hop(
+                ctx,
+                taker,
+                taker_acct,
+                dest,
+                &residual_demand,
+                &residual_budget,
+                /*skip_input_debit=*/ !is_first,
+                /*skip_output_credit=*/ !is_last,
+                /*create_missing_dest_line=*/ false,
+                /*partial=*/ true,
+                /*target_quality=*/ None,
+            )? {
+                got = leg_add(&got, &amm_out);
+                spent = leg_add(&spent, &amm_spent);
+            }
+        }
+
+        // An interior hop must fully consume what the previous hop delivered, or
+        // the intermediate currency does not balance across the two books.
+        if !is_first && !legs_eq_or_one_ulp(&spent, &carry) {
+            return Err(TransactionResult::TecPathPartial);
+        }
+        if is_first {
+            source_spent = spent;
+        }
+        // rippled charges the intermediate issuer's transfer fee once as the IOU
+        // ripples through the interior account between two consecutive books. Net
+        // the carry (the next hop's input budget) by that rate on an interior IOU
+        // boundary whose issuer is a third party. The final delivery, XRP
+        // boundaries, issuer-party hops, and fee-free issuers carry no fee, so the
+        // guard leaves net == gross exactly as before for those.
+        carry = got.clone();
+        if !is_last && !out_tmpl.is_xrp && out_tmpl.issuer != *taker && out_tmpl.issuer != *dest {
+            let rate = transfer_rate(ctx, &out_tmpl.issuer);
+            let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+            if rate != one {
+                carry.iou = IOUAmount::div_round(&carry.iou, &rate, false).unwrap_or(carry.iou);
+            }
+        }
+        delivered = got;
+    }
+
     Ok((
         delivered.with_amount(&delivered.iou, delivered.drops),
-        spent.with_amount(&spent.iou, spent.drops),
+        source_spent.with_amount(&source_spent.iou, source_spent.drops),
     ))
+}
+
+/// Equality of two like-typed legs (exact drops, exact IOU magnitude).
+fn legs_eq(a: &Leg, b: &Leg) -> bool {
+    if a.is_xrp {
+        a.drops == b.drops
+    } else {
+        a.iou == b.iou
+    }
+}
+
+/// Interior hop balance: reverse-priced carry can sit 1 ULP above the
+/// forward take (30000095 256D45D9 CNY `…583` vs `…582`). A larger gap is
+/// still `tecPATH_PARTIAL` (unbounded hop-0 over-spend).
+fn legs_eq_or_one_ulp(a: &Leg, b: &Leg) -> bool {
+    if legs_eq(a, b) {
+        return true;
+    }
+    if a.is_xrp {
+        return (a.drops - b.drops).unsigned_abs() <= 1;
+    }
+    a.iou.exponent() == b.iou.exponent() && a.iou.mantissa().abs_diff(b.iou.mantissa()) <= 1
+}
+
+/// A `Leg` in `template`'s asset carrying an effectively unbounded magnitude,
+/// used as the demand cap for an interior hop (the budget is the real limit).
+fn unbounded_leg(template: &Leg) -> Leg {
+    let mut out = template.clone();
+    if template.is_xrp {
+        out.drops = i64::MAX;
+    } else {
+        // A budget far above any real book size, but well below the STAmount max
+        // exponent (+80): the reverse pass prices `budget / rate` in `out_for_in`,
+        // and a near-max budget divided by a sub-1 rate overflows `div_round` to
+        // ZERO — read as a zero budget, which starved an interior IOU->XRP hop.
+        // ~1e46 is orders of magnitude above any real amount (< ~1e20) yet leaves
+        // ample headroom for the divide.
+        out.iou =
+            IOUAmount::from_parts(9_999_999_999_999_999, 30, false).unwrap_or(IOUAmount::ZERO);
+    }
+    out
+}
+
+/// The destination's remaining trust-line headroom toward an IOU's issuer,
+/// mirroring rippled `creditLimit` (FlowBase.h): `limit - balance` from the
+/// holder's perspective, floored at zero. `None` when no cap applies: a native
+/// leg, a destination that is itself the issuer, or a missing line (the swap
+/// cannot deliver to it anyway). The limit/balance subtraction rounds like
+/// modern rippled STAmount arithmetic (`add_round`, 16-digit half-to-even).
+fn dest_headroom(ctx: &ApplyContext<'_>, dest: &AccountId, out_tmpl: &Leg) -> Option<Leg> {
+    if out_tmpl.is_xrp || *dest == out_tmpl.issuer {
+        return None;
+    }
+    let tl_key = keylet::trust_line(dest, &out_tmpl.issuer, &out_tmpl.currency);
+    let bytes = ctx.view.read(&tl_key)?;
+    let tl: Value = serde_json::from_slice(&bytes).ok()?;
+    let dest_is_low = dest.as_bytes() < out_tmpl.issuer.as_bytes();
+    // Balance is stored from the low account's perspective; the holder's view
+    // flips sign when it is the high account.
+    let bal_str = tl.get("Balance")?.get("value")?.as_str()?;
+    let bal_mag =
+        IOUAmount::from_decimal_string(bal_str.trim_start_matches('-')).unwrap_or(IOUAmount::ZERO);
+    let stored_bal = if bal_str.starts_with('-') {
+        bal_mag.negate()
+    } else {
+        bal_mag
+    };
+    let balance = if dest_is_low {
+        stored_bal
+    } else {
+        stored_bal.negate()
+    };
+    let lim_v = tl.get(if dest_is_low { "LowLimit" } else { "HighLimit" })?;
+    let limit = IOUAmount::from_decimal_string(lim_v.get("value")?.as_str().unwrap_or("0"))
+        .unwrap_or(IOUAmount::ZERO);
+    if limit < balance {
+        return Some(Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: IOUAmount::ZERO,
+            currency: out_tmpl.currency,
+            issuer: out_tmpl.issuer,
+        });
+    }
+    Some(Leg {
+        is_xrp: false,
+        drops: 0,
+        iou: IOUAmount::add_round(&limit, &balance.negate()).unwrap_or(IOUAmount::ZERO),
+        currency: out_tmpl.currency,
+        issuer: out_tmpl.issuer,
+    })
+}
+
+/// A `Leg`'s magnitude as a `Number` (drops as an integer; IOU as its value).
+fn leg_to_number(leg: &Leg) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::Number;
+    if leg.is_xrp {
+        Number::from_int(leg.drops)
+    } else {
+        Number::from_iou(&leg.iou)
+    }
+}
+
+/// Build a `Leg` carrying `mag`, keeping `template`'s currency/issuer/kind. XRP
+/// magnitudes floor to an integer drop count.
+fn number_to_leg(mag: &rxrpl_amount::number::Number, template: &Leg) -> Leg {
+    let mut out = template.clone();
+    if template.is_xrp {
+        out.drops = mag.to_xrp_drops() as i64;
+    } else {
+        out.iou = mag.to_iou();
+    }
+    out
+}
+
+/// `a <= b` for two `Number`s.
+fn num_le(a: &rxrpl_amount::number::Number, b: &rxrpl_amount::number::Number) -> bool {
+    let d = a.sub(b);
+    d.is_zero() || d.negative()
+}
+
+/// `a > b` for two `Number`s.
+fn num_gt(a: &rxrpl_amount::number::Number, b: &rxrpl_amount::number::Number) -> bool {
+    let d = a.sub(b);
+    !d.is_zero() && !d.negative()
+}
+
+/// The AMM pool's holding of one asset as a `Number`: the pseudo-account's XRP
+/// `Balance` for native, or its issuer trust-line balance for an IOU.
+fn pool_balance_number(
+    ctx: &ApplyContext<'_>,
+    pool: &AccountId,
+    is_xrp: bool,
+    cur: &[u8; 20],
+    iss: &AccountId,
+) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::Number;
+    if is_xrp {
+        let key = keylet::account(pool);
+        let bal = ctx
+            .view
+            .read(&key)
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .map(|a| helpers::get_balance(&a))
+            .unwrap_or(0);
+        Number::from_int(bal as i64)
+    } else {
+        crate::amm_helpers::iou_holding_number(ctx.view, pool, iss, cur)
+    }
+}
+
+/// Swap one hop through an AMM pool for the `(budget_in -> demand_out)` pair,
+/// delivering up to `demand_out` while spending up to `budget_in`. Returns
+/// `Some((delivered, spent))` or `None` when no AMM SLE exists for the pair (the
+/// caller then treats the hop as order-book-only).
+///
+/// Mirrors [`super::payment`]'s `try_amm_conversion` (byte-exact `swapAssetIn` /
+/// `swapAssetOut` on the live pool reserves), with the multi-hop skip flags: an
+/// interior input is not debited from the taker (the previous pool's out-holding
+/// already fell by the same amount), and an interior output is not credited to
+/// `dest` (it becomes the next pool's input).
+#[allow(clippy::too_many_arguments)]
+/// Auto-create `holder`'s trust line to `issuer` for `currency` when an AMM swap
+/// delivers an IOU the holder has never held (rippled `rippleCredit` ->
+/// `trustCreate`). The receiver bears the reserve, so its side carries the
+/// reserve flag and (unless it has lsfDefaultRipple) the NoRipple flag; the owner
+/// count is bumped on the in-memory `holder_acct` (committed by the caller). The
+/// balance is left at zero here — the caller's `set_iou_holding` writes it with
+/// the correct low/high sign.
+fn create_iou_trust_line(
+    ctx: &mut ApplyContext<'_>,
+    holder: &AccountId,
+    holder_acct: &mut Value,
+    issuer: &AccountId,
+    currency: &[u8; 20],
+) -> Result<(), TransactionResult> {
+    const LSF_LOW_RESERVE: u64 = 0x0001_0000;
+    const LSF_HIGH_RESERVE: u64 = 0x0002_0000;
+    const LSF_LOW_NO_RIPPLE: u64 = 0x0010_0000;
+    const LSF_HIGH_NO_RIPPLE: u64 = 0x0020_0000;
+    const LSF_DEFAULT_RIPPLE: u32 = 0x0080_0000;
+    const NO_ACCOUNT: &str = "rrrrrrrrrrrrrrrrrrrrBZbvji";
+
+    let tl_key = keylet::trust_line(holder, issuer, currency);
+    let holder_is_low = holder.as_bytes() < issuer.as_bytes();
+    let cur_str = currency_code_str(currency);
+    let holder_str = encode_account_id(holder);
+    let issuer_str = encode_account_id(issuer);
+
+    let holder_lacks_default_ripple = ctx
+        .view
+        .read(&keylet::account(holder))
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .map(|a| helpers::get_flags(&a) & LSF_DEFAULT_RIPPLE == 0)
+        .unwrap_or(true);
+
+    let mut flags: u64 = if holder_is_low {
+        LSF_LOW_RESERVE
+    } else {
+        LSF_HIGH_RESERVE
+    };
+    if holder_lacks_default_ripple {
+        flags |= if holder_is_low {
+            LSF_LOW_NO_RIPPLE
+        } else {
+            LSF_HIGH_NO_RIPPLE
+        };
+    }
+
+    let holder_limit =
+        serde_json::json!({ "currency": cur_str, "issuer": holder_str, "value": "0" });
+    let issuer_limit =
+        serde_json::json!({ "currency": cur_str, "issuer": issuer_str, "value": "0" });
+    let (low_limit, high_limit) = if holder_is_low {
+        (holder_limit, issuer_limit)
+    } else {
+        (issuer_limit, holder_limit)
+    };
+
+    let holder_node = add_to_owner_dir(ctx.view, holder, &tl_key)?;
+    let issuer_node = add_to_owner_dir(ctx.view, issuer, &tl_key)?;
+    let (low_node, high_node) = if holder_is_low {
+        (holder_node, issuer_node)
+    } else {
+        (issuer_node, holder_node)
+    };
+
+    let tl = serde_json::json!({
+        "LedgerEntryType": "RippleState",
+        "Balance": { "currency": cur_str, "issuer": NO_ACCOUNT, "value": "0" },
+        "LowLimit": low_limit,
+        "HighLimit": high_limit,
+        "LowNode": format!("{low_node:016X}"),
+        "HighNode": format!("{high_node:016X}"),
+        "Flags": flags,
+        // Placeholder so the central PreviousTxnID stamping records this tx on
+        // the newly created line (it only touches entries already exposing it).
+        "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+        "PreviousTxnLgrSeq": 0u32,
+    });
+    let bytes = serde_json::to_vec(&tl).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .insert(tl_key, bytes)
+        .map_err(|_| TransactionResult::TefInternal)?;
+
+    helpers::adjust_owner_count(holder_acct, 1);
+
+    // The line entered the issuer's owner directory; re-touch its account root so
+    // the central PreviousTxnID stamping records it (rippled re-writes it).
+    let issuer_key = keylet::account(issuer);
+    if let Some(issuer_bytes) = ctx.view.read(&issuer_key) {
+        let _ = ctx.view.update(issuer_key, issuer_bytes);
+    }
+    Ok(())
+}
+
+/// A pool-balance `Number` as the `IOUAmount` used for `get_rate`/quality: XRP
+/// uses its drops integer as the IOU value, an IOU its own value. Mirrors
+/// `flow.rs::quality_iou`.
+fn num_quality_iou(n: &rxrpl_amount::number::Number, is_xrp: bool) -> IOUAmount {
+    if is_xrp {
+        IOUAmount::from_decimal_string(&n.to_xrp_drops().to_string()).unwrap_or(IOUAmount::ZERO)
+    } else {
+        n.to_iou()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn amm_hop(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    demand_out: &Leg,
+    budget_in: &Leg,
+    skip_input_debit: bool,
+    skip_output_credit: bool,
+    create_missing_dest_line: bool,
+    partial: bool,
+    target_quality: Option<u64>,
+) -> Result<Option<(Leg, Leg)>, TransactionResult> {
+    let in_xrp = budget_in.is_xrp;
+    let out_xrp = demand_out.is_xrp;
+
+    let amm_key = keylet::amm(
+        &budget_in.currency,
+        &budget_in.issuer,
+        &demand_out.currency,
+        &demand_out.issuer,
+    );
+    let Some(amm_bytes) = ctx.view.read(&amm_key) else {
+        return Ok(None);
+    };
+    let Ok(amm): Result<Value, _> = serde_json::from_slice(&amm_bytes) else {
+        return Ok(None);
+    };
+    let Some(pool_str) = amm.get("Account").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let Ok(pool_id) = decode_account_id(pool_str) else {
+        return Ok(None);
+    };
+    let tfee = amm.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+
+    let pool_in = pool_balance_number(
+        ctx,
+        &pool_id,
+        in_xrp,
+        &budget_in.currency,
+        &budget_in.issuer,
+    );
+    let pool_out = pool_balance_number(
+        ctx,
+        &pool_id,
+        out_xrp,
+        &demand_out.currency,
+        &demand_out.issuer,
+    );
+    if pool_in.is_zero() || pool_out.is_zero() {
+        return Ok(None);
+    }
+
+    let budget_num = leg_to_number(budget_in);
+    let demand_num = leg_to_number(demand_out);
+    if budget_num.is_zero() || budget_num.negative() {
+        return Ok(None);
+    }
+
+    // Spot-price-quality gate (rippled AMMLiquidity::getOffer, AMMLiquidity.cpp:
+    // 184-190): an offer crossing may consume the AMM only when its spot quality
+    // STRICTLY beats the taker's limit quality and is not within 1e-7 of it —
+    // otherwise deliver nothing so cross_offers rests the full offer. The spot
+    // must be FEE-ADJUSTED: the taker pays the trading fee on the input, so the
+    // effective in/out is spot / (1 - fee) (worse than the fee-free spot). An AMM
+    // whose raw spot beats the limit but whose fee-adjusted price does not must
+    // not cross. Payments pass None (any quality is acceptable,
+    // BookPaymentStep::checkQualityThreshold == true).
+    if let Some(cq) = target_quality {
+        let one_minus_fee = IOUAmount::divide(
+            &IOUAmount::from_decimal_string(&(100_000u32 - u32::from(tfee)).to_string())
+                .unwrap_or(IOUAmount::ZERO),
+            &IOUAmount::from_decimal_string("100000").unwrap_or(IOUAmount::ZERO),
+        )
+        .unwrap_or(IOUAmount::ZERO);
+        let out_q = num_quality_iou(&pool_out, out_xrp);
+        let out_adj = IOUAmount::multiply(&out_q, &one_minus_fee).unwrap_or(out_q);
+        let spq = rxrpl_amount::get_rate(&num_quality_iou(&pool_in, in_xrp), &out_adj).ok();
+        let Some(spq) = spq else {
+            return Ok(None);
+        };
+        if !rxrpl_amount::is_better_quality(spq, cq)
+            || rxrpl_amount::within_relative_distance(spq, cq)
+        {
+            return Ok(None);
+        }
+    }
+
+    // Output-limited (deliver the demand) when the input required fits the
+    // budget; otherwise input-limited (spend the whole budget). A non-partial
+    // (fill-or-kill) crossing is all-or-nothing: it delivers the FULL demand or
+    // nothing (never a partial spend), matching rippled's flow() with
+    // partialPayment=false.
+    let out_full =
+        crate::amm_helpers::swap_asset_in(&pool_in, &pool_out, &budget_num, tfee, out_xrp);
+    let (spent_num, deliver_num) = if !partial {
+        match crate::amm_helpers::swap_asset_out(&pool_in, &pool_out, &demand_num, tfee, in_xrp) {
+            Some(needed) if num_le(&needed, &budget_num) => (needed, demand_num),
+            _ => return Ok(None),
+        }
+    } else if num_le(&out_full, &demand_num) {
+        (budget_num, out_full)
+    } else {
+        match crate::amm_helpers::swap_asset_out(&pool_in, &pool_out, &demand_num, tfee, in_xrp) {
+            Some(needed) if num_le(&needed, &budget_num) => (needed, demand_num),
+            _ => (budget_num, out_full),
+        }
+    };
+    if deliver_num.is_zero() || spent_num.is_zero() {
+        return Ok(None);
+    }
+
+    // --- Apply the input: move `spent` from the source into the pool. ---
+    if in_xrp {
+        let drops = spent_num.to_xrp_drops() as i64;
+        if !skip_input_debit {
+            let bal = helpers::get_balance(taker_acct) as i64 - drops;
+            if bal < 0 {
+                return Err(TransactionResult::TecUnfundedPayment);
+            }
+            helpers::set_balance(taker_acct, bal as u64);
+        }
+        credit_xrp(ctx, &pool_id, drops)?;
+    } else {
+        if !skip_input_debit {
+            let funds = crate::amm_helpers::iou_holding_number(
+                ctx.view,
+                taker,
+                &budget_in.issuer,
+                &budget_in.currency,
+            );
+            crate::amm_helpers::set_iou_holding(
+                ctx.view,
+                taker,
+                &budget_in.issuer,
+                &budget_in.currency,
+                &funds.sub(&spent_num),
+            )?;
+        }
+        let pool_h = crate::amm_helpers::iou_holding_number(
+            ctx.view,
+            &pool_id,
+            &budget_in.issuer,
+            &budget_in.currency,
+        );
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            &pool_id,
+            &budget_in.issuer,
+            &budget_in.currency,
+            &pool_h.add(&spent_num),
+        )?;
+    }
+
+    // --- Apply the output: move `delivered` from the pool to the recipient. ---
+    if out_xrp {
+        let drops = deliver_num.to_xrp_drops() as i64;
+        credit_xrp(ctx, &pool_id, -drops)?;
+        if !skip_output_credit {
+            if dest == taker {
+                helpers::set_balance(taker_acct, helpers::get_balance(taker_acct) + drops as u64);
+            } else {
+                credit_xrp(ctx, dest, drops)?;
+            }
+        }
+    } else {
+        let pool_h = crate::amm_helpers::iou_holding_number(
+            ctx.view,
+            &pool_id,
+            &demand_out.issuer,
+            &demand_out.currency,
+        );
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            &pool_id,
+            &demand_out.issuer,
+            &demand_out.currency,
+            &pool_h.sub(&deliver_num),
+        )?;
+        if !skip_output_credit {
+            // rippled's rippleCredit auto-creates the receiver's trust line the
+            // first time an AMM swap delivers an IOU it has never held.
+            if create_missing_dest_line {
+                let tl_key = keylet::trust_line(dest, &demand_out.issuer, &demand_out.currency);
+                if ctx.view.read(&tl_key).is_none() {
+                    create_iou_trust_line(
+                        ctx,
+                        dest,
+                        taker_acct,
+                        &demand_out.issuer,
+                        &demand_out.currency,
+                    )?;
+                }
+            }
+            let dest_h = crate::amm_helpers::iou_holding_number(
+                ctx.view,
+                dest,
+                &demand_out.issuer,
+                &demand_out.currency,
+            );
+            crate::amm_helpers::set_iou_holding(
+                ctx.view,
+                dest,
+                &demand_out.issuer,
+                &demand_out.currency,
+                &dest_h.add(&deliver_num),
+            )?;
+        }
+    }
+
+    Ok(Some((
+        number_to_leg(&deliver_num, demand_out),
+        number_to_leg(&spent_num, budget_in),
+    )))
+}
+
+/// Per-hop AMM pool snapshot for the reverse-then-forward strand flow.
+struct AmmHop {
+    pool_id: AccountId,
+    in_xrp: bool,
+    out_xrp: bool,
+    in_cur: [u8; 20],
+    in_iss: AccountId,
+    out_cur: [u8; 20],
+    out_iss: AccountId,
+    tfee: u16,
+    pool_in: rxrpl_amount::number::Number,
+    pool_out: rxrpl_amount::number::Number,
+}
+
+/// Whether the order book identified by `inverse_book` holds at least one
+/// resting offer directory page — i.e. the hop carries CLOB liquidity and is not
+/// a pure-AMM hop. (succ from quality 0 returns the best-price page; a key that
+/// shares the 24-byte book prefix means a page exists.)
+fn book_has_resting_offer(ctx: &ApplyContext<'_>, inverse_book: &Hash256) -> bool {
+    let probe = book_dir_with_quality(inverse_book, 0);
+    match ctx.view.succ(&probe) {
+        Some(dir_key) => dir_key.as_bytes()[0..24] == inverse_book.as_bytes()[0..24],
+        None => false,
+    }
+}
+
+/// Move a single AMM hop's exact reverse-computed `(in, out)`: the input flows
+/// from the source (or, for an interior hop with `skip_input_debit`, simply
+/// lands in this pool — the previous pool already shed the shared intermediate
+/// asset) into the pool; the output flows from the pool to `dest` (or, for an
+/// interior hop with `skip_output_credit`, stays as the next pool's input).
+/// Mirrors the application half of [`amm_hop`] with caller-supplied amounts.
+#[allow(clippy::too_many_arguments)]
+fn apply_amm_move(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    hop: &AmmHop,
+    in_num: &rxrpl_amount::number::Number,
+    out_num: &rxrpl_amount::number::Number,
+    skip_input_debit: bool,
+    skip_output_credit: bool,
+) -> Result<(), TransactionResult> {
+    // Input: source / previous-pool -> this pool.
+    if hop.in_xrp {
+        let drops = in_num.to_xrp_drops() as i64;
+        if !skip_input_debit {
+            let bal = helpers::get_balance(taker_acct) as i64 - drops;
+            if bal < 0 {
+                return Err(TransactionResult::TecUnfundedPayment);
+            }
+            helpers::set_balance(taker_acct, bal as u64);
+        }
+        credit_xrp(ctx, &hop.pool_id, drops)?;
+    } else {
+        if !skip_input_debit {
+            let funds =
+                crate::amm_helpers::iou_holding_number(ctx.view, taker, &hop.in_iss, &hop.in_cur);
+            crate::amm_helpers::set_iou_holding(
+                ctx.view,
+                taker,
+                &hop.in_iss,
+                &hop.in_cur,
+                &funds.sub(in_num),
+            )?;
+        }
+        let pool_h = crate::amm_helpers::iou_holding_number(
+            ctx.view,
+            &hop.pool_id,
+            &hop.in_iss,
+            &hop.in_cur,
+        );
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            &hop.pool_id,
+            &hop.in_iss,
+            &hop.in_cur,
+            &pool_h.add(in_num),
+        )?;
+    }
+    // Output: this pool -> dest / next pool.
+    if hop.out_xrp {
+        let drops = out_num.to_xrp_drops() as i64;
+        credit_xrp(ctx, &hop.pool_id, -drops)?;
+        if !skip_output_credit {
+            if dest == taker {
+                helpers::set_balance(taker_acct, helpers::get_balance(taker_acct) + drops as u64);
+            } else {
+                credit_xrp(ctx, dest, drops)?;
+            }
+        }
+    } else {
+        let pool_h = crate::amm_helpers::iou_holding_number(
+            ctx.view,
+            &hop.pool_id,
+            &hop.out_iss,
+            &hop.out_cur,
+        );
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            &hop.pool_id,
+            &hop.out_iss,
+            &hop.out_cur,
+            &pool_h.sub(out_num),
+        )?;
+        if !skip_output_credit {
+            let dest_h =
+                crate::amm_helpers::iou_holding_number(ctx.view, dest, &hop.out_iss, &hop.out_cur);
+            crate::amm_helpers::set_iou_holding(
+                ctx.view,
+                dest,
+                &hop.out_iss,
+                &hop.out_cur,
+                &dest_h.add(out_num),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// rippled `StrandFlow` output-limited case for a pure-AMM strand: reverse-price
+/// the chain from the demanded output back to the required source input
+/// (`swapAssetOut`, round IN up — rippled `DirectStep`/`BookStep` reverse pass),
+/// and — when that input fits `budget` — apply the exact per-hop amounts so the
+/// full `target_out` is delivered (`tesSUCCESS`). The intermediate amounts thread
+/// exactly (each hop's input equals the previous hop's output), reproducing
+/// rippled's reverse-rounded intermediates rather than the forward flow's
+/// (which round the other way and would over-produce, then strand `TecPathPartial`).
+///
+/// Returns `Ok(Some((delivered, spent)))` after mutating the ledger, or
+/// `Ok(None)` (no mutation) when any hop is not pure-AMM (a resting CLOB offer is
+/// present or no AMM pool exists), the pool cannot meet the demand, or the
+/// required input exceeds `budget` (input-limited). The caller's forward-only
+/// flow then handles those cases.
+fn reverse_clob_amounts(
+    ctx: &mut ApplyContext<'_>,
+    dest: &AccountId,
+    boundaries: &[Value],
+    target_out: &Leg,
+    limit_q: u64,
+) -> Option<Vec<Leg>> {
+    let n = boundaries.len();
+    if n < 3 {
+        return None;
+    }
+    // Cap dest demand at last-hop book size so a PartialPayment Amount larger
+    // than resting liquidity does not reverse-price a hop-0 take that then
+    // fails `legs_eq` (30000095 256D45D9: 601 USD Amount vs 9.84 USD offer).
+    let mut last_in = Leg::parse(&boundaries[n - 2])?;
+    let mut last_out = Leg::parse(&boundaries[n - 1])?;
+    for hop in (0..n - 1).rev() {
+        let hi = Leg::parse(&boundaries[hop])?;
+        let ho = Leg::parse(&boundaries[hop + 1])?;
+        if peek_best_book_quality(ctx.view, &hi, &ho).is_some() {
+            last_in = hi;
+            last_out = ho;
+            break;
+        }
+    }
+    let mut hop0_q = 0u64;
+    for hop in 0..n - 1 {
+        let hi = Leg::parse(&boundaries[hop])?;
+        let ho = Leg::parse(&boundaries[hop + 1])?;
+        if let Some(q) = peek_best_book_quality(ctx.view, &hi, &ho) {
+            hop0_q = q;
+            break;
+        }
+    }
+    let mut target = target_out.clone();
+    if let Some(mut avail) = peek_best_book_gets(ctx, &last_in, &last_out) {
+        // TakerGets is gross; dest Amount is net. Capping at Gets then
+        // re-grossing the last hop double-counts the issuer fee (30000095
+        // bitstamp TransferRate 1.002: 9.84 Gets -> 9.82 net).
+        if !avail.is_xrp && last_out.issuer != *dest {
+            let tr = transfer_rate(ctx, &last_out.issuer);
+            let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+            if tr > one {
+                avail.iou = IOUAmount::div_round(&avail.iou, &tr, false).unwrap_or(avail.iou);
+            }
+        }
+        if !leg_ge(&avail, &target) {
+            let mut skip = 1usize;
+            while !leg_ge(&avail, &target) && skip < 8 {
+                if limit_q != 0 {
+                    if let Some(pq) = peek_book_quality_skip(ctx.view, &last_in, &last_out, skip) {
+                        let cq = if hop0_q == 0 {
+                            pq
+                        } else {
+                            composed_quality(hop0_q, pq)
+                        };
+                        if cq > limit_q {
+                            break;
+                        }
+                    }
+                }
+                let Some(off) = peek_funded_offer_skip(ctx, &last_in, &last_out, skip) else {
+                    break;
+                };
+                let Some(g) = Leg::parse(&off["TakerGets"]) else {
+                    break;
+                };
+                avail = leg_add(&avail, &g);
+                skip += 1;
+            }
+            if !leg_ge(&avail, &target) {
+                target = avail;
+            }
+        }
+    }
+    let mut amts = vec![target];
+    let mut last_clob = true;
+    for hop in (0..n - 1).rev() {
+        let in_tmpl = Leg::parse(&boundaries[hop])?;
+        let out_tmpl = Leg::parse(&boundaries[hop + 1])?;
+        let Some(q) = peek_best_book_quality(ctx.view, &in_tmpl, &out_tmpl) else {
+            amts.insert(0, amts[0].clone());
+            continue;
+        };
+        let rate = rxrpl_amount::from_rate(q).ok()?;
+        if rate.is_zero() {
+            return None;
+        }
+        let is_last_clob = last_clob;
+        last_clob = false;
+        let mut out_need = amts[0].clone();
+        if is_last_clob && !out_tmpl.is_xrp && out_tmpl.issuer != *dest {
+            let tr = transfer_rate(ctx, &out_tmpl.issuer);
+            let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+            if tr > one {
+                out_need.iou = grossed(&out_need.iou, &tr);
+                // Exact 10 USD Gets (30000096): gross(net) is 1e15 * 10^-14.
+                // +1 ULP oversizes hop 0 by ~9 CNY ULPs. Leftover 9.84 (95)
+                // grosses to a different mantissa; keep the bump.
+                let recovered_ten = out_need.iou.mantissa() == 1_000_000_000_000_000
+                    && out_need.iou.exponent() == -14;
+                if !recovered_ten {
+                    if let Ok(bumped) = IOUAmount::from_parts(
+                        out_need.iou.mantissa() + 1,
+                        out_need.iou.exponent(),
+                        false,
+                    ) {
+                        out_need.iou = bumped;
+                    }
+                }
+            }
+        }
+        let mut in_need = in_for_out(&out_need, &rate, &in_tmpl);
+        // Reverse +1 ULP on last-hop Gets can price hop-0 CNY 1 ULP above
+        // TakerPays (30000099 0C0344E7). Cap at Pays so the last hop can
+        // spend the carry (else tecPATH_PARTIAL, payment deferred).
+        if is_last_clob {
+            if let Some(tip_gets) = peek_best_book_gets(ctx, &in_tmpl, &out_tmpl) {
+                if leg_ge(&tip_gets, &out_need) {
+                    if let Some(pays) = peek_best_book_pays(ctx, &in_tmpl, &out_tmpl) {
+                        if !leg_ge(&pays, &in_need) {
+                            in_need = pays;
+                        }
+                    }
+                } else {
+                    let mut acc = peek_best_book_pays(ctx, &in_tmpl, &out_tmpl)
+                        .unwrap_or_else(|| in_for_out(&tip_gets, &rate, &in_tmpl));
+                    let mut got = tip_gets.clone();
+                    let mut skip = 1usize;
+                    while !leg_ge(&got, &out_need) && skip < 8 {
+                        if limit_q != 0 {
+                            if let Some(pq) =
+                                peek_book_quality_skip(ctx.view, &in_tmpl, &out_tmpl, skip)
+                            {
+                                let cq = if hop0_q == 0 {
+                                    pq
+                                } else {
+                                    composed_quality(hop0_q, pq)
+                                };
+                                if cq > limit_q {
+                                    break;
+                                }
+                            }
+                        }
+                        let Some(off) = peek_funded_offer_skip(ctx, &in_tmpl, &out_tmpl, skip)
+                        else {
+                            break;
+                        };
+                        let Some(p) = Leg::parse(&off["TakerPays"]) else {
+                            break;
+                        };
+                        let Some(g) = Leg::parse(&off["TakerGets"]) else {
+                            break;
+                        };
+                        acc = leg_add(&acc, &p);
+                        got = leg_add(&got, &g);
+                        skip += 1;
+                    }
+                    in_need = acc;
+                    if !in_need.is_xrp {
+                        if let Ok(bumped) = IOUAmount::from_parts(
+                            in_need.iou.mantissa() + 1,
+                            in_need.iou.exponent(),
+                            false,
+                        ) {
+                            in_need.iou = bumped;
+                        }
+                    }
+                }
+            }
+        }
+        // Hop 0 may span several XLM/XRP qualities (30000103 70135FCE:
+        // 1446 XLM tip vs ~2258 needed). Price each page; remainder at
+        // the next band's offer amounts so reverse XRP is not short.
+        if hop == 0 {
+            if let Some(tip_gets) = peek_best_book_gets(ctx, &in_tmpl, &out_tmpl) {
+                if !leg_ge(&tip_gets, &out_need) {
+                    let mut acc = peek_best_book_pays(ctx, &in_tmpl, &out_tmpl)
+                        .unwrap_or_else(|| in_for_out(&tip_gets, &rate, &in_tmpl));
+                    let mut got = tip_gets.clone();
+                    let mut skip = 1usize;
+                    while !leg_ge(&got, &out_need) && skip < 8 {
+                        let Some(off) = peek_funded_offer_skip(ctx, &in_tmpl, &out_tmpl, skip)
+                        else {
+                            break;
+                        };
+                        let Some(g) = Leg::parse(&off["TakerGets"]) else {
+                            break;
+                        };
+                        let Some(p) = Leg::parse(&off["TakerPays"]) else {
+                            break;
+                        };
+                        let rem = leg_sub(&out_need, &got);
+                        if leg_ge(&g, &rem) {
+                            if let Some(q) =
+                                peek_book_quality_skip(ctx.view, &in_tmpl, &out_tmpl, skip)
+                            {
+                                if let Ok(r2) = rxrpl_amount::from_rate(q) {
+                                    if !r2.is_zero() {
+                                        acc = leg_add(&acc, &in_for_out_offer(&p, &rem, &g, &r2));
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        acc = leg_add(&acc, &p);
+                        got = leg_add(&got, &g);
+                        skip += 1;
+                    }
+                    in_need = acc;
+                }
+            }
+        }
+        if in_need.is_zero() {
+            return None;
+        }
+        amts.insert(0, in_need);
+    }
+    (amts.len() == n).then_some(amts)
+}
+
+fn reverse_amm_strand(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    boundaries: &[Value],
+    target_out: &Leg,
+    budget: &Leg,
+) -> Result<Option<(Value, Value)>, TransactionResult> {
+    use rxrpl_amount::number::Number;
+    let n = boundaries.len();
+    // Only multi-hop strands need the reverse pass: a single AMM hop already
+    // delivers byte-exactly through the forward `amm_hop` (output-limited per
+    // hop). Leave single-hop and degenerate chains to the forward flow.
+    if n < 3 {
+        return Ok(None);
+    }
+
+    // Gather a pure-AMM snapshot of every hop; bail to the forward flow on the
+    // first hop carrying a resting CLOB offer or lacking an AMM pool.
+    let mut hops: Vec<AmmHop> = Vec::with_capacity(n - 1);
+    for h in 0..(n - 1) {
+        let in_leg = Leg::parse(&boundaries[h]).ok_or(TransactionResult::TemBadAmount)?;
+        let out_leg = Leg::parse(&boundaries[h + 1]).ok_or(TransactionResult::TemBadAmount)?;
+        let inverse_book = keylet::book_dir(
+            &in_leg.currency,
+            &in_leg.issuer,
+            &out_leg.currency,
+            &out_leg.issuer,
+        );
+        if book_has_resting_offer(ctx, &inverse_book) {
+            return Ok(None);
+        }
+        let amm_key = keylet::amm(
+            &in_leg.currency,
+            &in_leg.issuer,
+            &out_leg.currency,
+            &out_leg.issuer,
+        );
+        let Some(amm_bytes) = ctx.view.read(&amm_key) else {
+            return Ok(None);
+        };
+        let Ok(amm): Result<Value, _> = serde_json::from_slice(&amm_bytes) else {
+            return Ok(None);
+        };
+        let Some(pool_str) = amm.get("Account").and_then(|v| v.as_str()) else {
+            return Ok(None);
+        };
+        let Ok(pool_id) = decode_account_id(pool_str) else {
+            return Ok(None);
+        };
+        let tfee = amm.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+        let pool_in = pool_balance_number(
+            ctx,
+            &pool_id,
+            in_leg.is_xrp,
+            &in_leg.currency,
+            &in_leg.issuer,
+        );
+        let pool_out = pool_balance_number(
+            ctx,
+            &pool_id,
+            out_leg.is_xrp,
+            &out_leg.currency,
+            &out_leg.issuer,
+        );
+        if pool_in.is_zero() || pool_out.is_zero() {
+            return Ok(None);
+        }
+        hops.push(AmmHop {
+            pool_id,
+            in_xrp: in_leg.is_xrp,
+            out_xrp: out_leg.is_xrp,
+            in_cur: in_leg.currency,
+            in_iss: in_leg.issuer,
+            out_cur: out_leg.currency,
+            out_iss: out_leg.issuer,
+            tfee,
+            pool_in,
+            pool_out,
+        });
+    }
+
+    // Reverse pass: thread the demanded output back to the source input. Each
+    // hop's required input becomes the previous hop's demanded output.
+    let mut ins: Vec<Number> = vec![Number::ZERO; n - 1];
+    let mut outs: Vec<Number> = vec![Number::ZERO; n - 1];
+    let mut out_num = leg_to_number(target_out);
+    for h in (0..(n - 1)).rev() {
+        let hop = &hops[h];
+        let in_num = match crate::amm_helpers::swap_asset_out(
+            &hop.pool_in,
+            &hop.pool_out,
+            &out_num,
+            hop.tfee,
+            hop.in_xrp,
+        ) {
+            Some(v) if !v.is_zero() && !v.negative() => v,
+            // Pool can't deliver the demand -> not output-limited; the forward
+            // flow handles the (partial) input-limited case.
+            _ => return Ok(None),
+        };
+        outs[h] = out_num;
+        ins[h] = in_num;
+        out_num = in_num;
+    }
+
+    // Output binds only when the required source input fits the budget; a larger
+    // requirement means the strand is input-limited (forward flow handles it).
+    // Compare at the Leg grid (drops / IOU mantissa) rather than via `Number`
+    // subtraction, which panics on an exact-zero difference (in == budget).
+    let in0_leg = number_to_leg(&ins[0], budget);
+    if !leg_ge(budget, &in0_leg) {
+        return Ok(None);
+    }
+
+    // Apply each hop with its exact reverse-computed (in, out): the first hop
+    // debits the source, the last credits `dest`, interior hops move the shared
+    // intermediate asset between adjacent pools.
+    for h in 0..(n - 1) {
+        let hop = &hops[h];
+        apply_amm_move(
+            ctx,
+            taker,
+            taker_acct,
+            dest,
+            hop,
+            &ins[h],
+            &outs[h],
+            /*skip_input_debit=*/ h != 0,
+            /*skip_output_credit=*/ h != n - 2,
+        )?;
+    }
+
+    let spent_leg = number_to_leg(&ins[0], budget);
+    let delivered_leg = number_to_leg(&outs[n - 2], target_out);
+    Ok(Some((
+        delivered_leg.with_amount(&delivered_leg.iou, delivered_leg.drops),
+        spent_leg.with_amount(&spent_leg.iou, spent_leg.drops),
+    )))
+}
+
+// ===========================================================================
+// Multi-path Flow (rippled `Flow` + `AMMLiquidity` fib-chunked AMM consumption)
+// ===========================================================================
+//
+// When two or more strands are live, rippled consumes a shared AMM pool in
+// *fibonacci-sized synthetic offers* (one per multi-pass iteration) clamped to
+// the competing CLOB quality, instead of one full output-limited swap. This is
+// the difference between over-delivering (one swap) and the byte-exact chunked
+// total rippled produces. The fib sizing + per-chunk quality clamp live in
+// `super::flow`; the actual pool/holding mutation reuses `apply_amm_move` and
+// the CLOB walk reuses `cross_book_hop` verbatim.
+
+use super::flow::{AmmContext, AmmLiquidity};
+use rxrpl_amount::number::Number;
+
+/// rippled `Flow` loop bounds (StrandFlow.h).
+const FLOW_MAX_TRIES: u32 = 1000;
+const FLOW_MAX_OFFERS: u32 = 1500;
+
+/// One hop of a resolved strand: the in→out boundary pair plus the AMM pool
+/// (if any) and whether the book carries resting CLOB offers.
+pub(crate) struct FlowHop {
+    in_leg: Leg,
+    out_leg: Leg,
+    inverse_book: Hash256,
+    has_clob: bool,
+    /// AMM pool pseudo-account + trading fee, when a pool exists for the pair.
+    amm_pool: Option<AccountId>,
+    amm_tfee: u16,
+    /// Frozen initial-pool snapshot for the fib seed (held stable for the whole
+    /// payment); the live balances are refetched each pass.
+    liquidity: Option<AmmLiquidity>,
+}
+
+/// A resolved strand = an ordered boundary chain of hops.
+pub(crate) struct FlowStrand {
+    hops: Vec<FlowHop>,
+}
+
+/// The realised result of executing one pass of a strand.
+struct StrandPass {
+    in_amt: Number,
+    out_amt: Number,
+    offers_used: u32,
+}
+
+/// The best-page (tip) quality of an order book, or `None` when empty.
+fn book_tip_quality(ctx: &ApplyContext<'_>, inverse_book: &Hash256) -> Option<u64> {
+    let probe = book_dir_with_quality(inverse_book, 0);
+    let dir_key = ctx.view.succ(&probe)?;
+    if dir_key.as_bytes()[0..24] != inverse_book.as_bytes()[0..24] {
+        return None;
+    }
+    Some(u64::from_be_bytes(
+        dir_key.as_bytes()[24..32].try_into().unwrap(),
+    ))
+}
+
+/// Build a strand from a boundary chain, snapshotting each hop's AMM pool (with
+/// its frozen initial balances) and CLOB presence. Returns `None` if any hop has
+/// neither an AMM pool nor a resting offer (a dead hop).
+pub(crate) fn build_flow_strand(
+    ctx: &ApplyContext<'_>,
+    boundaries: &[Value],
+) -> Option<FlowStrand> {
+    let n = boundaries.len();
+    if n < 2 {
+        return None;
+    }
+    let mut hops = Vec::with_capacity(n - 1);
+    for h in 0..(n - 1) {
+        let in_leg = Leg::parse(&boundaries[h])?;
+        let out_leg = Leg::parse(&boundaries[h + 1])?;
+        let inverse_book = keylet::book_dir(
+            &in_leg.currency,
+            &in_leg.issuer,
+            &out_leg.currency,
+            &out_leg.issuer,
+        );
+        let has_clob = book_has_resting_offer(ctx, &inverse_book);
+
+        let amm_key = keylet::amm(
+            &in_leg.currency,
+            &in_leg.issuer,
+            &out_leg.currency,
+            &out_leg.issuer,
+        );
+        let (amm_pool, amm_tfee, liquidity) = match ctx
+            .view
+            .read(&amm_key)
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        {
+            Some(amm) => {
+                let pool_id = amm
+                    .get("Account")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| decode_account_id(s).ok());
+                let tfee = amm.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+                match pool_id {
+                    Some(pid) => {
+                        let pool_in = pool_balance_number(
+                            ctx,
+                            &pid,
+                            in_leg.is_xrp,
+                            &in_leg.currency,
+                            &in_leg.issuer,
+                        );
+                        let pool_out = pool_balance_number(
+                            ctx,
+                            &pid,
+                            out_leg.is_xrp,
+                            &out_leg.currency,
+                            &out_leg.issuer,
+                        );
+                        if pool_in.is_zero() || pool_out.is_zero() {
+                            (None, 0, None)
+                        } else {
+                            (
+                                Some(pid),
+                                tfee,
+                                Some(AmmLiquidity {
+                                    in_is_xrp: in_leg.is_xrp,
+                                    out_is_xrp: out_leg.is_xrp,
+                                    tfee,
+                                    initial_pool_in: pool_in,
+                                    initial_pool_out: pool_out,
+                                }),
+                            )
+                        }
+                    }
+                    None => (None, 0, None),
+                }
+            }
+            None => (None, 0, None),
+        };
+
+        // NOTE: a hop with neither an AMM pool nor a resting CLOB offer is a
+        // *dry* hop — the strand cannot deliver — but the strand is still
+        // syntactically valid and its PRESENCE keeps `multi_path > 1`, which is
+        // what triggers rippled's fib-chunked AMM consumption on the OTHER live
+        // strand. So we keep it (it simply returns no delivery each pass) rather
+        // than dropping it (which would collapse a multi-path payment to a
+        // single full swap).
+        hops.push(FlowHop {
+            in_leg,
+            out_leg,
+            inverse_book,
+            has_clob,
+            amm_pool,
+            amm_tfee,
+            liquidity,
+        });
+    }
+    Some(FlowStrand { hops })
+}
+
+/// A strand's a-priori quality upper bound as a `Number` rate (in/out, lower is
+/// better): the product of each hop's best-possible rate. Composing left→right,
+/// the intermediate magnitudes cancel so the product is the overall
+/// input-per-output rate. Used to rank live strands best-first each pass (rippled
+/// `StrandFlow.h:444-496` -> `BookStep::qualityUpperBound` -> `getTipQuality`).
+///
+/// Each hop's rate is the better of its CLOB tip and its AMM offer. The AMM
+/// contribution is the *fib-offer* quality (`getAMMOffer(nullopt).quality()`,
+/// which folds in the trading fee and the chunk's price impact for the CURRENT
+/// `amm_ctx` iteration), NOT the raw spot price — the raw spot over-ranks a
+/// pure-AMM strand and flips the first-survivor pick (StrandFlow `getTipQuality`,
+/// go-xrpl `step_book.go:869`).
+fn strand_quality_ub(ctx: &ApplyContext<'_>, strand: &FlowStrand, amm_ctx: &AmmContext) -> Number {
+    let mut rate = Number::from_int(1);
+    for hop in &strand.hops {
+        // AMM fib-offer quality for this iteration (fee + impact), as rippled's
+        // `getTipQuality` uses `getAMMOffer(nullopt).quality()`.
+        let amm_rate = match (hop.liquidity.as_ref(), hop.amm_pool.as_ref()) {
+            (Some(liq), Some(pool)) => {
+                let pin = pool_balance_number(
+                    ctx,
+                    pool,
+                    hop.in_leg.is_xrp,
+                    &hop.in_leg.currency,
+                    &hop.in_leg.issuer,
+                );
+                let pout = pool_balance_number(
+                    ctx,
+                    pool,
+                    hop.out_leg.is_xrp,
+                    &hop.out_leg.currency,
+                    &hop.out_leg.issuer,
+                );
+                liq.get_offer(&pin, &pout, None, amm_ctx)
+                    .and_then(|o| from_rate(o.quality).ok())
+                    .map(|r| Number::from_iou(&r))
+            }
+            _ => None,
+        };
+        // CLOB best-tip rate (in/out) from the book directory quality.
+        let clob_rate = book_tip_quality(ctx, &hop.inverse_book)
+            .and_then(|q| from_rate(q).ok())
+            .map(|r| Number::from_iou(&r));
+        let hop_rate = match (amm_rate, clob_rate) {
+            (Some(a), Some(c)) => {
+                if num_le(&a, &c) {
+                    a
+                } else {
+                    c
+                }
+            }
+            (Some(a), None) => a,
+            (None, Some(c)) => c,
+            (None, None) => Number::from_int(1),
+        };
+        rate = rate.mul(&hop_rate);
+    }
+    rate
+}
+
+/// Sum a slice of `Number`s smallest-magnitude first (rippled
+/// `StrandFlow.h:619-624`): never a running subtraction. Stable accumulation
+/// keeps the byte-exact total independent of pass order.
+fn sum_smallest_to_largest(v: &[Number]) -> Number {
+    let mut sorted: Vec<Number> = v.to_vec();
+    sorted.sort_by(|a, b| {
+        let d = a.sub(b);
+        if d.is_zero() {
+            std::cmp::Ordering::Equal
+        } else if d.negative() {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        }
+    });
+    let mut acc = Number::ZERO;
+    for n in &sorted {
+        acc = acc.add(n);
+    }
+    acc
+}
+
+/// `a >= b` for two `Number`s.
+fn num_ge(a: &Number, b: &Number) -> bool {
+    !num_gt(b, a)
+}
+
+/// Snapshot a hop's AMM pool as an [`AmmHop`] at the current (live) balances.
+fn hop_amm_snapshot(ctx: &ApplyContext<'_>, hop: &FlowHop) -> Option<(AmmHop, Number, Number)> {
+    let pool = hop.amm_pool.as_ref()?;
+    let pool_in = pool_balance_number(
+        ctx,
+        pool,
+        hop.in_leg.is_xrp,
+        &hop.in_leg.currency,
+        &hop.in_leg.issuer,
+    );
+    let pool_out = pool_balance_number(
+        ctx,
+        pool,
+        hop.out_leg.is_xrp,
+        &hop.out_leg.currency,
+        &hop.out_leg.issuer,
+    );
+    let amm_hop = AmmHop {
+        pool_id: *pool,
+        in_xrp: hop.in_leg.is_xrp,
+        out_xrp: hop.out_leg.is_xrp,
+        in_cur: hop.in_leg.currency,
+        in_iss: hop.in_leg.issuer,
+        out_cur: hop.out_leg.currency,
+        out_iss: hop.out_leg.issuer,
+        tfee: hop.amm_tfee,
+        pool_in,
+        pool_out,
+    };
+    Some((amm_hop, pool_in, pool_out))
+}
+
+/// Price one CLOB tip band in the reverse direction: how much input the resting
+/// offers need to deliver `demanded` output, and what they actually deliver
+/// (`min(band capacity, demanded)`). The walk mutates the view (consumes /
+/// reaps offers) so it runs on a checkpoint that is immediately rolled back; the
+/// forward pass re-walks and commits the real consumption. Returns
+/// `(input_needed, output_delivered)` as `Number`s, or `None` when the band is
+/// dry. The `skip_*` flags mirror the forward application so the grossed/netted
+/// transfer-fee amounts match.
+#[allow(clippy::too_many_arguments)]
+fn price_clob_band_reverse(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    hop: &FlowHop,
+    demanded: &Number,
+    is_first: bool,
+    is_last: bool,
+) -> Option<(Number, Number)> {
+    let demand_leg = number_to_leg(demanded, &hop.out_leg);
+    let budget_leg = unbounded_leg(&hop.in_leg);
+    let cp = ctx.view.checkpoint();
+    let res = cross_book_hop(
+        ctx,
+        taker,
+        taker_acct,
+        dest,
+        &demand_leg,
+        &budget_leg,
+        /*skip_input_debit=*/ !is_first,
+        /*skip_output_credit=*/ !is_last,
+        /*single_band=*/ true,
+        /*lq_stop=*/ None,
+    );
+    ctx.view.rollback(cp);
+    let (delivered, spent) = res.ok()?;
+    if delivered.is_zero() || spent.is_zero() {
+        return None;
+    }
+    Some((leg_to_number(&spent), leg_to_number(&delivered)))
+}
+
+/// Execute ONE pass of a (multi-hop, AMM and/or CLOB) strand with rippled's
+/// reverse-then-forward `StrandFlow` algorithm (StrandFlow.h:80-281).
+///
+/// Each hop consumes ONE quality band per pass. rippled's `BookStep` tries the
+/// AMM FIRST at the CLOB tip quality ([`AmmLiquidity::get_offer`]); the AMM
+/// declines (returns `None`) when its fib chunk is no better than the resting
+/// book, and the band is then filled by the CLOB tip alone (a one-band
+/// [`cross_book_hop`] walk). A pure-AMM hop is the fib chunk; a pure-CLOB hop is
+/// the tip band; a dry hop (neither) fails the strand this pass.
+///
+/// **Reverse pass**: from the demanded strand output `remaining_out`, pull the
+/// demand back through every hop. An AMM hop's chunk is clamped to the demand via
+/// `limit_out`; a CLOB hop is priced by a one-band `cross_book_hop` on a
+/// checkpoint that is immediately rolled back. The chunk/band's required input
+/// becomes the upstream hop's demand. The hop whose band cannot meet the
+/// back-propagated demand is the *limiting step*. The source (hop 0) is also
+/// limited when its required input exceeds the `remaining_in` budget.
+///
+/// **Forward pass** (mutates the checkpointed view): hops `0..=limiting` keep
+/// their reverse-priced amounts (which already thread — each hop's output equals
+/// the next hop's input); hops past the limiting step are re-priced forward
+/// against the reduced carry (AMM via `limit_in`, CLOB by an input-limited
+/// one-band walk), so the intermediate asset is conserved exactly. The AMM
+/// mutation reuses [`apply_amm_move`]; the CLOB mutation/reap reuses
+/// [`cross_book_hop`]. The SHARED `amm_ctx` threads `curIters` across all AMM
+/// hops of the strand.
+///
+/// Returns the realised `(source-in, delivered-out)`, or `None` when the strand
+/// cannot deliver this pass (a pool is frozen, a hop is dry, or the demand cannot
+/// be priced).
+#[allow(clippy::too_many_arguments)]
+fn execute_strand_pass(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    strand: &FlowStrand,
+    remaining_in: &Number,
+    remaining_out: &Number,
+    amm_ctx: &mut AmmContext,
+) -> Option<StrandPass> {
+    let trace = std::env::var("RXRPL_FLOW_TRACE").is_ok();
+    let n = strand.hops.len();
+    if n == 0 {
+        return None;
+    }
+
+    // Per-hop AMM snapshot (live pool balances at the start of this pass), or
+    // `None` for a pure-CLOB hop. A hop with neither AMM nor CLOB is dry.
+    let mut amm_hops: Vec<Option<AmmHop>> = Vec::with_capacity(n);
+    for hop in &strand.hops {
+        amm_hops.push(hop_amm_snapshot(ctx, hop).map(|(a, _, _)| a));
+    }
+
+    // Whether a hop consumes its AMM fib chunk this pass, or its CLOB tip band.
+    // rippled's `BookStep` tries the AMM FIRST at the CLOB tip quality; the AMM
+    // declines (`get_offer` -> None) when it is no better than the book, and the
+    // band is then filled by the resting CLOB offers alone.
+    #[derive(Clone, Copy, PartialEq)]
+    enum HopKindR {
+        Amm,
+        Clob,
+    }
+
+    // --- REVERSE PASS: back-propagate the demand, find the limiting step. ---
+    let mut ins: Vec<Number> = vec![Number::ZERO; n];
+    let mut outs: Vec<Number> = vec![Number::ZERO; n];
+    let mut kinds: Vec<HopKindR> = vec![HopKindR::Amm; n];
+    // The lowest-index hop whose band cannot meet the demand pulled back to it;
+    // `n` means "no interior limit" (only the source budget may bind).
+    let mut limiting = n;
+    let mut demanded = *remaining_out;
+    for h in (0..n).rev() {
+        let hop = &strand.hops[h];
+        let is_first = h == 0;
+        let is_last = h == n - 1;
+        let clob_quality = book_tip_quality(ctx, &hop.inverse_book);
+
+        // Try the AMM fib chunk first, gated to the CLOB tip quality.
+        let amm_offer = match (hop.liquidity.as_ref(), amm_hops[h].as_ref()) {
+            (Some(liq), Some(amm)) => {
+                liq.get_offer(&amm.pool_in, &amm.pool_out, clob_quality, amm_ctx)
+            }
+            _ => None,
+        };
+
+        if let Some(offer) = amm_offer {
+            kinds[h] = HopKindR::Amm;
+            if num_ge(&offer.out_num, &demanded) {
+                // The chunk covers the demand: clamp output to demand at constant
+                // quality (`ceilOutStrict`, round the cost up).
+                let (i, o) = offer.limit_out(&demanded, true);
+                ins[h] = i;
+                outs[h] = o;
+            } else {
+                // The chunk is smaller than the demand: this hop limits the pass.
+                ins[h] = offer.in_num;
+                outs[h] = offer.out_num;
+                limiting = h;
+            }
+        } else if clob_quality.is_some() {
+            // AMM declined (or absent) but the book has resting offers: price the
+            // CLOB tip band for the demand pulled to this hop. Done on a
+            // checkpoint that is rolled back — the forward pass re-runs the walk
+            // and commits the offer consumption / reaps.
+            kinds[h] = HopKindR::Clob;
+            let (i, o) = price_clob_band_reverse(
+                ctx, taker, taker_acct, dest, hop, &demanded, is_first, is_last,
+            )?;
+            ins[h] = i;
+            outs[h] = o;
+            // The band delivered less than demanded -> this hop limits the pass.
+            if num_gt(&demanded, &o) {
+                limiting = h;
+            }
+        } else {
+            // Dry hop: neither AMM liquidity nor a resting CLOB offer.
+            return None;
+        }
+        if ins[h].is_zero() || outs[h].is_zero() || ins[h].negative() {
+            return None;
+        }
+        demanded = ins[h];
+    }
+
+    // The source (hop 0) is input-limited when its required input exceeds the
+    // remaining SendMax budget: drive it forward from the budget instead.
+    let source_capped = num_gt(&ins[0], remaining_in);
+    if source_capped {
+        limiting = 0;
+    }
+
+    // --- FORWARD PASS: apply, threading the intermediate so it conserves. ---
+    let mut source_in = ins[0];
+    let mut carry = Number::ZERO;
+    for h in 0..n {
+        let hop = &strand.hops[h];
+        let is_first = h == 0;
+        let is_last = h == n - 1;
+        let clob_q = book_tip_quality(ctx, &hop.inverse_book);
+
+        match kinds[h] {
+            HopKindR::Amm => {
+                let amm = amm_hops[h].as_ref()?;
+                let (in_num, out_num) = if is_first && source_capped {
+                    // Source-limited: re-price hop 0 forward from the budget.
+                    let liq = hop.liquidity.as_ref()?;
+                    let offer = liq.get_offer(&amm.pool_in, &amm.pool_out, clob_q, amm_ctx)?;
+                    offer.limit_in(remaining_in, false)
+                } else if h <= limiting {
+                    // Reverse-priced; conserved by construction (outs[h-1] == ins[h]).
+                    (ins[h], outs[h])
+                } else {
+                    // Past the limiting step: re-price forward against the reduced
+                    // carry (`limitStepIn`, round the output down), keeping quality.
+                    let liq = hop.liquidity.as_ref()?;
+                    let offer = liq.get_offer(&amm.pool_in, &amm.pool_out, clob_q, amm_ctx)?;
+                    if num_ge(&offer.in_num, &carry) {
+                        offer.limit_in(&carry, false)
+                    } else {
+                        (offer.in_num, offer.out_num)
+                    }
+                };
+                if in_num.is_zero() || out_num.is_zero() || in_num.negative() || out_num.negative()
+                {
+                    return None;
+                }
+                // Conservation: an interior hop takes exactly what the previous hop
+                // delivered (`carry`); otherwise the intermediate does not balance.
+                let in_num = if is_first { in_num } else { carry };
+                apply_amm_move(
+                    ctx, taker, taker_acct, dest, amm, &in_num, &out_num,
+                    /*skip_input_debit=*/ !is_first, /*skip_output_credit=*/ !is_last,
+                )
+                .ok()?;
+                amm_ctx.set_amm_used();
+                if trace {
+                    eprintln!(
+                        "[flow]     hop{h} AMM in={} out={} (iter={} limiting={limiting})",
+                        in_num.to_iou().to_decimal_string(),
+                        out_num.to_iou().to_decimal_string(),
+                        amm_ctx.cur_iters(),
+                    );
+                }
+                if is_first {
+                    source_in = in_num;
+                }
+                carry = out_num;
+            }
+            HopKindR::Clob => {
+                // Drive the CLOB band: at/below the limiting step deliver the
+                // reverse-priced output; above it (or source-capped) drive by the
+                // available input (`BookStep::fwd`, input-limited).
+                let (demand_leg, budget_leg) = if is_first && source_capped {
+                    (
+                        unbounded_leg(&hop.out_leg),
+                        number_to_leg(remaining_in, &hop.in_leg),
+                    )
+                } else if h <= limiting {
+                    let budget = if is_first {
+                        number_to_leg(&ins[0], &hop.in_leg)
+                    } else {
+                        unbounded_leg(&hop.in_leg)
+                    };
+                    (number_to_leg(&outs[h], &hop.out_leg), budget)
+                } else {
+                    (
+                        unbounded_leg(&hop.out_leg),
+                        number_to_leg(&carry, &hop.in_leg),
+                    )
+                };
+                let (delivered, spent) = cross_book_hop(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    dest,
+                    &demand_leg,
+                    &budget_leg,
+                    /*skip_input_debit=*/ !is_first,
+                    /*skip_output_credit=*/ !is_last,
+                    /*single_band=*/ true,
+                    /*lq_stop=*/ None,
+                )
+                .ok()?;
+                if delivered.is_zero() || spent.is_zero() {
+                    return None;
+                }
+                if trace {
+                    eprintln!(
+                        "[flow]     hop{h} CLOB in={} out={} (limiting={limiting})",
+                        leg_to_number(&spent).to_iou().to_decimal_string(),
+                        leg_to_number(&delivered).to_iou().to_decimal_string(),
+                    );
+                }
+                if is_first {
+                    source_in = leg_to_number(&spent);
+                }
+                carry = leg_to_number(&delivered);
+            }
+        }
+    }
+
+    if source_in.is_zero() || carry.is_zero() {
+        return None;
+    }
+    Some(StrandPass {
+        in_amt: source_in,
+        out_amt: carry,
+        offers_used: 0,
+    })
+}
+
+/// rippled `Flow` multi-pass loop (sorted / first-survivor, `fixFlowSortStrands`
+/// active). Each pass ranks the live strands best-quality-first, recomputes the
+/// `multi_path` toggle from the live count, then picks the FIRST strand that
+/// delivers (checkpointing before each trial, rolling back failed ones, keeping
+/// the winner's mutation). `amm_ctx` is cleared per trial and advanced once per
+/// committed winner — this drives the fib index. Remaining in/out are always
+/// recomputed via `sum_smallest_to_largest`, never a running subtraction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn flow_multi(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    strands: &[FlowStrand],
+    deliver_req: &Number,
+    send_max: &Number,
+    amm_ctx: &mut AmmContext,
+) -> (Number, Number) {
+    let trace = std::env::var("RXRPL_FLOW_TRACE").is_ok();
+    if trace {
+        eprintln!(
+            "[flow] ENTER strands={} deliver_req={} send_max={}",
+            strands.len(),
+            deliver_req.to_iou().to_decimal_string(),
+            send_max.to_iou().to_decimal_string(),
+        );
+        for (si, s) in strands.iter().enumerate() {
+            let desc: Vec<String> = s
+                .hops
+                .iter()
+                .map(|h| format!("amm={} clob={}", h.amm_pool.is_some(), h.has_clob))
+                .collect();
+            eprintln!(
+                "[flow]   strand {si}: {} hops [{}]",
+                s.hops.len(),
+                desc.join(" | ")
+            );
+        }
+    }
+    let mut saved_ins: Vec<Number> = Vec::new();
+    let mut saved_outs: Vec<Number> = Vec::new();
+    let mut offers_considered = 0u32;
+
+    for cur_try in 0..FLOW_MAX_TRIES {
+        let remaining_out = {
+            let d = deliver_req.sub(&sum_smallest_to_largest(&saved_outs));
+            if d.is_zero() || d.negative() {
+                break;
+            }
+            d
+        };
+        let remaining_in = {
+            let r = send_max.sub(&sum_smallest_to_largest(&saved_ins));
+            if r.is_zero() || r.negative() {
+                break;
+            }
+            r
+        };
+
+        // (A) activateNext: rank ALL strands best-quality-first each pass.
+        //
+        // Unlike rippled's `ActiveStrands` (which drops a strand once its rev
+        // pass returns dry, shrinking the active set), we keep every strand live
+        // for the whole payment. A strand that delivers nothing this pass simply
+        // loses the first-survivor race, but its PRESENCE keeps `multi_path > 1`
+        // — which is what sustains the fib-chunked AMM consumption across all
+        // passes (a shared AMM first hop drains in fib increments only while two
+        // or more strands are live). Dropping the dry strand would collapse the
+        // payment to a single full swap (over-delivery).
+
+        let mut cur: Vec<usize> = (0..strands.len()).collect();
+        if cur.len() > 1 {
+            cur.sort_by(|&a, &b| {
+                let ra = strand_quality_ub(ctx, &strands[a], amm_ctx);
+                let rb = strand_quality_ub(ctx, &strands[b], amm_ctx);
+                let d = ra.sub(&rb);
+                if d.is_zero() {
+                    std::cmp::Ordering::Equal
+                } else if d.negative() {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            });
+        }
+        if cur.is_empty() {
+            break;
+        }
+        if trace {
+            let qs: Vec<String> = cur
+                .iter()
+                .map(|&i| {
+                    format!(
+                        "s{i}={}",
+                        strand_quality_ub(ctx, &strands[i], amm_ctx)
+                            .to_iou()
+                            .to_decimal_string()
+                    )
+                })
+                .collect();
+            eprintln!("[flow]   try={cur_try} rank [{}]", qs.join(" "));
+        }
+        // (B) multiPath toggle, from the live strand count (seeded at setup like
+        // rippled `Flow.cpp:106` = `strands.size() > 1`).
+        amm_ctx.set_multi_path(cur.len() > 1);
+
+        // (D) pick the FIRST surviving strand (checkpoint per trial; roll back
+        // losers; keep the winner's mutation).
+        let mut winner: Option<(usize, StrandPass)> = None;
+        for &si in cur.iter() {
+            let cp = ctx.view.checkpoint();
+            amm_ctx.clear();
+            match execute_strand_pass(
+                ctx,
+                taker,
+                taker_acct,
+                dest,
+                &strands[si],
+                &remaining_in,
+                &remaining_out,
+                amm_ctx,
+            ) {
+                Some(res) if !res.out_amt.is_zero() => {
+                    offers_considered += res.offers_used;
+                    winner = Some((si, res));
+                    break;
+                }
+                other => {
+                    if let Some(r) = other {
+                        offers_considered += r.offers_used;
+                    }
+                    if trace {
+                        eprintln!("[flow]   try={cur_try} strand={si} FAILED pass");
+                    }
+                    ctx.view.rollback(cp);
+                }
+            }
+        }
+
+        let Some((si, res)) = winner else {
+            break;
+        };
+        if trace {
+            eprintln!(
+                "[flow] try={cur_try} strand={si} multi={} amm_iter={} in={} out={}",
+                amm_ctx.multi_path(),
+                amm_ctx.cur_iters(),
+                res.in_amt.to_iou().to_decimal_string(),
+                res.out_amt.to_iou().to_decimal_string(),
+            );
+        }
+        saved_ins.push(res.in_amt);
+        saved_outs.push(res.out_amt);
+        // (E) advance the fib counter once per committed winner.
+        amm_ctx.update();
+
+        if offers_considered >= FLOW_MAX_OFFERS {
+            break;
+        }
+    }
+
+    (
+        sum_smallest_to_largest(&saved_outs),
+        sum_smallest_to_largest(&saved_ins),
+    )
+}
+
+/// `a + b` for like-typed legs (same asset).
+fn leg_add(a: &Leg, b: &Leg) -> Leg {
+    let mut out = a.clone();
+    if a.is_xrp {
+        out.drops = a.drops + b.drops;
+    } else {
+        out.iou = IOUAmount::add(&a.iou, &b.iou).unwrap_or(a.iou);
+    }
+    out
 }
 
 /// A leg's magnitude as an IOUAmount for quality math (drops become an integer).
@@ -904,6 +4226,41 @@ fn leg_ge(a: &Leg, b: &Leg) -> bool {
     }
 }
 
+/// True when `part` is below one ULP of a 16-digit `whole` (STAmount). 30000020
+/// IOC 4F0BD7AA leftover 1e-14 EUR on a 50 EUR offer; mainnet stores 0 and reaps.
+fn remaining_is_filled(remaining: &Leg, demand: &Leg) -> bool {
+    remaining_is_filled_at(remaining, demand, -30)
+}
+
+fn remaining_is_filled_at(remaining: &Leg, demand: &Leg, max_exp: i32) -> bool {
+    if remaining.is_zero() {
+        return true;
+    }
+    if remaining.is_xrp || demand.is_xrp || demand.is_zero() {
+        return false;
+    }
+    IOUAmount::divide(&remaining.iou, &demand.iou)
+        .map(|q| q.exponent() <= max_exp)
+        .unwrap_or(false)
+}
+
+fn leftover_is_dust(part: &Leg, whole: &Leg) -> bool {
+    if part.is_zero() {
+        return true;
+    }
+    if part.is_xrp || whole.is_xrp || whole.is_zero() {
+        return false;
+    }
+    match IOUAmount::divide(&part.iou, &whole.iou) {
+        Ok(q) => q.is_zero() || q.exponent() <= -16,
+        Err(_) => false,
+    }
+}
+
+fn hop_out_done(remaining: &Leg, demand: &Leg) -> bool {
+    remaining.is_zero() || remaining_is_filled(remaining, demand)
+}
+
 /// `a - b` for like-typed legs (same currency).
 fn leg_sub(a: &Leg, b: &Leg) -> Leg {
     let mut out = a.clone();
@@ -928,6 +4285,18 @@ fn leg_sub_round(a: &Leg, b: &Leg) -> Leg {
     out
 }
 
+/// Resting-offer leftover after a partial take. Pre-`fixUniversalNumber` STAmount
+/// subtraction truncates; post-amendment Number rounds to nearest. Ledger
+/// 30000008's leftover TakerPays is one ULP higher under truncation
+/// (`2.512242529714367` vs `…366`).
+fn leftover_leg(a: &Leg, b: &Leg, number_switchover: bool) -> Leg {
+    if number_switchover {
+        leg_sub_round(a, b)
+    } else {
+        leg_sub(a, b)
+    }
+}
+
 /// Move the taker's input to the offer owner: XRP via balances, IOU via the
 /// grossed trust-line debit / net credit.
 fn pay_in(
@@ -937,25 +4306,47 @@ fn pay_in(
     owner: &AccountId,
     amount: &Leg,
     round: bool,
+    skip_taker_debit: bool,
 ) -> Result<(), TransactionResult> {
     if amount.is_xrp {
-        let bal = helpers::get_balance(taker_acct) as i64 - amount.drops;
-        if bal < 0 {
-            return Err(TransactionResult::TecUnfundedOffer);
+        if !skip_taker_debit {
+            let bal = helpers::get_balance(taker_acct) as i64 - amount.drops;
+            if bal < 0 {
+                return Err(TransactionResult::TecUnfundedOffer);
+            }
+            helpers::set_balance(taker_acct, bal as u64);
         }
-        helpers::set_balance(taker_acct, bal as u64);
         return credit_xrp(ctx, owner, amount.drops);
     }
-    let rate = transfer_rate(ctx, &amount.issuer);
-    let gross = grossed(&amount.iou, &rate);
-    credit_line(
-        ctx,
-        taker,
-        &amount.issuer,
-        &amount.currency,
-        &gross.negate(),
-        round,
-    )?;
+    if !skip_taker_debit {
+        let rate = transfer_rate(ctx, &amount.issuer);
+        let gross = grossed(&amount.iou, &rate);
+        credit_line(
+            ctx,
+            taker,
+            &amount.issuer,
+            &amount.currency,
+            &gross.negate(),
+            round,
+        )?;
+    }
+    if owner != &amount.issuer {
+        let tl_key = keylet::trust_line(owner, &amount.issuer, &amount.currency);
+        if ctx.view.read(&tl_key).is_none() {
+            let owner_key = keylet::account(owner);
+            let ob = ctx
+                .view
+                .read(&owner_key)
+                .ok_or(TransactionResult::TefInternal)?;
+            let mut oacct: Value =
+                serde_json::from_slice(&ob).map_err(|_| TransactionResult::TefInternal)?;
+            create_iou_trust_line(ctx, owner, &mut oacct, &amount.issuer, &amount.currency)?;
+            let nb = serde_json::to_vec(&oacct).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(owner_key, nb)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
+    }
     credit_line(
         ctx,
         owner,
@@ -972,6 +4363,12 @@ fn pay_in(
 /// (the caller's working copy) so the apply's final account write does not
 /// clobber it; a distinct recipient (cross-currency payment to another account)
 /// is credited through the view instead.
+///
+/// This is the legacy Taker (OfferCreate crossing) path: `amount` is the NET
+/// the recipient receives and the offer's TakerGets reduction, while the owner
+/// is unconditionally debited the grossed-up amount (`amount * transfer_rate`).
+/// The cross-currency Payment path uses [`pay_out_gross`] instead, where the
+/// fee is charged out of a gross input and skipped when the issuer is a party.
 fn pay_out(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
@@ -995,14 +4392,21 @@ fn pay_out(
     }
     let rate = transfer_rate(ctx, &amount.issuer);
     let gross = grossed(&amount.iou, &rate);
-    credit_line(
-        ctx,
-        owner,
-        &amount.issuer,
-        &amount.currency,
-        &gross.negate(),
-        round,
-    )?;
+    // When the offer owner is itself the output issuer it has no trust line on
+    // its side to debit — it issues its own IOU directly (rippled's rippleCredit
+    // skips the issuer's self-line). Debiting the nonexistent self-line otherwise
+    // fails the whole crossing with tecPATH_DRY and the taker's offer rests
+    // uncrossed instead of consuming the issuer's resting offers.
+    if owner != &amount.issuer {
+        credit_line(
+            ctx,
+            owner,
+            &amount.issuer,
+            &amount.currency,
+            &gross.negate(),
+            round,
+        )?;
+    }
     credit_line(
         ctx,
         recipient,
@@ -1011,6 +4415,92 @@ fn pay_out(
         &amount.iou,
         round,
     )
+}
+
+/// Move the offer owner's output to `recipient` and return the NET delivered
+/// (what `recipient` actually receives). Used by the cross-currency Payment
+/// path, where `amount` is the GROSS the offer provides — exactly the offer's
+/// TakerGets reduction and the owner's debit. The output issuer's transfer fee
+/// is charged out of that gross: the recipient receives `amount / transfer_rate`
+/// rounded DOWN (rippled never delivers more), and the difference is the burned
+/// fee. rippled skips the fee whenever the issuer is itself a party (owner or
+/// recipient), so the net then equals the gross. XRP carries no transfer fee, so
+/// net == gross there. When `recipient` is the taker, its XRP credit goes
+/// through `taker_acct` (the caller's working copy) so the apply's final account
+/// write does not clobber it; a distinct recipient (cross-currency payment to
+/// another account) is credited through the view instead.
+#[allow(clippy::too_many_arguments)]
+fn pay_out_gross(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    owner: &AccountId,
+    recipient: &AccountId,
+    amount: &Leg,
+    round: bool,
+    skip_recipient_credit: bool,
+) -> Result<Leg, TransactionResult> {
+    if amount.is_xrp {
+        credit_xrp(ctx, owner, -amount.drops)?;
+        if !skip_recipient_credit {
+            if recipient == taker {
+                helpers::set_balance(
+                    taker_acct,
+                    helpers::get_balance(taker_acct) + amount.drops as u64,
+                );
+            } else {
+                credit_xrp(ctx, recipient, amount.drops)?;
+            }
+        }
+        return Ok(amount.clone());
+    }
+    // The fee applies only when neither party is the issuer (rippled charges no
+    // transfer fee on issuance/redemption). When it applies, the recipient nets
+    // `gross / rate` rounded down; otherwise net == gross. For an intermediate
+    // hop (`skip_recipient_credit`) the output funds the next book directly, so
+    // there is no fee-charged recipient and the net carried forward is the gross.
+    let fee_applies =
+        !skip_recipient_credit && amount.issuer != *owner && amount.issuer != *recipient;
+    let net = if fee_applies {
+        let rate = transfer_rate(ctx, &amount.issuer);
+        let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+        if rate > one {
+            IOUAmount::div_round(&amount.iou, &rate, /*round_up*/ false).unwrap_or(amount.iou)
+        } else {
+            amount.iou
+        }
+    } else {
+        amount.iou
+    };
+    // Debit the owner the full gross it provides (the offer's TakerGets move).
+    // When a party to the delivery is itself the output issuer it has no trust
+    // line on its side to move — it issues (owner) or redeems (recipient) its own
+    // IOU directly (rippled's rippleCredit skips the issuer self-line). Debiting a
+    // nonexistent self-line otherwise fails the crossing with tecPATH_DRY, exactly
+    // as `pay_out` did for issuer-owned offers before the guard.
+    if amount.issuer != *owner {
+        credit_line(
+            ctx,
+            owner,
+            &amount.issuer,
+            &amount.currency,
+            &amount.iou.negate(),
+            round,
+        )?;
+    }
+    if !skip_recipient_credit && amount.issuer != *recipient {
+        credit_line(
+            ctx,
+            recipient,
+            &amount.issuer,
+            &amount.currency,
+            &net,
+            round,
+        )?;
+    }
+    let mut net_leg = amount.clone();
+    net_leg.iou = net;
+    Ok(net_leg)
 }
 
 /// `amount * rate` using rippled's non-rounding STAmount multiply.
@@ -1028,6 +4518,83 @@ fn grossed(amount: &IOUAmount, rate: &IOUAmount) -> IOUAmount {
 /// Remove an offer: owner dir, its quality book dir, erase the SLE, decrement
 /// OwnerCount. `book_dir` is the offer's own `BookDirectory` (the quality
 /// directory it lives in), not the book base.
+fn reap_unfunded_on_page(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dir_key: &rxrpl_primitives::Hash256,
+) -> Result<bool, TransactionResult> {
+    let Some(dir_bytes) = ctx.view.read(dir_key) else {
+        return Ok(false);
+    };
+    let Ok(dir) = serde_json::from_slice::<Value>(&dir_bytes) else {
+        return Ok(false);
+    };
+    let offers: Vec<rxrpl_primitives::Hash256> = dir
+        .get("Indexes")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().and_then(|s| s.parse().ok()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut fundable = false;
+    for offer_key in offers {
+        let Some(ob) = ctx.view.read(&offer_key) else {
+            continue;
+        };
+        let Ok(offer) = serde_json::from_slice::<Value>(&ob) else {
+            continue;
+        };
+        if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+            continue;
+        }
+        let owner_str = offer.get("Account").and_then(|v| v.as_str()).unwrap_or("");
+        let Ok(owner) = decode_account_id(owner_str) else {
+            continue;
+        };
+        let Some(offer_out) = Leg::parse(&offer["TakerGets"]) else {
+            continue;
+        };
+        let Some(offer_in) = Leg::parse(&offer["TakerPays"]) else {
+            continue;
+        };
+        let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+        let expired = offer
+            .get("Expiration")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|exp| exp <= ctx.view.parent_close_time() as u64);
+        let funds = owner_funds_leg(ctx, &owner, &offer_out);
+        if expired
+            || offer_out.is_zero()
+            || offer_in.is_zero()
+            || is_deep_frozen(ctx, &owner, &offer_in)
+            || offer_cannot_pay(&funds, &offer_out, flags, &owner == taker)
+        {
+            reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, dir_key)?;
+        } else {
+            fundable = true;
+        }
+    }
+    Ok(fundable)
+}
+
+fn reap_walk_offer(
+    ctx: &mut ApplyContext<'_>,
+    owner: &AccountId,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    offer_key: &rxrpl_primitives::Hash256,
+    book_dir: &rxrpl_primitives::Hash256,
+) -> Result<(), TransactionResult> {
+    reap_offer(ctx, owner, offer_key, book_dir)?;
+    if owner == taker {
+        helpers::adjust_owner_count(taker_acct, -1);
+    }
+    Ok(())
+}
+
 fn reap_offer(
     ctx: &mut ApplyContext<'_>,
     owner: &AccountId,
@@ -1081,84 +4648,58 @@ fn currency_and_issuer(amount: &Value) -> ([u8; 20], AccountId) {
     (currency, issuer)
 }
 
-/// Permissioned DEX flag on an issuer's AccountRoot.
-const LSF_PERMISSIONED_DEX: u32 = 0x0080_0000;
-
-/// Check if an IOU asset's issuer requires permissioned DEX access.
+/// PermissionedDEX domain membership check for a domain-scoped offer.
 ///
-/// If the issuer has `lsfPermissionedDEX` set, verifies the trader holds
-/// accepted credentials from the issuer's PermissionedDomain. XRP assets
-/// are always allowed.
-fn check_permissioned_asset(
+/// rippled: an offer carrying a `DomainID` is authorised only for members of
+/// that domain. The `DomainID` is the `PermissionedDomain` object's ledger
+/// index; membership requires holding an *accepted* credential whose
+/// `(Issuer, CredentialType)` matches one of the domain's `AcceptedCredentials`.
+fn check_domain_membership(
     ctx: &PreclaimContext<'_>,
     trader_id: &AccountId,
-    asset: Option<&Value>,
+    domain_id: &str,
 ) -> Result<(), TransactionResult> {
-    let asset = match asset {
-        Some(v) if v.is_object() => v,
-        _ => return Ok(()), // XRP or missing -- no restriction
-    };
+    use std::str::FromStr;
+    let domain_key = rxrpl_primitives::Hash256::from_str(domain_id)
+        .map_err(|_| TransactionResult::TemMalformed)?;
+    let domain_bytes = ctx
+        .view
+        .read(&domain_key)
+        .ok_or(TransactionResult::TecNoPermission)?; // domain must exist
+    let domain: Value =
+        serde_json::from_slice(&domain_bytes).map_err(|_| TransactionResult::TemMalformed)?;
+    let accepted = domain
+        .get("AcceptedCredentials")
+        .and_then(|v| v.as_array())
+        .ok_or(TransactionResult::TecNoPermission)?;
 
-    // Extract issuer from the IOU object
-    let issuer_str = match asset.get("issuer").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return Ok(()),
-    };
-
-    let issuer_id = decode_account_id(issuer_str).map_err(|_| TransactionResult::TemMalformed)?;
-    let issuer_key = keylet::account(&issuer_id);
-
-    let issuer_bytes = match ctx.view.read(&issuer_key) {
-        Some(b) => b,
-        None => return Ok(()), // Issuer not found -- let other checks handle
-    };
-
-    let issuer_obj: Value =
-        serde_json::from_slice(&issuer_bytes).map_err(|_| TransactionResult::TemMalformed)?;
-
-    let flags = helpers::get_flags(&issuer_obj);
-    if flags & LSF_PERMISSIONED_DEX == 0 {
-        return Ok(()); // Issuer does not require permissioned DEX
-    }
-
-    // Issuer requires PermissionedDEX -- check if trader has credentials.
-    // Look up the issuer's PermissionedDomains (seq 0..9) and verify the
-    // trader holds at least one accepted credential type from any domain.
-    for domain_seq in 0..10u32 {
-        let domain_key = keylet::permissioned_domain(&issuer_id, domain_seq);
-        let domain_bytes = match ctx.view.read(&domain_key) {
-            Some(b) => b,
-            None => break, // No more domains
+    for entry in accepted {
+        // The SLE wraps each pair as `{"Credential": {"Issuer", "CredentialType"}}`.
+        let inner = entry.get("Credential").unwrap_or(entry);
+        let (Some(issuer_str), Some(ct_str)) = (
+            inner.get("Issuer").and_then(|v| v.as_str()),
+            inner.get("CredentialType").and_then(|v| v.as_str()),
+        ) else {
+            continue;
         };
-
-        let domain: Value =
-            serde_json::from_slice(&domain_bytes).map_err(|_| TransactionResult::TemMalformed)?;
-
-        if let Some(accepted) = domain.get("AcceptedCredentials").and_then(|v| v.as_array()) {
-            for entry in accepted {
-                let cred_issuer_str = entry
-                    .get("AcceptedCredential")
-                    .and_then(|c| c.get("Issuer"))
-                    .and_then(|v| v.as_str());
-                let cred_type = entry
-                    .get("AcceptedCredential")
-                    .and_then(|c| c.get("CredentialType"))
-                    .and_then(|v| v.as_str());
-
-                if let (Some(ci_str), Some(ct)) = (cred_issuer_str, cred_type) {
-                    if let Ok(ci_id) = decode_account_id(ci_str) {
-                        let cred_key = keylet::credential(trader_id, &ci_id, ct.as_bytes());
-                        if ctx.view.exists(&cred_key) {
-                            return Ok(()); // Trader holds an accepted credential
-                        }
-                    }
+        let Ok(issuer_id) = decode_account_id(issuer_str) else {
+            continue;
+        };
+        // CredentialType is stored hex-encoded; the keylet hashes the raw bytes.
+        let ct_bytes = hex::decode(ct_str).unwrap_or_else(|_| ct_str.as_bytes().to_vec());
+        let cred_key = keylet::credential(trader_id, &issuer_id, &ct_bytes);
+        if let Some(cred_bytes) = ctx.view.read(&cred_key) {
+            if let Ok(cred) = serde_json::from_slice::<Value>(&cred_bytes) {
+                // The credential must be accepted (lsfAccepted); an issued-but-not-
+                // accepted credential does not confer membership.
+                if helpers::get_flags(&cred) & crate::handlers::credentials::LSF_ACCEPTED != 0 {
+                    return Ok(());
                 }
             }
         }
     }
 
-    // No valid credential found in any domain
-    Err(TransactionResult::TecNoPermission)
+    Err(TransactionResult::TecNoPermission) // not a domain member
 }
 
 /// Test whether `owner` currently holds the `TakerGets` amount in full.
@@ -1169,6 +4710,160 @@ fn check_permissioned_asset(
 /// than requiring the whole offer to be funded). XRP uses the raw balance; an
 /// IOU issuer can always issue its own currency (not a binding constraint); an
 /// IOU holder is bounded by its trust-line balance.
+/// rippled `isDeepFrozen(view, account, asset)`: a line the account holds for
+/// `asset` is deep-frozen when either side set the deep-freeze flag (a
+/// deep-frozen line can neither receive nor send). XRP and the issuer's own
+/// asset are never deep-frozen.
+fn is_deep_frozen(ctx: &mut ApplyContext<'_>, account: &AccountId, asset: &Leg) -> bool {
+    const LSF_LOW_DEEP_FREEZE: u64 = 0x0200_0000;
+    const LSF_HIGH_DEEP_FREEZE: u64 = 0x0400_0000;
+    if asset.is_xrp || &asset.issuer == account {
+        return false;
+    }
+    let Some(tl_bytes) =
+        ctx.view
+            .read(&keylet::trust_line(account, &asset.issuer, &asset.currency))
+    else {
+        return false;
+    };
+    let Ok(tl) = serde_json::from_slice::<Value>(&tl_bytes) else {
+        return false;
+    };
+    let flags = tl.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+    flags & (LSF_LOW_DEEP_FREEZE | LSF_HIGH_DEEP_FREEZE) != 0
+}
+
+fn offer_cannot_pay(funds: &Leg, offer_out: &Leg, flags: u64, is_self: bool) -> bool {
+    if funds.is_zero() {
+        return true;
+    }
+    is_self && flags & LSF_SELL != 0 && !leg_ge(funds, offer_out)
+}
+
+fn reap_own_unfunded_inverse_tip(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    inverse_book: &Hash256,
+) -> Result<(), TransactionResult> {
+    let prefix = inverse_book.as_bytes()[0..24].to_vec();
+    let mut probe = book_dir_with_quality(inverse_book, 0);
+    let mut best_dir: Option<Hash256> = None;
+    while let Some(dir_key) = ctx.view.succ(&probe) {
+        if dir_key.as_bytes()[0..24] != prefix[..] {
+            break;
+        }
+        probe = dir_key;
+        let Some(bytes) = ctx.view.read(&dir_key) else {
+            continue;
+        };
+        let Ok(dir) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let empty = dir
+            .get("Indexes")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true);
+        if empty {
+            continue;
+        }
+        best_dir = Some(dir_key);
+        break;
+    }
+    let Some(best_dir) = best_dir else {
+        return Ok(());
+    };
+    let entries = crate::owner_dir::collect_owner_dir_entries(ctx.view, taker);
+    for s in entries {
+        let Ok(key) = s.parse::<Hash256>() else {
+            continue;
+        };
+        let Some(bytes) = ctx.view.read(&key) else {
+            continue;
+        };
+        let Ok(offer) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+            continue;
+        }
+        let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+        if flags & LSF_SELL == 0 {
+            continue;
+        }
+        let Some(book) = offer
+            .get("BookDirectory")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Hash256>().ok())
+        else {
+            continue;
+        };
+        if book != best_dir {
+            continue;
+        }
+        let Some(offer_out) = Leg::parse(&offer["TakerGets"]) else {
+            continue;
+        };
+        let funds = owner_funds_leg(ctx, taker, &offer_out);
+        if !leg_ge(&funds, &offer_out) {
+            reap_offer(ctx, taker, &key, &book)?;
+            helpers::adjust_owner_count(taker_acct, -1);
+        }
+    }
+    Ok(())
+}
+
+/// After an exhausted take, reap the maker's other lsfSell offers of the same
+/// asset that can no longer deliver TakerGets (30000060 D995194A seq 258).
+fn reap_maker_short_sells(
+    ctx: &mut ApplyContext<'_>,
+    owner: &AccountId,
+    sold: &Leg,
+) -> Result<(), TransactionResult> {
+    let entries = crate::owner_dir::collect_owner_dir_entries(ctx.view, owner);
+    for s in entries {
+        let Ok(key) = s.parse::<Hash256>() else {
+            continue;
+        };
+        let Some(bytes) = ctx.view.read(&key) else {
+            continue;
+        };
+        let Ok(offer) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+            continue;
+        }
+        let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+        if flags & LSF_SELL == 0 {
+            continue;
+        }
+        let Some(offer_out) = Leg::parse(&offer["TakerGets"]) else {
+            continue;
+        };
+        if offer_out.is_xrp != sold.is_xrp
+            || offer_out.currency != sold.currency
+            || offer_out.issuer != sold.issuer
+        {
+            continue;
+        }
+        let funds = owner_funds_leg(ctx, owner, &offer_out);
+        if !funds.is_zero() && leg_ge(&funds, &offer_out) {
+            continue;
+        }
+        let Some(book) = offer
+            .get("BookDirectory")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Hash256>().ok())
+        else {
+            continue;
+        };
+        reap_offer(ctx, owner, &key, &book)?;
+    }
+    Ok(())
+}
+
 fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) -> Leg {
     let zero = Leg {
         is_xrp: gets.is_xrp,
@@ -1179,22 +4874,30 @@ fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) ->
     };
     if gets.is_xrp {
         let key = keylet::account(owner);
-        let bal = ctx
+        let acct = ctx
             .view
             .read(&key)
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+        let bal = acct
+            .as_ref()
             .and_then(|a| {
                 a.get("Balance")
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<i64>().ok())
             })
             .unwrap_or(0);
-        if bal <= 0 {
+        // rippled `accountFunds` for XRP is `xrpLiquid(owner, 0)` = balance minus
+        // the account reserve, clamped at zero: an offer can only sell the owner's
+        // spendable XRP, not the reserve-locked portion. Using the raw balance let
+        // a reserve-constrained offer over-fill (execute instead of being reaped).
+        let owner_count = acct.as_ref().map(helpers::get_owner_count).unwrap_or(0);
+        let liquid = bal - ctx.fees.account_reserve(owner_count) as i64;
+        if liquid <= 0 {
             return zero;
         }
         return Leg {
             is_xrp: true,
-            drops: bal,
+            drops: liquid,
             iou: IOUAmount::ZERO,
             currency: gets.currency,
             issuer: gets.issuer,
@@ -1226,6 +4929,42 @@ fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) ->
     };
     if !holder_positive {
         return zero;
+    }
+    // rippled `accountFundsHelper` prices a maker's IOU with
+    // `ZeroIfFrozen`/`ZeroIfUnauthorized`: a maker cannot deliver an IOU it
+    // can't move, so the offer is found unfunded (0) and reaped. Mirror that —
+    // the issuer global-froze, or froze this line, or requires auth and hasn't
+    // authorized it.
+    const LSF_LOW_FREEZE: u64 = 0x0040_0000;
+    const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
+    const LSF_LOW_AUTH: u64 = 0x0004_0000;
+    const LSF_HIGH_AUTH: u64 = 0x0008_0000;
+    const LSF_GLOBAL_FREEZE: u64 = 0x0040_0000;
+    const LSF_REQUIRE_AUTH: u64 = 0x0004_0000;
+    let tl_flags = tl.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+    let issuer_flags = ctx
+        .view
+        .read(&keylet::account(&gets.issuer))
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|a| a.get("Flags").and_then(Value::as_u64))
+        .unwrap_or(0);
+    let line_frozen = if issuer_is_low {
+        tl_flags & LSF_LOW_FREEZE != 0
+    } else {
+        tl_flags & LSF_HIGH_FREEZE != 0
+    };
+    if line_frozen || issuer_flags & LSF_GLOBAL_FREEZE != 0 {
+        return zero;
+    }
+    if issuer_flags & LSF_REQUIRE_AUTH != 0 {
+        let authorized = if issuer_is_low {
+            tl_flags & LSF_LOW_AUTH != 0
+        } else {
+            tl_flags & LSF_HIGH_AUTH != 0
+        };
+        if !authorized {
+            return zero;
+        }
     }
     let mag = raw_str.trim_start_matches('-');
     Leg {
@@ -1284,5 +5023,2963 @@ fn remove_from_book_dir(
             return Ok(());
         }
         page = next_page;
+    }
+}
+
+// ============================================================================
+// Legacy Taker offer-crossing (pre-`FlowCross` era).
+//
+// rippled runs two offer-crossing engines gated on the `FlowCross` amendment
+// (`CreateOffer::cross`): the modern Flow/`BookStep` path (`cross_offers` above)
+// when it is enabled, and the legacy `BasicTaker`/`Taker` (`bridged_cross` /
+// `direct_cross`) when it is not. Every mainnet ledger past 2018 has `FlowCross`
+// enabled, so this arm is dead there; it exists for byte-exact replay of
+// pre-`FlowCross` ledgers. The port mirrors rippled 2.2.0
+// `Taker.cpp` / `CreateOffer.cpp`; the crux is that the legacy pricers round to
+// NEAREST (`STAmount::multiply`/`divide`) rather than the strict-directional
+// rounding the Flow path uses.
+// ============================================================================
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TakerCrossType {
+    XrpToIou,
+    IouToXrp,
+    IouToIou,
+}
+
+/// rippled `BasicTaker::Flow`: `order` = the net offer/taker amounts, `issuers` =
+/// the grossed amounts moved at the issuer (used only for the pricing clamps —
+/// settlement re-derives the fee inside `pay_in`/`pay_out`).
+struct TakerFlow {
+    order_in: Leg,
+    order_out: Leg,
+    issuers_in: Leg,
+    issuers_out: Leg,
+}
+
+/// The unit transfer rate (1.0) as an `IOUAmount`.
+fn parity_rate() -> IOUAmount {
+    IOUAmount::from_parts(1_000_000_000, -9, false).unwrap()
+}
+
+/// rippled `BasicTaker::effective_rate`: the issuer's transfer fee applies only
+/// when neither party is the issuer and the two parties differ (and it is not
+/// XRP). Otherwise parity.
+fn effective_rate(
+    ctx: &ApplyContext<'_>,
+    issuer: &AccountId,
+    from: &AccountId,
+    to: &AccountId,
+) -> IOUAmount {
+    if issuer == &AccountId::from([0u8; 20]) || from == to || from == issuer || to == issuer {
+        return parity_rate();
+    }
+    transfer_rate(ctx, issuer)
+}
+
+/// A zero amount carrying `tmpl`'s asset (issue/kind).
+fn zero_leg(tmpl: &Leg) -> Leg {
+    let mut z = tmpl.clone();
+    z.drops = 0;
+    z.iou = IOUAmount::ZERO;
+    z
+}
+
+/// `a * b` (round-to-nearest `STAmount::multiply`), result in `tmpl`'s asset.
+fn mul_nearest(a: &Leg, b: &IOUAmount, tmpl: &Leg) -> Leg {
+    rxrpl_amount::Amount::multiply(
+        &leg_to_amount(a),
+        &rxrpl_amount::Amount::Iou(*b),
+        tmpl.is_xrp,
+    )
+    .map(|x| amount_to_leg(&x, tmpl))
+    .unwrap_or_else(|_| zero_leg(tmpl))
+}
+
+/// `a / b` (round-to-nearest `STAmount::divide`), result in `tmpl`'s asset.
+fn div_nearest(a: &Leg, b: &IOUAmount, tmpl: &Leg) -> Leg {
+    rxrpl_amount::Amount::divide(
+        &leg_to_amount(a),
+        &rxrpl_amount::Amount::Iou(*b),
+        tmpl.is_xrp,
+    )
+    .map(|x| amount_to_leg(&x, tmpl))
+    .unwrap_or_else(|_| zero_leg(tmpl))
+}
+
+/// `a * rate` gross in `a`'s own asset (rippled `multiply(amount, rate)`).
+fn gross_leg(a: &Leg, rate: &IOUAmount) -> Leg {
+    mul_nearest(a, rate, a)
+}
+
+/// rippled `qual_mul(amount, quality, output)` = `min(multiply(amount, rate),
+/// output)`: the input required for `amount` output at `rate` (= in/out),
+/// clamped to `output`'s current value and issue.
+fn qual_mul(amount: &Leg, rate: &IOUAmount, output: &Leg) -> Leg {
+    leg_min(&mul_nearest(amount, rate, output), output)
+}
+
+/// rippled `qual_div(amount, quality, output)` = `min(divide(amount, rate),
+/// output)`: the output deliverable for `amount` input at `rate`, clamped.
+fn qual_div(amount: &Leg, rate: &IOUAmount, output: &Leg) -> Leg {
+    leg_min(&div_nearest(amount, rate, output), output)
+}
+
+/// The larger of two like-typed legs.
+fn leg_max(a: &Leg, b: &Leg) -> Leg {
+    if leg_ge(a, b) { a.clone() } else { b.clone() }
+}
+
+/// `a > b` for like-typed legs.
+fn leg_gt(a: &Leg, b: &Leg) -> bool {
+    !leg_ge(b, a)
+}
+
+/// Pack an `IOUAmount` rate into a book-directory quality u64 (rippled
+/// `Quality(uint64)` layout: `(exponent+100)<<56 | mantissa`).
+fn pack_rate(rate: &IOUAmount) -> u64 {
+    if rate.is_zero() {
+        return 0;
+    }
+    let exp_biased = (rate.exponent() + 100) as u64;
+    (exp_biased << 56) | rate.mantissa()
+}
+
+/// rippled `composed_quality(lhs, rhs)` = pack(`mulRound(lhs.rate(), rhs.rate(),
+/// roundUp=true)`), the quality of two bridged offers chained through XRP. The
+/// round-UP (worse) matches rippled's Quality.cpp:135 and keeps the bridge from
+/// looking marginally better than it is at a band boundary.
+fn composed_quality(q1: u64, q2: u64) -> u64 {
+    compose_packed_rates(q1, q2, true)
+}
+
+fn compose_packed_rates(q1: u64, q2: u64, round_up: bool) -> u64 {
+    let r1 = from_rate(q1).unwrap_or(IOUAmount::ZERO);
+    let r2 = from_rate(q2).unwrap_or(IOUAmount::ZERO);
+    match rxrpl_amount::Amount::mul_round(
+        &rxrpl_amount::Amount::Iou(r1),
+        &rxrpl_amount::Amount::Iou(r2),
+        false,
+        round_up,
+    ) {
+        Ok(rxrpl_amount::Amount::Iou(v)) => pack_rate(&v),
+        _ => 0,
+    }
+}
+
+/// rippled `CreateOffer::select_path`: pick the better of the direct tip and the
+/// composed bridge quality. Better quality = smaller packed rate. Returns
+/// `(use_direct, chosen_quality)`.
+fn select_path(have_direct: bool, direct_q: u64, have_bridge: bool, bridge_q: u64) -> (bool, u64) {
+    if !have_bridge {
+        return (true, direct_q);
+    }
+    // rippled: `if (bridged_quality < direct_quality) use direct`. A Quality
+    // compares `<` when its rate is LARGER (worse), so bridged worse than direct
+    // is `bridge_q > direct_q`.
+    if have_direct && bridge_q > direct_q {
+        return (true, direct_q);
+    }
+    (false, bridge_q)
+}
+
+/// rippled `Taker::reject`: a quality worse (larger rate) than the threshold is
+/// not crossed.
+fn reject_quality(quality: u64, threshold: u64) -> bool {
+    quality > threshold
+}
+
+/// rippled `BasicTaker::done` (funds limb handled by the pricer clamps): the
+/// taker stops when its input is spent, or (buy) its output demand is met.
+fn taker_done(is_sell: bool, remaining_out: &Leg, remaining_in: &Leg) -> bool {
+    remaining_in.is_zero() || (!is_sell && remaining_out.is_zero())
+}
+
+/// A tfSell fill can deliver past the remaining demand; clamp at zero rather than
+/// underflow (mirrors the Flow path).
+fn sell_clamp_sub(remaining: &Leg, order: &Leg, is_sell: bool) -> Leg {
+    if is_sell && leg_ge(order, remaining) {
+        leg_sub(remaining, remaining)
+    } else {
+        leg_sub(remaining, order)
+    }
+}
+
+/// rippled `BasicTaker::flow_xrp_to_iou` (T.cpp:214): taker gives XRP, receives an
+/// IOU. Clamp cascade owner-balance -> taker-output(buy) -> taker-funds ->
+/// taker-input(XrpToIou only), each re-priced NEAREST.
+#[allow(clippy::too_many_arguments)]
+fn flow_xrp_to_iou(
+    offer_in: &Leg,
+    offer_out: &Leg,
+    rate: &IOUAmount,
+    owner_funds: &Leg,
+    taker_funds: &Leg,
+    out_rate: &IOUAmount,
+    is_sell: bool,
+    remaining_out: &Leg,
+    remaining_in: &Leg,
+    cross_type: TakerCrossType,
+) -> TakerFlow {
+    let mut order_in = offer_in.clone();
+    let mut order_out = offer_out.clone();
+    let mut issuers_out = gross_leg(&order_out, out_rate);
+    if !leg_ge(owner_funds, &issuers_out) {
+        issuers_out = owner_funds.clone();
+        order_out = div_nearest(&issuers_out, out_rate, offer_out);
+        order_in = qual_mul(&order_out, rate, &order_in);
+    }
+    if !is_sell && !leg_ge(remaining_out, &order_out) {
+        order_out = remaining_out.clone();
+        order_in = qual_mul(&order_out, rate, &order_in);
+        issuers_out = gross_leg(&order_out, out_rate);
+    }
+    if !leg_ge(taker_funds, &order_in) {
+        order_in = taker_funds.clone();
+        order_out = qual_div(&order_in, rate, &order_out);
+        issuers_out = gross_leg(&order_out, out_rate);
+    }
+    if cross_type == TakerCrossType::XrpToIou && !leg_ge(remaining_in, &order_in) {
+        order_in = remaining_in.clone();
+        order_out = qual_div(&order_in, rate, &order_out);
+        issuers_out = gross_leg(&order_out, out_rate);
+    }
+    let issuers_in = order_in.clone();
+    TakerFlow {
+        order_in,
+        order_out,
+        issuers_in,
+        issuers_out,
+    }
+}
+
+/// rippled `BasicTaker::flow_iou_to_xrp` (T.cpp:268): taker gives an IOU, receives
+/// XRP. Note the clamp order (input before funds) and that the taker-output clamp
+/// fires only for a direct IouToXrp cross, not a bridge's first leg.
+#[allow(clippy::too_many_arguments)]
+fn flow_iou_to_xrp(
+    offer_in: &Leg,
+    offer_out: &Leg,
+    rate: &IOUAmount,
+    owner_funds: &Leg,
+    taker_funds: &Leg,
+    in_rate: &IOUAmount,
+    is_sell: bool,
+    remaining_out: &Leg,
+    remaining_in: &Leg,
+    cross_type: TakerCrossType,
+) -> TakerFlow {
+    let mut order_in = offer_in.clone();
+    let mut order_out = offer_out.clone();
+    let mut issuers_in = gross_leg(&order_in, in_rate);
+    if !leg_ge(owner_funds, &order_out) {
+        order_out = owner_funds.clone();
+        order_in = qual_mul(&order_out, rate, &order_in);
+        issuers_in = gross_leg(&order_in, in_rate);
+    }
+    if !is_sell && cross_type == TakerCrossType::IouToXrp && !leg_ge(remaining_out, &order_out) {
+        order_out = remaining_out.clone();
+        order_in = qual_mul(&order_out, rate, &order_in);
+        issuers_in = gross_leg(&order_in, in_rate);
+    }
+    if !leg_ge(remaining_in, &order_in) {
+        order_in = remaining_in.clone();
+        issuers_in = gross_leg(&order_in, in_rate);
+        order_out = qual_div(&order_in, rate, &order_out);
+    }
+    if !leg_ge(taker_funds, &issuers_in) {
+        issuers_in = taker_funds.clone();
+        order_in = div_nearest(&issuers_in, in_rate, offer_in);
+        order_out = qual_div(&order_in, rate, &order_out);
+    }
+    let issuers_out = order_out.clone();
+    TakerFlow {
+        order_in,
+        order_out,
+        issuers_in,
+        issuers_out,
+    }
+}
+
+/// rippled `BasicTaker::flow_iou_to_iou` (T.cpp:325): both sides IOU, both grossed.
+#[allow(clippy::too_many_arguments)]
+fn flow_iou_to_iou(
+    offer_in: &Leg,
+    offer_out: &Leg,
+    rate: &IOUAmount,
+    owner_funds: &Leg,
+    taker_funds: &Leg,
+    in_rate: &IOUAmount,
+    out_rate: &IOUAmount,
+    is_sell: bool,
+    remaining_out: &Leg,
+    remaining_in: &Leg,
+) -> TakerFlow {
+    let mut order_in = offer_in.clone();
+    let mut order_out = offer_out.clone();
+    let mut issuers_in = gross_leg(&order_in, in_rate);
+    let mut issuers_out = gross_leg(&order_out, out_rate);
+    if !leg_ge(owner_funds, &issuers_out) {
+        issuers_out = owner_funds.clone();
+        order_out = div_nearest(&issuers_out, out_rate, offer_out);
+        order_in = qual_mul(&order_out, rate, &order_in);
+        issuers_in = gross_leg(&order_in, in_rate);
+    }
+    if !is_sell && !leg_ge(remaining_out, &order_out) {
+        order_out = remaining_out.clone();
+        order_in = qual_mul(&order_out, rate, &order_in);
+        issuers_out = gross_leg(&order_out, out_rate);
+        issuers_in = gross_leg(&order_in, in_rate);
+    }
+    if !leg_ge(remaining_in, &order_in) {
+        order_in = remaining_in.clone();
+        issuers_in = gross_leg(&order_in, in_rate);
+        order_out = qual_div(&order_in, rate, &order_out);
+        issuers_out = gross_leg(&order_out, out_rate);
+    }
+    if !leg_ge(taker_funds, &issuers_in) {
+        issuers_in = taker_funds.clone();
+        order_in = div_nearest(&issuers_in, in_rate, offer_in);
+        order_out = qual_div(&order_in, rate, &order_out);
+        issuers_out = gross_leg(&order_out, out_rate);
+    }
+    TakerFlow {
+        order_in,
+        order_out,
+        issuers_in,
+        issuers_out,
+    }
+}
+
+/// The next crossable offer in a book, with its book-directory quality.
+#[derive(Clone)]
+struct OfferTip {
+    key: Hash256,
+    dir: Hash256,
+    quality: u64,
+    owner: AccountId,
+    offer_in: Leg,  // TakerPays (what the resting offer wants)
+    offer_out: Leg, // TakerGets (what the resting offer gives)
+}
+
+/// A best-price-first walk over one order book, reaping expired/empty/frozen/
+/// unfunded offers as it advances (rippled `OfferStream`). Holds only the cursor
+/// state; every step takes `ctx` so no view borrow is retained across streams.
+struct OfferStream {
+    prefix: [u8; 24],
+    probe: Hash256,
+    dir: Hash256,
+    quality: u64,
+    page: VecDeque<Hash256>,
+}
+
+impl OfferStream {
+    fn new(book_base: &Hash256) -> Self {
+        OfferStream {
+            prefix: book_base.as_bytes()[0..24].try_into().unwrap(),
+            probe: book_dir_with_quality(book_base, 0),
+            dir: *book_base,
+            quality: 0,
+            page: VecDeque::new(),
+        }
+    }
+
+    /// Advance to the next fundable offer. `skip_self` removes offers owned by the
+    /// taker (used for the direct book; the bridge legs take self-offers).
+    fn step(
+        &mut self,
+        ctx: &mut ApplyContext<'_>,
+        mut skip_self: Option<(&AccountId, &mut Value)>,
+        threshold: u64,
+    ) -> Result<Option<OfferTip>, TransactionResult> {
+        loop {
+            if self.page.is_empty() {
+                let Some(dir_key) = ctx.view.succ(&self.probe) else {
+                    return Ok(None);
+                };
+                if dir_key.as_bytes()[0..24] != self.prefix {
+                    return Ok(None);
+                }
+                self.probe = dir_key;
+                self.dir = dir_key;
+                self.quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
+                let Some(bytes) = ctx.view.read(&dir_key) else {
+                    continue;
+                };
+                let Ok(dir) = serde_json::from_slice::<Value>(&bytes) else {
+                    continue;
+                };
+                self.page = dir
+                    .get("Indexes")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().and_then(|s| s.parse().ok()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if self.page.is_empty() {
+                    continue;
+                }
+            }
+            let offer_key = self.page.pop_front().unwrap();
+            let Some(ob) = ctx.view.read(&offer_key) else {
+                continue;
+            };
+            let Ok(offer) = serde_json::from_slice::<Value>(&ob) else {
+                continue;
+            };
+            if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+                continue;
+            }
+            let owner_str = offer.get("Account").and_then(|v| v.as_str()).unwrap_or("");
+            let Ok(owner) = decode_account_id(owner_str) else {
+                continue;
+            };
+            let Some(offer_out) = Leg::parse(&offer["TakerGets"]) else {
+                continue;
+            };
+            let Some(offer_in) = Leg::parse(&offer["TakerPays"]) else {
+                continue;
+            };
+            if let Some(exp) = offer.get("Expiration").and_then(|v| v.as_u64()) {
+                if exp <= ctx.view.parent_close_time() as u64 {
+                    reap_offer(ctx, &owner, &offer_key, &self.dir)?;
+                    continue;
+                }
+            }
+            if offer_out.is_zero() || offer_in.is_zero() {
+                reap_offer(ctx, &owner, &offer_key, &self.dir)?;
+                continue;
+            }
+            if is_deep_frozen(ctx, &owner, &offer_in) {
+                reap_offer(ctx, &owner, &offer_key, &self.dir)?;
+                continue;
+            }
+            let funds = owner_funds_leg(ctx, &owner, &offer_out);
+            let is_self = skip_self.as_ref().is_some_and(|(t, _)| *t == &owner);
+            if funds.is_zero() {
+                reap_offer(ctx, &owner, &offer_key, &self.dir)?;
+                continue;
+            }
+            if is_self {
+                // Taker::unfunded is true for owner==taker: cancel self-crossing
+                // inverse offers instead of skipping them (30000073 3D88107D).
+                // Only within the new offer's quality; worse-page own offers stay.
+                if reject_quality(self.quality, threshold) {
+                    return Ok(None);
+                }
+                reap_offer(ctx, &owner, &offer_key, &self.dir)?;
+                if let Some((_, acct)) = skip_self.as_mut() {
+                    helpers::adjust_owner_count(acct, -1);
+                }
+                continue;
+            }
+            return Ok(Some(OfferTip {
+                key: offer_key,
+                dir: self.dir,
+                quality: self.quality,
+                owner,
+                offer_in,
+                offer_out,
+            }));
+        }
+    }
+}
+
+/// rippled `BasicTaker::do_cross` single-offer (T.cpp:385): dispatch to the pricer
+/// for the taker's cross type. Funds are read by the caller.
+#[allow(clippy::too_many_arguments)]
+fn do_cross_single(
+    ctx: &ApplyContext<'_>,
+    taker: &AccountId,
+    t: &OfferTip,
+    cross_type: TakerCrossType,
+    is_sell: bool,
+    remaining_out: &Leg,
+    remaining_in: &Leg,
+    owner_funds: &Leg,
+    taker_funds: &Leg,
+) -> TakerFlow {
+    let rate = from_rate(t.quality).unwrap_or(IOUAmount::ZERO);
+    let out_rate = effective_rate(ctx, &t.offer_out.issuer, &t.owner, taker);
+    let in_rate = effective_rate(ctx, &t.offer_in.issuer, &t.owner, taker);
+    match cross_type {
+        TakerCrossType::XrpToIou => flow_xrp_to_iou(
+            &t.offer_in,
+            &t.offer_out,
+            &rate,
+            owner_funds,
+            taker_funds,
+            &out_rate,
+            is_sell,
+            remaining_out,
+            remaining_in,
+            cross_type,
+        ),
+        TakerCrossType::IouToXrp => flow_iou_to_xrp(
+            &t.offer_in,
+            &t.offer_out,
+            &rate,
+            owner_funds,
+            taker_funds,
+            &in_rate,
+            is_sell,
+            remaining_out,
+            remaining_in,
+            cross_type,
+        ),
+        TakerCrossType::IouToIou => flow_iou_to_iou(
+            &t.offer_in,
+            &t.offer_out,
+            &rate,
+            owner_funds,
+            taker_funds,
+            &in_rate,
+            &out_rate,
+            is_sell,
+            remaining_out,
+            remaining_in,
+        ),
+    }
+}
+
+/// rippled `BasicTaker::do_cross` bridged (T.cpp:434): price leg1 (in->XRP) and
+/// leg2 (XRP->out), apply the self-ownership overrides, then equalize the XRP
+/// flow so `flow1.out == flow2.in`.
+#[allow(clippy::too_many_arguments)]
+fn do_cross_bridged(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    t1: &OfferTip,
+    t2: &OfferTip,
+    is_sell: bool,
+    remaining_out: &Leg,
+    remaining_in: &Leg,
+) -> (TakerFlow, TakerFlow) {
+    let mut leg1_in_funds = owner_funds_leg(ctx, taker, &t1.offer_in);
+    if taker == &t1.owner {
+        leg1_in_funds = leg_max(&leg1_in_funds, &t1.offer_in);
+    }
+    let mut leg2_out_funds = owner_funds_leg(ctx, &t2.owner, &t2.offer_out);
+    if taker == &t2.owner {
+        leg2_out_funds = leg_max(&leg2_out_funds, &t2.offer_out);
+    }
+    let mut xrp_funds = owner_funds_leg(ctx, &t1.owner, &t1.offer_out);
+    if t1.owner == t2.owner {
+        xrp_funds = leg_max(&t1.offer_out, &t2.offer_in);
+    }
+    let leg1_rate = effective_rate(ctx, &t1.offer_in.issuer, &t1.owner, taker);
+    let leg2_rate = effective_rate(ctx, &t2.offer_out.issuer, &t2.owner, taker);
+    let q1 = from_rate(t1.quality).unwrap_or(IOUAmount::ZERO);
+    let q2 = from_rate(t2.quality).unwrap_or(IOUAmount::ZERO);
+    let mut flow1 = flow_iou_to_xrp(
+        &t1.offer_in,
+        &t1.offer_out,
+        &q1,
+        &xrp_funds,
+        &leg1_in_funds,
+        &leg1_rate,
+        is_sell,
+        remaining_out,
+        remaining_in,
+        TakerCrossType::IouToIou,
+    );
+    let mut flow2 = flow_xrp_to_iou(
+        &t2.offer_in,
+        &t2.offer_out,
+        &q2,
+        &leg2_out_funds,
+        &xrp_funds,
+        &leg2_rate,
+        is_sell,
+        remaining_out,
+        remaining_in,
+        TakerCrossType::IouToIou,
+    );
+    if leg_gt(&flow2.order_in, &flow1.order_out) {
+        flow2.order_in = flow1.order_out.clone();
+        flow2.order_out = qual_div(&flow2.order_in, &q2, &flow2.order_out);
+        flow2.issuers_out = gross_leg(&flow2.order_out, &leg2_rate);
+    } else if leg_gt(&flow1.order_out, &flow2.order_in) {
+        flow1.order_out = flow2.order_in.clone();
+        flow1.order_in = qual_mul(&flow1.order_out, &q1, &flow1.order_in);
+        flow1.issuers_in = gross_leg(&flow1.order_in, &leg1_rate);
+    }
+    (flow1, flow2)
+}
+
+/// Reduce or reap a resting offer consumed by a fill (no settlement). Mirrors the
+/// consume/reap tail of `cross_offers`, using exact (legacy) subtraction.
+fn consume_leg(
+    ctx: &mut ApplyContext<'_>,
+    t: &OfferTip,
+    order_out: &Leg,
+    order_in: &Leg,
+    avail_out: &Leg,
+) -> Result<(), TransactionResult> {
+    let _ = avail_out;
+    let Some(ob) = ctx.view.read(&t.key) else {
+        return Ok(());
+    };
+    let Ok(mut offer) = serde_json::from_slice::<Value>(&ob) else {
+        return Ok(());
+    };
+    // `OfferTip` is the first-seen snapshot. Bridged_cross reuses the same
+    // leg1 (or leg2) tip across the other stream's fills, so leftover must
+    // subtract this fill from the current SLE, not from that snapshot.
+    let current_out = Leg::parse(&offer["TakerGets"]).unwrap_or_else(|| t.offer_out.clone());
+    let current_in = Leg::parse(&offer["TakerPays"]).unwrap_or_else(|| t.offer_in.clone());
+    let leftover_out = if leg_ge(order_out, &current_out) {
+        zero_leg(&current_out)
+    } else {
+        leg_sub(&current_out, order_out)
+    };
+    let leftover_in = if leg_ge(order_in, &current_in) {
+        zero_leg(&current_in)
+    } else {
+        leg_sub(&current_in, order_in)
+    };
+    offer["TakerGets"] = leftover_out.with_amount(&leftover_out.iou, leftover_out.drops);
+    offer["TakerPays"] = leftover_in.with_amount(&leftover_in.iou, leftover_in.drops);
+    let cb = serde_json::to_vec(&offer).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(t.key, cb)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    // rippled CreateOffer::dry_offer: fully consumed, or the owner cannot fund
+    // leftover TakerGets (transfer-fee gross drained the line).
+    if leftover_out.is_zero()
+        || leftover_in.is_zero()
+        || (leftover_in.is_xrp
+            && leftover_in.drops <= 1
+            && leftover_is_dust(&leftover_out, &t.offer_out))
+        || owner_funds_leg(ctx, &t.owner, &t.offer_out).is_zero()
+    {
+        reap_offer(ctx, &t.owner, &t.key, &t.dir)?;
+    }
+    Ok(())
+}
+
+fn offer_is_dry(
+    ctx: &mut ApplyContext<'_>,
+    owner: &AccountId,
+    offer_out: &Leg,
+    order_out: &Leg,
+) -> bool {
+    if leg_ge(order_out, offer_out) {
+        return true;
+    }
+    let leftover = leg_sub(offer_out, order_out);
+    leftover.is_zero() || owner_funds_leg(ctx, owner, offer_out).is_zero()
+}
+
+/// rippled `Taker::fill` input settlement (taker -> owner), a `redeemIOU` plus
+/// `issueIOU` pair (or `transferXRP`). `order_in` is the NET the owner receives;
+/// `issuers_in` the GROSS the taker's line is debited (grossed at the EFFECTIVE
+/// rate by the pricer). Each IOU leg skips the issuer's own (nonexistent)
+/// self-line, exactly as rippled's rippleCredit (`account == issue.account` ->
+/// no-op). Distinct from the shared `pay_in`, which grosses at the raw
+/// `transfer_rate` and lacks the taker/owner self-issuer skip — the FlowCross path
+/// keeps `pay_in`; only this legacy arm needs the fee-party-exempt semantics.
+fn settle_in_legacy(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    owner: &AccountId,
+    order_in: &Leg,
+    issuers_in: &Leg,
+    round: bool,
+) -> Result<(), TransactionResult> {
+    if order_in.is_xrp {
+        if taker != owner && order_in.drops != 0 {
+            let bal = helpers::get_balance(taker_acct) as i64 - order_in.drops;
+            if bal < 0 {
+                return Err(TransactionResult::TecUnfundedOffer);
+            }
+            helpers::set_balance(taker_acct, bal as u64);
+            credit_xrp(ctx, owner, order_in.drops)?;
+        }
+        return Ok(());
+    }
+    let issuer = order_in.issuer;
+    if taker != &issuer {
+        credit_line(
+            ctx,
+            taker,
+            &issuer,
+            &order_in.currency,
+            &issuers_in.iou.negate(),
+            round,
+        )?;
+        // rippled's rippleCredit deletes the payer's line when it drains to a
+        // default zero-balance state (View.cpp:994) — the taker just paid out.
+        crate::handlers::trust_set::maybe_delete_drained_trust_line(
+            ctx,
+            taker,
+            taker_acct,
+            &issuer,
+            &order_in.currency,
+        )?;
+    }
+    if owner != &issuer {
+        // rippleCredit createOnDemand for the maker: 30000015 OfferCreate
+        // 512120C8 delivers Gatehub BTC to rH3uSRUJ who had no BTC line.
+        // Missing-line TecPathDry left that take unapplied, so later
+        // IOU-selling OfferCreates (BBA2D098) were tecUNFUNDED.
+        let tl_key = keylet::trust_line(owner, &issuer, &order_in.currency);
+        if ctx.view.read(&tl_key).is_none() {
+            let owner_key = keylet::account(owner);
+            let ob = ctx
+                .view
+                .read(&owner_key)
+                .ok_or(TransactionResult::TefInternal)?;
+            let mut oacct: Value =
+                serde_json::from_slice(&ob).map_err(|_| TransactionResult::TefInternal)?;
+            create_iou_trust_line(ctx, owner, &mut oacct, &issuer, &order_in.currency)?;
+            let nb = serde_json::to_vec(&oacct).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(owner_key, nb)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
+        credit_line(
+            ctx,
+            owner,
+            &issuer,
+            &order_in.currency,
+            &order_in.iou,
+            round,
+        )?;
+    }
+    Ok(())
+}
+
+/// rippled `Taker::fill` output settlement (owner -> taker). `order_out` is the NET
+/// the taker receives; `issuers_out` the GROSS the owner's line is debited. Issuer
+/// self-lines skipped; a taker XRP credit routes through `taker_acct`.
+fn settle_out_legacy(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    owner: &AccountId,
+    order_out: &Leg,
+    issuers_out: &Leg,
+    round: bool,
+) -> Result<(), TransactionResult> {
+    if order_out.is_xrp {
+        if owner != taker && order_out.drops != 0 {
+            credit_xrp(ctx, owner, -order_out.drops)?;
+            helpers::set_balance(
+                taker_acct,
+                helpers::get_balance(taker_acct) + order_out.drops as u64,
+            );
+        }
+        return Ok(());
+    }
+    let issuer = order_out.issuer;
+    if owner != &issuer {
+        credit_line(
+            ctx,
+            owner,
+            &issuer,
+            &order_out.currency,
+            &issuers_out.iou.negate(),
+            round,
+        )?;
+        // Owner paid the IOU out; rippleCredit deletes a drained default line.
+        let owner_key = keylet::account(owner);
+        if let Some(ob) = ctx.view.read(&owner_key) {
+            let mut oacct: Value =
+                serde_json::from_slice(&ob).map_err(|_| TransactionResult::TefInternal)?;
+            if crate::handlers::trust_set::maybe_delete_drained_trust_line(
+                ctx,
+                owner,
+                &mut oacct,
+                &issuer,
+                &order_out.currency,
+            )? {
+                let nb = serde_json::to_vec(&oacct).map_err(|_| TransactionResult::TefInternal)?;
+                ctx.view
+                    .update(owner_key, nb)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+            }
+        }
+    }
+    if taker != &issuer {
+        // rippleCredit createOnDemand: first delivery of an IOU the taker
+        // has never held writes a CreatedNode RippleState.
+        let tl_key = keylet::trust_line(taker, &issuer, &order_out.currency);
+        if ctx.view.read(&tl_key).is_none() {
+            create_iou_trust_line(ctx, taker, taker_acct, &issuer, &order_out.currency)?;
+        }
+        credit_line(
+            ctx,
+            taker,
+            &issuer,
+            &order_out.currency,
+            &order_out.iou,
+            round,
+        )?;
+    }
+    Ok(())
+}
+
+/// rippled `Taker::fill` direct (T.cpp:683): move taker input to the owner, owner
+/// output to the taker, then consume/reap.
+fn fill_direct(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    t: &OfferTip,
+    flow: &TakerFlow,
+    avail_out: &Leg,
+    round: bool,
+) -> Result<(), TransactionResult> {
+    settle_in_legacy(
+        ctx,
+        taker,
+        taker_acct,
+        &t.owner,
+        &flow.order_in,
+        &flow.issuers_in,
+        round,
+    )?;
+    settle_out_legacy(
+        ctx,
+        taker,
+        taker_acct,
+        &t.owner,
+        &flow.order_out,
+        &flow.issuers_out,
+        round,
+    )?;
+    consume_leg(ctx, t, &flow.order_out, &flow.order_in, avail_out)
+}
+
+/// rippled `Taker::fill` bridged (T.cpp:739): taker -> leg1 (IOU), leg1 -> leg2
+/// (XRP, owner to owner), leg2 -> taker (IOU), then consume/reap both legs.
+#[allow(clippy::too_many_arguments)]
+fn fill_bridged(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    t1: &OfferTip,
+    flow1: &TakerFlow,
+    avail1: &Leg,
+    t2: &OfferTip,
+    flow2: &TakerFlow,
+    avail2: &Leg,
+    round: bool,
+) -> Result<(), TransactionResult> {
+    if &t1.owner != taker {
+        settle_in_legacy(
+            ctx,
+            taker,
+            taker_acct,
+            &t1.owner,
+            &flow1.order_in,
+            &flow1.issuers_in,
+            round,
+        )?;
+    }
+    // leg1 owner -> leg2 owner: a discrete XRP transfer (rippled transferXRP).
+    let drops = flow1.order_out.drops;
+    if drops != 0 && t1.owner != t2.owner {
+        if &t1.owner == taker {
+            let bal = helpers::get_balance(taker_acct) as i64 - drops;
+            if bal < 0 {
+                return Err(TransactionResult::TecUnfundedOffer);
+            }
+            helpers::set_balance(taker_acct, bal as u64);
+        } else {
+            credit_xrp(ctx, &t1.owner, -drops)?;
+        }
+        if &t2.owner == taker {
+            helpers::set_balance(taker_acct, helpers::get_balance(taker_acct) + drops as u64);
+        } else {
+            credit_xrp(ctx, &t2.owner, drops)?;
+        }
+    }
+    if &t2.owner != taker {
+        settle_out_legacy(
+            ctx,
+            taker,
+            taker_acct,
+            &t2.owner,
+            &flow2.order_out,
+            &flow2.issuers_out,
+            round,
+        )?;
+    }
+    consume_leg(ctx, t1, &flow1.order_out, &flow1.order_in, avail1)?;
+    consume_leg(ctx, t2, &flow2.order_out, &flow2.order_in, avail2)
+}
+
+/// rippled `BasicTaker::remaining_offer` (T.cpp:141): rescale the leftover back to
+/// the ORIGINAL offer quality so the shared placement path keys the book
+/// directory on the unchanged rate. Returns tx-oriented `(pays, gets)`.
+fn remaining_offer(
+    is_sell: bool,
+    orig_quality: u64,
+    remaining_out: &Leg,
+    remaining_in: &Leg,
+    out_leg: &Leg,
+    in_leg: &Leg,
+    crossed: bool,
+) -> (Value, Value) {
+    if remaining_out.is_zero() || remaining_in.is_zero() {
+        return (
+            out_leg.with_amount(&IOUAmount::ZERO, 0),
+            in_leg.with_amount(&IOUAmount::ZERO, 0),
+        );
+    }
+    if !crossed {
+        return (
+            remaining_out.with_amount(&remaining_out.iou, remaining_out.drops),
+            remaining_in.with_amount(&remaining_in.iou, remaining_in.drops),
+        );
+    }
+    let rate = from_rate(orig_quality).unwrap_or(IOUAmount::ZERO);
+    if is_sell {
+        let gets = remaining_in.clone();
+        let pays = rxrpl_amount::Amount::div_round(
+            &leg_to_amount(remaining_in),
+            &rxrpl_amount::Amount::Iou(rate),
+            out_leg.is_xrp,
+            true,
+        )
+        .map(|x| amount_to_leg(&x, out_leg))
+        .unwrap_or_else(|_| out_leg.clone());
+        (
+            pays.with_amount(&pays.iou, pays.drops),
+            gets.with_amount(&gets.iou, gets.drops),
+        )
+    } else {
+        let pays = remaining_out.clone();
+        let gets = rxrpl_amount::Amount::mul_round(
+            &leg_to_amount(remaining_out),
+            &rxrpl_amount::Amount::Iou(rate),
+            in_leg.is_xrp,
+            true,
+        )
+        .map(|x| amount_to_leg(&x, in_leg))
+        .unwrap_or_else(|_| in_leg.clone());
+        (
+            pays.with_amount(&pays.iou, pays.drops),
+            gets.with_amount(&gets.iou, gets.drops),
+        )
+    }
+}
+
+/// rippled `CreateOffer::direct_cross` (CO.cpp:511): a single-book best-price walk
+/// for XrpToIou / IouToXrp takers.
+#[allow(clippy::too_many_arguments)]
+fn direct_cross(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    out_leg: &Leg,
+    in_leg: &Leg,
+    book: &Hash256,
+    threshold: u64,
+    is_sell: bool,
+    remaining_out: &mut Leg,
+    remaining_in: &mut Leg,
+    round: bool,
+) -> Result<bool, TransactionResult> {
+    let _ = out_leg;
+    let cross_type = if in_leg.is_xrp {
+        TakerCrossType::XrpToIou
+    } else {
+        TakerCrossType::IouToXrp
+    };
+    let mut stream = OfferStream::new(book);
+    let mut crossed = false;
+    let mut direct_crossings: u32 = 0;
+    let mut tip = stream.step(ctx, Some((taker, taker_acct)), threshold)?;
+    while let Some(t) = tip.take() {
+        if reject_quality(t.quality, threshold) {
+            break;
+        }
+        let owner_funds = owner_funds_leg(ctx, &t.owner, &t.offer_out);
+        let taker_funds = owner_funds_leg(ctx, taker, &t.offer_in);
+        let avail_out = leg_min(&t.offer_out, &owner_funds);
+        let flow = do_cross_single(
+            ctx,
+            taker,
+            &t,
+            cross_type,
+            is_sell,
+            remaining_out,
+            remaining_in,
+            &owner_funds,
+            &taker_funds,
+        );
+        let did = !flow.order_out.is_zero() || !flow.order_in.is_zero();
+        if did {
+            fill_direct(ctx, taker, taker_acct, &t, &flow, &avail_out, round)?;
+            crossed = true;
+            direct_crossings += 1;
+        }
+        *remaining_out = sell_clamp_sub(remaining_out, &flow.order_out, is_sell);
+        *remaining_in = leg_sub(remaining_in, &flow.order_in);
+        if offer_is_dry(ctx, &t.owner, &t.offer_out, &flow.order_out) {
+            reap_maker_short_sells(ctx, &t.owner, &t.offer_out)?;
+        }
+        if taker_done(is_sell, remaining_out, remaining_in) {
+            break;
+        }
+        if direct_crossings >= 850 {
+            break;
+        }
+        if !offer_is_dry(ctx, &t.owner, &t.offer_out, &flow.order_out) {
+            break;
+        }
+        tip = stream.step(ctx, Some((taker, taker_acct)), threshold)?;
+    }
+    Ok(crossed)
+}
+
+/// rippled `CreateOffer::bridged_cross` (CO.cpp:322): the direct book plus the
+/// XRP autobridge (leg1 in->XRP, leg2 XRP->out), `select_path`-chosen per band.
+#[allow(clippy::too_many_arguments)]
+fn bridged_cross(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    out_leg: &Leg,
+    in_leg: &Leg,
+    direct_book: &Hash256,
+    threshold: u64,
+    is_sell: bool,
+    remaining_out: &mut Leg,
+    remaining_in: &mut Leg,
+    round: bool,
+) -> Result<bool, TransactionResult> {
+    let xrp_ccy = [0u8; 20];
+    let xrp_iss = AccountId::from([0u8; 20]);
+    let leg1_book = keylet::book_dir(&in_leg.currency, &in_leg.issuer, &xrp_ccy, &xrp_iss);
+    let leg2_book = keylet::book_dir(&xrp_ccy, &xrp_iss, &out_leg.currency, &out_leg.issuer);
+    let mut sd = OfferStream::new(direct_book);
+    let mut s1 = OfferStream::new(&leg1_book);
+    let mut s2 = OfferStream::new(&leg2_book);
+    let mut crossed = false;
+    let mut direct_crossings: u32 = 0;
+    let mut bridge_crossings: u32 = 0;
+    let mut direct_tip = sd.step(ctx, Some((taker, taker_acct)), threshold)?;
+    let mut leg1_tip = s1.step(ctx, None, threshold)?;
+    let mut leg2_tip = s2.step(ctx, None, threshold)?;
+    loop {
+        let have_direct = direct_tip.is_some();
+        let have_bridge = leg1_tip.is_some() && leg2_tip.is_some();
+        if !have_direct && !have_bridge {
+            break;
+        }
+        let direct_q = direct_tip.as_ref().map(|t| t.quality).unwrap_or(0);
+        let bridge_q = if have_bridge {
+            composed_quality(
+                leg1_tip.as_ref().unwrap().quality,
+                leg2_tip.as_ref().unwrap().quality,
+            )
+        } else {
+            0
+        };
+        let (use_direct, quality) = select_path(have_direct, direct_q, have_bridge, bridge_q);
+        if reject_quality(quality, threshold) {
+            break;
+        }
+        let mut advanced = false;
+        if use_direct {
+            let t = direct_tip.clone().unwrap();
+            let owner_funds = owner_funds_leg(ctx, &t.owner, &t.offer_out);
+            let taker_funds = owner_funds_leg(ctx, taker, &t.offer_in);
+            let avail_out = leg_min(&t.offer_out, &owner_funds);
+            let flow = do_cross_single(
+                ctx,
+                taker,
+                &t,
+                TakerCrossType::IouToIou,
+                is_sell,
+                remaining_out,
+                remaining_in,
+                &owner_funds,
+                &taker_funds,
+            );
+            let did = !flow.order_out.is_zero() || !flow.order_in.is_zero();
+            if did {
+                fill_direct(ctx, taker, taker_acct, &t, &flow, &avail_out, round)?;
+                crossed = true;
+                direct_crossings += 1;
+            }
+            *remaining_out = sell_clamp_sub(remaining_out, &flow.order_out, is_sell);
+            *remaining_in = leg_sub(remaining_in, &flow.order_in);
+            if offer_is_dry(ctx, &t.owner, &t.offer_out, &flow.order_out) {
+                direct_tip = sd.step(ctx, Some((taker, taker_acct)), threshold)?;
+                advanced = true;
+            }
+        } else {
+            let t1 = leg1_tip.clone().unwrap();
+            let t2 = leg2_tip.clone().unwrap();
+            let owner1_funds = owner_funds_leg(ctx, &t1.owner, &t1.offer_out);
+            let owner2_funds = owner_funds_leg(ctx, &t2.owner, &t2.offer_out);
+            let avail1 = leg_min(&t1.offer_out, &owner1_funds);
+            let avail2 = leg_min(&t2.offer_out, &owner2_funds);
+            let (flow1, flow2) =
+                do_cross_bridged(ctx, taker, &t1, &t2, is_sell, remaining_out, remaining_in);
+            let did = !flow1.order_in.is_zero() || !flow2.order_out.is_zero();
+            if did {
+                fill_bridged(
+                    ctx, taker, taker_acct, &t1, &flow1, &avail1, &t2, &flow2, &avail2, round,
+                )?;
+                crossed = true;
+                bridge_crossings += 1;
+            }
+            *remaining_out = sell_clamp_sub(remaining_out, &flow2.order_out, is_sell);
+            *remaining_in = leg_sub(remaining_in, &flow1.order_in);
+            if offer_is_dry(ctx, &t1.owner, &t1.offer_out, &flow1.order_out) {
+                leg1_tip = s1.step(ctx, None, threshold)?;
+                advanced = true;
+            }
+            if offer_is_dry(ctx, &t2.owner, &t2.offer_out, &flow2.order_out) {
+                leg2_tip = s2.step(ctx, None, threshold)?;
+                advanced = true;
+            }
+        }
+        if taker_done(is_sell, remaining_out, remaining_in) {
+            break;
+        }
+        if direct_crossings + 2 * bridge_crossings >= 850 {
+            break;
+        }
+        // If no stream advanced this round the taker is either done (checked above)
+        // or unfunded; stop rather than re-crossing the same tips. Mirrors rippled's
+        // done()/unfunded() limb and the "an offer must be fully consumed"
+        // postcondition of bridged_cross.
+        if !advanced {
+            break;
+        }
+    }
+    Ok(crossed)
+}
+
+/// rippled `CreateOffer::takerCross` (CO.cpp:627): the legacy `!FlowCross` arm.
+/// Returns the same tx-oriented `(remaining_pays, remaining_gets, crossed)` tuple
+/// as `cross_offers`, so the shared placement tail in `apply()` is unchanged.
+#[allow(clippy::too_many_arguments)]
+fn taker_cross(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    taker_pays: &Value,
+    taker_gets: &Value,
+    inverse_book: &Hash256,
+    is_sell: bool,
+    _domain_only: bool,
+) -> Result<(Value, Value, bool), TransactionResult> {
+    let out_leg = match Leg::parse(taker_pays) {
+        Some(l) => l,
+        None => return Ok((taker_pays.clone(), taker_gets.clone(), false)),
+    };
+    let in_leg = match Leg::parse(taker_gets) {
+        Some(l) => l,
+        None => return Ok((taker_pays.clone(), taker_gets.clone(), false)),
+    };
+    let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+    let pays_iou = leg_as_quality_iou(&out_leg);
+    let gets_iou = leg_as_quality_iou(&in_leg);
+    let orig_quality = if number_switchover {
+        rxrpl_amount::get_rate_round_even(&gets_iou, &pays_iou)
+    } else {
+        rxrpl_amount::get_rate(&gets_iou, &pays_iou)
+    }
+    .unwrap_or(0);
+    if orig_quality == 0 {
+        return Ok((taker_pays.clone(), taker_gets.clone(), false));
+    }
+    // rippled tightens the crossing threshold by one rate ULP for a passive offer
+    // so equal-quality resting offers are NOT consumed (`++threshold_`, T.cpp:79).
+    // `Quality::operator++` is `--m_value` ("advance to the next higher quality"),
+    // and a lower packed rate is a better quality, so the bump is a decrement here:
+    // reject (`dir_quality > threshold`) then fires on an equal-quality offer.
+    let passive = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_PASSIVE != 0;
+    let threshold = if passive {
+        orig_quality.saturating_sub(1)
+    } else {
+        orig_quality
+    };
+
+    let mut remaining_out = out_leg.clone();
+    let mut remaining_in = in_leg.clone();
+    let crossed = if !in_leg.is_xrp && !out_leg.is_xrp {
+        bridged_cross(
+            ctx,
+            taker,
+            taker_acct,
+            &out_leg,
+            &in_leg,
+            inverse_book,
+            threshold,
+            is_sell,
+            &mut remaining_out,
+            &mut remaining_in,
+            number_switchover,
+        )?
+    } else {
+        direct_cross(
+            ctx,
+            taker,
+            taker_acct,
+            &out_leg,
+            &in_leg,
+            inverse_book,
+            threshold,
+            is_sell,
+            &mut remaining_out,
+            &mut remaining_in,
+            number_switchover,
+        )?
+    };
+
+    let (remaining_pays, remaining_gets) = remaining_offer(
+        is_sell,
+        orig_quality,
+        &remaining_out,
+        &remaining_in,
+        &out_leg,
+        &in_leg,
+        crossed,
+    );
+    Ok((remaining_pays, remaining_gets, crossed))
+}
+
+#[cfg(test)]
+mod taker_crossing_tests {
+    use super::{
+        Leg, TakerCrossType, composed_quality, flow_iou_to_iou, flow_iou_to_xrp, flow_xrp_to_iou,
+        in_for_out, leftover_is_dust, leftover_leg, leg_gt, leg_max, pack_rate, parity_rate,
+        qual_div, qual_mul, reject_quality, remaining_is_filled, remaining_is_filled_at,
+        remaining_offer, select_path, sell_clamp_sub,
+    };
+    use rxrpl_amount::{IOUAmount, from_rate, get_rate, offer_quality};
+    use rxrpl_primitives::AccountId;
+    use rxrpl_protocol::keylet;
+
+    fn iou(v: &str) -> Leg {
+        Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: IOUAmount::from_decimal_string(v).unwrap(),
+            currency: [1u8; 20],
+            issuer: AccountId::from([2u8; 20]),
+        }
+    }
+
+    fn xrp(d: i64) -> Leg {
+        Leg {
+            is_xrp: true,
+            drops: d,
+            iou: IOUAmount::ZERO,
+            currency: [0u8; 20],
+            issuer: AccountId::from([0u8; 20]),
+        }
+    }
+
+    fn rate(inn: &str, out: &str) -> IOUAmount {
+        from_rate(
+            get_rate(
+                &IOUAmount::from_decimal_string(inn).unwrap(),
+                &IOUAmount::from_decimal_string(out).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ledger_30000020_eur_leftover_is_canonical_zero() {
+        // IOC 4F0BD7AA: taker wants 50.0000000012541 EUR, maker has
+        // 50.00000000125411. Mainnet leftover TakerGets is 0 and the offer is
+        // deleted. STAmount 16-digit leftover must be zero.
+        let offer = IOUAmount::from_decimal_string("50.00000000125411").unwrap();
+        let take = IOUAmount::from_decimal_string("50.0000000012541").unwrap();
+        let leftover = IOUAmount::sub(&offer, &take).unwrap();
+        let part = Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: leftover,
+            currency: [0u8; 20],
+            issuer: AccountId::from([0u8; 20]),
+        };
+        let whole = Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: offer,
+            currency: [0u8; 20],
+            issuer: AccountId::from([0u8; 20]),
+        };
+        assert!(
+            leftover_is_dust(&part, &whole),
+            "leftover {} must be dust vs {}",
+            leftover.to_decimal_string(),
+            offer.to_decimal_string()
+        );
+    }
+
+    #[test]
+    fn ledger_30000046_jpy_tail_is_filled_at_minus_21_not_at_hop_start() {
+        let demand = iou("25450");
+        assert!(
+            !remaining_is_filled_at(&demand, &demand, -21),
+            "remaining=Amount must keep walking (B19E first)"
+        );
+        let after_b19e = iou("25166.91826601741");
+        assert!(
+            !remaining_is_filled_at(&after_b19e, &demand, -21),
+            "after the 283 JPY B19E take the book still has work"
+        );
+        let tail = iou("0.08");
+        assert!(
+            remaining_is_filled_at(&tail, &demand, -21),
+            "0.08/25450 is the extra-offer tail"
+        );
+        assert!(
+            !remaining_is_filled(&tail, &demand),
+            "0.08/25450 is not 1e-15 STAmount dust"
+        );
+    }
+
+    #[test]
+    fn ledger_30000015_threshold_rejects_best_inverse_btc_xrp() {
+        // OfferCreate 7C16EAE4: TakerGets 23048078497 XRP / TakerPays 7.6826 BTC.
+        // Inverse book tip rhK6GEk 8688 is ~70000 XRP/BTC; we must not take it.
+        let threshold = get_rate(
+            &IOUAmount::from_decimal_string("23048078497").unwrap(),
+            &IOUAmount::from_decimal_string("7.68261600540501").unwrap(),
+        )
+        .unwrap();
+        let inverse_tip = 0x5F18_DE4D_4B80_5BD1u64;
+        assert!(
+            reject_quality(inverse_tip, threshold),
+            "inverse tip {inverse_tip:#x} must miss threshold {threshold:#x}"
+        );
+        let our_book = 0x4B0B_D79E_626E_0800u64;
+        assert_eq!(
+            offer_quality(
+                &IOUAmount::from_decimal_string("7.68261600540501").unwrap(),
+                &IOUAmount::from_decimal_string("23048078497").unwrap(),
+            )
+            .unwrap(),
+            our_book
+        );
+        let btc = {
+            let mut c = [0u8; 20];
+            c[12..15].copy_from_slice(b"BTC");
+            c
+        };
+        let issuer =
+            rxrpl_codec::address::classic::decode_account_id("rLEsXccBGNR3UPuPu2hUXPjziKC3qKSBun")
+                .unwrap();
+        let xrp = [0u8; 20];
+        let zero = AccountId::from([0u8; 20]);
+        let inverse = keylet::book_dir(&xrp, &zero, &btc, &issuer);
+        let same = keylet::book_dir(&btc, &issuer, &xrp, &zero);
+        assert!(
+            inverse.to_string().to_uppercase().starts_with("16CAFBAC"),
+            "inverse {}",
+            inverse
+        );
+        assert!(
+            same.to_string().to_uppercase().starts_with("101FE75F"),
+            "same {}",
+            same
+        );
+    }
+
+    #[test]
+    fn ledger_30000004_taker_threshold_vs_maker_qualities() {
+        let taker_q = get_rate(
+            &IOUAmount::from_decimal_string("30658943169").unwrap(),
+            &IOUAmount::from_decimal_string("9063").unwrap(),
+        )
+        .unwrap();
+        let m1 = get_rate(
+            &IOUAmount::from_decimal_string("409126752").unwrap(),
+            &IOUAmount::from_decimal_string("120.9419652590728").unwrap(),
+        )
+        .unwrap();
+        let m2 = get_rate(
+            &IOUAmount::from_decimal_string("166222442").unwrap(),
+            &IOUAmount::from_decimal_string("49.13701852804732").unwrap(),
+        )
+        .unwrap();
+        let m3 = get_rate(
+            &IOUAmount::from_decimal_string("1008259326").unwrap(),
+            &IOUAmount::from_decimal_string("298.0515540012705").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(m3, 0x5b0c_04ab_b9f8_8eed);
+        assert!(
+            !reject_quality(m1, taker_q),
+            "m1 {m1:#x} should pass threshold {taker_q:#x}"
+        );
+        assert!(
+            !reject_quality(m2, taker_q),
+            "m2 {m2:#x} should pass threshold {taker_q:#x}"
+        );
+        assert!(
+            !reject_quality(m3, taker_q),
+            "m3 {m3:#x} should pass threshold {taker_q:#x} (mainnet crossed F02D74BB)"
+        );
+    }
+
+    // select_path picks the better (smaller packed rate) of the direct tip and the
+    // composed bridge quality; rippled uses direct when `bridge_q > direct_q`.
+    #[test]
+    fn select_path_prefers_better_quality() {
+        assert_eq!(select_path(true, 100, false, 0), (true, 100)); // no bridge -> direct
+        assert_eq!(select_path(false, 0, true, 200), (false, 200)); // no direct -> bridge
+        assert_eq!(select_path(true, 100, true, 200), (true, 100)); // direct better (smaller)
+        assert_eq!(select_path(true, 200, true, 100), (false, 100)); // bridge better
+        assert_eq!(select_path(true, 100, true, 100), (false, 100)); // tie -> bridge
+    }
+
+    // composed_quality(q1, q2) = pack(multiply(rate1, rate2)): a 2.0 leg chained
+    // with a 3.0 leg gives a 6.0 bridge.
+    #[test]
+    fn composed_quality_multiplies_rates() {
+        let q2 = get_rate(
+            &IOUAmount::from_decimal_string("2").unwrap(),
+            &IOUAmount::from_decimal_string("1").unwrap(),
+        )
+        .unwrap();
+        let q3 = get_rate(
+            &IOUAmount::from_decimal_string("3").unwrap(),
+            &IOUAmount::from_decimal_string("1").unwrap(),
+        )
+        .unwrap();
+        let q6 = get_rate(
+            &IOUAmount::from_decimal_string("6").unwrap(),
+            &IOUAmount::from_decimal_string("1").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(composed_quality(q2, q3), q6);
+    }
+
+    #[test]
+    fn limit_quality_rejects_composed_path_worse_than_sendmax_amount() {
+        // 30000012 AE4D4DEA: SendMax 600.06 CNY / Amount 1482.4567 XLM.
+        // After 30000010 took the 10 CNY band, leftover hop quality composes
+        // strictly worse than that limit.
+        let limit = get_rate(
+            &IOUAmount::from_decimal_string("600.06").unwrap(),
+            &IOUAmount::from_decimal_string("1482.456705882353").unwrap(),
+        )
+        .unwrap();
+        let first_band = get_rate(
+            &IOUAmount::from_decimal_string("10").unwrap(),
+            &IOUAmount::from_decimal_string("4.200294").unwrap(),
+        )
+        .unwrap();
+        let xlm_band = get_rate(
+            &IOUAmount::from_decimal_string("4.200294").unwrap(),
+            &IOUAmount::from_decimal_string("24.707884").unwrap(),
+        )
+        .unwrap();
+        let ok = composed_quality(first_band, xlm_band);
+        assert!(
+            ok <= limit,
+            "30000010 fill {ok:#x} must pass limit {limit:#x}"
+        );
+        let worse_cny = get_rate(
+            &IOUAmount::from_decimal_string("20").unwrap(),
+            &IOUAmount::from_decimal_string("4.200294").unwrap(),
+        )
+        .unwrap();
+        let dry = composed_quality(worse_cny, xlm_band);
+        assert!(
+            dry > limit,
+            "leftover band {dry:#x} must miss limit {limit:#x}"
+        );
+    }
+
+    #[test]
+    fn pack_rate_roundtrips_from_rate() {
+        let q = get_rate(
+            &IOUAmount::from_decimal_string("2.5").unwrap(),
+            &IOUAmount::from_decimal_string("1").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pack_rate(&from_rate(q).unwrap()), q);
+    }
+
+    // qual_mul computes input from output at the rate and clamps to the cap;
+    // qual_div computes output from input and clamps.
+    #[test]
+    fn qual_mul_div_clamp_to_cap() {
+        let r = parity_rate(); // 1.0
+        // multiply(3, 1.0) = 3, clamped to cap 5 -> 3.
+        assert_eq!(
+            qual_mul(&iou("3"), &r, &iou("5")).iou.to_decimal_string(),
+            "3"
+        );
+        // multiply(3, 1.0) = 3, clamped to cap 2 -> 2.
+        assert_eq!(
+            qual_mul(&iou("3"), &r, &iou("2")).iou.to_decimal_string(),
+            "2"
+        );
+        // divide(6, 1.0) = 6, clamped to cap 10 -> 6.
+        assert_eq!(
+            qual_div(&iou("6"), &r, &iou("10")).iou.to_decimal_string(),
+            "6"
+        );
+    }
+
+    // flow_iou_to_iou owner-funds clamp: the owner can only give 40 of a 100/100
+    // offer, so the fill scales to (in=40, out=40).
+    #[test]
+    fn flow_iou_to_iou_owner_funds_bound() {
+        let f = flow_iou_to_iou(
+            &iou("100"),         // offer_in
+            &iou("100"),         // offer_out
+            &rate("100", "100"), // rate 1.0
+            &iou("40"),          // owner_funds (out asset)
+            &iou("1000000"),     // taker_funds (in asset)
+            &parity_rate(),      // in_rate
+            &parity_rate(),      // out_rate
+            false,               // buy
+            &iou("1000000"),     // remaining_out
+            &iou("1000000"),     // remaining_in
+        );
+        assert_eq!(f.order_out.iou.to_decimal_string(), "40");
+        assert_eq!(f.order_in.iou.to_decimal_string(), "40");
+    }
+
+    // flow_iou_to_iou taker-input clamp: the taker has only 30 input left.
+    #[test]
+    fn flow_iou_to_iou_taker_input_bound() {
+        let f = flow_iou_to_iou(
+            &iou("100"),
+            &iou("100"),
+            &rate("100", "100"),
+            &iou("1000000"),
+            &iou("1000000"),
+            &parity_rate(),
+            &parity_rate(),
+            false,
+            &iou("1000000"),
+            &iou("30"), // remaining_in
+        );
+        assert_eq!(f.order_in.iou.to_decimal_string(), "30");
+        assert_eq!(f.order_out.iou.to_decimal_string(), "30");
+    }
+
+    // flow_iou_to_iou taker-output (demand) clamp at rate 2.0: a 50-unit demand
+    // costs 100 input.
+    #[test]
+    fn flow_iou_to_iou_demand_bound_rate_two() {
+        let f = flow_iou_to_iou(
+            &iou("200"), // offer_in
+            &iou("100"), // offer_out (rate 2.0)
+            &rate("200", "100"),
+            &iou("100"), // owner_funds (full)
+            &iou("1000000"),
+            &parity_rate(),
+            &parity_rate(),
+            false,
+            &iou("50"), // remaining_out demand
+            &iou("1000000"),
+        );
+        assert_eq!(f.order_out.iou.to_decimal_string(), "50");
+        assert_eq!(f.order_in.iou.to_decimal_string(), "100");
+    }
+
+    // flow_xrp_to_iou taker-input clamp fires for a direct XrpToIou cross (taker's
+    // remaining XRP input bounds the fill).
+    #[test]
+    fn flow_xrp_to_iou_input_bound() {
+        let f = flow_xrp_to_iou(
+            &xrp(200),   // offer_in (XRP the offer wants)
+            &iou("100"), // offer_out (IOU, rate 2.0 in XRP/IOU)
+            &rate("200", "100"),
+            &iou("1000000"), // owner_funds (IOU out)
+            &xrp(1_000_000), // taker_funds (XRP)
+            &parity_rate(),  // out_rate
+            false,
+            &iou("1000000"), // remaining_out
+            &xrp(50),        // remaining_in (XRP)
+            TakerCrossType::XrpToIou,
+        );
+        assert_eq!(f.order_in.drops, 50);
+        assert_eq!(f.order_out.iou.to_decimal_string(), "25"); // 50 / 2.0
+    }
+
+    // flow_iou_to_xrp owner (XRP) funds clamp: the owner can only pay out 30 XRP.
+    #[test]
+    fn flow_iou_to_xrp_owner_funds_bound() {
+        let f = flow_iou_to_xrp(
+            &iou("100"), // offer_in (IOU the offer wants)
+            &xrp(100),   // offer_out (XRP, rate 1.0)
+            &rate("100", "100"),
+            &xrp(30),        // owner_funds (XRP)
+            &iou("1000000"), // taker_funds (IOU)
+            &parity_rate(),  // in_rate
+            false,
+            &xrp(1_000_000),
+            &iou("1000000"),
+            TakerCrossType::IouToXrp,
+        );
+        assert_eq!(f.order_out.drops, 30);
+        assert_eq!(f.order_in.iou.to_decimal_string(), "30");
+    }
+
+    // remaining_offer rescales the leftover to the ORIGINAL quality. Original
+    // offer TakerPays=100, TakerGets=200 (rate gets/pays = 2.0).
+    #[test]
+    fn remaining_offer_sell_rescales_to_original_quality() {
+        let orig_q = get_rate(
+            &IOUAmount::from_decimal_string("200").unwrap(), // gets
+            &IOUAmount::from_decimal_string("100").unwrap(), // pays
+        )
+        .unwrap();
+        let (pays, gets) = remaining_offer(
+            true, // sell
+            orig_q,
+            &iou("30"), // remaining_out (pays) — ignored for sell
+            &iou("50"), // remaining_in (gets)
+            &iou("100"),
+            &iou("200"),
+            true,
+        );
+        // sell: gets = remaining_in = 50; pays = divRound(50, gets/pays=2.0) = 25.
+        assert_eq!(gets["value"], "50");
+        assert_eq!(pays["value"], "25");
+    }
+
+    #[test]
+    fn remaining_offer_buy_rescales_to_original_quality() {
+        let orig_q = get_rate(
+            &IOUAmount::from_decimal_string("200").unwrap(),
+            &IOUAmount::from_decimal_string("100").unwrap(),
+        )
+        .unwrap();
+        let (pays, gets) = remaining_offer(
+            false, // buy
+            orig_q,
+            &iou("30"), // remaining_out (pays)
+            &iou("50"), // remaining_in (gets) — ignored for buy
+            &iou("100"),
+            &iou("200"),
+            true,
+        );
+        // buy: pays = remaining_out = 30; gets = mulRound(30, gets/pays=2.0) = 60.
+        assert_eq!(pays["value"], "30");
+        assert_eq!(gets["value"], "60");
+    }
+
+    #[test]
+    fn remaining_offer_buy_preserves_tick_snapped_testnet_quality() {
+        // Testnet 20934193 / 9B345F1A: TickSize=6 snaps TakerGets to
+        // 6.03172688340672 WAR. Two crossed offers leave 1,000,018 drops XRP.
+        // Flow must derive the WAR remainder at the snapped original quality,
+        // rather than subtracting the two makers' nominal WAR amounts.
+        let gets = iou("6.03172688340672");
+        let pays = xrp(12_000_000);
+        let orig_q = get_rate(
+            &gets.iou,
+            &IOUAmount::from_parts(12_000_000, 0, false).unwrap(),
+        )
+        .unwrap();
+        let (remaining_pays, remaining_gets) = remaining_offer(
+            false,
+            orig_q,
+            &xrp(1_000_018),
+            // `cross_offers`' independent subtraction produces this positive
+            // value; the rescaling path intentionally ignores it for a buy.
+            &iou("0.50768279238949"),
+            &pays,
+            &gets,
+            true,
+        );
+        assert_eq!(remaining_pays, serde_json::json!("1000018"));
+        assert_eq!(remaining_gets["value"], "0.5026529545408852");
+    }
+
+    #[test]
+    fn ledger_30000008_payment_leftover_taker_pays() {
+        // Payment D091EB7D (30000008): demand-limited take of 18985524 XRP
+        // from offer 67FAFA4B. Mainnet leftover TakerPays is 2.512242529714367.
+        let offer_in = iou("2.51453731");
+        let take_out = xrp(18_985_524);
+        let packed: u64 = 0x4B04_4B4E_6621_DCEF;
+        let rate = from_rate(packed).unwrap();
+        let priced = in_for_out(&take_out, &rate, &offer_in);
+        let leftover_trunc = leftover_leg(&offer_in, &priced, false);
+        let leftover_round = leftover_leg(&offer_in, &priced, true);
+        let want = IOUAmount::from_decimal_string("2.512242529714367").unwrap();
+        assert_eq!(
+            leftover_trunc.iou.to_decimal_string(),
+            want.to_decimal_string()
+        );
+        assert_eq!(leftover_round.iou.to_decimal_string(), "2.512242529714366");
+    }
+
+    #[test]
+    fn remaining_offer_exhausted_and_untouched() {
+        let orig_q = get_rate(
+            &IOUAmount::from_decimal_string("200").unwrap(),
+            &IOUAmount::from_decimal_string("100").unwrap(),
+        )
+        .unwrap();
+        // Exhausted (a side is zero) -> zero residual.
+        let (pays, gets) = remaining_offer(
+            false,
+            orig_q,
+            &iou("0"),
+            &iou("50"),
+            &iou("100"),
+            &iou("200"),
+            true,
+        );
+        assert_eq!(pays["value"], "0");
+        assert_eq!(gets["value"], "0");
+        // Untouched (nothing crossed) -> original amounts.
+        let (pays, gets) = remaining_offer(
+            false,
+            orig_q,
+            &iou("100"),
+            &iou("200"),
+            &iou("100"),
+            &iou("200"),
+            false,
+        );
+        assert_eq!(pays["value"], "100");
+        assert_eq!(gets["value"], "200");
+    }
+
+    #[test]
+    fn sell_clamp_and_leg_helpers() {
+        // sell overshoot clamps the remaining demand at zero.
+        assert!(sell_clamp_sub(&iou("40"), &iou("60"), true).is_zero());
+        assert_eq!(
+            sell_clamp_sub(&iou("40"), &iou("10"), true)
+                .iou
+                .to_decimal_string(),
+            "30"
+        );
+        assert!(leg_gt(&iou("5"), &iou("3")));
+        assert!(!leg_gt(&iou("3"), &iou("3")));
+        assert_eq!(leg_max(&xrp(7), &xrp(4)).drops, 7);
+    }
+}
+
+#[cfg(test)]
+mod tick_round_tests {
+    use super::{rebuild_iou, round_drops_half_even};
+    use rxrpl_amount::IOUAmount;
+
+    // The tick re-derivation of an XRP side yields a fractional drops magnitude;
+    // rebuild_iou must round it onto an integer drop the way rippled's
+    // `STAmount(XRP)` does (round half to even), not truncate. Mainnet tx
+    // DFF0E4CB snaps TakerGets 3654519 -> 3654430 (re-derived 3654430.39499415,
+    // rounds down); tx 3CB55737 snaps 8543180 -> 8543055 (re-derived
+    // 8543054.951085025, rounds up — truncation produced 8543054 and diverged).
+    #[test]
+    fn rebuild_iou_rounds_xrp_drops_half_even() {
+        let original = serde_json::json!("3654519");
+        let redrived = IOUAmount::from_decimal_string("3654430.39499415").unwrap();
+        assert_eq!(
+            rebuild_iou(&original, &redrived),
+            Some(serde_json::json!("3654430"))
+        );
+
+        let original = serde_json::json!("8543180");
+        let redrived = IOUAmount::from_decimal_string("8543054.951085025").unwrap();
+        assert_eq!(
+            rebuild_iou(&original, &redrived),
+            Some(serde_json::json!("8543055"))
+        );
+    }
+
+    #[test]
+    fn round_drops_ties_to_even() {
+        assert_eq!(round_drops_half_even("10.5"), Some(10));
+        assert_eq!(round_drops_half_even("11.5"), Some(12));
+        assert_eq!(round_drops_half_even("10.5000001"), Some(11));
+        assert_eq!(round_drops_half_even("10.4999999"), Some(10));
+        assert_eq!(round_drops_half_even("42"), Some(42));
+    }
+}
+
+#[cfg(test)]
+mod book_directory_quality_tests {
+    use super::offer_book_quality;
+
+    // Known-answer vectors for the helper (mainnet DFF0E4CB / 105333100).
+    // apply() keys BookDirectory on the ORIGINAL tick-snapped amounts (rippled
+    // uRate); leftover vs original still hash-differ when TakerPays is not
+    // scaled with TakerGets.
+    #[test]
+    fn book_quality_known_answers_original_and_leftover() {
+        let zrp = serde_json::json!({
+            "currency": "ZRP",
+            "issuer": "rZapJ1PZ297QAEXRGu3SZkAiwXbA7BNoe",
+            "value": "140.55304742187"
+        });
+        let remaining_gets = serde_json::json!("3654430");
+        let original_gets = serde_json::json!("3654519");
+        assert_eq!(
+            offer_book_quality(&zrp, &remaining_gets, true),
+            0x500DAA02090C875D
+        );
+        assert_eq!(
+            offer_book_quality(&zrp, &original_gets, true),
+            0x500DA9EC3A23F7E9
+        );
+    }
+
+    // Mainnet 30000004 / 681FEF4C: pre-fixUniversalNumber getRate of the
+    // original TakerPays/TakerGets. Placement must use this, not the leftover.
+    #[test]
+    fn pre_number_original_rate_pins_30000004() {
+        let usd = serde_json::json!({
+            "currency": "USD",
+            "issuer": "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
+            "value": "9063"
+        });
+        let xrp = serde_json::json!("30658943169");
+        assert_eq!(
+            offer_book_quality(&usd, &xrp, false),
+            5_623_448_405_541_126_236
+        );
+    }
+}
+
+#[cfg(test)]
+mod amm_quality_gate_tests {
+    use super::num_quality_iou;
+    use rxrpl_amount::number::Number;
+
+    // Mainnet tx 062FDE11 (ledger 105333100): offer sells 1061920 USD for
+    // 1e12 drops XRP => limit quality (in/out rate) = get_rate(1061920, 1e12).
+    // The USD/XRP AMM (4014336154 drops XRP + 4363.056921446038 USD) has a spot
+    // quality of only 920074 drops/USD, worse than the offer's 941690, so the
+    // gate must refuse the cross (amm_hop returns None) and the offer rests.
+    #[test]
+    fn amm_worse_than_offer_quality_is_gated_out() {
+        // AMM spot rate: in = pool USD (received), out = pool XRP (paid).
+        let pool_in = Number::from_iou(
+            &rxrpl_amount::IOUAmount::from_decimal_string("4363.056921446038").unwrap(),
+        );
+        let pool_out = Number::from_int(4_014_336_154); // XRP drops
+        let spq = rxrpl_amount::get_rate(
+            &num_quality_iou(&pool_in, false),
+            &num_quality_iou(&pool_out, true),
+        )
+        .unwrap();
+        // Offer limit: in = TakerGets 1061920 USD, out = TakerPays 1e12 drops.
+        let offer_in =
+            Number::from_iou(&rxrpl_amount::IOUAmount::from_decimal_string("1061920").unwrap());
+        let offer_out = Number::from_int(1_000_000_000_000);
+        let cq = rxrpl_amount::get_rate(
+            &num_quality_iou(&offer_in, false),
+            &num_quality_iou(&offer_out, true),
+        )
+        .unwrap();
+        // Gate refuses when the AMM does not strictly beat the offer quality.
+        assert!(
+            !rxrpl_amount::is_better_quality(spq, cq)
+                || rxrpl_amount::within_relative_distance(spq, cq),
+            "AMM spot must not beat the offer limit -> no cross"
+        );
+    }
+}
+
+#[cfg(test)]
+mod owner_funds_tests {
+    use super::*;
+    use crate::fees::FeeSettings;
+    use crate::transactor::ApplyContext;
+    use crate::view::ledger_view::LedgerView;
+    use crate::view::sandbox::Sandbox;
+    use rxrpl_amendment::Rules;
+    use rxrpl_ledger::Ledger;
+
+    const MAKER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    const ISSUER: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
+
+    // Build a ledger where MAKER holds 100 USD from ISSUER with the given
+    // trust-line and issuer-account flags, then return the maker's offer funds
+    // for an offer that SELLS that USD (`owner_funds_leg` on the USD leg).
+    fn maker_usd_funds(line_flags: u64, issuer_flags: u64) -> Leg {
+        let maker = decode_account_id(MAKER).unwrap();
+        let issuer = decode_account_id(ISSUER).unwrap();
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+        let issuer_is_low = issuer.as_bytes() < maker.as_bytes();
+        // Balance is the low account's view; the maker (holder) is positive iff
+        // value < 0 when the issuer is low, else value > 0.
+        let value = if issuer_is_low { "-100" } else { "100" };
+        let (low, high) = if issuer_is_low {
+            (ISSUER, MAKER)
+        } else {
+            (MAKER, ISSUER)
+        };
+        let mut ledger = Ledger::genesis();
+        for (addr, id, flags) in [(MAKER, &maker, 0u64), (ISSUER, &issuer, issuer_flags)] {
+            let acct = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": addr,
+                "Balance": "100000000", "Sequence": 1, "OwnerCount": 0, "Flags": flags,
+            });
+            ledger
+                .put_state(keylet::account(id), serde_json::to_vec(&acct).unwrap())
+                .unwrap();
+        }
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": value},
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "0"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "1000000"},
+            "Flags": line_flags,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&maker, &issuer, &cur),
+                serde_json::to_vec(&tl).unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({});
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let gets = Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: IOUAmount::ZERO,
+            currency: cur,
+            issuer,
+        };
+        owner_funds_leg(&mut ctx, &maker, &gets)
+    }
+
+    fn freeze_flag() -> u64 {
+        let maker = decode_account_id(MAKER).unwrap();
+        let issuer = decode_account_id(ISSUER).unwrap();
+        if issuer.as_bytes() < maker.as_bytes() {
+            0x0040_0000 // lsfLowFreeze
+        } else {
+            0x0080_0000 // lsfHighFreeze
+        }
+    }
+
+    fn auth_flag() -> u64 {
+        let maker = decode_account_id(MAKER).unwrap();
+        let issuer = decode_account_id(ISSUER).unwrap();
+        if issuer.as_bytes() < maker.as_bytes() {
+            0x0004_0000 // lsfLowAuth
+        } else {
+            0x0008_0000 // lsfHighAuth
+        }
+    }
+
+    #[test]
+    fn clean_line_is_funded() {
+        assert!(!maker_usd_funds(0, 0).is_zero());
+    }
+
+    #[test]
+    fn issuer_frozen_line_is_zero() {
+        assert!(maker_usd_funds(freeze_flag(), 0).is_zero());
+    }
+
+    #[test]
+    fn issuer_global_freeze_is_zero() {
+        assert!(maker_usd_funds(0, 0x0040_0000).is_zero());
+    }
+
+    #[test]
+    fn require_auth_unauthorized_is_zero() {
+        assert!(maker_usd_funds(0, 0x0004_0000).is_zero());
+    }
+
+    #[test]
+    fn require_auth_authorized_is_funded() {
+        assert!(!maker_usd_funds(auth_flag(), 0x0004_0000).is_zero());
+    }
+
+    // Does MAKER's USD line report deep-frozen for the given line flags?
+    fn maker_usd_deep_frozen(line_flags: u64) -> bool {
+        let maker = decode_account_id(MAKER).unwrap();
+        let issuer = decode_account_id(ISSUER).unwrap();
+        let mut cur = [0u8; 20];
+        cur[12..15].copy_from_slice(b"USD");
+        let issuer_is_low = issuer.as_bytes() < maker.as_bytes();
+        let (low, high) = if issuer_is_low {
+            (ISSUER, MAKER)
+        } else {
+            (MAKER, ISSUER)
+        };
+        let mut ledger = Ledger::genesis();
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": "0"},
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "0"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "1000000"},
+            "Flags": line_flags,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&maker, &issuer, &cur),
+                serde_json::to_vec(&tl).unwrap(),
+            )
+            .unwrap();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({});
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let asset = Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: IOUAmount::ZERO,
+            currency: cur,
+            issuer,
+        };
+        is_deep_frozen(&mut ctx, &maker, &asset)
+    }
+
+    #[test]
+    fn deep_freeze_detected_either_side() {
+        assert!(maker_usd_deep_frozen(0x0200_0000)); // lsfLowDeepFreeze
+        assert!(maker_usd_deep_frozen(0x0400_0000)); // lsfHighDeepFreeze
+    }
+
+    #[test]
+    fn clean_or_regular_freeze_is_not_deep_frozen() {
+        assert!(!maker_usd_deep_frozen(0));
+        assert!(!maker_usd_deep_frozen(0x0040_0000)); // regular freeze, not deep
+    }
+}
+
+// End-to-end synthetic exercise of the legacy Taker XRP AUTOBRIDGE. With an empty
+// `Rules` (FlowCross disabled) an IOU/IOU OfferCreate routes through `taker_cross`
+// -> `bridged_cross`. There is no direct AAA/BBB book, so the taker can only fill
+// by bridging AAA -> XRP (leg1) then XRP -> BBB (leg2). This deterministically
+// covers `do_cross_bridged` (leg equalisation), `fill_bridged` (the discrete
+// owner1 -> owner2 XRP transfer plus the two IOU settlements) and `composed_quality`
+// / `select_path` — the bridge-specific code that the direct-cross oracles do not
+// reach. Real pre-FlowCross autobridge transactions are vanishingly rare on chain,
+// so this synthetic ledger is the practical validation of the bridge legs.
+#[cfg(test)]
+mod taker_bridge_integration {
+    use super::*;
+    use crate::fees::FeeSettings;
+    use crate::transactor::ApplyContext;
+    use crate::view::ledger_view::LedgerView;
+    use crate::view::read_view::ReadView;
+    use crate::view::sandbox::Sandbox;
+    use rxrpl_amendment::Rules;
+    use rxrpl_ledger::Ledger;
+
+    const TAKER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    const O1: &str = "rf1BiGeXwwQoi8Z2ueFYTEXSwuJYfV2Jpn";
+    const O2: &str = "rpP2JgiMyTF5jR5hLG3xHCPi1knBb1v9cM";
+    const O3: &str = "r3kmLJN5D28dHuH8vZNUZpMC43pEHpaocV";
+    const ISS: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
+
+    fn ccy(code: &[u8; 3]) -> [u8; 20] {
+        let mut c = [0u8; 20];
+        c[12..15].copy_from_slice(code);
+        c
+    }
+
+    fn put_acct(ledger: &mut Ledger, addr: &str, drops: u64, owner_count: u64) {
+        let id = decode_account_id(addr).unwrap();
+        let acct = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": addr,
+            "Balance": drops.to_string(), "Sequence": 1,
+            "OwnerCount": owner_count, "Flags": 0,
+        });
+        ledger
+            .put_state(keylet::account(&id), serde_json::to_vec(&acct).unwrap())
+            .unwrap();
+    }
+
+    // Seed a RippleState where `holder` holds `bal` of `code` issued by ISS.
+    fn put_line(ledger: &mut Ledger, holder: &str, code: &[u8; 3], bal: i64) {
+        let h = decode_account_id(holder).unwrap();
+        let i = decode_account_id(ISS).unwrap();
+        let cur = ccy(code);
+        let issuer_is_low = i.as_bytes() < h.as_bytes();
+        // Balance is stored from the low account's view: a positive holder shows a
+        // negative low-view value when the issuer is the low account.
+        let value = if bal == 0 {
+            "0".to_string()
+        } else if issuer_is_low {
+            format!("-{bal}")
+        } else {
+            bal.to_string()
+        };
+        let cur_str = currency_code_str(&cur);
+        let (low, high) = if issuer_is_low {
+            (ISS, holder)
+        } else {
+            (holder, ISS)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": cur_str, "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": value},
+            "LowLimit": {"currency": cur_str, "issuer": low, "value": "0"},
+            "HighLimit": {"currency": cur_str, "issuer": high, "value": "1000000000"},
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&h, &i, &cur),
+                serde_json::to_vec(&tl).unwrap(),
+            )
+            .unwrap();
+    }
+
+    // The holder's balance magnitude in `code` (holders are positive here).
+    fn line_bal(sandbox: &Sandbox<'_>, holder: &str, code: &[u8; 3]) -> String {
+        let h = decode_account_id(holder).unwrap();
+        let i = decode_account_id(ISS).unwrap();
+        let b = sandbox
+            .read(&keylet::trust_line(&h, &i, &ccy(code)))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        v["Balance"]["value"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches('-')
+            .to_string()
+    }
+
+    fn xrp_bal(sandbox: &Sandbox<'_>, addr: &str) -> u64 {
+        let id = decode_account_id(addr).unwrap();
+        let b = sandbox.read(&keylet::account(&id)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        v["Balance"].as_str().unwrap().parse().unwrap()
+    }
+
+    fn apply_offer(
+        sandbox: &mut Sandbox<'_>,
+        fees: &FeeSettings,
+        tx: &serde_json::Value,
+    ) -> TransactionResult {
+        let rules = Rules::new(); // empty -> FlowCross disabled -> legacy taker_cross
+        let mut ctx = ApplyContext {
+            tx,
+            view: sandbox,
+            rules: &rules,
+            fees,
+        };
+        OfferCreateTransactor.apply(&mut ctx).unwrap()
+    }
+
+    #[test]
+    fn iou_to_iou_offer_autobridges_through_xrp() {
+        let mut ledger = Ledger::genesis();
+        // Accounts (generous XRP so the reserve never blocks placement).
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 2);
+        put_acct(&mut ledger, O1, 1_000_000_000, 1);
+        put_acct(&mut ledger, O2, 1_000_000_000, 1);
+        // Trust lines: taker holds 100 AAA (to spend) and 0 BBB (to receive);
+        // O1 holds 0 AAA (to receive); O2 holds 100 BBB (to give).
+        put_line(&mut ledger, TAKER, b"AAA", 100);
+        put_line(&mut ledger, TAKER, b"BBB", 0);
+        put_line(&mut ledger, O1, b"AAA", 0);
+        put_line(&mut ledger, O2, b"BBB", 100);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        // leg1: O1 gives 100 XRP for 100 AAA  (book AAA->XRP).
+        let r1 = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": O1, "Fee": "12", "Sequence": 1,
+                "TakerGets": "100000000",
+                "TakerPays": {"currency": "AAA", "issuer": ISS, "value": "100"},
+            }),
+        );
+        assert_eq!(r1, TransactionResult::TesSuccess);
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(O1).unwrap(), 1))
+                .is_some()
+        );
+
+        // leg2: O2 gives 100 BBB for 100 XRP  (book XRP->BBB).
+        let r2 = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": O2, "Fee": "12", "Sequence": 1,
+                "TakerGets": {"currency": "BBB", "issuer": ISS, "value": "100"},
+                "TakerPays": "100000000",
+            }),
+        );
+        assert_eq!(r2, TransactionResult::TesSuccess);
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(O2).unwrap(), 1))
+                .is_some()
+        );
+
+        // Taker: gives 100 AAA, wants 100 BBB. No direct AAA/BBB book -> autobridge.
+        let rt = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "12", "Sequence": 1,
+                "TakerGets": {"currency": "AAA", "issuer": ISS, "value": "100"},
+                "TakerPays": {"currency": "BBB", "issuer": ISS, "value": "100"},
+            }),
+        );
+        assert_eq!(rt, TransactionResult::TesSuccess);
+
+        // The bridge crossed in full at 1:1:1.
+        assert_eq!(
+            line_bal(&sandbox, TAKER, b"AAA"),
+            "0",
+            "taker spent all AAA"
+        );
+        assert_eq!(
+            line_bal(&sandbox, TAKER, b"BBB"),
+            "100",
+            "taker received BBB"
+        );
+        assert_eq!(
+            line_bal(&sandbox, O1, b"AAA"),
+            "100",
+            "leg1 owner received AAA"
+        );
+        assert_eq!(line_bal(&sandbox, O2, b"BBB"), "0", "leg2 owner gave BBB");
+        // XRP flowed leg1 owner -> leg2 owner (100 XRP), taker XRP untouched.
+        assert_eq!(
+            xrp_bal(&sandbox, O1),
+            900_000_000,
+            "leg1 owner paid 100 XRP"
+        );
+        assert_eq!(
+            xrp_bal(&sandbox, O2),
+            1_100_000_000,
+            "leg2 owner got 100 XRP"
+        );
+        assert_eq!(
+            xrp_bal(&sandbox, TAKER),
+            1_000_000_000,
+            "taker XRP untouched"
+        );
+        // Both legs fully consumed; the taker rests no residual.
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(O1).unwrap(), 1))
+                .is_none(),
+            "leg1 consumed"
+        );
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(O2).unwrap(), 1))
+                .is_none(),
+            "leg2 consumed"
+        );
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(TAKER).unwrap(), 1))
+                .is_none(),
+            "no taker residual"
+        );
+    }
+
+    #[test]
+    fn bridged_cross_accumulates_leg1_leftover_across_leg2_fills() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 2);
+        put_acct(&mut ledger, O1, 1_000_000_000, 1);
+        put_acct(&mut ledger, O2, 1_000_000_000, 1);
+        put_acct(&mut ledger, O3, 1_000_000_000, 1);
+        put_line(&mut ledger, TAKER, b"AAA", 200);
+        put_line(&mut ledger, TAKER, b"BBB", 0);
+        put_line(&mut ledger, O1, b"AAA", 0);
+        put_line(&mut ledger, O2, b"BBB", 100);
+        put_line(&mut ledger, O3, b"BBB", 100);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O1, "Fee": "12", "Sequence": 1,
+                    "TakerGets": "300000000",
+                    "TakerPays": {"currency": "AAA", "issuer": ISS, "value": "300"},
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O2, "Fee": "12", "Sequence": 1,
+                    "TakerGets": {"currency": "BBB", "issuer": ISS, "value": "100"},
+                    "TakerPays": "100000000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O3, "Fee": "12", "Sequence": 1,
+                    "TakerGets": {"currency": "BBB", "issuer": ISS, "value": "100"},
+                    "TakerPays": "100000000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "12", "Sequence": 1,
+                    "TakerGets": {"currency": "AAA", "issuer": ISS, "value": "200"},
+                    "TakerPays": {"currency": "BBB", "issuer": ISS, "value": "200"},
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+
+        assert_eq!(xrp_bal(&sandbox, O1), 800_000_000, "leg1 paid 200 XRP");
+        let leftover = sandbox
+            .read(&keylet::offer(&decode_account_id(O1).unwrap(), 1))
+            .expect("leg1 still resting");
+        let leftover: serde_json::Value = serde_json::from_slice(&leftover).unwrap();
+        assert_eq!(
+            leftover["TakerGets"].as_str(),
+            Some("100000000"),
+            "leg1 leftover is original minus every fill, not minus the last fill"
+        );
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(O2).unwrap(), 1))
+                .is_none(),
+            "leg2a consumed"
+        );
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(O3).unwrap(), 1))
+                .is_none(),
+            "leg2b consumed"
+        );
+    }
+
+    fn has_line(sandbox: &Sandbox<'_>, holder: &str, code: &[u8; 3]) -> bool {
+        let h = decode_account_id(holder).unwrap();
+        let i = decode_account_id(ISS).unwrap();
+        sandbox
+            .read(&keylet::trust_line(&h, &i, &ccy(code)))
+            .is_some()
+    }
+
+    fn owner_count(sandbox: &Sandbox<'_>, addr: &str) -> u64 {
+        let id = decode_account_id(addr).unwrap();
+        let b = sandbox.read(&keylet::account(&id)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        v["OwnerCount"].as_u64().unwrap()
+    }
+
+    // Seed a default (limit-0) RippleState so drain-to-zero is deletable.
+    fn put_default_line(ledger: &mut Ledger, holder: &str, code: &[u8; 3], bal: i64) {
+        let h = decode_account_id(holder).unwrap();
+        let i = decode_account_id(ISS).unwrap();
+        let cur = ccy(code);
+        let issuer_is_low = i.as_bytes() < h.as_bytes();
+        let value = if bal == 0 {
+            "0".to_string()
+        } else if issuer_is_low {
+            format!("-{bal}")
+        } else {
+            bal.to_string()
+        };
+        let cur_str = currency_code_str(&cur);
+        let (low, high) = if issuer_is_low {
+            (ISS, holder)
+        } else {
+            (holder, ISS)
+        };
+        // Reserve on the holder side only; no NoRipple so DefaultRipple-off
+        // still treats the drained line as deletable (View.cpp:994).
+        const LSF_LOW_RESERVE: u64 = 0x0001_0000;
+        const LSF_HIGH_RESERVE: u64 = 0x0002_0000;
+        let flags = if issuer_is_low {
+            LSF_HIGH_RESERVE
+        } else {
+            LSF_LOW_RESERVE
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": cur_str, "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": value},
+            "LowLimit": {"currency": cur_str, "issuer": low, "value": "0"},
+            "HighLimit": {"currency": cur_str, "issuer": high, "value": "0"},
+            "Flags": flags,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&h, &i, &cur),
+                serde_json::to_vec(&tl).unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn taker_without_output_line_creates_trust_line() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 0);
+        put_acct(&mut ledger, O1, 1_000_000_000, 0);
+        put_line(&mut ledger, O1, b"AAA", 100);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        let r1 = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": O1, "Fee": "12", "Sequence": 1,
+                "TakerGets": {"currency": "AAA", "issuer": ISS, "value": "100"},
+                "TakerPays": "100000000",
+            }),
+        );
+        assert_eq!(r1, TransactionResult::TesSuccess);
+        assert!(!has_line(&sandbox, TAKER, b"AAA"));
+
+        let rt = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "12", "Sequence": 1,
+                "TakerGets": "100000000",
+                "TakerPays": {"currency": "AAA", "issuer": ISS, "value": "100"},
+            }),
+        );
+        assert_eq!(rt, TransactionResult::TesSuccess);
+        assert!(
+            has_line(&sandbox, TAKER, b"AAA"),
+            "rippleCredit createOnDemand must write the taker's AAA line"
+        );
+        assert_eq!(line_bal(&sandbox, TAKER, b"AAA"), "100");
+        assert_eq!(line_bal(&sandbox, O1, b"AAA"), "0");
+        assert!(
+            owner_count(&sandbox, TAKER) >= 1,
+            "taker bears the new line's reserve"
+        );
+    }
+
+    #[test]
+    fn maker_without_input_line_creates_trust_line() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 0);
+        put_acct(&mut ledger, O1, 1_000_000_000, 0);
+        put_line(&mut ledger, TAKER, b"AAA", 100);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        let r1 = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": O1, "Fee": "12", "Sequence": 1,
+                "TakerGets": "100000000",
+                "TakerPays": {"currency": "AAA", "issuer": ISS, "value": "100"},
+            }),
+        );
+        assert_eq!(r1, TransactionResult::TesSuccess);
+        assert!(!has_line(&sandbox, O1, b"AAA"));
+
+        let rt = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "12", "Sequence": 1,
+                "TakerGets": {"currency": "AAA", "issuer": ISS, "value": "100"},
+                "TakerPays": "100000000",
+            }),
+        );
+        assert_eq!(rt, TransactionResult::TesSuccess);
+        assert!(
+            has_line(&sandbox, O1, b"AAA"),
+            "rippleCredit createOnDemand must write the maker's AAA line"
+        );
+        assert_eq!(line_bal(&sandbox, O1, b"AAA"), "100");
+        assert_eq!(line_bal(&sandbox, TAKER, b"AAA"), "0");
+        assert!(
+            owner_count(&sandbox, O1) >= 1,
+            "maker bears the new line's reserve"
+        );
+    }
+
+    #[test]
+    fn drained_default_trust_line_is_deleted() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 1);
+        put_acct(&mut ledger, O1, 1_000_000_000, 0);
+        put_default_line(&mut ledger, TAKER, b"AAA", 100);
+        put_line(&mut ledger, O1, b"AAA", 0);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        let r1 = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": O1, "Fee": "12", "Sequence": 1,
+                "TakerGets": "100000000",
+                "TakerPays": {"currency": "AAA", "issuer": ISS, "value": "100"},
+            }),
+        );
+        assert_eq!(r1, TransactionResult::TesSuccess);
+
+        let rt = apply_offer(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "12", "Sequence": 1,
+                "TakerGets": {"currency": "AAA", "issuer": ISS, "value": "100"},
+                "TakerPays": "100000000",
+            }),
+        );
+        assert_eq!(rt, TransactionResult::TesSuccess);
+        assert!(
+            !has_line(&sandbox, TAKER, b"AAA"),
+            "drained default line must be trustDeleted"
+        );
+        assert_eq!(
+            owner_count(&sandbox, TAKER),
+            0,
+            "sender OwnerCount drops with the deleted line"
+        );
+    }
+
+    fn oc(sandbox: &Sandbox<'_>, addr: &str) -> u64 {
+        let id = decode_account_id(addr).unwrap();
+        let b = sandbox.read(&keylet::account(&id)).unwrap();
+        let v: Value = serde_json::from_slice(&b).unwrap();
+        v["OwnerCount"].as_u64().unwrap()
+    }
+
+    /// 30000060 D995194A: after filling the better lsfSell, OfferStream must
+    /// still step and reap the maker's worse-page lsfSell that can no longer
+    /// deliver its whole TakerGets (OwnerCount 6→4, not 6→5).
+    #[test]
+    fn ledger_30000060_reaps_maker_short_lsfsell_after_fill() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 10_000_000_000, 0);
+        put_acct(&mut ledger, O1, 1_000_000_000, 0);
+        put_line(&mut ledger, TAKER, b"BTC", 0);
+        put_line(&mut ledger, O1, b"BTC", 1);
+        let o1 = decode_account_id(O1).unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O1, "Fee": "10", "Sequence": 1,
+                    "Flags": TF_SELL,
+                    "TakerGets": {"currency": "BTC", "issuer": ISS, "value": "1"},
+                    "TakerPays": "840000000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O1, "Fee": "10", "Sequence": 2,
+                    "Flags": TF_SELL,
+                    "TakerGets": {"currency": "BTC", "issuer": ISS, "value": "1"},
+                    "TakerPays": "845000000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert_eq!(oc(&sandbox, O1), 2);
+        assert!(sandbox.read(&keylet::offer(&o1, 1)).is_some());
+        assert!(sandbox.read(&keylet::offer(&o1, 2)).is_some());
+
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "12", "Sequence": 1,
+                    "Flags": TF_IMMEDIATE_OR_CANCEL,
+                    "TakerGets": "841000000",
+                    "TakerPays": {"currency": "BTC", "issuer": ISS, "value": "1"},
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert!(
+            sandbox.read(&keylet::offer(&o1, 1)).is_none(),
+            "better lsfSell consumed"
+        );
+        assert!(
+            sandbox.read(&keylet::offer(&o1, 2)).is_none(),
+            "worse lsfSell unfunded after the take must be reaped"
+        );
+        assert_eq!(oc(&sandbox, O1), 0, "both maker offers deleted");
+    }
+
+    /// 30000073 3D88107D: placing a buy of XID for XRP must reap the taker's
+    /// own inverse Flags=0 offers that would self-cross (OwnerCount 1672→1670).
+    #[test]
+    fn ledger_30000073_reaps_own_inverse_offers_that_self_cross() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, O1, 10_000_000_000, 0);
+        put_line(&mut ledger, O1, b"XID", 400);
+        let o1 = decode_account_id(O1).unwrap();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O1, "Fee": "10", "Sequence": 1,
+                    "TakerGets": {"currency": "XID", "issuer": ISS, "value": "199"},
+                    "TakerPays": "1000301600",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O1, "Fee": "10", "Sequence": 2,
+                    "TakerGets": {"currency": "XID", "issuer": ISS, "value": "199"},
+                    "TakerPays": "997863470",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert_eq!(oc(&sandbox, O1), 2);
+
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O1, "Fee": "10", "Sequence": 3,
+                    "TakerGets": "1002105230",
+                    "TakerPays": {"currency": "XID", "issuer": ISS, "value": "199"},
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert!(
+            sandbox.read(&keylet::offer(&o1, 1)).is_none(),
+            "own inverse seq 1 must be reaped"
+        );
+        assert!(
+            sandbox.read(&keylet::offer(&o1, 2)).is_none(),
+            "own inverse seq 2 must be reaped"
+        );
+        assert!(
+            sandbox.read(&keylet::offer(&o1, 3)).is_some(),
+            "new buy leftover is placed"
+        );
+        assert_eq!(oc(&sandbox, O1), 1, "two inverse offers reaped, one placed");
+    }
+}
+
+#[cfg(test)]
+mod flow_cross_own_unfunded {
+    use super::*;
+    use crate::fees::FeeSettings;
+    use crate::transactor::ApplyContext;
+    use crate::view::apply_view::ApplyView;
+    use crate::view::ledger_view::LedgerView;
+    use crate::view::read_view::ReadView;
+    use crate::view::sandbox::Sandbox;
+    use rxrpl_amendment::Rules;
+    use rxrpl_ledger::Ledger;
+
+    const TAKER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    const ISS: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
+
+    fn apply_flow(
+        sandbox: &mut Sandbox<'_>,
+        fees: &FeeSettings,
+        tx: &serde_json::Value,
+    ) -> TransactionResult {
+        let rules = Rules::from_enabled([feature_id("FlowCross")]);
+        let mut ctx = ApplyContext {
+            tx,
+            view: sandbox,
+            rules: &rules,
+            fees,
+        };
+        OfferCreateTransactor.apply(&mut ctx).unwrap()
+    }
+
+    fn owner_count(sandbox: &Sandbox<'_>, addr: &str) -> u64 {
+        let id = decode_account_id(addr).unwrap();
+        let b = sandbox.read(&keylet::account(&id)).unwrap();
+        let v: Value = serde_json::from_slice(&b).unwrap();
+        v["OwnerCount"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn ledger_30000048_inverse_book_prefix_matches_dcbe() {
+        let xrp = [0u8; 20];
+        let xrp_iss = AccountId::from([0u8; 20]);
+        let mut btc = [0u8; 20];
+        btc[12..15].copy_from_slice(b"BTC");
+        let iss = decode_account_id("rchGBxcD1A1C2tdxF6papQYZ8kjRKMYcL").unwrap();
+        let book = keylet::book_dir(&xrp, &xrp_iss, &btc, &iss);
+        let prefix = hex::encode_upper(&book.as_bytes()[0..24]);
+        assert_eq!(prefix, "DCBE2F8E6D6301D83DA0FB697299BFEECD45EF73EFD3EC72");
+        let page_q =
+            u64::from_be_bytes(hex::decode("5E1DFD8B851B2CA9").unwrap().try_into().unwrap());
+        let pays = IOUAmount::from_decimal_string("1.404741775486649").unwrap();
+        let gets = IOUAmount::from_decimal_string("11375915323").unwrap();
+        let threshold = get_rate(&gets, &pays).unwrap();
+        assert!(
+            page_q > threshold,
+            "45874350 should be past the new offer's quality"
+        );
+    }
+
+    #[test]
+    fn ledger_30000048_reaps_own_underfunded_sell() {
+        // 45874350: lsfSell, TakerGets 2.011 BTC, owner holds 0.008. Not zero so
+        // the old is_zero() path left it; rippled treats a sell that cannot
+        // deliver its whole TakerGets as unfunded.
+        let mut ledger = Ledger::genesis();
+        let taker_id = decode_account_id(TAKER).unwrap();
+        let iss_id = decode_account_id(ISS).unwrap();
+        for (addr, drops) in [(ISS, "1000000000"), (TAKER, "1000000000")] {
+            let id = decode_account_id(addr).unwrap();
+            let acct = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": addr,
+                "Balance": drops, "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&acct).unwrap())
+                .unwrap();
+        }
+        let usd = helpers::currency_to_bytes("USD");
+        let holder_is_low = taker_id.as_bytes() < iss_id.as_bytes();
+        let stored = if holder_is_low { "10" } else { "-10" };
+        let (low, high) = if holder_is_low {
+            (TAKER, ISS)
+        } else {
+            (ISS, TAKER)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": ISS, "value": stored},
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "0"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "1000"},
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&taker_id, &iss_id, &usd),
+                serde_json::to_vec(&tl).unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        let r1 = apply_flow(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "10", "Sequence": 1,
+                "Flags": TF_SELL,
+                "TakerGets": {"currency": "USD", "issuer": ISS, "value": "10"},
+                "TakerPays": "2000000000",
+            }),
+        );
+        assert_eq!(r1, TransactionResult::TesSuccess);
+        assert_eq!(owner_count(&sandbox, TAKER), 1);
+
+        let mut line: Value = serde_json::from_slice(
+            &sandbox
+                .read(&keylet::trust_line(&taker_id, &iss_id, &usd))
+                .unwrap(),
+        )
+        .unwrap();
+        let drained = if holder_is_low { "1" } else { "-1" };
+        line["Balance"]["value"] = Value::String(drained.into());
+        sandbox
+            .update(
+                keylet::trust_line(&taker_id, &iss_id, &usd),
+                serde_json::to_vec(&line).unwrap(),
+            )
+            .unwrap();
+
+        let r2 = apply_flow(
+            &mut sandbox,
+            &fees,
+            &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "10", "Sequence": 2,
+                "TakerGets": "100000000",
+                "TakerPays": {"currency": "USD", "issuer": ISS, "value": "1"},
+            }),
+        );
+        assert_eq!(r2, TransactionResult::TesSuccess);
+        assert_eq!(
+            owner_count(&sandbox, TAKER),
+            1,
+            "underfunded lsfSell own inverse offer must be reaped"
+        );
+        assert!(
+            sandbox.read(&keylet::offer(&taker_id, 1)).is_none(),
+            "seq 1 sell offer deleted"
+        );
+    }
+
+    #[test]
+    fn ledger_30000048_taker_path_reaps_own_underfunded_sell() {
+        let mut ledger = Ledger::genesis();
+        let taker_id = decode_account_id(TAKER).unwrap();
+        let iss_id = decode_account_id(ISS).unwrap();
+        for (addr, drops) in [(ISS, "1000000000"), (TAKER, "1000000000")] {
+            let id = decode_account_id(addr).unwrap();
+            let acct = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": addr,
+                "Balance": drops, "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&acct).unwrap())
+                .unwrap();
+        }
+        let usd = helpers::currency_to_bytes("USD");
+        let holder_is_low = taker_id.as_bytes() < iss_id.as_bytes();
+        let stored = if holder_is_low { "10" } else { "-10" };
+        let (low, high) = if holder_is_low {
+            (TAKER, ISS)
+        } else {
+            (ISS, TAKER)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": ISS, "value": stored},
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "0"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "1000"},
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&taker_id, &iss_id, &usd),
+                serde_json::to_vec(&tl).unwrap(),
+            )
+            .unwrap();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules_flow = Rules::from_enabled([feature_id("FlowCross")]);
+        let mut ctx = ApplyContext {
+            tx: &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "10", "Sequence": 1,
+                "Flags": TF_SELL,
+                "TakerGets": {"currency": "USD", "issuer": ISS, "value": "10"},
+                "TakerPays": "2000000000",
+            }),
+            view: &mut sandbox,
+            rules: &rules_flow,
+            fees: &fees,
+        };
+        assert_eq!(
+            OfferCreateTransactor.apply(&mut ctx).unwrap(),
+            TransactionResult::TesSuccess
+        );
+        let mut line: Value = serde_json::from_slice(
+            &sandbox
+                .read(&keylet::trust_line(&taker_id, &iss_id, &usd))
+                .unwrap(),
+        )
+        .unwrap();
+        line["Balance"]["value"] = Value::String(if holder_is_low { "1" } else { "-1" }.into());
+        sandbox
+            .update(
+                keylet::trust_line(&taker_id, &iss_id, &usd),
+                serde_json::to_vec(&line).unwrap(),
+            )
+            .unwrap();
+        let rules_taker = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "10", "Sequence": 2,
+                "TakerGets": "100000000",
+                "TakerPays": {"currency": "USD", "issuer": ISS, "value": "1"},
+            }),
+            view: &mut sandbox,
+            rules: &rules_taker,
+            fees: &fees,
+        };
+        assert_eq!(
+            OfferCreateTransactor.apply(&mut ctx).unwrap(),
+            TransactionResult::TesSuccess
+        );
+        let still = sandbox.read(&keylet::offer(&taker_id, 1)).is_some();
+        let oc = owner_count(&sandbox, TAKER);
+        assert!(
+            !still,
+            "taker path must delete underfunded lsfSell, oc={oc}"
+        );
+        assert_eq!(oc, 1, "OwnerCount after reap+place");
     }
 }

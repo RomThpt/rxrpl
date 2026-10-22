@@ -7,8 +7,14 @@ use rxrpl_shamap::{LeafNode, MissingNode, NodeStore, SHAMap};
 
 const MAX_CONCURRENT_REQUESTS: usize = 5;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Maximum number of missing node hashes to request in a single delta sync round.
-const MAX_DELTA_NODES_PER_REQUEST: usize = 512;
+/// In-flight window: how many frontier nodes a delta-sync round may have
+/// outstanding. The frontier of a wide tree (mainnet state) is far wider than a
+/// single fan-out, so capping at one request per peer under-fills the pipeline
+/// and inflates round-trips. Sizing the window to several requests per peer
+/// keeps requests outstanding across reply latency. 4096 across the 8-peer
+/// fan-out is 4 outstanding 128-id requests per peer -- bench (500k-leaf state):
+/// 64 -> 16 catchup rounds for the same request count, pure pipelining.
+const MAX_DELTA_NODES_PER_REQUEST: usize = 4096;
 /// Maximum number of sync rounds before giving up on incremental sync.
 const MAX_INCREMENTAL_ROUNDS: u32 = 50;
 /// Number of consecutive zero-add rounds before falling back to hash-based fetch.
@@ -31,6 +37,16 @@ const CATCHUP_PREEMPT_ZERO_ROUNDS: u32 = 6;
 /// tip is available to adopt.
 const STUCK_REMOVE_ZERO_ROUNDS: u32 = 20;
 const CATCHUP_STUCK_REMOVE_ZERO_ROUNDS: u32 = 16;
+/// During initial catchup, re-target to a fresher tip once the active target is
+/// this many ledgers behind the network -- even if it is not drained. The
+/// zero-add ("drained") trigger alone never fires on live mainnet: peers keep
+/// serving the aged target's SHALLOW nodes, so a thin trickle of additions holds
+/// `zero_rounds` at 0 while the DEEP frontier (flushed by every peer) never
+/// arrives, plateauing forever. An over-aged target is flushed deep regardless,
+/// so jump to a fresh tip the peers still serve in depth; the content-addressed
+/// store reuses everything already fetched (state barely changes between nearby
+/// ledgers), so re-targeting is cheap and only the small delta is re-walked.
+const STALE_TARGET_LEDGERS: u32 = 16;
 /// How long a requested node hash is considered in-flight before it may be
 /// requested again. Long enough to outlast a normal round-trip so duplicate
 /// requests are suppressed, short enough that a lost request is retried soon.
@@ -87,7 +103,7 @@ fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
                 return None;
             }
             let hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, payload]);
-            Some((hash, payload.to_vec()))
+            Some((hash, inner_store_record(payload)))
         }
         WIRE_TYPE_COMPRESSED_INNER => {
             // N * (hash[32] || branch[1])
@@ -103,7 +119,7 @@ fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
                 full[branch * 32..(branch + 1) * 32].copy_from_slice(&chunk[..32]);
             }
             let hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &full]);
-            Some((hash, full))
+            Some((hash, inner_store_record(&full)))
         }
         WIRE_TYPE_ACCOUNT_STATE => {
             // payload = data || key[32]
@@ -115,10 +131,7 @@ fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
             let key = &payload[split..];
             let hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_LEAF, data, key]);
             // Convert wire layout (data || key) to storage layout (key || data).
-            let mut storage = Vec::with_capacity(payload.len());
-            storage.extend_from_slice(key);
-            storage.extend_from_slice(data);
-            Some((hash, storage))
+            Some((hash, leaf_store_record(key, data)))
         }
         WIRE_TYPE_TRANSACTION_WITH_META => {
             // payload = data || key[32]
@@ -129,10 +142,7 @@ fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
             let data = &payload[..split];
             let key = &payload[split..];
             let hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_NODE, data, key]);
-            let mut storage = Vec::with_capacity(payload.len());
-            storage.extend_from_slice(key);
-            storage.extend_from_slice(data);
-            Some((hash, storage))
+            Some((hash, leaf_store_record(key, data)))
         }
         WIRE_TYPE_TRANSACTION => {
             // payload = data only; key = SHA512Half(TXN || data) i.e. the tx hash
@@ -141,13 +151,27 @@ fn decode_wire_node(node_data: &[u8]) -> Option<(Hash256, Vec<u8>)> {
             }
             let key = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_ID, payload]);
             // For tx-no-meta, key IS the hash. Storage = key || data.
-            let mut storage = Vec::with_capacity(32 + payload.len());
-            storage.extend_from_slice(key.as_bytes());
-            storage.extend_from_slice(payload);
-            Some((key, storage))
+            Some((key, leaf_store_record(key.as_bytes(), payload)))
         }
         _ => None,
     }
+}
+
+/// Build a tagged inner-node store record from its raw 16*32 child-hash payload.
+fn inner_store_record(child_hashes_512: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + child_hashes_512.len());
+    out.push(rxrpl_shamap::node_store::STORE_TAG_INNER);
+    out.extend_from_slice(child_hashes_512);
+    out
+}
+
+/// Build a tagged leaf store record (`tag || key || data`).
+fn leaf_store_record(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + key.len() + data.len());
+    out.push(rxrpl_shamap::node_store::STORE_TAG_LEAF);
+    out.extend_from_slice(key);
+    out.extend_from_slice(data);
+    out
 }
 
 /// Convert a `TMGetObjectByHash` NodeObject blob into the SHAMap wire form
@@ -402,13 +426,20 @@ impl LedgerSyncer {
                     } else {
                         TIP_PREEMPT_ZERO_ROUNDS
                     };
-                    if zero_rounds < preempt_threshold {
+                    // An initial-catchup target that has fallen too far behind the
+                    // network is flushed deep by peers no matter how many shallow
+                    // nodes still trickle in, so re-target by age even when the
+                    // zero-add trigger never fires (the live-mainnet plateau).
+                    let aged_out =
+                        initial_catchup && seq.saturating_sub(active_seq) >= STALE_TARGET_LEDGERS;
+                    if zero_rounds < preempt_threshold && !aged_out {
                         return Vec::new();
                     }
                     tracing::info!(
-                        "replacing stale sync #{} (round {}) with #{}",
+                        "replacing stale sync #{} (round {}, {} behind) with #{}",
                         active_seq,
                         zero_rounds,
+                        seq.saturating_sub(active_seq),
                         seq
                     );
                 } else {
@@ -752,8 +783,8 @@ mod tests {
         wire.push(WIRE_TYPE_INNER);
 
         let (hash, storage) = decode_wire_node(&wire).expect("decode");
-        assert_eq!(storage.len(), 16 * 32);
-        assert_eq!(storage, payload);
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_INNER);
+        assert_eq!(&storage[1..], &payload[..]);
         let expected_hash = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &payload]);
         assert_eq!(hash, expected_hash);
     }
@@ -774,16 +805,14 @@ mod tests {
         wire.push(WIRE_TYPE_COMPRESSED_INNER);
 
         let (hash, storage) = decode_wire_node(&wire).expect("decode");
-        assert_eq!(storage.len(), 16 * 32);
-        // branch 0 has h0
-        assert_eq!(&storage[0..32], &h0);
-        // branch 1..5 zero
-        assert!(storage[32..5 * 32].iter().all(|&b| b == 0));
-        // branch 5 has h5
-        assert_eq!(&storage[5 * 32..6 * 32], &h5);
-        // branch 6..16 zero
-        assert!(storage[6 * 32..].iter().all(|&b| b == 0));
-        let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, &storage]);
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_INNER);
+        let body = &storage[1..];
+        assert_eq!(body.len(), 16 * 32);
+        assert_eq!(&body[0..32], &h0);
+        assert!(body[32..5 * 32].iter().all(|&b| b == 0));
+        assert_eq!(&body[5 * 32..6 * 32], &h5);
+        assert!(body[6 * 32..].iter().all(|&b| b == 0));
+        let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_INNER, body]);
         assert_eq!(hash, expected);
     }
 
@@ -796,9 +825,10 @@ mod tests {
         wire.push(WIRE_TYPE_ACCOUNT_STATE);
 
         let (hash, storage) = decode_wire_node(&wire).expect("decode");
-        // Storage layout = key || data
-        assert_eq!(&storage[..32], &key);
-        assert_eq!(&storage[32..], &data[..]);
+        // Storage layout = tag || key || data
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_LEAF);
+        assert_eq!(&storage[1..33], &key);
+        assert_eq!(&storage[33..], &data[..]);
         // Hash uses rippled order (data || key)
         let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_LEAF, &data, &key]);
         assert_eq!(hash, expected);
@@ -813,8 +843,9 @@ mod tests {
         wire.push(WIRE_TYPE_TRANSACTION_WITH_META);
 
         let (hash, storage) = decode_wire_node(&wire).expect("decode");
-        assert_eq!(&storage[..32], &key);
-        assert_eq!(&storage[32..], &data[..]);
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_LEAF);
+        assert_eq!(&storage[1..33], &key);
+        assert_eq!(&storage[33..], &data[..]);
         let expected = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_NODE, &data, &key]);
         assert_eq!(hash, expected);
     }
@@ -829,9 +860,10 @@ mod tests {
         let expected_key = rxrpl_crypto::sha512_half::sha512_half(&[&HASH_PREFIX_TX_ID, &data]);
         // Hash IS the tx hash
         assert_eq!(hash, expected_key);
-        // Storage = key || data
-        assert_eq!(&storage[..32], expected_key.as_bytes());
-        assert_eq!(&storage[32..], &data[..]);
+        // Storage = tag || key || data
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_LEAF);
+        assert_eq!(&storage[1..33], expected_key.as_bytes());
+        assert_eq!(&storage[33..], &data[..]);
     }
 
     #[test]
@@ -947,7 +979,8 @@ mod tests {
         assert_eq!(*wire.last().unwrap(), WIRE_TYPE_INNER);
         let (hash, storage) = decode_wire_node(&wire).expect("wire decodes");
         assert_eq!(hash, expected);
-        assert_eq!(storage, child_hashes);
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_INNER);
+        assert_eq!(&storage[1..], &child_hashes[..]);
     }
 
     /// A leaf account-state NodeObject (`MLN\0 || data || key`) likewise.
@@ -964,9 +997,10 @@ mod tests {
         assert_eq!(*wire.last().unwrap(), WIRE_TYPE_ACCOUNT_STATE);
         let (hash, storage) = decode_wire_node(&wire).expect("wire decodes");
         assert_eq!(hash, expected);
-        // storage layout is key || data.
-        assert_eq!(&storage[..32], &key[..]);
-        assert_eq!(&storage[32..], &data[..]);
+        // storage layout is tag || key || data.
+        assert_eq!(storage[0], rxrpl_shamap::node_store::STORE_TAG_LEAF);
+        assert_eq!(&storage[1..33], &key[..]);
+        assert_eq!(&storage[33..], &data[..]);
     }
 
     #[test]
@@ -1077,6 +1111,39 @@ mod tests {
             "a drained target re-targets to the fresher tip"
         );
         assert!(syncer.has_incremental_sync(106));
+        assert!(!syncer.has_incremental_sync(100));
+    }
+
+    #[test]
+    fn initial_catchup_retargets_by_age_even_when_not_drained() {
+        // The live-mainnet plateau: a target keeps getting a thin trickle of
+        // shallow nodes (zero_rounds never reaches the drain threshold) while its
+        // deep frontier is flushed by every peer. A target that has fallen
+        // STALE_TARGET_LEDGERS behind must re-target by age regardless.
+        let store = Arc::new(rxrpl_shamap::InMemoryNodeStore::new());
+        let mut syncer = LedgerSyncer::new();
+        let _ = syncer.start_incremental_sync(100, Hash256::new([0x11; 32]), store.clone());
+
+        // Never drained (zero_rounds stays 0). A tip only a few ledgers ahead is held.
+        let held = syncer.start_incremental_sync(
+            100 + STALE_TARGET_LEDGERS - 1,
+            Hash256::new([0x22; 32]),
+            store.clone(),
+        );
+        assert!(held.is_empty(), "a young, non-drained target is held");
+        assert!(syncer.has_incremental_sync(100));
+
+        // A tip STALE_TARGET_LEDGERS ahead re-targets even without any drain.
+        let retarget = syncer.start_incremental_sync(
+            100 + STALE_TARGET_LEDGERS,
+            Hash256::new([0x33; 32]),
+            store,
+        );
+        assert!(
+            !retarget.is_empty(),
+            "an over-aged target re-targets by age despite no zero-add rounds"
+        );
+        assert!(syncer.has_incremental_sync(100 + STALE_TARGET_LEDGERS));
         assert!(!syncer.has_incremental_sync(100));
     }
 
@@ -1222,5 +1289,92 @@ mod tests {
                 "leaf {key} mismatch"
             );
         }
+    }
+
+    /// Cold-start catchup against an aging target: a peer keeps the full state
+    /// of recent ledgers in memory but flushes the deep nodes of older ones, so
+    /// a target stops serving its deep frontier once it ages. With a FIXED
+    /// target this strands the deep frontier forever (the mainnet "aged target"
+    /// wall). Re-targeting to a fresh tip -- same content-addressed state, higher
+    /// seq -- restores deep service and lets the shared store finish. This is the
+    /// dynamic the cold-start tip-targeting wiring relies on, so prove both arms:
+    /// fixed target never completes, re-targeting does.
+    fn run_aged_target(retarget: bool) -> bool {
+        const COUNT: usize = 8192;
+        const AGED_HORIZON: u8 = 2; // an aged target serves only depth <= 2
+        const AGE_LIMIT: u32 = 4; // a target serves deep for its first 4 rounds
+
+        let (server, root) = build_server_map(COUNT);
+        let store = Arc::new(rxrpl_shamap::InMemoryNodeStore::new());
+        let mut syncer = LedgerSyncer::new();
+        let mut tip_seq = 100u32;
+        let mut missing = syncer.start_incremental_sync(tip_seq, root, store.clone());
+        assert!(!missing.is_empty());
+        let mut target_age = 0u32;
+
+        for _round in 0..5000 {
+            let active = match syncer.active_incremental_seq() {
+                Some(s) => s,
+                None => break,
+            };
+            if missing.is_empty() {
+                if let Some(_l) = syncer.try_complete_sync(active) {
+                    return true;
+                }
+                break;
+            }
+
+            // Serve the frontier; an aged target withholds deep nodes.
+            let aged = target_age >= AGE_LIMIT;
+            let mut served = Vec::new();
+            for mn in &missing {
+                if aged && mn.node_id.depth() > AGED_HORIZON {
+                    continue;
+                }
+                if let Some((_h, wire)) = serve_node_inner(&server, mn.node_id, false) {
+                    served.push((mn.node_id.to_wire_bytes(), wire));
+                }
+            }
+
+            let before = syncer.lifetime_added();
+            if let FeedResult::Complete(_) = syncer.feed_nodes(active, &served) {
+                return true;
+            }
+            target_age += 1;
+
+            // No progress this round -> the target has aged out its deep frontier.
+            // Re-target to a fresh tip (same state, higher seq); start_incremental_sync
+            // only replaces once the current target has drained, so a fresh tip that
+            // serves the deep nodes again takes over and the shared store advances.
+            if retarget && syncer.lifetime_added() == before {
+                tip_seq += 1;
+                let m = syncer.start_incremental_sync(tip_seq, root, store.clone());
+                if !m.is_empty() {
+                    target_age = 0;
+                }
+            }
+
+            missing = match syncer.active_incremental_seq() {
+                Some(s) => syncer.get_missing_node_ids(s),
+                None => break,
+            };
+        }
+        false
+    }
+
+    #[test]
+    fn aged_target_strands_fixed_catchup() {
+        assert!(
+            !run_aged_target(false),
+            "a fixed aged target must NOT complete -- this is the mainnet wall"
+        );
+    }
+
+    #[test]
+    fn retargeting_completes_catchup_past_aged_wall() {
+        assert!(
+            run_aged_target(true),
+            "re-targeting to a fresh tip must complete despite the aged-target wall"
+        );
     }
 }

@@ -6,9 +6,17 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transac
 
 /// UNLModify pseudo-transaction handler.
 ///
-/// Modifies the Negative UNL by adding or removing validators.
-/// - `UNLModifyDisabling == 1`: disable a validator (add to DisabledValidators)
-/// - `UNLModifyDisabling == 0`: re-enable a validator (remove from DisabledValidators)
+/// Mirrors rippled's `Change::applyUNLModify`: the transaction only records
+/// the *pending* intent on the `NegativeUNL` singleton object — it does NOT
+/// touch `DisabledValidators`:
+/// - `UNLModifyDisabling == 1`: set `ValidatorToDisable` to the public key.
+/// - `UNLModifyDisabling == 0`: set `ValidatorToReEnable` to the public key.
+///
+/// The actual move into / out of `DisabledValidators` (with the
+/// `DisabledValidator` STObject wrapper and `FirstLedgerSequence` stamp) is
+/// DEFERRED to the build of the next flag ledger — see
+/// `rxrpl_node::Node::update_negative_unl`, which mirrors
+/// `Ledger::updateNegativeUNL`.
 pub struct UNLModifyTransactor;
 
 impl Transactor for UNLModifyTransactor {
@@ -37,6 +45,10 @@ impl Transactor for UNLModifyTransactor {
             .ok_or(TransactionResult::TefInternal)?;
 
         let nunl_key = keylet::negative_unl();
+        // Load the NegativeUNL singleton, or create it fresh. A freshly
+        // created ledger entry carries only the required common fields
+        // (`LedgerEntryType` + `Flags`); rippled does not serialize an empty
+        // `DisabledValidators` array, so we omit it here for byte parity.
         let (mut obj, exists) = if let Some(data) = ctx.view.read(&nunl_key) {
             let obj: Value =
                 serde_json::from_slice(&data).map_err(|_| TransactionResult::TefInternal)?;
@@ -45,40 +57,18 @@ impl Transactor for UNLModifyTransactor {
             (
                 serde_json::json!({
                     "LedgerEntryType": "NegativeUNL",
-                    "DisabledValidators": [],
+                    "Flags": 0,
                 }),
                 false,
             )
         };
 
+        // Record ONLY the pending field. `DisabledValidators` is intentionally
+        // left untouched here; the deferred flag-ledger move
+        // (`Node::update_negative_unl`) is the sole writer of that array.
         if disabling == 1 {
-            // Add to DisabledValidators
-            let disabled = obj
-                .get_mut("DisabledValidators")
-                .and_then(|v| v.as_array_mut())
-                .ok_or(TransactionResult::TefInternal)?;
-
-            // Don't add duplicate
-            if !disabled
-                .iter()
-                .any(|d| d.get("PublicKey").and_then(|v| v.as_str()) == Some(validator))
-            {
-                disabled.push(serde_json::json!({
-                    "PublicKey": validator,
-                    "LedgerSequence": ctx.tx.get("LedgerSequence").cloned().unwrap_or(Value::from(0)),
-                }));
-            }
-
             obj["ValidatorToDisable"] = Value::String(validator.to_string());
         } else {
-            // Remove from DisabledValidators
-            if let Some(disabled) = obj
-                .get_mut("DisabledValidators")
-                .and_then(|v| v.as_array_mut())
-            {
-                disabled.retain(|d| d.get("PublicKey").and_then(|v| v.as_str()) != Some(validator));
-            }
-
             obj["ValidatorToReEnable"] = Value::String(validator.to_string());
         }
 
@@ -190,7 +180,10 @@ mod tests {
     // -- apply tests --
 
     #[test]
-    fn apply_disable_validator() {
+    fn apply_disable_sets_pending_only() {
+        // Deferred model: disabling records `ValidatorToDisable` and must
+        // NOT touch `DisabledValidators` (that move is deferred to the next
+        // flag-ledger build).
         let ledger = Ledger::genesis();
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
@@ -211,21 +204,34 @@ mod tests {
         let key = keylet::negative_unl();
         let data = sandbox.read(&key).unwrap();
         let obj: Value = serde_json::from_slice(&data).unwrap();
-        let disabled = obj["DisabledValidators"].as_array().unwrap();
-        assert_eq!(disabled.len(), 1);
-        assert_eq!(disabled[0]["PublicKey"].as_str().unwrap(), VALIDATOR_KEY);
         assert_eq!(obj["ValidatorToDisable"].as_str().unwrap(), VALIDATOR_KEY);
+        // DisabledValidators is left absent until the deferred move.
+        assert!(
+            obj.get("DisabledValidators").is_none(),
+            "handler must not populate DisabledValidators: {obj}"
+        );
+        assert!(obj.get("ValidatorToReEnable").is_none());
     }
 
     #[test]
-    fn apply_reenable_validator() {
+    fn apply_reenable_sets_pending_only() {
+        // Deferred model: re-enabling records `ValidatorToReEnable` and must
+        // leave the existing `DisabledValidators` array untouched (the entry
+        // is removed later by the deferred flag-ledger move).
         let mut ledger = Ledger::genesis();
 
-        // Pre-populate with disabled validator
+        // Pre-populate with a disabled validator using the byte-exact
+        // `DisabledValidator` wrapper shape.
         let nunl_key = keylet::negative_unl();
         let nunl_obj = serde_json::json!({
             "LedgerEntryType": "NegativeUNL",
-            "DisabledValidators": [{ "PublicKey": VALIDATOR_KEY, "LedgerSequence": 0 }],
+            "Flags": 0,
+            "DisabledValidators": [{
+                "DisabledValidator": {
+                    "PublicKey": VALIDATOR_KEY,
+                    "FirstLedgerSequence": 256u32,
+                }
+            }],
         });
         ledger
             .put_state(nunl_key, serde_json::to_vec(&nunl_obj).unwrap())
@@ -249,8 +255,16 @@ mod tests {
 
         let data = sandbox.read(&nunl_key).unwrap();
         let obj: Value = serde_json::from_slice(&data).unwrap();
-        let disabled = obj["DisabledValidators"].as_array().unwrap();
-        assert!(disabled.is_empty());
         assert_eq!(obj["ValidatorToReEnable"].as_str().unwrap(), VALIDATOR_KEY);
+        // The disabled entry is still present — the handler does not remove it.
+        let disabled = obj["DisabledValidators"].as_array().unwrap();
+        assert_eq!(disabled.len(), 1);
+        assert_eq!(
+            disabled[0]["DisabledValidator"]["PublicKey"]
+                .as_str()
+                .unwrap(),
+            VALIDATOR_KEY
+        );
+        assert!(obj.get("ValidatorToDisable").is_none());
     }
 }

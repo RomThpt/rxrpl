@@ -82,7 +82,9 @@ impl Transactor for XChainClaimTransactor {
         // door on the issuing chain means wasLockingChainSend = 1.
         let bridge_key = bridge_helpers::find_bridge_keylet(&bridge, |k| ctx.view.exists(k))?;
         let bridge_sle: serde_json::Value = serde_json::from_slice(
-            &ctx.view.read(&bridge_key).ok_or(TransactionResult::TecNoEntry)?,
+            &ctx.view
+                .read(&bridge_key)
+                .ok_or(TransactionResult::TecNoEntry)?,
         )
         .map_err(|_| TransactionResult::TefInternal)?;
         let door_str = bridge_sle["Account"]
@@ -152,13 +154,14 @@ impl Transactor for XChainClaimTransactor {
             &claim_key,
         )?;
 
-        // Increment sender sequence.
+        // Sequence and ticket consumption are handled by the transaction engine.
         let src_key = keylet::account(&account_id);
-        let mut src_account: serde_json::Value = serde_json::from_slice(
-            &ctx.view.read(&src_key).ok_or(TransactionResult::TerNoAccount)?,
+        let src_account: serde_json::Value = serde_json::from_slice(
+            &ctx.view
+                .read(&src_key)
+                .ok_or(TransactionResult::TerNoAccount)?,
         )
         .map_err(|_| TransactionResult::TefInternal)?;
-        helpers::increment_sequence(&mut src_account);
         ctx.view
             .update(
                 src_key,
@@ -385,6 +388,7 @@ mod tests {
             let id = decode_account_id(addr).unwrap();
             serde_json::from_slice(&sandbox.read(&keylet::account(&id)).unwrap()).unwrap()
         };
+        assert_eq!(read(USER)["Sequence"], serde_json::json!(1));
         assert_eq!(read(DOOR)["Balance"].as_str().unwrap(), "90000000");
         assert_eq!(read(DEST)["Balance"].as_str().unwrap(), "60000000");
         assert_eq!(read(WITNESS)["Balance"].as_str().unwrap(), "100000100");

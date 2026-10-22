@@ -45,3 +45,35 @@ pub async fn shard_info(_params: Value, ctx: &Arc<ServerContext>) -> Result<Valu
         },
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rxrpl_config::ServerConfig;
+    use rxrpl_nodestore::ShardManager;
+    use rxrpl_primitives::Hash256;
+    use tokio::sync::RwLock;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn reports_not_enabled_without_manager() {
+        let ctx = ServerContext::new(ServerConfig::default());
+        let res = shard_info(serde_json::json!({}), &ctx).await.unwrap();
+        assert_eq!(res["shards"], "none");
+    }
+
+    #[tokio::test]
+    async fn reports_live_shard_when_attached() {
+        let mut manager = ShardManager::new();
+        manager.import_ledger(1, Hash256::default(), vec![1, 2, 3]);
+
+        let mut ctx = ServerContext::new(ServerConfig::default());
+        ctx.attach_shard_manager(Arc::new(RwLock::new(manager)));
+
+        let res = shard_info(serde_json::json!({}), &ctx).await.unwrap();
+        let shards = res["shards"].as_array().expect("shards array");
+        assert_eq!(shards.len(), 1);
+    }
+}

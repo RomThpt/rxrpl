@@ -1,8 +1,9 @@
 use std::collections::{HashSet, VecDeque};
 #[cfg(feature = "grpc")]
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rxrpl_amendment::{AmendmentTable, FeatureRegistry, Rules};
@@ -113,6 +114,88 @@ impl Node {
         self.validation_seed.as_ref()
     }
 
+    /// Directory for the resume-from-disk pointer, when a *persistent* node
+    /// store is configured. Returns `None` for in-memory / store-less
+    /// backends: their SHAMap nodes do not survive a restart, so a resume
+    /// pointer would be useless (it would just fail `from_header` and fall
+    /// through to RPC/genesis). Mirrors the `flush()` gating, which is a
+    /// no-op without a persistent store.
+    fn resume_dir(&self) -> Option<PathBuf> {
+        if self.node_store.is_some() && self.config.database.backend != "memory" {
+            Some(self.config.database.path.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Best-effort resume from a previously persisted validated ledger.
+    ///
+    /// On a prior run, every validated close wrote the 118-byte header to
+    /// `<db_dir>/resume_ledger.bin` immediately after flushing its SHAMap
+    /// nodes to the persistent node store. Here we read that pointer and
+    /// reconstruct the validated ledger lazily from the store
+    /// (`Ledger::from_header`, which fetches the state/tx root nodes — a
+    /// cheap probe that the subtree is actually present), then install it
+    /// as the base ledger exactly like the RPC-bootstrap path.
+    ///
+    /// Returns `true` when the validated ledger was reconstructed and
+    /// installed (so the caller skips the ~32-minute RPC bootstrap), `false`
+    /// on any failure (no store, no pointer, decode fail, or missing SHAMap
+    /// nodes), leaving the genesis ledger in place. Never blocks startup.
+    async fn resume_from_disk(&self) -> bool {
+        let Some(store) = self.node_store.as_ref() else {
+            return false;
+        };
+        let db_dir = &self.config.database.path;
+        let Some(header) = crate::resume_ledger_store::load(db_dir) else {
+            return false;
+        };
+        let seq = header.sequence;
+        let expected_hash = header.hash;
+
+        // `from_header` fetches the state/tx root nodes from the store; an
+        // error means the validated subtree is not (fully) present, so we
+        // cannot trust the resume and fall back to RPC/genesis.
+        let validated = match Ledger::from_header(header, Arc::clone(store)) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(
+                    "resume-from-disk: validated ledger #{} pointer found but state not \
+                     reconstructable from store ({}); falling back to RPC/genesis",
+                    seq,
+                    e,
+                );
+                return false;
+            }
+        };
+
+        // Sanity: the reconstructed header must hash to the persisted hash.
+        if validated.header.hash != expected_hash {
+            tracing::warn!(
+                "resume-from-disk: reconstructed ledger #{} hash {} != persisted {}; ignoring",
+                seq,
+                validated.header.hash,
+                expected_hash,
+            );
+            return false;
+        }
+
+        let hash = validated.header.hash;
+        // Mirror `bootstrap_from_rpc`'s install: the open ledger becomes
+        // validated+1 and the validated ledger is pushed onto
+        // `closed_ledgers`. The shared `ledger_seq`/`ledger_hash` atomics are
+        // derived from the installed open ledger immediately afterwards.
+        *self.ledger.write().await = Ledger::new_open(&validated);
+        self.closed_ledgers.write().await.push_back(validated);
+        tracing::info!(
+            "resumed from disk: validated ledger #{} hash={}, open ledger #{}",
+            seq,
+            hash,
+            seq + 1,
+        );
+        true
+    }
+
     /// Load the validator signing seed if configured, enforcing strict
     /// permissions. Returns `Ok(None)` when no `seed_file` is set; emits a
     /// warning (and drops the seed) when a seed file is provided but
@@ -145,7 +228,8 @@ impl Node {
 
         // Initialize amendment registry
         let registry = FeatureRegistry::with_known_amendments();
-        let mut amendment_table = AmendmentTable::new(&registry, 14 * 24 * 60 * 4); // ~14 days at 4s/ledger
+        // Majority window in close-time SECONDS (rippled's two-week window).
+        let mut amendment_table = AmendmentTable::new(&registry, 1_209_600); // 14 days in seconds
         config
             .amendments
             .apply(&registry, &mut amendment_table)
@@ -179,16 +263,20 @@ impl Node {
         // store-backed variant propagates hashes via a different path and
         // produces a different root for identical content).
         let _ = &node_store; // SHAMap store attached lazily during close().
-        // Networked genesis MUST match what peers will reconstruct from
-        // their own genesis bootstrap. xrpl-confluence sets rippled
-        // `genesis_amendments_disabled = true`, so kurtosis rippled
-        // genesis contains ONLY the canonical XRPL master AccountRoot
-        // (`rHb9CJAW…`, 100B drops) — no FeeSettings SLE and no
-        // Amendments SLE. Adding either makes our account_hash diverge
-        // from rippled, every close after #1 produces a mismatching
-        // hash, and rxrpl falls into the catchup feedback loop seen on
-        // 2026-05-12.
-        let ledger = Self::genesis_with_master_account_only("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")?;
+        // Networked genesis MUST match the topology's configured bootstrap.
+        // xrpl-confluence sets rippled `genesis_amendments_disabled = true`,
+        // which produces only the canonical master AccountRoot. Public XRPL
+        // networks use rippled's stock genesis instead, including FeeSettings
+        // and Amendments. Selecting the wrong layout changes the SHAMap root
+        // bytes and prevents consensus convergence after bootstrap.
+        let ledger = if config.network.genesis_amendments_disabled {
+            Self::genesis_with_master_account_only("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")?
+        } else {
+            Self::genesis_with_funded_account_and_store(
+                "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+                &node_store,
+            )?
+        };
 
         // Initialize transaction queue
         let tx_queue = TxQueue::new(2000);
@@ -223,7 +311,8 @@ impl Node {
         let node_store = Self::create_node_store(&config)?;
 
         let registry = FeatureRegistry::with_known_amendments();
-        let mut amendment_table = AmendmentTable::new(&registry, 14 * 24 * 60 * 4);
+        // Majority window in close-time SECONDS (rippled's two-week window).
+        let mut amendment_table = AmendmentTable::new(&registry, 1_209_600); // 14 days in seconds
         config
             .amendments
             .apply(&registry, &mut amendment_table)
@@ -326,6 +415,7 @@ impl Node {
             Some(Arc::clone(&self.tx_queue)),
             None, // no relay in standalone mode
             self.pruner.shared_state(),
+            Some(rxrpl_rpc_server::metrics::global_handle()),
         );
         let event_tx = ctx.event_sender().clone();
 
@@ -366,6 +456,9 @@ impl Node {
         let interval_duration = Duration::from_secs(close_interval_secs);
         let pruner = Arc::clone(&self.pruner);
         let node_store_prune = self.node_store.clone();
+        // Resume pointer dir: Some only for a persistent backend (no-op for
+        // the in-memory standalone default).
+        let resume_dir = self.resume_dir();
 
         tokio::spawn(async move {
             let adapter = NodeConsensusAdapter::new();
@@ -450,6 +543,14 @@ impl Node {
                     );
                 }
 
+                // Deferred negative-UNL move: process any pending
+                // ValidatorToDisable/ReEnable set at the PREVIOUS flag ledger
+                // BEFORE generating this flag ledger's pseudo-txs. Mirrors
+                // rippled's buildLedgerImpl, where updateNegativeUNL() runs
+                // before the UNLModify txs are applied (no-op off a flag
+                // ledger or with nothing pending).
+                Node::update_negative_unl(&mut l, ledger_seq);
+
                 // Apply negative-UNL pseudo-transactions on flag ledgers
                 // (no-op otherwise). Mirrors apply_amendment_voting:
                 // pseudo-txs land before the ledger's final hash is
@@ -468,9 +569,17 @@ impl Node {
                     continue;
                 }
 
-                // Flush closed ledger to node store
-                if let Err(e) = l.flush() {
-                    tracing::warn!("failed to flush ledger: {}", e);
+                // Flush closed ledger to node store, then persist the
+                // resume pointer so a restart skips the RPC re-bootstrap.
+                match l.flush() {
+                    Ok(_) => {
+                        if let Some(ref dir) = resume_dir {
+                            if let Err(e) = crate::resume_ledger_store::save(dir, &l.header) {
+                                tracing::warn!("failed to persist resume pointer: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("failed to flush ledger: {}", e),
                 }
 
                 let hash = l.header.hash;
@@ -663,6 +772,39 @@ impl Node {
         Ok(())
     }
 
+    /// Refuse to run as a validator on a live network with no source of
+    /// trust. A validating node (validation seed set) whose UNL would be
+    /// empty -- no parseable `[validators]` key and no validator-list
+    /// publisher site -- puts the consensus engine in solo mode, where it
+    /// accepts its own ledgers as validated with no quorum. On a public
+    /// network that is a silent fork. Legitimate single-node validation
+    /// goes through `run_standalone`; tracking nodes (no validation seed)
+    /// are unaffected.
+    fn validate_validating_unl(&self) -> Result<(), NodeError> {
+        if self.validation_seed.is_none() {
+            return Ok(());
+        }
+        const NODE_PUBLIC_KEY_PREFIX: u8 = 0x1C;
+        let has_trusted_key = self.config.validators.trusted.iter().any(|entry| {
+            let t = entry.trim();
+            if let Ok(decoded) = rxrpl_codec::address::base58::base58check_decode(t) {
+                if decoded.len() == 1 + 33 && decoded[0] == NODE_PUBLIC_KEY_PREFIX {
+                    return true;
+                }
+            }
+            hex::decode(t).is_ok()
+        });
+        if !has_trusted_key && self.config.validators.validator_list_sites.is_empty() {
+            return Err(NodeError::Config(
+                "refusing to validate with no trusted validators: configure \
+                 `[validators]` keys or a `validators.validator_list_sites` \
+                 publisher, or run in standalone mode for solo validation"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn run_networked(
         &self,
         close_interval_secs: u64,
@@ -673,6 +815,7 @@ impl Node {
         // task spawn so a misconfiguration is reported deterministically
         // rather than racing `EADDRINUSE` (port collision in parallel tests).
         self.validate_starting_ledger_unl(starting_ledger.as_ref())?;
+        self.validate_validating_unl()?;
 
         // 1. Generate/load node identity. node_seed accepts either:
         //   - 32 hex characters (16 raw seed bytes)
@@ -769,72 +912,83 @@ impl Node {
             None => None,
         };
 
-        // 2. Bootstrap from RPC: fetch latest validated ledger to set our starting point
-        if let Some(rpc_url) = sync_rpc_url {
-            match Self::bootstrap_from_rpc(rpc_url).await {
-                Ok((seq, hash)) => {
-                    let mut l = self.ledger.write().await;
-                    l.header.sequence = seq + 1; // open ledger = validated + 1
-                    l.header.parent_hash = hash;
-                    drop(l);
-                    tracing::info!(
-                        "bootstrapped from RPC: validated ledger #{} hash={}, open ledger #{}",
-                        seq,
-                        hash,
-                        seq + 1
-                    );
+        // 2a. Resume from disk (best-effort): if a prior run persisted its
+        // latest validated ledger AND that ledger's SHAMap nodes are still in
+        // the node store, reconstruct it lazily and install it as the base
+        // ledger — skipping the ~32-minute RPC re-bootstrap below. Any failure
+        // (no pointer, decode fail, missing nodes) falls through to the
+        // existing RPC/genesis path unchanged.
+        let resumed = self.resume_from_disk().await;
 
-                    // Bulk-download and VERIFY the full validated state via RPC,
-                    // then install it as our base ledger -- the fast, completing
-                    // alternative to node-by-node P2P SHAMap sync.
-                    if let Some(ref store) = self.node_store {
-                        let hash_hex = hex::encode(hash.as_bytes());
-                        match Self::fetch_validated_header(rpc_url, &hash_hex).await {
-                            Ok(header) => {
-                                match Self::download_state_via_rpc(
-                                    rpc_url,
-                                    &hash_hex,
-                                    header.account_hash,
-                                    Arc::clone(store),
-                                )
-                                .await
-                                {
-                                    Ok(state_map) => {
-                                        let mut validated = Ledger::from_catchup_with_store(
-                                            seq,
-                                            hash,
-                                            state_map,
-                                            Arc::clone(store),
-                                        );
-                                        // Apply the trusted validated header so the
-                                        // next local close agrees with the chain.
-                                        validated.header = header;
-                                        *self.ledger.write().await = Ledger::new_open(&validated);
-                                        self.closed_ledgers.write().await.push_back(validated);
-                                        tracing::info!(
-                                            "installed RPC-bootstrapped validated state for ledger #{}",
-                                            seq
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "RPC state download failed (P2P sync will be used): {}",
-                                            e
-                                        );
+        // 2. Bootstrap from RPC: fetch latest validated ledger to set our starting point
+        if !resumed {
+            if let Some(rpc_url) = sync_rpc_url {
+                match Self::bootstrap_from_rpc(rpc_url).await {
+                    Ok((seq, hash)) => {
+                        let mut l = self.ledger.write().await;
+                        l.header.sequence = seq + 1; // open ledger = validated + 1
+                        l.header.parent_hash = hash;
+                        drop(l);
+                        tracing::info!(
+                            "bootstrapped from RPC: validated ledger #{} hash={}, open ledger #{}",
+                            seq,
+                            hash,
+                            seq + 1
+                        );
+
+                        // Bulk-download and VERIFY the full validated state via RPC,
+                        // then install it as our base ledger -- the fast, completing
+                        // alternative to node-by-node P2P SHAMap sync.
+                        if let Some(ref store) = self.node_store {
+                            let hash_hex = hex::encode(hash.as_bytes());
+                            match Self::fetch_validated_header(rpc_url, &hash_hex).await {
+                                Ok(header) => {
+                                    match Self::download_state_via_rpc(
+                                        rpc_url,
+                                        &hash_hex,
+                                        header.account_hash,
+                                        Arc::clone(store),
+                                    )
+                                    .await
+                                    {
+                                        Ok(state_map) => {
+                                            let mut validated = Ledger::from_catchup_with_store(
+                                                seq,
+                                                hash,
+                                                state_map,
+                                                Arc::clone(store),
+                                            );
+                                            // Apply the trusted validated header so the
+                                            // next local close agrees with the chain.
+                                            validated.header = header;
+                                            *self.ledger.write().await =
+                                                Ledger::new_open(&validated);
+                                            self.closed_ledgers.write().await.push_back(validated);
+                                            tracing::info!(
+                                                "installed RPC-bootstrapped validated state for ledger #{}",
+                                                seq
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "RPC state download failed (P2P sync will be used): {}",
+                                                e
+                                            );
+                                        }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "could not fetch validated header for RPC bootstrap: {}",
-                                    e
-                                );
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "could not fetch validated header for RPC bootstrap: {}",
+                                        e
+                                    );
+                                }
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!("RPC bootstrap failed (starting from genesis): {}", e);
+                    Err(e) => {
+                        tracing::warn!("RPC bootstrap failed (starting from genesis): {}", e);
+                    }
                 }
             }
         }
@@ -852,6 +1006,8 @@ impl Node {
         let peer_config = PeerManagerConfig {
             listen_port: self.config.peer.port,
             max_peers: self.config.peer.max_peers,
+            reserved_outbound_slots: self.config.peer.reserved_outbound_slots,
+            max_peers_per_ip: self.config.peer.max_peers_per_ip,
             seeds: self.config.peer.seeds.clone(),
             fixed_peers: self.config.peer.fixed_peers.clone(),
             network_id: self.config.network.network_id,
@@ -889,13 +1045,21 @@ impl Node {
         let cmd_tx_catchup = cmd_tx.clone();
         let cmd_tx_rpc = cmd_tx.clone();
 
+        // Amendment-blocked safety halt: set true by `close_consensus_round`
+        // once an on-ledger amendment this build does not understand becomes
+        // enabled. Shared with the consensus adapter (suppresses proposals),
+        // the consensus loop (suppresses validation), and the RPC context
+        // (reports `server_info.amendment_blocked`). Once set, stays set.
+        let amendment_blocked = Arc::new(AtomicBool::new(false));
+
         // 5. Create NetworkConsensusAdapter (consumes cmd_tx). When a
         // validator identity is configured, attach it so that proposals are
         // signed with the manifest-bound ephemeral signing key (issue #76 —
         // rippled drops proposals signed with the node peer key as
         // untrusted).
         let adapter = {
-            let base = NetworkConsensusAdapter::new(cmd_tx, Arc::clone(&identity));
+            let base = NetworkConsensusAdapter::new(cmd_tx, Arc::clone(&identity))
+                .with_amendment_blocked_flag(Arc::clone(&amendment_blocked));
             match validator_id.as_ref() {
                 Some(vid) => base.with_validator_identity(Arc::clone(vid)),
                 None => base,
@@ -950,6 +1114,12 @@ impl Node {
             let fetcher_status_handle: rxrpl_overlay::StatusHandle =
                 Arc::new(RwLock::new(Vec::new()));
             let fetcher_status_for_publish = Arc::clone(&fetcher_status_handle);
+            // Feed HTTP-verified VLs into the consensus loop (UNL + quorum),
+            // not just the aggregator trust filter, so a publisher-served
+            // dynamic VL actually drives consensus instead of leaving the
+            // engine in solo mode.
+            let vl_consensus_tx = peer_mgr.consensus_sender();
+            let vl_overlay_command_tx = cmd_tx_catchup.clone();
             tokio::spawn(async move {
                 let fetcher = match VlFetcher::new(
                     sites_for_fetcher,
@@ -963,6 +1133,9 @@ impl Node {
                         return;
                     }
                 };
+                let fetcher = fetcher
+                    .with_consensus_sender(vl_consensus_tx)
+                    .with_overlay_command_sender(vl_overlay_command_tx);
                 // Bridge the typed status snapshot into the JSON value the
                 // RPC handler reads from `ctx.validator_list_status`.
                 let publish_handle = Arc::clone(&fetcher_status_for_publish);
@@ -1004,12 +1177,21 @@ impl Node {
             Some(Arc::clone(&self.tx_queue)),
             Some(relay_tx),
             self.pruner.shared_state(),
+            Some(rxrpl_rpc_server::metrics::global_handle()),
         );
         ctx.attach_validator_list_status(Arc::clone(&vl_status));
         ctx.attach_network_id(self.config.network.network_id);
         // Peer set: shared with the overlay so `server_info.peers` reads the
         // live connection count.
         ctx.attach_peer_set(peer_mgr.peer_set());
+        // Shard store: when `[shard] enabled`, construct the manager and share
+        // it with the overlay (shard exchange protocol) and the RPC context so
+        // `shard_info`/`node_to_shard`/`crawl_shards` report the live store.
+        if self.config.database.shard.enabled {
+            let shard_manager = Arc::new(RwLock::new(rxrpl_nodestore::ShardManager::new()));
+            peer_mgr.set_shard_manager(Arc::clone(&shard_manager));
+            ctx.attach_shard_manager(shard_manager);
+        }
         // Overlay command channel: lets the `connect` admin RPC initiate
         // outbound peer connections via OverlayCommand::ConnectTo.
         ctx.attach_overlay_command(cmd_tx_rpc);
@@ -1030,6 +1212,22 @@ impl Node {
             rxrpl_rpc_server::NetworkValidatedSnapshot::default(),
         ));
         ctx.attach_network_validated(Arc::clone(&network_validated_arc));
+        // Amendment-blocked flag: surfaced as `server_info.amendment_blocked`.
+        ctx.attach_amendment_blocked(Arc::clone(&amendment_blocked));
+        // Live validation quorum: seeded to 0 here and set to the computed
+        // initial quorum by the consensus loop below (and re-stored on every
+        // VL-driven quorum change), so `server_info.validation_quorum` and the
+        // `validators` RPC always reflect what consensus is actually using.
+        let quorum_arc = Arc::new(AtomicUsize::new(0));
+        ctx.attach_quorum(Arc::clone(&quorum_arc));
+        // Trusted validator master pubkeys (canonical 33-byte hex): startup
+        // snapshot from the configured `[validators]` set, surfaced by the
+        // `validators` RPC. Dynamic-VL nodes populate the consensus UNL's
+        // master_keys map at runtime; this immutable snapshot mirrors what
+        // that map exposes for the common static-config case.
+        let trusted_validator_keys_snapshot =
+            Self::config_trusted_master_hex(&self.config.validators.trusted);
+        ctx.attach_trusted_validator_keys(Arc::new(trusted_validator_keys_snapshot));
         // B5: expose the local manifest to the RPC `manifest` handler.
         if let Some(vid) = validator_id.as_deref() {
             let seq = self.config.validator_identity.sequence.max(1);
@@ -1060,6 +1258,14 @@ impl Node {
             }
         }
         let event_tx = ctx.event_sender().clone();
+
+        // Feed the overlay's `/crawl` endpoint the same server-info snapshot so
+        // this node is discoverable on network explorers. Cloned after the last
+        // `ctx` mutation (attach_* rely on Arc::get_mut) and before `serve`
+        // takes ownership of `ctx`.
+        let crawl_ctx: Arc<ServerContext> = Arc::clone(&ctx);
+        let crawl_info: Arc<dyn rxrpl_overlay::CrawlInfo> = crawl_ctx;
+        peer_mgr.set_crawl_info(crawl_info);
 
         // Clone ctx for gRPC before moving into RPC router
         #[cfg(feature = "grpc")]
@@ -1224,12 +1430,25 @@ impl Node {
         let tx_queue = Arc::clone(&self.tx_queue);
         let amendment_table = Arc::clone(&self.amendment_table);
         let node_store = self.node_store.clone();
+        // Resume pointer dir: Some only for a persistent backend. Captured by
+        // the consensus loop so each validated close updates the pointer.
+        let resume_dir_for_loop = self.resume_dir();
         let tx_store = self.tx_store.as_ref().map(Arc::clone);
         let pruner = Arc::clone(&self.pruner);
         let ledger_seq_shared = Arc::clone(&ledger_seq);
         let ledger_hash_shared = Arc::clone(&ledger_hash);
         let network_validated_for_loop = Arc::clone(&network_validated_arc);
+        // Live quorum cell shared with the RPC context: the loop stores the
+        // initial quorum once computed and re-stores it on every VL update so
+        // `server_info.validation_quorum` tracks the live value.
+        let quorum_arc_for_loop = Arc::clone(&quorum_arc);
         let configured_quorum = self.config.validators.quorum;
+        // Whether a dynamic validator list is configured. Gates every
+        // runtime mutation of the consensus engine's UNL so that a node
+        // running on a static `[validators]` config (e.g. hive clusters)
+        // never has its trusted set or ephemeral mappings rewritten — its
+        // consensus behavior is identical to before this wiring existed.
+        let vl_dynamic = !self.config.validators.validator_list_sites.is_empty();
         let trusted_validators_for_aggregator = if self.config.validators.require_trusted_validators
             && !self.config.validators.validator_list_sites.is_empty()
             && !vl_publisher_keys.is_empty()
@@ -1362,6 +1581,17 @@ impl Node {
         }
 
         let validator_id_for_loop = validator_id.clone();
+        // Set of amendment ids this build knows how to apply. Captured by the
+        // consensus loop so each close can detect an on-ledger amendment it
+        // does not understand and trip the amendment-blocked halt.
+        let known_amendment_ids: HashSet<Hash256> = FeatureRegistry::with_known_amendments()
+            .known_ids()
+            .copied()
+            .collect();
+        let amendment_blocked_for_loop = Arc::clone(&amendment_blocked);
+        // This node's fee-vote targets, captured by value for the consensus
+        // loop. Empty by default => fee voting is a no-op (see `apply_fee_voting`).
+        let fee_vote_cfg = self.config.fee_vote.clone();
         tokio::spawn(async move {
             let node_id = NodeId(identity.node_id);
             // Networked mode: enforce a minimum Establish-phase duration
@@ -1371,6 +1601,9 @@ impl Node {
             // Poll converge() every 250ms (vs the 1250ms proposal cadence)
             // so a round finalizes close to the 1950ms floor instead of
             // overshooting to the next coarse 1250ms tick (~2.5s → ~2.0s).
+            // The 2000ms open (`ledger_idle_interval_ms`) + 1950ms establish
+            // floor gives a ~3.95s open+establish floor that targets mainnet's
+            // 3-4s close cadence.
             let consensus_params = ConsensusParams {
                 min_consensus_time_ms: 1_950,
                 converge_poll_interval_ms: 250,
@@ -1476,6 +1709,9 @@ impl Node {
                 tracing::info!("validation aggregator: trust filter enabled (UNL-bound)");
             }
             tracing::info!("validation quorum initialized to {}", initial_quorum);
+            // Publish the live quorum so `server_info.validation_quorum` and the
+            // `validators` RPC reflect what consensus is using from the start.
+            quorum_arc_for_loop.store(initial_quorum, Ordering::Relaxed);
 
             let mut pending_validations = crate::pending_validations::PendingValidations::new();
 
@@ -1507,7 +1743,17 @@ impl Node {
             // Collect amendment votes from received validations for the current round.
             // Reset after each ledger close.
             let mut amendment_votes: Vec<Vec<Hash256>> = Vec::new();
+            // Fee/reserve votes carried by the same trusted validations, in
+            // lockstep with `amendment_votes` (same dedup + reset lifecycle).
+            let mut fee_votes: Vec<rxrpl_amendment::fee_voting::FeeVoteEntry> = Vec::new();
+            // Denominator for amendment voting: the number of DISTINCT trusted
+            // validators that sent a FULL validation this voting window. An
+            // empty amendment list is a "no" vote that still counts toward the
+            // denominator, so we count voters here independently of whether they
+            // listed any amendments. `seen_amendment_voters` dedups by node id
+            // so a validator that re-validates within the window is counted once.
             let mut trusted_validator_count: usize = 0;
+            let mut seen_amendment_voters: HashSet<NodeId> = HashSet::new();
 
             // Cooldown for wrong-prev-ledger recovery to prevent flip-flopping.
             // At most one switch per 10 seconds.
@@ -1525,6 +1771,15 @@ impl Node {
 
             // Track consensus stalls for escalating recovery.
             let mut stall_metrics = rxrpl_consensus::StallMetrics::new();
+
+            // Validator-safety guard (M0): tracks the highest (seq, hash) this
+            // node has self-validated and the monotonic SigningTime floor.
+            // Shared by BOTH self-validation producers — the consensus-close
+            // path (`close_consensus_round`) and the catchup-adopt path below —
+            // so a sync/consensus race can never emit two conflicting FULL
+            // validations for one sequence (equivocation), nor a non-increasing
+            // SigningTime. See `crate::validation_guard`.
+            let mut self_validation_guard = crate::validation_guard::SelfValidationGuard::default();
 
             let sync_check_duration = Duration::from_secs(5);
             let mut sync_check_interval = tokio::time::interval(sync_check_duration);
@@ -1797,8 +2052,13 @@ impl Node {
                                             &cmd_tx_catchup,
                                             &amendment_table, &tx_engine, &fees,
                                             &amendment_votes, trusted_validator_count,
+                                            &fee_votes, &fee_vote_cfg,
                                             &pruner, &node_store,
                                             &self_validation_tx,
+                                            &mut self_validation_guard,
+                                            &amendment_blocked_for_loop,
+                                            &known_amendment_ids,
+                                            resume_dir_for_loop.as_deref(),
                                         ).await;
                                         if let Ok(mut lc) = last_close_arc.write() {
                                             lc.proposers = proposers_this_round;
@@ -1810,6 +2070,8 @@ impl Node {
                                         stall_metrics.reset_consecutive();
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
+                                        fee_votes.clear();
+                                        seen_amendment_voters.clear();
                                         // Start new open phase
                                         timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
                                     } else {
@@ -1967,6 +2229,8 @@ impl Node {
                                         consensus.start_round(reset_prev, 0);
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
+                                        fee_votes.clear();
+                                        seen_amendment_voters.clear();
                                         round_started_at = None;
                                         continue;
                                     }
@@ -1986,8 +2250,13 @@ impl Node {
                                             &cmd_tx_catchup,
                                             &amendment_table, &tx_engine, &fees,
                                             &amendment_votes, trusted_validator_count,
+                                            &fee_votes, &fee_vote_cfg,
                                             &pruner, &node_store,
                                             &self_validation_tx,
+                                            &mut self_validation_guard,
+                                            &amendment_blocked_for_loop,
+                                            &known_amendment_ids,
+                                            resume_dir_for_loop.as_deref(),
                                         ).await;
                                         if let Ok(mut lc) = last_close_arc.write() {
                                             lc.proposers = proposers_this_round;
@@ -1999,6 +2268,8 @@ impl Node {
                                         stall_metrics.reset_consecutive();
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
+                                        fee_votes.clear();
+                                        seen_amendment_voters.clear();
                                         // Start new open phase
                                         timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
                                     }
@@ -2031,6 +2302,8 @@ impl Node {
                                             timer.on_phase_change(rxrpl_consensus::ConsensusPhase::Open);
                                             amendment_votes.clear();
                                             trusted_validator_count = 0;
+                                            fee_votes.clear();
+                                            seen_amendment_voters.clear();
                                         }
                                         rxrpl_consensus::StallAction::Resync => {
                                             // Escalate: request latest ledger from peers
@@ -2047,6 +2320,8 @@ impl Node {
                                             );
                                             amendment_votes.clear();
                                             trusted_validator_count = 0;
+                                            fee_votes.clear();
+                                            seen_amendment_voters.clear();
                                         }
                                     }
                                 }
@@ -2146,6 +2421,8 @@ impl Node {
                                         consensus.start_round(detected.preferred_ledger, 0);
                                         amendment_votes.clear();
                                         trusted_validator_count = 0;
+                                        fee_votes.clear();
+                                        seen_amendment_voters.clear();
                                     }
                                 }
                             }
@@ -2170,13 +2447,41 @@ impl Node {
                                     full: validation.full,
                                 });
 
-                                // Collect amendment votes from this validator
-                                if validation.full && !validation.amendments.is_empty() {
-                                    amendment_votes.push(validation.amendments.clone());
+                                // Collect amendment votes from this validator.
+                                //
+                                // The denominator for the 80% majority is the
+                                // number of DISTINCT TRUSTED validators that sent
+                                // a FULL validation this window — matching rippled,
+                                // where a validator with no amendments listed still
+                                // counts as a "no" voter in the denominator. Gate on
+                                // trust using the resolved master key (handles
+                                // ephemeral->master via the manifest), and dedup by
+                                // node id so a re-validation in the same window is
+                                // counted once.
+                                if validation.full
+                                    && val_aggregator.is_trusted(validation.trusted_key())
+                                    && seen_amendment_voters.insert(validation.node_id)
+                                {
+                                    trusted_validator_count += 1;
+                                    if !validation.amendments.is_empty() {
+                                        amendment_votes.push(validation.amendments.clone());
+                                    }
+                                    // Fee vote: prefer the drops variant, fall
+                                    // back to the legacy fields (pre-XRPFees). A
+                                    // field absent on both sides stays None and
+                                    // the tally treats it as a vote for current.
+                                    fee_votes.push(rxrpl_amendment::fee_voting::FeeVoteEntry {
+                                        base_fee: validation
+                                            .base_fee_drops
+                                            .or(validation.base_fee),
+                                        reserve_base: validation
+                                            .reserve_base_drops
+                                            .or(validation.reserve_base.map(u64::from)),
+                                        reserve_increment: validation
+                                            .reserve_increment_drops
+                                            .or(validation.reserve_increment.map(u64::from)),
+                                    });
                                 }
-                                trusted_validator_count = trusted_validator_count.max(
-                                    amendment_votes.len(),
-                                );
 
                                 // Feed into the checkpoint anchor first (if active). On
                                 // resolution we directly request the agreed ledger and
@@ -2187,7 +2492,7 @@ impl Node {
                                 // could resolve the anchor on a forged hash and
                                 // bootstrap the node onto an attacker-chosen chain.
                                 let anchor_trustable =
-                                    val_aggregator.is_trusted(&validation.public_key);
+                                    val_aggregator.is_trusted(validation.trusted_key());
                                 if let Some(anchor) = checkpoint_anchor.as_mut() {
                                     if !anchor_trustable {
                                         // Drop silently — the same validation may
@@ -2230,6 +2535,18 @@ impl Node {
                                         "validation buffered (signing key not yet trusted)"
                                     );
                                     continue;
+                                }
+
+                                // Feed the trusted full validation into the
+                                // validations-trie under its resolved master
+                                // identity, so get_preferred / wrong-prev-ledger
+                                // detection can follow the trusted-majority
+                                // branch. Gated on a dynamic VL so static-config
+                                // nodes (e.g. hive clusters) are unaffected and
+                                // cross-impl convergence is untouched.
+                                if vl_dynamic && validation.full {
+                                    consensus
+                                        .record_trusted_validation(validation.to_trie_identity());
                                 }
 
                                 // Aggregate validation and check for quorum
@@ -2327,6 +2644,14 @@ impl Node {
                                         continue;
                                     }
                                 };
+
+                                // Peer-relayed transactions are untrusted: verify the
+                                // signature before touching the open ledger, otherwise a
+                                // peer could inject forged/unsigned transactions.
+                                if let Err(e) = rxrpl_protocol::tx::verify_signature(&tx_json) {
+                                    tracing::warn!("dropping P2P tx {} with bad signature: {}", hash, e);
+                                    continue;
+                                }
 
                                 // Apply to open ledger (speculative)
                                 let mut l = ledger.write().await;
@@ -2674,7 +2999,18 @@ impl Node {
                                                 // and broadcast — peer receives 2 validations
                                                 // (own + ours) for the same hash, reaches quorum,
                                                 // advances validated_ledger.
-                                                {
+                                                //
+                                                // Equivocation guard (M0): if the consensus-close
+                                                // path already self-validated this (or a newer) seq
+                                                // with a different hash, refuse — emitting a second
+                                                // conflicting FULL validation would get this node
+                                                // dropped as an equivocator.
+                                                if !self_validation_guard.may_validate(seq, reconstructed.header.hash) {
+                                                    tracing::warn!(
+                                                        "equivocation guard: refusing to validate adopted ledger #{} hash={} (already self-validated up to #{}); skipping validation broadcast",
+                                                        seq, reconstructed.header.hash, self_validation_guard.highest_seq(),
+                                                    );
+                                                } else {
                                                     use rxrpl_consensus::types::Validation;
                                                     use rxrpl_primitives::Hash256;
                                                     let our_amendment_votes =
@@ -2688,6 +3024,9 @@ impl Node {
                                                         .unwrap_or_default()
                                                         .as_secs()
                                                         .saturating_sub(rxrpl_ledger::header::RIPPLE_EPOCH_OFFSET) as u32;
+                                                    // SigningTime monotonic floor (M0):
+                                                    // max(now, lastSigningTime + 1s).
+                                                    let sign_time = self_validation_guard.floor_signing_time(now_netclock);
                                                     let signing_pubkey: Vec<u8> = match validator_id_for_loop.as_ref() {
                                                         Some(vid) => vid.signing_pubkey().as_bytes().to_vec(),
                                                         None => identity.public_key_bytes().to_vec(),
@@ -2699,7 +3038,7 @@ impl Node {
                                                         ledger_seq: seq,
                                                         full: true,
                                                         close_time: reconstructed.header.close_time,
-                                                        sign_time: now_netclock,
+                                                        sign_time,
                                                         signature: None,
                                                         amendments: our_amendment_votes,
                                                         signing_payload: None,
@@ -2718,6 +3057,8 @@ impl Node {
                                                         msg_type: rxrpl_p2p_proto::MessageType::Validation,
                                                         payload,
                                                     });
+                                                    self_validation_guard.record_validation(seq, reconstructed.header.hash);
+                                                    self_validation_guard.record_signing_time(sign_time);
                                                     tracing::debug!(
                                                         "adopted ledger #{} validated by us, broadcast Validation",
                                                         seq
@@ -2784,6 +3125,7 @@ impl Node {
                                 if configured_quorum.is_none() && validator_count > 0 {
                                     let new_quorum = Node::compute_quorum(validator_count);
                                     val_aggregator.update_quorum(new_quorum);
+                                    quorum_arc_for_loop.store(new_quorum, Ordering::Relaxed);
                                     tracing::info!(
                                         "auto-set validation quorum to {} (from {} validators)",
                                         new_quorum, validator_count
@@ -2795,11 +3137,25 @@ impl Node {
                                     "verified validator list seq={} with {} validators",
                                     sequence, validators.len()
                                 );
+                                if vl_dynamic && !validators.is_empty() {
+                                    consensus.set_trusted_master_keys(&validators);
+                                    if configured_quorum.is_none() {
+                                        let new_quorum = Node::compute_quorum(validators.len());
+                                        val_aggregator.update_quorum(new_quorum);
+                                        quorum_arc_for_loop.store(new_quorum, Ordering::Relaxed);
+                                    }
+                                    tracing::info!(
+                                        "applied verified validator list seq={}: consensus UNL now {} validators, quorum {}",
+                                        sequence,
+                                        validators.len(),
+                                        consensus.unl().quorum_threshold()
+                                    );
+                                }
                             }
                             ConsensusMessage::ManifestApplied {
                                 master_key,
                                 ephemeral_key,
-                                old_ephemeral_key: _,
+                                old_ephemeral_key,
                                 revoked,
                             } => {
                                 if revoked {
@@ -2812,6 +3168,28 @@ impl Node {
                                         "manifest applied: master={} ephemeral={}",
                                         master_key, eph
                                     );
+                                }
+
+                                // Keep the consensus engine's UNL aware of the
+                                // ephemeral->master mapping so trusted proposals
+                                // and validations signed by the ephemeral key
+                                // resolve to their (VL-trusted) master. Gated on
+                                // a dynamic VL so static-config nodes are
+                                // untouched.
+                                if vl_dynamic {
+                                    let unl = consensus.unl_mut();
+                                    if revoked {
+                                        unl.revoke_master_key(&master_key);
+                                        if let Some(ref eph) = ephemeral_key {
+                                            unl.remove_ephemeral_key(eph);
+                                        }
+                                    } else if let Some(ref eph) = ephemeral_key {
+                                        unl.register_ephemeral_key(
+                                            &master_key,
+                                            eph,
+                                            old_ephemeral_key.as_ref(),
+                                        );
+                                    }
                                 }
 
                                 if !revoked {
@@ -2895,9 +3273,15 @@ impl Node {
         fees: &Arc<FeeSettings>,
         validator_amendment_votes: &[Vec<Hash256>],
         trusted_validator_count: usize,
+        validator_fee_votes: &[rxrpl_amendment::fee_voting::FeeVoteEntry],
+        fee_vote_cfg: &rxrpl_config::FeeVoteConfig,
         pruner: &Arc<LedgerPruner>,
         node_store: &Option<Arc<dyn NodeStore>>,
-        self_validation_tx: &tokio::sync::mpsc::UnboundedSender<rxrpl_overlay::ConsensusMessage>,
+        self_validation_tx: &tokio::sync::mpsc::Sender<rxrpl_overlay::ConsensusMessage>,
+        validation_guard: &mut crate::validation_guard::SelfValidationGuard,
+        amendment_blocked: &Arc<AtomicBool>,
+        known_amendment_ids: &HashSet<Hash256>,
+        resume_dir: Option<&Path>,
     ) {
         // Resolve close_time in priority order:
         //  1. Quorum-accepted close_time from converge() — strongest signal,
@@ -2941,10 +3325,10 @@ impl Node {
 
         // Apply amendment voting on flag ledgers (before close computes
         // final hashes). Votes are collected from received validations.
-        {
+        let rules_after_voting = {
             let ledger_seq = l.header.sequence;
             let mut at = amendment_table.write().await;
-            let _rules = Node::apply_amendment_voting(
+            Node::apply_amendment_voting(
                 &mut l,
                 tx_engine,
                 &mut at,
@@ -2953,11 +3337,41 @@ impl Node {
                 validator_amendment_votes,
                 effective_close_time,
                 ledger_seq,
+            )
+        };
+
+        // Fee / reserve voting on flag ledgers (rippled FeeVoteImpl::doVoting),
+        // right after amendment voting. No-op unless an operator configured
+        // fee-vote targets AND the weighted median actually moves a value — a
+        // `None` config field resolves to the current value, collapsing the vote
+        // range so no in-range peer vote can shift it.
+        {
+            let ledger_seq = l.header.sequence;
+            let target = rxrpl_amendment::fee_voting::FeeSettingsVote {
+                base_fee: fee_vote_cfg.base_fee_drops.unwrap_or(fees.base_fee),
+                reserve_base: fee_vote_cfg.reserve_base_drops.unwrap_or(fees.reserve_base),
+                reserve_increment: fee_vote_cfg
+                    .reserve_increment_drops
+                    .unwrap_or(fees.reserve_increment),
+            };
+            Node::apply_fee_voting(
+                &mut l,
+                tx_engine,
+                fees,
+                &rules_after_voting,
+                target,
+                validator_fee_votes,
+                ledger_seq,
             );
         }
 
         // Apply negative-UNL pseudo-transactions on flag ledgers.
         let nunl_seq = l.header.sequence;
+        // Deferred move first (mirrors rippled buildLedgerImpl:
+        // updateNegativeUNL() precedes the UNLModify pseudo-txs), so a
+        // disable requested at the previous flag ledger is moved into
+        // DisabledValidators before this flag ledger sets new pending fields.
+        Node::update_negative_unl(&mut l, nunl_seq);
         let _nunl_results = Node::apply_negative_unl(consensus, &mut l, tx_engine, fees, nunl_seq);
         consensus.on_ledger_close_for_tracker();
 
@@ -2966,9 +3380,18 @@ impl Node {
             return;
         }
 
-        // Flush closed ledger to node store
-        if let Err(e) = l.flush() {
-            tracing::warn!("failed to flush ledger: {}", e);
+        // Flush closed ledger to node store, then persist the resume pointer
+        // (best-effort) so a restart can reconstruct this validated ledger
+        // from the store and skip the ~32-minute RPC re-bootstrap.
+        match l.flush() {
+            Ok(_) => {
+                if let Some(dir) = resume_dir {
+                    if let Err(e) = crate::resume_ledger_store::save(dir, &l.header) {
+                        tracing::warn!("failed to persist resume pointer: {}", e);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("failed to flush ledger: {}", e),
         }
 
         let hash = l.header.hash;
@@ -3000,6 +3423,12 @@ impl Node {
                 });
             }
         });
+
+        // Prometheus: current validated ledger height + tx count on every close,
+        // the two gauges operators graph. No-op unless the global recorder was
+        // installed at startup (via `metrics::global_handle`).
+        rxrpl_rpc_server::metrics::set_ledger_sequence(closed_seq as f64);
+        rxrpl_rpc_server::metrics::set_ledger_tx_count(tx_count as f64);
 
         // Emit book change events for order book modifications
         if has_offer_changes {
@@ -3048,8 +3477,47 @@ impl Node {
         );
         drop(l);
 
+        // Amendment-blocked detection: if the just-closed ledger has an
+        // amendment enabled that this build does not understand, halt this
+        // node's own validation and proposals so it cannot fork away from the
+        // network that does understand it. Once blocked, stays blocked.
+        if !amendment_blocked.load(Ordering::Relaxed) {
+            let closed_rules = crate::play_forward::rules_for_ledger(&closed);
+            if let Some(unknown) = closed_rules
+                .iter()
+                .find(|id| !known_amendment_ids.contains(*id))
+            {
+                tracing::error!(
+                    "amendment_blocked: ledger #{} enabled unknown amendment {}; \
+                     halting own validation and proposals to avoid forking",
+                    closed_seq,
+                    unknown
+                );
+                amendment_blocked.store(true, Ordering::Relaxed);
+            }
+        }
+
         // Broadcast validation (STObject format, rippled-compatible)
-        {
+        //
+        // Equivocation guard (M0): refuse to emit a FULL validation that would
+        // conflict with one we already produced for this (or a newer) sequence.
+        // Without this a sync/consensus race could double-sign a sequence with
+        // two different hashes and get this node dropped as an equivocator.
+        if amendment_blocked.load(Ordering::Relaxed) {
+            tracing::warn!(
+                "amendment_blocked: not validating ledger #{} hash={}",
+                closed_seq,
+                hash
+            );
+        } else if !validation_guard.may_validate(closed_seq, hash) {
+            tracing::warn!(
+                "equivocation guard: refusing to validate ledger #{} hash={} \
+                 (already self-validated up to #{}); skipping validation broadcast",
+                closed_seq,
+                hash,
+                validation_guard.highest_seq(),
+            );
+        } else {
             use rxrpl_consensus::types::Validation;
             // Include our amendment votes in the validation message
             let our_amendment_votes = amendment_table.read().await.get_votes();
@@ -3057,6 +3525,10 @@ impl Node {
                 Some(vid) => vid.signing_pubkey().as_bytes().to_vec(),
                 None => identity.public_key_bytes().to_vec(),
             };
+            // SigningTime monotonic floor (M0): max(ledgerCloseTime, last+1s),
+            // mirroring rippled's RCLConsensus::Adaptor::validate so successive
+            // validations never carry a non-increasing timestamp.
+            let sign_time = validation_guard.floor_signing_time(effective_close_time);
             let mut validation = Validation {
                 node_id: rxrpl_consensus::types::NodeId(Hash256::new(identity.node_id.0)),
                 public_key: signing_pubkey.clone(),
@@ -3064,12 +3536,35 @@ impl Node {
                 ledger_seq: closed_seq,
                 full: true,
                 close_time: effective_close_time,
-                sign_time: effective_close_time,
+                sign_time,
                 signature: None,
                 amendments: our_amendment_votes,
                 signing_payload: None,
                 ..Default::default()
             };
+            // Advertise our fee-vote preference on flag-ledger validations, so
+            // peers can tally it (rippled `FeeVoteImpl::doValidation`: a field is
+            // added only when current != target). Drops variant (XRPFees era).
+            // No-op unless an operator configured a target that differs from the
+            // current on-ledger value, so a default node adds no fee fields and
+            // its validation bytes are unchanged.
+            if rxrpl_amendment::is_flag_ledger(closed_seq) {
+                if let Some(bf) = fee_vote_cfg.base_fee_drops {
+                    if bf != fees.base_fee {
+                        validation.base_fee_drops = Some(bf);
+                    }
+                }
+                if let Some(rb) = fee_vote_cfg.reserve_base_drops {
+                    if rb != fees.reserve_base {
+                        validation.reserve_base_drops = Some(rb);
+                    }
+                }
+                if let Some(ri) = fee_vote_cfg.reserve_increment_drops {
+                    if ri != fees.reserve_increment {
+                        validation.reserve_increment_drops = Some(ri);
+                    }
+                }
+            }
             if let Some(vid) = validator_id_for_loop.as_ref() {
                 vid.sign_validation(&mut validation);
             } else {
@@ -3089,8 +3584,24 @@ impl Node {
             // and never reach quorum=ceil(N*0.8) when N=4 (mixed kurtosis:
             // 2 rxrpl + 2 rippled). Rippled does the equivalent in
             // `Validations::add` from its own onAccept path.
-            let _ =
-                self_validation_tx.send(rxrpl_overlay::ConsensusMessage::Validation(validation));
+            // `try_send`, never `await`: this runs inside the same
+            // `tokio::select!` task that drains the consensus channel
+            // (`consensus_rx.recv()`), so awaiting a full channel here would
+            // deadlock (the task can't drain while blocked on send). The
+            // bounded channel is large and self-validations are emitted once
+            // per ledger close, so Full is only reachable when the consumer is
+            // already badly backed up -- in which case we warn and shed rather
+            // than stall consensus.
+            if let Err(e) =
+                self_validation_tx.try_send(rxrpl_overlay::ConsensusMessage::Validation(validation))
+            {
+                tracing::warn!("could not self-inject local validation: {}", e);
+            }
+
+            // Advance the equivocation high-water mark + SigningTime floor only
+            // once the validation has actually been emitted.
+            validation_guard.record_validation(closed_seq, hash);
+            validation_guard.record_signing_time(sign_time);
         }
 
         // Broadcast StatusChange so peers know our current ledger and our
@@ -3386,6 +3897,37 @@ impl Node {
         (validator_count as f64 * 0.8).ceil().max(1.0) as usize
     }
 
+    /// Canonical 33-byte hex master public keys for the configured trusted
+    /// validators. Accepts both rippled-style base58 `n...` node-public-key
+    /// encodings (the 0x1C-prefixed form used in validators.txt) and raw hex;
+    /// invalid entries are skipped. Used to seed
+    /// `ServerContext::trusted_validator_keys` so the `validators` RPC can
+    /// surface the UNL without exposing the consensus engine's hashed NodeIds.
+    fn config_trusted_master_hex(entries: &[String]) -> Vec<String> {
+        const NODE_PUBLIC_KEY_PREFIX: &[u8] = &[0x1C];
+        let mut keys: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| {
+                let trimmed = entry.trim();
+                let bytes = if let Ok(decoded) =
+                    rxrpl_codec::address::base58::base58check_decode(trimmed)
+                {
+                    if decoded.len() == 1 + 33 && decoded[..1] == NODE_PUBLIC_KEY_PREFIX[..] {
+                        Some(decoded[1..].to_vec())
+                    } else {
+                        None
+                    }
+                } else {
+                    hex::decode(trimmed).ok()
+                };
+                bytes.map(hex::encode)
+            })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
     /// Apply a transaction to the current open ledger (standalone mode).
     ///
     /// Returns the transaction result code.
@@ -3423,7 +3965,14 @@ impl Node {
         close_time: u32,
         ledger_seq: u32,
     ) -> Rules {
-        if !rxrpl_amendment::is_flag_ledger(ledger_seq) {
+        // Amendment (and fee) pseudo-transactions land in the ledger AFTER a
+        // flag ledger, not in the flag ledger itself: rippled's onClose injects
+        // them when `prevLedger->isFlagLedger()`, so they carry
+        // `LedgerSequence == flag + 1` and the Amendments SLE changes one ledger
+        // later than the vote is tallied. (nUNL, handled separately, DOES land
+        // in the flag ledger.) Gating on the previous ledger keeps the whole
+        // tally/apply keyed to `ledger_seq == flag + 1`.
+        if ledger_seq == 0 || !rxrpl_amendment::is_flag_ledger(ledger_seq - 1) {
             return amendment_table.build_rules();
         }
 
@@ -3443,9 +3992,29 @@ impl Node {
             return rules;
         }
 
+        // Apply the pseudo-transactions in the order a validating peer would.
+        // rippled orders the consensus set by (salted account, sequence, txid);
+        // every amendment pseudo-tx carries account 0 and sequence 0, so within
+        // a flag+1 ledger they apply in transaction-id order. Sorting here keeps
+        // the resulting account_hash deterministic (independent of the tally's
+        // hash-set iteration order) and matches rippled when more than one
+        // amendment changes on the same ledger.
+        let mut pending: Vec<(
+            Hash256,
+            &rxrpl_amendment::AmendmentAction,
+            serde_json::Value,
+        )> = Vec::with_capacity(actions.len());
         for action in &actions {
-            let tx = rxrpl_amendment::voting::make_enable_amendment_tx(action);
-            match tx_engine.apply(&tx, ledger, &rules, fees) {
+            let tx = rxrpl_amendment::voting::make_enable_amendment_tx(action, ledger_seq);
+            let txid = rxrpl_codec::binary::encode(&tx)
+                .map(|blob| crate::play_forward::transaction_id(&blob))
+                .unwrap_or_else(|_| Hash256::new([0u8; 32]));
+            pending.push((txid, action, tx));
+        }
+        pending.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+
+        for (_txid, action, tx) in &pending {
+            match tx_engine.apply(tx, ledger, &rules, fees) {
                 Ok(result) => {
                     if result.is_success() {
                         match action {
@@ -3482,6 +4051,68 @@ impl Node {
 
         // Return updated rules after any activations
         amendment_table.build_rules()
+    }
+
+    /// Apply fee / reserve voting on a flag ledger.
+    ///
+    /// Mirrors [`Self::apply_amendment_voting`] for the fee-vote mechanism
+    /// (rippled `FeeVoteImpl::doVoting`). On a flag ledger this tallies the fee
+    /// votes carried by trusted validations against this node's configured
+    /// `target` and, if the weighted median moves any of base fee / base reserve
+    /// / owner-reserve increment, applies a `SetFee` pseudo-transaction that
+    /// rewrites the `FeeSettings` object. Off a flag ledger, or when nothing
+    /// moves, it is a no-op.
+    ///
+    /// Safety: a `None` fee-vote config field is passed here as the current
+    /// value (no preference), so with no config `target == current`; the
+    /// [`rxrpl_amendment::fee_voting::tally_fee_votes`] range then collapses to a
+    /// single point and no in-range peer vote can move it — the node emits no
+    /// `SetFee` and stays byte-identical to a non-voting node. The `SetFee`
+    /// field variant (drops vs legacy) follows the `XRPFees` amendment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_fee_voting(
+        ledger: &mut Ledger,
+        tx_engine: &TxEngine,
+        fees: &FeeSettings,
+        rules: &Rules,
+        target: rxrpl_amendment::fee_voting::FeeSettingsVote,
+        fee_votes: &[rxrpl_amendment::fee_voting::FeeVoteEntry],
+        ledger_seq: u32,
+    ) {
+        if !rxrpl_amendment::is_flag_ledger(ledger_seq) {
+            return;
+        }
+
+        let current = rxrpl_amendment::fee_voting::FeeSettingsVote {
+            base_fee: fees.base_fee,
+            reserve_base: fees.reserve_base,
+            reserve_increment: fees.reserve_increment,
+        };
+
+        let Some(new) = rxrpl_amendment::fee_voting::tally_fee_votes(current, target, fee_votes)
+        else {
+            return;
+        };
+
+        let xrp_fees = rules.enabled(&rxrpl_amendment::feature_id("XRPFees"));
+        let tx = rxrpl_amendment::fee_voting::make_set_fee_tx(new, ledger_seq, xrp_fees);
+        match tx_engine.apply(&tx, ledger, rules, fees) {
+            Ok(result) if result.is_success() => {
+                tracing::info!(
+                    "fee voting: SetFee applied at flag ledger #{} (base={} reserve_base={} reserve_inc={})",
+                    ledger_seq,
+                    new.base_fee,
+                    new.reserve_base,
+                    new.reserve_increment
+                );
+            }
+            Ok(result) => {
+                tracing::warn!("fee voting: SetFee pseudo-tx failed: {}", result);
+            }
+            Err(e) => {
+                tracing::error!("fee voting: failed to apply SetFee pseudo-tx: {}", e);
+            }
+        }
     }
 
     /// Forward a received `Validation` message into the consensus engine's
@@ -3528,9 +4159,17 @@ impl Node {
         for change in changes {
             let tx = serde_json::json!({
                 "TransactionType": "UNLModify",
+                // Canonical pseudo-tx skeleton (byte-exactness vs rippled). For
+                // UNLModify sfAccount is left at the SOTemplate default -> empty
+                // VL (`8100`), NOT the 20 zero bytes an EnableAmendment emits;
+                // the empty Account string drives the codec's empty-VL path.
+                "Account": "",
+                "Sequence": 0u32,
+                "Fee": "0",
+                "SigningPubKey": "",
+                "LedgerSequence": change.ledger_seq,
                 "UNLModifyDisabling": if change.disable { 1u32 } else { 0u32 },
                 "UNLModifyValidator": change.validator_key,
-                "LedgerSequence": change.ledger_seq,
             });
             match tx_engine.apply(&tx, ledger, &rules, fees) {
                 Ok(result) => {
@@ -3555,6 +4194,118 @@ impl Node {
             }
         }
         results
+    }
+
+    /// Deferred negative-UNL move at a flag-ledger build.
+    ///
+    /// Mirrors rippled's [`Ledger::updateNegativeUNL`]. The `UNLModify`
+    /// pseudo-transaction (`Node::apply_negative_unl` ->
+    /// `UNLModifyTransactor`) only records the *pending*
+    /// `ValidatorToDisable` / `ValidatorToReEnable` field on the
+    /// `NegativeUNL` singleton. The actual move into / out of
+    /// `DisabledValidators` is deferred to the build of the NEXT flag
+    /// ledger, which is what this function performs:
+    ///
+    /// - `ValidatorToDisable` present: append a
+    ///   `{"DisabledValidator": {"PublicKey", "FirstLedgerSequence"}}`
+    ///   entry (stamping `flag_ledger_seq`), then drop the pending field.
+    /// - `ValidatorToReEnable` present: remove the matching `PublicKey`
+    ///   entry, then drop the pending field.
+    ///
+    /// Entries are appended to the back exactly as rippled's `pushBack`
+    /// (no re-sort). If the resulting array is empty the object is erased,
+    /// matching rippled's `rawErase`.
+    ///
+    /// IMPORTANT: this MUST be invoked BEFORE [`Self::apply_negative_unl`]
+    /// at a flag-ledger build, mirroring `buildLedgerImpl` where
+    /// `updateNegativeUNL()` runs before the `UNLModify` pseudo-txs are
+    /// applied. Running it after would (a) immediately move a freshly
+    /// requested disable instead of deferring it and (b) let a new
+    /// `ValidatorToDisable` overwrite a still-pending one. Off a flag
+    /// ledger (or when the object is absent / has no pending field) this is
+    /// a no-op.
+    pub fn update_negative_unl(ledger: &mut Ledger, flag_ledger_seq: u32) {
+        if !rxrpl_amendment::is_flag_ledger(flag_ledger_seq) {
+            return;
+        }
+
+        let key = keylet::negative_unl();
+        let Some(raw) = ledger.get_state(&key) else {
+            return; // no NegativeUNL object yet
+        };
+        let Ok(mut obj) = rxrpl_ledger::sle_codec::decode_state(raw) else {
+            tracing::warn!("update_negative_unl: failed to decode NegativeUNL object");
+            return;
+        };
+
+        let to_disable = obj
+            .get("ValidatorToDisable")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let to_reenable = obj
+            .get("ValidatorToReEnable")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        if to_disable.is_none() && to_reenable.is_none() {
+            return; // nothing pending
+        }
+
+        // Rebuild DisabledValidators: carry forward existing entries (minus
+        // the re-enabled one), then append the newly disabled validator.
+        let mut new_disabled: Vec<Value> = Vec::new();
+        if let Some(arr) = obj.get("DisabledValidators").and_then(|v| v.as_array()) {
+            for entry in arr {
+                if let Some(reenable) = &to_reenable {
+                    let pk = entry
+                        .get("DisabledValidator")
+                        .and_then(|d| d.get("PublicKey"))
+                        .and_then(|p| p.as_str());
+                    if pk == Some(reenable.as_str()) {
+                        continue; // drop the re-enabled validator
+                    }
+                }
+                new_disabled.push(entry.clone());
+            }
+        }
+
+        if let Some(disable) = &to_disable {
+            new_disabled.push(serde_json::json!({
+                "DisabledValidator": {
+                    "PublicKey": disable,
+                    "FirstLedgerSequence": flag_ledger_seq,
+                }
+            }));
+        }
+
+        if new_disabled.is_empty() {
+            // rippled erases the whole object when nothing remains.
+            if let Err(e) = ledger.delete_state(&key) {
+                tracing::error!("update_negative_unl: failed to erase NegativeUNL: {}", e);
+            }
+            return;
+        }
+
+        if let Some(map) = obj.as_object_mut() {
+            map.insert("DisabledValidators".to_string(), Value::Array(new_disabled));
+            map.remove("ValidatorToDisable");
+            map.remove("ValidatorToReEnable");
+        }
+
+        let Ok(json_bytes) = serde_json::to_vec(&obj) else {
+            tracing::error!("update_negative_unl: failed to serialize NegativeUNL");
+            return;
+        };
+        let binary = match rxrpl_ledger::sle_codec::encode_sle(&json_bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("update_negative_unl: failed to encode NegativeUNL: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = ledger.put_state(key, binary) {
+            tracing::error!("update_negative_unl: failed to write NegativeUNL: {}", e);
+        }
     }
 
     /// Close the current ledger and return a new open ledger derived from it.

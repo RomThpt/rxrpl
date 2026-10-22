@@ -253,6 +253,8 @@ fn make_test_peer_manager() -> (PeerManager, Hash256, mpsc::Receiver<PeerMessage
     let config = PeerManagerConfig {
         listen_port: 0,
         max_peers: 4,
+        reserved_outbound_slots: 0,
+        max_peers_per_ip: usize::MAX,
         seeds: vec![],
         fixed_peers: vec![],
         network_id: 1,
@@ -276,6 +278,8 @@ fn make_test_peer_manager() -> (PeerManager, Hash256, mpsc::Receiver<PeerMessage
         node_id: peer_id,
         address: "127.0.0.1:0".into(),
         inbound: false,
+        public_key: vec![0x03; 33],
+        connected_at: std::time::Instant::now(),
         ledger_seq: AtomicU32::new(0),
         reputation: crate::reputation::PeerReputation::new(),
         scoring: crate::peer_score::PeerScore::new(),
@@ -291,6 +295,138 @@ fn make_test_peer_manager() -> (PeerManager, Hash256, mpsc::Receiver<PeerMessage
         },
     );
     (mgr, peer_id, rx)
+}
+
+/// Like [`make_test_peer_manager`] but keeps the consensus receiver alive so a
+/// test can observe the bounded overlay->consensus channel directly.
+fn make_test_peer_manager_with_consensus() -> (PeerManager, mpsc::Receiver<ConsensusMessage>) {
+    use crate::identity::NodeIdentity;
+    use crate::tls;
+    use std::sync::atomic::AtomicU32;
+    use tokio::sync::RwLock;
+
+    let id = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("test-consensus-cap"));
+    let id_arc = Arc::new(id);
+    let config = PeerManagerConfig {
+        listen_port: 0,
+        max_peers: 4,
+        reserved_outbound_slots: 0,
+        max_peers_per_ip: usize::MAX,
+        seeds: vec![],
+        fixed_peers: vec![],
+        network_id: 1,
+        tls_server: tls::build_server_config(&id_arc),
+        tls_client: tls::build_client_config(),
+        cluster_enabled: false,
+        cluster_node_name: String::new(),
+        cluster_members: vec![],
+        cluster_broadcast_interval_secs: 5,
+    };
+    let (mgr, _cmd_tx, consensus_rx) = PeerManager::new(
+        id_arc,
+        config,
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(RwLock::new(Hash256::ZERO)),
+    );
+    (mgr, consensus_rx)
+}
+
+#[test]
+fn validator_list_manifest_command_updates_ephemeral_mapping() {
+    use crate::command::OverlayCommand;
+    use crate::identity::ValidatorIdentity;
+    use crate::manifest::parse_and_verify;
+
+    let (mut manager, mut consensus_rx) = make_test_peer_manager_with_consensus();
+    let identity = ValidatorIdentity::two_key(
+        &rxrpl_crypto::Seed::from_passphrase("vl-manifest-master"),
+        &rxrpl_crypto::Seed::from_passphrase("vl-manifest-ephemeral"),
+    );
+    let raw = identity
+        .sign_manifest(1, None)
+        .expect("test manifest signs");
+    let expected = parse_and_verify(&raw).expect("test manifest verifies");
+    let expected_ephemeral = expected
+        .ephemeral_public_key
+        .clone()
+        .expect("test manifest has an ephemeral key");
+
+    manager.handle_command(OverlayCommand::ApplyValidatorListManifests {
+        manifests: vec![raw],
+    });
+
+    assert_eq!(
+        manager
+            .manifest_store
+            .master_key_for_ephemeral(&expected_ephemeral),
+        Some(&expected.master_public_key)
+    );
+    assert!(matches!(
+        consensus_rx.try_recv(),
+        Ok(ConsensusMessage::ManifestApplied {
+            master_key,
+            ephemeral_key: Some(ephemeral_key),
+            revoked: false,
+            ..
+        }) if master_key == expected.master_public_key && ephemeral_key == expected_ephemeral
+    ));
+}
+
+#[tokio::test]
+async fn consensus_channel_sheds_when_consumer_stalled() {
+    // A stalled consumer (consensus_rx never drained) must not let the bounded
+    // overlay->consensus channel grow without limit: once full, forwarding
+    // sheds (and counts) instead of OOMing the node under a tx/ledger-data
+    // burst. This is the M0 hardening fix's whole point.
+    let (mgr, mut consensus_rx) = make_test_peer_manager_with_consensus();
+
+    // Fill exactly to capacity -- nothing shed while space remains.
+    for _ in 0..CONSENSUS_CHANNEL_CAP {
+        mgr.forward_to_consensus(ConsensusMessage::ValidatorListReceived { validator_count: 1 });
+    }
+    assert_eq!(
+        mgr.consensus_dropped(),
+        0,
+        "must not shed while capacity remains"
+    );
+
+    // Overflow: each further send is shed and counted, and the buffer never
+    // grows past capacity.
+    for _ in 0..16 {
+        mgr.forward_to_consensus(ConsensusMessage::ValidatorListReceived { validator_count: 1 });
+    }
+    assert_eq!(
+        mgr.consensus_dropped(),
+        16,
+        "overflow must shed rather than grow the queue"
+    );
+
+    let mut buffered = 0;
+    while consensus_rx.try_recv().is_ok() {
+        buffered += 1;
+    }
+    assert_eq!(
+        buffered, CONSENSUS_CHANNEL_CAP,
+        "bounded channel must hold at most its capacity"
+    );
+}
+
+#[tokio::test]
+async fn consensus_channel_delivers_normal_flow() {
+    // With a live consumer the bounded channel behaves transparently: the
+    // message is delivered and nothing is shed.
+    let (mgr, mut consensus_rx) = make_test_peer_manager_with_consensus();
+
+    mgr.forward_to_consensus(ConsensusMessage::ValidatorListReceived { validator_count: 7 });
+
+    match consensus_rx.recv().await {
+        Some(ConsensusMessage::ValidatorListReceived { validator_count }) => {
+            assert_eq!(validator_count, 7);
+        }
+        Some(_) => panic!("delivered the wrong ConsensusMessage variant"),
+        None => panic!("channel closed without delivering"),
+    }
+    assert_eq!(mgr.consensus_dropped(), 0, "normal flow must not shed");
 }
 
 #[tokio::test]
@@ -431,6 +567,8 @@ async fn send_local_manifest_to_pushes_our_manifest_into_peer_channel() {
     let cfg = PeerManagerConfig {
         listen_port: 0,
         max_peers: 4,
+        reserved_outbound_slots: 0,
+        max_peers_per_ip: usize::MAX,
         seeds: vec![],
         fixed_peers: vec![],
         network_id: 12345,
@@ -458,6 +596,8 @@ async fn send_local_manifest_to_pushes_our_manifest_into_peer_channel() {
         node_id: peer_id,
         address: "127.0.0.1:0".into(),
         inbound: true,
+        public_key: vec![0x03; 33],
+        connected_at: std::time::Instant::now(),
         ledger_seq: AtomicU32::new(0),
         reputation: crate::reputation::PeerReputation::new(),
         scoring: crate::peer_score::PeerScore::new(),
@@ -522,6 +662,8 @@ async fn dispatch_manifest_relays_to_other_peers_but_not_back_to_sender() {
     let cfg = PeerManagerConfig {
         listen_port: 0,
         max_peers: 4,
+        reserved_outbound_slots: 0,
+        max_peers_per_ip: usize::MAX,
         seeds: vec![],
         fixed_peers: vec![],
         network_id: 12345,
@@ -550,6 +692,8 @@ async fn dispatch_manifest_relays_to_other_peers_but_not_back_to_sender() {
             node_id: id,
             address: "127.0.0.1:0".into(),
             inbound: true,
+            public_key: vec![0x03; 33],
+            connected_at: std::time::Instant::now(),
             ledger_seq: AtomicU32::new(0),
             reputation: crate::reputation::PeerReputation::new(),
             scoring: crate::peer_score::PeerScore::new(),
@@ -607,6 +751,8 @@ async fn send_local_manifest_to_is_noop_without_local_manifest() {
     let cfg = PeerManagerConfig {
         listen_port: 0,
         max_peers: 4,
+        reserved_outbound_slots: 0,
+        max_peers_per_ip: usize::MAX,
         seeds: vec![],
         fixed_peers: vec![],
         network_id: 12345,
@@ -632,6 +778,8 @@ async fn send_local_manifest_to_is_noop_without_local_manifest() {
         node_id: peer_id,
         address: "127.0.0.1:0".into(),
         inbound: true,
+        public_key: vec![0x03; 33],
+        connected_at: std::time::Instant::now(),
         ledger_seq: AtomicU32::new(0),
         reputation: crate::reputation::PeerReputation::new(),
         scoring: crate::peer_score::PeerScore::new(),
@@ -654,4 +802,102 @@ async fn send_local_manifest_to_is_noop_without_local_manifest() {
         Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
         other => panic!("expected empty channel, got {:?}", other.is_ok()),
     }
+}
+
+fn signed_validation() -> Validation {
+    use crate::identity::NodeIdentity;
+    use rxrpl_consensus::types::NodeId;
+
+    let id = NodeIdentity::from_seed(&rxrpl_crypto::Seed::from_passphrase("val-signer"));
+    let mut v = Validation {
+        node_id: NodeId(id.node_id),
+        public_key: id.public_key_bytes().to_vec(),
+        ledger_hash: Hash256::new([0xCC; 32]),
+        ledger_seq: 42,
+        full: true,
+        close_time: 1000,
+        sign_time: 1000,
+        signature: None,
+        amendments: vec![],
+        signing_payload: None,
+        ..Default::default()
+    };
+    id.sign_validation(&mut v);
+    v
+}
+
+#[tokio::test]
+async fn verified_validation_forwarded_only_when_valid() {
+    let (mut mgr, mut consensus_rx) = make_test_peer_manager_with_consensus();
+    let peer_id = Hash256::new([0xAB; 32]);
+    let v = signed_validation();
+    let payload = proto_convert::encode_validation(&v, &v.public_key);
+
+    // A validation whose signature verified is forwarded to consensus.
+    mgr.handle_verified_validation(peer_id, payload.clone(), v.clone(), true);
+    assert!(matches!(
+        consensus_rx.try_recv(),
+        Ok(ConsensusMessage::Validation(_))
+    ));
+
+    // One that failed verification is dropped, never reaching consensus.
+    mgr.handle_verified_validation(peer_id, payload, v, false);
+    assert!(consensus_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn validation_dispatch_offloads_signature_verify() {
+    let (mut mgr, _consensus_rx) = make_test_peer_manager_with_consensus();
+    let peer_id = Hash256::new([0xAB; 32]);
+    let v = signed_validation();
+    let payload = proto_convert::encode_validation(&v, &v.public_key);
+
+    mgr.dispatch_message(peer_id, MessageType::Validation, &payload);
+
+    // The verify worker only runs inside run(); in this unit context the job
+    // waits in the queue, proving dispatch offloaded the signature check off the
+    // event loop instead of verifying inline.
+    let job = mgr
+        .validation_verify_rx
+        .as_mut()
+        .expect("verify receiver present")
+        .try_recv()
+        .expect("verify job queued");
+    assert_eq!(job.validation.ledger_seq, 42);
+    assert!(crate::identity::verify_validation_signature(
+        &job.validation
+    ));
+}
+
+#[tokio::test]
+async fn validation_offload_removes_verify_from_event_loop() {
+    // The event loop's per-validation cost drops from "decode + verify" to
+    // "decode + enqueue": the signature verify now runs on the worker. This
+    // asserts the loop path is cheaper than the inline path it replaced, which
+    // is what unblocks the sync pipeline during a validation burst.
+    let (mut mgr, _consensus_rx) = make_test_peer_manager_with_consensus();
+    let peer_id = Hash256::new([0xAB; 32]);
+    let v = signed_validation();
+    let payload = proto_convert::encode_validation(&v, &v.public_key);
+    const N: usize = 2000;
+
+    let t0 = std::time::Instant::now();
+    for _ in 0..N {
+        mgr.dispatch_message(peer_id, MessageType::Validation, &payload);
+        let _ = mgr.validation_verify_rx.as_mut().unwrap().try_recv();
+    }
+    let offload = t0.elapsed();
+
+    let t1 = std::time::Instant::now();
+    for _ in 0..N {
+        let _ = proto_convert::decode_validation(&payload);
+        let _ = crate::identity::verify_validation_signature(&v);
+    }
+    let inline = t1.elapsed();
+
+    eprintln!("event-loop per-validation over {N}: offload {offload:?} vs inline {inline:?}");
+    assert!(
+        offload < inline,
+        "offloading the verify must make the event-loop path cheaper: offload={offload:?} inline={inline:?}"
+    );
 }

@@ -118,6 +118,33 @@ fn create_node() {
 }
 
 #[test]
+fn networked_node_uses_stock_genesis_by_default() {
+    let node = Node::new(NodeConfig::default()).unwrap();
+    let ledger = node.ledger.blocking_read();
+
+    assert!(ledger.is_closed());
+    assert!(ledger.get_state(&keylet::fee_settings()).is_some());
+    assert!(ledger.get_state(&keylet::amendments()).is_some());
+    assert_eq!(
+        hex::encode_upper(ledger.header.account_hash.as_bytes()),
+        "3791BF543E5B77A17BC454F7A0720E4615760F457135F399DE67C54D7929546D",
+        "networked genesis account_hash must match rippled's stock layout"
+    );
+}
+
+#[test]
+fn networked_node_honors_master_only_genesis_config() {
+    let mut config = NodeConfig::default();
+    config.network.genesis_amendments_disabled = true;
+    let node = Node::new(config).unwrap();
+    let ledger = node.ledger.blocking_read();
+
+    assert!(ledger.is_closed());
+    assert!(ledger.get_state(&keylet::fee_settings()).is_none());
+    assert!(ledger.get_state(&keylet::amendments()).is_none());
+}
+
+#[test]
 fn genesis_with_funded_account() {
     let address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
     let genesis = Node::genesis_with_funded_account(address).unwrap();

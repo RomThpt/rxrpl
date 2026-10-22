@@ -1,3 +1,4 @@
+use rxrpl_amendment::feature::feature_id;
 use rxrpl_codec::address::classic::{decode_account_id, encode_account_id};
 use rxrpl_primitives::{AccountId, Hash256};
 use rxrpl_protocol::{TransactionResult, keylet};
@@ -90,6 +91,7 @@ impl Transactor for AMMCreateTransactor {
     }
 
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
+        let _scale = amm_helpers::amm_number_scale_guard(ctx.rules);
         use rxrpl_amount::number::Number;
 
         let account_str = helpers::get_account(ctx.tx)?;
@@ -130,14 +132,22 @@ impl Transactor for AMMCreateTransactor {
         let amt2_num = amount_to_number(&amount2_field)?;
         let lp_tokens = amm_helpers::amm_lp_tokens(&amt1_num, &amt2_num);
 
-        // 1. Create the AMM pseudo-account root.
-        let seq = ctx.view.seq();
+        // 1. Create the AMM pseudo-account root. rippled's createPseudoAccount
+        // sets sfSequence to the ledger index, unless the SingleAssetVault or
+        // LendingProtocol amendment is enabled -- then it is 0.
         let amm_acct_key = keylet::account(&amm_id);
+        let pseudo_seq = if ctx.rules.enabled(&feature_id("SingleAssetVault"))
+            || ctx.rules.enabled(&feature_id("LendingProtocol"))
+        {
+            0
+        } else {
+            ctx.view.seq()
+        };
         let amm_acct = serde_json::json!({
             "LedgerEntryType": "AccountRoot",
             "Account": amm_str,
             "Balance": "0",
-            "Sequence": seq,
+            "Sequence": pseudo_seq,
             "OwnerCount": 0,
             "Flags": LSF_DISABLE_MASTER | LSF_DEFAULT_RIPPLE | LSF_DEPOSIT_AUTH,
             "AMMID": hex::encode_upper(amm_key.as_bytes()),
@@ -176,10 +186,14 @@ impl Transactor for AMMCreateTransactor {
             auction_slot["DiscountedFee"] = serde_json::Value::from(dfee);
         }
 
+        // rippled sets sfAsset = min(asset1, asset2), sfAsset2 = max, both
+        // unconditionally via STIssue (the XRP side is 20 zero bytes /
+        // {"currency":"XRP"}). Both fields are SoeRequired on the AMM entry.
         let mut amm = serde_json::json!({
             "LedgerEntryType": "AMM",
             "Account": amm_str,
-            "Asset2": high_asset,
+            "Asset": asset_to_issue_json(&low_asset),
+            "Asset2": asset_to_issue_json(&high_asset),
             "LPTokenBalance": {
                 "currency": lp_currency_hex,
                 "issuer": amm_str,
@@ -187,18 +201,16 @@ impl Transactor for AMMCreateTransactor {
             },
             "VoteSlots": [ { "VoteEntry": vote_entry } ],
             "AuctionSlot": auction_slot,
+            // rippled constructs the AMM SLE with sfFlags = 0 and links it into
+            // the pseudo-account's owner directory, writing sfOwnerNode
+            // unconditionally (setFieldU64 even at page 0).
+            "Flags": 0,
+            "OwnerNode": format!("{amm_owner_node:016X}"),
             "PreviousTxnID": ZERO_TXID,
             "PreviousTxnLgrSeq": 0,
         });
-        // Asset (low) is omitted when XRP (the default STIssue).
-        if !is_xrp_asset(&low_asset) {
-            amm["Asset"] = low_asset.clone();
-        }
         if trading_fee != 0 {
             amm["TradingFee"] = serde_json::Value::from(trading_fee);
-        }
-        if amm_owner_node != 0 {
-            amm["OwnerNode"] = serde_json::Value::String(format!("{amm_owner_node:016X}"));
         }
         ctx.view
             .insert(
@@ -270,7 +282,6 @@ impl Transactor for AMMCreateTransactor {
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
         let balance = helpers::get_balance(&account);
         helpers::set_balance(&mut account, balance.saturating_sub(xrp_legs));
-        helpers::increment_sequence(&mut account);
         ctx.view
             .update(
                 acct_key,
@@ -421,21 +432,20 @@ fn create_iou_line(
     let mut account_one = [0u8; 20];
     account_one[19] = 1;
     let no_account = encode_account_id(&AccountId::from(account_one));
-    let mut tl_obj = serde_json::json!({
+    let tl_obj = serde_json::json!({
         "LedgerEntryType": "RippleState",
         "Balance": { "currency": currency_hex, "issuer": no_account, "value": balance.to_iou().to_decimal_string() },
         "LowLimit": low_limit,
         "HighLimit": high_limit,
         "Flags": flags,
+        // rippled's trustCreate sets both directory page hints unconditionally
+        // (setFieldU64 even at 0), so they are always serialized on a created
+        // RippleState — including the AMM's LP and pool trust lines.
+        "LowNode": format!("{low_node:016X}"),
+        "HighNode": format!("{high_node:016X}"),
         "PreviousTxnID": ZERO_TXID,
         "PreviousTxnLgrSeq": 0,
     });
-    if low_node != 0 {
-        tl_obj["LowNode"] = serde_json::Value::String(format!("{low_node:016X}"));
-    }
-    if high_node != 0 {
-        tl_obj["HighNode"] = serde_json::Value::String(format!("{high_node:016X}"));
-    }
     ctx.view
         .insert(
             tl_key,
@@ -539,6 +549,18 @@ fn is_xrp_asset(asset: &serde_json::Value) -> bool {
             .unwrap_or(false)
 }
 
+/// Normalize an asset into the `Issue` JSON the codec serializes for `sfAsset`/
+/// `sfAsset2`. XRP (the `"XRP"` string or `{"currency":"XRP"}`) becomes
+/// `{"currency":"XRP"}` (20 zero bytes, no issuer); an IOU passes through as its
+/// `{"currency":..,"issuer":..}` object.
+fn asset_to_issue_json(asset: &serde_json::Value) -> serde_json::Value {
+    if is_xrp_asset(asset) {
+        serde_json::json!({ "currency": "XRP" })
+    } else {
+        asset.clone()
+    }
+}
+
 /// An Amount field as a `Number` (integer drops for XRP, IOU value otherwise).
 fn amount_to_number(
     amount: &serde_json::Value,
@@ -631,6 +653,8 @@ mod tests {
             "Sequence": 1,
         });
 
+        // Engine consumes the sender's Sequence/Ticket centrally before doApply.
+        crate::handlers::central_consume_for_test(&mut sandbox, &tx);
         let mut ctx = ApplyContext {
             tx: &tx,
             view: &mut sandbox,
@@ -645,12 +669,44 @@ mod tests {
         let amm_bytes = sandbox.read(&amm_key).unwrap();
         let amm: serde_json::Value = serde_json::from_slice(&amm_bytes).unwrap();
         assert_eq!(amm["LedgerEntryType"].as_str().unwrap(), "AMM");
-        // XRP (low) asset is omitted; Asset2 is the IOU.
-        assert!(amm.get("Asset").is_none());
+        // Asset (low) = XRP serializes as {"currency":"XRP"} (20 zero bytes, no
+        // issuer); Asset2 = the IOU. Both are always present.
+        assert_eq!(amm["Asset"]["currency"].as_str().unwrap(), "XRP");
+        assert!(amm["Asset"].get("issuer").is_none());
         assert_eq!(amm["Asset2"]["currency"].as_str().unwrap(), "USD");
+        // The AMM SLE carries Flags=0 and OwnerNode unconditionally.
+        assert_eq!(amm["Flags"].as_u64().unwrap(), 0);
+        assert!(amm.get("OwnerNode").is_some());
         assert_eq!(amm["TradingFee"].as_u64().unwrap(), 500);
         assert!(amm.get("VoteSlots").is_some());
         assert!(amm.get("AuctionSlot").is_some());
+
+        // Without SingleAssetVault/LendingProtocol the AMM pseudo-account root
+        // takes the ledger sequence (rippled's createPseudoAccount).
+        let amm_id = decode_account_id(amm["Account"].as_str().unwrap()).unwrap();
+        let amm_acct_bytes = sandbox.read(&keylet::account(&amm_id)).unwrap();
+        let amm_acct: serde_json::Value = serde_json::from_slice(&amm_acct_bytes).unwrap();
+        assert_eq!(amm_acct["Sequence"].as_u64().unwrap(), sandbox.seq() as u64);
+
+        // The LP RippleState (creator <-> AMM pseudo-account) carries LowNode
+        // and HighNode even at page 0 (rippled's trustCreate).
+        let lp_cur_vec = hex::decode(amm["LPTokenBalance"]["currency"].as_str().unwrap()).unwrap();
+        let lp_cur: [u8; 20] = lp_cur_vec.try_into().unwrap();
+        let lp_line_bytes = sandbox
+            .read(&keylet::trust_line(&alice, &amm_id, &lp_cur))
+            .unwrap();
+        let lp_line: serde_json::Value = serde_json::from_slice(&lp_line_bytes).unwrap();
+        assert!(lp_line.get("LowNode").is_some());
+        assert!(lp_line.get("HighNode").is_some());
+
+        // The pool's USD RippleState (AMM pseudo-account <-> issuer) likewise
+        // carries LowNode and HighNode unconditionally.
+        let pool_line_bytes = sandbox
+            .read(&keylet::trust_line(&amm_id, &issuer, &cur))
+            .unwrap();
+        let pool_line: serde_json::Value = serde_json::from_slice(&pool_line_bytes).unwrap();
+        assert!(pool_line.get("LowNode").is_some());
+        assert!(pool_line.get("HighNode").is_some());
 
         // Creator balance: 100_000_000 - 10_000_000 XRP leg = 90_000_000.
         let acct_bytes = sandbox.read(&keylet::account(&alice)).unwrap();

@@ -59,6 +59,7 @@ impl Transactor for AMMBidTransactor {
     }
 
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
+        let _scale = amm_helpers::amm_number_scale_guard(ctx.rules);
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
@@ -263,9 +264,8 @@ impl Transactor for AMMBidTransactor {
             .view
             .read(&acct_key)
             .ok_or(TransactionResult::TerNoAccount)?;
-        let mut account: Value =
+        let account: Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        helpers::increment_sequence(&mut account);
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)

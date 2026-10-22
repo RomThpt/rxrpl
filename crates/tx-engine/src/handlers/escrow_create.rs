@@ -40,15 +40,10 @@ impl Transactor for EscrowCreateTransactor {
 
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        let (_, src_account) = helpers::read_account_by_address(ctx.view, account_str)?;
-
-        let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
-        let fee = helpers::get_fee(ctx.tx);
-        let balance = helpers::get_balance(&src_account);
-
-        if balance < amount + fee {
-            return Err(TransactionResult::TecUnfundedPayment);
-        }
+        // The funded / reserve check lives in `apply` so its tec is CLAIMED (fee +
+        // sequence charged), matching rippled's EscrowCreate::doApply. rippled has
+        // no funds check in preclaim; only confirm the sender exists here.
+        helpers::read_account_by_address(ctx.view, account_str)?;
 
         // RequireDestTag enforcement on destination.
         let destination_str = helpers::get_destination(ctx.tx)?;
@@ -85,6 +80,26 @@ impl Transactor for EscrowCreateTransactor {
         let mut src_account: serde_json::Value =
             serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
+        // Funded / reserve check (rippled EscrowCreate::doApply): the new Escrow
+        // both locks `amount` XRP and adds one owned object, so the creator's
+        // spendable balance must cover accountReserve(OwnerCount + 1) for the new
+        // object PLUS the locked amount. rippled reads sfBalance — already reduced
+        // by the fee in Transactor::apply — and returns tecINSUFFICIENT_RESERVE
+        // when it can't cover the reserve, else tecUNFUNDED when it can't also
+        // cover the amount. Both are CLAIMED tecs (fee + sequence charged, no
+        // escrow); the engine consumed the fee centrally before apply, so
+        // get_balance here is rippled's post-fee `balance`.
+        let reserve = ctx
+            .fees
+            .account_reserve(helpers::get_owner_count(&src_account) + 1);
+        let post_fee_balance = helpers::get_balance(&src_account);
+        if post_fee_balance < reserve {
+            return Err(TransactionResult::TecInsufficientReserve);
+        }
+        if post_fee_balance < reserve.saturating_add(amount) {
+            return Err(TransactionResult::TecUnfunded);
+        }
+
         let src_balance = helpers::get_balance(&src_account);
         helpers::set_balance(
             &mut src_account,
@@ -92,7 +107,6 @@ impl Transactor for EscrowCreateTransactor {
                 .checked_sub(amount)
                 .ok_or(TransactionResult::TecUnfundedPayment)?,
         );
-        helpers::increment_sequence(&mut src_account);
         helpers::adjust_owner_count(&mut src_account, 1);
 
         let src_data =
@@ -101,9 +115,27 @@ impl Transactor for EscrowCreateTransactor {
             .update(src_key, src_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Create Escrow ledger entry
-        let tx_seq = helpers::get_sequence(&src_account) - 1; // sequence was already incremented
+        // Create Escrow ledger entry. The Escrow's keylet/Sequence is the TX
+        // seq-proxy value (the engine already consumed the sender's
+        // Sequence/Ticket centrally).
+        let tx_seq = helpers::tx_seq_proxy_value(ctx.tx);
         let escrow_key = keylet::escrow(&src_id, tx_seq);
+
+        let dst_id = decode_account_id(destination_str)
+            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+
+        // Link the escrow into the creator's owner directory (the resulting page
+        // is the SoeRequired sfOwnerNode) and, when the destination differs from
+        // the creator, into the destination's owner directory (the SoeOptional
+        // sfDestinationNode). Both page hints are serialized onto the SLE; rippled
+        // creates the SLE from the ledger-entry template, so even the default
+        // sfFlags=0 (a SoeRequired common field) is written.
+        let owner_node = add_to_owner_dir(ctx.view, &src_id, &escrow_key)?;
+        let dest_node = if dst_id != src_id {
+            Some(add_to_owner_dir(ctx.view, &dst_id, &escrow_key)?)
+        } else {
+            None
+        };
 
         let mut escrow = serde_json::json!({
             "LedgerEntryType": "Escrow",
@@ -113,10 +145,17 @@ impl Transactor for EscrowCreateTransactor {
             // Originating tx Sequence; consumed by EscrowFinish/Cancel
             // via OfferSequence and surfaced through account_objects.
             "Sequence": tx_seq,
+            // Default sfFlags is serialized (SoeRequired common field).
+            "Flags": 0u32,
+            // Owner-directory page hint (SoeRequired).
+            "OwnerNode": format!("{owner_node:016X}"),
             // Placeholder filled by the engine's central PreviousTxnID stamping.
             "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
             "PreviousTxnLgrSeq": 0,
         });
+        if let Some(dest_node) = dest_node {
+            escrow["DestinationNode"] = serde_json::Value::String(format!("{dest_node:016X}"));
+        }
 
         if let Some(finish_after) = helpers::get_u32_field(ctx.tx, "FinishAfter") {
             escrow["FinishAfter"] = serde_json::Value::from(finish_after);
@@ -140,15 +179,14 @@ impl Transactor for EscrowCreateTransactor {
             .insert(escrow_key, escrow_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        add_to_owner_dir(ctx.view, &src_id, &escrow_key)?;
-
-        // When the destination differs from the owner, rippled also links the
-        // escrow into the destination's owner directory and threads the
-        // destination AccountRoot (no field change).
-        let dst_id = decode_account_id(destination_str)
-            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        // When the destination differs from the creator, rippled threads the
+        // destination AccountRoot's PreviousTxnID to this transaction (it lands
+        // in the modified set via the destination owner-directory link). Re-touch
+        // it with unchanged bytes so the engine's central PreviousTxnID stamping
+        // records this tx (only PreviousTxnID / PreviousTxnLgrSeq change; balance,
+        // owner count and sequence stay put — the escrow does not count against
+        // the destination's reserve).
         if dst_id != src_id {
-            add_to_owner_dir(ctx.view, &dst_id, &escrow_key)?;
             let dst_key = keylet::account(&dst_id);
             if let Some(dst_bytes) = ctx.view.read(&dst_key) {
                 ctx.view
@@ -280,5 +318,73 @@ mod tests {
         let escrow: serde_json::Value = serde_json::from_slice(&escrow_bytes).unwrap();
         assert_eq!(escrow["Amount"].as_str().unwrap(), "10000000");
         assert_eq!(escrow["Destination"].as_str().unwrap(), DST);
+        // The created Escrow carries the default sfFlags=0 and the owner-directory
+        // page hints (sfOwnerNode always; sfDestinationNode because DST != SRC),
+        // all serialized onto the SLE to match rippled's account_hash.
+        assert_eq!(escrow["Flags"].as_u64().unwrap(), 0);
+        assert_eq!(escrow["OwnerNode"].as_str().unwrap(), "0000000000000000");
+        assert_eq!(
+            escrow["DestinationNode"].as_str().unwrap(),
+            "0000000000000000"
+        );
+    }
+
+    #[test]
+    fn apply_unfunded_below_reserve_plus_amount() {
+        // Balance covers the single-object reserve (12 XRP) but not the reserve
+        // plus the 10 XRP locked amount -> tecUNFUNDED (rippled doApply).
+        let ledger = setup_ledger(SRC, 13_000_000);
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "EscrowCreate",
+            "Account": SRC,
+            "Destination": DST,
+            "Amount": "10000000",
+            "Fee": "12",
+            "Sequence": 1,
+            "FinishAfter": 1000,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            EscrowCreateTransactor.apply(&mut ctx),
+            Err(TransactionResult::TecUnfunded)
+        );
+    }
+
+    #[test]
+    fn apply_below_object_reserve_is_insufficient_reserve() {
+        // Balance under the single-object reserve (account_reserve(1) = 12 XRP).
+        let ledger = setup_ledger(SRC, 11_000_000);
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "EscrowCreate",
+            "Account": SRC,
+            "Destination": DST,
+            "Amount": "1000000",
+            "Fee": "12",
+            "Sequence": 1,
+            "FinishAfter": 1000,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            EscrowCreateTransactor.apply(&mut ctx),
+            Err(TransactionResult::TecInsufficientReserve)
+        );
     }
 }

@@ -56,15 +56,30 @@ impl Transactor for NFTokenMintTransactor {
         let mut issuer_acct: Value =
             serde_json::from_slice(&issuer_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        // The token sequence is FirstNFTokenSequence + MintedNFTokens; the first
-        // ever mint stamps FirstNFTokenSequence with the ledger sequence.
+        // The token sequence is FirstNFTokenSequence + MintedNFTokens. On the
+        // first ever mint rippled (NFTokenMint::doApply) stamps
+        // FirstNFTokenSequence with the *issuer's account Sequence* — NOT the
+        // ledger index. Because the engine consumed the sender's Sequence/Ticket
+        // centrally before doApply (mirroring rippled's pre-increment), the
+        // issuer's Sequence is already advanced for a sequence-based self-mint,
+        // so we subtract one; for a ticketed mint (Sequence untouched) or an
+        // authorized-minter mint (sfIssuer present, the issuer's Sequence is left
+        // alone) we use the Sequence as-is. Getting this wrong also corrupts the
+        // minted NFTokenID, whose low bytes encode this token sequence.
         let first_seq = match issuer_acct
             .get("FirstNFTokenSequence")
             .and_then(|v| v.as_u64())
         {
             Some(s) => s as u32,
             None => {
-                let s = ctx.view.seq();
+                let acct_seq = helpers::get_sequence(&issuer_acct);
+                let has_issuer = ctx.tx.get("Issuer").is_some();
+                let is_ticket = ctx.tx.get("TicketSequence").is_some();
+                let s = if has_issuer || is_ticket {
+                    acct_seq
+                } else {
+                    acct_seq.saturating_sub(1)
+                };
                 issuer_acct["FirstNFTokenSequence"] = Value::from(s);
                 s
             }
@@ -104,8 +119,9 @@ impl Transactor for NFTokenMintTransactor {
             .update(issuer_key, issuer_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // The minter consumes its sequence proxy; its owner count rises only
-        // when a brand-new page had to be created.
+        // The minter consumes its sequence proxy; its owner count rises when a
+        // brand-new NFTokenPage had to be created and/or an atomic sell offer is
+        // created (NFTokenMintOffer amendment).
         let minter_key = keylet::account(&minter_id);
         let minter_bytes = ctx
             .view
@@ -113,9 +129,48 @@ impl Transactor for NFTokenMintTransactor {
             .ok_or(TransactionResult::TerNoAccount)?;
         let mut minter_acct: Value =
             serde_json::from_slice(&minter_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        crate::owner_dir::consume_seq_or_ticket(ctx.view, &minter_id, &mut minter_acct, ctx.tx)?;
+
+        // rippled NFTokenMint::doApply captures ownerCountBefore *after* the
+        // central Sequence/Ticket consume (already applied; a consumed ticket has
+        // decremented OwnerCount by one). Adding a brand-new page reserves one
+        // object; adding a token to an existing, non-full page reserves nothing.
+        let owner_count_before = helpers::get_owner_count(&minter_acct);
         if new_page {
             helpers::adjust_owner_count(&mut minter_acct, 1);
+        }
+
+        // NFTokenMintOffer amendment (rippled NFTokenMint::doApply): when the mint
+        // carries sfAmount it ALSO atomically creates a sell NFTokenOffer for the
+        // just-minted token (optionally Destination/Expiration-restricted). The
+        // missing offer object, its directory links and the +1 owner count are
+        // the state divergence this fixes. rippled shares the offer-creation code
+        // with NFTokenCreateOffer (`nft::tokenOfferCreateApply`, always passing
+        // tfSellNFToken — a mint may only create a sell offer).
+        if ctx.tx.get("Amount").is_some() {
+            self.create_sell_offer(
+                ctx,
+                &minter_id,
+                account_str,
+                &nftoken_id,
+                &nft_hash,
+                &mut minter_acct,
+            )?;
+        }
+
+        // Owner reserve (rippled NFTokenMint::doApply tail): checked ONLY when the
+        // owner count actually rose, comparing `accountReserve(ownerCountAfter)`
+        // against `mPriorBalance` (the XRP balance *before* the fee). The engine
+        // deducted the fee centrally before doApply, so reconstruct mPriorBalance
+        // by adding it back. tecINSUFFICIENT_RESERVE is a CLAIMED tec — fee and
+        // sequence charged, all child writes (the new page, the issuer mint count,
+        // the offer) discarded by the engine.
+        let owner_count_after = helpers::get_owner_count(&minter_acct);
+        if owner_count_after > owner_count_before {
+            let prior_balance =
+                helpers::get_balance(&minter_acct).saturating_add(helpers::get_fee(ctx.tx));
+            if prior_balance < ctx.fees.account_reserve(owner_count_after) {
+                return Err(TransactionResult::TecInsufficientReserve);
+            }
         }
         let minter_data =
             serde_json::to_vec(&minter_acct).map_err(|_| TransactionResult::TefInternal)?;
@@ -124,6 +179,106 @@ impl Transactor for NFTokenMintTransactor {
             .map_err(|_| TransactionResult::TefInternal)?;
 
         Ok(TransactionResult::TesSuccess)
+    }
+}
+
+/// True when an offer amount is zero (XRP `"0"` drops or IOU value `0`). A
+/// zero-amount (gift) sell offer omits sfAmount, matching rippled's default-drop
+/// serialization. Mirrors the helper in `nftoken_create_offer`.
+fn amount_is_zero(amount: &Value) -> bool {
+    match amount {
+        Value::String(s) => s.parse::<u128>().map(|n| n == 0).unwrap_or(false),
+        Value::Object(o) => o
+            .get("value")
+            .and_then(|v| v.as_str())
+            .map(|s| {
+                s.trim_start_matches('-')
+                    .trim_matches('0')
+                    .trim_matches('.')
+                    .is_empty()
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+impl NFTokenMintTransactor {
+    /// NFTokenMintOffer: atomically create the sell NFTokenOffer for the token
+    /// just minted. Mirrors rippled `nft::tokenOfferCreateApply` with the
+    /// tfSellNFToken path — owner-directory and per-NFToken sell-book links, the
+    /// NFTokenOffer SLE (always `lsfSellNFToken` = 1), a +1 owner-count bump on
+    /// the minter, and the Destination AccountRoot touch. The offer keylet uses
+    /// the transaction's seq-proxy (the ticket sequence for a ticketed mint),
+    /// matching the on-chain NFTokenOffer index.
+    #[allow(clippy::too_many_arguments)]
+    fn create_sell_offer(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+        minter_id: &rxrpl_primitives::AccountId,
+        minter_str: &str,
+        nftoken_id: &str,
+        nft_hash: &rxrpl_primitives::Hash256,
+        minter_acct: &mut Value,
+    ) -> Result<(), TransactionResult> {
+        let tx_seq = helpers::tx_seq_proxy_value(ctx.tx);
+        let offer_key = keylet::nftoken_offer(minter_id, tx_seq);
+
+        // Owner directory link + per-NFToken sell-offer book link. sfOwnerNode
+        // and sfNFTokenOfferNode are SoeRequired on ltNFTOKEN_OFFER, so rippled
+        // always serializes both directory-page numbers (0 for the root page).
+        let owner_node = crate::owner_dir::add_to_owner_dir(ctx.view, minter_id, &offer_key)?;
+        let book_key = keylet::nft_sells(nft_hash);
+        let offer_node = crate::owner_dir::add_to_nft_offer_dir(
+            ctx.view, &book_key, nftoken_id, &offer_key, true,
+        )?;
+
+        let mut offer = serde_json::json!({
+            "LedgerEntryType": "NFTokenOffer",
+            "Owner": minter_str,
+            "NFTokenID": nftoken_id,
+            "Flags": 1u32,
+            "OwnerNode": format!("{owner_node:016X}"),
+            "NFTokenOfferNode": format!("{offer_node:016X}"),
+            "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+            "PreviousTxnLgrSeq": 0,
+        });
+        let amount_value = ctx
+            .tx
+            .get("Amount")
+            .cloned()
+            .unwrap_or_else(|| Value::String("0".to_string()));
+        if !amount_is_zero(&amount_value) {
+            offer["Amount"] = amount_value;
+        }
+        if let Some(dest) = helpers::get_str_field(ctx.tx, "Destination") {
+            offer["Destination"] = Value::String(dest.to_string());
+        }
+        if let Some(exp) = helpers::get_u32_field(ctx.tx, "Expiration") {
+            offer["Expiration"] = Value::from(exp);
+        }
+
+        let offer_data = serde_json::to_vec(&offer).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .insert(offer_key, offer_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        // The offer adds one owned object to the minter.
+        helpers::adjust_owner_count(minter_acct, 1);
+
+        // A Destination-restricted offer touches the destination AccountRoot (its
+        // PreviousTxnID is threaded though no field changes), as rippled does when
+        // validating the named destination.
+        if let Some(dest) = helpers::get_str_field(ctx.tx, "Destination") {
+            if let Ok(dest_id) = decode_account_id(dest) {
+                let dest_key = keylet::account(&dest_id);
+                if let Some(dest_bytes) = ctx.view.read(&dest_key) {
+                    ctx.view
+                        .update(dest_key, dest_bytes)
+                        .map_err(|_| TransactionResult::TefInternal)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -173,6 +328,8 @@ mod tests {
             "Sequence": 1,
         });
 
+        // Engine consumes the sender's Sequence/Ticket centrally before doApply.
+        crate::handlers::central_consume_for_test(&mut sandbox, &tx);
         let mut ctx = ApplyContext {
             tx: &tx,
             view: &mut sandbox,
@@ -190,17 +347,24 @@ mod tests {
         let page: Value = serde_json::from_slice(&page_bytes).unwrap();
         let tokens = page["NFTokens"].as_array().unwrap();
         assert_eq!(tokens.len(), 1);
-        assert_eq!(
-            tokens[0]["NFToken"]["NFTokenID"].as_str().unwrap().len(),
-            64
-        );
+        // sfFlags is a common SoeRequired field: the page serializes Flags=0.
+        assert_eq!(page["Flags"].as_u64().unwrap(), 0);
+        let nftoken_id = tokens[0]["NFToken"]["NFTokenID"].as_str().unwrap();
+        assert_eq!(nftoken_id.len(), 64);
+        // FirstNFTokenSequence is the account's own Sequence at mint time (the
+        // tx Sequence 1, i.e. post-consume account Sequence 2 minus 1), NOT the
+        // ledger index. token_seq = FirstNFTokenSequence + MintedNFTokens(0) = 1,
+        // so the NFTokenID's low 4 bytes encode 0x00000001.
+        assert_eq!(&nftoken_id[56..], "00000001");
 
-        // Verify owner count incremented
+        // Verify owner count incremented and FirstNFTokenSequence stamped.
         let acct_key = keylet::account(&minter_id);
         let acct_bytes = sandbox.read(&acct_key).unwrap();
         let acct: Value = serde_json::from_slice(&acct_bytes).unwrap();
         assert_eq!(acct["OwnerCount"].as_u64().unwrap(), 1);
         assert_eq!(acct["Sequence"].as_u64().unwrap(), 2);
+        assert_eq!(acct["FirstNFTokenSequence"].as_u64().unwrap(), 1);
+        assert_eq!(acct["MintedNFTokens"].as_u64().unwrap(), 1);
     }
 
     #[test]

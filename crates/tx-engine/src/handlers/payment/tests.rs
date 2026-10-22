@@ -4,6 +4,7 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext};
 use crate::view::ledger_view::LedgerView;
 use crate::view::sandbox::Sandbox;
 use rxrpl_amendment::Rules;
+use rxrpl_amount::IOUAmount;
 use rxrpl_ledger::Ledger;
 
 const SRC_ADDRESS: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
@@ -201,7 +202,9 @@ fn preclaim_valid_create_account() {
 
 #[test]
 fn apply_transfer_to_existing_account() {
-    let mut ledger = setup_ledger_with_account(SRC_ADDRESS, 10_000_000);
+    // Source funded above amount + owner reserve (10 XRP base): a payment must
+    // leave the sender its reserve, else it returns tecUNFUNDED_PAYMENT.
+    let mut ledger = setup_ledger_with_account(SRC_ADDRESS, 20_000_000);
     add_account(&mut ledger, DST_ADDRESS, 5_000_000);
 
     let fees = FeeSettings::default();
@@ -210,6 +213,8 @@ fn apply_transfer_to_existing_account() {
     let tx = make_payment_tx(SRC_ADDRESS, DST_ADDRESS, "1000000", "10");
     let rules = Rules::new();
 
+    // Engine consumes the sender's Sequence/Ticket centrally before doApply.
+    crate::handlers::central_consume_for_test(&mut sandbox, &tx);
     let mut ctx = ApplyContext {
         tx: &tx,
         view: &mut sandbox,
@@ -225,7 +230,7 @@ fn apply_transfer_to_existing_account() {
     let src_key = keylet::account(&src_id);
     let src_bytes = sandbox.read(&src_key).unwrap();
     let src: serde_json::Value = serde_json::from_slice(&src_bytes).unwrap();
-    assert_eq!(src["Balance"].as_str().unwrap(), "9000000");
+    assert_eq!(src["Balance"].as_str().unwrap(), "19000000");
     assert_eq!(src["Sequence"].as_u64().unwrap(), 2);
 
     // Verify destination balance increased
@@ -247,7 +252,9 @@ fn apply_xrp_payment_with_ticket_consumes_ticket_not_sequence() {
     let src = serde_json::json!({
         "LedgerEntryType": "AccountRoot",
         "Account": SRC_ADDRESS,
-        "Balance": "10000000",
+        // Above amount + owner reserve (base 10 XRP + 1 owned ticket): the
+        // payment must leave the sender its reserve.
+        "Balance": "20000000",
         "Sequence": 9,
         "OwnerCount": 1,
         "Flags": 0,
@@ -274,6 +281,8 @@ fn apply_xrp_payment_with_ticket_consumes_ticket_not_sequence() {
     tx["TicketSequence"] = serde_json::json!(ticket_seq);
     let rules = Rules::new();
 
+    // Engine consumes the sender's Sequence/Ticket centrally before doApply.
+    crate::handlers::central_consume_for_test(&mut sandbox, &tx);
     let mut ctx = ApplyContext {
         tx: &tx,
         view: &mut sandbox,
@@ -547,13 +556,22 @@ fn apply_cross_currency_consumes_offer() {
     let eur = helpers::currency_to_bytes("EUR");
     let issuer_id = decode_account_id(ISSUER).unwrap();
     let book_root = keylet::book_dir(&usd, &issuer_id, &eur, &issuer_id);
+    // Place the offer in its quality sub-directory (rippled keys book pages by
+    // the offer's quality = TakerPays/TakerGets), so the book step prices the
+    // fill off the directory quality rather than a base page with no quality.
+    let quality = rxrpl_amount::get_rate(
+        &rxrpl_amount::IOUAmount::from_decimal_string("50").unwrap(),
+        &rxrpl_amount::IOUAmount::from_decimal_string("50").unwrap(),
+    )
+    .unwrap();
+    let book_dir_key = crate::handlers::offer_create::book_dir_with_quality(&book_root, quality);
     let dir = serde_json::json!({
         "LedgerEntryType": "DirectoryNode",
         "Indexes": [offer_key.to_string()],
         "IndexNext": 0,
     });
     ledger
-        .put_state(book_root, serde_json::to_vec(&dir).unwrap())
+        .put_state(book_dir_key, serde_json::to_vec(&dir).unwrap())
         .unwrap();
 
     let fees = FeeSettings::default();
@@ -581,6 +599,151 @@ fn apply_cross_currency_consumes_offer() {
     assert!((holder_balance(&sandbox, ALICE, ISSUER, "USD") - 80.0).abs() < 1e-6);
     assert!((holder_balance(&sandbox, MM, ISSUER, "USD") - 20.0).abs() < 1e-6);
     assert!((holder_balance(&sandbox, MM, ISSUER, "EUR") - 80.0).abs() < 1e-6);
+}
+
+#[test]
+fn apply_cross_currency_creates_maker_trust_line_on_demand() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, ALICE, "50000000", None);
+    put_account(&mut ledger, BOB, "50000000", None);
+    put_account(&mut ledger, MM, "50000000", None);
+
+    put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+    put_trust_line(&mut ledger, BOB, ISSUER, "EUR", 0.0);
+    put_trust_line(&mut ledger, MM, ISSUER, "EUR", 100.0);
+
+    let mm_id = decode_account_id(MM).unwrap();
+    let offer_key = keylet::offer(&mm_id, 1);
+    let offer = serde_json::json!({
+        "LedgerEntryType": "Offer",
+        "Account": MM,
+        "Sequence": 1,
+        "TakerPays": iou("USD", ISSUER, "50"),
+        "TakerGets": iou("EUR", ISSUER, "50"),
+        "Flags": 0,
+    });
+    ledger
+        .put_state(offer_key, serde_json::to_vec(&offer).unwrap())
+        .unwrap();
+
+    let usd = helpers::currency_to_bytes("USD");
+    let eur = helpers::currency_to_bytes("EUR");
+    let issuer_id = decode_account_id(ISSUER).unwrap();
+    let book_root = keylet::book_dir(&usd, &issuer_id, &eur, &issuer_id);
+    let quality = rxrpl_amount::get_rate(
+        &rxrpl_amount::IOUAmount::from_decimal_string("50").unwrap(),
+        &rxrpl_amount::IOUAmount::from_decimal_string("50").unwrap(),
+    )
+    .unwrap();
+    let book_dir_key = crate::handlers::offer_create::book_dir_with_quality(&book_root, quality);
+    let dir = serde_json::json!({
+        "LedgerEntryType": "DirectoryNode",
+        "Indexes": [offer_key.to_string()],
+        "IndexNext": 0,
+    });
+    ledger
+        .put_state(book_dir_key, serde_json::to_vec(&dir).unwrap())
+        .unwrap();
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let usd_line = keylet::trust_line(&mm_id, &issuer_id, &usd);
+    assert!(sandbox.read(&usd_line).is_none());
+
+    let tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": BOB,
+        "Amount": iou("EUR", ISSUER, "20"),
+        "SendMax": iou("USD", ISSUER, "20"),
+        "Fee": "10",
+    });
+    let rules = Rules::new();
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    let result = PaymentTransactor.apply(&mut ctx).unwrap();
+    assert_eq!(result, TransactionResult::TesSuccess);
+    assert!(
+        sandbox.read(&usd_line).is_some(),
+        "rippleCredit createOnDemand must write the maker's USD line"
+    );
+    assert!((holder_balance(&sandbox, MM, ISSUER, "USD") - 20.0).abs() < 1e-6);
+    assert!((holder_balance(&sandbox, BOB, ISSUER, "EUR") - 20.0).abs() < 1e-6);
+}
+
+#[test]
+fn apply_paths_payment_direct_step_then_xrp_book() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, ALICE, "50000000", None);
+    put_account(&mut ledger, MM, "150000000", None);
+
+    put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+    put_trust_line(&mut ledger, MM, ISSUER, "USD", 0.0);
+
+    let mm_id = decode_account_id(MM).unwrap();
+    let offer_key = keylet::offer(&mm_id, 1);
+    let offer = serde_json::json!({
+        "LedgerEntryType": "Offer",
+        "Account": MM,
+        "Sequence": 1,
+        "TakerPays": iou("USD", ISSUER, "50"),
+        "TakerGets": "50000000",
+        "Flags": 0,
+    });
+    ledger
+        .put_state(offer_key, serde_json::to_vec(&offer).unwrap())
+        .unwrap();
+
+    let usd = helpers::currency_to_bytes("USD");
+    let xrp = [0u8; 20];
+    let issuer_id = decode_account_id(ISSUER).unwrap();
+    let zero = rxrpl_primitives::AccountId::from([0u8; 20]);
+    let book_root = keylet::book_dir(&usd, &issuer_id, &xrp, &zero);
+    let quality = rxrpl_amount::get_rate(
+        &rxrpl_amount::IOUAmount::from_decimal_string("50").unwrap(),
+        &rxrpl_amount::IOUAmount::from_decimal_string("50000000").unwrap(),
+    )
+    .unwrap();
+    let book_dir_key = crate::handlers::offer_create::book_dir_with_quality(&book_root, quality);
+    let dir = serde_json::json!({
+        "LedgerEntryType": "DirectoryNode",
+        "Indexes": [offer_key.to_string()],
+        "IndexNext": 0,
+    });
+    ledger
+        .put_state(book_dir_key, serde_json::to_vec(&dir).unwrap())
+        .unwrap();
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": "50000000",
+        "SendMax": iou("USD", ALICE, "50"),
+        "Paths": [[{ "account": ISSUER, "type": 1 }, { "currency": "XRP", "type": 16 }]],
+        "Fee": "10",
+    });
+    let rules = Rules::new();
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    let result = PaymentTransactor.apply(&mut ctx).unwrap();
+    assert_eq!(result, TransactionResult::TesSuccess);
+    assert!((holder_balance(&sandbox, ALICE, ISSUER, "USD") - 50.0).abs() < 1e-6);
+    assert!(sandbox.read(&keylet::offer(&mm_id, 1)).is_none());
 }
 
 // -- multi-hop walker --
@@ -2360,4 +2523,1255 @@ fn conversion_crosses_multiple_offers_best_price_first() {
     assert_eq!(read_xrp(ALICE), 57_000_000, "ALICE spends 43M XRP");
     assert_eq!(read_xrp(ISSUER2), 225_000_000);
     assert_eq!(read_xrp(BOB), 218_000_000);
+}
+
+#[test]
+fn conversion_transfer_fee_grosses_up_last_hop_take() {
+    // 30000046 63B72EB4: remaining is NET dest-JPY; TakerGets is GROSS. With
+    // TransferRate 1.002 the demand-limited maker must give remaining*1.002 so
+    // dest nets Amount. Capping take_out at remaining leaves a fee shortfall
+    // that walks worse-quality offers (2126 extra drops on mainnet).
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", Some(1_002_000_000));
+    put_account(&mut ledger, BOB, "200000000", None);
+    put_account(&mut ledger, MM, "400000000", None);
+    put_account(&mut ledger, ALICE, "300000000", None);
+    put_trust_line(&mut ledger, BOB, ISSUER, "USD", 10.0);
+    put_trust_line(&mut ledger, MM, ISSUER, "USD", 1000.0);
+    put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 0.0);
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let bob_offer = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": BOB,
+        "TakerGets": iou("USD", ISSUER, "10"),
+        "TakerPays": "10000000",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &bob_offer,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    crate::handlers::offer_create::OfferCreateTransactor
+        .apply(&mut octx)
+        .unwrap();
+
+    let mm_offer = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM,
+        "TakerGets": iou("USD", ISSUER, "200"),
+        "TakerPays": "200000000",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &mm_offer,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    crate::handlers::offer_create::OfferCreateTransactor
+        .apply(&mut octx)
+        .unwrap();
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": iou("USD", ISSUER, "100"),
+        "SendMax": "150000000",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let dest = holder_balance(&sandbox, ALICE, ISSUER, "USD");
+    assert!(
+        (dest - 100.0).abs() < 1e-6,
+        "dest nets Amount after the 1.002 fee, got {dest}"
+    );
+    let mm = holder_balance(&sandbox, MM, ISSUER, "USD");
+    assert!(
+        mm < 1000.0 - 90.1,
+        "demand-limited maker gives remaining*1.002 gross, left {mm}"
+    );
+}
+
+/// 30000051 B6E7A0DC: conversion XRP SendMax -> CNY book -> ETH book.
+/// Mainnet delivers 0.03667 ETH; a dry/partial strand only charges the fee.
+#[test]
+fn ledger_30000051_xrp_cny_eth_two_hop_delivers() {
+    const TF_SELL: u64 = 0x0008_0000;
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "1000000000", None);
+    put_account(&mut ledger, ISSUER2, "1000000000", Some(1_003_000_000));
+    put_account(&mut ledger, ALICE, "1000000000", None);
+    put_account(&mut ledger, MM, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_trust_line(&mut ledger, MM, ISSUER, "CNY", 1000.0);
+    put_trust_line(&mut ledger, MM2, ISSUER2, "ETH", 10.0);
+    put_trust_line(&mut ledger, MM2, ISSUER, "CNY", 0.0);
+    put_trust_line(&mut ledger, ALICE, ISSUER2, "ETH", 0.0);
+    {
+        let alice_id = decode_account_id(ALICE).unwrap();
+        let iss2 = decode_account_id(ISSUER2).unwrap();
+        let cur = helpers::currency_to_bytes("ETH");
+        let key = keylet::trust_line(&alice_id, &iss2, &cur);
+        let alice_is_low = alice_id.as_bytes() < iss2.as_bytes();
+        let (low, high) = if alice_is_low {
+            (ALICE, ISSUER2)
+        } else {
+            (ISSUER2, ALICE)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": "ETH", "issuer": ISSUER2, "value": "0" },
+            "LowLimit": { "currency": "ETH", "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": "ETH", "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let eth_offer = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM2,
+        "Flags": TF_SELL,
+        "TakerGets": iou("ETH", ISSUER2, "1"),
+        "TakerPays": iou("CNY", ISSUER, "1570"),
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &eth_offer,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess,
+        "ETH offer"
+    );
+
+    let cny_offer = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM,
+        "TakerGets": iou("CNY", ISSUER, "100"),
+        "TakerPays": "40000000",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &cny_offer,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess,
+        "CNY offer"
+    );
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": iou("ETH", ISSUER2, "0.03666999476872078"),
+        "SendMax": "24411839",
+        "Paths": [[
+            { "currency": "CNY", "issuer": ISSUER },
+            { "currency": "ETH", "issuer": ISSUER2 }
+        ]],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess,
+        "XRP->CNY->ETH conversion must cross"
+    );
+    let dest = holder_balance(&sandbox, ALICE, ISSUER2, "ETH");
+    assert!(dest > 0.03, "dest must receive ETH, got {dest}");
+    let mm2_cny = holder_balance(&sandbox, MM2, ISSUER, "CNY");
+    assert!(mm2_cny > 50.0, "ETH maker must be paid CNY, got {mm2_cny}");
+}
+
+/// 30000054 E60BA9E1: dest nets Amount; offer leftover TakerGets is 1 ULP
+/// higher than remaining*rate+1 (the extra mantissa bump over-takes).
+#[test]
+fn ledger_30000054_eth_offer_leftover_truncates() {
+    const TF_SELL: u64 = 0x0008_0000;
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER2, "1000000000", Some(1_003_000_000));
+    put_account(&mut ledger, ALICE, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_trust_line(&mut ledger, MM2, ISSUER2, "ETH", 10.0);
+    {
+        let alice_id = decode_account_id(ALICE).unwrap();
+        let iss2 = decode_account_id(ISSUER2).unwrap();
+        let cur = helpers::currency_to_bytes("ETH");
+        let key = keylet::trust_line(&alice_id, &iss2, &cur);
+        let alice_is_low = alice_id.as_bytes() < iss2.as_bytes();
+        let (low, high) = if alice_is_low {
+            (ALICE, ISSUER2)
+        } else {
+            (ISSUER2, ALICE)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": "ETH", "issuer": ISSUER2, "value": "0" },
+            "LowLimit": { "currency": "ETH", "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": "ETH", "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let eth_offer = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM2,
+        "Flags": TF_SELL,
+        "TakerGets": iou("ETH", ISSUER2, "1.438681906732764"),
+        "TakerPays": "935341445",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &eth_offer,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": iou("ETH", ISSUER2, "0.0283226784131625"),
+        "SendMax": "18487353",
+        "Paths": [[{ "currency": "ETH", "issuer": ISSUER2 }]],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let mm2_id = decode_account_id(MM2).unwrap();
+    let offer: serde_json::Value =
+        serde_json::from_slice(&sandbox.read(&keylet::offer(&mm2_id, 1)).unwrap()).unwrap();
+    let leftover = offer["TakerGets"]["value"].as_str().unwrap();
+    assert_eq!(
+        leftover, "1.410274260284363",
+        "leftover TakerGets 1 ULP above remaining*rate+1, got {leftover}"
+    );
+    let leftover_pays = offer["TakerPays"].as_str().unwrap();
+    assert_eq!(
+        leftover_pays, "916872561",
+        "E60 leftover TakerPays, got {leftover_pays}"
+    );
+}
+
+/// 30000057 502E1318: same ETH/XRP book as E60; demand-limited ceil over-spends
+/// 1 drop (taker 10493839936 vs 10493839937, offer TakerPays 896953642 vs 643).
+#[test]
+fn ledger_30000057_eth_xrp_demand_limited_does_not_overpay_one_drop() {
+    const TF_SELL: u64 = 0x0008_0000;
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER2, "1000000000", Some(1_003_000_000));
+    put_account(&mut ledger, ALICE, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_trust_line(&mut ledger, MM2, ISSUER2, "ETH", 10.0);
+    {
+        let alice_id = decode_account_id(ALICE).unwrap();
+        let iss2 = decode_account_id(ISSUER2).unwrap();
+        let cur = helpers::currency_to_bytes("ETH");
+        let key = keylet::trust_line(&alice_id, &iss2, &cur);
+        let alice_is_low = alice_id.as_bytes() < iss2.as_bytes();
+        let (low, high) = if alice_is_low {
+            (ALICE, ISSUER2)
+        } else {
+            (ISSUER2, ALICE)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": "ETH", "issuer": ISSUER2, "value": "0" },
+            "LowLimit": { "currency": "ETH", "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": "ETH", "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let eth_offer = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM2,
+        "Flags": TF_SELL,
+        "TakerGets": iou("ETH", ISSUER2, "1.410274260284363"),
+        "TakerPays": "916872561",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &eth_offer,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": iou("ETH", ISSUER2, "0.03054635640390767"),
+        "SendMax": "19938837",
+        "Paths": [[{ "currency": "ETH", "issuer": ISSUER2 }]],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let mm2_id = decode_account_id(MM2).unwrap();
+    let offer: serde_json::Value =
+        serde_json::from_slice(&sandbox.read(&keylet::offer(&mm2_id, 1)).unwrap()).unwrap();
+    let leftover_pays = offer["TakerPays"].as_str().unwrap();
+    assert_eq!(
+        leftover_pays, "896953643",
+        "502E leftover TakerPays, got {leftover_pays}"
+    );
+}
+
+/// 30000066 33FB4822: last hop is input-limited (XLM from hop 0). leftover
+/// TakerGets is 1 ULP high (`119.1853156456341` vs `…634`); TakerPays matches.
+#[test]
+fn ledger_30000066_cny_leftover_gets_truncates() {
+    const TF_SELL: u64 = 0x0008_0000;
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "1000000000", None);
+    put_account(&mut ledger, ALICE, "10000000000", None);
+    put_account(&mut ledger, MM, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_trust_line(&mut ledger, MM, ISSUER, "XLM", 200.0);
+    put_trust_line(&mut ledger, MM2, ISSUER, "CNY", 200.0);
+    for (holder, cur) in [(MM2, "XLM"), (ALICE, "CNY")] {
+        let hid = decode_account_id(holder).unwrap();
+        let iid = decode_account_id(ISSUER).unwrap();
+        let key = keylet::trust_line(&hid, &iid, &helpers::currency_to_bytes(cur));
+        let holder_is_low = hid.as_bytes() < iid.as_bytes();
+        let (low, high) = if holder_is_low {
+            (holder, ISSUER)
+        } else {
+            (ISSUER, holder)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": cur, "issuer": ISSUER, "value": "0" },
+            "LowLimit": { "currency": cur, "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": cur, "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let xlm_offer = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM,
+        "Flags": TF_SELL,
+        "TakerGets": iou("XLM", ISSUER, "99.029847449557"),
+        "TakerPays": "16736045",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &xlm_offer,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let cny_offer = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM2,
+        "TakerGets": iou("CNY", ISSUER, "159.203277"),
+        "TakerPays": iou("XLM", ISSUER, "393.97"),
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &cny_offer,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Flags": TF_PARTIAL_PAYMENT_TEST,
+        "Amount": iou("CNY", ISSUER, "1433.8566"),
+        "SendMax": "600000000",
+        "Paths": [[
+            { "currency": "XLM", "issuer": ISSUER },
+            { "currency": "CNY", "issuer": ISSUER }
+        ]],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let mm2_id = decode_account_id(MM2).unwrap();
+    let offer: serde_json::Value =
+        serde_json::from_slice(&sandbox.read(&keylet::offer(&mm2_id, 1)).unwrap()).unwrap();
+    let leftover_gets = offer["TakerGets"]["value"].as_str().unwrap();
+    assert_eq!(
+        leftover_gets, "119.185315645634",
+        "33FB leftover TakerGets, got {leftover_gets}"
+    );
+    let leftover_pays = offer["TakerPays"]["value"].as_str().unwrap();
+    assert_eq!(
+        leftover_pays, "294.940152550443",
+        "33FB leftover TakerPays, got {leftover_pays}"
+    );
+}
+
+#[test]
+fn ledger_30000054_xlm_take_vs_offer_leftover() {
+    let offer = IOUAmount::from_decimal_string("1372.070869049977").unwrap();
+    let take57 = IOUAmount::from_decimal_string("24.70842771705957").unwrap();
+    let take58 = IOUAmount::from_decimal_string("24.70842771705958").unwrap();
+    let lo57 = IOUAmount::sub(&offer, &take57).unwrap().to_decimal_string();
+    let lo58 = IOUAmount::sub(&offer, &take58).unwrap().to_decimal_string();
+    assert_eq!(lo57, "1347.362441332918", "take57 leftover {lo57}");
+    assert_eq!(lo58, "1347.362441332918", "take58 leftover {lo58}");
+}
+
+/// 30000071 51FF9B2E: same-currency Payment to the issuer with SendMax
+/// issued by the sender is a redeem, not a book conversion. Mainnet
+/// debits 25842 JPY off the line (`-25842.99999999999` → `-0.99999999999`).
+#[test]
+fn ledger_30000071_redeems_iou_to_issuer_with_self_issued_sendmax() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, ALICE, "100000000", None);
+    {
+        let hid = decode_account_id(ALICE).unwrap();
+        let iid = decode_account_id(ISSUER).unwrap();
+        let key = keylet::trust_line(&hid, &iid, &helpers::currency_to_bytes("JPY"));
+        let holder_is_low = hid.as_bytes() < iid.as_bytes();
+        let stored = if holder_is_low {
+            "25842.99999999999"
+        } else {
+            "-25842.99999999999"
+        };
+        let (low, high) = if holder_is_low {
+            (ALICE, ISSUER)
+        } else {
+            (ISSUER, ALICE)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": "JPY", "issuer": ISSUER, "value": stored },
+            "LowLimit": { "currency": "JPY", "issuer": low, "value": "0" },
+            "HighLimit": { "currency": "JPY", "issuer": high, "value": "10000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ISSUER,
+        "Amount": iou("JPY", ISSUER, "25842"),
+        "SendMax": iou("JPY", ALICE, "26100.42"),
+        "Fee": "10",
+        "Sequence": 1,
+    });
+    let rules = Rules::new();
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut ctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+    let left = holder_balance(&sandbox, ALICE, ISSUER, "JPY");
+    assert!(
+        (left - 0.99999999999).abs() < 1e-8,
+        "redeem leftover, got {left}"
+    );
+}
+
+/// 30000095 256D45D9: XRP→CNY→USD conversion with tfLimitQuality + tfPartialPayment
+/// and issuer account-rippling path steps. Mainnet delivers ~9.82 USD; we used
+/// to tecPATH_DRY and leave the CNY/USD book offer standing.
+#[test]
+fn ledger_30000095_limit_quality_two_hop_delivers() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "1000000000", None);
+    put_account(&mut ledger, ISSUER2, "1000000000", Some(1_002_000_000));
+    put_account(&mut ledger, ALICE, "10000000000", None);
+    put_account(&mut ledger, MM, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_trust_line(&mut ledger, MM, ISSUER, "CNY", 4000.0);
+    put_trust_line(&mut ledger, MM2, ISSUER2, "USD", 20.0);
+    put_trust_line(&mut ledger, MM2, ISSUER, "CNY", 0.0);
+    for (holder, iss, cur) in [(ALICE, ISSUER2, "USD"), (MM2, ISSUER, "CNY")] {
+        let hid = decode_account_id(holder).unwrap();
+        let iid = decode_account_id(iss).unwrap();
+        let key = keylet::trust_line(&hid, &iid, &helpers::currency_to_bytes(cur));
+        let holder_is_low = hid.as_bytes() < iid.as_bytes();
+        let (low, high) = if holder_is_low {
+            (holder, iss)
+        } else {
+            (iss, holder)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": cur, "issuer": iss, "value": "0" },
+            "LowLimit": { "currency": cur, "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": cur, "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let cny_xrp = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM,
+        "TakerGets": iou("CNY", ISSUER, "3113.399661968121"),
+        "TakerPays": "1318234295",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &cny_xrp,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let usd_cny = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM2,
+        "TakerGets": iou("USD", ISSUER2, "9.840000000000018"),
+        "TakerPays": iou("CNY", ISSUER, "78.80797529543582"),
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &usd_cny,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Flags": 458752,
+        "Amount": iou("USD", ISSUER2, "601.9866384119105"),
+        "SendMax": "2046286188",
+        "Paths": [[
+            { "currency": "CNY", "issuer": ISSUER },
+            { "account": ISSUER },
+            { "currency": "USD", "issuer": ISSUER2 },
+            { "account": ISSUER2 }
+        ]],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+    let usd = holder_balance(&sandbox, ALICE, ISSUER2, "USD");
+    assert!(
+        (usd - 9.820359281437143).abs() < 1e-8,
+        "256D45 dest nets Gets/1.002, got {usd}"
+    );
+}
+
+/// 30000096 2DDBE66F: same strand as 256D45D9 after that offer is gone. Best
+/// USD/CNY rest is an exact 10 USD Gets (fully consumed). Dest nets 10/1.002.
+#[test]
+fn ledger_30000096_fully_consumes_ten_usd_last_hop() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "1000000000", None);
+    put_account(&mut ledger, ISSUER2, "1000000000", Some(1_002_000_000));
+    put_account(&mut ledger, ALICE, "10000000000", None);
+    put_account(&mut ledger, MM, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_trust_line(&mut ledger, MM, ISSUER, "CNY", 4000.0);
+    put_trust_line(&mut ledger, MM2, ISSUER2, "USD", 20.0);
+    put_trust_line(&mut ledger, MM2, ISSUER, "CNY", 0.0);
+    for (holder, iss, cur) in [(ALICE, ISSUER2, "USD"), (MM2, ISSUER, "CNY")] {
+        let hid = decode_account_id(holder).unwrap();
+        let iid = decode_account_id(iss).unwrap();
+        let key = keylet::trust_line(&hid, &iid, &helpers::currency_to_bytes(cur));
+        let holder_is_low = hid.as_bytes() < iid.as_bytes();
+        let (low, high) = if holder_is_low {
+            (holder, iss)
+        } else {
+            (iss, holder)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": cur, "issuer": iss, "value": "0" },
+            "LowLimit": { "currency": cur, "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": cur, "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let cny_xrp = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM,
+        "TakerGets": iou("CNY", ISSUER, "3034.591686672686"),
+        "TakerPays": "1284866469",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &cny_xrp,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let usd_cny = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM2,
+        "TakerGets": iou("USD", ISSUER2, "10"),
+        "TakerPays": iou("CNY", ISSUER, "80.16949519383243"),
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &usd_cny,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Flags": 458752,
+        "Amount": iou("USD", ISSUER2, "684.3637483553164"),
+        "SendMax": "2328400037",
+        "Paths": [[
+            { "currency": "CNY", "issuer": ISSUER },
+            { "account": ISSUER },
+            { "currency": "USD", "issuer": ISSUER2 },
+            { "account": ISSUER2 }
+        ]],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+    let usd = holder_balance(&sandbox, ALICE, ISSUER2, "USD");
+    assert!(
+        (usd - 9.98003992015968).abs() < 1e-8,
+        "2DDB dest nets 10/1.002, got {usd}"
+    );
+    let mm2_id = decode_account_id(MM2).unwrap();
+    assert!(
+        sandbox.read(&keylet::offer(&mm2_id, 1)).is_none(),
+        "10 USD offer must be fully consumed"
+    );
+}
+
+/// 30000095 4C4D82CA: same 10 USD last hop as 2DDBE66F but tighter
+/// SendMax/Amount. Mainnet tecPATH_DRY (LimitQuality). Must stay Dry so
+/// skip-ulp for 96 does not extra-fill this payment.
+#[test]
+fn ledger_30000095_4c4d82ca_stays_path_dry() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "1000000000", None);
+    put_account(&mut ledger, ISSUER2, "1000000000", Some(1_002_000_000));
+    put_account(&mut ledger, ALICE, "10000000000", None);
+    put_account(&mut ledger, MM, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_trust_line(&mut ledger, MM, ISSUER, "CNY", 4000.0);
+    put_trust_line(&mut ledger, MM2, ISSUER2, "USD", 20.0);
+    put_trust_line(&mut ledger, MM2, ISSUER, "CNY", 0.0);
+    for (holder, iss, cur) in [(ALICE, ISSUER2, "USD"), (MM2, ISSUER, "CNY")] {
+        let hid = decode_account_id(holder).unwrap();
+        let iid = decode_account_id(iss).unwrap();
+        let key = keylet::trust_line(&hid, &iid, &helpers::currency_to_bytes(cur));
+        let holder_is_low = hid.as_bytes() < iid.as_bytes();
+        let (low, high) = if holder_is_low {
+            (holder, iss)
+        } else {
+            (iss, holder)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": cur, "issuer": iss, "value": "0" },
+            "LowLimit": { "currency": cur, "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": cur, "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let cny_xrp = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM,
+        "TakerGets": iou("CNY", ISSUER, "3034.591686672686"),
+        "TakerPays": "1284866469",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &cny_xrp,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let usd_cny = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM2,
+        "TakerGets": iou("USD", ISSUER2, "10"),
+        "TakerPays": iou("CNY", ISSUER, "80.16949519383243"),
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &usd_cny,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Flags": 458752,
+        "Amount": iou("USD", ISSUER2, "73.17423733766798"),
+        "SendMax": "248735473",
+        "Paths": [[
+            { "currency": "CNY", "issuer": ISSUER },
+            { "account": ISSUER },
+            { "currency": "USD", "issuer": ISSUER2 },
+            { "account": ISSUER2 }
+        ]],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx),
+        Err(TransactionResult::TecPathDry)
+    );
+}
+
+/// 30000099 0C0344E7: hop 0 best band is 10 CNY; last hop needs 15.656 CNY.
+/// LimitQuality single_band on hop 0 starves the BTC/CNY take. Walk hop 0
+/// past the first band so the last hop can fully consume.
+#[test]
+fn ledger_30000099_hop0_walks_second_cny_band() {
+    const TF_SELL: u64 = 0x0008_0000;
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "1000000000", None);
+    put_account(&mut ledger, ISSUER2, "1000000000", Some(1_002_000_000));
+    put_account(&mut ledger, ALICE, "10000000000", None);
+    put_account(&mut ledger, MM, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_account(&mut ledger, MM3, "1000000000", None);
+    put_trust_line(&mut ledger, MM, ISSUER, "CNY", 40.0);
+    put_trust_line(&mut ledger, MM3, ISSUER, "CNY", 2000.0);
+    put_trust_line(&mut ledger, MM2, ISSUER2, "BTC", 1.0);
+    put_trust_line(&mut ledger, MM2, ISSUER, "CNY", 0.0);
+    for (holder, iss, cur) in [(ALICE, ISSUER2, "BTC"), (MM2, ISSUER, "CNY")] {
+        let hid = decode_account_id(holder).unwrap();
+        let iid = decode_account_id(iss).unwrap();
+        let key = keylet::trust_line(&hid, &iid, &helpers::currency_to_bytes(cur));
+        let holder_is_low = hid.as_bytes() < iid.as_bytes();
+        let (low, high) = if holder_is_low {
+            (holder, iss)
+        } else {
+            (iss, holder)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": cur, "issuer": iss, "value": "0" },
+            "LowLimit": { "currency": cur, "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": cur, "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    for (acct, seq, gets, pays) in [
+        (
+            MM,
+            1u32,
+            iou("CNY", ISSUER, "10"),
+            serde_json::json!("4208699"),
+        ),
+        (
+            MM3,
+            1u32,
+            iou("CNY", ISSUER, "1425.6"),
+            serde_json::json!("600000000"),
+        ),
+        (
+            MM,
+            2u32,
+            iou("CNY", ISSUER, "10"),
+            serde_json::json!("4212907"),
+        ),
+        (
+            MM,
+            3u32,
+            iou("CNY", ISSUER, "10"),
+            serde_json::json!("4217120"),
+        ),
+    ] {
+        let tx = serde_json::json!({
+            "TransactionType": "OfferCreate",
+            "Account": acct,
+            "TakerGets": gets,
+            "TakerPays": pays,
+            "Sequence": seq,
+            "Fee": "10",
+        });
+        let mut octx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            crate::handlers::offer_create::OfferCreateTransactor
+                .apply(&mut octx)
+                .unwrap(),
+            TransactionResult::TesSuccess
+        );
+    }
+
+    let btc_cny = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM2,
+        "Flags": TF_SELL,
+        "TakerGets": iou("BTC", ISSUER2, "0.00080830444658478"),
+        "TakerPays": iou("CNY", ISSUER, "15.65604882574229"),
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut octx = ApplyContext {
+        tx: &btc_cny,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut octx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Flags": 458752,
+        "Amount": iou("BTC", ISSUER2, "0.1794154049999999"),
+        "SendMax": "1500000000",
+        "Paths": [[
+            { "currency": "CNY", "issuer": ISSUER },
+            { "account": ISSUER },
+            { "currency": "BTC", "issuer": ISSUER2 },
+            { "account": ISSUER2 }
+        ]],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+    let btc = holder_balance(&sandbox, ALICE, ISSUER2, "BTC");
+    assert!(
+        (btc - 0.0008066910644558682).abs() < 1e-10,
+        "0C034 dest nets Gets/1.002, got {btc}"
+    );
+    let mm2_id = decode_account_id(MM2).unwrap();
+    assert!(
+        sandbox.read(&keylet::offer(&mm2_id, 1)).is_none(),
+        "BTC/CNY offer must be fully consumed"
+    );
+    let mm_id = decode_account_id(MM).unwrap();
+    assert!(
+        sandbox.read(&keylet::offer(&mm_id, 2)).is_some(),
+        "worse 10 CNY band after rJ2XL must not be taken"
+    );
+}
+
+/// 30000103 70135FCE: first path (XLM) fills, second path (JPY) must still
+/// consume the JPY/CNY book. Stopping at the first Ok left the tip offer.
+#[test]
+fn ledger_30000103_second_path_consumes_jpy_cny_book() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "1000000000", None);
+    put_account(&mut ledger, ISSUER2, "1000000000", None);
+    put_account(&mut ledger, ALICE, "10000000000", None);
+    put_account(&mut ledger, MM, "1000000000", None);
+    put_account(&mut ledger, MM2, "1000000000", None);
+    put_account(&mut ledger, MM3, "1000000000", None);
+    put_account(&mut ledger, BOB, "1000000000", None);
+    put_trust_line(&mut ledger, MM, ISSUER, "CNY", 20.0);
+    put_trust_line(&mut ledger, MM, ISSUER, "XLM", 0.0);
+    put_trust_line(&mut ledger, MM2, ISSUER, "XLM", 100.0);
+    put_trust_line(&mut ledger, MM3, ISSUER2, "JPY", 1000.0);
+    put_trust_line(&mut ledger, MM3, ISSUER, "CNY", 20.0);
+    put_trust_line(&mut ledger, BOB, ISSUER, "CNY", 5.0);
+    put_trust_line(&mut ledger, BOB, ISSUER2, "JPY", 0.0);
+    for (holder, iss, cur) in [
+        (ALICE, ISSUER, "CNY"),
+        (MM, ISSUER, "XLM"),
+        (BOB, ISSUER2, "JPY"),
+    ] {
+        let hid = decode_account_id(holder).unwrap();
+        let iid = decode_account_id(iss).unwrap();
+        let key = keylet::trust_line(&hid, &iid, &helpers::currency_to_bytes(cur));
+        let holder_is_low = hid.as_bytes() < iid.as_bytes();
+        let (low, high) = if holder_is_low {
+            (holder, iss)
+        } else {
+            (iss, holder)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": cur, "issuer": iss, "value": "0" },
+            "LowLimit": { "currency": cur, "issuer": low, "value": "1000000000" },
+            "HighLimit": { "currency": cur, "issuer": high, "value": "1000000000" },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&tl).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    for (acct, seq, gets, pays) in [
+        (
+            MM2,
+            1u32,
+            iou("XLM", ISSUER, "50"),
+            serde_json::json!("10000000"),
+        ),
+        (MM, 1u32, iou("CNY", ISSUER, "10"), iou("XLM", ISSUER, "20")),
+        (
+            MM3,
+            1u32,
+            iou("JPY", ISSUER2, "500"),
+            serde_json::json!("20000000"),
+        ),
+        (
+            BOB,
+            1u32,
+            iou("CNY", ISSUER, "2.197112403109713"),
+            iou("JPY", ISSUER2, "34.98586629155595"),
+        ),
+        (
+            MM3,
+            2u32,
+            iou("CNY", ISSUER, "10.85800235643242"),
+            iou("JPY", ISSUER2, "173.1738812828137"),
+        ),
+    ] {
+        let tx = serde_json::json!({
+            "TransactionType": "OfferCreate",
+            "Account": acct,
+            "TakerGets": gets,
+            "TakerPays": pays,
+            "Sequence": seq,
+            "Fee": "10",
+        });
+        let mut octx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            crate::handlers::offer_create::OfferCreateTransactor
+                .apply(&mut octx)
+                .unwrap(),
+            TransactionResult::TesSuccess
+        );
+    }
+
+    let convert_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": iou("CNY", ISSUER, "1000"),
+        "SendMax": "1000000000",
+        "Flags": 458752,
+        "Paths": [
+            [
+                { "currency": "XLM", "issuer": ISSUER },
+                { "account": ISSUER },
+                { "currency": "CNY", "issuer": ISSUER },
+                { "account": ISSUER }
+            ],
+            [
+                { "currency": "JPY", "issuer": ISSUER2 },
+                { "account": ISSUER2 },
+                { "currency": "CNY", "issuer": ISSUER },
+                { "account": ISSUER }
+            ]
+        ],
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut pctx = ApplyContext {
+        tx: &convert_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut pctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+    let cny = holder_balance(&sandbox, ALICE, ISSUER, "CNY");
+    assert!(
+        (cny - 23.055114759542133).abs() < 0.02,
+        "path1 10 + path2 13.055 CNY, got {cny}"
+    );
+    let bob_id = decode_account_id(BOB).unwrap();
+    assert!(
+        sandbox.read(&keylet::offer(&bob_id, 1)).is_none(),
+        "best JPY/CNY offer must be consumed"
+    );
+    let mm3_id = decode_account_id(MM3).unwrap();
+    match sandbox.read(&keylet::offer(&mm3_id, 2)) {
+        None => {}
+        Some(b) => {
+            let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            panic!(
+                "second JPY/CNY leftover Gets={:?} Pays={:?} dest={cny}",
+                v["TakerGets"], v["TakerPays"]
+            );
+        }
+    }
 }

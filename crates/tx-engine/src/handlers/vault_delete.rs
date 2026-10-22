@@ -144,7 +144,6 @@ impl Transactor for VaultDeleteTransactor {
         let mut account: serde_json::Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
         helpers::adjust_owner_count(&mut account, owner_count_delta);
-        helpers::increment_sequence(&mut account);
         ctx.view
             .update(
                 acct_key,

@@ -1,3 +1,4 @@
+use rxrpl_amendment::feature::feature_id;
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_primitives::Hash256;
 use rxrpl_protocol::{TransactionResult, keylet};
@@ -16,6 +17,14 @@ pub struct NFTokenModifyTransactor;
 
 impl Transactor for NFTokenModifyTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
+        // NFTokenModify is gated on the DynamicNFT amendment. rippled enforces
+        // this in the transactor framework (via the transaction's required
+        // feature) before the transactor's own preflight, returning temDISABLED
+        // when the amendment is not yet enabled. Mirror that here.
+        if !ctx.rules.enabled(&feature_id("DynamicNFT")) {
+            return Err(TransactionResult::TemDisabled);
+        }
+
         let id =
             helpers::get_str_field(ctx.tx, "NFTokenID").ok_or(TransactionResult::TemMalformed)?;
         if id.len() != 64 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -34,13 +43,17 @@ impl Transactor for NFTokenModifyTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         helpers::read_account_by_address(ctx.view, account_str)?;
 
-        // Verify token exists in one of the account's pages.
-        let account_id =
-            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        // The NFToken lives in its OWNER's pages. rippled NFTokenModify accepts
+        // an optional `Owner`: when the modifier (the issuer or an authorized
+        // minter) is not the token's holder, the token is located under `Owner`,
+        // not under the sending Account.
+        let owner_str = helpers::get_str_field(ctx.tx, "Owner").unwrap_or(account_str);
+        let owner_id =
+            decode_account_id(owner_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let nftoken_id =
             helpers::get_str_field(ctx.tx, "NFTokenID").ok_or(TransactionResult::TemMalformed)?;
         let nft_hash = nft_hash(nftoken_id)?;
-        let page_key = nftoken::find_owner_page(ctx.view, &account_id, &nft_hash)
+        let page_key = nftoken::find_owner_page(ctx.view, &owner_id, &nft_hash)
             .ok_or(TransactionResult::TecNoEntry)?;
         let page_bytes = ctx
             .view
@@ -68,12 +81,17 @@ impl Transactor for NFTokenModifyTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         let account_id =
             decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+        // The token is located under its OWNER (the optional `Owner` field),
+        // which may differ from the sending Account (issuer / authorized minter).
+        let owner_str = helpers::get_str_field(ctx.tx, "Owner").unwrap_or(account_str);
+        let owner_id =
+            decode_account_id(owner_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
         let nftoken_id =
             helpers::get_str_field(ctx.tx, "NFTokenID").ok_or(TransactionResult::TemMalformed)?;
         let nft_hash = nft_hash(nftoken_id)?;
 
-        // Update the token's URI in whichever page holds it.
-        let page_key = nftoken::find_owner_page(ctx.view, &account_id, &nft_hash)
+        // Update the token's URI in whichever of the owner's pages holds it.
+        let page_key = nftoken::find_owner_page(ctx.view, &owner_id, &nft_hash)
             .ok_or(TransactionResult::TecNoEntry)?;
         let page_bytes = ctx
             .view
@@ -116,9 +134,8 @@ impl Transactor for NFTokenModifyTransactor {
             .view
             .read(&acct_key)
             .ok_or(TransactionResult::TerNoAccount)?;
-        let mut acct: Value =
+        let acct: Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        helpers::increment_sequence(&mut acct);
         let acct_data = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(acct_key, acct_data)
@@ -228,6 +245,63 @@ mod tests {
     }
 
     #[test]
+    fn modify_uri_via_owner_field() {
+        // A modifier that is not the token holder locates the token under the
+        // optional `Owner` field, not under the sending Account.
+        let (mut ledger, nftoken_id) = setup_with_token();
+
+        const MINTER: &str = "rf1BiGeXwwQoi8Z2ueFYTEXSwuJYfV2Jpn";
+        let minter_id = decode_account_id(MINTER).unwrap();
+        let minter = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": MINTER,
+            "Balance": "100000000",
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::account(&minter_id),
+                serde_json::to_vec(&minter).unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenModify",
+            "Account": MINTER,
+            "Owner": OWNER,
+            "NFTokenID": nftoken_id,
+            "URI": "https://minter-updated.com",
+            "Fee": "12",
+            "Sequence": 1,
+        });
+
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+
+        let result = NFTokenModifyTransactor.apply(&mut ctx).unwrap();
+        assert_eq!(result, TransactionResult::TesSuccess);
+
+        let owner_id = decode_account_id(OWNER).unwrap();
+        let page_key = keylet::nftoken_page_max(&owner_id);
+        let page_bytes = sandbox.read(&page_key).unwrap();
+        let page: Value = serde_json::from_slice(&page_bytes).unwrap();
+        assert_eq!(
+            page["NFTokens"][0]["NFToken"]["URI"].as_str().unwrap(),
+            "https://minter-updated.com"
+        );
+    }
+
+    #[test]
     fn reject_missing_uri() {
         let tx = serde_json::json!({
             "TransactionType": "NFTokenModify",
@@ -235,7 +309,8 @@ mod tests {
             "NFTokenID": "00000000000000000000000000000000B5F762798A53D543A014CAF8B297CFF8",
             "Fee": "12",
         });
-        let rules = Rules::new();
+        // DynamicNFT enabled so preflight reaches the URI check (not the gate).
+        let rules = Rules::from_enabled([feature_id("DynamicNFT")]);
         let fees = FeeSettings::default();
         let ctx = PreflightContext {
             tx: &tx,
@@ -245,6 +320,30 @@ mod tests {
         assert_eq!(
             NFTokenModifyTransactor.preflight(&ctx),
             Err(TransactionResult::TemMalformed)
+        );
+    }
+
+    #[test]
+    fn reject_when_dynamicnft_disabled() {
+        // A well-formed NFTokenModify (valid NFTokenID + URI) must still be
+        // rejected with temDISABLED while the DynamicNFT amendment is off.
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenModify",
+            "Account": OWNER,
+            "NFTokenID": "00000000000000000000000000000000B5F762798A53D543A014CAF8B297CFF8",
+            "URI": "https://new-uri.com",
+            "Fee": "12",
+        });
+        let rules = Rules::new(); // DynamicNFT not enabled
+        let fees = FeeSettings::default();
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            NFTokenModifyTransactor.preflight(&ctx),
+            Err(TransactionResult::TemDisabled)
         );
     }
 

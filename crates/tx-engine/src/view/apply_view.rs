@@ -19,6 +19,13 @@ pub trait ApplyView: ReadView {
     /// Record destroyed XRP drops (transaction fees).
     fn destroy_drops(&mut self, drops: u64);
 
+    /// Record the amount this transaction actually delivered (rippled's
+    /// `ApplyContext::deliver`). A Payment sets it only when the delivered
+    /// amount differs from the requested `Amount` (a partial or path-limited
+    /// delivery), and the engine then writes `sfDeliveredAmount` into the
+    /// metadata. Default is a no-op for views that do not track it.
+    fn set_delivered_amount(&mut self, _amount: serde_json::Value) {}
+
     /// Whether the `SortedDirectories` amendment is active. Gates directory
     /// maintenance: when enabled, owner directories are kept sorted and entry
     /// removal preserves order; otherwise rippled's legacy append / swap-with-
@@ -26,7 +33,39 @@ pub trait ApplyView: ReadView {
     fn sorted_directories(&self) -> bool {
         false
     }
+
+    /// Whether the `fixPreviousTxnID` amendment is active. Gates directory-node
+    /// threading: when enabled, freshly created `DirectoryNode` pages carry
+    /// `sfPreviousTxnID` / `sfPreviousTxnLgrSeq` (filled by central stamping);
+    /// before the amendment rippled left directory nodes unthreaded, so
+    /// replaying pre-amendment ledgers must omit those fields. Defaults to
+    /// `true` (modern behaviour) for views that do not set it.
+    fn thread_directories(&self) -> bool {
+        true
+    }
+
+    /// Snapshot the current mutation state so a speculative sub-flow can be
+    /// rolled back (rippled's nested `ApplyView`/`Sandbox` checkpointing, used by
+    /// `flow`'s multi-pass strand trials). The returned token is opaque; pass it
+    /// back to [`ApplyView::rollback`] to restore the view to exactly this point.
+    ///
+    /// The default (for non-`Sandbox` views) returns an empty token and
+    /// `rollback` is a no-op — only the copy-on-write `Sandbox` supports true
+    /// speculative nesting.
+    fn checkpoint(&self) -> ApplyCheckpoint {
+        ApplyCheckpoint(None)
+    }
+
+    /// Restore the view to a previous [`ApplyView::checkpoint`]. Mutations made
+    /// after the checkpoint are discarded.
+    fn rollback(&mut self, _cp: ApplyCheckpoint) {}
 }
+
+/// Opaque snapshot of an [`ApplyView`]'s mutation state, taken by
+/// [`ApplyView::checkpoint`] and consumed by [`ApplyView::rollback`]. Carries a
+/// type-erased copy of the concrete view's internal change set (only `Sandbox`
+/// produces a non-empty one).
+pub struct ApplyCheckpoint(pub(crate) Option<Box<dyn std::any::Any>>);
 
 /// Errors from apply view operations.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

@@ -7,8 +7,9 @@ use crate::error::RpcServerError;
 
 /// Admin command to control transaction relay load.
 ///
-/// When enabled, reduces the volume of transaction relay messages
-/// to lower bandwidth usage.
+/// The flag is accepted and echoed back, but the overlay does not yet expose a
+/// backing knob to act on it, so setting it currently has no effect on relay
+/// volume.
 pub async fn tx_reduce_relay(
     params: Value,
     _ctx: &Arc<ServerContext>,

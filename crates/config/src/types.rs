@@ -27,6 +27,34 @@ pub struct NodeConfig {
     pub reporting: ReportingConfig,
     #[serde(default)]
     pub amendments: AmendmentConfig,
+    #[serde(default)]
+    pub fee_vote: FeeVoteConfig,
+}
+
+/// Fee / reserve voting targets advertised at flag ledgers.
+///
+/// Mirrors rippled's `[voting]` config section. Each field is the value this
+/// validator *wants* for the corresponding fee parameter. A `None` field means
+/// "no preference" — the node votes for the current on-ledger value and never
+/// pushes to change that parameter. With every field unset (the default), fee
+/// voting is a complete no-op: no vote fields are added to validations and no
+/// `SetFee` pseudo-transaction is ever produced, so a non-configured node is
+/// byte-for-byte identical to one without fee voting at all.
+///
+/// Consensus note: a fee change only enacts when a super-majority of the UNL
+/// agrees, so these targets must be coordinated across the trusted validator
+/// set — a lone divergent target simply never reaches majority.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct FeeVoteConfig {
+    /// Preferred base transaction fee, in drops (`sfBaseFeeDrops`).
+    #[serde(default)]
+    pub base_fee_drops: Option<u64>,
+    /// Preferred account base reserve, in drops (`sfReserveBaseDrops`).
+    #[serde(default)]
+    pub reserve_base_drops: Option<u64>,
+    /// Preferred owner reserve increment, in drops (`sfReserveIncrementDrops`).
+    #[serde(default)]
+    pub reserve_increment_drops: Option<u64>,
 }
 
 /// Reporting mode configuration.
@@ -107,6 +135,12 @@ pub struct PeerConfig {
     /// Maximum number of peer connections.
     #[serde(default = "default_max_peers")]
     pub max_peers: usize,
+    /// Outbound slots an inbound peer may never occupy (eclipse-attack resistance).
+    #[serde(default = "default_reserved_outbound_slots")]
+    pub reserved_outbound_slots: usize,
+    /// Max simultaneous peers sharing one remote IP (eclipse-attack resistance).
+    #[serde(default = "default_max_peers_per_ip")]
+    pub max_peers_per_ip: usize,
     /// Bootstrap peer addresses.
     #[serde(default = "default_seeds")]
     pub seeds: Vec<String>,
@@ -133,6 +167,14 @@ fn default_max_peers() -> usize {
     21
 }
 
+fn default_reserved_outbound_slots() -> usize {
+    6
+}
+
+fn default_max_peers_per_ip() -> usize {
+    2
+}
+
 fn default_seeds() -> Vec<String> {
     Vec::new()
 }
@@ -142,6 +184,8 @@ impl Default for PeerConfig {
         Self {
             port: default_peer_port(),
             max_peers: default_max_peers(),
+            reserved_outbound_slots: default_reserved_outbound_slots(),
+            max_peers_per_ip: default_max_peers_per_ip(),
             seeds: default_seeds(),
             fixed_peers: Vec::new(),
             node_seed: None,

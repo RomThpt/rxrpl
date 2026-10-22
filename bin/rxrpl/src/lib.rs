@@ -86,7 +86,7 @@ pub enum Commands {
         /// Node run mode
         #[arg(short, long, default_value = "standalone", value_enum)]
         mode: RunMode,
-        /// Genesis account address
+        /// Genesis account address (standalone mode only)
         #[arg(long, default_value = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh")]
         genesis_account: String,
         /// Ledger close interval in seconds
@@ -252,6 +252,24 @@ pub enum Commands {
     ConfigValidate {
         /// Path to the TOML config (defaults to the global --config path).
         path: Option<PathBuf>,
+    },
+
+    /// Replay a checkpoint-seeded segment from `xrpl-state-compare` XSCP packs
+    /// and print one JSON line per ledger (hashes + per-tx emitted metadata).
+    /// The differential lab's worker invokes this per leased segment.
+    ReplaySegment {
+        /// Path to the checkpoint STATE pack (`state/ckpt-<start>.pack`).
+        #[arg(long)]
+        state: PathBuf,
+        /// Paths to the LEDGER packs covering `start..=end` (repeatable).
+        #[arg(long = "ledgers", required = true, num_args = 1..)]
+        ledgers: Vec<PathBuf>,
+        /// Segment start (== the checkpoint sequence).
+        #[arg(long)]
+        start: u64,
+        /// Segment end (inclusive).
+        #[arg(long)]
+        end: u64,
     },
 }
 

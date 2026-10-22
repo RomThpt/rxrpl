@@ -117,7 +117,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_sends_connect_commands() {
         let seeds = vec!["127.0.0.1:51235".to_string(), "127.0.0.1:51236".to_string()];
-        let peer_set = Arc::new(PeerSet::new(10));
+        let peer_set = Arc::new(PeerSet::new(10, 0, usize::MAX));
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let discovery = PeerDiscovery::new(seeds, peer_set, cmd_tx, 10);
@@ -136,7 +136,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_peers_response_deduplicates() {
-        let peer_set = Arc::new(PeerSet::new(10));
+        let peer_set = Arc::new(PeerSet::new(10, 0, usize::MAX));
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let discovery = PeerDiscovery::new(vec![], peer_set, cmd_tx, 10);
@@ -158,12 +158,14 @@ mod tests {
 
     #[tokio::test]
     async fn respects_max_peers() {
-        let peer_set = Arc::new(PeerSet::new(1));
+        let peer_set = Arc::new(PeerSet::new(1, 0, usize::MAX));
         // Fill peer_set to capacity
         let info = Arc::new(crate::peer_set::PeerInfo {
             node_id: rxrpl_primitives::Hash256::new([0x01; 32]),
             address: "127.0.0.1:9999".to_string(),
             inbound: false,
+            public_key: vec![0x03; 33],
+            connected_at: std::time::Instant::now(),
             ledger_seq: std::sync::atomic::AtomicU32::new(0),
             reputation: crate::reputation::PeerReputation::new(),
             scoring: crate::peer_score::PeerScore::new(),

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use rxrpl_primitives::Hash256;
 
 use crate::view::sandbox::SandboxChanges;
@@ -11,8 +13,9 @@ pub struct TxMeta {
     pub tx_index: u32,
     /// Result code.
     pub result_code: i32,
-    /// Delivered amount for payments (if applicable).
-    pub delivered_amount: Option<String>,
+    /// Delivered amount for payments (if applicable). An XRP-drops string or an
+    /// IOU/MPT amount object, mirroring rippled's `sfDeliveredAmount`.
+    pub delivered_amount: Option<serde_json::Value>,
 }
 
 /// A ledger entry affected by a transaction.
@@ -28,6 +31,11 @@ pub struct AffectedNode {
     pub previous: Option<Vec<u8>>,
     /// New state (for created/modified).
     pub final_fields: Option<Vec<u8>>,
+    /// Node-level `(PreviousTxnID, PreviousTxnLgrSeq)` a modified node carried
+    /// before this tx threaded it (rippled `threadItem`). `None` when the node
+    /// is not threaded; the zero placeholder of a recreated directory is left
+    /// in place so it is filtered out downstream.
+    pub prev_txn: Option<(serde_json::Value, serde_json::Value)>,
 }
 
 /// How a ledger entry was changed.
@@ -80,8 +88,19 @@ fn is_default_json(v: &serde_json::Value) -> bool {
         serde_json::Value::Number(n) => n.as_u64() == Some(0) || n.as_i64() == Some(0),
         serde_json::Value::String(s) => s.is_empty() || s.chars().all(|c| c == '0'),
         serde_json::Value::Array(a) => a.is_empty(),
-        // STAmount: default is a zero value (XRP or IOU).
-        serde_json::Value::Object(o) => o.get("value").and_then(|x| x.as_str()) == Some("0"),
+        serde_json::Value::Object(o) => {
+            // STAmount: `isDefault() == value_ == 0 && native()`. A native (XRP)
+            // amount is a string, so an object amount (an IOU/MPT, which carries a
+            // currency/issuer) is never default — even at value 0 (so a created
+            // node's zero Balance/LowLimit/HighLimit is still serialized).
+            if o.contains_key("value") {
+                return false;
+            }
+            // STIssue: the default is the XRP issue (`{"currency":"XRP"}`, no
+            // issuer). rippled keeps SoeRequired Asset in the state SLE but
+            // omits this default value from a CreatedNode's NewFields.
+            o.get("issuer").is_none() && o.get("currency").and_then(|x| x.as_str()) == Some("XRP")
+        }
     }
 }
 
@@ -109,6 +128,33 @@ fn section_fields(
     out
 }
 
+/// True when the only differences between the original and final node are the
+/// threading fields (`PreviousTxnID` / `PreviousTxnLgrSeq`). Such a node was
+/// touched purely to re-point its transaction thread (rippled's `threadOwners`)
+/// and carries no FinalFields/PreviousFields in the metadata.
+fn is_threading_only(
+    prev: &serde_json::Map<String, serde_json::Value>,
+    fin: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    prev.keys()
+        .chain(fin.keys())
+        .all(|k| k == "PreviousTxnID" || k == "PreviousTxnLgrSeq" || prev.get(k) == fin.get(k))
+}
+
+/// True when the final node gained a metadata-eligible field that was absent
+/// (or at its default) in the original — i.e. a pure field addition. rippled
+/// still emits a (possibly empty) `PreviousFields` container in that case.
+fn has_added_field(
+    prev: &serde_json::Map<String, serde_json::Value>,
+    fin: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    fin.iter().any(|(k, v)| {
+        should_meta(k, SMD_CHANGE_NEW)
+            && !is_default_json(v)
+            && prev.get(k).map(is_default_json).unwrap_or(true)
+    })
+}
+
 /// `PreviousFields`: original values of fields that changed and carry the
 /// `ChangeOrig` flag (rippled's `shouldMeta(kSmdChangeOrig)` over the orig node).
 fn changed_previous_fields(
@@ -126,7 +172,13 @@ fn changed_previous_fields(
 
 impl SandboxChanges {
     /// Build transaction metadata from these sandbox changes.
-    pub fn build_metadata(&self, tx_index: u32, result_code: i32) -> TxMeta {
+    pub fn build_metadata(
+        &self,
+        tx_index: u32,
+        result_code: i32,
+        node_prev_txn: &HashMap<Hash256, (serde_json::Value, serde_json::Value)>,
+        delivered_amount: Option<serde_json::Value>,
+    ) -> TxMeta {
         let mut affected_nodes = Vec::new();
 
         for (key, data) in &self.inserts {
@@ -136,6 +188,7 @@ impl SandboxChanges {
                 ledger_entry_type: extract_entry_type(data),
                 previous: None,
                 final_fields: Some(data.clone()),
+                prev_txn: None,
             });
         }
 
@@ -146,6 +199,7 @@ impl SandboxChanges {
                 ledger_entry_type: extract_entry_type(data),
                 previous: self.originals.get(key).cloned(),
                 final_fields: Some(data.clone()),
+                prev_txn: node_prev_txn.get(key).cloned(),
             });
         }
 
@@ -163,6 +217,7 @@ impl SandboxChanges {
                 // zero before deletion). Equals the original when nothing
                 // mutated it first, so a plain delete shows no PreviousFields.
                 final_fields: Some(data.clone()),
+                prev_txn: None,
             });
         }
 
@@ -170,7 +225,7 @@ impl SandboxChanges {
             affected_nodes,
             tx_index,
             result_code,
-            delivered_amount: None,
+            delivered_amount,
         }
     }
 }
@@ -209,20 +264,41 @@ impl TxMeta {
                     if prev == fin {
                         continue;
                     }
-                    // Threaded types (those carrying PreviousTxnID) record the
-                    // PREVIOUS values at the node level, via threadItem.
-                    for f in ["PreviousTxnID", "PreviousTxnLgrSeq"] {
-                        if let Some(v) = prev.get(f).filter(|v| !is_default_json(v)) {
-                            inner.insert(f.into(), v.clone());
+                    // Threaded types record, at the node level, the value the
+                    // SLE carried BEFORE this tx threaded it (rippled threadItem
+                    // / SLE::thread) — captured pre-stamp, not the parent's. A
+                    // directory emptied and recreated this tx holds only a zero
+                    // placeholder, which is default and thus omitted, matching
+                    // rippled leaving the recreated node unthreaded in metadata.
+                    if let Some((pid, pseq)) = &n.prev_txn {
+                        if !is_default_json(pid) {
+                            inner.insert("PreviousTxnID".into(), pid.clone());
+                            inner.insert("PreviousTxnLgrSeq".into(), pseq.clone());
                         }
                     }
-                    let finals = section_fields(&fin, SMD_ALWAYS | SMD_CHANGE_NEW, false);
-                    if !finals.is_empty() {
-                        inner.insert("FinalFields".into(), finals.into());
-                    }
-                    let prevs = changed_previous_fields(&prev, &fin);
-                    if !prevs.is_empty() {
-                        inner.insert("PreviousFields".into(), prevs.into());
+                    // A node that only had its transaction thread re-pointed
+                    // (PreviousTxnID/LgrSeq) — e.g. an Escrow/PayChannel destination
+                    // AccountRoot, or an issuer restamped because a new object was
+                    // linked into its directory — is threaded in rippled via
+                    // threadOwners and carries NO FinalFields or PreviousFields,
+                    // only the node-level PreviousTxnID/LgrSeq.
+                    if !is_threading_only(&prev, &fin) {
+                        let finals = section_fields(&fin, SMD_ALWAYS | SMD_CHANGE_NEW, false);
+                        if !finals.is_empty() {
+                            inner.insert("FinalFields".into(), finals.into());
+                        }
+                        let prevs = changed_previous_fields(&prev, &fin);
+                        if !prevs.is_empty() {
+                            inner.insert("PreviousFields".into(), prevs.into());
+                        } else if has_added_field(&prev, &fin) {
+                            // rippled still emits an (empty) PreviousFields when the
+                            // node's only metadata-eligible changes are additions of
+                            // fields that were previously at their default (absent)
+                            // value — e.g. a Vault's AssetsTotal/AssetsAvailable on
+                            // the first deposit. The prior values (defaults) are not
+                            // recorded, leaving the object empty.
+                            inner.insert("PreviousFields".into(), serde_json::Map::new().into());
+                        }
                     }
                     "ModifiedNode"
                 }
@@ -246,7 +322,7 @@ impl TxMeta {
         meta.insert("TransactionResult".into(), self.result_code.into());
         meta.insert("AffectedNodes".into(), serde_json::Value::Array(affected));
         if let Some(amt) = &self.delivered_amount {
-            meta.insert("DeliveredAmount".into(), amt.clone().into());
+            meta.insert("DeliveredAmount".into(), amt.clone());
         }
         serde_json::Value::Object(meta)
     }
@@ -277,7 +353,7 @@ mod tests {
             destroyed_drops: 0,
         };
 
-        let meta = changes.build_metadata(0, 0);
+        let meta = changes.build_metadata(0, 0, &HashMap::new(), None);
         assert_eq!(meta.affected_nodes.len(), 1);
         assert_eq!(meta.affected_nodes[0].change_type, ChangeType::Created);
         assert_eq!(meta.affected_nodes[0].ledger_entry_type, "AccountRoot");
@@ -298,7 +374,7 @@ mod tests {
             destroyed_drops: 10,
         };
 
-        let meta = changes.build_metadata(1, 0);
+        let meta = changes.build_metadata(1, 0, &HashMap::new(), None);
         assert_eq!(meta.affected_nodes.len(), 1);
         assert_eq!(meta.affected_nodes[0].change_type, ChangeType::Modified);
         assert!(meta.affected_nodes[0].previous.is_some());
@@ -317,7 +393,7 @@ mod tests {
             destroyed_drops: 0,
         };
 
-        let meta = changes.build_metadata(0, 0);
+        let meta = changes.build_metadata(0, 0, &HashMap::new(), None);
         assert_eq!(meta.affected_nodes.len(), 1);
         assert_eq!(meta.affected_nodes[0].change_type, ChangeType::Deleted);
         assert!(meta.affected_nodes[0].previous.is_some());

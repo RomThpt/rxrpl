@@ -94,6 +94,11 @@ fn e2e_negative_unl_generates_and_applies_pseudo_txs() {
 
     // Apply negative-UNL pseudo-txs at flag ledger 256.
     let mut ledger = node.ledger().blocking_write();
+    let nunl_key = keylet::negative_unl();
+    let key5 = keys.get(&nid(5)).unwrap().clone();
+
+    // Deferred move at flag 256 is a no-op (nothing pending yet).
+    Node::update_negative_unl(&mut ledger, 256);
     let results = Node::apply_negative_unl(
         &mut consensus,
         &mut ledger,
@@ -111,30 +116,49 @@ fn e2e_negative_unl_generates_and_applies_pseudo_txs() {
         "UNLModify pseudo-tx must apply successfully"
     );
 
-    // NegativeUNL ledger entry exists and lists validator 5.
+    // Deferred model: only the pending ValidatorToDisable is recorded here.
     let nunl_data = ledger
-        .get_state(&keylet::negative_unl())
+        .get_state(&nunl_key)
         .expect("NegativeUNL SLE present after pseudo-tx");
     let nunl: Value = sle_codec::decode_state(nunl_data).unwrap();
     assert_eq!(nunl["LedgerEntryType"], "NegativeUNL");
-    let disabled = nunl["DisabledValidators"].as_array().unwrap();
+    assert_eq!(nunl["ValidatorToDisable"].as_str().unwrap(), key5);
+    assert!(nunl.get("DisabledValidators").is_none());
+
+    // Engine UNL must be in sync with on-ledger intent immediately.
+    assert!(consensus.unl().is_in_negative_unl(&nid(5)));
+
+    // The deferred move at the next flag ledger (512) makes the demotion
+    // effective: validator 5 lands in DisabledValidators with the wrapper
+    // shape and FirstLedgerSequence stamp.
+    Node::update_negative_unl(&mut ledger, 512);
+    let moved: Value = sle_codec::decode_state(ledger.get_state(&nunl_key).unwrap()).unwrap();
+    let disabled = moved["DisabledValidators"].as_array().unwrap();
     assert_eq!(
         disabled.len(),
         1,
         "validator 5 must be the sole demoted entry"
     );
-    let key5 = keys.get(&nid(5)).unwrap();
-    assert_eq!(disabled[0]["PublicKey"].as_str().unwrap(), key5);
-
-    // Engine UNL must be in sync with on-ledger state.
-    assert!(consensus.unl().is_in_negative_unl(&nid(5)));
+    assert_eq!(
+        disabled[0]["DisabledValidator"]["PublicKey"]
+            .as_str()
+            .unwrap(),
+        key5
+    );
+    assert_eq!(
+        disabled[0]["DisabledValidator"]["FirstLedgerSequence"]
+            .as_u64()
+            .unwrap(),
+        512
+    );
+    assert!(moved.get("ValidatorToDisable").is_none());
 
     // The entry must survive a subsequent ledger close (B7 invariant
     // exercised through the node's owned ledger).
     ledger.close(123, 0).unwrap();
     let after_close = ledger
-        .get_state(&keylet::negative_unl())
+        .get_state(&nunl_key)
         .expect("NegativeUNL must survive ledger close in the e2e flow");
     let reloaded: Value = sle_codec::decode_state(after_close).unwrap();
-    assert_eq!(reloaded["DisabledValidators"].as_array().unwrap().len(), 1,);
+    assert_eq!(reloaded["DisabledValidators"].as_array().unwrap().len(), 1);
 }

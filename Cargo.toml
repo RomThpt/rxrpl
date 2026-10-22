@@ -76,7 +76,8 @@ clap = { version = "4", features = ["derive"] }
 # Storage
 rocksdb = "0.22"
 rusqlite = { version = "0.31", features = ["bundled"] }
-lru = "0.12"
+lru = "0.18.2"
+lz4_flex = { version = "0.14", default-features = false, features = ["safe-decode"] }
 
 # WASM
 wasmi = "0.40"

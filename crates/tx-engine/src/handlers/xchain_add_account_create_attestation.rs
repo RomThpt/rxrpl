@@ -40,7 +40,7 @@ impl Transactor for XChainAddAccountCreateAttestationTransactor {
         helpers::get_u32_field(ctx.tx, "WasLockingChainSend")
             .ok_or(TransactionResult::TemMalformed)?;
 
-        Ok(())
+        crate::xchain_attestation::verify_attestation_proof(ctx.tx, true)
     }
 
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
@@ -55,7 +55,7 @@ impl Transactor for XChainAddAccountCreateAttestationTransactor {
             return Err(TransactionResult::TecNoEntry);
         }
 
-        Ok(())
+        crate::xchain_attestation::check_attestation_signer(ctx.view, ctx.tx)
     }
 
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
@@ -86,7 +86,9 @@ impl Transactor for XChainAddAccountCreateAttestationTransactor {
         // and the reward pool.
         let bridge_key = bridge_helpers::find_bridge_keylet(&bridge, |k| ctx.view.exists(k))?;
         let mut bridge_sle: serde_json::Value = serde_json::from_slice(
-            &ctx.view.read(&bridge_key).ok_or(TransactionResult::TecNoEntry)?,
+            &ctx.view
+                .read(&bridge_key)
+                .ok_or(TransactionResult::TecNoEntry)?,
         )
         .map_err(|_| TransactionResult::TefInternal)?;
         let door_str = bridge_sle["Account"]
@@ -133,7 +135,9 @@ impl Transactor for XChainAddAccountCreateAttestationTransactor {
             })
             .unwrap_or_default();
         let inner = |e: &serde_json::Value| -> serde_json::Value {
-            e.get("XChainCreateAccountProofSig").cloned().unwrap_or_else(|| e.clone())
+            e.get("XChainCreateAccountProofSig")
+                .cloned()
+                .unwrap_or_else(|| e.clone())
         };
         if let Some(slot) = atts.iter_mut().find(|e| {
             inner(e)["AttestationSignerAccount"].as_str() == Some(attestation_signer.as_str())
@@ -177,27 +181,31 @@ impl Transactor for XChainAddAccountCreateAttestationTransactor {
                 &reward_accounts,
                 ledger_seq,
             )?;
-            // Advance the door's processed-create counter; a never-created object
-            // is left behind (transient create + delete).
+            if ctx.view.exists(&create_key) {
+                crate::xchain_attestation::remove_claim(ctx.view, &door_str, &create_key)?;
+            }
+            // Advance the door's processed-create counter after releasing any
+            // claim object persisted while waiting for quorum.
             bridge_sle["XChainAccountClaimCount"] =
                 serde_json::Value::String(create_count.to_string());
             ctx.view
                 .update(
                     bridge_key,
-                    serde_json::to_vec(&bridge_sle)
-                        .map_err(|_| TransactionResult::TefInternal)?,
+                    serde_json::to_vec(&bridge_sle).map_err(|_| TransactionResult::TefInternal)?,
                 )
                 .map_err(|_| TransactionResult::TefInternal)?;
         } else if ctx.view.read(&create_key).is_none() {
             // No quorum yet: create the door-owned create-account claim id object.
             let door_id =
                 decode_account_id(&door_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+            let owner_node = crate::owner_dir::add_to_owner_dir(ctx.view, &door_id, &create_key)?;
             let entry = serde_json::json!({
                 "LedgerEntryType": "XChainOwnedCreateAccountClaimID",
                 "Account": door_str,
                 "XChainBridge": bridge,
                 "XChainAccountCreateCount": create_count.to_string(),
                 "XChainCreateAccountAttestations": atts,
+                "OwnerNode": format!("{owner_node:016X}"),
                 "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
                 "PreviousTxnLgrSeq": 0,
             });
@@ -207,10 +215,11 @@ impl Transactor for XChainAddAccountCreateAttestationTransactor {
                     serde_json::to_vec(&entry).map_err(|_| TransactionResult::TefInternal)?,
                 )
                 .map_err(|_| TransactionResult::TefInternal)?;
-            crate::owner_dir::add_to_owner_dir(ctx.view, &door_id, &create_key)?;
             let door_key = keylet::account(&door_id);
             let mut door_acct: serde_json::Value = serde_json::from_slice(
-                &ctx.view.read(&door_key).ok_or(TransactionResult::TerNoAccount)?,
+                &ctx.view
+                    .read(&door_key)
+                    .ok_or(TransactionResult::TerNoAccount)?,
             )
             .map_err(|_| TransactionResult::TefInternal)?;
             helpers::adjust_owner_count(&mut door_acct, 1);
@@ -222,10 +231,9 @@ impl Transactor for XChainAddAccountCreateAttestationTransactor {
                 .map_err(|_| TransactionResult::TefInternal)?;
         } else {
             // Existing object below quorum: store the merged attestations.
-            let mut entry: serde_json::Value = serde_json::from_slice(
-                &ctx.view.read(&create_key).unwrap(),
-            )
-            .map_err(|_| TransactionResult::TefInternal)?;
+            let mut entry: serde_json::Value =
+                serde_json::from_slice(&ctx.view.read(&create_key).unwrap())
+                    .map_err(|_| TransactionResult::TefInternal)?;
             entry["XChainCreateAccountAttestations"] = serde_json::Value::Array(atts);
             ctx.view
                 .update(
@@ -235,13 +243,14 @@ impl Transactor for XChainAddAccountCreateAttestationTransactor {
                 .map_err(|_| TransactionResult::TefInternal)?;
         }
 
-        // Increment sender sequence.
+        // Sequence and ticket consumption are handled by the transaction engine.
         let src_key = keylet::account(&account_id);
-        let mut src_account: serde_json::Value = serde_json::from_slice(
-            &ctx.view.read(&src_key).ok_or(TransactionResult::TerNoAccount)?,
+        let src_account: serde_json::Value = serde_json::from_slice(
+            &ctx.view
+                .read(&src_key)
+                .ok_or(TransactionResult::TerNoAccount)?,
         )
         .map_err(|_| TransactionResult::TefInternal)?;
-        helpers::increment_sequence(&mut src_account);
         ctx.view
             .update(
                 src_key,
@@ -363,7 +372,9 @@ mod tests {
     #[test]
     fn preflight_missing_count() {
         let mut tx = attestation_tx("1");
-        tx.as_object_mut().unwrap().remove("XChainAccountCreateCount");
+        tx.as_object_mut()
+            .unwrap()
+            .remove("XChainAccountCreateCount");
         let rules = Rules::new();
         let fees = FeeSettings::default();
         let ctx = PreflightContext {
@@ -443,6 +454,7 @@ mod tests {
             serde_json::from_slice(&sandbox.read(&keylet::account(&id)).unwrap()).unwrap()
         };
         // Door funds the new account (20000000) and the reward (100).
+        assert_eq!(read(WITNESS)["Sequence"], serde_json::json!(1));
         assert_eq!(read(DOOR)["Balance"].as_str().unwrap(), "979999900");
         assert_eq!(read(NEW_ACCOUNT)["Balance"].as_str().unwrap(), "20000000");
         assert_eq!(read(WITNESS)["Balance"].as_str().unwrap(), "1000000100");
@@ -496,5 +508,51 @@ mod tests {
         let door: serde_json::Value =
             serde_json::from_slice(&sandbox.read(&keylet::account(&door_id)).unwrap()).unwrap();
         assert_eq!(door["OwnerCount"].as_u64().unwrap(), 1);
+    }
+
+    #[test]
+    fn reaching_quorum_releases_existing_claim_and_owner_reserve() {
+        let mut ledger = setup(2);
+        let door_id = decode_account_id(DOOR).unwrap();
+        let signer_list_key = keylet::signer_list(&door_id);
+        let mut list: serde_json::Value =
+            serde_json::from_slice(ledger.get_state(&signer_list_key).unwrap()).unwrap();
+        list["SignerEntries"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "SignerEntry": {"Account": USER, "SignerWeight": 1}
+            }));
+        ledger
+            .put_state(signer_list_key, serde_json::to_vec(&list).unwrap())
+            .unwrap();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let mut tx = attestation_tx("1");
+        for witness in [WITNESS, USER] {
+            tx["Account"] = serde_json::json!(witness);
+            tx["AttestationSignerAccount"] = serde_json::json!(witness);
+            tx["AttestationRewardAccount"] = serde_json::json!(witness);
+            let mut ctx = ApplyContext {
+                tx: &tx,
+                view: &mut sandbox,
+                rules: &rules,
+                fees: &fees,
+            };
+            assert_eq!(
+                XChainAddAccountCreateAttestationTransactor.apply(&mut ctx),
+                Ok(TransactionResult::TesSuccess)
+            );
+        }
+        let bridge_data = bridge_helpers::serialize_bridge_spec(&bridge_spec()).unwrap();
+        assert!(!sandbox.exists(&keylet::xchain_create_account_claim_id(&bridge_data, 1)));
+        let door: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&keylet::account(&door_id)).unwrap()).unwrap();
+        assert_eq!(door["OwnerCount"], serde_json::json!(0));
+        let directory: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&keylet::owner_dir(&door_id)).unwrap()).unwrap();
+        assert!(directory["Indexes"].as_array().unwrap().is_empty());
     }
 }

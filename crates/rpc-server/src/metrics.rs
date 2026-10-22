@@ -301,6 +301,25 @@ pub fn install_recorder() -> PrometheusHandle {
         .expect("failed to install Prometheus recorder")
 }
 
+/// Process-wide Prometheus handle: installs the global recorder (and describes
+/// the metrics) on the first call, then returns a clone of the same handle on
+/// every subsequent call.
+///
+/// The global recorder can be installed only once per process, so node startup
+/// must go through this rather than [`install_recorder`] directly — otherwise a
+/// second node in the same process (e.g. an in-process multi-node test) would
+/// panic. Metrics are process-global anyway, so a shared handle is correct.
+pub fn global_handle() -> PrometheusHandle {
+    static METRICS_HANDLE: std::sync::OnceLock<PrometheusHandle> = std::sync::OnceLock::new();
+    METRICS_HANDLE
+        .get_or_init(|| {
+            let handle = install_recorder();
+            describe_metrics();
+            handle
+        })
+        .clone()
+}
+
 /// Describe all metrics with help text for the Prometheus exporter.
 ///
 /// Should be called once after the recorder is installed. This populates

@@ -3,6 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+use rxrpl_txq::{BASE_FEE_LEVEL, FeeMetrics};
+
 use crate::context::ServerContext;
 use crate::error::RpcServerError;
 
@@ -24,6 +26,22 @@ fn ledger_age(close_time: u32) -> u64 {
         .unwrap_or(0)
         .saturating_sub(RIPPLE_EPOCH_OFFSET);
     now.saturating_sub(close_time as u64)
+}
+
+const DROPS_PER_XRP: f64 = 1_000_000.0;
+
+/// `validated_ledger` fee/reserve fields (in XRP), from the live `FeeSettings`
+/// or the protocol defaults when no fee snapshot is attached (reporting mode).
+fn ledger_fee_fields(ctx: &Arc<ServerContext>) -> (f64, f64, f64) {
+    let fees = ctx.fees.as_ref();
+    let base_fee = fees.map(|f| f.base_fee).unwrap_or(10);
+    let reserve_base = fees.map(|f| f.reserve_base).unwrap_or(10_000_000);
+    let reserve_inc = fees.map(|f| f.reserve_increment).unwrap_or(2_000_000);
+    (
+        base_fee as f64 / DROPS_PER_XRP,
+        reserve_base as f64 / DROPS_PER_XRP,
+        reserve_inc as f64 / DROPS_PER_XRP,
+    )
 }
 
 /// Snapshot of "what's in the closed ledger window" used by both
@@ -80,6 +98,7 @@ async fn closed_ledgers_summary(ctx: &Arc<ServerContext>) -> ClosedLedgersSummar
     // In standalone (no slot attached) or before the first quorum is reached,
     // fall back to the locally-closed window — that's all the truth we have.
     let net = ctx.network_validated();
+    let (base_fee_xrp, reserve_base_xrp, reserve_inc_xrp) = ledger_fee_fields(ctx);
     if let Some(ref closed) = ctx.closed_ledgers {
         let closed = closed.read().await;
         if closed.is_empty() {
@@ -108,9 +127,9 @@ async fn closed_ledgers_summary(ctx: &Arc<ServerContext>) -> ClosedLedgersSummar
                     "hash": snap.hash.to_string(),
                     "close_time": snap.close_time,
                     "age": ledger_age(snap.close_time),
-                    "base_fee_xrp": 0.00001,
-                    "reserve_base_xrp": 10,
-                    "reserve_inc_xrp": 2,
+                    "base_fee_xrp": base_fee_xrp,
+                    "reserve_base_xrp": reserve_base_xrp,
+                    "reserve_inc_xrp": reserve_inc_xrp,
                 });
                 ClosedLedgersSummary {
                     complete_ledgers: format_ledger_ranges(&seqs),
@@ -126,9 +145,9 @@ async fn closed_ledgers_summary(ctx: &Arc<ServerContext>) -> ClosedLedgersSummar
                     "hash": last_ledger.header.hash.to_string(),
                     "close_time": last_ledger.header.close_time,
                     "age": ledger_age(last_ledger.header.close_time),
-                    "base_fee_xrp": 0.00001,
-                    "reserve_base_xrp": 10,
-                    "reserve_inc_xrp": 2,
+                    "base_fee_xrp": base_fee_xrp,
+                    "reserve_base_xrp": reserve_base_xrp,
+                    "reserve_inc_xrp": reserve_inc_xrp,
                 });
                 ClosedLedgersSummary {
                     complete_ledgers: format_ledger_ranges(&seqs),
@@ -180,6 +199,30 @@ pub async fn server_info(
         "peers": ctx.peer_count(),
         "uptime": ctx.uptime_seconds(),
     });
+    info["amendment_blocked"] = serde_json::json!(
+        ctx.amendment_blocked
+            .as_ref()
+            .map(|b| b.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+    );
+    // Live validation quorum (80% of the trusted UNL, or the configured
+    // override). 0 in standalone/reporting mode. Mirrors rippled's
+    // `validation_quorum` so operator dashboards can confirm the node's
+    // quorum target.
+    info["validation_quorum"] = ctx.validation_quorum().into();
+    // load_factor / load_base: fee-escalation level over the base fee level
+    // (256 = 1x). Reuses the same `FeeMetrics` computation as `queue_info` so
+    // dashboards see consistent numbers. With no tx queue attached (reporting
+    // mode), report no escalation.
+    let (load_base, load_factor) = if let Some(ref tq) = ctx.tx_queue {
+        let q = tq.read().await;
+        let metrics = FeeMetrics::from_queue(q.len(), q.max_size());
+        (BASE_FEE_LEVEL, metrics.escalated_fee_level(BASE_FEE_LEVEL))
+    } else {
+        (BASE_FEE_LEVEL, BASE_FEE_LEVEL)
+    };
+    info["load_base"] = load_base.into();
+    info["load_factor"] = load_factor.into();
     if let Some(lc) = ctx.last_close() {
         info["last_close"] = serde_json::json!({
             "proposers": lc.proposers,
@@ -217,6 +260,36 @@ pub async fn server_state(
             "complete_ledgers": summary.complete_ledgers,
         }
     }))
+}
+
+/// Feeds the overlay's peer `/crawl` endpoint the same server-level data that
+/// `server_info` reports. Kept sync (the crawl is served from the accept path),
+/// so the ledger window is read non-blocking via `try_read`.
+impl rxrpl_overlay::crawl::CrawlInfo for ServerContext {
+    fn crawl_snapshot(&self) -> rxrpl_overlay::crawl::CrawlServerSnapshot {
+        let server_state = if self.local_manifest().is_some() {
+            "proposing"
+        } else {
+            "full"
+        };
+        let complete_ledgers = self
+            .closed_ledgers
+            .as_ref()
+            .and_then(|cl| cl.try_read().ok())
+            .map(|guard| {
+                let mut seqs: Vec<u32> = guard.iter().map(|l| l.header.sequence).collect();
+                seqs.sort_unstable();
+                format_ledger_ranges(&seqs)
+            })
+            .unwrap_or_else(|| "empty".to_string());
+
+        rxrpl_overlay::crawl::CrawlServerSnapshot {
+            build_version: env!("CARGO_PKG_VERSION").to_string(),
+            server_state: server_state.to_string(),
+            complete_ledgers,
+            uptime_secs: self.uptime_seconds(),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -20,9 +20,6 @@ impl Transactor for XChainAddClaimAttestationTransactor {
         helpers::get_u64_str_field(ctx.tx, "XChainClaimID")
             .ok_or(TransactionResult::TemMalformed)?;
 
-        // Destination is required
-        helpers::get_destination(ctx.tx)?;
-
         // Amount is required
         helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
 
@@ -36,7 +33,7 @@ impl Transactor for XChainAddClaimAttestationTransactor {
         helpers::get_u32_field(ctx.tx, "WasLockingChainSend")
             .ok_or(TransactionResult::TemMalformed)?;
 
-        Ok(())
+        crate::xchain_attestation::verify_attestation_proof(ctx.tx, false)
     }
 
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
@@ -59,7 +56,7 @@ impl Transactor for XChainAddClaimAttestationTransactor {
             return Err(TransactionResult::TecXChainNoClaimId);
         }
 
-        Ok(())
+        crate::xchain_attestation::check_attestation_signer(ctx.view, ctx.tx)
     }
 
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
@@ -143,7 +140,9 @@ impl Transactor for XChainAddClaimAttestationTransactor {
             .cloned()
             .unwrap_or_default();
         let inner = |e: &serde_json::Value| -> serde_json::Value {
-            e.get("XChainClaimProofSig").cloned().unwrap_or_else(|| e.clone())
+            e.get("XChainClaimProofSig")
+                .cloned()
+                .unwrap_or_else(|| e.clone())
         };
         if let Some(slot) = atts.iter_mut().find(|e| {
             inner(e)["AttestationSignerAccount"].as_str() == Some(attestation_signer.as_str())
@@ -202,15 +201,14 @@ impl Transactor for XChainAddClaimAttestationTransactor {
                 .map_err(|_| TransactionResult::TefInternal)?;
         }
 
-        // Increment sender sequence.
+        // Sequence and ticket consumption are handled by the transaction engine.
         let src_key = keylet::account(&account_id);
         let src_bytes = ctx
             .view
             .read(&src_key)
             .ok_or(TransactionResult::TerNoAccount)?;
-        let mut src_account: serde_json::Value =
+        let src_account: serde_json::Value =
             serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        helpers::increment_sequence(&mut src_account);
 
         let src_data =
             serde_json::to_vec(&src_account).map_err(|_| TransactionResult::TefInternal)?;
@@ -511,6 +509,7 @@ mod tests {
         };
         // Door pays the full amount; dest receives it; reward (100) comes from the
         // claim owner and goes to the witness.
+        assert_eq!(read(WITNESS)["Sequence"], serde_json::json!(1));
         assert_eq!(read(DOOR)["Balance"].as_str().unwrap(), "90000000");
         assert_eq!(read(DEST)["Balance"].as_str().unwrap(), "110000000");
         assert_eq!(read(WITNESS)["Balance"].as_str().unwrap(), "100000100");

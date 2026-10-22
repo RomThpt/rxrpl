@@ -3,8 +3,20 @@ use std::collections::HashMap;
 use rxrpl_primitives::Hash256;
 
 use crate::fees::FeeSettings;
-use crate::view::apply_view::{ApplyError, ApplyView};
+use crate::view::apply_view::{ApplyCheckpoint, ApplyError, ApplyView};
 use crate::view::read_view::ReadView;
+
+/// Type-erased snapshot of a [`Sandbox`]'s mutation maps, carried inside an
+/// [`ApplyCheckpoint`]. Cloned by `Sandbox::checkpoint` and restored by
+/// `Sandbox::rollback`. Payment sandboxes hold only a few dozen SLEs, so the
+/// clone is cheap.
+struct SandboxSnapshot {
+    inserts: HashMap<Hash256, Vec<u8>>,
+    updates: HashMap<Hash256, Vec<u8>>,
+    deletes: HashMap<Hash256, Vec<u8>>,
+    originals: HashMap<Hash256, Vec<u8>>,
+    destroyed_drops: u64,
+}
 
 /// A copy-on-write mutation layer over a `ReadView`.
 ///
@@ -22,6 +34,12 @@ pub struct Sandbox<'a> {
     destroyed_drops: u64,
     /// Whether the `SortedDirectories` amendment is active for this apply.
     sorted_directories: bool,
+    /// Whether the `fixPreviousTxnID` amendment is active for this apply. Gates
+    /// whether newly created directory-node pages are threaded.
+    thread_directories: bool,
+    /// The amount this transaction actually delivered, set by a Payment when it
+    /// differs from the requested `Amount`; surfaced as `sfDeliveredAmount`.
+    delivered_amount: Option<serde_json::Value>,
 }
 
 impl<'a> Sandbox<'a> {
@@ -35,7 +53,15 @@ impl<'a> Sandbox<'a> {
             originals: HashMap::new(),
             destroyed_drops: 0,
             sorted_directories: false,
+            thread_directories: true,
+            delivered_amount: None,
         }
+    }
+
+    /// Take the amount recorded via [`ApplyView::set_delivered_amount`], if any.
+    /// The engine reads it after `apply` to write `sfDeliveredAmount` metadata.
+    pub fn take_delivered_amount(&mut self) -> Option<serde_json::Value> {
+        self.delivered_amount.take()
     }
 
     /// Record whether the `SortedDirectories` amendment is active. Set once per
@@ -44,10 +70,17 @@ impl<'a> Sandbox<'a> {
         self.sorted_directories = enabled;
     }
 
+    /// Record whether the `fixPreviousTxnID` amendment is active. Set once per
+    /// apply from the engine's `Rules`; inherited by child sandboxes.
+    pub fn set_thread_directories(&mut self, enabled: bool) {
+        self.thread_directories = enabled;
+    }
+
     /// Create a nested sandbox for speculative execution.
     pub fn child(&self) -> Sandbox<'_> {
         let mut c = Sandbox::new(self);
         c.sorted_directories = self.sorted_directories;
+        c.thread_directories = self.thread_directories;
         c
     }
 
@@ -233,8 +266,37 @@ impl ApplyView for Sandbox<'_> {
     fn destroy_drops(&mut self, drops: u64) {
         self.destroyed_drops += drops;
     }
+    fn set_delivered_amount(&mut self, amount: serde_json::Value) {
+        self.delivered_amount = Some(amount);
+    }
     fn sorted_directories(&self) -> bool {
         self.sorted_directories
+    }
+    fn thread_directories(&self) -> bool {
+        self.thread_directories
+    }
+
+    fn checkpoint(&self) -> ApplyCheckpoint {
+        ApplyCheckpoint(Some(Box::new(SandboxSnapshot {
+            inserts: self.inserts.clone(),
+            updates: self.updates.clone(),
+            deletes: self.deletes.clone(),
+            originals: self.originals.clone(),
+            destroyed_drops: self.destroyed_drops,
+        })))
+    }
+
+    fn rollback(&mut self, cp: ApplyCheckpoint) {
+        let Some(any) = cp.0 else { return };
+        let Ok(snap) = any.downcast::<SandboxSnapshot>() else {
+            return;
+        };
+        let snap = *snap;
+        self.inserts = snap.inserts;
+        self.updates = snap.updates;
+        self.deletes = snap.deletes;
+        self.originals = snap.originals;
+        self.destroyed_drops = snap.destroyed_drops;
     }
 }
 
@@ -261,8 +323,52 @@ impl SandboxChanges {
     /// centrally, covers all transaction types. We only touch entries that
     /// already expose `PreviousTxnID` so field-less types (DirectoryNode,
     /// LedgerHashes, Amendments, ...) are left untouched.
-    pub fn stamp_previous_txn(&mut self, tx_id_hex: &str, ledger_seq: u32) {
-        for data in self.inserts.values_mut().chain(self.updates.values_mut()) {
+    pub fn stamp_previous_txn(
+        &mut self,
+        tx_id_hex: &str,
+        ledger_seq: u32,
+    ) -> HashMap<Hash256, (serde_json::Value, serde_json::Value)> {
+        // rippled records a modified node's node-level PreviousTxnID as the
+        // value the SLE carried BEFORE this tx threaded it
+        // (`ApplyStateTable::threadItem` -> `SLE::thread`). A directory emptied
+        // then recreated in this tx carries only a fresh zero placeholder, so
+        // its metadata must not surface the parent's PreviousTxnID. Capture each
+        // updated node's pre-stamp value for the metadata builder to use.
+        let mut pre_stamp = HashMap::new();
+        for (key, data) in self.updates.iter_mut() {
+            let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(data) else {
+                continue;
+            };
+            let Some(obj) = v.as_object_mut() else {
+                continue;
+            };
+            if !obj.contains_key("PreviousTxnID") {
+                continue;
+            }
+            pre_stamp.insert(
+                *key,
+                (
+                    obj.get("PreviousTxnID")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    obj.get("PreviousTxnLgrSeq")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+            );
+            obj.insert(
+                "PreviousTxnID".to_string(),
+                serde_json::Value::String(tx_id_hex.to_string()),
+            );
+            obj.insert(
+                "PreviousTxnLgrSeq".to_string(),
+                serde_json::Value::Number(ledger_seq.into()),
+            );
+            if let Ok(bytes) = serde_json::to_vec(&v) {
+                *data = bytes;
+            }
+        }
+        for data in self.inserts.values_mut() {
             let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(data) else {
                 continue;
             };
@@ -283,6 +389,45 @@ impl SandboxChanges {
             if let Ok(bytes) = serde_json::to_vec(&v) {
                 *data = bytes;
             }
+        }
+        pre_stamp
+    }
+
+    /// Thread `sfAccountTxnID` on the sender's account root to the id of the
+    /// transaction being applied, mirroring rippled's base `Transactor::apply`:
+    ///
+    /// ```text
+    /// if (sle->isFieldPresent(sfAccountTxnID))
+    ///     sle->setFieldH256(sfAccountTxnID, ctx_.tx.getTransactionID());
+    /// ```
+    ///
+    /// rippled updates the field ONLY when it is already present (the account
+    /// opted in via `asfAccountTxnID`); accounts that never enabled it are left
+    /// untouched. The sender root is always in the change set (its sequence was
+    /// consumed), so we patch it in place here.
+    pub fn thread_account_txn_id(&mut self, account_key: &Hash256, tx_id_hex: &str) {
+        let Some(data) = self
+            .updates
+            .get_mut(account_key)
+            .or_else(|| self.inserts.get_mut(account_key))
+        else {
+            return;
+        };
+        let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(data) else {
+            return;
+        };
+        let Some(obj) = v.as_object_mut() else {
+            return;
+        };
+        if !obj.contains_key("AccountTxnID") {
+            return;
+        }
+        obj.insert(
+            "AccountTxnID".to_string(),
+            serde_json::Value::String(tx_id_hex.to_string()),
+        );
+        if let Ok(bytes) = serde_json::to_vec(&v) {
+            *data = bytes;
         }
     }
 
@@ -448,6 +593,60 @@ mod tests {
 
         assert_eq!(ledger.get_state(&k1), Some(&[10][..]));
         assert!(!ledger.has_state(&k2));
+    }
+
+    #[test]
+    fn checkpoint_rollback_restores_state() {
+        let (mut ledger, _) = genesis_view();
+        let existing = Hash256::new([0x10; 32]);
+        ledger.put_state(existing, vec![1]).unwrap();
+
+        let view = LedgerView::new(&ledger);
+        let mut sandbox = Sandbox::new(&view);
+        sandbox.update(existing, vec![2]).unwrap();
+
+        // Checkpoint, then mutate further (insert + update + erase + destroy).
+        let cp = sandbox.checkpoint();
+        let inserted = Hash256::new([0x11; 32]);
+        sandbox.insert(inserted, vec![9]).unwrap();
+        sandbox.update(existing, vec![3]).unwrap();
+        sandbox.erase(&existing).unwrap();
+        sandbox.destroy_drops(123);
+        assert!(!sandbox.exists(&existing));
+        assert!(sandbox.exists(&inserted));
+        assert_eq!(sandbox.destroyed_drops(), 123);
+
+        // Rollback restores exactly the checkpointed state.
+        sandbox.rollback(cp);
+        assert_eq!(sandbox.read(&existing), Some(vec![2]));
+        assert!(!sandbox.exists(&inserted));
+        assert_eq!(sandbox.destroyed_drops(), 0);
+    }
+
+    #[test]
+    fn reap_side_channel_survives_rollback() {
+        // The reap pattern: a deletion threaded out as a side-channel is
+        // re-applied AFTER rollback, so an unfunded-offer removal survives a
+        // discarded speculative trial (matches rippled's ofrsToRm -> accumSandbox).
+        let (mut ledger, _) = genesis_view();
+        let offer = Hash256::new([0x20; 32]);
+        ledger.put_state(offer, vec![1]).unwrap();
+
+        let view = LedgerView::new(&ledger);
+        let mut sandbox = Sandbox::new(&view);
+        let cp = sandbox.checkpoint();
+        // Speculative mutation that will be discarded.
+        sandbox.update(offer, vec![7]).unwrap();
+        // Side-channel reap recorded out of band.
+        let reap = vec![offer];
+        sandbox.rollback(cp);
+        // The trial's mutation is gone...
+        assert_eq!(sandbox.read(&offer), Some(vec![1]));
+        // ...but the reap is re-applied permanently.
+        for k in &reap {
+            sandbox.erase(k).unwrap();
+        }
+        assert!(!sandbox.exists(&offer));
     }
 
     #[test]

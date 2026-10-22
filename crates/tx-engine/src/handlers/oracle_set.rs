@@ -76,11 +76,17 @@ impl Transactor for OracleSetTransactor {
         let mut account: serde_json::Value =
             serde_json::from_slice(&account_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        helpers::increment_sequence(&mut account);
-
         let doc_id = helpers::get_u32_field(ctx.tx, "OracleDocumentID").unwrap();
         let oracle_key = keylet::oracle(&account_id, doc_id);
         let is_create = !ctx.view.exists(&oracle_key);
+
+        // On create, link the Oracle into the owner directory up front so its
+        // page index can be recorded as the SoeRequired sfOwnerNode on the SLE.
+        let owner_node = if is_create {
+            Some(add_to_owner_dir(ctx.view, &account_id, &oracle_key)?)
+        } else {
+            None
+        };
 
         let mut entry = if is_create {
             serde_json::json!({
@@ -88,6 +94,13 @@ impl Transactor for OracleSetTransactor {
                 "Owner": account_str,
                 "OracleDocumentID": doc_id,
                 "Flags": 0,
+                // Owner-directory page hint (SoeRequired).
+                "OwnerNode": format!("{:016X}", owner_node.unwrap()),
+                // Placeholders filled by the engine's central PreviousTxnID
+                // stamping (it only backfills entries that already carry the
+                // field, so both must be seeded here).
+                "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
+                "PreviousTxnLgrSeq": 0,
             })
         } else {
             let entry_bytes = ctx
@@ -107,36 +120,90 @@ impl Transactor for OracleSetTransactor {
             entry["LastUpdateTime"] = serde_json::Value::from(last_update_time);
         }
         if let Some(tx_series) = ctx.tx.get("PriceDataSeries").and_then(|v| v.as_array()) {
-            // rippled merges the update into the existing series: each tx entry
-            // updates the matching (BaseAsset, QuoteAsset) pair in place, keeping
-            // the existing order, and new pairs are appended. A replacement would
-            // reorder the array and diverge byte-for-byte.
-            let asset_key = |p: &serde_json::Value| -> (String, String) {
-                let pd = p.get("PriceData").unwrap_or(p);
-                (
-                    pd.get("BaseAsset")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    pd.get("QuoteAsset")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                )
+            // Mirror rippled SetOracle::doApply: rebuild the series from a map
+            // keyed by (BaseAsset, QuoteAsset). Existing pairs are seeded with
+            // ONLY their asset codes — their prior AssetPrice/Scale are dropped.
+            // Each tx pair then either (a) sets a price when AssetPrice is
+            // present, (b) deletes the pair when AssetPrice is absent, or (c)
+            // adds a brand-new priced pair. The result is emitted in ascending
+            // (BaseAsset, QuoteAsset) currency order — the std::map iteration
+            // order — so a pair that was priced before but is left untouched by
+            // this tx ends up with no price at all.
+            use std::collections::BTreeMap;
+
+            // Encode a currency code to its canonical 20-byte form, matching the
+            // codec, so the BTreeMap orders pairs exactly like rippled's
+            // std::pair<Currency, Currency>.
+            let currency_key = |c: &str| -> [u8; 20] {
+                let mut b = [0u8; 20];
+                if c == "XRP" {
+                    // 20 zero bytes.
+                } else if c.len() == 3 {
+                    let s = c.as_bytes();
+                    b[12] = s[0];
+                    b[13] = s[1];
+                    b[14] = s[2];
+                } else if c.len() == 40 {
+                    if let Ok(d) = hex::decode(c) {
+                        if d.len() == 20 {
+                            b.copy_from_slice(&d);
+                        }
+                    }
+                }
+                b
             };
-            let mut merged: Vec<serde_json::Value> = entry
-                .get("PriceDataSeries")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            for tx_pd in tx_series {
-                let k = asset_key(tx_pd);
-                if let Some(pos) = merged.iter().position(|e| asset_key(e) == k) {
-                    merged[pos] = tx_pd.clone();
-                } else {
-                    merged.push(tx_pd.clone());
+            let asset_str = |pd: &serde_json::Value, field: &str| -> String {
+                pd.get(field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+
+            let mut pairs: BTreeMap<([u8; 20], [u8; 20]), serde_json::Value> = BTreeMap::new();
+
+            // Seed the existing pairs carrying ONLY their asset codes.
+            if let Some(existing) = entry.get("PriceDataSeries").and_then(|v| v.as_array()) {
+                for e in existing {
+                    let pd = e.get("PriceData").unwrap_or(e);
+                    let base = asset_str(pd, "BaseAsset");
+                    let quote = asset_str(pd, "QuoteAsset");
+                    let key = (currency_key(&base), currency_key(&quote));
+                    pairs.insert(
+                        key,
+                        serde_json::json!({
+                            "PriceData": { "BaseAsset": base, "QuoteAsset": quote }
+                        }),
+                    );
                 }
             }
+
+            // Apply the tx's update/add/delete operations.
+            for tx_pd in tx_series {
+                let pd = tx_pd.get("PriceData").unwrap_or(tx_pd);
+                let base = asset_str(pd, "BaseAsset");
+                let quote = asset_str(pd, "QuoteAsset");
+                let key = (currency_key(&base), currency_key(&quote));
+                match pd.get("AssetPrice") {
+                    None => {
+                        // Token pair carried without a price is deleted.
+                        pairs.remove(&key);
+                    }
+                    Some(price) => {
+                        let slot = pairs.entry(key).or_insert_with(|| {
+                            serde_json::json!({
+                                "PriceData": { "BaseAsset": base, "QuoteAsset": quote }
+                            })
+                        });
+                        let inner = &mut slot["PriceData"];
+                        inner["AssetPrice"] = price.clone();
+                        if let Some(scale) = pd.get("Scale") {
+                            inner["Scale"] = scale.clone();
+                        }
+                    }
+                }
+            }
+
+            let merged: Vec<serde_json::Value> = pairs.into_values().collect();
             entry["PriceDataSeries"] = serde_json::Value::Array(merged);
         }
 
@@ -146,7 +213,6 @@ impl Transactor for OracleSetTransactor {
             ctx.view
                 .insert(oracle_key, entry_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
-            add_to_owner_dir(ctx.view, &account_id, &oracle_key)?;
             helpers::adjust_owner_count(&mut account, 1);
         } else {
             ctx.view
@@ -328,6 +394,13 @@ mod tests {
         let entry: serde_json::Value = serde_json::from_slice(&entry_bytes).unwrap();
         assert_eq!(entry["Provider"].as_str().unwrap(), "chainlink");
         assert_eq!(entry["Owner"].as_str().unwrap(), ALICE);
+        // The created Oracle carries the owner-directory page hint (sfOwnerNode)
+        // and the PreviousTxnID placeholder the central stamp backfills.
+        assert_eq!(entry["OwnerNode"].as_str().unwrap(), "0000000000000000");
+        assert_eq!(
+            entry["PreviousTxnID"].as_str().unwrap(),
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
 
         let account_key = keylet::account(&id);
         let account_bytes = sandbox.read(&account_key).unwrap();

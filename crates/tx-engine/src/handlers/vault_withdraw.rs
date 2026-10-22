@@ -223,7 +223,6 @@ impl Transactor for VaultWithdrawTransactor {
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
         let bal = helpers::get_balance(&account);
         helpers::set_balance(&mut account, bal + assets_out as u64);
-        helpers::increment_sequence(&mut account);
         if remove_mptoken {
             helpers::adjust_owner_count(&mut account, -1);
         }
@@ -446,7 +445,6 @@ fn apply_iou_withdraw(
         .ok_or(TransactionResult::TerNoAccount)?;
     let mut account: serde_json::Value =
         serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
-    helpers::increment_sequence(&mut account);
     if remove_mptoken {
         helpers::adjust_owner_count(&mut account, -1);
     }

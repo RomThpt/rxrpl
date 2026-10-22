@@ -783,6 +783,7 @@ mod tests {
             base_fee_drops: Some(10),
             reserve_base_drops: Some(10_000_000),
             reserve_increment_drops: Some(2_000_000),
+            master_public_key: None,
         };
 
         id.sign_validation(&mut validation);

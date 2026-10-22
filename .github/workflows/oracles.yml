@@ -1,0 +1,53 @@
+name: Byte-exact oracles
+
+# The mainnet replay oracles in crates/node/src/play_forward.rs are #[ignore]d
+# because they hit a live mainnet RPC server, so `cargo test --workspace` (the
+# main CI) never runs them. This workflow runs them nightly and on demand once
+# the RXRPL_PLAY_FORWARD_RPC repository secret points at a full-history rippled
+# RPC endpoint. Without the secret it reports a clean skip rather than a false
+# pass, so the byte-exact claim is only "green" when it is actually verified.
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  oracles:
+    name: Mainnet replay oracles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check RPC secret
+        id: check
+        env:
+          RPC: ${{ secrets.RXRPL_PLAY_FORWARD_RPC }}
+        run: |
+          if [ -z "$RPC" ]; then
+            echo "::notice::RXRPL_PLAY_FORWARD_RPC secret not configured — skipping byte-exact oracles."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.check.outputs.configured == 'true'
+
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        if: steps.check.outputs.configured == 'true'
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.check.outputs.configured == 'true'
+        with:
+          shared-key: workspace
+
+      - name: Run mainnet replay oracles
+        if: steps.check.outputs.configured == 'true'
+        env:
+          RXRPL_PLAY_FORWARD_RPC: ${{ secrets.RXRPL_PLAY_FORWARD_RPC }}
+          RXRPL_PLAY_FORWARD_LEDGER: ${{ vars.RXRPL_PLAY_FORWARD_LEDGER }}
+        run: cargo test -p rxrpl-node -- --ignored --nocapture

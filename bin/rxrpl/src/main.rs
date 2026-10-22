@@ -123,7 +123,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 RunMode::Network => {
                     return cmd_network_run(
                         config,
-                        &genesis_account,
                         close_interval,
                         sync_rpc.as_deref(),
                         parsed_starting,
@@ -240,6 +239,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             return cmd_config_validate(resolved.as_ref());
         }
 
+        Commands::ReplaySegment {
+            state,
+            ledgers,
+            start,
+            end,
+        } => {
+            return cmd_replay_segment(&state, &ledgers, start, end);
+        }
+
         _ => {}
     }
 
@@ -269,7 +277,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         | Commands::Validators { .. }
         | Commands::ValidatorInfo
         | Commands::Metrics { .. }
-        | Commands::ConfigValidate { .. } => unreachable!(),
+        | Commands::ConfigValidate { .. }
+        | Commands::ReplaySegment { .. } => unreachable!(),
     };
 
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -434,15 +443,13 @@ async fn cmd_node_run(
 
 async fn cmd_network_run(
     config: rxrpl_config::NodeConfig,
-    genesis_account: &str,
     close_interval: u64,
     sync_rpc_url: Option<&str>,
     starting_ledger: Option<rxrpl_node::StartingLedger>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let node = rxrpl_node::Node::new_standalone(config, genesis_account)?;
+    let node = rxrpl_node::Node::new(config)?;
 
     eprintln!("Starting networked node...");
-    eprintln!("  Genesis account: {genesis_account}");
     eprintln!("  Close interval: {close_interval}s");
     match sync_rpc_url {
         Some(url) => eprintln!("  Sync RPC: {url}"),
@@ -546,6 +553,50 @@ async fn cmd_metrics(url: &str, export: MetricsExport) -> Result<(), Box<dyn std
             let v = prometheus_to_json(&body);
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
+    }
+    Ok(())
+}
+
+fn cmd_replay_segment(
+    state: &std::path::Path,
+    ledgers: &[PathBuf],
+    start: u64,
+    end: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state_pack = std::fs::read(state)?;
+    let ledger_blobs: Vec<Vec<u8>> = ledgers
+        .iter()
+        .map(std::fs::read)
+        .collect::<Result<_, _>>()?;
+    let refs: Vec<&[u8]> = ledger_blobs.iter().map(Vec::as_slice).collect();
+    let reports = rxrpl_node::replay_worker::replay_segment(&state_pack, &refs, start, end)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    for r in &reports {
+        let txs: Vec<serde_json::Value> = r
+            .txs
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "txid": t.txid.to_string(),
+                    "meta": hex::encode_upper(&t.meta_blob),
+                })
+            })
+            .collect();
+        let line = serde_json::json!({
+            "seq": r.seq,
+            "account_hash_match": r.account_hash_match,
+            "tx_hash_match": r.tx_hash_match,
+            "ledger_hash_match": r.ledger_hash_match,
+            "drops_match": r.drops_match,
+            "applied": r.applied,
+            "failed": r.failed,
+            "computed_account_hash": r.computed_account_hash.to_string(),
+            "expected_account_hash": r.expected_account_hash.to_string(),
+            "computed_tx_hash": r.computed_tx_hash.to_string(),
+            "expected_tx_hash": r.expected_tx_hash.to_string(),
+            "txs": txs,
+        });
+        println!("{}", serde_json::to_string(&line)?);
     }
     Ok(())
 }

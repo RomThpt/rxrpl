@@ -239,7 +239,6 @@ impl Transactor for AccountSetTransactor {
         }
 
         // Increment sequence
-        helpers::increment_sequence(&mut obj);
 
         let new_bytes = serde_json::to_vec(&obj).map_err(|_| TransactionResult::TemMalformed)?;
         ctx.view

@@ -108,7 +108,6 @@ impl Transactor for PaymentChannelFundTransactor {
                 .checked_sub(amount)
                 .ok_or(TransactionResult::TecUnfundedPayment)?,
         );
-        helpers::increment_sequence(&mut account);
 
         let account_data =
             serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;

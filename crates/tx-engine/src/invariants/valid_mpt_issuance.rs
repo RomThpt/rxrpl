@@ -4,8 +4,8 @@ use serde_json::Value;
 
 /// Invariant: MPTokenIssuance and MPToken lifecycle.
 ///
-/// - MPTokenIssuance can only be created by MPTokenIssuanceCreate.
-/// - MPToken can only be created by MPTokenAuthorize.
+/// - MPTokenIssuance can only be created by MPTokenIssuanceCreate (or VaultCreate).
+/// - MPToken can only be created by MPTokenAuthorize (or VaultCreate/VaultDeposit).
 /// - MPTokenIssuance can only be deleted by MPTokenIssuanceDestroy.
 /// - MPToken can only be deleted by MPTokenAuthorize (or Clawback).
 pub struct ValidMptIssuance;
@@ -43,9 +43,12 @@ impl InvariantCheck for ValidMptIssuance {
                     ));
                 }
 
+                // A depositor's share MPToken is created on their first
+                // VaultDeposit (rippled calls authorizeMPToken internally).
                 if entry_type == Some("MPToken")
                     && tx_type != "MPTokenAuthorize"
                     && tx_type != "VaultCreate"
+                    && tx_type != "VaultDeposit"
                 {
                     return Err(format!(
                         "MPToken created at {key} by {tx_type} (expected MPTokenAuthorize)"

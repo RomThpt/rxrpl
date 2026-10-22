@@ -1,5 +1,5 @@
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{Arc, OnceLock};
 
 use rxrpl_config::ServerConfig;
@@ -108,6 +108,23 @@ pub struct ServerContext {
     /// tip, not the locally-closed one. `None` until quorum is reached at
     /// least once.
     network_validated: Option<Arc<std::sync::RwLock<NetworkValidatedSnapshot>>>,
+    /// Shared amendment-blocked flag, set by the consensus loop when an
+    /// on-ledger amendment this build does not understand activates. Surfaced
+    /// as `server_info.amendment_blocked` so operators can see the node has
+    /// halted its own validation/proposal to avoid forking. `None` in
+    /// standalone/reporting mode (no consensus loop to set it).
+    pub amendment_blocked: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Live validation quorum (80% of the trusted UNL size, or the configured
+    /// override), published by the consensus loop and re-stored on every
+    /// VL-driven quorum change. Read by `server_info.validation_quorum` and
+    /// the `validators` RPC. `None` in standalone/reporting mode (no consensus
+    /// loop) → reported as 0.
+    quorum: Option<Arc<AtomicUsize>>,
+    /// Startup snapshot of the trusted validators' master public keys
+    /// (canonical 33-byte hex), derived from the configured `[validators]`
+    /// set. Read by the `validators` RPC. `None` when no UNL is configured →
+    /// reported as an empty array.
+    trusted_validator_keys: Option<Arc<Vec<String>>>,
     /// Wall-clock instant the server was constructed; used to compute
     /// `server_info.uptime` in seconds.
     startup_instant: std::time::Instant,
@@ -182,6 +199,9 @@ impl ServerContext {
             overlay_command: None,
             last_close: None,
             network_validated: None,
+            amendment_blocked: None,
+            quorum: None,
+            trusted_validator_keys: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -224,6 +244,9 @@ impl ServerContext {
             overlay_command: None,
             last_close: None,
             network_validated: None,
+            amendment_blocked: None,
+            quorum: None,
+            trusted_validator_keys: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -267,6 +290,9 @@ impl ServerContext {
             overlay_command: None,
             last_close: None,
             network_validated: None,
+            amendment_blocked: None,
+            quorum: None,
+            trusted_validator_keys: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -284,6 +310,7 @@ impl ServerContext {
         tx_queue: Option<Arc<RwLock<TxQueue>>>,
         relay_tx: Option<mpsc::UnboundedSender<(Hash256, Vec<u8>)>>,
         pruner_state: Arc<PrunerState>,
+        metrics_handle: Option<PrometheusHandle>,
     ) -> Arc<Self> {
         let (event_tx, _) = broadcast::channel(1024);
         Arc::new(Self {
@@ -295,7 +322,7 @@ impl ServerContext {
             tx_store,
             tx_queue,
             relay_tx,
-            metrics_handle: None,
+            metrics_handle,
             peer_reservations: Arc::new(RwLock::new(HashSet::new())),
             pruner_state: Some(pruner_state),
             shard_manager: None,
@@ -310,6 +337,9 @@ impl ServerContext {
             overlay_command: None,
             last_close: None,
             network_validated: None,
+            amendment_blocked: None,
+            quorum: None,
+            trusted_validator_keys: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -346,6 +376,9 @@ impl ServerContext {
             overlay_command: None,
             last_close: None,
             network_validated: None,
+            amendment_blocked: None,
+            quorum: None,
+            trusted_validator_keys: None,
             startup_instant: std::time::Instant::now(),
             event_tx,
         })
@@ -404,6 +437,17 @@ impl ServerContext {
     /// Get the local validator manifest snapshot, if set.
     pub fn local_manifest(&self) -> Option<&LocalManifestSnapshot> {
         self.local_manifest.get().map(|arc| arc.as_ref())
+    }
+
+    /// Attach the shard manager so the shard admin RPCs (`shard_info`,
+    /// `node_to_shard`, `crawl_shards`, `download_shard`) operate on the live
+    /// store instead of returning the not-enabled stub. Set when
+    /// `[shard] enabled` is configured; must be called before the `Arc` is
+    /// shared (same constraint as `attach_peer_set`).
+    pub fn attach_shard_manager(self: &mut Arc<Self>, manager: Arc<RwLock<ShardManager>>) {
+        if let Some(ctx) = Arc::get_mut(self) {
+            ctx.shard_manager = Some(manager);
+        }
     }
 
     /// Attach the overlay's PeerSet so `server_info.peers` reflects live
@@ -490,6 +534,55 @@ impl ServerContext {
                 .ok()
                 .and_then(|guard| if guard.seq > 0 { Some(*guard) } else { None })
         })
+    }
+
+    /// Attach the shared amendment-blocked flag so `server_info` can report
+    /// it. Same Arc::get_mut constraint as `attach_validator_list_status`:
+    /// must be called before the context is shared with other tasks.
+    pub fn attach_amendment_blocked(
+        self: &mut Arc<Self>,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        if let Some(ctx) = Arc::get_mut(self) {
+            ctx.amendment_blocked = Some(flag);
+        }
+    }
+
+    /// Attach the shared live validation-quorum cell so `server_info` and the
+    /// `validators` RPC report the quorum the consensus loop is using. Same
+    /// Arc::get_mut constraint as `attach_validator_list_status`: must be
+    /// called before the context is shared with other tasks.
+    pub fn attach_quorum(self: &mut Arc<Self>, q: Arc<AtomicUsize>) {
+        if let Some(ctx) = Arc::get_mut(self) {
+            ctx.quorum = Some(q);
+        }
+    }
+
+    /// Current validation quorum (live). Returns 0 when no quorum cell is
+    /// attached (standalone/reporting mode).
+    pub fn validation_quorum(&self) -> usize {
+        self.quorum
+            .as_ref()
+            .map(|q| q.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Attach the startup snapshot of trusted validator master public keys
+    /// (canonical 33-byte hex) so the `validators` RPC can surface the UNL.
+    /// Same Arc::get_mut constraint as `attach_validator_list_status`.
+    pub fn attach_trusted_validator_keys(self: &mut Arc<Self>, keys: Arc<Vec<String>>) {
+        if let Some(ctx) = Arc::get_mut(self) {
+            ctx.trusted_validator_keys = Some(keys);
+        }
+    }
+
+    /// The trusted validator master public keys (hex), or an empty vec when
+    /// no snapshot is attached.
+    pub fn trusted_validator_keys(&self) -> Vec<String> {
+        self.trusted_validator_keys
+            .as_ref()
+            .map(|k| k.as_ref().clone())
+            .unwrap_or_default()
     }
 
     /// Seconds elapsed since the context was constructed (used as

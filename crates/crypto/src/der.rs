@@ -38,6 +38,10 @@ pub fn decode_der_signature(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), DerError>
     if data[0] != 0x30 {
         return Err(DerError::IncorrectLength);
     }
+    // Short-form length only (an ECDSA signature is well under 128 bytes).
+    if data[1] & 0x80 != 0 {
+        return Err(DerError::IncorrectLength);
+    }
     let seq_len = data[1] as usize;
     if seq_len != data.len() - 2 {
         return Err(DerError::IncorrectLength);
@@ -61,18 +65,34 @@ fn parse_integer(data: &[u8]) -> Result<(Vec<u8>, &[u8]), DerError> {
         return Err(DerError::InvalidIntegerTag);
     }
     let len = data[1] as usize;
+    // Strict DER: at least one content byte, short-form length only.
+    if len == 0 || data[1] & 0x80 != 0 {
+        return Err(DerError::IncorrectLength);
+    }
     if data.len() < 2 + len {
         return Err(DerError::NotEnoughData);
     }
-    let integer_bytes = &data[2..2 + len];
-    // Strip leading zero padding
-    let stripped = strip_leading_zeros(integer_bytes);
+    let int = &data[2..2 + len];
+    // Reject negative values (a set sign bit with no 0x00 prefix).
+    if int[0] & 0x80 != 0 {
+        return Err(DerError::IncorrectLength);
+    }
+    // Reject non-minimal encodings: a leading 0x00 is only allowed when the next
+    // byte would otherwise set the sign bit. This kills padding malleability.
+    if int[0] == 0x00 && (len == 1 || int[1] & 0x80 == 0) {
+        return Err(DerError::IncorrectLength);
+    }
+    let stripped = if int[0] == 0x00 { &int[1..] } else { int };
+    // r and s are 256-bit scalars: 1..=32 bytes, never zero.
+    if stripped.is_empty() || stripped.len() > 32 {
+        return Err(DerError::IncorrectLength);
+    }
     Ok((stripped.to_vec(), &data[2 + len..]))
 }
 
 fn strip_leading_zeros(bytes: &[u8]) -> &[u8] {
     let mut i = 0;
-    while i < bytes.len() - 1 && bytes[i] == 0 {
+    while i + 1 < bytes.len() && bytes[i] == 0 {
         i += 1;
     }
     &bytes[i..]
@@ -95,6 +115,42 @@ fn pad_integer(bytes: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_zero_length_integer_without_panic() {
+        // 30 04 02 00 02 00: SEQUENCE of two empty INTEGERs (the DoS vector).
+        let malformed = [0x30u8, 0x04, 0x02, 0x00, 0x02, 0x00];
+        assert!(decode_der_signature(&malformed).is_err());
+    }
+
+    #[test]
+    fn rejects_oversize_integer() {
+        // r encoded on 33 non-zero bytes (> 256-bit) would overflow the 32-byte
+        // scalar buffer in verify(); the decoder must reject it.
+        let mut sig = vec![0x30u8, 0x00, 0x02, 0x21];
+        sig.extend_from_slice(&[0x11u8; 33]);
+        sig.extend_from_slice(&[0x02u8, 0x01, 0x01]);
+        sig[1] = (sig.len() - 2) as u8;
+        assert!(decode_der_signature(&sig).is_err());
+    }
+
+    #[test]
+    fn rejects_non_minimal_leading_zero() {
+        // r = 00 01: a superfluous leading zero (next byte high bit clear).
+        let sig = [0x30u8, 0x07, 0x02, 0x02, 0x00, 0x01, 0x02, 0x01, 0x05];
+        assert!(decode_der_signature(&sig).is_err());
+    }
+
+    #[test]
+    fn accepts_canonical_padded_integer() {
+        // r whose first byte has the sign bit set is legitimately 0x00-prefixed.
+        let r = vec![0x80u8; 32];
+        let s = vec![0x01u8; 32];
+        let der = encode_der_signature(&r, &s);
+        let (r2, s2) = decode_der_signature(&der).unwrap();
+        assert_eq!(r2, r);
+        assert_eq!(s2, s);
+    }
 
     #[test]
     fn roundtrip_der() {

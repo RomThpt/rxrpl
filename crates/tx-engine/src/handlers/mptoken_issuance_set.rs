@@ -134,10 +134,8 @@ impl Transactor for MPTokenIssuanceSetTransactor {
             .view
             .read(&acct_key)
             .ok_or(TransactionResult::TerNoAccount)?;
-        let mut acct: Value =
+        let acct: Value =
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
-
-        helpers::increment_sequence(&mut acct);
 
         let acct_data = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view

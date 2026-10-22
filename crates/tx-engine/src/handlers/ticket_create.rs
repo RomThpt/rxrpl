@@ -53,14 +53,33 @@ impl Transactor for TicketCreateTransactor {
         let mut acct: Value =
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
 
-        let start_seq = helpers::get_sequence(&acct);
-        // The TicketCreate tx itself consumes `start_seq`; tickets are
-        // reserved starting at `start_seq + 1`, matching rippled.
-        let first_ticket_seq = start_seq + 1;
+        // Owner reserve (rippled CreateTicket::doApply): each of the `count`
+        // tickets adds 1 to OwnerCount, so the account must fund the reserve for
+        // the new owner count. rippled compares its `mPriorBalance` (the XRP
+        // balance *before* the fee) against `accountReserve(OwnerCount + count)`
+        // and returns tecINSUFFICIENT_RESERVE — fee and sequence charged, no
+        // tickets created — when it falls short. The engine consumed the fee
+        // centrally before doApply, so reconstruct mPriorBalance by adding it
+        // back; the post-consume OwnerCount already reflects a spent Ticket.
+        let owner_count = helpers::get_owner_count(&acct);
+        let prior_balance = helpers::get_balance(&acct).saturating_add(helpers::get_fee(ctx.tx));
+        if prior_balance < ctx.fees.account_reserve(owner_count + count) {
+            return Err(TransactionResult::TecInsufficientReserve);
+        }
 
-        // Create tickets. rippled's Ticket SLE carries OwnerNode and the
-        // threaded PreviousTxnID (placeholder here; the engine stamps it), and
-        // omits Flags when zero.
+        // The engine already consumed the tx's own Sequence/Ticket centrally
+        // (parent sandbox). rippled's `firstTicketSeq` is the AccountRoot
+        // Sequence *after* that consume: for a sequence-based tx it is the
+        // bumped value (tx Sequence + 1), and for a ticketed tx it is the
+        // unchanged account Sequence. Reading it here from the post-consume
+        // account mirrors both cases.
+        let first_ticket_seq = helpers::get_sequence(&acct);
+
+        // Create tickets. rippled's Ticket SLE (ltTICKET, ledger_entries.macro)
+        // has sfFlags (common SoeRequired field) and sfOwnerNode as SoeRequired,
+        // so both are always serialized — Flags=0 and the owner-directory page
+        // number (0 for the root page) — plus the threaded PreviousTxnID
+        // (placeholder here; the engine stamps it).
         for i in 0..count {
             let ticket_seq = first_ticket_seq + i;
             let ticket_key = keylet::ticket(&account_id, ticket_seq);
@@ -68,17 +87,15 @@ impl Transactor for TicketCreateTransactor {
             let owner_node = crate::owner_dir::add_to_owner_dir(ctx.view, &account_id, &ticket_key)
                 .map_err(|_| TransactionResult::TemMalformed)?;
 
-            let mut ticket_obj = serde_json::json!({
+            let ticket_obj = serde_json::json!({
                 "LedgerEntryType": "Ticket",
                 "Account": account_str,
+                "Flags": 0,
+                "OwnerNode": format!("{owner_node:016X}"),
                 "TicketSequence": ticket_seq,
                 "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
                 "PreviousTxnLgrSeq": 0,
             });
-            // OwnerNode is omitted when zero (rippled drops default U64 fields).
-            if owner_node != 0 {
-                ticket_obj["OwnerNode"] = Value::from(format!("{owner_node:016X}"));
-            }
 
             let ticket_bytes =
                 serde_json::to_vec(&ticket_obj).map_err(|_| TransactionResult::TemMalformed)?;
@@ -104,5 +121,69 @@ impl Transactor for TicketCreateTransactor {
             .map_err(|_| TransactionResult::TemMalformed)?;
 
         Ok(TransactionResult::TesSuccess)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fees::FeeSettings;
+    use crate::transactor::ApplyContext;
+    use crate::view::ledger_view::LedgerView;
+    use crate::view::read_view::ReadView;
+    use crate::view::sandbox::Sandbox;
+    use rxrpl_amendment::Rules;
+    use rxrpl_ledger::Ledger;
+
+    const ACCT: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+
+    #[test]
+    fn ticket_sle_carries_flags_and_owner_node() {
+        let mut ledger = Ledger::genesis();
+        let id = decode_account_id(ACCT).unwrap();
+        let acct = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": ACCT,
+            "Balance": "100000000",
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(keylet::account(&id), serde_json::to_vec(&acct).unwrap())
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "TicketCreate",
+            "Account": ACCT,
+            "TicketCount": 1,
+            "Fee": "12",
+            "Sequence": 1,
+        });
+        // Engine consumes the sender's Sequence centrally before doApply.
+        crate::handlers::central_consume_for_test(&mut sandbox, &tx);
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            TicketCreateTransactor.apply(&mut ctx).unwrap(),
+            TransactionResult::TesSuccess
+        );
+
+        // The ticket keyed at the post-consume account Sequence (2) carries the
+        // common SoeRequired Flags=0 and the SoeRequired OwnerNode (0 = root
+        // directory page), both always serialized by rippled.
+        let ticket_key = keylet::ticket(&id, 2);
+        let ticket: Value = serde_json::from_slice(&sandbox.read(&ticket_key).unwrap()).unwrap();
+        assert_eq!(ticket["Flags"].as_u64().unwrap(), 0);
+        assert_eq!(ticket["OwnerNode"].as_str().unwrap(), "0000000000000000");
+        assert_eq!(ticket["TicketSequence"].as_u64().unwrap(), 2);
     }
 }

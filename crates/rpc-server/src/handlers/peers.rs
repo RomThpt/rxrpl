@@ -7,11 +7,12 @@ use crate::error::RpcServerError;
 
 /// Return list of connected peers.
 ///
-/// This is a placeholder implementation that returns an empty peer list
-/// until the P2P overlay network integration is complete.
-pub async fn peers(_params: Value, _ctx: &Arc<ServerContext>) -> Result<Value, RpcServerError> {
+/// Reports the live overlay connection count. The per-peer detail array is not
+/// yet surfaced through the context, so `peers` stays empty while `peer_count`
+/// reflects the real overlay state.
+pub async fn peers(_params: Value, ctx: &Arc<ServerContext>) -> Result<Value, RpcServerError> {
     Ok(serde_json::json!({
         "peers": [],
-        "peer_count": 0,
+        "peer_count": ctx.peer_count(),
     }))
 }

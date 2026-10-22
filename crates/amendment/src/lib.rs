@@ -8,6 +8,7 @@
 pub mod config;
 pub mod error;
 pub mod feature;
+pub mod fee_voting;
 pub mod presets;
 pub mod registry;
 pub mod rules;

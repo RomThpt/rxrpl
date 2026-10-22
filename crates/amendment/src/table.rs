@@ -11,7 +11,8 @@ use crate::rules::Rules;
 /// enabling amendments that maintain majority for the required period.
 #[derive(Debug)]
 pub struct AmendmentTable {
-    /// How many consecutive ledgers an amendment needs majority for activation.
+    /// How many seconds of close-time an amendment must hold majority before
+    /// activation (rippled's two-week window = 1,209,600 seconds).
     majority_time: u32,
     /// Map from amendment ID to voting state.
     state: HashMap<Hash256, AmendmentState>,
@@ -24,15 +25,17 @@ struct AmendmentState {
     enabled: bool,
     /// Whether this validator supports this amendment.
     supported: bool,
-    /// If currently has majority, the ledger sequence when majority was first gained.
+    /// If currently has majority, the close-time (in seconds) when majority
+    /// was first gained.
     majority_since: Option<u32>,
 }
 
 impl AmendmentTable {
     /// Create a new amendment table from a registry.
     ///
-    /// `majority_time` is the number of ledgers an amendment must hold majority
-    /// before it becomes enabled (typically 14 days worth of ledgers).
+    /// `majority_time` is the number of seconds of close-time an amendment must
+    /// hold majority before it becomes enabled (rippled's two-week window =
+    /// 1,209,600 seconds).
     pub fn new(registry: &FeatureRegistry, majority_time: u32) -> Self {
         let mut state = HashMap::new();
         for feature in registry.all() {
@@ -82,11 +85,15 @@ impl AmendmentTable {
             .is_some_and(|s| s.majority_since.is_some())
     }
 
-    /// Record that an amendment has gained majority at a given ledger sequence.
-    pub fn set_majority(&mut self, id: &Hash256, ledger_seq: u32) {
+    /// Record that an amendment has gained majority at a given close time.
+    ///
+    /// `close_time` is the close-time (in seconds) of the flag ledger on which
+    /// majority was first observed; it is the reference point for the
+    /// `majority_time` activation window.
+    pub fn set_majority(&mut self, id: &Hash256, close_time: u32) {
         if let Some(state) = self.state.get_mut(id) {
             if state.majority_since.is_none() {
-                state.majority_since = Some(ledger_seq);
+                state.majority_since = Some(close_time);
             }
         }
     }
@@ -98,22 +105,29 @@ impl AmendmentTable {
         }
     }
 
-    /// Check amendments for activation based on current ledger sequence.
+    /// Check amendments for activation based on the current close time.
     ///
-    /// Returns a list of newly activated amendment IDs.
-    pub fn check_activations(&mut self, current_seq: u32) -> Vec<Hash256> {
+    /// An amendment activates once it has held majority for at least
+    /// `majority_time` seconds of close-time (rippled's two-week window).
+    /// Returns a list of newly activated amendment IDs, sorted by id so that
+    /// multiple simultaneous activations emit their `EnableAmendment`
+    /// pseudo-transactions in a deterministic order (avoids cross-impl
+    /// ledger-hash divergence).
+    pub fn check_activations(&mut self, current_close_time: u32) -> Vec<Hash256> {
         let mut activated = Vec::new();
         for (id, state) in &mut self.state {
             if state.enabled {
                 continue;
             }
             if let Some(since) = state.majority_since {
-                if current_seq >= since + self.majority_time {
+                if current_close_time.saturating_sub(since) >= self.majority_time {
                     state.enabled = true;
                     activated.push(*id);
                 }
             }
         }
+        // Deterministic emission order (HashMap iteration is unordered).
+        activated.sort();
         activated
     }
 
@@ -170,15 +184,65 @@ mod tests {
     #[test]
     fn majority_and_activation() {
         let reg = test_registry();
+        // majority_time is now close-time SECONDS, not a ledger count.
         let mut table = AmendmentTable::new(&reg, 100);
         let id = reg.id_for_name("FeatureA").unwrap();
 
+        // Majority recorded at close_time = 1000.
         table.set_majority(&id, 1000);
+        // 50 seconds later: still inside the window.
         assert!(table.check_activations(1050).is_empty());
 
+        // 100 seconds later: window elapsed, amendment activates.
         let activated = table.check_activations(1100);
         assert!(activated.contains(&id));
         assert!(table.is_enabled(&id));
+    }
+
+    #[test]
+    fn check_activations_uses_close_time_seconds() {
+        // check_activations compares elapsed close-time SECONDS against
+        // majority_time and only activates once `current - since >= majority_time`.
+        let reg = test_registry();
+        let majority_time: u32 = 1000;
+        let mut table = AmendmentTable::new(&reg, majority_time);
+        let id = reg.id_for_name("FeatureA").unwrap();
+
+        let since: u32 = 5000;
+        table.set_majority(&id, since);
+
+        // One second short of the window: no activation.
+        assert!(
+            table
+                .check_activations(since + majority_time - 1)
+                .is_empty()
+        );
+        assert!(!table.is_enabled(&id));
+
+        // Exactly at the window: activates.
+        let activated = table.check_activations(since + majority_time);
+        assert!(activated.contains(&id));
+        assert!(table.is_enabled(&id));
+    }
+
+    #[test]
+    fn check_activations_emits_sorted_ids() {
+        // Multiple simultaneous activations must be returned in id-sorted order
+        // for deterministic pseudo-tx emission across implementations.
+        let reg = test_registry();
+        let mut table = AmendmentTable::new(&reg, 100);
+        let id_a = reg.id_for_name("FeatureA").unwrap();
+        let id_b = reg.id_for_name("FeatureB").unwrap();
+
+        table.set_majority(&id_a, 1000);
+        table.set_majority(&id_b, 1000);
+
+        let activated = table.check_activations(1100);
+        assert!(activated.contains(&id_a));
+        assert!(activated.contains(&id_b));
+        let mut expected = activated.clone();
+        expected.sort();
+        assert_eq!(activated, expected, "activations must be id-sorted");
     }
 
     #[test]

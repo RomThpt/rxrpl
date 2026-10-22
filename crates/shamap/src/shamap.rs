@@ -330,11 +330,11 @@ impl SHAMap {
             SHAMapNode::Inner(inner) => {
                 let hash = inner.hash();
                 if !hash.is_zero() {
-                    let mut data = Vec::with_capacity(16 * 32);
-                    for i in 0..16u8 {
-                        data.extend_from_slice(inner.child_hash(i).as_bytes());
+                    let mut child_hashes = [Hash256::ZERO; 16];
+                    for (i, slot) in child_hashes.iter_mut().enumerate() {
+                        *slot = inner.child_hash(i as u8);
                     }
-                    out.push((hash, data));
+                    out.push((hash, crate::node_store::serialize_inner(child_hashes)));
                 }
 
                 // for_each_branch only visits loaded children
@@ -344,10 +344,10 @@ impl SHAMap {
             }
             SHAMapNode::Leaf(leaf) => {
                 let hash = leaf.hash();
-                let mut data = Vec::with_capacity(32 + leaf.data().len());
-                data.extend_from_slice(leaf.key().as_bytes());
-                data.extend_from_slice(leaf.data());
-                out.push((hash, data));
+                out.push((
+                    hash,
+                    crate::node_store::serialize_leaf(leaf.key(), leaf.data()),
+                ));
             }
         }
     }
@@ -724,7 +724,21 @@ impl SHAMap {
                         }
                     }
                     SHAMapNode::Inner(mut inner) => {
-                        let data = Self::delete_from(&mut inner, key, depth + 1, store, leaf_ctor)?;
+                        // `take_child` above already removed `inner` from `node`.
+                        // When the recursion cannot find the key it leaves `inner`
+                        // untouched, so it must be put back before the error
+                        // propagates — otherwise this whole (unrelated) subtree is
+                        // silently dropped. Deleting a key that is absent deep under
+                        // a shared prefix would otherwise wipe out every sibling
+                        // above the point of divergence.
+                        let data =
+                            match Self::delete_from(&mut inner, key, depth + 1, store, leaf_ctor) {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    node.set_child(branch, SHAMapNode::Inner(inner));
+                                    return Err(e);
+                                }
+                            };
                         if inner.branch_count() == 0 {
                             // Empty inner, don't re-insert
                         } else if let Some(single) = inner.single_branch() {
@@ -930,6 +944,122 @@ impl SHAMap {
         Some(serialize_node_shallow(current))
     }
 
+    /// Serve a node and a fat slice of its descendants, mirroring rippled's
+    /// `SHAMap::getNodeFat`.
+    ///
+    /// A peer requesting a single inner node during catchup gets that node plus
+    /// descendants down `depth` levels, so each round-trip carries a connected
+    /// chunk of the frontier instead of one node. This is the dominant lever for
+    /// catchup throughput: rounds scale inversely with nodes returned per reply.
+    ///
+    /// Faithful to rippled semantics:
+    /// - single-child inner nodes are followed without spending `depth`
+    ///   (the chain is collapsed),
+    /// - at the depth edge, inner children are included shallowly and leaf
+    ///   children only when `fat_leaves` is set,
+    /// - collection stops once `max_nodes` entries are gathered.
+    ///
+    /// Returns `(NodeId, shallow-serialized bytes, is_inner)` per node, in the
+    /// same wire-ready form as [`node_at`]. An empty vec means the requested node
+    /// is absent or the located inner node is empty (rippled returns `false`).
+    pub fn get_node_fat(
+        &self,
+        wanted: NodeId,
+        fat_leaves: bool,
+        depth: u8,
+        max_nodes: usize,
+    ) -> Vec<(NodeId, Vec<u8>, bool)> {
+        let mut out = Vec::new();
+        if max_nodes == 0 {
+            return out;
+        }
+
+        let target_depth = wanted.depth();
+        let key = *wanted.id();
+        let mut current: &Arc<SHAMapNode> = &self.root;
+        for d in 0..target_depth {
+            let inner = match current.as_ref() {
+                SHAMapNode::Inner(i) => i,
+                SHAMapNode::Leaf(_) => return out,
+            };
+            let branch = select_branch(&key, d);
+            if inner.is_empty_branch(branch) {
+                return out;
+            }
+            current = match inner.child_with_store(branch, self.store.as_ref(), self.leaf_ctor) {
+                Ok(Some(c)) => c,
+                _ => return out,
+            };
+        }
+
+        if let SHAMapNode::Inner(i) = current.as_ref() {
+            if i.branch_count() == 0 {
+                return out;
+            }
+        }
+
+        self.fat_descend(
+            current,
+            wanted,
+            depth as i32,
+            fat_leaves,
+            max_nodes,
+            &mut out,
+        );
+        out
+    }
+
+    fn fat_descend(
+        &self,
+        node: &Arc<SHAMapNode>,
+        node_id: NodeId,
+        depth: i32,
+        fat_leaves: bool,
+        max_nodes: usize,
+        out: &mut Vec<(NodeId, Vec<u8>, bool)>,
+    ) {
+        if out.len() >= max_nodes {
+            return;
+        }
+        let (_hash, raw, is_inner) = serialize_node_shallow(node);
+        out.push((node_id, raw, is_inner));
+
+        let inner = match node.as_ref() {
+            SHAMapNode::Inner(i) => i,
+            SHAMapNode::Leaf(_) => return,
+        };
+        let bc = inner.branch_count();
+        if depth <= 0 && bc != 1 {
+            return;
+        }
+
+        for branch in 0..16u8 {
+            if inner.is_empty_branch(branch) {
+                continue;
+            }
+            if out.len() >= max_nodes {
+                return;
+            }
+            let child = match inner.child_with_store(branch, self.store.as_ref(), self.leaf_ctor) {
+                Ok(Some(c)) => c,
+                _ => continue,
+            };
+            let child_id = NodeId::new(
+                node_id.depth() + 1,
+                &Self::child_key(*node_id.id(), node_id.depth(), branch),
+            );
+            let child_is_inner = matches!(child.as_ref(), SHAMapNode::Inner(_));
+
+            if child_is_inner && (depth > 1 || bc == 1) {
+                let next_depth = if bc > 1 { depth - 1 } else { depth };
+                self.fat_descend(child, child_id, next_depth, fat_leaves, max_nodes, out);
+            } else if child_is_inner || fat_leaves {
+                let (_h, raw, ii) = serialize_node_shallow(child);
+                out.push((child_id, raw, ii));
+            }
+        }
+    }
+
     /// Compute hashes of missing nodes needed to complete the tree toward a target root.
     ///
     /// Walks the tree comparing known inner node hashes against what is in the
@@ -1012,6 +1142,15 @@ impl SHAMap {
         out: &mut Vec<MissingNode>,
         complete: &mut HashSet<Hash256>,
     ) -> bool {
+        // A SHAMap key is 256 bits = 64 nibbles, so inner nodes live at depths
+        // 0..=63 and leaves at depth 64. An inner node reaching depth 64 is
+        // malformed (a peer can send bad node data during delta sync); walking
+        // it would index `child_key` past the 32-byte key. Refuse it instead of
+        // panicking, and report the subtree as incomplete so it is re-fetched.
+        if depth as usize >= Hash256::LEN * 2 {
+            return false;
+        }
+
         let mut subtree_complete = true;
         let mut mask = inner.branch_mask();
         while mask != 0 {
@@ -1183,13 +1322,26 @@ impl SHAMap {
     }
 
     /// Recursively update hashes for all dirty nodes.
+    ///
+    /// Descends only into subtrees modified since the parent map. `put_leaf` /
+    /// `insert` / `delete` rebuild just the root→leaf path they touch (via
+    /// `take_child` + `Arc::try_unwrap`), so a modified subtree is uniquely owned
+    /// (`Arc::get_mut` succeeds) while an untouched one stays Arc-shared with the
+    /// parent snapshot and keeps its already-valid cached hash. Skipping the
+    /// shared subtrees keeps a ledger close proportional to what the block
+    /// changed rather than re-cloning and rehashing the whole state tree — for a
+    /// mainnet-sized ~19M-node map that is the difference between milliseconds and
+    /// ~a minute per close under continuous replay. Verified byte-identical to the
+    /// unconditional walk on replayed mainnet ledgers.
     fn update_hashes(node: &mut SHAMapNode) {
         if let SHAMapNode::Inner(inner) = node {
             let mut mask = inner.branch_mask();
             while mask != 0 {
                 let branch = mask.trailing_zeros() as u8;
                 if let Some(child) = inner.child_mut(branch) {
-                    Self::update_hashes(Arc::make_mut(child));
+                    if let Some(child_node) = Arc::get_mut(child) {
+                        Self::update_hashes(child_node);
+                    }
                 }
                 mask &= mask - 1;
             }
@@ -1611,6 +1763,37 @@ mod tests {
         let mut map = SHAMap::account_state();
         let key = make_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         assert_eq!(map.update(key, vec![1]), Err(SHAMapError::NotFound));
+    }
+
+    #[test]
+    fn notfound_delete_preserves_siblings() {
+        // Deleting a key that is not in the map must leave every other key
+        // intact. The delete walks down taking each inner out of its parent;
+        // when the recursion reports NotFound the parent must put the inner back,
+        // else the entire path (a large sibling subtree) is dropped.
+        let mut map = SHAMap::account_state();
+        let a = make_key(&format!("50{}", "0".repeat(62)));
+        let b = make_key(&format!("54{}", "1".repeat(62)));
+        map.put(a, vec![1]).unwrap();
+        map.put(b, vec![2]).unwrap();
+        let root0 = map.root_hash();
+        let ghost = make_key(&format!("54{}", "F".repeat(62)));
+        assert_eq!(map.delete(&ghost), Err(SHAMapError::NotFound));
+        assert_eq!(
+            map.get(&a),
+            Some(&[1][..]),
+            "sibling a dropped by a NotFound delete"
+        );
+        assert_eq!(
+            map.get(&b),
+            Some(&[2][..]),
+            "b dropped by a NotFound delete"
+        );
+        assert_eq!(
+            map.root_hash(),
+            root0,
+            "NotFound delete must not change the root"
+        );
     }
 
     #[test]
@@ -2048,4 +2231,81 @@ mod tests {
     }
 
     use crate::leaf_node::LeafNode;
+
+    /// Build a depth-2 state map: top nibbles 0-3 each hold 16 leaves, so the
+    /// tree has the root (d0), 4 inner nodes (d1) and 64 leaves (d2).
+    fn fat_test_map() -> (SHAMap, Vec<Hash256>) {
+        let store = Arc::new(InMemoryNodeStore::new());
+        let mut map = SHAMap::account_state_with_store(store);
+        let keys: Vec<Hash256> = (0..64u8)
+            .map(|i| {
+                let mut b = [0u8; 32];
+                b[0] = i;
+                b[31] = i;
+                Hash256::new(b)
+            })
+            .collect();
+        for (i, k) in keys.iter().enumerate() {
+            map.put(*k, vec![(i & 0xFF) as u8; 40]).unwrap();
+        }
+        let _ = map.flush();
+        (map, keys)
+    }
+
+    #[test]
+    fn get_node_fat_full_depth_covers_whole_tree() {
+        let (map, keys) = fat_test_map();
+        let fat = map.get_node_fat(NodeId::ROOT, true, 64, 100_000);
+
+        assert!(fat.iter().any(|(id, _, ii)| id.depth() == 0 && *ii));
+        let leaves = fat.iter().filter(|(_, _, ii)| !*ii).count();
+        assert_eq!(leaves, keys.len());
+        assert_eq!(fat.len(), 1 + 4 + keys.len());
+
+        for (id, raw, ii) in &fat {
+            let (_h, raw2, ii2) = map.node_at(*id).expect("served node must exist");
+            assert_eq!(raw, &raw2);
+            assert_eq!(*ii, ii2);
+        }
+    }
+
+    #[test]
+    fn get_node_fat_depth_zero_returns_only_root() {
+        let (map, _) = fat_test_map();
+        let fat = map.get_node_fat(NodeId::ROOT, true, 0, 100_000);
+        assert_eq!(fat.len(), 1);
+        assert!(fat[0].2);
+    }
+
+    #[test]
+    fn get_node_fat_depth_bounds_the_frontier() {
+        let (map, _) = fat_test_map();
+        let one = map.get_node_fat(NodeId::ROOT, true, 1, 100_000);
+        assert_eq!(one.len(), 5);
+        assert!(one.iter().all(|(_, _, ii)| *ii));
+    }
+
+    #[test]
+    fn get_node_fat_leaves_flag_excludes_edge_leaves() {
+        let (map, _) = fat_test_map();
+        let no_leaves = map.get_node_fat(NodeId::ROOT, false, 64, 100_000);
+        assert_eq!(no_leaves.len(), 5);
+        assert!(no_leaves.iter().all(|(_, _, ii)| *ii));
+    }
+
+    #[test]
+    fn get_node_fat_respects_max_nodes() {
+        let (map, _) = fat_test_map();
+        let capped = map.get_node_fat(NodeId::ROOT, true, 64, 10);
+        assert!(capped.len() <= 10);
+    }
+
+    #[test]
+    fn get_node_fat_absent_node_is_empty() {
+        let (map, _) = fat_test_map();
+        let mut path = [0u8; 32];
+        path[0] = 0xF0;
+        let absent = NodeId::new(1, &Hash256::new(path));
+        assert!(map.get_node_fat(absent, true, 4, 100_000).is_empty());
+    }
 }

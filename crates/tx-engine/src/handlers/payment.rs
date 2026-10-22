@@ -1,3 +1,4 @@
+use rxrpl_amendment::feature::feature_id;
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::{TransactionResult, keylet};
 
@@ -85,32 +86,12 @@ impl Transactor for PaymentTransactor {
         let dst_bytes = ctx.view.read(&dst_key);
         let _dst_exists = dst_bytes.is_some();
 
-        // DepositAuth: if destination has lsfDepositAuth set, the source must
-        // either be the destination itself OR be pre-authorized via a
-        // DepositPreauth ledger entry. Self-payments are always allowed.
-        // RequireDestTag: if destination has lsfRequireDestTag set, the tx
-        // must include a DestinationTag.
-        if let Some(bytes) = &dst_bytes {
-            if let Ok(dst_account) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                let dst_flags = dst_account
-                    .get("Flags")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-                const LSF_DEPOSIT_AUTH: u32 = 0x01000000;
-                const LSF_REQUIRE_DEST_TAG: u32 = 0x00020000;
-                if dst_flags & LSF_DEPOSIT_AUTH != 0 && account_str != destination_str {
-                    let preauth_key = keylet::deposit_preauth(&dst_id, &src_id);
-                    if !ctx.view.exists(&preauth_key) {
-                        return Err(TransactionResult::TecNoPermission);
-                    }
-                }
-                if dst_flags & LSF_REQUIRE_DEST_TAG != 0
-                    && helpers::get_u32_field(ctx.tx, "DestinationTag").is_none()
-                {
-                    return Err(TransactionResult::TecDstTagNeeded);
-                }
-            }
-        }
+        // NOTE: DepositAuth (tecNO_PERMISSION) and RequireDestTag
+        // (tecDST_TAG_NEEDED) are tec-returning checks; rippled claims a tec
+        // (fee + seq charged). Since the engine now consumes fee + seq centrally
+        // in the parent sandbox *before* doApply, these checks were moved to the
+        // start of `Payment::apply` so they land as apply-tecs (kept on tec)
+        // rather than free preclaim returns.
 
         // Cross-currency payment: the source spends SendMax (a different asset),
         // not Amount, so the Amount-vs-balance funding check below does not
@@ -147,21 +128,117 @@ impl Transactor for PaymentTransactor {
         let account_str = helpers::get_account(ctx.tx)?;
         let destination_str = helpers::get_destination(ctx.tx)?;
 
+        // DepositAuth / RequireDestTag: these return a `tec` that rippled claims
+        // (fee + seq charged). The engine consumes fee + seq centrally in the
+        // parent sandbox *before* doApply, so these checks run here at the start
+        // of apply (instead of preclaim) to land as apply-tecs that survive on
+        // tec. Mirrors rippled checking them in preclaim while still claiming.
+        {
+            let dst_id = decode_account_id(destination_str)
+                .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+            let dst_key = keylet::account(&dst_id);
+            if let Some(bytes) = ctx.view.read(&dst_key) {
+                if let Ok(dst_account) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    let dst_flags = dst_account
+                        .get("Flags")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    const LSF_DEPOSIT_AUTH: u32 = 0x01000000;
+                    const LSF_REQUIRE_DEST_TAG: u32 = 0x00020000;
+                    if dst_flags & LSF_DEPOSIT_AUTH != 0 && account_str != destination_str {
+                        let src_id = decode_account_id(account_str)
+                            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+                        let preauth_key = keylet::deposit_preauth(&dst_id, &src_id);
+                        if !ctx.view.exists(&preauth_key) {
+                            return Err(TransactionResult::TecNoPermission);
+                        }
+                    }
+                    if dst_flags & LSF_REQUIRE_DEST_TAG != 0
+                        && helpers::get_u32_field(ctx.tx, "DestinationTag").is_none()
+                    {
+                        return Err(TransactionResult::TecDstTagNeeded);
+                    }
+                }
+            }
+        }
+
         // Cross-currency Payment (a SendMax in a different asset than Amount):
         // cross the order book via the shared Taker engine — for a conversion
-        // (Account == Destination) or a direct payment to another account. Only
-        // the single-book shape is handled here; multi-hop `Paths` falls through
-        // to the legacy path below.
-        if ctx.tx.get("Paths").is_none() {
-            if let Some(send_max) = ctx.tx.get("SendMax") {
-                if cross_assets_differ(send_max, &ctx.tx["Amount"]) {
-                    return apply_conversion(
-                        ctx,
-                        account_str,
-                        destination_str,
-                        ctx.tx["Amount"].clone(),
-                        send_max.clone(),
-                    );
+        // (Account == Destination) or a direct payment to another account.
+        if let Some(send_max) = ctx.tx.get("SendMax") {
+            if cross_assets_differ(send_max, &ctx.tx["Amount"]) {
+                // Same-currency SendMax issued by the sender, Amount issued by
+                // the destination, no Paths: redeem/direct IOU spend, not a
+                // book conversion (30000071 51FF9B2E).
+                let (sm_cur, sm_iss) = asset_of(send_max);
+                let (am_cur, am_iss) = asset_of(&ctx.tx["Amount"]);
+                let redeem_to_dest = sm_cur == am_cur
+                    && sm_iss == account_str
+                    && am_iss == destination_str
+                    && ctx.tx.get("Paths").is_none();
+                if !redeem_to_dest {
+                    // Multi-path Flow: a Payment with two or more alternative `Paths`
+                    // that each resolve to a pure book/AMM boundary chain. rippled
+                    // runs these through the multi-pass Flow loop, consuming any
+                    // shared AMM pool in fibonacci-sized chunks clamped to the
+                    // competing CLOB quality; a single full swap over-delivers. Gated
+                    // narrowly (>= 2 resolvable boundary chains) so single-path
+                    // cross-currency and AMM-routed payments keep their existing
+                    // byte-exact single-strand engine.
+                    if count_flow_strands(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]) >= 2
+                        && flow_strands_have_amm(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"])
+                    {
+                        return apply_paths_payment_multi(
+                            ctx,
+                            account_str,
+                            destination_str,
+                            ctx.tx["Amount"].clone(),
+                            send_max.clone(),
+                        );
+                    }
+                    if ctx.tx.get("Paths").is_none() {
+                        return apply_conversion(
+                            ctx,
+                            account_str,
+                            destination_str,
+                            ctx.tx["Amount"].clone(),
+                            send_max.clone(),
+                        );
+                    }
+                    // Multi-hop `Paths` with a native (XRP) source or destination
+                    // leg: the legacy IOU-only back-solve below cannot represent the
+                    // native leg, so route to the byte-exact book-chain crossing
+                    // built on the shared Taker engine. IOU<->IOU multi-hop keeps its
+                    // existing dispatch (apply_cross_currency) further down.
+                    if send_max.is_string() || ctx.tx["Amount"].is_string() {
+                        return apply_paths_payment(
+                            ctx,
+                            account_str,
+                            destination_str,
+                            ctx.tx["Amount"].clone(),
+                            send_max.clone(),
+                        );
+                    }
+                    // IOU<->IOU multi-hop `Paths`: when at least one path resolves to
+                    // a pure book/AMM chain (no genuine DirectStep), route it through
+                    // the same byte-exact engine as the native-leg case. Paths that
+                    // need a genuine DirectStep fall through to apply_cross_currency.
+                    let require_ripple_step = account_str != destination_str;
+                    if paths_resolve_to_chain(
+                        ctx.view,
+                        ctx.tx,
+                        send_max,
+                        &ctx.tx["Amount"],
+                        require_ripple_step,
+                    ) {
+                        return apply_paths_payment(
+                            ctx,
+                            account_str,
+                            destination_str,
+                            ctx.tx["Amount"].clone(),
+                            send_max.clone(),
+                        );
+                    }
                 }
             }
         }
@@ -207,12 +284,23 @@ impl Transactor for PaymentTransactor {
             serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
         let src_balance = helpers::get_balance(&src_account);
+        // rippled Payment::doApply (XRP): the source must retain its owner reserve
+        // after sending the amount — `mPriorBalance < saDstAmount +
+        // accountReserve(ownerCount)` yields tecUNFUNDED_PAYMENT (fee charged, no
+        // transfer). `mPriorBalance` is the balance BEFORE the fee, so add the fee
+        // back to this post-fee working balance. Without this the transfer went
+        // through and drove the source below its reserve.
+        let owner_count = helpers::get_owner_count(&src_account);
+        let reserve = ctx.fees.account_reserve(owner_count);
+        let prior_balance = src_balance.saturating_add(helpers::get_fee(ctx.tx));
+        if prior_balance < amount.saturating_add(reserve) {
+            return Err(TransactionResult::TecUnfundedPayment);
+        }
         let new_src_balance = src_balance
             .checked_sub(amount)
             .ok_or(TransactionResult::TecUnfundedPayment)?;
 
         helpers::set_balance(&mut src_account, new_src_balance);
-        crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut src_account, ctx.tx)?;
 
         let src_data =
             serde_json::to_vec(&src_account).map_err(|_| TransactionResult::TefInternal)?;
@@ -247,10 +335,16 @@ impl Transactor for PaymentTransactor {
                 return Err(TransactionResult::TecNoDstInsuf);
             }
 
-            // New / resurrected accounts get Sequence = current ledger seq
-            // (rippled convention; preserves uniqueness of OfferIDs etc. across
-            // delete/recreate cycles within the same ledger history).
-            let new_seq = ctx.view.seq().max(1);
+            // Pre-DeletableAccounts, a brand-new AccountRoot starts at
+            // Sequence 1 (30000008 Payment 5703AAB5). After the amendment,
+            // Sequence is the current ledger seq so a resurrected account
+            // cannot replay offers from a previous incarnation.
+            let ledger_seq = ctx.view.seq().max(1);
+            let new_seq = if ctx.rules.enabled(&feature_id("DeletableAccounts")) {
+                ledger_seq
+            } else {
+                1
+            };
             // PreviousTxnID + PreviousTxnLgrSeq are SOE_REQUIRED on rippled's
             // AccountRoot SOTemplate. Omitting them produced parse-time
             // throws ("Field 'PreviousTxnID' is required but missing.") on
@@ -269,7 +363,7 @@ impl Transactor for PaymentTransactor {
                 "OwnerCount": 0,
                 "Flags": 0,
                 "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
-                "PreviousTxnLgrSeq": new_seq,
+                "PreviousTxnLgrSeq": ledger_seq,
             });
 
             let dst_data =
@@ -341,20 +435,6 @@ fn apply_iou(
         let trust_data = serde_json::to_vec(&trust).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(trust_key, trust_data)
-            .map_err(|_| TransactionResult::TefInternal)?;
-
-        let issuer_key = keylet::account(&issuer_id);
-        let issuer_bytes = ctx
-            .view
-            .read(&issuer_key)
-            .ok_or(TransactionResult::TerNoAccount)?;
-        let mut issuer_acct: serde_json::Value =
-            serde_json::from_slice(&issuer_bytes).map_err(|_| TransactionResult::TefInternal)?;
-        helpers::increment_sequence(&mut issuer_acct);
-        let issuer_data =
-            serde_json::to_vec(&issuer_acct).map_err(|_| TransactionResult::TefInternal)?;
-        ctx.view
-            .update(issuer_key, issuer_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
         return Ok(TransactionResult::TesSuccess);
@@ -434,21 +514,6 @@ fn apply_iou(
             .map_err(|_| TransactionResult::TefInternal)?;
     }
 
-    // Bump source Sequence.
-    let src_key = keylet::account(&src_id);
-    let src_bytes = ctx
-        .view
-        .read(&src_key)
-        .ok_or(TransactionResult::TerNoAccount)?;
-    let mut src_acct: serde_json::Value =
-        serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
-    crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut src_acct, ctx.tx)?;
-    let src_acct_data =
-        serde_json::to_vec(&src_acct).map_err(|_| TransactionResult::TefInternal)?;
-    ctx.view
-        .update(src_key, src_acct_data)
-        .map_err(|_| TransactionResult::TefInternal)?;
-
     Ok(TransactionResult::TesSuccess)
 }
 
@@ -504,6 +569,16 @@ fn get_deliver_min_iou(tx: &serde_json::Value) -> Option<(&str, &str, &str)> {
         dm.get("issuer")?.as_str()?,
         dm.get("value")?.as_str()?,
     ))
+}
+
+/// `DeliverMin` as a raw magnitude — XRP drops for an amount string, IOU value
+/// for an object — regardless of the asset. `None` when the field is absent.
+fn get_deliver_min_value(tx: &serde_json::Value) -> Option<f64> {
+    let dm = tx.get("DeliverMin")?;
+    if let Some(s) = dm.as_str() {
+        return s.parse().ok();
+    }
+    dm.get("value").and_then(|v| v.as_str())?.parse().ok()
 }
 
 /// Read the issuer's TransferRate as a multiplier (1.0 = no fee).
@@ -599,16 +674,57 @@ fn apply_conversion(
         .ok_or(TransactionResult::TerNoAccount)?;
     let mut acct: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
-    crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut acct, ctx.tx)?;
 
-    let (delivered, _spent) = crate::handlers::offer_create::cross_book_payment(
-        ctx, &src_id, &mut acct, &dst_id, &amount, &send_max,
-    )?;
+    // AMM-routed conversion: when an AMM pool exists for the (SendMax → Amount)
+    // pair, swap through it with exact constant-product math. The pool here is
+    // always the sole/best liquidity for the books we replay (the swap is small
+    // relative to the reserves, so its quality beats any resting offer and
+    // rippled never reaches the CLOB); for those it either spends the whole
+    // budget or delivers the whole target, so the order book is left untouched.
+    // Books with no AMM (every pre-AMM order-book oracle) fall through to the
+    // shared Taker engine unchanged.
+    let delivered = match try_amm_conversion(ctx, &src_id, &mut acct, &dst_id, &amount, &send_max)?
+    {
+        Some(delivered) => delivered,
+        None => {
+            crate::handlers::offer_create::cross_book_payment(
+                ctx, &src_id, &mut acct, &dst_id, &amount, &send_max,
+            )?
+            .0
+        }
+    };
+
+    // rippled: a cross-currency payment that delivers exactly zero is dry and
+    // returns tecPATH_DRY EVEN under tfPartialPayment (StrandFlow.h:803-806) —
+    // only a strictly positive (even dust) delivery is tesSUCCESS. Returning it
+    // as a retryable tec lets the build-ledger loop defer the payment to a later
+    // pass once a sibling funds its path, instead of committing a no-op success.
+    if delivered_amount(&delivered) <= 0.0 {
+        return Err(TransactionResult::TecPathDry);
+    }
 
     const TF_PARTIAL_PAYMENT: u32 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT;
     let partial = helpers::get_flags(ctx.tx) & TF_PARTIAL_PAYMENT != 0;
-    if !partial && !delivered_meets_target(&delivered, &amount) {
-        return Err(TransactionResult::TecPathPartial);
+    if !partial {
+        if !delivered_meets_target(&delivered, &amount) {
+            return Err(TransactionResult::TecPathPartial);
+        }
+    } else if let Some(dmin) = get_deliver_min_value(ctx.tx) {
+        // rippled Payment::doApply: under tfPartialPayment the delivery may fall
+        // short of Amount but must still reach DeliverMin. When the AMM/book can
+        // only convert a sub-DeliverMin dust amount, the whole path result is
+        // rejected with tecPATH_PARTIAL — the child sandbox (the swap) is
+        // discarded, so only the fee is charged, matching mainnet.
+        if delivered_amount(&delivered) + 1e-9 < dmin {
+            return Err(TransactionResult::TecPathPartial);
+        }
+    }
+
+    // rippled Payment::doApply: record sfDeliveredAmount when the delivered
+    // amount differs from the requested Amount (a partial or path-limited
+    // delivery); a full delivery leaves it unset.
+    if delivered != amount {
+        ctx.view.set_delivered_amount(delivered.clone());
     }
 
     let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
@@ -618,19 +734,980 @@ fn apply_conversion(
     Ok(TransactionResult::TesSuccess)
 }
 
+/// Whether at least one of the transaction's `Paths` is a real
+/// pathfinder-shaped pure book/AMM chain that the byte-exact engine can serve.
+///
+/// rippled's pathfinder threads every interior book step with an account-ripple
+/// step (`type` 0x01) through that book's output issuer (e.g. `book RPR/I`,
+/// `account I`, `book FUZZY/J`, `account J`); `build_path_boundaries` folds those
+/// no-op ripple steps away to a book/AMM boundary chain. Requiring such a step
+/// keeps the byte-exact engine to the mainnet path shape (Gap 2) and leaves the
+/// legacy back-solve to serve the bare-book synthetic shapes and any path that
+/// needs a genuine cross-issuer `DirectStep` or multi-path quality blend.
+///
+/// `require_ripple_step` keeps that account-ripple gate for genuine payments to
+/// another account. A self-payment conversion (`Account == Destination`) needs
+/// no ripple step: a bare currency-only path already denotes a direct
+/// `SendMax -> Amount` book/AMM swap, and the legacy back-solve rounds that AMM
+/// residual in f64 and under-delivers, so those resolve straight to the
+/// byte-exact chain engine.
+fn paths_resolve_to_chain(
+    view: &dyn ReadView,
+    tx: &serde_json::Value,
+    send_max: &serde_json::Value,
+    amount: &serde_json::Value,
+    require_ripple_step: bool,
+) -> bool {
+    tx.get("Paths")
+        .and_then(|v| v.as_array())
+        .map(|paths| {
+            paths.iter().any(|p| {
+                let Some(steps) = p.as_array() else {
+                    return false;
+                };
+                let has_ripple_step = steps
+                    .iter()
+                    .any(|s| s.get("account").and_then(|v| v.as_str()).is_some());
+                (!require_ripple_step || has_ripple_step)
+                    && build_path_boundaries(
+                        view,
+                        steps,
+                        send_max,
+                        amount,
+                        tx.get("Account").and_then(|v| v.as_str()).unwrap_or(""),
+                    )
+                    .map(|b| b.len() >= 2)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Whether `account`'s `AccountRoot` carries an `AMMID` field — i.e. it is an
+/// AMM pseudo-account. A bare account path step naming such an account is an AMM
+/// crossing pivot (folded into the surrounding book/AMM-by-pair hop) rather than
+/// a genuine cross-issuer `DirectStep` ripple.
+fn account_has_ammid(view: &dyn ReadView, account: &str) -> bool {
+    let Ok(id) = decode_account_id(account) else {
+        return false;
+    };
+    let Some(bytes) = view.read(&keylet::account(&id)) else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|a| a.get("AMMID").cloned())
+        .is_some()
+}
+
+/// Build the boundary chain of a single resolved path: `[source asset,
+/// intermediate1, intermediate2, ..., destination asset]`. Each interior
+/// boundary is an IOU object `{currency, issuer, value:"0"}` (the magnitude is
+/// supplied by the crossing). Returns `None` for any path step that is not a
+/// pure book step (an account-ripple `0x01` step or a step that names neither a
+/// currency nor an issuer), so the caller can fall back to another path.
+fn build_path_boundaries(
+    view: &dyn ReadView,
+    path: &[serde_json::Value],
+    send_max: &serde_json::Value,
+    amount: &serde_json::Value,
+    source: &str,
+) -> Option<Vec<serde_json::Value>> {
+    let boundary_asset = |v: &serde_json::Value| -> (String, String) { asset_of(v) };
+
+    let mut out = vec![send_max.clone()];
+    let (mut cur, mut iss) = boundary_asset(send_max);
+    for step in path {
+        // rippled serializes a PathStep as the present subset of
+        // account/currency/issuer (the `type` bitmap is derived from which
+        // fields appear and is NOT emitted by the binary decoder). Infer the
+        // step kind from field presence:
+        //   * an `account` step is account-rippling (not a pure book step) and
+        //     is not modelled by this handler — fall back to another path.
+        //   * a `currency`/`issuer` step changes the book boundary; the omitted
+        //     side is inherited from the previous hop.
+        let step_account = step.get("account").and_then(|v| v.as_str());
+        let step_cur = step.get("currency").and_then(|v| v.as_str());
+        let step_iss = step.get("issuer").and_then(|v| v.as_str());
+        if let Some(account) = step_account {
+            // A bare account-rippling step (`type` 0x01, no currency/issuer)
+            // ripples into that account keeping the current asset; whether it
+            // changes the boundary depends on what that account is:
+            //   * `account == iss` is a literal no-op (the book output lands on
+            //     the issuer's own books before the next book step). Skip it.
+            //   * an AMM pseudo-account (its `AccountRoot` carries `AMMID`) is the
+            //     pivot the pathfinder names for an AMM crossing: the currency
+            //     change and liquidity are resolved between the adjacent
+            //     boundaries by `cross_path_payment` (AMM-by-pair via
+            //     `keylet::amm`), so the step is a pass-through here.
+            //   * any other account is a genuine cross-issuer `DirectStep` ripple
+            //     (same currency, different issuer obligations) that this
+            //     book/AMM-chain engine does not model — fall back to another path
+            //     (or the legacy IOU<->IOU back-solve).
+            if step_cur.is_none() && step_iss.is_none() {
+                if account == iss || account_has_ammid(view, account) {
+                    continue;
+                }
+                // DirectStep: ripple into `account` keeping the currency, so
+                // the next book hop spends that account's IOU. 30000046 path
+                // `{account: rDAN} -> {currency: XRP}` must become ETC@rDAN
+                // -> XRP, not fall off the book/AMM engine.
+                if iss.is_empty() || iss != source {
+                    return None;
+                }
+                iss = account.to_string();
+                if let Some(obj) = out.last_mut().and_then(|v| v.as_object_mut()) {
+                    obj.insert(
+                        "issuer".into(),
+                        serde_json::Value::String(account.to_string()),
+                    );
+                }
+                continue;
+            }
+            return None;
+        }
+        if step_cur.is_none() && step_iss.is_none() {
+            return None;
+        }
+        if let Some(c) = step_cur {
+            cur = c.to_string();
+        }
+        if let Some(i) = step_iss {
+            iss = i.to_string();
+        }
+        // A `currency: XRP` step is a native boundary: XRP carries no issuer, so
+        // clear any issuer inherited from the previous hop and represent the
+        // boundary as a drops string (the shape `Leg::parse` decodes as native).
+        // Keeping it as an `{currency, issuer}` object would mint a bogus
+        // issued-XRP boundary, splitting a single AMM/book hop into two dead hops
+        // with no liquidity (the pool/book keylet would never match).
+        if cur == "XRP" {
+            iss = String::new();
+            out.push(serde_json::Value::String("0".into()));
+        } else {
+            out.push(serde_json::json!({
+                "currency": cur,
+                "issuer": iss,
+                "value": "0",
+            }));
+        }
+    }
+    // Append the destination asset (Amount) unless the last step already lands
+    // on it.
+    let (amt_cur, amt_iss) = boundary_asset(amount);
+    if cur == amt_cur && iss != amt_iss {
+        // Same currency, different issuer: dest is credited the path IOU
+        // (30000046 Payment 63B72EB4: book XRP->JPY@rB3g, Amount names dest).
+        // Pushing Amount would add a JPY@rB3g->JPY@self hop with no book.
+        if let Some(last) = out.last_mut() {
+            if let Some(obj) = last.as_object_mut() {
+                if let Some(v) = amount.get("value") {
+                    obj.insert("value".into(), v.clone());
+                }
+            }
+        }
+    } else if (cur, iss) != (amt_cur, amt_iss) {
+        out.push(amount.clone());
+    } else {
+        // Replace the trailing interior boundary with the real Amount object so
+        // the final hop's output template carries Amount's issuer/currency.
+        *out.last_mut().unwrap() = amount.clone();
+    }
+    Some(out)
+}
+
+/// Apply a cross-currency Payment that carries `Paths` and a native (XRP)
+/// source or destination leg. Resolves the first viable path into a book chain
+/// and crosses it forward via the shared byte-exact Taker engine
+/// (`cross_path_payment`), spending up to `send_max` to deliver as much of
+/// `amount` as the path's liquidity allows.
+///
+/// The transaction fee is already charged on the account by the engine; this
+/// reads that working copy (the source's AccountRoot, which carries any native
+/// leg), crosses the chain, enforces the partial-payment gate, then writes the
+/// working copy back.
+fn apply_paths_payment(
+    ctx: &mut ApplyContext<'_>,
+    account_str: &str,
+    destination_str: &str,
+    amount: serde_json::Value,
+    send_max: serde_json::Value,
+) -> Result<TransactionResult, TransactionResult> {
+    let src_id =
+        decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let dst_id =
+        decode_account_id(destination_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let src_key = keylet::account(&src_id);
+    let bytes = ctx
+        .view
+        .read(&src_key)
+        .ok_or(TransactionResult::TerNoAccount)?;
+    let mut acct: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+
+    let paths = ctx
+        .tx
+        .get("Paths")
+        .and_then(|v| v.as_array())
+        .ok_or(TransactionResult::TemBadPath)?;
+
+    // Fill every viable path in order with remaining Amount/SendMax.
+    // 30000103 70135FCE: path 0 (XLM) delivers 912 CNY then path 1 (JPY)
+    // consumes the leftover JPY/CNY book; stopping at the first Ok left
+    // BookDirectory 042607ED in place.
+    let mut delivered: Option<serde_json::Value> = None;
+    let mut remain_out = amount.clone();
+    let mut remain_in = send_max.clone();
+    let limit_quality =
+        helpers::get_flags(ctx.tx) & rxrpl_protocol::flags::payment::TF_LIMIT_QUALITY != 0;
+    for path in paths {
+        if delivered_amount(&remain_out) <= 0.0 {
+            break;
+        }
+        let Some(path) = path.as_array() else {
+            continue;
+        };
+        let Some(boundaries) =
+            build_path_boundaries(ctx.view, path, &remain_in, &remain_out, account_str)
+        else {
+            continue;
+        };
+        match crate::handlers::offer_create::cross_path_payment(
+            ctx,
+            &src_id,
+            &mut acct,
+            &dst_id,
+            &boundaries,
+            &remain_out,
+            &remain_in,
+            limit_quality,
+        ) {
+            Ok((got, spent)) => {
+                if delivered_amount(&got) <= 0.0 {
+                    continue;
+                }
+                delivered = Some(match delivered {
+                    Some(prev) => json_add_amounts(&prev, &got).unwrap_or_else(|| got.clone()),
+                    None => got.clone(),
+                });
+                if let Some(next) = json_sub_amounts(&remain_out, &got) {
+                    remain_out = next;
+                }
+                if let Some(next) = json_sub_amounts(&remain_in, &spent) {
+                    remain_in = next;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    let Some(delivered) = delivered else {
+        return Err(if limit_quality {
+            TransactionResult::TecPathDry
+        } else {
+            TransactionResult::TecPathPartial
+        });
+    };
+
+    // A path that delivers exactly zero is dry (tecPATH_DRY), even under
+    // tfPartialPayment — mirrors rippled StrandFlow and lets the build-ledger
+    // loop retry once a sibling funds the path.
+    if delivered_amount(&delivered) <= 0.0 {
+        return Err(TransactionResult::TecPathDry);
+    }
+
+    // Partial-payment gate. Without tfPartialPayment the full Amount must be
+    // delivered; with it, the delivery must reach DeliverMin (when present),
+    // else the requested Amount.
+    const TF_PARTIAL_PAYMENT: u32 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT;
+    let partial = helpers::get_flags(ctx.tx) & TF_PARTIAL_PAYMENT != 0;
+    if !partial {
+        if !delivered_meets_target(&delivered, &amount) {
+            return Err(TransactionResult::TecPathPartial);
+        }
+    } else if let Some((dm_cur, dm_iss, dm_val)) = get_deliver_min_iou(ctx.tx) {
+        let (d_cur, d_iss) = asset_of(&delivered);
+        let target = serde_json::json!({
+            "currency": dm_cur, "issuer": dm_iss, "value": dm_val,
+        });
+        let _ = (d_cur, d_iss);
+        if !delivered_meets_target(&delivered, &target) {
+            return Err(TransactionResult::TecPathPartial);
+        }
+    }
+
+    // rippled Payment::doApply: record sfDeliveredAmount when delivered differs
+    // from the requested Amount (partial or path-limited delivery).
+    if delivered != amount {
+        ctx.view.set_delivered_amount(delivered.clone());
+    }
+
+    let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(src_key, nb)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    Ok(TransactionResult::TesSuccess)
+}
+
+/// Count the transaction's alternative `Paths` that resolve to a pure book/AMM
+/// boundary chain of at least two assets. The multi-path Flow gate fires when at
+/// least two paths resolve (so a shared AMM is consumed in fib chunks). Unlike
+/// [`paths_resolve_to_chain`], this does NOT require an account-ripple step: the
+/// multi-path repro's paths are pure currency steps (no `account` field).
+fn count_flow_strands(
+    view: &dyn ReadView,
+    tx: &serde_json::Value,
+    send_max: &serde_json::Value,
+    amount: &serde_json::Value,
+) -> usize {
+    let Some(paths) = tx.get("Paths").and_then(|v| v.as_array()) else {
+        return 0;
+    };
+    if paths.len() < 2 {
+        return 0;
+    }
+    paths
+        .iter()
+        .filter(|p| {
+            p.as_array()
+                .and_then(|steps| {
+                    build_path_boundaries(
+                        view,
+                        steps,
+                        send_max,
+                        amount,
+                        tx.get("Account").and_then(|v| v.as_str()).unwrap_or(""),
+                    )
+                })
+                .map(|b| b.len() >= 2)
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// Whether any resolvable strand carries an AMM pool on one of its hops.
+///
+/// The multi-pass Flow loop (`apply_paths_payment_multi`) exists specifically to
+/// consume a *shared AMM pool* in fibonacci-sized chunks across competing
+/// strands — the byte-exact behaviour the single-strand/back-solve engines
+/// cannot reproduce. A pure-CLOB multi-path payment (no AMM on any hop) is
+/// handled correctly by the legacy quality-ranked back-solve
+/// (`apply_cross_currency`), which dry-runs every alternative and commits the
+/// cheapest. So the Flow gate fires only when an AMM is actually present;
+/// routing pure-CLOB multi-path through `flow_multi` (whose forward walk does not
+/// reverse-price interior book hops) would mis-size them.
+fn flow_strands_have_amm(
+    view: &dyn ReadView,
+    tx: &serde_json::Value,
+    send_max: &serde_json::Value,
+    amount: &serde_json::Value,
+) -> bool {
+    let Some(paths) = tx.get("Paths").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    for p in paths {
+        let Some(steps) = p.as_array() else {
+            continue;
+        };
+        let Some(boundaries) = build_path_boundaries(
+            view,
+            steps,
+            send_max,
+            amount,
+            tx.get("Account").and_then(|v| v.as_str()).unwrap_or(""),
+        ) else {
+            continue;
+        };
+        for pair in boundaries.windows(2) {
+            let (Some((_, in_cur, in_iss)), Some((_, out_cur, out_iss))) =
+                (amm_asset_of(&pair[0]), amm_asset_of(&pair[1]))
+            else {
+                continue;
+            };
+            let amm_key = keylet::amm(&in_cur, &in_iss, &out_cur, &out_iss);
+            if view.read(&amm_key).is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A SendMax / Amount value as a `Number` magnitude (XRP drops as an integer,
+/// IOU as its decimal value).
+fn value_to_number(v: &serde_json::Value) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::Number;
+    if let Some(s) = v.as_str() {
+        return Number::from_int(s.parse::<i64>().unwrap_or(0));
+    }
+    match v
+        .get("value")
+        .and_then(|x| x.as_str())
+        .and_then(|s| rxrpl_amount::IOUAmount::from_decimal_string(s).ok())
+    {
+        Some(iou) => Number::from_iou(&iou),
+        None => Number::ZERO,
+    }
+}
+
+/// Apply a multi-path cross-currency Payment through the multi-pass Flow loop.
+/// Builds every resolvable strand, runs `flow_multi` (fib-chunked shared-AMM
+/// consumption when two or more strands are live), enforces the partial-payment
+/// gate, then writes the source working copy back. Mirrors rippled's `Flow`
+/// driving `apply_paths_payment`'s single-strand engine across multiple strands.
+fn apply_paths_payment_multi(
+    ctx: &mut ApplyContext<'_>,
+    account_str: &str,
+    destination_str: &str,
+    amount: serde_json::Value,
+    send_max: serde_json::Value,
+) -> Result<TransactionResult, TransactionResult> {
+    use rxrpl_amount::number::Number;
+    let src_id =
+        decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let dst_id =
+        decode_account_id(destination_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let src_key = keylet::account(&src_id);
+    let bytes = ctx
+        .view
+        .read(&src_key)
+        .ok_or(TransactionResult::TerNoAccount)?;
+    let mut acct: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+
+    let paths = ctx
+        .tx
+        .get("Paths")
+        .and_then(|v| v.as_array())
+        .ok_or(TransactionResult::TemBadPath)?
+        .clone();
+
+    // Build every strand that resolves to a boundary chain (>= 2 assets).
+    let mut strands = Vec::new();
+    for path in &paths {
+        let Some(steps) = path.as_array() else {
+            continue;
+        };
+        let Some(boundaries) =
+            build_path_boundaries(ctx.view, steps, &send_max, &amount, account_str)
+        else {
+            continue;
+        };
+        if boundaries.len() < 2 {
+            continue;
+        }
+        if let Some(strand) = crate::handlers::offer_create::build_flow_strand(ctx, &boundaries) {
+            strands.push(strand);
+        }
+    }
+    if strands.is_empty() {
+        return Err(TransactionResult::TecPathDry);
+    }
+
+    // Source-funds cap on the SendMax (cannot spend more than held).
+    let deliver_req = value_to_number(&amount);
+    let send_max_num = value_to_number(&send_max);
+
+    let mut amm_ctx = crate::handlers::flow::AmmContext::new(strands.len() > 1);
+    let (delivered_num, _spent_num) = crate::handlers::offer_create::flow_multi(
+        ctx,
+        &src_id,
+        &mut acct,
+        &dst_id,
+        &strands,
+        &deliver_req,
+        &send_max_num,
+        &mut amm_ctx,
+    );
+
+    if delivered_num.is_zero() {
+        // Zero delivery is dry, not partial (rippled StrandFlow.h:805).
+        return Err(TransactionResult::TecPathDry);
+    }
+
+    // The delivered magnitude in the Amount asset, for the partial-payment gate.
+    let (amt_cur, amt_iss) = asset_of(&amount);
+    let delivered = if amount.is_string() {
+        serde_json::Value::String(delivered_num.to_xrp_drops().to_string())
+    } else {
+        serde_json::json!({
+            "currency": amt_cur,
+            "issuer": amt_iss,
+            "value": delivered_num.to_iou().to_decimal_string(),
+        })
+    };
+
+    // Partial-payment gate: without tfPartialPayment the full Amount must be
+    // delivered; with it, the delivery must reach DeliverMin (when present).
+    const TF_PARTIAL_PAYMENT: u32 = rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT;
+    let partial = helpers::get_flags(ctx.tx) & TF_PARTIAL_PAYMENT != 0;
+    if !partial {
+        if !delivered_meets_target(&delivered, &amount) {
+            return Err(TransactionResult::TecPathPartial);
+        }
+    } else if let Some((dm_cur, dm_iss, dm_val)) = get_deliver_min_iou(ctx.tx) {
+        let target = serde_json::json!({
+            "currency": dm_cur, "issuer": dm_iss, "value": dm_val,
+        });
+        if !delivered_meets_target(&delivered, &target) {
+            return Err(TransactionResult::TecPathPartial);
+        }
+    }
+    let _ = Number::ZERO;
+
+    // rippled Payment::doApply: record sfDeliveredAmount when delivered differs
+    // from the requested Amount (partial or path-limited delivery).
+    if delivered != amount {
+        ctx.view.set_delivered_amount(delivered.clone());
+    }
+
+    let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(src_key, nb)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    Ok(TransactionResult::TesSuccess)
+}
+
+/// The asset identity of an Amount value, parsed for AMM lookups: `(is_xrp,
+/// currency_bytes, issuer)`. Returns `None` for shapes an AMM can't represent.
+fn amm_asset_of(v: &serde_json::Value) -> Option<(bool, [u8; 20], rxrpl_primitives::AccountId)> {
+    if v.is_string() {
+        return Some((true, [0u8; 20], rxrpl_primitives::AccountId::new([0u8; 20])));
+    }
+    let cur = v.get("currency")?.as_str()?;
+    let iss = v.get("issuer")?.as_str()?;
+    let cur_b = helpers::currency_to_bytes(cur);
+    let iss_id = decode_account_id(iss).ok()?;
+    Some((false, cur_b, iss_id))
+}
+
+/// `a <= b` for two like-asset `Number`s.
+fn num_le(a: &rxrpl_amount::number::Number, b: &rxrpl_amount::number::Number) -> bool {
+    let d = a.sub(b);
+    d.is_zero() || d.negative()
+}
+
+/// The AMM pool's holding of one asset as a `Number`: the pseudo-account's XRP
+/// AccountRoot balance for XRP, or its issuer trust-line balance for an IOU.
+fn amm_pool_balance(
+    ctx: &ApplyContext<'_>,
+    pool: &rxrpl_primitives::AccountId,
+    is_xrp: bool,
+    cur: &[u8; 20],
+    iss: &rxrpl_primitives::AccountId,
+) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::Number;
+    if is_xrp {
+        let key = keylet::account(pool);
+        let bal = ctx
+            .view
+            .read(&key)
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .map(|a| helpers::get_balance(&a))
+            .unwrap_or(0);
+        Number::from_int(bal as i64)
+    } else {
+        crate::amm_helpers::iou_holding_number(ctx.view, pool, iss, cur)
+    }
+}
+
+/// Attempt to satisfy a cross-currency conversion through an AMM pool. Returns
+/// `Ok(Some(delivered))` with the pool and the user's (= destination, for a
+/// conversion) balances mutated byte-exactly, or `Ok(None)` when there is no AMM
+/// for the `(send_max, amount)` pair (or it can deliver nothing), leaving the
+/// caller to fall back to the order book.
+///
+/// Quality (book-directory `in/out` rate) of the best resting offer a conversion
+/// crossing `in -> out` would hit: the first funded, non-self offer walking the
+/// book best-price-first. `None` when the book has no such offer. Gates the AMM
+/// swap in [`try_amm_conversion`] — rippled's `BookStep` crosses whichever of the
+/// AMM synthetic offer / CLOB tip is better, so an AMM whose fee-adjusted spot
+/// does not beat this must defer to the CLOB.
+fn best_book_dir_quality(
+    ctx: &mut ApplyContext<'_>,
+    taker: &rxrpl_primitives::AccountId,
+    in_cur: &[u8; 20],
+    in_iss: &rxrpl_primitives::AccountId,
+    out_cur: &[u8; 20],
+    out_iss: &rxrpl_primitives::AccountId,
+    out_xrp: bool,
+) -> Option<u64> {
+    let book = keylet::book_dir(in_cur, in_iss, out_cur, out_iss);
+    let book_prefix = book.as_bytes()[0..24].to_vec();
+    let mut probe = crate::handlers::offer_create::book_dir_with_quality(&book, 0);
+    while let Some(dir_key) = ctx.view.succ(&probe) {
+        if dir_key.as_bytes()[0..24] != book_prefix[..] {
+            break;
+        }
+        probe = dir_key;
+        let dir_quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
+        let Some(dir_bytes) = ctx.view.read(&dir_key) else {
+            continue;
+        };
+        let Ok(dir) = serde_json::from_slice::<serde_json::Value>(&dir_bytes) else {
+            continue;
+        };
+        let Some(indexes) = dir.get("Indexes").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for idx in indexes {
+            let Some(h) = idx
+                .as_str()
+                .and_then(|s| s.parse::<rxrpl_primitives::Hash256>().ok())
+            else {
+                continue;
+            };
+            let Some(eb) = ctx.view.read(&h) else {
+                continue;
+            };
+            let Ok(entry) = serde_json::from_slice::<serde_json::Value>(&eb) else {
+                continue;
+            };
+            if entry.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+                continue;
+            }
+            let Some(owner) = entry
+                .get("Account")
+                .and_then(|v| v.as_str())
+                .and_then(|s| decode_account_id(s).ok())
+            else {
+                continue;
+            };
+            if &owner == taker {
+                continue;
+            }
+            let funded = if out_xrp {
+                ctx.view
+                    .read(&keylet::account(&owner))
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                    .map(|a| helpers::get_balance(&a) > 0)
+                    .unwrap_or(false)
+            } else {
+                let h = crate::amm_helpers::iou_holding_number(ctx.view, &owner, out_iss, out_cur);
+                !h.is_zero() && !h.negative()
+            };
+            if !funded {
+                continue;
+            }
+            return Some(dir_quality);
+        }
+    }
+    None
+}
+
+/// Mirrors rippled's single-path AMM offer in a `BookStep`: the delivered/spent
+/// amounts come from `swapAssetIn`/`swapAssetOut` on the live pool reserves. The
+/// trade is output-limited (deliver the full `Amount`) when the required input
+/// fits the budget, otherwise input-limited (spend the whole budget — the
+/// SendMax capped by the source's funds). The transaction fee was already
+/// charged on `user_acct`; XRP legs move through that working copy (the caller
+/// writes it back), IOU legs through the trust lines directly.
+///
+/// The `spent` input leg is debited from `user_id` (the source), the `delivered`
+/// output leg is credited to `dst_id` (the destination) — they coincide for a
+/// same-account conversion but differ for a cross-account payment, where the
+/// output must land on the destination's line, not the source's.
+fn try_amm_conversion(
+    ctx: &mut ApplyContext<'_>,
+    user_id: &rxrpl_primitives::AccountId,
+    user_acct: &mut serde_json::Value,
+    dst_id: &rxrpl_primitives::AccountId,
+    amount: &serde_json::Value,
+    send_max: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, TransactionResult> {
+    use rxrpl_amount::number::Number;
+
+    let (out_xrp, out_cur, out_iss) = match amm_asset_of(amount) {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    let (in_xrp, in_cur, in_iss) = match amm_asset_of(send_max) {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+
+    // Locate the AMM SLE for the pair; absent ⇒ no AMM liquidity.
+    let amm_key = keylet::amm(&in_cur, &in_iss, &out_cur, &out_iss);
+    let Some(amm_bytes) = ctx.view.read(&amm_key) else {
+        return Ok(None);
+    };
+    let Ok(amm): Result<serde_json::Value, _> = serde_json::from_slice(&amm_bytes) else {
+        return Ok(None);
+    };
+    let Some(pool_str) = amm.get("Account").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let Ok(pool_id) = decode_account_id(pool_str) else {
+        return Ok(None);
+    };
+    let tfee = amm.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+
+    // Live pool reserves (rippled `ammAccountHolds`).
+    let pool_in = amm_pool_balance(ctx, &pool_id, in_xrp, &in_cur, &in_iss);
+    let pool_out = amm_pool_balance(ctx, &pool_id, out_xrp, &out_cur, &out_iss);
+    if pool_in.is_zero() || pool_out.is_zero() {
+        return Ok(None);
+    }
+
+    // AMM-vs-CLOB interleave gate (rippled `BookStep`): when the order book holds
+    // an offer whose quality strictly beats the AMM's fee-adjusted spot price,
+    // rippled crosses that CLOB offer first, not the pool. Defer to the CLOB
+    // (`cross_book_payment`) in that case instead of consuming the AMM here. The
+    // spot must be fee-adjusted — the taker pays the trading fee on the input, so
+    // the effective in/out is spot / (1 - fee) — matching `amm_hop`'s band gate.
+    if let Some(cq) =
+        best_book_dir_quality(ctx, user_id, &in_cur, &in_iss, &out_cur, &out_iss, out_xrp)
+    {
+        let q_iou = |n: &Number, is_xrp: bool| {
+            if is_xrp {
+                rxrpl_amount::IOUAmount::from_decimal_string(&n.to_xrp_drops().to_string())
+                    .unwrap_or(rxrpl_amount::IOUAmount::ZERO)
+            } else {
+                n.to_iou()
+            }
+        };
+        let one_minus_fee = rxrpl_amount::IOUAmount::divide(
+            &rxrpl_amount::IOUAmount::from_decimal_string(
+                &(100_000u32 - u32::from(tfee)).to_string(),
+            )
+            .unwrap_or(rxrpl_amount::IOUAmount::ZERO),
+            &rxrpl_amount::IOUAmount::from_decimal_string("100000")
+                .unwrap_or(rxrpl_amount::IOUAmount::ZERO),
+        )
+        .unwrap_or(rxrpl_amount::IOUAmount::ZERO);
+        let out_q = q_iou(&pool_out, out_xrp);
+        let out_adj = rxrpl_amount::IOUAmount::multiply(&out_q, &one_minus_fee).unwrap_or(out_q);
+        if let Ok(spq) = rxrpl_amount::get_rate(&q_iou(&pool_in, in_xrp), &out_adj) {
+            if !rxrpl_amount::is_better_quality(spq, cq)
+                || rxrpl_amount::within_relative_distance(spq, cq)
+            {
+                return Ok(None);
+            }
+        }
+    }
+
+    // Target output (Amount).
+    let target_out = if out_xrp {
+        Number::from_int(
+            amount
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0) as i64,
+        )
+    } else {
+        Number::from_iou(&crate::amm_helpers::parse_iou_value(
+            amount.get("value").and_then(|v| v.as_str()).unwrap_or("0"),
+        ))
+    };
+
+    // Budget input (SendMax), capped at the source's spendable funds.
+    let (budget_in, src_in_funds) = if in_xrp {
+        let send = send_max
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let avail = helpers::get_balance(user_acct);
+        (Number::from_int(send.min(avail) as i64), Number::ZERO)
+    } else {
+        let send = Number::from_iou(&crate::amm_helpers::parse_iou_value(
+            send_max
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0"),
+        ));
+        let funds = crate::amm_helpers::iou_holding_number(ctx.view, user_id, &in_iss, &in_cur);
+        let budget = if num_le(&send, &funds) { send } else { funds };
+        (budget, funds)
+    };
+    if budget_in.is_zero() || budget_in.negative() {
+        return Ok(None);
+    }
+
+    // Choose the binding limit. Output-limited when the input needed for the
+    // full target fits the budget; otherwise input-limited (spend the budget).
+    let in_needed =
+        crate::amm_helpers::swap_asset_out(&pool_in, &pool_out, &target_out, tfee, in_xrp);
+    let (spent, delivered) = match in_needed {
+        Some(needed) if num_le(&needed, &budget_in) => (needed, target_out),
+        _ => (
+            budget_in,
+            crate::amm_helpers::swap_asset_in(&pool_in, &pool_out, &budget_in, tfee, out_xrp),
+        ),
+    };
+    if delivered.is_zero() || spent.is_zero() {
+        return Ok(None);
+    }
+
+    // --- Apply: move `spent` in from the user to the pool. ---
+    if in_xrp {
+        let drops = spent.to_xrp_drops();
+        let ubal = helpers::get_balance(user_acct);
+        helpers::set_balance(user_acct, ubal.saturating_sub(drops));
+        let pkey = keylet::account(&pool_id);
+        let pbytes = ctx.view.read(&pkey).ok_or(TransactionResult::TecNoEntry)?;
+        let mut pacct: serde_json::Value =
+            serde_json::from_slice(&pbytes).map_err(|_| TransactionResult::TefInternal)?;
+        let pbal = helpers::get_balance(&pacct);
+        helpers::set_balance(&mut pacct, pbal + drops);
+        let pd = serde_json::to_vec(&pacct).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(pkey, pd)
+            .map_err(|_| TransactionResult::TefInternal)?;
+    } else {
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            user_id,
+            &in_iss,
+            &in_cur,
+            &src_in_funds.sub(&spent),
+        )?;
+        // rippled's rippleCredit deletes a line drained to zero in the default
+        // state (trustDelete); fires inline after the debit.
+        crate::handlers::trust_set::maybe_delete_drained_trust_line(
+            ctx, user_id, user_acct, &in_iss, &in_cur,
+        )?;
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            &pool_id,
+            &in_iss,
+            &in_cur,
+            &pool_in.add(&spent),
+        )?;
+    }
+
+    // --- Apply: move `delivered` out from the pool to the destination. ---
+    let dst_is_src = dst_id.as_bytes() == user_id.as_bytes();
+    if out_xrp {
+        let drops = delivered.to_xrp_drops();
+        let pkey = keylet::account(&pool_id);
+        let pbytes = ctx.view.read(&pkey).ok_or(TransactionResult::TecNoEntry)?;
+        let mut pacct: serde_json::Value =
+            serde_json::from_slice(&pbytes).map_err(|_| TransactionResult::TefInternal)?;
+        let pbal = helpers::get_balance(&pacct);
+        helpers::set_balance(&mut pacct, pbal.saturating_sub(drops));
+        let pd = serde_json::to_vec(&pacct).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(pkey, pd)
+            .map_err(|_| TransactionResult::TefInternal)?;
+        if dst_is_src {
+            let ubal = helpers::get_balance(user_acct);
+            helpers::set_balance(user_acct, ubal + drops);
+        } else {
+            let dkey = keylet::account(dst_id);
+            let dbytes = ctx.view.read(&dkey).ok_or(TransactionResult::TecNoEntry)?;
+            let mut dacct: serde_json::Value =
+                serde_json::from_slice(&dbytes).map_err(|_| TransactionResult::TefInternal)?;
+            let dbal = helpers::get_balance(&dacct);
+            helpers::set_balance(&mut dacct, dbal + drops);
+            let dd = serde_json::to_vec(&dacct).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(dkey, dd)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
+    } else {
+        crate::amm_helpers::set_iou_holding(
+            ctx.view,
+            &pool_id,
+            &out_iss,
+            &out_cur,
+            &pool_out.sub(&delivered),
+        )?;
+        // Delivering the output IOU to its own issuer redeems it: the pool's
+        // holding decrease above already reflects the burn, and the issuer holds
+        // no trust line to itself, so there is no destination balance to credit.
+        if dst_id.as_bytes() != out_iss.as_bytes() {
+            let dst_out =
+                crate::amm_helpers::iou_holding_number(ctx.view, dst_id, &out_iss, &out_cur);
+            crate::amm_helpers::set_iou_holding(
+                ctx.view,
+                dst_id,
+                &out_iss,
+                &out_cur,
+                &dst_out.add(&delivered),
+            )?;
+        }
+    }
+
+    // Delivered amount in the Amount asset's JSON shape (for the partial gate).
+    let delivered_value = if out_xrp {
+        serde_json::Value::String(delivered.to_xrp_drops().to_string())
+    } else {
+        serde_json::json!({
+            "currency": amount.get("currency").cloned().unwrap_or_default(),
+            "issuer": amount.get("issuer").cloned().unwrap_or_default(),
+            "value": delivered.to_iou().to_decimal_string(),
+        })
+    };
+    Ok(Some(delivered_value))
+}
+
 /// Whether `delivered` reaches `target` (gate only — f64 comparison is fine for
 /// a success/fail decision; the byte-exact amounts come from the Taker engine).
+/// Numeric magnitude of a delivered amount, whether it is an XRP drop string or
+/// an IOU `{value}` object.
+fn delivered_amount(v: &serde_json::Value) -> f64 {
+    if let Some(s) = v.as_str() {
+        return s.parse().unwrap_or(0.0);
+    }
+    v.get("value")
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0)
+}
+
 fn delivered_meets_target(delivered: &serde_json::Value, target: &serde_json::Value) -> bool {
-    let val = |v: &serde_json::Value| -> f64 {
-        if let Some(s) = v.as_str() {
-            return s.parse().unwrap_or(0.0);
+    delivered_amount(delivered) + 1e-9 >= delivered_amount(target)
+}
+
+fn json_sub_amounts(
+    whole: &serde_json::Value,
+    part: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if let (Some(w), Some(p)) = (whole.as_str(), part.as_str()) {
+        let a: u64 = w.parse().ok()?;
+        let b: u64 = p.parse().ok()?;
+        return Some(serde_json::Value::String(a.saturating_sub(b).to_string()));
+    }
+    let wv = whole.get("value")?.as_str()?;
+    let pv = part.get("value")?.as_str()?;
+    let w = rxrpl_amount::IOUAmount::from_decimal_string(wv).ok()?;
+    let p = rxrpl_amount::IOUAmount::from_decimal_string(pv).ok()?;
+    let rem = rxrpl_amount::IOUAmount::add(&w, &p.negate()).ok()?;
+    if rem.is_negative() || rem.is_zero() {
+        let mut z = whole.clone();
+        if let Some(obj) = z.as_object_mut() {
+            obj.insert("value".into(), serde_json::Value::String("0".into()));
         }
-        v.get("value")
-            .and_then(|x| x.as_str())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0)
-    };
-    val(delivered) + 1e-9 >= val(target)
+        return Some(z);
+    }
+    let mut out = whole.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "value".into(),
+            serde_json::Value::String(rem.to_decimal_string()),
+        );
+    }
+    Some(out)
+}
+
+fn json_add_amounts(a: &serde_json::Value, b: &serde_json::Value) -> Option<serde_json::Value> {
+    if let (Some(as_), Some(bs)) = (a.as_str(), b.as_str()) {
+        let x: u64 = as_.parse().ok()?;
+        let y: u64 = bs.parse().ok()?;
+        return Some(serde_json::Value::String(x.saturating_add(y).to_string()));
+    }
+    let av = a.get("value")?.as_str()?;
+    let bv = b.get("value")?.as_str()?;
+    let x = rxrpl_amount::IOUAmount::from_decimal_string(av).ok()?;
+    let y = rxrpl_amount::IOUAmount::from_decimal_string(bv).ok()?;
+    let sum = rxrpl_amount::IOUAmount::add(&x, &y).ok()?;
+    let mut out = a.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "value".into(),
+            serde_json::Value::String(sum.to_decimal_string()),
+        );
+    }
+    Some(out)
 }
 
 /// Apply a cross-currency Payment: the source pays `send_max` (currency A)
@@ -795,21 +1872,6 @@ fn apply_cross_currency(
 
     // Credit destination's dst-currency trust line.
     apply_trust_delta(ctx, &dest_id, &dst_issuer_id, &dst_cur_bytes, target)?;
-
-    // Bump source Sequence.
-    let src_key = keylet::account(&src_id);
-    let src_bytes = ctx
-        .view
-        .read(&src_key)
-        .ok_or(TransactionResult::TerNoAccount)?;
-    let mut src_acct: serde_json::Value =
-        serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
-    crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut src_acct, ctx.tx)?;
-    let src_acct_data =
-        serde_json::to_vec(&src_acct).map_err(|_| TransactionResult::TefInternal)?;
-    ctx.view
-        .update(src_key, src_acct_data)
-        .map_err(|_| TransactionResult::TefInternal)?;
 
     Ok(TransactionResult::TesSuccess)
 }
@@ -1364,73 +2426,69 @@ fn commit_n_hop_plan(
     let (last_cur, last_iss) = &chain[chain.len() - 1];
     apply_trust_delta(ctx, &dest_id, last_iss, last_cur, target)?;
 
-    let src_key = keylet::account(&src_id);
-    let src_bytes = ctx
-        .view
-        .read(&src_key)
-        .ok_or(TransactionResult::TerNoAccount)?;
-    let mut src_acct: serde_json::Value =
-        serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
-    crate::owner_dir::consume_seq_or_ticket(ctx.view, &src_id, &mut src_acct, ctx.tx)?;
-    let src_acct_data =
-        serde_json::to_vec(&src_acct).map_err(|_| TransactionResult::TefInternal)?;
-    ctx.view
-        .update(src_key, src_acct_data)
-        .map_err(|_| TransactionResult::TefInternal)?;
-
     Ok(TransactionResult::TesSuccess)
 }
 
-/// Walk a book directory and collect its offers with parsed IOU amounts.
+/// Walk a book and collect its offers with parsed IOU amounts, best price
+/// (lowest quality) first.
+///
+/// An XRPL order book is NOT a single paginated directory keyed off the book
+/// base: it is a family of quality sub-directories, one per distinct offer
+/// rate, each keyed `book_dir_with_quality(book_base, quality)` (the base with
+/// its low 64 bits replaced by the rate). They sort by quality, so walking the
+/// keyspace via `succ()` from the base — exactly as `cross_offers` /
+/// `cross_book_payment` do — visits offers in ascending price. The previous
+/// `keylet::dir_node(book_base, page)` pagination read the (usually empty) base
+/// index itself, so the book was invisible to the back-solve and the strand
+/// never crossed.
 fn collect_book_offers(
     ctx: &mut ApplyContext<'_>,
     book_root: &rxrpl_primitives::Hash256,
 ) -> Vec<CrossOffer> {
     let mut out = Vec::new();
-    let mut page = 0u64;
-    loop {
-        let page_key = keylet::dir_node(book_root, page);
-        let page_bytes = match ctx.view.read(&page_key) {
-            Some(b) => b,
-            None => break,
-        };
-        let page_json: serde_json::Value = match serde_json::from_slice(&page_bytes) {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-        if let Some(indexes) = page_json.get("Indexes").and_then(|v| v.as_array()) {
-            for idx in indexes {
-                let Some(s) = idx.as_str() else { continue };
-                let Ok(h) = s.parse::<rxrpl_primitives::Hash256>() else {
-                    continue;
-                };
-                let Some(eb) = ctx.view.read(&h) else {
-                    continue;
-                };
-                let Ok(entry) = serde_json::from_slice::<serde_json::Value>(&eb) else {
-                    continue;
-                };
-                if entry.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
-                    continue;
-                }
-                let owner = entry
-                    .get("Account")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| decode_account_id(s).ok());
-                let Some(owner) = owner else { continue };
-                let taker_pays = iou_value(entry.get("TakerPays"));
-                let taker_gets = iou_value(entry.get("TakerGets"));
-                out.push(CrossOffer {
-                    key: h,
-                    owner,
-                    taker_pays,
-                    taker_gets,
-                });
-            }
+    let book_prefix = book_root.as_bytes()[0..24].to_vec();
+    let mut probe = crate::handlers::offer_create::book_dir_with_quality(book_root, 0);
+    while let Some(dir_key) = ctx.view.succ(&probe) {
+        if dir_key.as_bytes()[0..24] != book_prefix[..] {
+            break; // left this book
         }
-        match page_json.get("IndexNext").and_then(|v| v.as_u64()) {
-            Some(next) if next != 0 => page = next,
-            _ => break,
+        probe = dir_key;
+        let Some(dir_bytes) = ctx.view.read(&dir_key) else {
+            continue;
+        };
+        let Ok(dir) = serde_json::from_slice::<serde_json::Value>(&dir_bytes) else {
+            continue;
+        };
+        let Some(indexes) = dir.get("Indexes").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for idx in indexes {
+            let Some(s) = idx.as_str() else { continue };
+            let Ok(h) = s.parse::<rxrpl_primitives::Hash256>() else {
+                continue;
+            };
+            let Some(eb) = ctx.view.read(&h) else {
+                continue;
+            };
+            let Ok(entry) = serde_json::from_slice::<serde_json::Value>(&eb) else {
+                continue;
+            };
+            if entry.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+                continue;
+            }
+            let owner = entry
+                .get("Account")
+                .and_then(|v| v.as_str())
+                .and_then(|s| decode_account_id(s).ok());
+            let Some(owner) = owner else { continue };
+            let taker_pays = iou_value(entry.get("TakerPays"));
+            let taker_gets = iou_value(entry.get("TakerGets"));
+            out.push(CrossOffer {
+                key: h,
+                owner,
+                taker_pays,
+                taker_gets,
+            });
         }
     }
     out

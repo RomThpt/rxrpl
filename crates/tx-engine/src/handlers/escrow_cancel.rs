@@ -79,36 +79,14 @@ impl Transactor for EscrowCancelTransactor {
         helpers::set_balance(&mut owner_account, owner_balance + amount);
         helpers::adjust_owner_count(&mut owner_account, -1);
 
-        // Increment sequence on tx sender
-        let account_str = helpers::get_account(ctx.tx)?;
-        let account_id =
-            decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
-        if account_id == owner_id {
-            helpers::increment_sequence(&mut owner_account);
-        }
-
+        // The canceler's Sequence/Ticket (and fee) are consumed centrally by the
+        // engine (parent sandbox) before doApply — whether or not the canceler is
+        // the escrow owner.
         let owner_data =
             serde_json::to_vec(&owner_account).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(owner_key, owner_data)
             .map_err(|_| TransactionResult::TefInternal)?;
-
-        // If sender is different from owner, increment sender's sequence
-        if account_id != owner_id {
-            let sender_key = keylet::account(&account_id);
-            let sender_bytes = ctx
-                .view
-                .read(&sender_key)
-                .ok_or(TransactionResult::TerNoAccount)?;
-            let mut sender_account: serde_json::Value = serde_json::from_slice(&sender_bytes)
-                .map_err(|_| TransactionResult::TefInternal)?;
-            helpers::increment_sequence(&mut sender_account);
-            let sender_data =
-                serde_json::to_vec(&sender_account).map_err(|_| TransactionResult::TefInternal)?;
-            ctx.view
-                .update(sender_key, sender_data)
-                .map_err(|_| TransactionResult::TefInternal)?;
-        }
 
         // Unlink escrow from the owner directory (keeping an emptied root), and
         // — when the destination differs from the owner — from the destination

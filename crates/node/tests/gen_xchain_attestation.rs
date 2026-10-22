@@ -13,10 +13,8 @@ fn gen_xchain_attestation() {
         serde_json::from_slice(&std::fs::read(&msg_path).unwrap()).unwrap();
 
     let (entropy, key_type) = rxrpl_codec::address::seed::decode_seed(&seed).unwrap();
-    let kp = rxrpl_crypto::KeyPair::from_seed(
-        &rxrpl_crypto::seed::Seed::from_bytes(entropy),
-        key_type,
-    );
+    let kp =
+        rxrpl_crypto::KeyPair::from_seed(&rxrpl_crypto::seed::Seed::from_bytes(entropy), key_type);
 
     // The attestation message is the raw STObject serialization (all fields,
     // canonical order); secp256k1::sign hashes it (sha512-half) internally.

@@ -74,8 +74,10 @@ impl Transactor for CheckCreateTransactor {
         let mut src_account: serde_json::Value =
             serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        let tx_seq = helpers::get_sequence(&src_account);
-        helpers::increment_sequence(&mut src_account);
+        // The Check's keylet/Sequence is the TX seq-proxy value (the engine
+        // already consumed the sender's Sequence/Ticket centrally, so the
+        // account Sequence is one ahead and must not be used here).
+        let tx_seq = helpers::tx_seq_proxy_value(ctx.tx);
         helpers::adjust_owner_count(&mut src_account, 1);
 
         let src_data =
@@ -103,11 +105,12 @@ impl Transactor for CheckCreateTransactor {
             .get("SendMax")
             .cloned()
             .unwrap_or_else(|| serde_json::Value::String("0".to_string()));
-        // rippled does not set sfFlags on a Check, so it is absent (unlike a
-        // Ticket, which carries Flags=0). Emitting it here breaks byte fidelity.
+        // sfFlags is a common SoeRequired field on every SLE (LedgerFormats
+        // getCommonFields), so rippled always serializes Flags=0 on a Check.
         let mut check = serde_json::json!({
             "LedgerEntryType": "Check",
             "Account": account_str,
+            "Flags": 0,
             "Destination": destination_str,
             "SendMax": send_max_value,
             "Sequence": tx_seq,
@@ -238,10 +241,11 @@ mod tests {
         let check: serde_json::Value = serde_json::from_slice(&check_bytes).unwrap();
         assert_eq!(check["SendMax"].as_str().unwrap(), "5000000");
         assert_eq!(check["Destination"].as_str().unwrap(), DST);
-        // Linked into both directories, with page hints recorded and no sfFlags.
+        // Linked into both directories, with page hints recorded and Flags=0
+        // (sfFlags is a common SoeRequired field on every SLE).
         assert!(check.get("OwnerNode").is_some());
         assert!(check.get("DestinationNode").is_some());
-        assert!(check.get("Flags").is_none());
+        assert_eq!(check["Flags"].as_u64().unwrap(), 0);
 
         // The check is in the destination's owner directory too.
         let dst_id = decode_account_id(DST).unwrap();

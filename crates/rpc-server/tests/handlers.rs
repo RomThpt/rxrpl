@@ -314,8 +314,8 @@ async fn tx_invalid_hash() {
     let err = rxrpl_rpc_server::handlers::tx(params, &ctx)
         .await
         .unwrap_err();
-    assert!(matches!(err, RpcServerError::NotImplemented));
-    assert_eq!(err.token(), "notImpl");
+    assert!(matches!(err, RpcServerError::InvalidParams(_)));
+    assert_eq!(err.token(), "invalidParams");
 }
 
 // -- domain attestation RPC tests (F-B4) --

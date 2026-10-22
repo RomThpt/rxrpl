@@ -1,6 +1,6 @@
 # rxrpl
 
-A modular, type-safe Rust SDK for the XRP Ledger.
+A complete, modular XRP Ledger node and validator implementation in Rust. The workspace ships the full stack — consensus, overlay/P2P, transaction engine, SHAMap, node store, path finding, hooks, and RPC server — as a set of type-safe crates that can also be reused as an SDK.
 
 ## Quick start
 
@@ -69,4 +69,9 @@ Rust 1.85+
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.

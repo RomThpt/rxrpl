@@ -4,7 +4,7 @@
 
 Produire un nœud validateur XRPL complet en Rust, à parité fonctionnelle avec **rippled** (C++, source de vérité protocolaire) et inspiré structurellement de **goXRPLd** (`LeJamon/go-xrpl`). Critère de succès : un nœud rxrpl rejoint un réseau mixte (rippled + rxrpl) et participe au consensus sans divergence — vérifié en continu via les harnais cross-impl **xrpl-hive** et **xrpl-confluence**.
 
-État (2026-05-07) : 24 crates Rust, 460k+ LOC, 1392+ tests. Score interop empirique : **4/4 cas** via xrpl-hive sync (rxrpl→rxrpl, rxrpl→rippled, rippled→rxrpl, rippled→rippled). Le dernier cas (rippled late-join sur réseau rxrpl-only) débloqué par PR #71 (GetLedger itype dispatch + GetObjects wireType), PR #73 (TMStatusChange range advertising + otFETCH_PACK server) et PR #74 (PreviousTxnID/PreviousTxnLgrSeq sur AccountRoot).
+État (2026-05-07) : 24 crates Rust, 460k+ LOC, 1392+ tests. Score interop empirique : **3/4 cas** via xrpl-hive sync (rxrpl→rxrpl, rxrpl→rippled, rippled→rippled OK ; rippled late-join sur réseau rxrpl-only encore bloqué — voir §3.2 et §5). Les cas déjà verts ont été débloqués par PR #71 (GetLedger itype dispatch + GetObjects wireType), PR #73 (TMStatusChange range advertising + otFETCH_PACK server) et PR #74 (PreviousTxnID/PreviousTxnLgrSeq sur AccountRoot) ; le dernier cas reste en cours de fix (`TMLedgerData` not-found, worktree `fix-tmledgerdata`).
 
 ## 1. Architecture cible — modules par parité rippled
 

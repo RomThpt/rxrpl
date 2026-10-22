@@ -1,4 +1,3 @@
-use rxrpl_amendment::feature::feature_id;
 use rxrpl_codec::address::classic::{decode_account_id, encode_account_id};
 use rxrpl_primitives::AccountId;
 use rxrpl_protocol::TransactionResult;
@@ -12,14 +11,201 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transac
 // RippleState (trust line) flags.
 const LSF_LOW_RESERVE: u32 = 0x0001_0000;
 const LSF_HIGH_RESERVE: u32 = 0x0002_0000;
+const LSF_LOW_AUTH: u32 = 0x0004_0000;
+const LSF_HIGH_AUTH: u32 = 0x0008_0000;
 const LSF_LOW_NO_RIPPLE: u32 = 0x0010_0000;
 const LSF_HIGH_NO_RIPPLE: u32 = 0x0020_0000;
 const LSF_LOW_FREEZE: u32 = 0x0040_0000;
 const LSF_HIGH_FREEZE: u32 = 0x0080_0000;
-// AccountRoot flag.
+const LSF_LOW_DEEP_FREEZE: u32 = 0x0200_0000;
+const LSF_HIGH_DEEP_FREEZE: u32 = 0x0400_0000;
+// AccountRoot flags.
 const LSF_DEFAULT_RIPPLE: u32 = 0x0080_0000;
+const LSF_NO_FREEZE: u32 = 0x0020_0000;
+// TrustSet transaction flags (rippled TxFlags.h).
+const TF_SETF_AUTH: u32 = 0x0001_0000;
+const TF_SET_NO_RIPPLE: u32 = 0x0002_0000;
+const TF_CLEAR_NO_RIPPLE: u32 = 0x0004_0000;
+const TF_SET_FREEZE: u32 = 0x0010_0000;
+const TF_CLEAR_FREEZE: u32 = 0x0020_0000;
+const TF_SET_DEEP_FREEZE: u32 = 0x0040_0000;
+const TF_CLEAR_DEEP_FREEZE: u32 = 0x0080_0000;
 // Quality value that rippled treats as "unset" (1.0).
 const QUALITY_ONE: u32 = 1_000_000_000;
+
+// The DefaultRipple amendment predates rippled's `sha512Half(name)` feature-ID
+// convention, so its on-ledger amendment ID is a hardcoded value that does NOT
+// equal `feature_id("DefaultRipple")`. Use the real ID so `Rules::enabled`
+// resolves correctly on mainnet (where DefaultRipple has been active since 2015).
+const DEFAULT_RIPPLE_AMENDMENT_ID: [u8; 32] = [
+    0x15, 0x62, 0x51, 0x1F, 0x57, 0x3A, 0x19, 0xAE, 0x9B, 0xD1, 0x03, 0xB5, 0xD6, 0xB9, 0xE0, 0x1B,
+    0x3B, 0x46, 0x80, 0x5A, 0xEC, 0x5D, 0x3C, 0x48, 0x05, 0xC9, 0x02, 0xB5, 0x14, 0x39, 0x91, 0x46,
+];
+
+/// rippled `trustDelete` fired from `rippleCredit`/`directSendNoFeeIOU`: after an
+/// IOU credit has rewritten a RippleState balance, delete the line if it has
+/// fallen to the default state with a zero balance. No-op when the line is
+/// absent, non-default (non-zero limit/quality/freeze/noRipple-override on either
+/// side), or still carries a non-zero balance. Only the sender (the reserve
+/// holder whose balance drained to zero) has its OwnerCount decremented, in the
+/// caller's `sender_acct` working copy; the issuer AccountRoot is re-threaded.
+pub(crate) fn maybe_delete_drained_trust_line(
+    ctx: &mut ApplyContext<'_>,
+    sender_id: &AccountId,
+    sender_acct: &mut Value,
+    issuer_id: &AccountId,
+    currency: &[u8; 20],
+) -> Result<bool, TransactionResult> {
+    let tl_key = keylet::trust_line(sender_id, issuer_id, currency);
+    let Some(bytes) = ctx.view.read(&tl_key) else {
+        return Ok(false);
+    };
+    let obj: Value = serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+
+    let default_ripple = ctx.rules.enabled(&rxrpl_primitives::Hash256::from(
+        DEFAULT_RIPPLE_AMENDMENT_ID,
+    ));
+
+    let is_low = sender_id.as_bytes() < issuer_id.as_bytes();
+    let low_id: &AccountId = if is_low { sender_id } else { issuer_id };
+    let high_id: &AccountId = if is_low { issuer_id } else { sender_id };
+
+    let issuer_key = keylet::account(issuer_id);
+    let issuer_acct = ctx
+        .view
+        .read(&issuer_key)
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+
+    let amt = |o: &Value, field: &str| -> f64 {
+        o.get(field)
+            .and_then(|a| a.get("value"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0)
+    };
+    let qual = |o: &Value, field: &str| -> u32 {
+        let q = o.get(field).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        if q == QUALITY_ONE { 0 } else { q }
+    };
+    let def_ripple = |a: &Value| -> bool {
+        (a.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) as u32 & LSF_DEFAULT_RIPPLE) != 0
+    };
+
+    let flags = obj.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let low_balance = amt(&obj, "Balance");
+    let high_balance = -low_balance;
+
+    let low_def_ripple = if is_low {
+        def_ripple(sender_acct)
+    } else {
+        issuer_acct.as_ref().map(def_ripple).unwrap_or(false)
+    };
+    let high_def_ripple = if is_low {
+        issuer_acct.as_ref().map(def_ripple).unwrap_or(false)
+    } else {
+        def_ripple(sender_acct)
+    };
+
+    let low_no_ripple_reserve = if default_ripple {
+        ((flags & LSF_LOW_NO_RIPPLE) == 0) != low_def_ripple
+    } else {
+        (flags & LSF_LOW_NO_RIPPLE) != 0
+    };
+    let high_no_ripple_reserve = if default_ripple {
+        ((flags & LSF_HIGH_NO_RIPPLE) == 0) != high_def_ripple
+    } else {
+        (flags & LSF_HIGH_NO_RIPPLE) != 0
+    };
+
+    let low_reserve_set = qual(&obj, "LowQualityIn") != 0
+        || qual(&obj, "LowQualityOut") != 0
+        || low_no_ripple_reserve
+        || (flags & LSF_LOW_FREEZE) != 0
+        || amt(&obj, "LowLimit") != 0.0
+        || low_balance > 0.0;
+    let high_reserve_set = qual(&obj, "HighQualityIn") != 0
+        || qual(&obj, "HighQualityOut") != 0
+        || high_no_ripple_reserve
+        || (flags & LSF_HIGH_FREEZE) != 0
+        || amt(&obj, "HighLimit") != 0.0
+        || high_balance > 0.0;
+
+    if low_reserve_set || high_reserve_set || low_balance != 0.0 {
+        return Ok(false);
+    }
+
+    let sender_reserve_flag = if is_low {
+        LSF_LOW_RESERVE
+    } else {
+        LSF_HIGH_RESERVE
+    };
+    if (flags & sender_reserve_flag) != 0 {
+        helpers::adjust_owner_count(sender_acct, -1);
+        // rippled's trustDelete releases the sender's reserve before removing
+        // the line: clear its reserve flag so the DeletedNode metadata shows
+        // FinalFields with the flag cleared and PreviousFields with the
+        // original flags. The erase below snapshots this cleared value; the
+        // line leaves state either way, so account_hash is unaffected.
+        let mut cleared = obj.clone();
+        cleared["Flags"] = Value::from(flags & !sender_reserve_flag);
+        if let Ok(nb) = serde_json::to_vec(&cleared) {
+            let _ = ctx.view.update(tl_key, nb);
+        }
+    }
+
+    let parse_node = |o: &Value, f: &str| -> u64 {
+        o.get(f)
+            .and_then(|v| v.as_str())
+            .and_then(|s| u64::from_str_radix(s, 16).ok())
+            .unwrap_or(0)
+    };
+    let low_node = parse_node(&obj, "LowNode");
+    let high_node = parse_node(&obj, "HighNode");
+    crate::owner_dir::remove_from_owner_dir_page(ctx.view, low_id, low_node, &tl_key)?;
+    crate::owner_dir::remove_from_owner_dir_page(ctx.view, high_id, high_node, &tl_key)?;
+    let _ = ctx.view.erase(&tl_key);
+
+    // rippled threadOwners re-threads BOTH owner roots on delete. The sender's
+    // root is the caller's working copy (written back → threaded); the issuer's
+    // root is re-written unchanged here so central stamping bumps its
+    // PreviousTxnID into a threading-only ModifiedNode.
+    if let Some(a) = issuer_acct {
+        if let Ok(nb) = serde_json::to_vec(&a) {
+            let _ = ctx.view.update(issuer_key, nb);
+        }
+    }
+
+    Ok(true)
+}
+
+/// rippled `computeFreezeFlags`: apply set/clear freeze and deep-freeze to a
+/// side's flags. `bNoFreeze` (the account's lsfNoFreeze) blocks setting freeze.
+fn compute_freeze_flags(
+    mut flags: u32,
+    high: bool,
+    no_freeze: bool,
+    set_freeze: bool,
+    clear_freeze: bool,
+    set_deep_freeze: bool,
+    clear_deep_freeze: bool,
+) -> u32 {
+    let (freeze, deep_freeze) = if high {
+        (LSF_HIGH_FREEZE, LSF_HIGH_DEEP_FREEZE)
+    } else {
+        (LSF_LOW_FREEZE, LSF_LOW_DEEP_FREEZE)
+    };
+    if set_freeze && !clear_freeze && !no_freeze {
+        flags |= freeze;
+    } else if clear_freeze && !set_freeze {
+        flags &= !freeze;
+    }
+    if set_deep_freeze && !clear_deep_freeze && !no_freeze {
+        flags |= deep_freeze;
+    } else if clear_deep_freeze && !set_deep_freeze {
+        flags &= !deep_freeze;
+    }
+    flags
+}
 
 /// TrustSet transaction handler.
 ///
@@ -146,13 +332,40 @@ impl Transactor for TrustSetTransactor {
         // Compute trust line keylet (symmetric between the two accounts)
         let tl_key = keylet::trust_line(&account_id, &issuer_id, &currency_bytes);
 
+        // Transaction flags (which side / what to set is decided by `is_low`).
+        let tx_flags = helpers::get_u32_field(ctx.tx, "Flags").unwrap_or(0);
+        let b_set_auth = tx_flags & TF_SETF_AUTH != 0;
+        let b_set_no_ripple = tx_flags & TF_SET_NO_RIPPLE != 0;
+        let b_clear_no_ripple = tx_flags & TF_CLEAR_NO_RIPPLE != 0;
+        let b_set_freeze = tx_flags & TF_SET_FREEZE != 0;
+        let b_clear_freeze = tx_flags & TF_CLEAR_FREEZE != 0;
+        let b_set_deep_freeze = tx_flags & TF_SET_DEEP_FREEZE != 0;
+        let b_clear_deep_freeze = tx_flags & TF_CLEAR_DEEP_FREEZE != 0;
+
+        // QualityIn / QualityOut from the tx; QualityOut==QUALITY_ONE normalizes
+        // to 0 (clear), matching rippled. QualityIn is NOT normalized before the
+        // set/clear decision (rippled quirk).
+        let b_quality_in = ctx.tx.get("QualityIn").is_some();
+        let b_quality_out = ctx.tx.get("QualityOut").is_some();
+        let u_quality_in = helpers::get_u32_field(ctx.tx, "QualityIn").unwrap_or(0);
+        let mut u_quality_out = helpers::get_u32_field(ctx.tx, "QualityOut").unwrap_or(0);
+        if b_quality_out && u_quality_out == QUALITY_ONE {
+            u_quality_out = 0;
+        }
+
+        // DefaultRipple amendment state (uses the real on-ledger amendment ID).
+        let default_ripple = ctx.rules.enabled(&rxrpl_primitives::Hash256::from(
+            DEFAULT_RIPPLE_AMENDMENT_ID,
+        ));
+
         // Check if trust line exists
         let existing = ctx.view.read(&tl_key);
 
         if let Some(bytes) = existing {
             // Update existing trust line
-            let mut obj: Value =
+            let obj_orig: Value =
                 serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
+            let mut obj = obj_orig.clone();
 
             // Determine which side we are (low or high). The `*Limit.issuer`
             // field is THIS side's address (rippled convention), so rebuild
@@ -171,22 +384,26 @@ impl Transactor for TrustSetTransactor {
                 obj["HighLimit"] = side_limit;
             }
 
-            // Apply quality settings if present
-            if is_low {
-                if let Some(qi) = ctx.tx.get("QualityIn") {
-                    obj["LowQualityIn"] = qi.clone();
+            // Apply quality settings: set when present and non-zero, clear
+            // (remove the field) when present and zero, keep otherwise. rippled
+            // mutates only this side's QualityIn/QualityOut.
+            let set_or_clear = |obj: &mut Value, field: &str, present: bool, value: u32| {
+                if !present {
+                    return;
                 }
-                if let Some(qo) = ctx.tx.get("QualityOut") {
-                    obj["LowQualityOut"] = qo.clone();
+                if value != 0 {
+                    obj[field] = Value::from(value);
+                } else if let Some(m) = obj.as_object_mut() {
+                    m.remove(field);
                 }
+            };
+            let (qin_field, qout_field) = if is_low {
+                ("LowQualityIn", "LowQualityOut")
             } else {
-                if let Some(qi) = ctx.tx.get("QualityIn") {
-                    obj["HighQualityIn"] = qi.clone();
-                }
-                if let Some(qo) = ctx.tx.get("QualityOut") {
-                    obj["HighQualityOut"] = qo.clone();
-                }
-            }
+                ("HighQualityIn", "HighQualityOut")
+            };
+            set_or_clear(&mut obj, qin_field, b_quality_in, u_quality_in);
+            set_or_clear(&mut obj, qout_field, b_quality_out, u_quality_out);
 
             // Reserve accounting (rippled SetTrust::doApply): a side counts
             // toward its account's owner reserve when its trust line is not in
@@ -228,41 +445,117 @@ impl Transactor for TrustSetTransactor {
             };
             let flags_in = obj.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let low_balance = amt(&obj, "Balance");
+            let high_balance = -low_balance;
+
+            // Compute the post-tx flags (rippled `uFlagsOut`): apply the tx's
+            // noRipple / freeze / auth changes to THIS side BEFORE deriving the
+            // reserve terms, exactly as rippled does.
+            let mut flags_out = flags_in;
+            let side_no_ripple = if is_low {
+                LSF_LOW_NO_RIPPLE
+            } else {
+                LSF_HIGH_NO_RIPPLE
+            };
+            if b_set_no_ripple && !b_clear_no_ripple {
+                let sender_balance = if is_low { low_balance } else { high_balance };
+                if sender_balance >= 0.0 {
+                    flags_out |= side_no_ripple;
+                } else {
+                    // Cannot set noRipple on a negative balance.
+                    return Err(TransactionResult::TecNoPermission);
+                }
+            } else if b_clear_no_ripple && !b_set_no_ripple {
+                flags_out &= !side_no_ripple;
+            }
+            let b_high = !is_low;
+            // lsfNoFreeze lives on the SENDER's account root.
+            let sender_no_freeze = {
+                let sender = if is_low {
+                    low_acct.as_ref()
+                } else {
+                    high_acct.as_ref()
+                };
+                sender
+                    .map(|a| helpers::get_flags(a) & LSF_NO_FREEZE != 0)
+                    .unwrap_or(false)
+            };
+            flags_out = compute_freeze_flags(
+                flags_out,
+                b_high,
+                sender_no_freeze,
+                b_set_freeze,
+                b_clear_freeze,
+                b_set_deep_freeze,
+                b_clear_deep_freeze,
+            );
+            if b_set_auth {
+                flags_out |= if is_low { LSF_LOW_AUTH } else { LSF_HIGH_AUTH };
+            }
+
             // The noRipple term that contributes to reserve changed with the
             // DefaultRipple amendment (2015). Before it, a side counts a noRipple
             // line toward reserve when its line flag is set; after it, when the
             // line's noRipple state disagrees with the account's DefaultRipple.
             // Replaying pre-amendment (2013) ledgers needs the historical form.
-            let default_ripple = ctx.rules.enabled(&feature_id("DefaultRipple"));
             let low_no_ripple_reserve = if default_ripple {
-                ((flags_in & LSF_LOW_NO_RIPPLE) == 0) != def_ripple(&low_acct)
+                ((flags_out & LSF_LOW_NO_RIPPLE) == 0) != def_ripple(&low_acct)
             } else {
-                (flags_in & LSF_LOW_NO_RIPPLE) != 0
+                (flags_out & LSF_LOW_NO_RIPPLE) != 0
             };
             let high_no_ripple_reserve = if default_ripple {
-                ((flags_in & LSF_HIGH_NO_RIPPLE) == 0) != def_ripple(&high_acct)
+                ((flags_out & LSF_HIGH_NO_RIPPLE) == 0) != def_ripple(&high_acct)
             } else {
-                (flags_in & LSF_HIGH_NO_RIPPLE) != 0
+                (flags_out & LSF_HIGH_NO_RIPPLE) != 0
             };
             let low_reserve_set = qual(&obj, "LowQualityIn") != 0
                 || qual(&obj, "LowQualityOut") != 0
                 || low_no_ripple_reserve
-                || (flags_in & LSF_LOW_FREEZE) != 0
+                || (flags_out & LSF_LOW_FREEZE) != 0
                 || amt(&obj, "LowLimit") != 0.0
                 || low_balance > 0.0;
             let high_reserve_set = qual(&obj, "HighQualityIn") != 0
                 || qual(&obj, "HighQualityOut") != 0
                 || high_no_ripple_reserve
-                || (flags_in & LSF_HIGH_FREEZE) != 0
+                || (flags_out & LSF_HIGH_FREEZE) != 0
                 || amt(&obj, "HighLimit") != 0.0
-                || (-low_balance) > 0.0;
+                || high_balance > 0.0;
+
+            // rippled SetTrust::doApply: when the SOURCE's side of the line
+            // starts taking a reserve slot it did not hold before (e.g. clearing
+            // noRipple on a non-DefaultRipple account flips the line out of its
+            // default state), the source must fund the extra owner reserve. If
+            // `mPriorBalance` (the XRP balance before the fee) is below
+            // `accountReserve(OwnerCount + 1)`, the whole change is rejected with
+            // tecINSUF_RESERVE_LINE — a CLAIMED tec: fee and sequence charged
+            // centrally, the trust line left untouched. Only the source is
+            // checked; the counterparty never funds a change it did not sign.
+            let sender_takes_reserve = if is_low {
+                low_reserve_set && (flags_in & LSF_LOW_RESERVE) == 0
+            } else {
+                high_reserve_set && (flags_in & LSF_HIGH_RESERVE) == 0
+            };
+            if sender_takes_reserve {
+                let sender = if is_low {
+                    low_acct.as_ref()
+                } else {
+                    high_acct.as_ref()
+                };
+                if let Some(sender) = sender {
+                    let owner_count = helpers::get_owner_count(sender);
+                    let reserve = ctx.fees.account_reserve(owner_count + 1);
+                    let prior_balance =
+                        helpers::get_balance(sender).saturating_add(helpers::get_fee(ctx.tx));
+                    if prior_balance < reserve {
+                        return Err(TransactionResult::TecInsufReserveLine);
+                    }
+                }
+            }
 
             // Only accounts actually mutated here are written back (and thus
             // get their PreviousTxnID restamped) — rippled leaves the
             // counterparty untouched when its reserve state does not change.
             let mut low_dirty = false;
             let mut high_dirty = false;
-            let mut flags_out = flags_in;
             if low_reserve_set && (flags_in & LSF_LOW_RESERVE) == 0 {
                 flags_out |= LSF_LOW_RESERVE;
                 if let Some(a) = low_acct.as_mut() {
@@ -291,18 +584,9 @@ impl Transactor for TrustSetTransactor {
             }
             obj["Flags"] = serde_json::json!(flags_out);
 
-            // Bump the sender's sequence (rippled consumes the seq proxy for
-            // every TrustSet, including modifications of an existing line).
-            {
-                let sender_acct = if is_low {
-                    low_acct.as_mut()
-                } else {
-                    high_acct.as_mut()
-                };
-                if let Some(a) = sender_acct {
-                    crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, a, ctx.tx)?;
-                }
-            }
+            // The sender's Sequence/Ticket is consumed centrally by the engine
+            // (parent sandbox) before doApply; the sender's account (low or high)
+            // inherits that bump and is written back via the dirty path below.
             if is_low {
                 low_dirty = true;
             } else {
@@ -310,13 +594,38 @@ impl Transactor for TrustSetTransactor {
             }
 
             // rippled deletes a trust line that ends in the default state with a
-            // zero balance (removeEmptyTrustLine); otherwise it persists.
+            // zero balance (trustDelete); otherwise it persists.
             let b_default = !low_reserve_set && !high_reserve_set;
             if b_default && low_balance == 0.0 {
-                crate::owner_dir::remove_from_owner_dir(ctx.view, &low_id, &tl_key)?;
-                crate::owner_dir::remove_from_owner_dir(ctx.view, &high_id, &tl_key)?;
+                // Use the line's LowNode / HighNode page hints to remove the
+                // entry directly from each owner directory, exactly like
+                // rippled's trustDelete (`dirRemove(ownerDir, uLow/HighNode, …)`).
+                // Walking from the root would dead-end when the entry sits in a
+                // non-root page whose predecessor pages are not loaded.
+                let parse_node = |o: &Value, f: &str| -> u64 {
+                    o.get(f)
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| u64::from_str_radix(s, 16).ok())
+                        .unwrap_or(0)
+                };
+                let low_node = parse_node(&obj, "LowNode");
+                let high_node = parse_node(&obj, "HighNode");
+                crate::owner_dir::remove_from_owner_dir_page(ctx.view, &low_id, low_node, &tl_key)?;
+                crate::owner_dir::remove_from_owner_dir_page(
+                    ctx.view, &high_id, high_node, &tl_key,
+                )?;
                 let _ = ctx.view.erase(&tl_key);
-            } else {
+                // Deleting the line removes it from BOTH accounts' owner
+                // directories, so rippled re-threads both account roots (updates
+                // their PreviousTxnID) even when the side's reserve/owner count
+                // is unchanged. Mark both dirty so central stamping threads them.
+                low_dirty = true;
+                high_dirty = true;
+            } else if obj != obj_orig {
+                // rippled drops a modified node whose serialized SLE equals the
+                // original (ApplyStateTable `*curNode == *origNode`): a no-op
+                // TrustSet (re-set an already-set flag, same limit) must not
+                // restamp the line's PreviousTxnID nor emit a ModifiedNode.
                 let new_bytes =
                     serde_json::to_vec(&obj).map_err(|_| TransactionResult::TemMalformed)?;
                 ctx.view
@@ -337,7 +646,7 @@ impl Transactor for TrustSetTransactor {
                 }
             }
         } else {
-            // Create new trust line.
+            // Create new trust line (rippled `trustCreate`).
             //
             // RippleState convention (matches rippled): each side's `*Limit`
             // object carries that side's address as `issuer`, not the
@@ -345,6 +654,52 @@ impl Transactor for TrustSetTransactor {
             // convention; sign of the balance encodes which side owes whom.
             let is_low = account_id.as_bytes() < issuer_id.as_bytes();
             let acct_value = limit.get("value").cloned().unwrap_or_else(|| "0".into());
+            let limit_is_zero = acct_value
+                .as_str()
+                .map(|s| s == "0" || s.parse::<f64>().map(|f| f == 0.0).unwrap_or(false))
+                .unwrap_or(false);
+
+            // rippled: setting a non-existent line to its default state (zero
+            // limit, no quality, no auth) is a no-op (tecNO_LINE_REDUNDANT).
+            if limit_is_zero
+                && (!b_quality_in || u_quality_in == 0)
+                && (!b_quality_out || u_quality_out == 0)
+                && !b_set_auth
+            {
+                return Err(TransactionResult::TecNoLineRedundant);
+            }
+
+            // Owner reserve (rippled SetTrust::doApply): a brand-new trust line
+            // adds one owned object to the creator, so it must fund the reserve.
+            // rippled computes `reserveCreate = (OwnerCount < 2) ? 0 :
+            // accountReserve(OwnerCount + 1)` — the first two trust lines are
+            // reserve-free, a deliberate gateway-funding feature — and returns
+            // tecNO_LINE_INSUF_RESERVE when `mPriorBalance` (the XRP balance
+            // *before* the fee) is below it. This is a CLAIMED tec (fee and
+            // sequence charged, no line created); returning it from apply routes
+            // through the engine's central fee/sequence consume. The engine
+            // already deducted the fee centrally before doApply, so reconstruct
+            // mPriorBalance by adding it back. The check sits only on the create
+            // path (after the redundant guard), exactly the
+            // `else if (mPriorBalance < reserveCreate)` branch that precedes
+            // trustCreate — an existing line takes the update path with no check.
+            let creator = ctx
+                .view
+                .read(&keylet::account(&account_id))
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .ok_or(TransactionResult::TefInternal)?;
+            let owner_count = helpers::get_owner_count(&creator);
+            let reserve_create = if owner_count < 2 {
+                0
+            } else {
+                ctx.fees.account_reserve(owner_count + 1)
+            };
+            let prior_balance =
+                helpers::get_balance(&creator).saturating_add(helpers::get_fee(ctx.tx));
+            if prior_balance < reserve_create {
+                return Err(TransactionResult::TecNoLineInsuf);
+            }
+
             let currency = limit["currency"].clone();
             let acct_limit = serde_json::json!({
                 "currency": currency,
@@ -373,20 +728,54 @@ impl Transactor for TrustSetTransactor {
                 (issuer_page, acct_page)
             };
 
-            // The creator set a non-default (non-zero) limit, so its side counts
-            // toward the owner reserve: set its reserve flag and increment only
-            // that account's OwnerCount. A fresh line carries no noRipple/freeze
-            // and a zero balance, so the counterparty side stays default.
-            let creator_reserves = acct_value.as_str().map(|s| s != "0").unwrap_or(true);
-            let flags = if creator_reserves {
-                if is_low {
-                    LSF_LOW_RESERVE
-                } else {
-                    LSF_HIGH_RESERVE
-                }
+            // Flags (rippled `trustCreate`): the creator always takes the reserve
+            // on its side (the redundant guard above filtered out default lines),
+            // plus auth / noRipple / freeze it requested. The PEER's side gets
+            // noRipple set when the peer's account does not default to rippling.
+            let mut flags = if is_low {
+                LSF_LOW_RESERVE
             } else {
-                0
+                LSF_HIGH_RESERVE
             };
+            if b_set_auth {
+                flags |= if is_low { LSF_LOW_AUTH } else { LSF_HIGH_AUTH };
+            }
+            if b_set_no_ripple && !b_clear_no_ripple {
+                flags |= if is_low {
+                    LSF_LOW_NO_RIPPLE
+                } else {
+                    LSF_HIGH_NO_RIPPLE
+                };
+            }
+            if b_set_freeze && !b_clear_freeze {
+                flags |= if is_low {
+                    LSF_LOW_FREEZE
+                } else {
+                    LSF_HIGH_FREEZE
+                };
+            }
+            if b_set_deep_freeze {
+                flags |= if is_low {
+                    LSF_LOW_DEEP_FREEZE
+                } else {
+                    LSF_HIGH_DEEP_FREEZE
+                };
+            }
+            // Peer (issuer) side: noRipple if the issuer account does not have
+            // lsfDefaultRipple set.
+            let issuer_has_default_ripple = ctx
+                .view
+                .read(&keylet::account(&issuer_id))
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .map(|a| helpers::get_flags(&a) & LSF_DEFAULT_RIPPLE != 0)
+                .unwrap_or(false);
+            if !issuer_has_default_ripple {
+                flags |= if is_low {
+                    LSF_HIGH_NO_RIPPLE
+                } else {
+                    LSF_LOW_NO_RIPPLE
+                };
+            }
 
             // RippleState Balance is an STAmount whose issuer is rippled's
             // ACCOUNT_ONE placeholder (20 bytes ending in 1, "rrrr…BZbvji"), not
@@ -394,40 +783,70 @@ impl Transactor for TrustSetTransactor {
             let mut account_one = [0u8; 20];
             account_one[19] = 1;
             let no_account = encode_account_id(&AccountId::from(account_one));
-            let tl_obj = serde_json::json!({
-                "LedgerEntryType": "RippleState",
-                "Balance": { "currency": currency, "issuer": no_account, "value": "0" },
-                "LowLimit": low_limit,
-                "HighLimit": high_limit,
-                "LowNode": format!("{low_node:016X}"),
-                "HighNode": format!("{high_node:016X}"),
-                "Flags": flags,
-                // Placeholder so the central PreviousTxnID stamping records this
-                // tx on the newly created line (it only touches entries that
-                // already expose the field).
-                "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
-                "PreviousTxnLgrSeq": 0,
-            });
+            let mut tl_map = serde_json::Map::new();
+            tl_map.insert("LedgerEntryType".into(), "RippleState".into());
+            tl_map.insert(
+                "Balance".into(),
+                serde_json::json!({ "currency": currency, "issuer": no_account, "value": "0" }),
+            );
+            tl_map.insert("LowLimit".into(), low_limit);
+            tl_map.insert("HighLimit".into(), high_limit);
+            tl_map.insert("LowNode".into(), format!("{low_node:016X}").into());
+            tl_map.insert("HighNode".into(), format!("{high_node:016X}").into());
+            tl_map.insert("Flags".into(), serde_json::json!(flags));
+            // Quality on the creator's side (only when non-zero).
+            if b_quality_in && u_quality_in != 0 {
+                let f = if is_low {
+                    "LowQualityIn"
+                } else {
+                    "HighQualityIn"
+                };
+                tl_map.insert(f.into(), Value::from(u_quality_in));
+            }
+            if b_quality_out && u_quality_out != 0 {
+                let f = if is_low {
+                    "LowQualityOut"
+                } else {
+                    "HighQualityOut"
+                };
+                tl_map.insert(f.into(), Value::from(u_quality_out));
+            }
+            // Placeholder so the central PreviousTxnID stamping records this tx
+            // on the newly created line (it only touches entries that already
+            // expose the field).
+            tl_map.insert(
+                "PreviousTxnID".into(),
+                "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            );
+            tl_map.insert("PreviousTxnLgrSeq".into(), Value::from(0u32));
+            let tl_obj = Value::Object(tl_map);
             let bytes = serde_json::to_vec(&tl_obj).map_err(|_| TransactionResult::TemMalformed)?;
             ctx.view
                 .insert(tl_key, bytes)
                 .map_err(|_| TransactionResult::TemMalformed)?;
 
-            // Increment owner count for the creator (it took the reserve) and
-            // consume its sequence.
+            // The creator always takes the reserve on create: increment its
+            // OwnerCount. Its Sequence/Ticket is consumed centrally by the engine
+            // before doApply.
             let acct_key = keylet::account(&account_id);
             if let Some(acct_bytes) = ctx.view.read(&acct_key) {
                 let mut acct: Value = serde_json::from_slice(&acct_bytes)
                     .map_err(|_| TransactionResult::TemMalformed)?;
-                if creator_reserves {
-                    helpers::adjust_owner_count(&mut acct, 1);
-                }
-                crate::owner_dir::consume_seq_or_ticket(ctx.view, &account_id, &mut acct, ctx.tx)?;
+                helpers::adjust_owner_count(&mut acct, 1);
                 let new_bytes =
                     serde_json::to_vec(&acct).map_err(|_| TransactionResult::TemMalformed)?;
                 ctx.view
                     .update(acct_key, new_bytes)
                     .map_err(|_| TransactionResult::TemMalformed)?;
+            }
+
+            // Adding the line to the issuer's owner directory re-threads the
+            // issuer's account root in rippled (its PreviousTxnID becomes this
+            // tx) even though no field on it changes. Re-write it unchanged so
+            // central PreviousTxnID stamping touches it too.
+            let issuer_key = keylet::account(&issuer_id);
+            if let Some(issuer_bytes) = ctx.view.read(&issuer_key) {
+                let _ = ctx.view.update(issuer_key, issuer_bytes);
             }
         }
 
