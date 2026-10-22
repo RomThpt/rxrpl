@@ -482,13 +482,14 @@ pub fn consume_seq_or_ticket(
             };
             // rippled consumes the ticket via a HINTED directory removal using
             // the page recorded on the Ticket SLE's `OwnerNode` (`dirRemove` with
-            // the known page), not a walk from the root. This is essential for a
-            // large owner directory whose intermediate pages are not loaded (e.g.
-            // the single-tx oracle seeds only touched pages): a root walk stops at
-            // the first absent page and would leave the consumed ticket's index
-            // stranded on its high-numbered page. `OwnerNode` is default-dropped
-            // when zero, so its absence means the ticket lives on the root page —
-            // fall back to the walk, which finds it there immediately.
+            // the known page and keepRoot=true), not a walk from the root. This
+            // is essential for a large owner directory whose intermediate pages
+            // are not loaded (e.g. the single-tx oracle seeds only touched
+            // pages): a root walk stops at the first absent page and would leave
+            // the consumed ticket's index stranded on its high-numbered page.
+            // `OwnerNode` is default-dropped when zero, so its absence means the
+            // ticket lives on the root page — fall back to the keep-root walk,
+            // which finds it there immediately.
             let owner_node = serde_json::from_slice::<Value>(&ticket_bytes)
                 .ok()
                 .and_then(|t| {
@@ -497,8 +498,10 @@ pub fn consume_seq_or_ticket(
                         .and_then(|s| u64::from_str_radix(s, 16).ok())
                 });
             match owner_node {
-                Some(page) => remove_from_owner_dir_page(view, account_id, page, &ticket_key)?,
-                None => remove_from_owner_dir(view, account_id, &ticket_key)?,
+                Some(page) => {
+                    remove_from_owner_dir_page_keep_root(view, account_id, page, &ticket_key)?
+                }
+                None => remove_from_owner_dir_keep_root(view, account_id, &ticket_key)?,
             }
             view.erase(&ticket_key)
                 .map_err(|_| TransactionResult::TefInternal)?;
@@ -905,6 +908,43 @@ mod tests {
         assert_eq!(acct["Sequence"], serde_json::json!(5));
         assert_eq!(acct["OwnerCount"], serde_json::json!(1));
         assert!(!sandbox.exists(&ticket_key));
+    }
+
+    #[test]
+    fn consume_last_ticket_keeps_empty_owner_dir_root() {
+        let (ledger, fees) = fresh_sandbox();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let mut sandbox = Sandbox::new(&view);
+
+        let account = id();
+        let ticket_key = keylet::ticket(&account, 3);
+        assert_eq!(
+            add_to_owner_dir(&mut sandbox, &account, &ticket_key).unwrap(),
+            0
+        );
+        let ticket = serde_json::json!({
+            "LedgerEntryType": "Ticket",
+            "Account": ACCT,
+            "TicketSequence": 3,
+            "OwnerNode": "0000000000000000",
+            "Flags": 0,
+        });
+        sandbox
+            .insert(ticket_key, serde_json::to_vec(&ticket).unwrap())
+            .unwrap();
+
+        let mut acct = account_obj(5, 1);
+        acct["TicketCount"] = Value::from(1u32);
+        let tx = serde_json::json!({ "Account": ACCT, "TicketSequence": 3 });
+
+        consume_seq_or_ticket(&mut sandbox, &account, &mut acct, &tx).unwrap();
+
+        let dir: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::owner_dir(&account)).unwrap()).unwrap();
+        assert!(dir["Indexes"].as_array().unwrap().is_empty());
+        assert!(!sandbox.exists(&ticket_key));
+        assert_eq!(acct["OwnerCount"], serde_json::json!(0));
+        assert!(acct.get("TicketCount").is_none());
     }
 
     #[test]
