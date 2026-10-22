@@ -13,6 +13,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # RocksDB 8.10 omits <cstdint> in headers that newer GCC no longer supplies indirectly.
+  CXXFLAGS: "-include cstdint"
 
 jobs:
   fmt:
