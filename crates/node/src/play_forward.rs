@@ -1204,6 +1204,9 @@ mod tests {
                                 .to_string()
                                 .to_uppercase(),
                         );
+                        // The attestation transactors read the door's SignerList
+                        // SLE (witnesses + quorum); it is not in AffectedNodes.
+                        read_keys.insert(keylet::signer_list(&did).to_string().to_uppercase());
                     }
                 }
             }
@@ -5082,7 +5085,7 @@ does not apply to this tx type (e.g. a pure delete/modify)."
                                 continue;
                             }
                             let got = oj.get(f).map(ToString::to_string).unwrap_or_default();
-                            let same = oj.get(f).map(&norm).as_deref() == Some(&norm(want));
+                            let same = oj.get(f).map(norm).as_deref() == Some(&norm(want));
                             eprintln!(
                                 "TRACE {txid} ({ty}) {} .{f} ours={got} theirs={want} {}",
                                 &key[..12],
@@ -5094,7 +5097,7 @@ does not apply to this tx type (e.g. a pure delete/modify)."
                         if f == "PreviousTxnID" || f == "PreviousTxnLgrSeq" {
                             continue;
                         }
-                        let same = oj.get(f).map(&norm).as_deref() == Some(&norm(want));
+                        let same = oj.get(f).map(norm).as_deref() == Some(&norm(want));
                         if !same && !divergent.contains(&txid) {
                             divergent.push(txid.clone());
                             eprintln!(

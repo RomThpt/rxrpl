@@ -61,11 +61,19 @@ impl PeerReputation {
 
     /// Adjust the score by `delta`, clamping to [SCORE_MIN, SCORE_MAX].
     fn adjust_score(&self, delta: i32) {
-        self.score
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_add(delta).clamp(SCORE_MIN, SCORE_MAX))
-            })
-            .ok();
+        let mut current = self.score.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(delta).clamp(SCORE_MIN, SCORE_MAX);
+            match self.score.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Record a valid message received.
@@ -223,6 +231,24 @@ mod tests {
             rep.record_violation();
         }
         assert_eq!(rep.score(), SCORE_MIN);
+    }
+
+    #[test]
+    fn concurrent_updates_preserve_all_score_adjustments() {
+        let rep = PeerReputation::new();
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..200 {
+                        rep.record_valid_message(1);
+                    }
+                });
+            }
+        });
+        assert_eq!(rep.score(), 800);
+        assert_eq!(rep.messages_received(), 800);
     }
 
     #[test]
