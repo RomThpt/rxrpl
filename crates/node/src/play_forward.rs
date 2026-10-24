@@ -195,14 +195,18 @@ pub fn rules_for_ledger(ledger: &Ledger) -> Rules {
         })
         .unwrap_or_default();
     let mut enabled = enabled;
-    // SortedDirectories was retired (permanently baked in) by the time of the
-    // modern lending/vault amendments, so it is no longer listed in the
-    // Amendments object even though directories are kept sorted. Re-enable it
-    // whenever a clearly post-retirement amendment is active.
+    // Some amendments were retired (permanently baked in) by the time of the
+    // modern lending/vault amendments, so they are no longer listed in the
+    // Amendments object. Restore the retired rules needed by replay whenever a
+    // clearly post-retirement amendment is active.
     let single_asset_vault = rxrpl_amendment::feature::feature_id("SingleAssetVault");
-    let sorted_directories = rxrpl_amendment::feature::feature_id("SortedDirectories");
-    if enabled.contains(&single_asset_vault) && !enabled.contains(&sorted_directories) {
-        enabled.push(sorted_directories);
+    if enabled.contains(&single_asset_vault) {
+        for retired in ["SortedDirectories", "fixUniversalNumber"] {
+            let feature = rxrpl_amendment::feature::feature_id(retired);
+            if !enabled.contains(&feature) {
+                enabled.push(feature);
+            }
+        }
     }
     Rules::from_enabled(enabled)
 }
@@ -4418,6 +4422,27 @@ does not apply to this tx type (e.g. a pure delete/modify)."
             .unwrap();
 
         assert!(rules_for_ledger(&ledger).enabled(&sorted));
+    }
+
+    #[test]
+    fn rules_for_modern_ledger_restore_retired_number_rules() {
+        use rxrpl_amendment::feature::feature_id;
+        let mut ledger = Ledger::genesis();
+        let modern = feature_id("SingleAssetVault");
+        let amendments = serde_json::json!({
+            "LedgerEntryType": "Amendments",
+            "Amendments": [hex::encode_upper(modern.as_bytes())],
+            "Flags": 0,
+        });
+        let bytes =
+            rxrpl_ledger::sle_codec::encode_sle(&serde_json::to_vec(&amendments).unwrap()).unwrap();
+        ledger
+            .put_state(rxrpl_protocol::keylet::amendments(), bytes)
+            .unwrap();
+
+        let rules = rules_for_ledger(&ledger);
+        assert!(rules.enabled(&feature_id("SortedDirectories")));
+        assert!(rules.enabled(&feature_id("fixUniversalNumber")));
     }
 
     #[test]
