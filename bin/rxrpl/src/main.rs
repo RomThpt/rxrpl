@@ -246,8 +246,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             checkpoint,
             start,
             end,
+            output_state,
         } => {
-            return cmd_replay_segment(&state, &ledgers, checkpoint, start, end);
+            return cmd_replay_segment(
+                &state,
+                &ledgers,
+                checkpoint,
+                start,
+                end,
+                output_state.as_deref(),
+            );
         }
 
         _ => {}
@@ -565,6 +573,7 @@ fn cmd_replay_segment(
     checkpoint: Option<u64>,
     start: u64,
     end: u64,
+    output_state: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let checkpoint = resolve_replay_range(checkpoint, start, end)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -574,7 +583,7 @@ fn cmd_replay_segment(
         .map(std::fs::read)
         .collect::<Result<_, _>>()?;
     let refs: Vec<&[u8]> = ledger_blobs.iter().map(Vec::as_slice).collect();
-    let summary = rxrpl_node::replay_worker::replay_segment_with(
+    let (summary, resume_ledger) = rxrpl_node::replay_worker::replay_segment_with_state(
         &state_pack,
         &refs,
         checkpoint,
@@ -617,6 +626,27 @@ fn cmd_replay_segment(
         },
     )
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    if let Some(path) = output_state {
+        let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+        let file = std::fs::File::create(&tmp_path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        let count = rxrpl_node::replay_worker::write_state_pack(
+            &mut writer,
+            u64::from(resume_ledger.header.sequence),
+            &resume_ledger.state_map,
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        use std::io::Write;
+        writer.flush()?;
+        drop(writer);
+        std::fs::rename(&tmp_path, path)?;
+        tracing::info!(
+            checkpoint = resume_ledger.header.sequence,
+            entries = count,
+            path = %path.display(),
+            "wrote replay checkpoint"
+        );
+    }
     let final_line = serde_json::json!({
         "summary": {
             "checkpoint": summary.checkpoint,

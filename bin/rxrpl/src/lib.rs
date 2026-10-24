@@ -273,6 +273,9 @@ pub enum Commands {
         /// Segment end (inclusive).
         #[arg(long)]
         end: u64,
+        /// Write the last faithful ledger state as a resumable XSCP checkpoint.
+        #[arg(long)]
+        output_state: Option<PathBuf>,
     },
 }
 

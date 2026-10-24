@@ -12,6 +12,7 @@
 //! localise a divergence to ledger -> tx -> object -> field. No RPC, no network.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Seek, SeekFrom, Write};
 
 use rxrpl_ledger::{Ledger, LedgerHeader};
 use rxrpl_primitives::Hash256;
@@ -161,6 +162,59 @@ pub fn unpack_state(blob: &[u8]) -> Result<StatePack, String> {
         checkpoint_seq,
         entries,
     })
+}
+
+/// Stream an account-state SHAMap as an `XSCP` STATE pack.
+///
+/// The entry count is patched after the ordered leaf walk, so exporting a
+/// multi-gigabyte checkpoint does not require a second copy in memory.
+pub fn write_state_pack<W: Write + Seek>(
+    writer: &mut W,
+    checkpoint_seq: u64,
+    state: &SHAMap,
+) -> Result<u32, String> {
+    if checkpoint_seq == 0 || checkpoint_seq > u64::from(u32::MAX) {
+        return Err(format!(
+            "checkpoint {checkpoint_seq} is outside the valid u32 ledger range"
+        ));
+    }
+    writer.write_all(MAGIC).map_err(|e| e.to_string())?;
+    writer
+        .write_all(&[VERSION, KIND_STATE])
+        .map_err(|e| e.to_string())?;
+    writer
+        .write_all(&checkpoint_seq.to_be_bytes())
+        .map_err(|e| e.to_string())?;
+    let count_pos = writer.stream_position().map_err(|e| e.to_string())?;
+    writer
+        .write_all(&0u32.to_be_bytes())
+        .map_err(|e| e.to_string())?;
+
+    let mut count = 0u32;
+    for (index, data) in state.iter_ref() {
+        let len = u32::try_from(data.len()).map_err(|_| "state entry exceeds u32 length")?;
+        writer
+            .write_all(index.as_bytes())
+            .map_err(|e| e.to_string())?;
+        writer
+            .write_all(&len.to_be_bytes())
+            .map_err(|e| e.to_string())?;
+        writer.write_all(data).map_err(|e| e.to_string())?;
+        count = count
+            .checked_add(1)
+            .ok_or("state entry count exceeds u32")?;
+    }
+    let end = writer.stream_position().map_err(|e| e.to_string())?;
+    writer
+        .seek(SeekFrom::Start(count_pos))
+        .map_err(|e| e.to_string())?;
+    writer
+        .write_all(&count.to_be_bytes())
+        .map_err(|e| e.to_string())?;
+    writer
+        .seek(SeekFrom::Start(end))
+        .map_err(|e| e.to_string())?;
+    Ok(count)
 }
 
 /// Decode a `LEDGER` pack: header, `batch_start`, `ledger_count`, then each
@@ -322,8 +376,26 @@ pub fn replay_segment_with<F>(
     checkpoint: u64,
     start: u64,
     end: u64,
-    mut emit: F,
+    emit: F,
 ) -> Result<ReplaySummary, String>
+where
+    F: FnMut(LedgerReport) -> Result<(), String>,
+{
+    replay_segment_with_state(state_pack, ledger_packs, checkpoint, start, end, emit)
+        .map(|(summary, _)| summary)
+}
+
+/// Replay a segment and return the latest byte-exact ledger state suitable for
+/// seeding the next segment. On a fatal divergence this is the faithful parent,
+/// never the divergent child.
+pub fn replay_segment_with_state<F>(
+    state_pack: &[u8],
+    ledger_packs: &[&[u8]],
+    checkpoint: u64,
+    start: u64,
+    end: u64,
+    mut emit: F,
+) -> Result<(ReplaySummary, Ledger), String>
 where
     F: FnMut(LedgerReport) -> Result<(), String>,
 {
@@ -472,16 +544,16 @@ where
         // fresh-seed oracle does.
         let mut carried = outcome.ledger;
         carried.header.hash = hdr.hash;
-        parent = carried;
         emit(report)?;
 
         if must_stop {
             summary.stopped_early = seq != end;
             break;
         }
+        parent = carried;
     }
 
-    Ok(summary)
+    Ok((summary, parent))
 }
 
 fn validate_range(checkpoint: u64, start: u64, end: u64) -> Result<(), String> {
@@ -532,6 +604,22 @@ mod tests {
             out.extend_from_slice(data);
         }
         out
+    }
+
+    #[test]
+    fn streamed_state_pack_round_trips() {
+        let mut state = SHAMap::account_state();
+        state
+            .put(Hash256::new([2; 32]), b"second".to_vec())
+            .unwrap();
+        state.put(Hash256::new([1; 32]), b"first".to_vec()).unwrap();
+        let mut out = std::io::Cursor::new(Vec::new());
+
+        assert_eq!(write_state_pack(&mut out, 42, &state).unwrap(), 2);
+        let decoded = unpack_state(out.get_ref()).unwrap();
+        assert_eq!(decoded.checkpoint_seq, 42);
+        assert_eq!(decoded.entries[0], ([1; 32], b"first".to_vec()));
+        assert_eq!(decoded.entries[1], ([2; 32], b"second".to_vec()));
     }
 
     fn ledger_pack(batch_start: u64, records: &[(u64, Vec<u8>, Vec<TxRecord>)]) -> Vec<u8> {
@@ -754,7 +842,7 @@ mod tests {
             ],
         );
         let mut reports = Vec::new();
-        let summary = replay_segment_with(&state, &[&pack], 1, 2, 3, |report| {
+        let (summary, resume) = replay_segment_with_state(&state, &[&pack], 1, 2, 3, |report| {
             reports.push(report);
             Ok(())
         })
@@ -767,6 +855,7 @@ mod tests {
         assert!(reports[1].account_hash_match);
         assert_eq!(summary.tx_hash_mismatches, 1);
         assert!(!summary.stopped_early);
+        assert_eq!(resume.header.sequence, 3);
     }
 
     #[test]
@@ -791,7 +880,7 @@ mod tests {
             ],
         );
         let mut reports = Vec::new();
-        let summary = replay_segment_with(&state, &[&pack], 1, 2, 3, |report| {
+        let (summary, resume) = replay_segment_with_state(&state, &[&pack], 1, 2, 3, |report| {
             reports.push(report);
             Ok(())
         })
@@ -800,6 +889,7 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert!(!reports[0].account_hash_match);
         assert!(summary.stopped_early);
+        assert_eq!(resume.header.sequence, 1);
     }
 
     #[test]

@@ -32,12 +32,16 @@ rxrpl replay-segment \
   --state checkpoint.pack \
   --ledgers ledger.pack \
   --checkpoint PARENT \
-  --start START --end END
+  --start START --end END \
+  --output-state resume.pack
 ```
 
 `PARENT + 1` must equal `START`. It emits one JSON object for every ledger in
 the exact inclusive range `START..=END`, followed by one summary object. Logs
 and diagnostics must stay on stderr so consumers can parse stdout as JSON Lines.
+`--output-state` is optional; it atomically writes the last faithful state as an
+XSCP checkpoint. If replay stops on a divergence, that checkpoint is the exact
+parent, never the divergent child.
 
 ## Protocol conventions
 

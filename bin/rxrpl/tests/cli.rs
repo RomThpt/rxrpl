@@ -110,17 +110,21 @@ fn replay_segment_accepts_explicit_checkpoint() {
         "10",
         "--end",
         "12",
+        "--output-state",
+        "/tmp/resume.pack",
     ]);
     match cli.command {
         Commands::ReplaySegment {
             checkpoint,
             start,
             end,
+            output_state,
             ..
         } => {
             assert_eq!(checkpoint, Some(9));
             assert_eq!(start, 10);
             assert_eq!(end, 12);
+            assert_eq!(output_state.unwrap().to_str(), Some("/tmp/resume.pack"));
         }
         _ => panic!("expected Commands::ReplaySegment"),
     }
