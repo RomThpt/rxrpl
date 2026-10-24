@@ -11,7 +11,7 @@
 //! metadata, which the orchestration layer diffs against mainnet metadata to
 //! localise a divergence to ledger -> tx -> object -> field. No RPC, no network.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rxrpl_ledger::{Ledger, LedgerHeader};
 use rxrpl_primitives::Hash256;
@@ -26,6 +26,7 @@ const KIND_STATE: u8 = 1;
 const KIND_LEDGER: u8 = 2;
 
 /// A decoded checkpoint `STATE` pack: the full mainnet state at `checkpoint_seq`.
+#[derive(Debug)]
 pub struct StatePack {
     pub checkpoint_seq: u64,
     /// `(ledger index, raw serialized SLE)` pairs, byte-identical to what
@@ -34,6 +35,7 @@ pub struct StatePack {
 }
 
 /// One transaction inside a `LEDGER` pack: raw signed tx + mainnet metadata.
+#[derive(Debug)]
 pub struct TxRecord {
     pub tx_hash: [u8; 32],
     pub tx_blob: Vec<u8>,
@@ -42,6 +44,7 @@ pub struct TxRecord {
 
 /// One ledger inside a `LEDGER` pack: raw header + its transactions in canonical
 /// (pack) order.
+#[derive(Debug)]
 pub struct LedgerRecord {
     pub seq: u64,
     pub header_blob: Vec<u8>,
@@ -49,6 +52,7 @@ pub struct LedgerRecord {
 }
 
 /// Per-tx replay result: the emitted metadata to diff against mainnet's.
+#[derive(Debug)]
 pub struct TxReport {
     pub txid: Hash256,
     /// Our engine's emitted metadata blob (mainnet `AffectedNodes` shape).
@@ -68,7 +72,26 @@ pub struct LedgerReport {
     pub expected_account_hash: Hash256,
     pub computed_tx_hash: Hash256,
     pub expected_tx_hash: Hash256,
+    pub computed_ledger_hash: Hash256,
+    pub expected_ledger_hash: Hash256,
+    pub computed_drops: u64,
+    pub expected_drops: u64,
     pub txs: Vec<TxReport>,
+}
+
+/// Aggregate result emitted after the final audited ledger (or an early stop).
+pub struct ReplaySummary {
+    pub checkpoint: u64,
+    pub start: u64,
+    pub end: u64,
+    pub processed: usize,
+    pub applied: usize,
+    pub failed: usize,
+    pub account_hash_mismatches: usize,
+    pub tx_hash_mismatches: usize,
+    pub ledger_hash_mismatches: usize,
+    pub drops_mismatches: usize,
+    pub stopped_early: bool,
 }
 
 fn take<'a>(b: &'a [u8], off: &mut usize, n: usize) -> Result<&'a [u8], String> {
@@ -105,13 +128,34 @@ pub fn unpack_state(blob: &[u8]) -> Result<StatePack, String> {
     let mut off = 0;
     read_header(blob, &mut off, KIND_STATE)?;
     let checkpoint_seq = read_u64(blob, &mut off)?;
+    if checkpoint_seq == 0 || checkpoint_seq > u64::from(u32::MAX) {
+        return Err(format!(
+            "checkpoint {checkpoint_seq} is outside the valid u32 ledger range"
+        ));
+    }
     let n = read_u32(blob, &mut off)? as usize;
+    if n > blob.len().saturating_sub(off) / 36 {
+        return Err("state entry count exceeds remaining pack bytes".into());
+    }
     let mut entries = Vec::with_capacity(n);
+    let mut indexes = BTreeSet::new();
     for _ in 0..n {
         let index: [u8; 32] = take(blob, &mut off, 32)?.try_into().unwrap();
+        if !indexes.insert(index) {
+            return Err(format!(
+                "duplicate state index {}",
+                hex::encode_upper(index)
+            ));
+        }
         let dlen = read_u32(blob, &mut off)? as usize;
         let data = take(blob, &mut off, dlen)?.to_vec();
         entries.push((index, data));
+    }
+    if off != blob.len() {
+        return Err(format!(
+            "trailing bytes after STATE pack: {}",
+            blob.len() - off
+        ));
     }
     Ok(StatePack {
         checkpoint_seq,
@@ -125,19 +169,57 @@ pub fn unpack_state(blob: &[u8]) -> Result<StatePack, String> {
 pub fn unpack_ledger_batch(blob: &[u8]) -> Result<Vec<LedgerRecord>, String> {
     let mut off = 0;
     read_header(blob, &mut off, KIND_LEDGER)?;
-    let _batch_start = read_u64(blob, &mut off)?;
+    let batch_start = read_u64(blob, &mut off)?;
     let count = read_u32(blob, &mut off)? as usize;
+    if count == 0 {
+        return Err("empty LEDGER pack".into());
+    }
+    if count > blob.len().saturating_sub(off) / 16 {
+        return Err("ledger count exceeds remaining pack bytes".into());
+    }
     let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
+    for i in 0..count {
         let seq = read_u64(blob, &mut off)?;
+        if seq == 0 || seq > u64::from(u32::MAX) {
+            return Err(format!(
+                "ledger {seq} is outside the valid u32 ledger range"
+            ));
+        }
+        let expected_seq = batch_start
+            .checked_add(i as u64)
+            .ok_or("ledger sequence overflow")?;
+        if seq != expected_seq {
+            return Err(format!(
+                "non-contiguous LEDGER pack: record {seq} != expected {expected_seq}"
+            ));
+        }
         let hlen = read_u32(blob, &mut off)? as usize;
         let header_blob = take(blob, &mut off, hlen)?.to_vec();
         let tx_count = read_u32(blob, &mut off)? as usize;
+        if tx_count > blob.len().saturating_sub(off) / 40 {
+            return Err(format!(
+                "transaction count for ledger {seq} exceeds remaining pack bytes"
+            ));
+        }
         let mut txs = Vec::with_capacity(tx_count);
+        let mut tx_hashes = BTreeSet::new();
         for _ in 0..tx_count {
             let tx_hash: [u8; 32] = take(blob, &mut off, 32)?.try_into().unwrap();
+            if !tx_hashes.insert(tx_hash) {
+                return Err(format!(
+                    "duplicate packed transaction hash {} in ledger {seq}",
+                    hex::encode_upper(tx_hash)
+                ));
+            }
             let blen = read_u32(blob, &mut off)? as usize;
             let tx_blob = take(blob, &mut off, blen)?.to_vec();
+            let computed = transaction_id(&tx_blob);
+            if computed.as_bytes() != &tx_hash {
+                return Err(format!(
+                    "packed transaction hash mismatch in ledger {seq}: packed {} computed {computed}",
+                    hex::encode_upper(tx_hash)
+                ));
+            }
             let mlen = read_u32(blob, &mut off)? as usize;
             let meta_blob = take(blob, &mut off, mlen)?.to_vec();
             txs.push(TxRecord {
@@ -152,72 +234,104 @@ pub fn unpack_ledger_batch(blob: &[u8]) -> Result<Vec<LedgerRecord>, String> {
             txs,
         });
     }
+    if off != blob.len() {
+        return Err(format!(
+            "trailing bytes after LEDGER pack: {}",
+            blob.len() - off
+        ));
+    }
     Ok(out)
 }
 
 /// Read one variable-length segment (rippled VL prefix) from `b` at `off`.
-fn read_vl(b: &[u8], off: &mut usize) -> Option<Vec<u8>> {
-    let b0 = *b.get(*off)? as usize;
-    *off += 1;
+fn read_vl<'a>(b: &'a [u8], off: &mut usize) -> Result<&'a [u8], String> {
+    let b0 = take(b, off, 1)?[0] as usize;
     let len = if b0 <= 192 {
         b0
     } else if b0 <= 240 {
-        let b1 = *b.get(*off)? as usize;
-        *off += 1;
+        let b1 = take(b, off, 1)?[0] as usize;
         193 + (b0 - 193) * 256 + b1
     } else if b0 <= 254 {
-        let b1 = *b.get(*off)? as usize;
-        let b2 = *b.get(*off + 1)? as usize;
-        *off += 2;
+        let prefix = take(b, off, 2)?;
+        let b1 = prefix[0] as usize;
+        let b2 = prefix[1] as usize;
         12481 + (b0 - 241) * 65536 + b1 * 256 + b2
     } else {
-        return None;
+        return Err("invalid VL length prefix".into());
     };
-    let seg = b.get(*off..*off + len)?.to_vec();
-    *off += len;
-    Some(seg)
+    take(b, off, len)
 }
 
 /// Extract our emitted metadata for each transaction from the closed ledger's
 /// transaction SHAMap. Each leaf is `VL(tx) || VL(meta)`; the leaf key is the
 /// transaction id, so we look each tx up by the id recomputed from its blob.
-fn emitted_meta(ledger: &Ledger, txids: &[Hash256]) -> Vec<TxReport> {
-    let mut out = Vec::with_capacity(txids.len());
-    for txid in txids {
-        let meta_blob = ledger
-            .tx_map
-            .get(txid)
-            .and_then(|leaf| {
-                let mut off = 0;
-                let _tx = read_vl(leaf, &mut off)?;
-                read_vl(leaf, &mut off)
-            })
-            .unwrap_or_default();
+fn emitted_meta(ledger: &Ledger, txs: &[TxRecord]) -> Result<Vec<TxReport>, String> {
+    let mut out = Vec::with_capacity(txs.len());
+    for tx in txs {
+        let txid = transaction_id(&tx.tx_blob);
+        let Some(leaf) = ledger.tx_map.get(&txid) else {
+            continue;
+        };
+        let mut off = 0;
+        let emitted_tx = read_vl(leaf, &mut off)
+            .map_err(|e| format!("invalid emitted transaction leaf {txid}: {e}"))?;
+        let meta_blob = read_vl(leaf, &mut off)
+            .map_err(|e| format!("invalid emitted metadata leaf {txid}: {e}"))?;
+        if emitted_tx != tx.tx_blob {
+            return Err(format!("emitted transaction blob differs for {txid}"));
+        }
+        if off != leaf.len() {
+            return Err(format!(
+                "trailing bytes in emitted transaction leaf {txid}: {}",
+                leaf.len() - off
+            ));
+        }
         out.push(TxReport {
-            txid: *txid,
-            meta_blob,
+            txid,
+            meta_blob: meta_blob.to_vec(),
         });
     }
-    out
+    Ok(out)
 }
 
 /// Replay one checkpoint-seeded segment from its `XSCP` packs.
 ///
-/// `state_pack` is the `STATE` pack whose `checkpoint_seq == start`; `ledger_packs`
-/// are the `LEDGER` packs covering `start..=end` (the checkpoint ledger `start`
-/// supplies the parent header, then `start+1..=end` are replayed). Returns one
-/// [`LedgerReport`] per replayed ledger, carrying state forward so a divergence at
-/// ledger N is contaminated only by N (segments seed from real mainnet state).
+/// `state_pack` is the `STATE` pack for the parent `checkpoint`; `ledger_packs`
+/// cover `checkpoint..=end`, including the parent header. The audited range is
+/// exactly `start..=end`, where `checkpoint + 1 == start`.
 pub fn replay_segment(
     state_pack: &[u8],
     ledger_packs: &[&[u8]],
+    checkpoint: u64,
     start: u64,
     end: u64,
 ) -> Result<Vec<LedgerReport>, String> {
+    let mut reports = Vec::new();
+    replay_segment_with(state_pack, ledger_packs, checkpoint, start, end, |report| {
+        reports.push(report);
+        Ok(())
+    })?;
+    Ok(reports)
+}
+
+/// Streaming variant of [`replay_segment`]. The callback runs once per audited
+/// ledger, including the first ledger that causes an early stop.
+pub fn replay_segment_with<F>(
+    state_pack: &[u8],
+    ledger_packs: &[&[u8]],
+    checkpoint: u64,
+    start: u64,
+    end: u64,
+    mut emit: F,
+) -> Result<ReplaySummary, String>
+where
+    F: FnMut(LedgerReport) -> Result<(), String>,
+{
+    validate_range(checkpoint, start, end)?;
     let sp = unpack_state(state_pack)?;
-    if sp.checkpoint_seq != start {
+    if sp.checkpoint_seq != checkpoint {
         return Err(format!(
-            "state pack checkpoint {} != segment start {start}",
+            "state pack checkpoint {} != requested checkpoint {checkpoint}",
             sp.checkpoint_seq
         ));
     }
@@ -232,15 +346,40 @@ pub fn replay_segment(
     let mut ledgers: BTreeMap<u64, LedgerRecord> = BTreeMap::new();
     for pack in ledger_packs {
         for rec in unpack_ledger_batch(pack)? {
-            ledgers.insert(rec.seq, rec);
+            let seq = rec.seq;
+            if ledgers.insert(seq, rec).is_some() {
+                return Err(format!("duplicate ledger {seq} across LEDGER packs"));
+            }
         }
     }
 
+    for seq in checkpoint..=end {
+        if !ledgers.contains_key(&seq) {
+            return Err(format!("ledger {seq} missing from ledger packs"));
+        }
+    }
+
+    let mut previous_hash = None;
+    for seq in checkpoint..=end {
+        let rec = ledgers
+            .get(&seq)
+            .ok_or_else(|| format!("ledger {seq} missing from ledger packs"))?;
+        let hdr = decode_header(seq, &rec.header_blob)?;
+        if let Some(parent_hash) = previous_hash
+            && hdr.parent_hash != parent_hash
+        {
+            return Err(format!(
+                "ledger {seq} parent hash {} != previous ledger hash {parent_hash}",
+                hdr.parent_hash
+            ));
+        }
+        previous_hash = Some(hdr.hash);
+    }
+
     let seed = ledgers
-        .get(&start)
-        .ok_or_else(|| format!("checkpoint ledger {start} missing from ledger packs"))?;
-    let parent_hdr =
-        LedgerHeader::from_raw_bytes(&seed.header_blob).ok_or("checkpoint header decode failed")?;
+        .get(&checkpoint)
+        .ok_or_else(|| format!("checkpoint ledger {checkpoint} missing from ledger packs"))?;
+    let parent_hdr = decode_header(checkpoint, &seed.header_blob)?;
     if state.root_hash() != parent_hdr.account_hash {
         return Err(format!(
             "seed state root {} != checkpoint account_hash {}",
@@ -249,18 +388,29 @@ pub fn replay_segment(
         ));
     }
 
-    let mut parent = Ledger::from_catchup(start as u32, parent_hdr.hash, state);
+    let mut parent = Ledger::from_catchup(checkpoint as u32, parent_hdr.hash, state);
     parent.header = parent_hdr;
 
     let engine = all_handlers_engine();
-    let mut reports = Vec::with_capacity((end - start) as usize);
+    let mut summary = ReplaySummary {
+        checkpoint,
+        start,
+        end,
+        processed: 0,
+        applied: 0,
+        failed: 0,
+        account_hash_mismatches: 0,
+        tx_hash_mismatches: 0,
+        ledger_hash_mismatches: 0,
+        drops_mismatches: 0,
+        stopped_early: false,
+    };
 
-    for seq in (start + 1)..=end {
+    for seq in start..=end {
         let rec = ledgers
             .get(&seq)
             .ok_or_else(|| format!("ledger {seq} missing from ledger packs"))?;
-        let hdr =
-            LedgerHeader::from_raw_bytes(&rec.header_blob).ok_or("ledger header decode failed")?;
+        let hdr = decode_header(seq, &rec.header_blob)?;
 
         let txids: Vec<Hash256> = rec.txs.iter().map(|t| transaction_id(&t.tx_blob)).collect();
         let txset = rec
@@ -275,7 +425,15 @@ pub fn replay_segment(
         let outcome = replay_forward(&parent, set_hash, txset, &hdr, &engine, &fees)
             .map_err(|e| format!("replay of ledger {seq} failed: {e:?}"))?;
 
-        reports.push(LedgerReport {
+        let txs = emitted_meta(&outcome.ledger, &rec.txs)?;
+        if txs.len() != outcome.applied {
+            return Err(format!(
+                "ledger {seq} emitted {} transaction leaves for {} applied transactions",
+                txs.len(),
+                outcome.applied
+            ));
+        }
+        let report = LedgerReport {
             seq,
             account_hash_match: outcome.account_hash_match,
             tx_hash_match: outcome.tx_hash_match,
@@ -287,8 +445,21 @@ pub fn replay_segment(
             expected_account_hash: hdr.account_hash,
             computed_tx_hash: outcome.ledger.header.tx_hash,
             expected_tx_hash: hdr.tx_hash,
-            txs: emitted_meta(&outcome.ledger, &txids),
-        });
+            computed_ledger_hash: outcome.ledger.header.hash,
+            expected_ledger_hash: hdr.hash,
+            computed_drops: outcome.ledger.header.drops,
+            expected_drops: hdr.drops,
+            txs,
+        };
+
+        summary.processed += 1;
+        summary.applied += report.applied;
+        summary.failed += report.failed;
+        summary.account_hash_mismatches += usize::from(!report.account_hash_match);
+        summary.tx_hash_mismatches += usize::from(!report.tx_hash_match);
+        summary.ledger_hash_mismatches += usize::from(!report.ledger_hash_match);
+        summary.drops_mismatches += usize::from(!report.drops_match);
+        let must_stop = !report.account_hash_match || !report.drops_match || report.failed != 0;
 
         // Seed the next ledger's parent hash from mainnet's real value rather
         // than our computed one. rxrpl's canonical-ordering tx_hash artifact
@@ -302,14 +473,126 @@ pub fn replay_segment(
         let mut carried = outcome.ledger;
         carried.header.hash = hdr.hash;
         parent = carried;
+        emit(report)?;
+
+        if must_stop {
+            summary.stopped_early = seq != end;
+            break;
+        }
     }
 
-    Ok(reports)
+    Ok(summary)
+}
+
+fn validate_range(checkpoint: u64, start: u64, end: u64) -> Result<(), String> {
+    for (name, seq) in [("checkpoint", checkpoint), ("start", start), ("end", end)] {
+        if seq == 0 || seq > u64::from(u32::MAX) {
+            return Err(format!(
+                "{name} {seq} is outside the valid u32 ledger range"
+            ));
+        }
+    }
+    if start > end {
+        return Err(format!("segment start {start} is greater than end {end}"));
+    }
+    if checkpoint.checked_add(1) != Some(start) {
+        return Err(format!(
+            "checkpoint {checkpoint} must be the parent of start {start}"
+        ));
+    }
+    Ok(())
+}
+
+fn decode_header(seq: u64, blob: &[u8]) -> Result<LedgerHeader, String> {
+    let header = LedgerHeader::from_raw_bytes(blob)
+        .ok_or_else(|| format!("ledger {seq} header decode failed"))?;
+    if u64::from(header.sequence) != seq {
+        return Err(format!(
+            "ledger record sequence {seq} != header sequence {}",
+            header.sequence
+        ));
+    }
+    Ok(header)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn state_pack(checkpoint: u64, entries: &[([u8; 32], &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.push(VERSION);
+        out.push(KIND_STATE);
+        out.extend_from_slice(&checkpoint.to_be_bytes());
+        out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (index, data) in entries {
+            out.extend_from_slice(index);
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            out.extend_from_slice(data);
+        }
+        out
+    }
+
+    fn ledger_pack(batch_start: u64, records: &[(u64, Vec<u8>, Vec<TxRecord>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.push(VERSION);
+        out.push(KIND_LEDGER);
+        out.extend_from_slice(&batch_start.to_be_bytes());
+        out.extend_from_slice(&(records.len() as u32).to_be_bytes());
+        for (seq, header, txs) in records {
+            out.extend_from_slice(&seq.to_be_bytes());
+            out.extend_from_slice(&(header.len() as u32).to_be_bytes());
+            out.extend_from_slice(header);
+            out.extend_from_slice(&(txs.len() as u32).to_be_bytes());
+            for tx in txs {
+                out.extend_from_slice(&tx.tx_hash);
+                out.extend_from_slice(&(tx.tx_blob.len() as u32).to_be_bytes());
+                out.extend_from_slice(&tx.tx_blob);
+                out.extend_from_slice(&(tx.meta_blob.len() as u32).to_be_bytes());
+                out.extend_from_slice(&tx.meta_blob);
+            }
+        }
+        out
+    }
+
+    fn tx_record(blob: &[u8]) -> TxRecord {
+        TxRecord {
+            tx_hash: *transaction_id(blob).as_bytes(),
+            tx_blob: blob.to_vec(),
+            meta_blob: vec![0xF1],
+        }
+    }
+
+    fn empty_parent(sequence: u32) -> Ledger {
+        let mut state = SHAMap::account_state();
+        let mut header = LedgerHeader::new();
+        header.sequence = sequence;
+        header.account_hash = state.root_hash();
+        header.hash = header.compute_hash();
+        let mut ledger = Ledger::from_catchup(sequence, header.hash, state);
+        ledger.header = header;
+        ledger
+    }
+
+    fn replay_empty(parent: &Ledger) -> crate::play_forward::ReplayOutcome {
+        let mut header = LedgerHeader::new();
+        header.sequence = parent.header.sequence + 1;
+        header.parent_hash = parent.header.hash;
+        header.parent_close_time = parent.header.close_time;
+        header.close_time = parent.header.close_time + 10;
+        header.close_time_resolution = 10;
+        replay_forward(
+            parent,
+            Hash256::ZERO,
+            Vec::new(),
+            &header,
+            &all_handlers_engine(),
+            &fees_for_ledger(parent),
+        )
+        .unwrap()
+    }
 
     /// Cross-language codec check: decode packs produced by `xrpl-state-compare`'s
     /// Python `core/pack.py` (fixtures generated with `pack_state` / `pack_ledger_batch`).
@@ -342,5 +625,216 @@ mod tests {
         assert!(unpack_state(b"XSCP\x01\x02").is_err()); // wrong kind
         assert!(unpack_state(b"NOPE\x01\x01").is_err()); // bad magic
         assert!(unpack_ledger_batch(b"XSCP\x01\x02\x00").is_err()); // truncated
+    }
+
+    #[test]
+    fn rejects_trailing_pack_bytes_and_duplicate_state_indexes() {
+        let mut state = state_pack(7, &[]);
+        state.push(0);
+        assert!(unpack_state(&state).unwrap_err().contains("trailing bytes"));
+
+        let duplicate = state_pack(7, &[([3; 32], b"a"), ([3; 32], b"b")]);
+        assert!(
+            unpack_state(&duplicate)
+                .unwrap_err()
+                .contains("duplicate state index")
+        );
+
+        let mut ledgers = ledger_pack(7, &[(7, b"header".to_vec(), Vec::new())]);
+        ledgers.push(0);
+        assert!(
+            unpack_ledger_batch(&ledgers)
+                .unwrap_err()
+                .contains("trailing bytes")
+        );
+    }
+
+    #[test]
+    fn rejects_non_contiguous_ledgers_and_bad_packed_tx_hash() {
+        let discontinuous = ledger_pack(7, &[(8, b"header".to_vec(), Vec::new())]);
+        assert!(
+            unpack_ledger_batch(&discontinuous)
+                .unwrap_err()
+                .contains("non-contiguous")
+        );
+
+        let mut bad_tx = tx_record(b"transaction");
+        bad_tx.tx_hash = [9; 32];
+        let pack = ledger_pack(7, &[(7, b"header".to_vec(), vec![bad_tx])]);
+        assert!(
+            unpack_ledger_batch(&pack)
+                .unwrap_err()
+                .contains("packed transaction hash mismatch")
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_transactions() {
+        let tx = tx_record(b"transaction");
+        let duplicate = TxRecord {
+            tx_hash: tx.tx_hash,
+            tx_blob: tx.tx_blob.clone(),
+            meta_blob: tx.meta_blob.clone(),
+        };
+        let pack = ledger_pack(7, &[(7, b"header".to_vec(), vec![tx, duplicate])]);
+        assert!(
+            unpack_ledger_batch(&pack)
+                .unwrap_err()
+                .contains("duplicate packed transaction")
+        );
+    }
+
+    #[test]
+    fn emitted_meta_requires_exact_two_vl_segments() {
+        let tx = tx_record(b"transaction");
+        let txid = transaction_id(&tx.tx_blob);
+        let mut ledger = Ledger::genesis();
+        let mut leaf = rxrpl_codec::binary::encode_vl(&tx.tx_blob);
+        leaf.extend_from_slice(&rxrpl_codec::binary::encode_vl(b"metadata"));
+        ledger.add_transaction(txid, leaf.clone()).unwrap();
+        let reports = emitted_meta(&ledger, &[tx_record(b"transaction")]).unwrap();
+        assert_eq!(reports[0].meta_blob, b"metadata");
+
+        let mut trailing_ledger = Ledger::genesis();
+        leaf.push(0);
+        trailing_ledger.add_transaction(txid, leaf).unwrap();
+        assert!(
+            emitted_meta(&trailing_ledger, &[tx_record(b"transaction")])
+                .unwrap_err()
+                .contains("trailing bytes")
+        );
+
+        let mut wrong_tx_ledger = Ledger::genesis();
+        let mut wrong_leaf = rxrpl_codec::binary::encode_vl(b"different");
+        wrong_leaf.extend_from_slice(&rxrpl_codec::binary::encode_vl(b"metadata"));
+        wrong_tx_ledger.add_transaction(txid, wrong_leaf).unwrap();
+        assert!(
+            emitted_meta(&wrong_tx_ledger, &[tx_record(b"transaction")])
+                .unwrap_err()
+                .contains("blob differs")
+        );
+    }
+
+    #[test]
+    fn validates_parent_checkpoint_and_u32_bounds() {
+        assert!(validate_range(9, 10, 12).is_ok());
+        assert!(validate_range(10, 10, 12).is_err());
+        assert!(validate_range(9, 12, 10).is_err());
+        assert!(validate_range(9, 10, u64::from(u32::MAX) + 1).is_err());
+
+        let oversized_state = state_pack(u64::from(u32::MAX) + 1, &[]);
+        assert!(unpack_state(&oversized_state).is_err());
+        let oversized_ledger = ledger_pack(
+            u64::from(u32::MAX) + 1,
+            &[(u64::from(u32::MAX) + 1, Vec::new(), Vec::new())],
+        );
+        assert!(unpack_ledger_batch(&oversized_ledger).is_err());
+    }
+
+    #[test]
+    fn tx_hash_only_divergence_continues_with_pinned_parent_hash() {
+        let parent = empty_parent(1);
+        let first = replay_empty(&parent);
+        let mut expected_first = first.ledger.header.clone();
+        expected_first.tx_hash = Hash256::new([7; 32]);
+        expected_first.hash = expected_first.compute_hash();
+
+        let mut carried = first.ledger;
+        carried.header.hash = expected_first.hash;
+        let second = replay_empty(&carried);
+        let expected_second = second.ledger.header.clone();
+
+        let state = state_pack(1, &[]);
+        let pack = ledger_pack(
+            1,
+            &[
+                (1, parent.header.to_raw_bytes(), Vec::new()),
+                (2, expected_first.to_raw_bytes(), Vec::new()),
+                (3, expected_second.to_raw_bytes(), Vec::new()),
+            ],
+        );
+        let mut reports = Vec::new();
+        let summary = replay_segment_with(&state, &[&pack], 1, 2, 3, |report| {
+            reports.push(report);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(reports.len(), 2);
+        assert!(!reports[0].tx_hash_match);
+        assert!(reports[0].account_hash_match);
+        assert!(reports[0].drops_match);
+        assert!(reports[1].account_hash_match);
+        assert_eq!(summary.tx_hash_mismatches, 1);
+        assert!(!summary.stopped_early);
+    }
+
+    #[test]
+    fn state_divergence_stops_after_first_report() {
+        let parent = empty_parent(1);
+        let first = replay_empty(&parent);
+        let mut divergent = first.ledger.header.clone();
+        divergent.account_hash = Hash256::new([8; 32]);
+        divergent.hash = divergent.compute_hash();
+        let mut next = LedgerHeader::new();
+        next.sequence = 3;
+        next.parent_hash = divergent.hash;
+        next.hash = next.compute_hash();
+
+        let state = state_pack(1, &[]);
+        let pack = ledger_pack(
+            1,
+            &[
+                (1, parent.header.to_raw_bytes(), Vec::new()),
+                (2, divergent.to_raw_bytes(), Vec::new()),
+                (3, next.to_raw_bytes(), Vec::new()),
+            ],
+        );
+        let mut reports = Vec::new();
+        let summary = replay_segment_with(&state, &[&pack], 1, 2, 3, |report| {
+            reports.push(report);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(reports.len(), 1);
+        assert!(!reports[0].account_hash_match);
+        assert!(summary.stopped_early);
+    }
+
+    #[test]
+    fn failed_transaction_stops_after_first_report() {
+        let parent = empty_parent(1);
+        let first = replay_empty(&parent);
+        let expected = first.ledger.header.clone();
+        let mut next = LedgerHeader::new();
+        next.sequence = 3;
+        next.parent_hash = expected.hash;
+        next.hash = next.compute_hash();
+
+        let state = state_pack(1, &[]);
+        let pack = ledger_pack(
+            1,
+            &[
+                (1, parent.header.to_raw_bytes(), Vec::new()),
+                (
+                    2,
+                    expected.to_raw_bytes(),
+                    vec![tx_record(b"not an STObject")],
+                ),
+                (3, next.to_raw_bytes(), Vec::new()),
+            ],
+        );
+        let mut reports = Vec::new();
+        let summary = replay_segment_with(&state, &[&pack], 1, 2, 3, |report| {
+            reports.push(report);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].failed, 1);
+        assert_eq!(summary.failed, 1);
+        assert!(summary.stopped_early);
     }
 }

@@ -258,13 +258,16 @@ pub enum Commands {
     /// and print one JSON line per ledger (hashes + per-tx emitted metadata).
     /// The differential lab's worker invokes this per leased segment.
     ReplaySegment {
-        /// Path to the checkpoint STATE pack (`state/ckpt-<start>.pack`).
+        /// Path to the parent checkpoint STATE pack.
         #[arg(long)]
         state: PathBuf,
-        /// Paths to the LEDGER packs covering `start..=end` (repeatable).
+        /// Paths to the LEDGER packs covering `checkpoint..=end` (repeatable).
         #[arg(long = "ledgers", required = true, num_args = 1..)]
         ledgers: Vec<PathBuf>,
-        /// Segment start (== the checkpoint sequence).
+        /// Parent checkpoint sequence. Defaults to `start - 1`.
+        #[arg(long)]
+        checkpoint: Option<u64>,
+        /// First audited ledger (must equal `checkpoint + 1`).
         #[arg(long)]
         start: u64,
         /// Segment end (inclusive).
@@ -282,6 +285,37 @@ pub fn resolve_run_mode(mode: RunMode, standalone: bool, network: bool) -> RunMo
     } else {
         mode
     }
+}
+
+/// Resolve and validate the parent checkpoint and inclusive replay range.
+pub fn resolve_replay_range(checkpoint: Option<u64>, start: u64, end: u64) -> Result<u64, String> {
+    for (name, seq) in [("start", start), ("end", end)] {
+        if seq == 0 || seq > u64::from(u32::MAX) {
+            return Err(format!(
+                "{name} {seq} is outside the valid u32 ledger range"
+            ));
+        }
+    }
+    if start > end {
+        return Err(format!("segment start {start} is greater than end {end}"));
+    }
+    let checkpoint = match checkpoint {
+        Some(seq) => seq,
+        None => start
+            .checked_sub(1)
+            .ok_or_else(|| "cannot derive checkpoint before ledger 0".to_string())?,
+    };
+    if checkpoint == 0 || checkpoint > u64::from(u32::MAX) {
+        return Err(format!(
+            "checkpoint {checkpoint} is outside the valid u32 ledger range"
+        ));
+    }
+    if checkpoint.checked_add(1) != Some(start) {
+        return Err(format!(
+            "checkpoint {checkpoint} must be the parent of start {start}"
+        ));
+    }
+    Ok(checkpoint)
 }
 
 /// Convert a Prometheus exposition body into a JSON array of

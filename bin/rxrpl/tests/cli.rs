@@ -1,7 +1,9 @@
 //! Parser-level tests for the I-B3 operator subcommands.
 
 use clap::Parser;
-use rxrpl_cli::{Cli, Commands, MetricsExport, default_metrics_url, prometheus_to_json};
+use rxrpl_cli::{
+    Cli, Commands, MetricsExport, default_metrics_url, prometheus_to_json, resolve_replay_range,
+};
 
 fn parse(args: &[&str]) -> Cli {
     let mut full = vec!["rxrpl"];
@@ -92,6 +94,46 @@ fn config_validate_without_path() {
         Commands::ConfigValidate { path } => assert!(path.is_none()),
         _ => panic!("expected Commands::ConfigValidate"),
     }
+}
+
+#[test]
+fn replay_segment_accepts_explicit_checkpoint() {
+    let cli = parse(&[
+        "replay-segment",
+        "--state",
+        "/tmp/state.pack",
+        "--ledgers",
+        "/tmp/ledger.pack",
+        "--checkpoint",
+        "9",
+        "--start",
+        "10",
+        "--end",
+        "12",
+    ]);
+    match cli.command {
+        Commands::ReplaySegment {
+            checkpoint,
+            start,
+            end,
+            ..
+        } => {
+            assert_eq!(checkpoint, Some(9));
+            assert_eq!(start, 10);
+            assert_eq!(end, 12);
+        }
+        _ => panic!("expected Commands::ReplaySegment"),
+    }
+}
+
+#[test]
+fn replay_range_derives_and_checks_parent_checkpoint() {
+    assert_eq!(resolve_replay_range(None, 10, 12).unwrap(), 9);
+    assert_eq!(resolve_replay_range(Some(9), 10, 12).unwrap(), 9);
+    assert!(resolve_replay_range(Some(8), 10, 12).is_err());
+    assert!(resolve_replay_range(None, 1, 1).is_err());
+    assert!(resolve_replay_range(None, 12, 10).is_err());
+    assert!(resolve_replay_range(None, u64::from(u32::MAX) + 1, 12).is_err());
 }
 
 // -- helpers --

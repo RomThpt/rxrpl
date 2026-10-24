@@ -4,7 +4,7 @@ use clap::Parser;
 use rxrpl::Wallet;
 use rxrpl_cli::{
     Cli, Commands, LogLevel, MetricsExport, RunMode, default_metrics_url, prometheus_to_json,
-    resolve_run_mode,
+    resolve_replay_range, resolve_run_mode,
 };
 use serde_json::Value;
 
@@ -242,10 +242,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::ReplaySegment {
             state,
             ledgers,
+            checkpoint,
             start,
             end,
         } => {
-            return cmd_replay_segment(&state, &ledgers, start, end);
+            return cmd_replay_segment(&state, &ledgers, checkpoint, start, end);
         }
 
         _ => {}
@@ -560,44 +561,77 @@ async fn cmd_metrics(url: &str, export: MetricsExport) -> Result<(), Box<dyn std
 fn cmd_replay_segment(
     state: &std::path::Path,
     ledgers: &[PathBuf],
+    checkpoint: Option<u64>,
     start: u64,
     end: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let checkpoint = resolve_replay_range(checkpoint, start, end)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let state_pack = std::fs::read(state)?;
     let ledger_blobs: Vec<Vec<u8>> = ledgers
         .iter()
         .map(std::fs::read)
         .collect::<Result<_, _>>()?;
     let refs: Vec<&[u8]> = ledger_blobs.iter().map(Vec::as_slice).collect();
-    let reports = rxrpl_node::replay_worker::replay_segment(&state_pack, &refs, start, end)
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    for r in &reports {
-        let txs: Vec<serde_json::Value> = r
-            .txs
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "txid": t.txid.to_string(),
-                    "meta": hex::encode_upper(&t.meta_blob),
+    let summary = rxrpl_node::replay_worker::replay_segment_with(
+        &state_pack,
+        &refs,
+        checkpoint,
+        start,
+        end,
+        |r| {
+            let txs: Vec<serde_json::Value> = r
+                .txs
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "txid": t.txid.to_string(),
+                        "meta": hex::encode_upper(&t.meta_blob),
+                    })
                 })
-            })
-            .collect();
-        let line = serde_json::json!({
-            "seq": r.seq,
-            "account_hash_match": r.account_hash_match,
-            "tx_hash_match": r.tx_hash_match,
-            "ledger_hash_match": r.ledger_hash_match,
-            "drops_match": r.drops_match,
-            "applied": r.applied,
-            "failed": r.failed,
-            "computed_account_hash": r.computed_account_hash.to_string(),
-            "expected_account_hash": r.expected_account_hash.to_string(),
-            "computed_tx_hash": r.computed_tx_hash.to_string(),
-            "expected_tx_hash": r.expected_tx_hash.to_string(),
-            "txs": txs,
-        });
-        println!("{}", serde_json::to_string(&line)?);
-    }
+                .collect();
+            let line = serde_json::json!({
+                "seq": r.seq,
+                "account_hash_match": r.account_hash_match,
+                "tx_hash_match": r.tx_hash_match,
+                "ledger_hash_match": r.ledger_hash_match,
+                "drops_match": r.drops_match,
+                "applied": r.applied,
+                "failed": r.failed,
+                "computed_account_hash": r.computed_account_hash.to_string(),
+                "expected_account_hash": r.expected_account_hash.to_string(),
+                "computed_tx_hash": r.computed_tx_hash.to_string(),
+                "expected_tx_hash": r.expected_tx_hash.to_string(),
+                "computed_ledger_hash": r.computed_ledger_hash.to_string(),
+                "expected_ledger_hash": r.expected_ledger_hash.to_string(),
+                "computed_drops": r.computed_drops,
+                "expected_drops": r.expected_drops,
+                "txs": txs,
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&line).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        },
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let final_line = serde_json::json!({
+        "summary": {
+            "checkpoint": summary.checkpoint,
+            "start": summary.start,
+            "end": summary.end,
+            "processed": summary.processed,
+            "applied": summary.applied,
+            "failed": summary.failed,
+            "account_hash_mismatches": summary.account_hash_mismatches,
+            "tx_hash_mismatches": summary.tx_hash_mismatches,
+            "ledger_hash_mismatches": summary.ledger_hash_mismatches,
+            "drops_mismatches": summary.drops_mismatches,
+            "stopped_early": summary.stopped_early,
+        }
+    });
+    println!("{}", serde_json::to_string(&final_line)?);
     Ok(())
 }
 
