@@ -614,6 +614,16 @@ impl Transactor for TrustSetTransactor {
                 crate::owner_dir::remove_from_owner_dir_page(
                     ctx.view, &high_id, high_node, &tl_key,
                 )?;
+                // `trustDelete` records the line after this TrustSet's limit and
+                // flag changes, not the pre-transaction SLE. Stage the updated
+                // object before erasing it so Sandbox::erase snapshots those
+                // values as DeletedNode FinalFields while retaining the original
+                // for PreviousFields (105500004 ACCACC91).
+                let deleted_bytes =
+                    serde_json::to_vec(&obj).map_err(|_| TransactionResult::TemMalformed)?;
+                ctx.view
+                    .update(tl_key, deleted_bytes)
+                    .map_err(|_| TransactionResult::TemMalformed)?;
                 let _ = ctx.view.erase(&tl_key);
                 // Deleting the line removes it from BOTH accounts' owner
                 // directories, so rippled re-threads both account roots (updates
