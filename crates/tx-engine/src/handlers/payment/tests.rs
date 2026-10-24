@@ -2211,6 +2211,39 @@ fn apply_cross_currency_amm_partial_scales_to_send_max() {
 }
 
 #[test]
+fn flow_strand_count_includes_distinct_implicit_direct_path() {
+    let ledger = Ledger::genesis();
+    let view = LedgerView::new(&ledger);
+    let send_max = iou("USD", ISSUER, "100");
+    let amount = iou("GBP", ISSUER, "50");
+
+    let duplicate = serde_json::json!({
+        "Account": ALICE,
+        "Amount": amount,
+        "SendMax": send_max,
+        "Paths": [[{ "currency": "GBP", "issuer": ISSUER }]],
+    });
+    assert_eq!(count_flow_strands(&view, &duplicate, &send_max, &amount), 1);
+
+    let distinct = serde_json::json!({
+        "Account": ALICE,
+        "Amount": amount,
+        "SendMax": send_max,
+        "Paths": [[{ "currency": "XRP" }, { "currency": "GBP", "issuer": ISSUER }]],
+    });
+    assert_eq!(count_flow_strands(&view, &distinct, &send_max, &amount), 2);
+
+    let no_direct = serde_json::json!({
+        "Account": ALICE,
+        "Amount": amount,
+        "SendMax": send_max,
+        "Flags": rxrpl_protocol::flags::payment::TF_NO_RIPPLE_DIRECT,
+        "Paths": [[{ "currency": "XRP" }, { "currency": "GBP", "issuer": ISSUER }]],
+    });
+    assert_eq!(count_flow_strands(&view, &no_direct, &send_max, &amount), 1);
+}
+
+#[test]
 fn conversion_crosses_book_xrp_to_iou() {
     // BOB rests an offer selling 100 USD for 50 XRP (rate 0.5 XRP/USD), then
     // ALICE converts XRP -> USD on her own account (Account == Destination),

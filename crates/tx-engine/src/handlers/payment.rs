@@ -1058,26 +1058,27 @@ fn count_flow_strands(
     let Some(paths) = tx.get("Paths").and_then(|v| v.as_array()) else {
         return 0;
     };
-    if paths.len() < 2 {
-        return 0;
+    let mut chains = Vec::new();
+    if helpers::get_flags(tx) & rxrpl_protocol::flags::payment::TF_NO_RIPPLE_DIRECT == 0 {
+        chains.push(vec![send_max.clone(), amount.clone()]);
     }
-    paths
-        .iter()
-        .filter(|p| {
-            p.as_array()
-                .and_then(|steps| {
-                    build_path_boundaries(
-                        view,
-                        steps,
-                        send_max,
-                        amount,
-                        tx.get("Account").and_then(|v| v.as_str()).unwrap_or(""),
-                    )
-                })
-                .map(|b| b.len() >= 2)
-                .unwrap_or(false)
-        })
-        .count()
+    for path in paths {
+        let Some(boundaries) = path.as_array().and_then(|steps| {
+            build_path_boundaries(
+                view,
+                steps,
+                send_max,
+                amount,
+                tx.get("Account").and_then(|v| v.as_str()).unwrap_or(""),
+            )
+        }) else {
+            continue;
+        };
+        if boundaries.len() >= 2 && !chains.contains(&boundaries) {
+            chains.push(boundaries);
+        }
+    }
+    chains.len()
 }
 
 /// Whether any resolvable strand carries an AMM pool on one of its hops.
@@ -1097,6 +1098,18 @@ fn flow_strands_have_amm(
     send_max: &serde_json::Value,
     amount: &serde_json::Value,
 ) -> bool {
+    if helpers::get_flags(tx) & rxrpl_protocol::flags::payment::TF_NO_RIPPLE_DIRECT == 0 {
+        if let (Some((_, in_cur, in_iss)), Some((_, out_cur, out_iss))) =
+            (amm_asset_of(send_max), amm_asset_of(amount))
+        {
+            if view
+                .read(&keylet::amm(&in_cur, &in_iss, &out_cur, &out_iss))
+                .is_some()
+            {
+                return true;
+            }
+        }
+    }
     let Some(paths) = tx.get("Paths").and_then(|v| v.as_array()) else {
         return false;
     };
@@ -1177,8 +1190,12 @@ fn apply_paths_payment_multi(
         .ok_or(TransactionResult::TemBadPath)?
         .clone();
 
-    // Build every strand that resolves to a boundary chain (>= 2 assets).
-    let mut strands = Vec::new();
+    // Build every distinct strand, including the implicit direct path unless
+    // tfNoRippleDirect disables it.
+    let mut chains = Vec::new();
+    if helpers::get_flags(ctx.tx) & rxrpl_protocol::flags::payment::TF_NO_RIPPLE_DIRECT == 0 {
+        chains.push(vec![send_max.clone(), amount.clone()]);
+    }
     for path in &paths {
         let Some(steps) = path.as_array() else {
             continue;
@@ -1191,10 +1208,14 @@ fn apply_paths_payment_multi(
         if boundaries.len() < 2 {
             continue;
         }
-        if let Some(strand) = crate::handlers::offer_create::build_flow_strand(ctx, &boundaries) {
-            strands.push(strand);
+        if !chains.contains(&boundaries) {
+            chains.push(boundaries);
         }
     }
+    let strands: Vec<_> = chains
+        .iter()
+        .filter_map(|boundaries| crate::handlers::offer_create::build_flow_strand(ctx, boundaries))
+        .collect();
     if strands.is_empty() {
         return Err(TransactionResult::TecPathDry);
     }
@@ -1225,10 +1246,24 @@ fn apply_paths_payment_multi(
     let delivered = if amount.is_string() {
         serde_json::Value::String(delivered_num.to_xrp_drops().to_string())
     } else {
+        let mut delivered_iou = {
+            let _round = rxrpl_amount::number::RoundModeGuard::new(
+                rxrpl_amount::number::RoundingMode::Downward,
+            );
+            delivered_num.to_iou()
+        };
+        if delivered_iou.mantissa() > 0 {
+            delivered_iou = rxrpl_amount::IOUAmount::from_parts(
+                delivered_iou.mantissa() - 1,
+                delivered_iou.exponent(),
+                false,
+            )
+            .unwrap_or(delivered_iou);
+        }
         serde_json::json!({
             "currency": amt_cur,
             "issuer": amt_iss,
-            "value": delivered_num.to_iou().to_decimal_string(),
+            "value": delivered_iou.to_decimal_string(),
         })
     };
 

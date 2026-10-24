@@ -2959,6 +2959,7 @@ struct AmmHop {
     tfee: u16,
     pool_in: rxrpl_amount::number::Number,
     pool_out: rxrpl_amount::number::Number,
+    best_book_quality: Option<u64>,
 }
 
 /// Whether the order book identified by `inverse_book` holds at least one
@@ -2990,7 +2991,7 @@ fn apply_amm_move(
     out_num: &rxrpl_amount::number::Number,
     skip_input_debit: bool,
     skip_output_credit: bool,
-) -> Result<(), TransactionResult> {
+) -> Result<rxrpl_amount::number::Number, TransactionResult> {
     // Input: source / previous-pool -> this pool.
     if hop.in_xrp {
         let drops = in_num.to_xrp_drops() as i64;
@@ -3003,29 +3004,24 @@ fn apply_amm_move(
         }
         credit_xrp(ctx, &hop.pool_id, drops)?;
     } else {
-        if !skip_input_debit {
-            let funds =
-                crate::amm_helpers::iou_holding_number(ctx.view, taker, &hop.in_iss, &hop.in_cur);
-            crate::amm_helpers::set_iou_holding(
-                ctx.view,
-                taker,
-                &hop.in_iss,
-                &hop.in_cur,
-                &funds.sub(in_num),
-            )?;
-        }
-        let pool_h = crate::amm_helpers::iou_holding_number(
-            ctx.view,
-            &hop.pool_id,
-            &hop.in_iss,
-            &hop.in_cur,
+        let amount = number_to_leg(
+            in_num,
+            &Leg {
+                is_xrp: false,
+                currency: hop.in_cur,
+                issuer: hop.in_iss,
+                iou: IOUAmount::ZERO,
+                drops: 0,
+            },
         );
-        crate::amm_helpers::set_iou_holding(
-            ctx.view,
+        pay_in(
+            ctx,
+            taker,
+            taker_acct,
             &hop.pool_id,
-            &hop.in_iss,
-            &hop.in_cur,
-            &pool_h.add(in_num),
+            &amount,
+            ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+            skip_input_debit,
         )?;
     }
     // Output: this pool -> dest / next pool.
@@ -3039,33 +3035,30 @@ fn apply_amm_move(
                 credit_xrp(ctx, dest, drops)?;
             }
         }
+        Ok(*out_num)
     } else {
-        let pool_h = crate::amm_helpers::iou_holding_number(
-            ctx.view,
-            &hop.pool_id,
-            &hop.out_iss,
-            &hop.out_cur,
+        let amount = number_to_leg(
+            out_num,
+            &Leg {
+                is_xrp: false,
+                currency: hop.out_cur,
+                issuer: hop.out_iss,
+                iou: IOUAmount::ZERO,
+                drops: 0,
+            },
         );
-        crate::amm_helpers::set_iou_holding(
-            ctx.view,
+        let net = pay_out_gross(
+            ctx,
+            taker,
+            taker_acct,
             &hop.pool_id,
-            &hop.out_iss,
-            &hop.out_cur,
-            &pool_h.sub(out_num),
+            dest,
+            &amount,
+            ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+            skip_output_credit,
         )?;
-        if !skip_output_credit {
-            let dest_h =
-                crate::amm_helpers::iou_holding_number(ctx.view, dest, &hop.out_iss, &hop.out_cur);
-            crate::amm_helpers::set_iou_holding(
-                ctx.view,
-                dest,
-                &hop.out_iss,
-                &hop.out_cur,
-                &dest_h.add(out_num),
-            )?;
-        }
+        Ok(leg_to_number(&net))
     }
-    Ok(())
 }
 
 /// rippled `StrandFlow` output-limited case for a pure-AMM strand: reverse-price
@@ -3326,21 +3319,14 @@ fn reverse_amm_strand(
         return Ok(None);
     }
 
-    // Gather a pure-AMM snapshot of every hop; bail to the forward flow on the
-    // first hop carrying a resting CLOB offer or lacking an AMM pool.
+    // Gather an AMM snapshot of every hop. A coexisting CLOB does not by itself
+    // disqualify the reverse AMM strand: rippled compares the synthetic AMM
+    // offer with the book tip and may route the whole hop through the pool.
     let mut hops: Vec<AmmHop> = Vec::with_capacity(n - 1);
     for h in 0..(n - 1) {
         let in_leg = Leg::parse(&boundaries[h]).ok_or(TransactionResult::TemBadAmount)?;
         let out_leg = Leg::parse(&boundaries[h + 1]).ok_or(TransactionResult::TemBadAmount)?;
-        let inverse_book = keylet::book_dir(
-            &in_leg.currency,
-            &in_leg.issuer,
-            &out_leg.currency,
-            &out_leg.issuer,
-        );
-        if book_has_resting_offer(ctx, &inverse_book) {
-            return Ok(None);
-        }
+        let best_book_quality = peek_best_book_quality(ctx.view, &in_leg, &out_leg);
         let amm_key = keylet::amm(
             &in_leg.currency,
             &in_leg.issuer,
@@ -3388,14 +3374,23 @@ fn reverse_amm_strand(
             tfee,
             pool_in,
             pool_out,
+            best_book_quality,
         });
     }
 
-    // Reverse pass: thread the demanded output back to the source input. Each
-    // hop's required input becomes the previous hop's demanded output.
+    // Reverse pass: thread the demanded NET output back to the source input.
+    // The last pool must provide the gross amount when its issuer charges a
+    // transfer fee; likewise the source pays gross for the first pool's net
+    // input when neither side is the issuer.
     let mut ins: Vec<Number> = vec![Number::ZERO; n - 1];
     let mut outs: Vec<Number> = vec![Number::ZERO; n - 1];
-    let mut out_num = leg_to_number(target_out);
+    let last = &hops[n - 2];
+    let last_fee_applies = !last.out_xrp && last.out_iss != last.pool_id && last.out_iss != *dest;
+    let mut pool_target = target_out.clone();
+    if last_fee_applies {
+        pool_target.iou = grossed(&pool_target.iou, &transfer_rate(ctx, &last.out_iss));
+    }
+    let mut out_num = leg_to_number(&pool_target);
     for h in (0..(n - 1)).rev() {
         let hop = &hops[h];
         let in_num = match crate::amm_helpers::swap_asset_out(
@@ -3415,13 +3410,66 @@ fn reverse_amm_strand(
         out_num = in_num;
     }
 
-    // Output binds only when the required source input fits the budget; a larger
-    // requirement means the strand is input-limited (forward flow handles it).
-    // Compare at the Leg grid (drops / IOU mantissa) rather than via `Number`
-    // subtraction, which panics on an exact-zero difference (in == budget).
-    let in0_leg = number_to_leg(&ins[0], budget);
-    if !leg_ge(budget, &in0_leg) {
-        return Ok(None);
+    let first = &hops[0];
+    let first_fee_applies =
+        !first.in_xrp && first.in_iss != *taker && first.in_iss != first.pool_id;
+    let mut source_spent = number_to_leg(&ins[0], budget);
+    if first_fee_applies {
+        source_spent.iou = grossed(&source_spent.iou, &transfer_rate(ctx, &first.in_iss));
+    }
+
+    // If the requested output does not fit the gross SendMax, run the pure-AMM
+    // strand forward from the whole input budget. The first pool receives the
+    // net-of-transfer-fee input and the destination receives the last pool's
+    // gross output net of its transfer fee.
+    if !leg_ge(budget, &source_spent) {
+        let mut pool_input = budget.clone();
+        if first_fee_applies {
+            let rate = transfer_rate(ctx, &first.in_iss);
+            pool_input.iou =
+                IOUAmount::div_round(&pool_input.iou, &rate, false).unwrap_or(pool_input.iou);
+        }
+        let mut current = leg_to_number(&pool_input);
+        for h in 0..(n - 1) {
+            let hop = &hops[h];
+            ins[h] = current;
+            let out = crate::amm_helpers::swap_asset_in(
+                &hop.pool_in,
+                &hop.pool_out,
+                &current,
+                hop.tfee,
+                hop.out_xrp,
+            );
+            if out.is_zero() || out.negative() {
+                return Ok(None);
+            }
+            outs[h] = out;
+            current = out;
+        }
+        source_spent = number_to_leg(&ins[0], budget);
+        if first_fee_applies {
+            source_spent.iou = grossed(&source_spent.iou, &transfer_rate(ctx, &first.in_iss));
+        }
+    }
+
+    // A coexisting CLOB only wins when its best page is at least as good as the
+    // realised AMM quote for that hop. Otherwise the reverse AMM strand remains
+    // the exact route and no Offer node is touched.
+    for (h, hop) in hops.iter().enumerate() {
+        if let Some(book_quality) = hop.best_book_quality {
+            let Some(amm_quality) = rxrpl_amount::get_rate(
+                &num_quality_iou(&ins[h], hop.in_xrp),
+                &num_quality_iou(&outs[h], hop.out_xrp),
+            )
+            .ok() else {
+                return Ok(None);
+            };
+            if !rxrpl_amount::is_better_quality(amm_quality, book_quality)
+                || rxrpl_amount::within_relative_distance(amm_quality, book_quality)
+            {
+                return Ok(None);
+            }
+        }
     }
 
     // Apply each hop with its exact reverse-computed (in, out): the first hop
@@ -3442,11 +3490,18 @@ fn reverse_amm_strand(
         )?;
     }
 
-    let spent_leg = number_to_leg(&ins[0], budget);
-    let delivered_leg = number_to_leg(&outs[n - 2], target_out);
+    let mut delivered_leg = number_to_leg(&outs[n - 2], target_out);
+    if last_fee_applies {
+        delivered_leg.iou = IOUAmount::div_round(
+            &delivered_leg.iou,
+            &transfer_rate(ctx, &last.out_iss),
+            false,
+        )
+        .unwrap_or(delivered_leg.iou);
+    }
     Ok(Some((
         delivered_leg.with_amount(&delivered_leg.iou, delivered_leg.drops),
-        spent_leg.with_amount(&spent_leg.iou, spent_leg.drops),
+        source_spent.with_amount(&source_spent.iou, source_spent.drops),
     )))
 }
 
@@ -3721,6 +3776,7 @@ fn hop_amm_snapshot(ctx: &ApplyContext<'_>, hop: &FlowHop) -> Option<(AmmHop, Nu
         tfee: hop.amm_tfee,
         pool_in,
         pool_out,
+        best_book_quality: None,
     };
     Some((amm_hop, pool_in, pool_out))
 }
@@ -3937,7 +3993,7 @@ fn execute_strand_pass(
                 // Conservation: an interior hop takes exactly what the previous hop
                 // delivered (`carry`); otherwise the intermediate does not balance.
                 let in_num = if is_first { in_num } else { carry };
-                apply_amm_move(
+                let actual_out = apply_amm_move(
                     ctx, taker, taker_acct, dest, amm, &in_num, &out_num,
                     /*skip_input_debit=*/ !is_first, /*skip_output_credit=*/ !is_last,
                 )
@@ -3954,7 +4010,7 @@ fn execute_strand_pass(
                 if is_first {
                     source_in = in_num;
                 }
-                carry = out_num;
+                carry = actual_out;
             }
             HopKindR::Clob => {
                 // Drive the CLOB band: at/below the limiting step deliver the
