@@ -3163,8 +3163,13 @@ fn reverse_clob_amounts(
         let in_tmpl = Leg::parse(&boundaries[hop])?;
         let out_tmpl = Leg::parse(&boundaries[hop + 1])?;
         let Some(q) = peek_best_book_quality(ctx.view, &in_tmpl, &out_tmpl) else {
-            amts.insert(0, amts[0].clone());
-            continue;
+            // A CLOB reverse quote is only valid when every amount is priced in
+            // the asset of its boundary. Copying the downstream amount across
+            // a missing book preserves its magnitude but not its issue (for
+            // example XRP becomes a zero-valued IOU), which can incorrectly
+            // replace the source budget. Let the forward flow price AMM-only
+            // and mixed-liquidity strands instead.
+            return None;
         };
         let rate = rxrpl_amount::from_rate(q).ok()?;
         if rate.is_zero() {
