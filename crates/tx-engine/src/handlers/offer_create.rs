@@ -4574,13 +4574,12 @@ fn reap_unfunded_on_page(
             continue;
         };
         let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
-        let expired = offer
-            .get("Expiration")
-            .and_then(|v| v.as_u64())
-            .is_some_and(|exp| exp <= ctx.view.parent_close_time() as u64);
         let funds = owner_funds_leg(ctx, &owner, &offer_out);
-        if expired
-            || offer_out.is_zero()
+        // Past the taker's quality threshold, rippled may advance far enough to
+        // remove unfunded tips but does not visit otherwise funded expired
+        // offers. Expiration is reaped only on a quality page the taker can
+        // actually enter (the normal book walk above).
+        if offer_out.is_zero()
             || offer_in.is_zero()
             || is_deep_frozen(ctx, &owner, &offer_in)
             || offer_cannot_pay(&funds, &offer_out, flags, &owner == taker)
@@ -7920,6 +7919,83 @@ mod flow_cross_own_unfunded {
         assert!(
             sandbox.read(&keylet::offer(&taker_id, 1)).is_none(),
             "seq 1 sell offer deleted"
+        );
+    }
+
+    #[test]
+    fn expired_offer_past_quality_threshold_is_not_reaped() {
+        let mut ledger = Ledger::genesis();
+        let taker_id = decode_account_id(TAKER).unwrap();
+        let iss_id = decode_account_id(ISS).unwrap();
+        for (addr, drops) in [(ISS, "10000000000"), (TAKER, "10000000000")] {
+            let id = decode_account_id(addr).unwrap();
+            let acct = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": addr,
+                "Balance": drops, "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&acct).unwrap())
+                .unwrap();
+        }
+        let usd = helpers::currency_to_bytes("USD");
+        let holder_is_low = taker_id.as_bytes() < iss_id.as_bytes();
+        let (low, high) = if holder_is_low {
+            (TAKER, ISS)
+        } else {
+            (ISS, TAKER)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": ISS, "value": "0"},
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "2000"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "2000"},
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&taker_id, &iss_id, &usd),
+                serde_json::to_vec(&tl).unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": ISS, "Fee": "10",
+                    "Sequence": 1, "TakerGets": {"currency": "USD", "issuer": ISS, "value": "324.134308"},
+                    "TakerPays": "292000000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        let maker_offer = keylet::offer(&iss_id, 1);
+        let mut expired: Value =
+            serde_json::from_slice(&sandbox.read(&maker_offer).unwrap()).unwrap();
+        expired["Expiration"] = Value::from(0u64);
+        sandbox
+            .update(maker_offer, serde_json::to_vec(&expired).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER, "Fee": "10",
+                    "Sequence": 1, "TakerGets": "910000000",
+                    "TakerPays": {"currency": "USD", "issuer": ISS, "value": "1045.044"},
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert!(
+            sandbox.read(&maker_offer).is_some(),
+            "expired offer beyond the taker's quality must remain untouched"
         );
     }
 
