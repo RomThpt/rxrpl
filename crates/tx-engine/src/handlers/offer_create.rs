@@ -890,6 +890,18 @@ fn transfer_rate(ctx: &ApplyContext<'_>, issuer: &AccountId) -> IOUAmount {
     }
 }
 
+fn add_iou_balance(
+    balance: &IOUAmount,
+    delta: &IOUAmount,
+    number_switchover: bool,
+) -> Result<IOUAmount, rxrpl_amount::AmountError> {
+    if number_switchover {
+        IOUAmount::add_round(balance, delta)
+    } else {
+        IOUAmount::add(balance, delta)
+    }
+}
+
 /// Apply a signed IOU change to a holder's trust line toward `issuer`.
 /// `gain` > 0 credits the holder, < 0 debits. Balance is stored from the low
 /// account's perspective, so a high-account holder's balance moves opposite to
@@ -917,12 +929,8 @@ fn credit_line(
     let delta = if holder_is_high { gain.negate() } else { *gain };
     // Legacy crossing (pre-Number 2013 ledgers) truncates the smaller term;
     // modern Flow conversions round to nearest. See [`IOUAmount::add_round`].
-    let new = if round {
-        IOUAmount::add_round(&balance, &delta)
-    } else {
-        IOUAmount::add(&balance, &delta)
-    }
-    .map_err(|_| TransactionResult::TefInternal)?;
+    let new =
+        add_iou_balance(&balance, &delta, round).map_err(|_| TransactionResult::TefInternal)?;
     line["Balance"]["value"] = Value::String(new.to_decimal_string());
     let nb = serde_json::to_vec(&line).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view
@@ -2171,7 +2179,7 @@ fn cross_book_hop(
                 } else {
                     credit
                 };
-                if let Ok(expected) = IOUAmount::add(&before, &delta) {
+                if let Ok(expected) = add_iou_balance(&before, &delta, number_switchover) {
                     if let Some(bytes) = ctx.view.read(&dest_line_key) {
                         if let Ok(mut line) = serde_json::from_slice::<Value>(&bytes) {
                             line["Balance"]["value"] = Value::String(expected.to_decimal_string());
@@ -6254,10 +6262,10 @@ fn taker_cross(
 #[cfg(test)]
 mod taker_crossing_tests {
     use super::{
-        Leg, TakerCrossType, composed_quality, flow_iou_to_iou, flow_iou_to_xrp, flow_xrp_to_iou,
-        in_for_out, leftover_is_dust, leftover_leg, leg_gt, leg_max, pack_rate, parity_rate,
-        qual_div, qual_mul, reject_quality, remaining_is_filled, remaining_is_filled_at,
-        remaining_offer, select_path, sell_clamp_sub,
+        Leg, TakerCrossType, add_iou_balance, composed_quality, flow_iou_to_iou, flow_iou_to_xrp,
+        flow_xrp_to_iou, in_for_out, leftover_is_dust, leftover_leg, leg_gt, leg_max, pack_rate,
+        parity_rate, qual_div, qual_mul, reject_quality, remaining_is_filled,
+        remaining_is_filled_at, remaining_offer, select_path, sell_clamp_sub,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, offer_quality};
     use rxrpl_primitives::AccountId;
@@ -6292,6 +6300,25 @@ mod taker_crossing_tests {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn ledger_105500002_destination_balance_uses_number_rounding() {
+        let before = IOUAmount::from_decimal_string("-2178.562819378854").unwrap();
+        let delta = IOUAmount::from_decimal_string("-0.004283181667522685").unwrap();
+
+        assert_eq!(
+            add_iou_balance(&before, &delta, false)
+                .unwrap()
+                .to_decimal_string(),
+            "-2178.567102560521"
+        );
+        assert_eq!(
+            add_iou_balance(&before, &delta, true)
+                .unwrap()
+                .to_decimal_string(),
+            "-2178.567102560522"
+        );
     }
 
     #[test]

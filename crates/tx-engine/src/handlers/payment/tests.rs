@@ -746,6 +746,42 @@ fn apply_paths_payment_direct_step_then_xrp_book() {
     assert!(sandbox.read(&keylet::offer(&mm_id, 1)).is_none());
 }
 
+#[test]
+fn apply_paths_payment_zero_delivery_is_path_dry() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, ALICE, "50000000", None);
+    put_trust_line(&mut ledger, ALICE, ISSUER, "LOVE", 0.0);
+
+    for flags in [0, 0x0003_0000] {
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": ALICE,
+            "Amount": iou("LOVE", ISSUER, "3601.49539897054"),
+            "DeliverMin": iou("LOVE", ISSUER, "3243.26655209549"),
+            "SendMax": "1514",
+            "Flags": flags,
+            "Paths": [[{ "currency": "JOY", "issuer": ISSUER }]],
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            PaymentTransactor.apply(&mut ctx),
+            Err(TransactionResult::TecPathDry)
+        );
+    }
+}
+
 // -- multi-hop walker --
 //
 // A USD→EUR→GBP payment with no direct USD/GBP book walks two book
@@ -2068,11 +2104,11 @@ fn apply_cross_currency_book_then_amm_combined() {
 }
 
 /// When no AMM is registered for the pair and the book is empty, the
-/// strand fails `TecPathPartial` — the AMM lookup is a pure read with
-/// no side effects, so absent AMM falls through to the existing
-/// insufficient-liquidity error path.
+/// strand falls through to the direct book unless `tfNoRippleDirect`
+/// explicitly forbids that fallback. A dry explicit path is `tecPATH_DRY`
+/// in the latter case (mainnet ledger 105500002, transaction 0ED7975F).
 #[test]
-fn apply_cross_currency_no_amm_no_book_fails_path_partial() {
+fn apply_cross_currency_no_amm_no_book_honors_no_ripple_direct() {
     let mut ledger = Ledger::genesis();
     put_account(&mut ledger, ISSUER, "100000000", None);
     put_account(&mut ledger, ALICE, "50000000", None);
@@ -2081,27 +2117,36 @@ fn apply_cross_currency_no_amm_no_book_fails_path_partial() {
     put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
     put_trust_line(&mut ledger, BOB, ISSUER, "GBP", 0.0);
 
-    let fees = FeeSettings::default();
-    let view = LedgerView::with_fees(&ledger, fees.clone());
-    let mut sandbox = Sandbox::new(&view);
-    let tx = serde_json::json!({
-        "TransactionType": "Payment",
-        "Account": ALICE,
-        "Destination": BOB,
-        "Amount": iou("GBP", ISSUER, "10"),
-        "SendMax": iou("USD", ISSUER, "20"),
-        "Paths": [[ { "currency": "GBP", "issuer": ISSUER, "type": 0x30 } ]],
-        "Fee": "10",
-    });
-    let rules = Rules::new();
-    let mut ctx = ApplyContext {
-        tx: &tx,
-        view: &mut sandbox,
-        rules: &rules,
-        fees: &fees,
-    };
-    let result = PaymentTransactor.apply(&mut ctx);
-    assert_eq!(result, Err(TransactionResult::TecPathPartial));
+    for (flags, expected) in [
+        (0, TransactionResult::TecPathPartial),
+        (
+            rxrpl_protocol::flags::payment::TF_NO_RIPPLE_DIRECT,
+            TransactionResult::TecPathDry,
+        ),
+    ] {
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("GBP", ISSUER, "10"),
+            "SendMax": iou("USD", ISSUER, "20"),
+            "Paths": [[ { "currency": "GBP", "issuer": ISSUER, "type": 0x30 } ]],
+            "Flags": flags,
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let result = PaymentTransactor.apply(&mut ctx);
+        assert_eq!(result, Err(expected));
+    }
 }
 
 /// Partial payment through an AMM-only strand when SendMax cannot cover the

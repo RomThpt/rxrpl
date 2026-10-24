@@ -1001,11 +1001,7 @@ fn apply_paths_payment(
         }
     }
     let Some(delivered) = delivered else {
-        return Err(if limit_quality {
-            TransactionResult::TecPathDry
-        } else {
-            TransactionResult::TecPathPartial
-        });
+        return Err(TransactionResult::TecPathDry);
     };
 
     // A path that delivers exactly zero is dry (tecPATH_DRY), even under
@@ -1789,6 +1785,9 @@ fn apply_cross_currency(
         }
         if let Some(plan) = best {
             return commit_n_hop_plan(ctx, plan);
+        }
+        if helpers::get_flags(ctx.tx) & rxrpl_protocol::flags::payment::TF_NO_RIPPLE_DIRECT != 0 {
+            return Err(TransactionResult::TecPathDry);
         }
     }
     let (dst_cur, dst_iss, dst_val) = amount;
