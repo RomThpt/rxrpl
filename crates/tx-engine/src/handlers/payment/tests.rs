@@ -2134,6 +2134,89 @@ fn apply_cross_currency_book_then_amm_combined() {
     assert_eq!(new_gbp, 990);
 }
 
+/// A two-hop CLOB -> AMM strand must reverse-price the terminal pool before
+/// crossing the prefix book. Spending the whole SendMax in the first hop would
+/// leave surplus EUR after the AMM reaches the requested GBP amount and make
+/// the strand fail its interior-balance invariant.
+#[test]
+fn apply_two_hop_clob_then_amm_reverse_prices_prefix() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, ALICE, "50000000", None);
+    put_account(&mut ledger, BOB, "50000000", None);
+    put_account(&mut ledger, MM, "50000000", None);
+
+    put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+    put_trust_line(&mut ledger, BOB, ISSUER, "GBP", 0.0);
+    put_trust_line(&mut ledger, MM, ISSUER, "USD", 0.0);
+    put_trust_line(&mut ledger, MM, ISSUER, "EUR", 100.0);
+
+    // The maker can absorb the full 100 USD SendMax at 1:1, but the terminal
+    // 1000/1000 EUR/GBP pool needs only ~52.63 EUR to deliver 50 GBP.
+    let mm_id = decode_account_id(MM).unwrap();
+    let mm_offer = keylet::offer(&mm_id, 1);
+    ledger
+        .put_state(
+            mm_offer,
+            serde_json::to_vec(&serde_json::json!({
+                "LedgerEntryType": "Offer",
+                "Account": MM,
+                "Sequence": 1,
+                "TakerPays": iou("USD", ISSUER, "100"),
+                "TakerGets": iou("EUR", ISSUER, "100"),
+                "Flags": 0,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let usd = helpers::currency_to_bytes("USD");
+    let eur = helpers::currency_to_bytes("EUR");
+    let issuer_id = decode_account_id(ISSUER).unwrap();
+    let usd_eur_book = keylet::book_dir(&usd, &issuer_id, &eur, &issuer_id);
+    ledger
+        .put_state(
+            usd_eur_book,
+            serde_json::to_vec(&serde_json::json!({
+                "LedgerEntryType": "DirectoryNode",
+                "Indexes": [mm_offer.to_string()],
+                "IndexNext": 0,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+    put_amm(&mut ledger, "EUR", ISSUER, "GBP", ISSUER, 1000, 1000, 0);
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": BOB,
+        "Amount": iou("GBP", ISSUER, "50"),
+        "SendMax": iou("USD", ISSUER, "100"),
+        "Paths": [[ { "currency": "EUR", "issuer": ISSUER, "type": 0x30 } ]],
+        "Flags": rxrpl_protocol::flags::payment::TF_NO_RIPPLE_DIRECT,
+        "Fee": "10",
+    });
+    let rules = Rules::new();
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    let result = PaymentTransactor.apply(&mut ctx).unwrap();
+    assert_eq!(result, TransactionResult::TesSuccess);
+
+    assert!((holder_balance(&sandbox, BOB, ISSUER, "GBP") - 50.0).abs() < 1e-6);
+    let maker_usd = holder_balance(&sandbox, MM, ISSUER, "USD");
+    let maker_eur = holder_balance(&sandbox, MM, ISSUER, "EUR");
+    assert!((52.0..53.0).contains(&maker_usd), "maker USD {maker_usd}");
+    assert!((47.0..48.0).contains(&maker_eur), "maker EUR {maker_eur}");
+}
+
 /// When no AMM is registered for the pair and the book is empty, the
 /// strand falls through to the direct book unless `tfNoRippleDirect`
 /// explicitly forbids that fallback. A dry explicit path is `tecPATH_DRY`

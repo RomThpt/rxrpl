@@ -1476,6 +1476,7 @@ fn try_amm_step(
         /*skip_output_credit=*/ false,
         /*create_missing_dest_line=*/ true,
         /*partial=*/ amm_offer_allows_partial_output(fok, is_sell),
+        /*reverse_output_limited=*/ false,
         /*target_quality=*/ Some(cq),
         cap_ending_spot_price,
     )? {
@@ -1884,6 +1885,7 @@ fn cross_book_hop(
                     skip_output_credit,
                     /*create_missing_dest_line=*/ true,
                     /*partial=*/ true,
+                    /*reverse_output_limited=*/ false,
                     /*target_quality=*/ Some(dir_quality),
                     /*cap_ending_spot_price=*/ true,
                 )? {
@@ -2448,7 +2450,11 @@ pub(crate) fn cross_path_payment(
         }
     }
 
-    let reverse_amts = reverse_clob_amounts(ctx, dest, boundaries, &final_demand, limit_q);
+    let reverse_mixed =
+        reverse_clob_then_amm_amounts(ctx, taker, dest, boundaries, &final_demand, limit_q);
+    let terminal_reverse_amm = reverse_mixed.is_some();
+    let reverse_amts = reverse_mixed
+        .or_else(|| reverse_clob_amounts(ctx, dest, boundaries, &final_demand, limit_q));
     if let Some(ref amts) = reverse_amts {
         if amts.len() == n && leg_ge(&carry, &amts[0]) {
             carry = amts[0].clone();
@@ -2556,6 +2562,7 @@ pub(crate) fn cross_path_payment(
                 /*skip_output_credit=*/ !is_last,
                 /*create_missing_dest_line=*/ false,
                 /*partial=*/ true,
+                terminal_reverse_amm && is_last,
                 /*target_quality=*/ None,
                 /*cap_ending_spot_price=*/ false,
             )? {
@@ -2880,6 +2887,7 @@ fn amm_hop(
     skip_output_credit: bool,
     create_missing_dest_line: bool,
     partial: bool,
+    reverse_output_limited: bool,
     target_quality: Option<u64>,
     cap_ending_spot_price: bool,
 ) -> Result<Option<(Leg, Leg)>, TransactionResult> {
@@ -3003,7 +3011,9 @@ fn amm_hop(
     } else {
         crate::amm_helpers::swap_asset_in(&pool_in, &pool_out, &capped_budget, tfee, out_xrp)
     };
-    let (spent_num, deliver_num) = if !partial {
+    let (spent_num, deliver_num) = if reverse_output_limited {
+        (capped_budget, demand_num)
+    } else if !partial {
         match crate::amm_helpers::swap_asset_out(&pool_in, &pool_out, &demand_num, tfee, in_xrp) {
             Some(needed) if num_le(&needed, &capped_budget) => (needed, demand_num),
             _ => return Ok(None),
@@ -3267,7 +3277,7 @@ fn reverse_clob_amounts(
     limit_q: u64,
 ) -> Option<Vec<Leg>> {
     let n = boundaries.len();
-    if n < 3 {
+    if n < 2 {
         return None;
     }
     // Cap dest demand at last-hop book size so a PartialPayment Amount larger
@@ -3483,6 +3493,99 @@ fn reverse_clob_amounts(
         amts.insert(0, in_need);
     }
     (amts.len() == n).then_some(amts)
+}
+
+/// Reverse-price a mixed strand whose final hop is AMM-only and whose prefix
+/// is carried by order books. The AMM input is computed first, then grossed by
+/// the intermediate issuer's transfer rate before the CLOB prefix is priced.
+/// This prevents the forward pass from consuming the whole SendMax in the
+/// prefix and stranding an interior remainder once the AMM reaches Amount.
+fn reverse_clob_then_amm_amounts(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    dest: &AccountId,
+    boundaries: &[Value],
+    target_out: &Leg,
+    limit_q: u64,
+) -> Option<Vec<Leg>> {
+    let n = boundaries.len();
+    if n < 3 {
+        return None;
+    }
+    let amm_hop = n - 2;
+
+    // Keep this planner deliberately narrow: every prefix hop must have a
+    // resting book and the terminal hop must be AMM-only. Other mixtures keep
+    // using the existing forward liquidity interleaving.
+    for h in 0..amm_hop {
+        let input = Leg::parse(&boundaries[h])?;
+        let output = Leg::parse(&boundaries[h + 1])?;
+        peek_best_book_quality(ctx.view, &input, &output)?;
+    }
+    let amm_in = Leg::parse(&boundaries[amm_hop])?;
+    let amm_out = Leg::parse(&boundaries[amm_hop + 1])?;
+    if peek_best_book_quality(ctx.view, &amm_in, &amm_out).is_some() {
+        return None;
+    }
+
+    let amm_key = keylet::amm(
+        &amm_in.currency,
+        &amm_in.issuer,
+        &amm_out.currency,
+        &amm_out.issuer,
+    );
+    let amm: Value = serde_json::from_slice(&ctx.view.read(&amm_key)?).ok()?;
+    let pool_id = decode_account_id(amm.get("Account")?.as_str()?).ok()?;
+    let tfee = amm.get("TradingFee").and_then(Value::as_u64).unwrap_or(0) as u16;
+    let pool_in = pool_balance_number(
+        ctx,
+        &pool_id,
+        amm_in.is_xrp,
+        &amm_in.currency,
+        &amm_in.issuer,
+    );
+    let pool_out = pool_balance_number(
+        ctx,
+        &pool_id,
+        amm_out.is_xrp,
+        &amm_out.currency,
+        &amm_out.issuer,
+    );
+    if pool_in.is_zero() || pool_out.is_zero() {
+        return None;
+    }
+
+    let mut pool_target = target_out.clone();
+    if !amm_out.is_xrp && amm_out.issuer != pool_id && amm_out.issuer != *dest {
+        pool_target.iou = grossed(&pool_target.iou, &transfer_rate(ctx, &amm_out.issuer));
+    }
+    let required_in = crate::amm_helpers::swap_asset_out(
+        &pool_in,
+        &pool_out,
+        &leg_to_number(&pool_target),
+        tfee,
+        amm_in.is_xrp,
+    )?;
+    if required_in.is_zero() || required_in.negative() {
+        return None;
+    }
+    let mut prefix_target = number_to_leg(&required_in, &amm_in);
+    if !amm_in.is_xrp && amm_in.issuer != *taker && amm_in.issuer != *dest {
+        prefix_target.iou = grossed(&prefix_target.iou, &transfer_rate(ctx, &amm_in.issuer));
+    }
+
+    // Treat the intermediate issuer as the prefix destination: its transfer
+    // fee was already applied above and must not be charged a second time by
+    // the CLOB reverse-pricer's terminal-delivery logic.
+    let mut amounts = reverse_clob_amounts(
+        ctx,
+        &amm_in.issuer,
+        &boundaries[..=amm_hop],
+        &prefix_target,
+        limit_q,
+    )?;
+    amounts.push(target_out.clone());
+    (amounts.len() == n).then_some(amounts)
 }
 
 fn reverse_amm_strand(
