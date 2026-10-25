@@ -1267,8 +1267,7 @@ fn cross_offers(
                     // (offer_in * avail_out / offer_out, floored to drops) — the
                     // same scale-down the multi-hop book path uses. Repricing the
                     // clamped output at the book's quantized rate ceils a drop high
-                    // and over-charges the taker (105500121/122). An IOU take keeps
-                    // the offer-amounts ceil price (105600000).
+                    // and over-charges the taker (105500121/122).
                     let ratio = IOUAmount::divide(
                         &leg_as_quality_iou(&avail_out),
                         &leg_as_quality_iou(&offer_out),
@@ -1278,14 +1277,12 @@ fn cross_offers(
                         .unwrap_or(IOUAmount::ZERO);
                     leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in)
                 } else {
-                    // Funds-limited IOU take (took all the underfunded owner can
-                    // give): price from the offer's own amounts, since repricing the
-                    // clamped output at the quantized quality rate ceils one drop
-                    // high and cascades through the taker's remaining budget.
-                    leg_min(
-                        &in_for_out_offer(&offer_in, &take_out, &offer_out, &rate),
-                        &offer_in,
-                    )
+                    // Funds-limited IOU take: BasicTaker's `qual_mul` uses the
+                    // canonical quality multiplication (nearest), not the strict
+                    // demand-side ceil. Ceil prices BA71A68E one input ULP high
+                    // (52.38814400000006 vs rippled's ...005), which survives in
+                    // the DeletedNode residue even though the ledger state agrees.
+                    qual_mul(&take_out, &rate, &offer_in)
                 };
                 (take_out.clone(), order_in)
             };
@@ -6384,6 +6381,26 @@ mod taker_crossing_tests {
                 .unwrap()
                 .to_decimal_string(),
             "-2178.567102560522"
+        );
+    }
+
+    #[test]
+    fn ledger_105500053_funds_limited_iou_uses_nearest_quality() {
+        let offer_in = iou("52.3881452157");
+        let take_out = iou("10.15254433053624");
+        let rate = from_rate(0x5512_5515_6781_6800).unwrap();
+
+        assert_eq!(
+            qual_mul(&take_out, &rate, &offer_in)
+                .iou
+                .to_decimal_string(),
+            "52.38814400000005"
+        );
+        assert_eq!(
+            in_for_out(&take_out, &rate, &offer_in)
+                .iou
+                .to_decimal_string(),
+            "52.38814400000006"
         );
     }
 
