@@ -1953,6 +1953,14 @@ fn cross_book_hop(
             let Some(offer_in) = Leg::parse(&offer["TakerPays"]) else {
                 continue;
             };
+            if offer
+                .get("Expiration")
+                .and_then(|v| v.as_u64())
+                .is_some_and(|exp| exp <= ctx.view.parent_close_time() as u64)
+            {
+                reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                continue;
+            }
             let funds = owner_funds_leg(ctx, &owner, &offer_out);
             if funds.is_zero() {
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
@@ -5041,7 +5049,7 @@ fn reap_walk_offer(
     Ok(())
 }
 
-fn reap_offer(
+pub(crate) fn reap_offer(
     ctx: &mut ApplyContext<'_>,
     owner: &AccountId,
     offer_key: &rxrpl_primitives::Hash256,

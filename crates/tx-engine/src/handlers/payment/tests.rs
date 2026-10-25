@@ -2050,6 +2050,64 @@ fn apply_cross_currency_amm_only_strand_succeeds() {
     assert!((1052..=1053).contains(&new_usd));
 }
 
+#[test]
+fn amm_quality_gate_reaps_expired_tip_offer() {
+    let mut ledger = Ledger::genesis();
+    ledger.header.parent_close_time = 100;
+    put_account(&mut ledger, ALICE, "50000000", None);
+    put_account(&mut ledger, MM, "50000000", None);
+
+    let alice_id = decode_account_id(ALICE).unwrap();
+    let mm_id = decode_account_id(MM).unwrap();
+    let issuer_id = decode_account_id(ISSUER).unwrap();
+    let xrp = [0u8; 20];
+    let zero = rxrpl_primitives::AccountId::from([0u8; 20]);
+    let gbp = helpers::currency_to_bytes("GBP");
+    let book = keylet::book_dir(&xrp, &zero, &gbp, &issuer_id);
+    let quality_dir = crate::handlers::offer_create::book_dir_with_quality(&book, 1);
+    let offer_key = keylet::offer(&mm_id, 1);
+
+    let offer = serde_json::json!({
+        "LedgerEntryType": "Offer",
+        "Account": MM,
+        "Sequence": 1,
+        "TakerPays": "100",
+        "TakerGets": iou("GBP", ISSUER, "1"),
+        "Expiration": 100,
+        "Flags": 0,
+    });
+    ledger
+        .put_state(offer_key, serde_json::to_vec(&offer).unwrap())
+        .unwrap();
+    let dir = serde_json::json!({
+        "LedgerEntryType": "DirectoryNode",
+        "Indexes": [offer_key.to_string()],
+        "IndexNext": 0,
+    });
+    ledger
+        .put_state(quality_dir, serde_json::to_vec(&dir).unwrap())
+        .unwrap();
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+    let tx = serde_json::json!({});
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+
+    assert_eq!(
+        best_book_dir_quality(&mut ctx, &alice_id, &xrp, &zero, &gbp, &issuer_id, false),
+        Ok(None)
+    );
+    assert!(ctx.view.read(&offer_key).is_none());
+    assert!(ctx.view.read(&quality_dir).is_none());
+}
+
 /// A book that satisfies part of the target leaves the remainder to
 /// the AMM. The MM offer sells 20 GBP for 20 USD; the strand needs
 /// 30 GBP total, so 10 GBP comes from the constant-product pool.

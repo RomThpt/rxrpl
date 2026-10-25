@@ -1485,7 +1485,7 @@ fn best_book_dir_quality(
     out_cur: &[u8; 20],
     out_iss: &rxrpl_primitives::AccountId,
     out_xrp: bool,
-) -> Option<u64> {
+) -> Result<Option<u64>, TransactionResult> {
     let book = keylet::book_dir(in_cur, in_iss, out_cur, out_iss);
     let book_prefix = book.as_bytes()[0..24].to_vec();
     let mut probe = crate::handlers::offer_create::book_dir_with_quality(&book, 0);
@@ -1530,6 +1530,14 @@ fn best_book_dir_quality(
             if &owner == taker {
                 continue;
             }
+            if entry
+                .get("Expiration")
+                .and_then(|v| v.as_u64())
+                .is_some_and(|exp| exp <= ctx.view.parent_close_time() as u64)
+            {
+                crate::handlers::offer_create::reap_offer(ctx, &owner, &h, &dir_key)?;
+                continue;
+            }
             let funded = if out_xrp {
                 ctx.view
                     .read(&keylet::account(&owner))
@@ -1543,10 +1551,10 @@ fn best_book_dir_quality(
             if !funded {
                 continue;
             }
-            return Some(dir_quality);
+            return Ok(Some(dir_quality));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Mirrors rippled's single-path AMM offer in a `BookStep`: the delivered/spent
@@ -1610,7 +1618,7 @@ fn try_amm_conversion(
     // spot must be fee-adjusted — the taker pays the trading fee on the input, so
     // the effective in/out is spot / (1 - fee) — matching `amm_hop`'s band gate.
     if let Some(cq) =
-        best_book_dir_quality(ctx, user_id, &in_cur, &in_iss, &out_cur, &out_iss, out_xrp)
+        best_book_dir_quality(ctx, user_id, &in_cur, &in_iss, &out_cur, &out_iss, out_xrp)?
     {
         let q_iou = |n: &Number, is_xrp: bool| {
             if is_xrp {
