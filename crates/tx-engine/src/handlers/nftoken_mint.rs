@@ -8,6 +8,12 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext, Transac
 
 pub struct NFTokenMintTransactor;
 
+fn blob_byte_len(field: &str) -> usize {
+    hex::decode(field)
+        .map(|bytes| bytes.len())
+        .unwrap_or(field.len())
+}
+
 impl Transactor for NFTokenMintTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
         // NFTokenTaxon must be present
@@ -22,9 +28,10 @@ impl Transactor for NFTokenMintTransactor {
             }
         }
 
-        // URI length <= 256 if present
+        // URI is a serialized Blob represented as hex in transaction JSON.
+        // The protocol limit applies to the decoded bytes, not hex characters.
         if let Some(uri) = helpers::get_str_field(ctx.tx, "URI") {
-            if uri.len() > 256 {
+            if blob_byte_len(uri) > 256 {
                 return Err(TransactionResult::TemMalformed);
             }
         }
@@ -462,6 +469,45 @@ mod tests {
         });
         let rules = Rules::new();
         let fees = FeeSettings::default();
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            NFTokenMintTransactor.preflight(&ctx),
+            Err(TransactionResult::TemMalformed)
+        );
+    }
+
+    #[test]
+    fn uri_limit_counts_decoded_blob_bytes() {
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+
+        let max_uri = "AB".repeat(256);
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenMint",
+            "Account": MINTER,
+            "NFTokenTaxon": 0,
+            "URI": max_uri,
+            "Fee": "12",
+        });
+        let ctx = PreflightContext {
+            tx: &tx,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(NFTokenMintTransactor.preflight(&ctx), Ok(()));
+
+        let oversized_uri = "AB".repeat(257);
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenMint",
+            "Account": MINTER,
+            "NFTokenTaxon": 0,
+            "URI": oversized_uri,
+            "Fee": "12",
+        });
         let ctx = PreflightContext {
             tx: &tx,
             rules: &rules,
