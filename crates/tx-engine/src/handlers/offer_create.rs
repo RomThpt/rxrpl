@@ -1092,14 +1092,11 @@ fn cross_offers(
         probe = dir_key;
         let dir_quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
         if dir_quality > threshold {
-            // Taker OfferStream still advances to the next fundable tip past
-            // the threshold, reaping unfunded (including short lsfSell) on the
-            // way, then reject_quality stops. FlowCross used to break here and
-            // left 30000048's own underfunded BTC sell in the book.
-            if reap_unfunded_on_page(ctx, taker, taker_acct, &dir_key)? {
-                break;
-            }
-            continue;
+            // Quality rejection happens before dereferencing the page's offers.
+            // In particular, unfunded third-party offers beyond the taker's
+            // limit remain untouched (105500120). The taker's own unfunded tip
+            // is handled separately by `reap_own_unfunded_inverse_tip`.
+            break;
         }
         // Interleave the AMM at this quality band BEFORE the resting CLOB offers.
         // rippled crosses whichever of the synthetic AMM offer / CLOB tip is
@@ -4806,70 +4803,6 @@ fn grossed(amount: &IOUAmount, rate: &IOUAmount) -> IOUAmount {
         Ok(rxrpl_amount::Amount::Iou(v)) => v,
         _ => *amount,
     }
-}
-
-/// Remove an offer: owner dir, its quality book dir, erase the SLE, decrement
-/// OwnerCount. `book_dir` is the offer's own `BookDirectory` (the quality
-/// directory it lives in), not the book base.
-fn reap_unfunded_on_page(
-    ctx: &mut ApplyContext<'_>,
-    taker: &AccountId,
-    taker_acct: &mut Value,
-    dir_key: &rxrpl_primitives::Hash256,
-) -> Result<bool, TransactionResult> {
-    let Some(dir_bytes) = ctx.view.read(dir_key) else {
-        return Ok(false);
-    };
-    let Ok(dir) = serde_json::from_slice::<Value>(&dir_bytes) else {
-        return Ok(false);
-    };
-    let offers: Vec<rxrpl_primitives::Hash256> = dir
-        .get("Indexes")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().and_then(|s| s.parse().ok()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut fundable = false;
-    for offer_key in offers {
-        let Some(ob) = ctx.view.read(&offer_key) else {
-            continue;
-        };
-        let Ok(offer) = serde_json::from_slice::<Value>(&ob) else {
-            continue;
-        };
-        if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
-            continue;
-        }
-        let owner_str = offer.get("Account").and_then(|v| v.as_str()).unwrap_or("");
-        let Ok(owner) = decode_account_id(owner_str) else {
-            continue;
-        };
-        let Some(offer_out) = Leg::parse(&offer["TakerGets"]) else {
-            continue;
-        };
-        let Some(offer_in) = Leg::parse(&offer["TakerPays"]) else {
-            continue;
-        };
-        let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
-        let funds = owner_funds_leg(ctx, &owner, &offer_out);
-        // Past the taker's quality threshold, rippled may advance far enough to
-        // remove unfunded tips but does not visit otherwise funded expired
-        // offers. Expiration is reaped only on a quality page the taker can
-        // actually enter (the normal book walk above).
-        if offer_out.is_zero()
-            || offer_in.is_zero()
-            || is_deep_frozen(ctx, &owner, &offer_in)
-            || offer_cannot_pay(&funds, &offer_out, flags, &owner == taker)
-        {
-            reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, dir_key)?;
-        } else {
-            fundable = true;
-        }
-    }
-    Ok(fundable)
 }
 
 fn reap_walk_offer(
