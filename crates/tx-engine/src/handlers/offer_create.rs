@@ -1376,7 +1376,11 @@ fn cross_offers(
             } else {
                 leg_sub(&remaining_out, &order_out)
             };
-            remaining_in = leg_sub(&remaining_in, &order_in);
+            // FlowCross carries the taker's remaining input as a Number. Round
+            // the aggregate remainder once per fill under fixUniversalNumber;
+            // truncating each subtraction can leave one extra ULP for the next
+            // offer and make a tfSell cross spend above its TakerGets ceiling.
+            remaining_in = leftover_leg(&remaining_in, &order_in, number_switchover);
             crossed = true;
         }
     }
@@ -7538,7 +7542,10 @@ mod amm_quality_gate_tests {
 
 #[cfg(test)]
 mod flow_source_balance_tests {
-    use super::{aggregate_flow_source_balance, can_fund_new_trust_line, preserve_flow_output_ulp};
+    use super::{
+        Leg, aggregate_flow_source_balance, can_fund_new_trust_line, leftover_leg,
+        preserve_flow_output_ulp,
+    };
     use rxrpl_amount::IOUAmount;
     use rxrpl_amount::number::Number;
 
@@ -7553,6 +7560,21 @@ mod flow_source_balance_tests {
                 .to_decimal_string(),
             "0.0023781541865634"
         );
+    }
+
+    #[test]
+    fn sell_remainder_rounds_before_crossing_the_next_offer() {
+        let leg = |value: &str| {
+            Leg::parse(&serde_json::json!({
+                "currency": "BBRL",
+                "issuer": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+                "value": value,
+            }))
+            .unwrap()
+        };
+        let remaining = leftover_leg(&leg("1026.811695"), &leg("0.01144606677961959"), true);
+
+        assert_eq!(remaining.iou.to_decimal_string(), "1026.80024893322");
     }
 
     #[test]
