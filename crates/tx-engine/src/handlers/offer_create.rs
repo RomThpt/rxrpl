@@ -546,7 +546,14 @@ impl Transactor for OfferCreateTransactor {
             ),
             _ => keylet::book_dir(&gets_currency, &gets_issuer, &pays_currency, &pays_issuer),
         };
-        reap_own_unfunded_inverse_tip(ctx, &account_id, &mut acct, &inverse_book)?;
+        reap_own_unfunded_inverse_tip(
+            ctx,
+            &account_id,
+            &mut acct,
+            &inverse_book,
+            &taker_pays,
+            &taker_gets,
+        )?;
         // rippled's mPriorBalance for the resting-offer reserve gate: the XRP
         // balance before the fee and before crossing. The engine deducted the
         // fee centrally and crossing has not run yet, so add the fee back.
@@ -5171,6 +5178,8 @@ fn reap_own_unfunded_inverse_tip(
     taker: &AccountId,
     taker_acct: &mut Value,
     inverse_book: &Hash256,
+    taker_pays: &Value,
+    taker_gets: &Value,
 ) -> Result<(), TransactionResult> {
     let prefix = inverse_book.as_bytes()[0..24].to_vec();
     let mut probe = book_dir_with_quality(inverse_book, 0);
@@ -5200,6 +5209,28 @@ fn reap_own_unfunded_inverse_tip(
     let Some(best_dir) = best_dir else {
         return Ok(());
     };
+    let Some(out_leg) = Leg::parse(taker_pays) else {
+        return Ok(());
+    };
+    let Some(in_leg) = Leg::parse(taker_gets) else {
+        return Ok(());
+    };
+    let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+    let quality = if number_switchover {
+        rxrpl_amount::get_rate_round_even(
+            &leg_as_quality_iou(&in_leg),
+            &leg_as_quality_iou(&out_leg),
+        )
+    } else {
+        rxrpl_amount::get_rate(&leg_as_quality_iou(&in_leg), &leg_as_quality_iou(&out_leg))
+    }
+    .unwrap_or(0);
+    let passive = ctx.tx.get("Flags").and_then(Value::as_u64).unwrap_or(0) & TF_PASSIVE != 0;
+    let threshold = crossing_threshold(quality, passive);
+    let best_quality = u64::from_be_bytes(best_dir.as_bytes()[24..32].try_into().unwrap());
+    if threshold == 0 || (passive && reject_quality(best_quality, threshold)) {
+        return Ok(());
+    }
     let entries = crate::owner_dir::collect_owner_dir_entries(ctx.view, taker);
     for s in entries {
         let Ok(key) = s.parse::<Hash256>() else {
@@ -8677,6 +8708,93 @@ mod flow_cross_own_unfunded {
             sandbox.read(&keylet::offer(&taker_id, 1)).is_none(),
             "seq 1 sell offer deleted"
         );
+    }
+
+    #[test]
+    fn passive_offer_preserves_equal_quality_own_underfunded_sell() {
+        let mut ledger = Ledger::genesis();
+        let taker_id = decode_account_id(TAKER).unwrap();
+        let iss_id = decode_account_id(ISS).unwrap();
+        for (addr, drops) in [(ISS, "1000000000"), (TAKER, "1000000000")] {
+            let id = decode_account_id(addr).unwrap();
+            let acct = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": addr,
+                "Balance": drops, "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&acct).unwrap())
+                .unwrap();
+        }
+        let usd = helpers::currency_to_bytes("USD");
+        let holder_is_low = taker_id.as_bytes() < iss_id.as_bytes();
+        let stored = if holder_is_low { "10" } else { "-10" };
+        let (low, high) = if holder_is_low {
+            (TAKER, ISS)
+        } else {
+            (ISS, TAKER)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": ISS, "value": stored},
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "0"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "1000"},
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&taker_id, &iss_id, &usd),
+                serde_json::to_vec(&tl).unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let passive_sell = TF_PASSIVE | TF_SELL;
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER,
+                    "Fee": "10", "Sequence": 1, "Flags": passive_sell,
+                    "TakerGets": {"currency": "USD", "issuer": ISS, "value": "10"},
+                    "TakerPays": "100000000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+
+        let mut line: Value = serde_json::from_slice(
+            &sandbox
+                .read(&keylet::trust_line(&taker_id, &iss_id, &usd))
+                .unwrap(),
+        )
+        .unwrap();
+        line["Balance"]["value"] = Value::String(if holder_is_low { "1" } else { "-1" }.into());
+        sandbox
+            .update(
+                keylet::trust_line(&taker_id, &iss_id, &usd),
+                serde_json::to_vec(&line).unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER,
+                    "Fee": "10", "Sequence": 2, "Flags": passive_sell,
+                    "TakerGets": "100000000",
+                    "TakerPays": {"currency": "USD", "issuer": ISS, "value": "10"},
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert!(sandbox.read(&keylet::offer(&taker_id, 1)).is_some());
+        assert!(sandbox.read(&keylet::offer(&taker_id, 2)).is_some());
+        assert_eq!(owner_count(&sandbox, TAKER), 2);
     }
 
     #[test]
