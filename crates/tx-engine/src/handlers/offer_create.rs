@@ -4805,8 +4805,16 @@ fn pay_in(
         }
         return credit_xrp(ctx, owner, amount.drops);
     }
-    if !skip_taker_debit {
-        let rate = transfer_rate(ctx, &amount.issuer);
+    if !skip_taker_debit && taker != &amount.issuer {
+        // Redeeming an IOU directly to its issuer carries no transfer fee.
+        // Likewise, an issuer paying its own IOU creates value without a
+        // self-line debit. Only a third-party-to-third-party transfer is
+        // grossed by the issuer's TransferRate.
+        let rate = if owner == &amount.issuer {
+            IOUAmount::from_parts(1_000_000_000, -9, false).unwrap()
+        } else {
+            transfer_rate(ctx, &amount.issuer)
+        };
         let gross = grossed(&amount.iou, &rate);
         credit_line(
             ctx,
@@ -4817,22 +4825,23 @@ fn pay_in(
             round,
         )?;
     }
-    if owner != &amount.issuer {
-        let tl_key = keylet::trust_line(owner, &amount.issuer, &amount.currency);
-        if ctx.view.read(&tl_key).is_none() {
-            let owner_key = keylet::account(owner);
-            let ob = ctx
-                .view
-                .read(&owner_key)
-                .ok_or(TransactionResult::TefInternal)?;
-            let mut oacct: Value =
-                serde_json::from_slice(&ob).map_err(|_| TransactionResult::TefInternal)?;
-            create_iou_trust_line(ctx, owner, &mut oacct, &amount.issuer, &amount.currency)?;
-            let nb = serde_json::to_vec(&oacct).map_err(|_| TransactionResult::TefInternal)?;
-            ctx.view
-                .update(owner_key, nb)
-                .map_err(|_| TransactionResult::TefInternal)?;
-        }
+    if owner == &amount.issuer {
+        return Ok(());
+    }
+    let tl_key = keylet::trust_line(owner, &amount.issuer, &amount.currency);
+    if ctx.view.read(&tl_key).is_none() {
+        let owner_key = keylet::account(owner);
+        let ob = ctx
+            .view
+            .read(&owner_key)
+            .ok_or(TransactionResult::TefInternal)?;
+        let mut oacct: Value =
+            serde_json::from_slice(&ob).map_err(|_| TransactionResult::TefInternal)?;
+        create_iou_trust_line(ctx, owner, &mut oacct, &amount.issuer, &amount.currency)?;
+        let nb = serde_json::to_vec(&oacct).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(owner_key, nb)
+            .map_err(|_| TransactionResult::TefInternal)?;
     }
     credit_line(
         ctx,
@@ -7730,6 +7739,82 @@ mod amm_transfer_fee_tests {
         assert_eq!(
             holding(&sandbox, RECIPIENT).to_decimal_string(),
             "1.068687312151697"
+        );
+    }
+
+    #[test]
+    fn flow_redeems_iou_to_issuer_without_fee_or_self_line() {
+        let issuer = decode_account_id(ISSUER).unwrap();
+        let taker = decode_account_id(RECIPIENT).unwrap();
+        let currency = helpers::currency_to_bytes("USD");
+        let stored = if taker.as_bytes() < issuer.as_bytes() {
+            "100"
+        } else {
+            "-100"
+        };
+        let (low, high) = if taker.as_bytes() < issuer.as_bytes() {
+            (RECIPIENT, ISSUER)
+        } else {
+            (ISSUER, RECIPIENT)
+        };
+        let mut ledger = Ledger::genesis();
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": ISSUER, "value": stored},
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "1000"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "1000"},
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&taker, &issuer, &currency),
+                serde_json::to_vec(&line).unwrap(),
+            )
+            .unwrap();
+        let issuer_root = serde_json::json!({
+            "LedgerEntryType": "AccountRoot", "Account": ISSUER,
+            "Balance": "100000000", "Sequence": 1, "OwnerCount": 0,
+            "Flags": 0, "TransferRate": 1100000000u64,
+        });
+        ledger
+            .put_state(
+                keylet::account(&issuer),
+                serde_json::to_vec(&issuer_root).unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({});
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let amount = Leg::parse(&serde_json::json!({
+            "currency": "USD", "issuer": ISSUER, "value": "25",
+        }))
+        .unwrap();
+        let mut taker_acct = serde_json::json!({});
+        pay_in(
+            &mut ctx,
+            &taker,
+            &mut taker_acct,
+            &issuer,
+            &amount,
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate::amm_helpers::iou_holding_number(ctx.view, &taker, &issuer, &currency,)
+                .to_iou()
+                .to_decimal_string(),
+            "75"
         );
     }
 }
