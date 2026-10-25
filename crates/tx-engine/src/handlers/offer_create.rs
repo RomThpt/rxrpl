@@ -2116,21 +2116,19 @@ fn cross_book_hop(
                         &remaining_in,
                     )
                 } else {
-                    let ratio = IOUAmount::divide(
-                        &leg_as_quality_iou(&avail_out),
-                        &leg_as_quality_iou(&offer_out),
-                    )
-                    .unwrap_or(IOUAmount::ZERO);
-                    let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
-                        .unwrap_or(IOUAmount::ZERO);
-                    let floor = leg_min(
-                        &leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in),
-                        &remaining_in,
-                    );
-                    if terminal
-                        && offer_in.is_xrp
-                        && floor.drops >= 1_000_000
-                        && xrp_half_up.is_none()
+                    let scaled = scale_funds_limited_input(&offer_in, &avail_out, &offer_out);
+                    let floor = leg_min(&leg_min(&scaled, &offer_in), &remaining_in);
+                    // The post-hop +1 drop is part of rippled's transfer-fee
+                    // gross-up path (30000046 B19E), not generic proportional
+                    // XRP scaling. Applying it to a parity-rate issue overpays
+                    // an underfunded maker by one drop (105500212 6B2B088C).
+                    if funds_limited_xrp_rounds_up(
+                        terminal,
+                        offer_in.is_xrp,
+                        floor.drops,
+                        fee_applies,
+                        &transfer_rate(ctx, &offer_out.issuer),
+                    ) && xrp_half_up.is_none()
                     {
                         xrp_half_up = Some(owner);
                     }
@@ -2332,6 +2330,46 @@ fn terminal_budget_binds(
             remaining_in,
             &in_for_out_offer(offer_in, take_out, offer_out, rate),
         )
+}
+
+fn funds_limited_xrp_rounds_up(
+    terminal: bool,
+    offer_in_is_xrp: bool,
+    floor_drops: i64,
+    fee_applies: bool,
+    output_rate: &IOUAmount,
+) -> bool {
+    terminal
+        && offer_in_is_xrp
+        && floor_drops >= 1_000_000
+        && fee_applies
+        && *output_rate > parity_rate()
+}
+
+/// Scale a funded offer's input side by `available / original output`.
+///
+/// Native input must multiply before dividing and then truncate to drops. Doing
+/// the ratio first loses precision at the IOUAmount boundary and can round the
+/// native result up by one drop (105500212 6B2B088C).
+fn scale_funds_limited_input(offer_in: &Leg, available: &Leg, offer_out: &Leg) -> Leg {
+    if offer_in.is_xrp {
+        use rxrpl_amount::number::Number;
+        let scaled = Number::from_int(offer_in.drops)
+            .mul(&Number::from_iou(&leg_as_quality_iou(available)))
+            .div(&Number::from_iou(&leg_as_quality_iou(offer_out)));
+        let mut out = offer_in.clone();
+        out.drops = scaled.to_xrp_drops() as i64;
+        return out;
+    }
+
+    let ratio = IOUAmount::divide(
+        &leg_as_quality_iou(available),
+        &leg_as_quality_iou(offer_out),
+    )
+    .unwrap_or(IOUAmount::ZERO);
+    let scaled =
+        IOUAmount::multiply(&leg_as_quality_iou(offer_in), &ratio).unwrap_or(IOUAmount::ZERO);
+    leg_from_magnitude(&scaled, offer_in)
 }
 
 fn input_limited_uses_full_budget(
@@ -6762,11 +6800,12 @@ fn taker_cross(
 mod taker_crossing_tests {
     use super::{
         Leg, TakerCrossType, add_iou_balance, composed_quality, crossing_threshold,
-        flow_iou_to_iou, flow_iou_to_xrp, flow_xrp_to_iou, full_offer_take, in_for_out,
-        in_for_out_offer, input_limited_uses_full_budget, leftover_is_dust, leftover_leg, leg_ge,
-        leg_gt, leg_max, out_for_in, pack_rate, parity_rate, qual_div, qual_mul, reject_quality,
-        remaining_is_filled, remaining_is_filled_at, remaining_offer, select_path, sell_clamp_sub,
-        should_trim_input_limited_iou_leftover, terminal_budget_binds,
+        flow_iou_to_iou, flow_iou_to_xrp, flow_xrp_to_iou, full_offer_take,
+        funds_limited_xrp_rounds_up, in_for_out, in_for_out_offer, input_limited_uses_full_budget,
+        leftover_is_dust, leftover_leg, leg_ge, leg_gt, leg_max, out_for_in, pack_rate,
+        parity_rate, qual_div, qual_mul, reject_quality, remaining_is_filled,
+        remaining_is_filled_at, remaining_offer, scale_funds_limited_input, select_path,
+        sell_clamp_sub, should_trim_input_limited_iou_leftover, terminal_budget_binds,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, get_rate_round_even, offer_quality};
     use rxrpl_primitives::AccountId;
@@ -6839,6 +6878,34 @@ mod taker_crossing_tests {
                 .iou
                 .to_decimal_string(),
             "52.38814400000006"
+        );
+    }
+
+    #[test]
+    fn ledger_105500212_parity_issue_does_not_round_funded_xrp_up() {
+        let parity = parity_rate();
+        let fee_rate = IOUAmount::from_decimal_string("1.002").unwrap();
+
+        assert!(!funds_limited_xrp_rounds_up(
+            true, true, 1_914_188, true, &parity
+        ));
+        assert!(!funds_limited_xrp_rounds_up(
+            true, true, 1_914_188, false, &fee_rate
+        ));
+        assert!(funds_limited_xrp_rounds_up(
+            true, true, 1_914_188, true, &fee_rate
+        ));
+    }
+
+    #[test]
+    fn ledger_105500212_funded_xrp_scales_before_dividing() {
+        let offer_in = xrp(4_787_716);
+        let available = iou("2.130004");
+        let offer_out = iou("5.327509");
+
+        assert_eq!(
+            scale_funds_limited_input(&offer_in, &available, &offer_out).drops,
+            1_914_188
         );
     }
 
