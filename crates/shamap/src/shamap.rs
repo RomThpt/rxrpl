@@ -260,10 +260,70 @@ impl SHAMap {
     }
 
     /// The smallest key strictly greater than `key`, or `None` if none exists.
-    /// Leaves iterate in ascending key order, so this stops at the first hit.
-    /// Used to walk order-book quality directories (rippled's `ReadView::succ`).
+    ///
+    /// Descends directly through the radix trie instead of scanning from its
+    /// first leaf. Order-book walks call this repeatedly with keys near the end
+    /// of the account-state keyspace, where a full scan is prohibitively
+    /// expensive.
     pub fn succ(&self, key: &Hash256) -> Option<Hash256> {
-        self.iter().map(|(k, _)| k).find(|k| k > key)
+        Self::succ_in(
+            self.root.as_ref(),
+            key,
+            0,
+            self.store.as_ref(),
+            self.leaf_ctor,
+        )
+    }
+
+    fn succ_in(
+        node: &SHAMapNode,
+        key: &Hash256,
+        depth: u8,
+        store: Option<&Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+    ) -> Option<Hash256> {
+        match node {
+            SHAMapNode::Leaf(leaf) => (*leaf.key() > *key).then_some(*leaf.key()),
+            SHAMapNode::Inner(inner) => {
+                let branch = select_branch(key, depth);
+                if let Ok(Some(child)) = inner.child_with_store(branch, store, leaf_ctor) {
+                    if let Some(found) =
+                        Self::succ_in(child.as_ref(), key, depth + 1, store, leaf_ctor)
+                    {
+                        return Some(found);
+                    }
+                }
+
+                for next in (branch + 1)..16 {
+                    if let Ok(Some(child)) = inner.child_with_store(next, store, leaf_ctor) {
+                        if let Some(found) = Self::first_key(child.as_ref(), store, leaf_ctor) {
+                            return Some(found);
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    fn first_key(
+        node: &SHAMapNode,
+        store: Option<&Arc<dyn NodeStore>>,
+        leaf_ctor: fn(Hash256, Vec<u8>) -> LeafNode,
+    ) -> Option<Hash256> {
+        match node {
+            SHAMapNode::Leaf(leaf) => Some(*leaf.key()),
+            SHAMapNode::Inner(inner) => {
+                for branch in 0..16 {
+                    if let Ok(Some(child)) = inner.child_with_store(branch, store, leaf_ctor) {
+                        if let Some(found) = Self::first_key(child.as_ref(), store, leaf_ctor) {
+                            return Some(found);
+                        }
+                    }
+                }
+                None
+            }
+        }
     }
 
     /// Create a SHAMap from a root hash, loading nodes lazily from the store.
@@ -1451,6 +1511,32 @@ mod tests {
     }
 
     #[test]
+    fn succ_matches_sorted_reference_across_shared_prefixes() {
+        let mut map = SHAMap::account_state();
+        let mut keys = Vec::new();
+        for i in 0u16..512 {
+            let mut bytes = [0xA5; 32];
+            bytes[0] = (i >> 8) as u8;
+            bytes[1] = i as u8;
+            bytes[31] = (i as u8).wrapping_mul(37);
+            let key = Hash256::new(bytes);
+            map.insert(key, vec![i as u8]).unwrap();
+            keys.push(key);
+        }
+        keys.sort_unstable();
+
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(map.succ(key), keys.get(index + 1).copied());
+        }
+
+        let mut between = *keys[255].as_bytes();
+        between[31] = between[31].saturating_add(1);
+        let between = Hash256::new(between);
+        let expected = keys.iter().copied().find(|candidate| *candidate > between);
+        assert_eq!(map.succ(&between), expected);
+    }
+
+    #[test]
     fn transaction_set_root_matches_real_shamap() {
         use rxrpl_crypto::hash_prefix::HashPrefix;
         use rxrpl_crypto::sha512_half::sha512_half;
@@ -2158,6 +2244,26 @@ mod tests {
         assert_eq!(loaded.get(&k1), Some(&[1][..]));
         assert_eq!(loaded.get(&k2), Some(&[2][..]));
         assert_eq!(loaded.get(&k3), Some(&[3][..]));
+    }
+
+    #[test]
+    fn succ_loads_only_the_required_persisted_path() {
+        let store = Arc::new(InMemoryNodeStore::new());
+        let mut map = SHAMap::account_state_with_store(store.clone());
+        let keys = [
+            make_key("1000000000000000000000000000000000000000000000000000000000000000"),
+            make_key("5000000000000000000000000000000000000000000000000000000000000000"),
+            make_key("9000000000000000000000000000000000000000000000000000000000000000"),
+        ];
+        for key in keys {
+            map.put(key, vec![1]).unwrap();
+        }
+        let root_hash = map.flush().unwrap();
+        let loaded = SHAMap::from_root_hash(root_hash, LeafNode::account_state, store).unwrap();
+
+        let between = make_key("7000000000000000000000000000000000000000000000000000000000000000");
+        assert_eq!(loaded.succ(&between), Some(keys[2]));
+        assert_eq!(loaded.succ(&keys[2]), None);
     }
 
     #[test]
