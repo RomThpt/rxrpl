@@ -1764,6 +1764,7 @@ pub(crate) fn cross_book_payment(
         /*skip_input_debit=*/ false,
         /*skip_output_credit=*/ false,
         /*single_band=*/ false,
+        /*allow_amm=*/ true,
         /*lq_stop=*/ None,
         /*preserve_input_limited_iou_ulp=*/ false,
     )?;
@@ -1799,6 +1800,7 @@ fn cross_book_hop(
     skip_input_debit: bool,
     skip_output_credit: bool,
     single_band: bool,
+    allow_amm: bool,
     lq_stop: Option<(u64, u64)>,
     preserve_input_limited_iou_ulp: bool,
 ) -> Result<(Leg, Leg), TransactionResult> {
@@ -1878,7 +1880,7 @@ fn cross_book_hop(
         // where the AMM is at least as good as the offers about to fill and is a
         // no-op on a pure-CLOB book. The output lands on `dest`; interior hops
         // carry the previous hop's delivery so their input is not funds-capped.
-        if !remaining_in.is_zero() && !hop_out_done(&remaining_out, demand_out) {
+        if allow_amm && !remaining_in.is_zero() && !hop_out_done(&remaining_out, demand_out) {
             let amm_budget = if skip_input_debit {
                 remaining_in.clone()
             } else {
@@ -2556,6 +2558,7 @@ pub(crate) fn cross_path_payment(
             /*skip_input_debit=*/ !is_first,
             /*skip_output_credit=*/ !is_last,
             /*single_band=*/ limit_quality && is_last && reverse_amts.is_none(),
+            /*allow_amm=*/ true,
             lq_stop,
             /*preserve_input_limited_iou_ulp=*/ false,
         )?;
@@ -4210,6 +4213,7 @@ fn price_clob_band_reverse(
         /*skip_input_debit=*/ !is_first,
         /*skip_output_credit=*/ !is_last,
         /*single_band=*/ true,
+        /*allow_amm=*/ false,
         /*lq_stop=*/ None,
         /*preserve_input_limited_iou_ulp=*/ false,
     );
@@ -4442,6 +4446,7 @@ fn execute_strand_pass(
                     /*skip_input_debit=*/ !is_first,
                     /*skip_output_credit=*/ !is_last,
                     /*single_band=*/ true,
+                    /*allow_amm=*/ false,
                     /*lq_stop=*/ None,
                     /*preserve_input_limited_iou_ulp=*/
                     h > 0 && h > limiting && kinds[h - 1] == HopKindR::Amm,
@@ -8021,6 +8026,7 @@ mod taker_bridge_integration {
     use super::*;
     use crate::fees::FeeSettings;
     use crate::transactor::ApplyContext;
+    use crate::view::apply_view::ApplyView;
     use crate::view::ledger_view::LedgerView;
     use crate::view::read_view::ReadView;
     use crate::view::sandbox::Sandbox;
@@ -8241,6 +8247,89 @@ mod taker_bridge_integration {
                 .is_none(),
             "no taker residual"
         );
+    }
+
+    #[test]
+    fn clob_only_bridge_hop_does_not_reinject_amm() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 1);
+        put_acct(&mut ledger, O2, 1_000_000_000, 1);
+        put_acct(&mut ledger, O3, 50_000_000, 1);
+        put_line(&mut ledger, TAKER, b"BBB", 0);
+        put_line(&mut ledger, O2, b"BBB", 100);
+        put_line(&mut ledger, O3, b"BBB", 100);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        // Resting CLOB price: 1 BBB costs 1 XRP.
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O2, "Fee": "12", "Sequence": 1,
+                    "TakerGets": {"currency": "BBB", "issuer": ISS, "value": "100"},
+                    "TakerPays": "100000000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+
+        // The pool's 0.5 XRP/BBB spot is better than the CLOB. A generic book
+        // walk would therefore take the AMM first, but an OfferCreate XRP
+        // autobridge is explicitly CLOB-only.
+        let zero = AccountId::from([0u8; 20]);
+        let issuer = decode_account_id(ISS).unwrap();
+        let amm_key = keylet::amm(&[0u8; 20], &zero, &ccy(b"BBB"), &issuer);
+        let amm = serde_json::json!({
+            "LedgerEntryType": "AMM",
+            "Account": O3,
+            "TradingFee": 0,
+            "Flags": 0,
+        });
+        sandbox
+            .insert(amm_key, serde_json::to_vec(&amm).unwrap())
+            .unwrap();
+
+        let taker = decode_account_id(TAKER).unwrap();
+        let account_bytes = sandbox.read(&keylet::account(&taker)).unwrap();
+        let mut taker_acct: Value = serde_json::from_slice(&account_bytes).unwrap();
+        let demand = Leg::parse(&serde_json::json!({
+            "currency": "BBB", "issuer": ISS, "value": "10"
+        }))
+        .unwrap();
+        let budget = Leg::parse(&serde_json::json!("10000000")).unwrap();
+        let rules = Rules::from_enabled([feature_id("FlowCross")]);
+        let tx = serde_json::json!({});
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let (delivered, spent) = cross_book_hop(
+            &mut ctx,
+            &taker,
+            &mut taker_acct,
+            &taker,
+            &demand,
+            &budget,
+            false,
+            false,
+            true,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(delivered.iou.to_decimal_string(), "10");
+        assert_eq!(spent.drops, 10_000_000);
+        assert_eq!(xrp_bal(&sandbox, O3), 50_000_000);
+        assert_eq!(line_bal(&sandbox, O3, b"BBB"), "100");
     }
 
     #[test]
