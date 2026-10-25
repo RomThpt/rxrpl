@@ -1035,12 +1035,14 @@ fn cross_offers(
     let pays_iou = leg_as_quality_iou(&out_leg);
     let gets_iou = leg_as_quality_iou(&in_leg);
     let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
-    let threshold = if number_switchover {
+    let orig_quality = if number_switchover {
         rxrpl_amount::get_rate_round_even(&gets_iou, &pays_iou)
     } else {
         rxrpl_amount::get_rate(&gets_iou, &pays_iou)
     }
     .unwrap_or(0);
+    let passive = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_PASSIVE != 0;
+    let threshold = crossing_threshold(orig_quality, passive);
     if threshold == 0 {
         return Ok((taker_pays.clone(), taker_gets.clone(), false));
     }
@@ -1117,6 +1119,7 @@ fn cross_offers(
                     &mut remaining_in,
                     &mut crossed,
                     dir_quality,
+                    is_sell,
                 )?;
                 if remaining_out.is_zero() || remaining_in.is_zero() {
                     break 'walk;
@@ -1390,6 +1393,7 @@ fn cross_offers(
                 &mut remaining_in,
                 &mut crossed,
                 threshold,
+                is_sell,
             )?;
         }
         if !domain_only {
@@ -1496,10 +1500,9 @@ fn amm_offer_allows_partial_output(fok: bool, is_sell: bool) -> bool {
 /// two-hop `bridge` strand) as a competing source in the `cross_offers` walk,
 /// mirroring [`try_amm_step`]: cross bridge passes whose realised quality still
 /// beats `cq` (the current CLOB band, or the taker's overall limit at the tail),
-/// updating the remaining demand/budget in place. Each `execute_strand_pass` is
-/// checkpointed and rolled back when its quality is worse than `cq`, so the
-/// bridge only wins the bands where it is genuinely better — matching rippled's
-/// per-band interleave of the direct book and the autobridge path.
+/// updating the remaining demand/budget in place. Buy passes are evaluated per
+/// band. A tfSell bridge is evaluated atomically across all bands because Flow
+/// compares its aggregate realised quality with the taker's limit.
 #[allow(clippy::too_many_arguments)]
 fn try_bridge_step(
     ctx: &mut ApplyContext<'_>,
@@ -1512,6 +1515,7 @@ fn try_bridge_step(
     remaining_in: &mut Leg,
     crossed: &mut bool,
     cq: u64,
+    is_sell: bool,
 ) -> Result<(), TransactionResult> {
     let taker_funds = owner_funds_leg(ctx, taker, in_leg);
     let mut budget = leg_min(remaining_in, &taker_funds);
@@ -1521,6 +1525,80 @@ fn try_bridge_step(
     // context per pass would reseed the smallest fib chunk every time, delivering
     // an identical dust sliver and looping ~10^5 times to drain the budget.
     let mut amm_ctx = AmmContext::new(false);
+
+    // tfSell asks Flow to deliver an unbounded output and spend the whole SendMax.
+    // The strand is one atomic candidate: rippled walks all of its successive
+    // book bands, computes quality from the aggregate input/output, and rolls the
+    // whole candidate back when that average misses the offer limit. Committing
+    // each individually-profitable band let a bridge keep its first fill even
+    // when the full sell strand was worse overall (mainnet 105500132).
+    if is_sell {
+        let cp = ctx.view.checkpoint();
+        let mut pass_ins = Vec::new();
+        let mut pass_outs = Vec::new();
+        let demand = leg_to_number(&unbounded_leg(out_leg));
+        for _ in 0..FLOW_MAX_TRIES {
+            if budget.is_zero() {
+                break;
+            }
+            amm_ctx.clear();
+            let ri = leg_to_number(&budget);
+            let Some(res) = execute_strand_pass(
+                ctx,
+                taker,
+                taker_acct,
+                taker,
+                bridge,
+                &ri,
+                &demand,
+                &mut amm_ctx,
+            ) else {
+                break;
+            };
+            if res.out_amt.is_zero() || res.in_amt.is_zero() {
+                break;
+            }
+            let spent = leg_from_magnitude(&res.in_amt.to_iou(), in_leg);
+            if spent.is_zero() {
+                break;
+            }
+            pass_ins.push(res.in_amt);
+            pass_outs.push(res.out_amt);
+            budget = leg_sub(&budget, &spent);
+            amm_ctx.update();
+        }
+
+        if pass_ins.is_empty() {
+            ctx.view.rollback(cp);
+            return Ok(());
+        }
+        let total_in = sum_smallest_to_largest(&pass_ins);
+        let total_out = sum_smallest_to_largest(&pass_outs);
+        let in_q = num_quality_iou(&total_in, in_leg.is_xrp);
+        let out_q = num_quality_iou(&total_out, out_leg.is_xrp);
+        let eff_q = if ctx.rules.enabled(&feature_id("fixUniversalNumber")) {
+            rxrpl_amount::get_rate_round_even(&in_q, &out_q)
+        } else {
+            rxrpl_amount::get_rate(&in_q, &out_q)
+        }
+        .unwrap_or(u64::MAX);
+        if !rxrpl_amount::is_better_quality(eff_q, cq) {
+            ctx.view.rollback(cp);
+            return Ok(());
+        }
+
+        let spent = leg_from_magnitude(&total_in.to_iou(), in_leg);
+        let delivered = leg_from_magnitude(&total_out.to_iou(), out_leg);
+        *remaining_in = leg_sub(remaining_in, &spent);
+        *remaining_out = if leg_ge(&delivered, remaining_out) {
+            leg_sub(remaining_out, remaining_out)
+        } else {
+            leg_sub(remaining_out, &delivered)
+        };
+        *crossed = true;
+        return Ok(());
+    }
+
     loop {
         if remaining_out.is_zero() || budget.is_zero() {
             break;
@@ -1542,7 +1620,12 @@ fn try_bridge_step(
             Some(res) if !res.out_amt.is_zero() && !res.in_amt.is_zero() => {
                 let in_q = num_quality_iou(&res.in_amt, in_leg.is_xrp);
                 let out_q = num_quality_iou(&res.out_amt, out_leg.is_xrp);
-                let eff_q = rxrpl_amount::get_rate(&in_q, &out_q).unwrap_or(u64::MAX);
+                let eff_q = if ctx.rules.enabled(&feature_id("fixUniversalNumber")) {
+                    rxrpl_amount::get_rate_round_even(&in_q, &out_q)
+                } else {
+                    rxrpl_amount::get_rate(&in_q, &out_q)
+                }
+                .unwrap_or(u64::MAX);
                 if !rxrpl_amount::is_better_quality(eff_q, cq) {
                     ctx.view.rollback(cp);
                     break;
@@ -5414,6 +5497,17 @@ fn reject_quality(quality: u64, threshold: u64) -> bool {
     quality > threshold
 }
 
+/// Tighten a passive offer's crossing limit by one packed-rate ULP. This makes
+/// equal-quality direct and autobridged liquidity fail `reject_quality`, while
+/// strictly better liquidity remains crossable.
+fn crossing_threshold(quality: u64, passive: bool) -> u64 {
+    if passive {
+        quality.saturating_sub(1)
+    } else {
+        quality
+    }
+}
+
 /// rippled `BasicTaker::done` (funds limb handled by the pricer clamps): the
 /// taker stops when its input is spent, or (buy) its output demand is met.
 fn taker_done(is_sell: bool, remaining_out: &Leg, remaining_in: &Leg) -> bool {
@@ -6426,11 +6520,7 @@ fn taker_cross(
     // and a lower packed rate is a better quality, so the bump is a decrement here:
     // reject (`dir_quality > threshold`) then fires on an equal-quality offer.
     let passive = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_PASSIVE != 0;
-    let threshold = if passive {
-        orig_quality.saturating_sub(1)
-    } else {
-        orig_quality
-    };
+    let threshold = crossing_threshold(orig_quality, passive);
 
     let mut remaining_out = out_leg.clone();
     let mut remaining_in = in_leg.clone();
@@ -6479,13 +6569,14 @@ fn taker_cross(
 #[cfg(test)]
 mod taker_crossing_tests {
     use super::{
-        Leg, TakerCrossType, add_iou_balance, composed_quality, flow_iou_to_iou, flow_iou_to_xrp,
-        flow_xrp_to_iou, in_for_out, in_for_out_offer, leftover_is_dust, leftover_leg, leg_ge,
-        leg_gt, leg_max, out_for_in, pack_rate, parity_rate, qual_div, qual_mul, reject_quality,
-        remaining_is_filled, remaining_is_filled_at, remaining_offer, select_path, sell_clamp_sub,
+        Leg, TakerCrossType, add_iou_balance, composed_quality, crossing_threshold,
+        flow_iou_to_iou, flow_iou_to_xrp, flow_xrp_to_iou, in_for_out, in_for_out_offer,
+        leftover_is_dust, leftover_leg, leg_ge, leg_gt, leg_max, out_for_in, pack_rate,
+        parity_rate, qual_div, qual_mul, reject_quality, remaining_is_filled,
+        remaining_is_filled_at, remaining_offer, select_path, sell_clamp_sub,
         terminal_budget_binds,
     };
-    use rxrpl_amount::{IOUAmount, from_rate, get_rate, offer_quality};
+    use rxrpl_amount::{IOUAmount, from_rate, get_rate, get_rate_round_even, offer_quality};
     use rxrpl_primitives::AccountId;
     use rxrpl_protocol::keylet;
 
@@ -6721,6 +6812,34 @@ mod taker_crossing_tests {
             !reject_quality(m3, taker_q),
             "m3 {m3:#x} should pass threshold {taker_q:#x} (mainnet crossed F02D74BB)"
         );
+    }
+
+    #[test]
+    fn passive_threshold_rejects_equal_quality() {
+        let quality = 0x5503_8dad_1140_38e4;
+        let passive = crossing_threshold(quality, true);
+
+        assert!(reject_quality(quality, passive));
+        assert!(!reject_quality(quality - 2, passive));
+        assert_eq!(crossing_threshold(quality, false), quality);
+    }
+
+    #[test]
+    fn sell_bridge_uses_aggregate_quality() {
+        let threshold = 0x5503_8dad_1140_38e4;
+        let first_in = IOUAmount::from_decimal_string("1.643241424565478").unwrap();
+        let first_out = IOUAmount::from_decimal_string("1.64375665128").unwrap();
+        let total_in = IOUAmount::from_decimal_string("68.182047").unwrap();
+        let total_out = IOUAmount::from_decimal_string("68.1046293541").unwrap();
+
+        let first_quality = get_rate_round_even(&first_in, &first_out).unwrap();
+        let aggregate_quality = get_rate_round_even(&total_in, &total_out).unwrap();
+
+        assert!(rxrpl_amount::is_better_quality(first_quality, threshold));
+        assert!(!rxrpl_amount::is_better_quality(
+            aggregate_quality,
+            threshold
+        ));
     }
 
     // select_path picks the better (smaller packed rate) of the direct tip and the
