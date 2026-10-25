@@ -1500,9 +1500,9 @@ fn amm_offer_allows_partial_output(fok: bool, is_sell: bool) -> bool {
 /// two-hop `bridge` strand) as a competing source in the `cross_offers` walk,
 /// mirroring [`try_amm_step`]: cross bridge passes whose realised quality still
 /// beats `cq` (the current CLOB band, or the taker's overall limit at the tail),
-/// updating the remaining demand/budget in place. Buy passes are evaluated per
-/// band. A tfSell bridge is evaluated atomically across all bands because Flow
-/// compares its aggregate realised quality with the taker's limit.
+/// updating the remaining demand/budget in place. The bridge is evaluated
+/// atomically across all bands because Flow compares its aggregate realised
+/// quality with the competing direct path or the taker's limit.
 #[allow(clippy::too_many_arguments)]
 fn try_bridge_step(
     ctx: &mut ApplyContext<'_>,
@@ -1526,88 +1526,27 @@ fn try_bridge_step(
     // an identical dust sliver and looping ~10^5 times to drain the budget.
     let mut amm_ctx = AmmContext::new(false);
 
-    // tfSell asks Flow to deliver an unbounded output and spend the whole SendMax.
-    // The strand is one atomic candidate: rippled walks all of its successive
-    // book bands, computes quality from the aggregate input/output, and rolls the
-    // whole candidate back when that average misses the offer limit. Committing
-    // each individually-profitable band let a bridge keep its first fill even
-    // when the full sell strand was worse overall (mainnet 105500132).
-    if is_sell {
-        let cp = ctx.view.checkpoint();
-        let mut pass_ins = Vec::new();
-        let mut pass_outs = Vec::new();
-        let demand = leg_to_number(&unbounded_leg(out_leg));
-        for _ in 0..FLOW_MAX_TRIES {
-            if budget.is_zero() {
-                break;
-            }
-            amm_ctx.clear();
-            let ri = leg_to_number(&budget);
-            let Some(res) = execute_strand_pass(
-                ctx,
-                taker,
-                taker_acct,
-                taker,
-                bridge,
-                &ri,
-                &demand,
-                &mut amm_ctx,
-            ) else {
-                break;
-            };
-            if res.out_amt.is_zero() || res.in_amt.is_zero() {
-                break;
-            }
-            let spent = leg_from_magnitude(&res.in_amt.to_iou(), in_leg);
-            if spent.is_zero() {
-                break;
-            }
-            pass_ins.push(res.in_amt);
-            pass_outs.push(res.out_amt);
-            budget = leg_sub(&budget, &spent);
-            amm_ctx.update();
-        }
-
-        if pass_ins.is_empty() {
-            ctx.view.rollback(cp);
-            return Ok(());
-        }
-        let total_in = sum_smallest_to_largest(&pass_ins);
-        let total_out = sum_smallest_to_largest(&pass_outs);
-        let in_q = num_quality_iou(&total_in, in_leg.is_xrp);
-        let out_q = num_quality_iou(&total_out, out_leg.is_xrp);
-        let eff_q = if ctx.rules.enabled(&feature_id("fixUniversalNumber")) {
-            rxrpl_amount::get_rate_round_even(&in_q, &out_q)
-        } else {
-            rxrpl_amount::get_rate(&in_q, &out_q)
-        }
-        .unwrap_or(u64::MAX);
-        if !rxrpl_amount::is_better_quality(eff_q, cq) {
-            ctx.view.rollback(cp);
-            return Ok(());
-        }
-
-        let spent = leg_from_magnitude(&total_in.to_iou(), in_leg);
-        let delivered = leg_from_magnitude(&total_out.to_iou(), out_leg);
-        *remaining_in = leg_sub(remaining_in, &spent);
-        *remaining_out = if leg_ge(&delivered, remaining_out) {
-            leg_sub(remaining_out, remaining_out)
-        } else {
-            leg_sub(remaining_out, &delivered)
-        };
-        *crossed = true;
-        return Ok(());
-    }
-
-    loop {
-        if remaining_out.is_zero() || budget.is_zero() {
+    // One Flow strand execution is an atomic candidate. rippled walks all of
+    // its successive book bands, computes quality from the aggregate input and
+    // output, then rolls the whole candidate back when that average misses the
+    // limit. Committing each individually-profitable band diverged for both
+    // sell and buy OfferCreate transactions (mainnet 105500132 and 105500135).
+    let cp = ctx.view.checkpoint();
+    let mut pass_ins = Vec::new();
+    let mut pass_outs = Vec::new();
+    let mut demand = if is_sell {
+        unbounded_leg(out_leg)
+    } else {
+        remaining_out.clone()
+    };
+    for _ in 0..FLOW_MAX_TRIES {
+        if budget.is_zero() || (!is_sell && demand.is_zero()) {
             break;
         }
-        let cp = ctx.view.checkpoint();
         amm_ctx.clear();
-        let ro = leg_to_number(remaining_out);
         let ri = leg_to_number(&budget);
-        match execute_strand_pass(
+        let ro = leg_to_number(&demand);
+        let Some(res) = execute_strand_pass(
             ctx,
             taker,
             taker_acct,
@@ -1616,34 +1555,58 @@ fn try_bridge_step(
             &ri,
             &ro,
             &mut amm_ctx,
-        ) {
-            Some(res) if !res.out_amt.is_zero() && !res.in_amt.is_zero() => {
-                let in_q = num_quality_iou(&res.in_amt, in_leg.is_xrp);
-                let out_q = num_quality_iou(&res.out_amt, out_leg.is_xrp);
-                let eff_q = if ctx.rules.enabled(&feature_id("fixUniversalNumber")) {
-                    rxrpl_amount::get_rate_round_even(&in_q, &out_q)
-                } else {
-                    rxrpl_amount::get_rate(&in_q, &out_q)
-                }
-                .unwrap_or(u64::MAX);
-                if !rxrpl_amount::is_better_quality(eff_q, cq) {
-                    ctx.view.rollback(cp);
-                    break;
-                }
-                let d = leg_from_magnitude(&res.out_amt.to_iou(), out_leg);
-                let s = leg_from_magnitude(&res.in_amt.to_iou(), in_leg);
-                *remaining_out = leg_sub(remaining_out, &d);
-                *remaining_in = leg_sub(remaining_in, &s);
-                budget = leg_sub(&budget, &s);
-                *crossed = true;
-                amm_ctx.update();
-            }
-            _ => {
-                ctx.view.rollback(cp);
-                break;
-            }
+        ) else {
+            break;
+        };
+        if res.out_amt.is_zero() || res.in_amt.is_zero() {
+            break;
         }
+        let spent = leg_from_magnitude(&res.in_amt.to_iou(), in_leg);
+        let delivered = leg_from_magnitude(&res.out_amt.to_iou(), out_leg);
+        if spent.is_zero() || delivered.is_zero() {
+            break;
+        }
+        pass_ins.push(res.in_amt);
+        pass_outs.push(res.out_amt);
+        budget = leg_sub(&budget, &spent);
+        if !is_sell {
+            demand = if leg_ge(&delivered, &demand) {
+                leg_sub(&demand, &demand)
+            } else {
+                leg_sub(&demand, &delivered)
+            };
+        }
+        amm_ctx.update();
     }
+
+    if pass_ins.is_empty() {
+        ctx.view.rollback(cp);
+        return Ok(());
+    }
+    let total_in = sum_smallest_to_largest(&pass_ins);
+    let total_out = sum_smallest_to_largest(&pass_outs);
+    let in_q = num_quality_iou(&total_in, in_leg.is_xrp);
+    let out_q = num_quality_iou(&total_out, out_leg.is_xrp);
+    let eff_q = if ctx.rules.enabled(&feature_id("fixUniversalNumber")) {
+        rxrpl_amount::get_rate_round_even(&in_q, &out_q)
+    } else {
+        rxrpl_amount::get_rate(&in_q, &out_q)
+    }
+    .unwrap_or(u64::MAX);
+    if !rxrpl_amount::is_better_quality(eff_q, cq) {
+        ctx.view.rollback(cp);
+        return Ok(());
+    }
+
+    let spent = leg_from_magnitude(&total_in.to_iou(), in_leg);
+    let delivered = leg_from_magnitude(&total_out.to_iou(), out_leg);
+    *remaining_in = leg_sub(remaining_in, &spent);
+    *remaining_out = if leg_ge(&delivered, remaining_out) {
+        leg_sub(remaining_out, remaining_out)
+    } else {
+        leg_sub(remaining_out, &delivered)
+    };
+    *crossed = true;
     Ok(())
 }
 
@@ -6825,7 +6788,7 @@ mod taker_crossing_tests {
     }
 
     #[test]
-    fn sell_bridge_uses_aggregate_quality() {
+    fn bridge_uses_aggregate_quality() {
         let threshold = 0x5503_8dad_1140_38e4;
         let first_in = IOUAmount::from_decimal_string("1.643241424565478").unwrap();
         let first_out = IOUAmount::from_decimal_string("1.64375665128").unwrap();
