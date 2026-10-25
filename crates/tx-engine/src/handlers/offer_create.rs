@@ -2051,13 +2051,21 @@ fn cross_book_hop(
             let (order_out, order_in) = if full_take {
                 (offer_out.clone(), offer_in.clone())
             } else if budget_binds {
-                let order_in = if terminal {
+                let order_in = if input_limited_uses_full_budget(
+                    terminal,
+                    skip_input_debit,
+                    skip_output_credit,
+                    &offer_out,
+                ) {
                     // ceilIn: the SendMax input is the binding limit (it cannot
                     // afford the ceilOut cost of the demanded output), so rippled
                     // re-runs the terminal book forward with `in = maxIn` and spends
                     // the WHOLE remaining budget — the forward re-run asserts
                     // `result.in == limit` and ceilIn pins in=limit,
-                    // out=floor(limit/rate). `take_out` is already floor(budget/rate).
+                    // out=floor(limit/rate). The same applies to a path's final
+                    // IOU->XRP hop: drops are discrete, so repricing the floored
+                    // output can leave an artificial IOU residual and dry the
+                    // otherwise valid strand (ledger 105500157).
                     leg_min(&remaining_in, &offer_in)
                 } else {
                     // Interior hop: charge the ceilOut price for the delivered
@@ -2192,12 +2200,17 @@ fn cross_book_hop(
                 let mut new_gets = leftover_leg(&offer_out, &order_out, number_switchover);
                 // Last-hop input-limited: `out_for_in` floors 1 ULP below the
                 // consumed Gets (30000066 33FB4822 leftover `…6341` vs `…634`).
-                if skip_input_debit
-                    && budget_binds
-                    && !new_gets.is_xrp
-                    && !preserve_input_limited_iou_ulp
-                    && new_gets.iou.mantissa() > 0
-                {
+                // Apply that correction only while the hop remains partial. If
+                // this fill satisfies the requested output exactly, rippled
+                // keeps the untrimmed leftover (105500157 C32058ED).
+                if should_trim_input_limited_iou_leftover(
+                    skip_input_debit,
+                    budget_binds,
+                    &new_gets,
+                    preserve_input_limited_iou_ulp,
+                    &net_out,
+                    &remaining_out,
+                ) {
                     if let Ok(trimmed) = IOUAmount::from_parts(
                         new_gets.iou.mantissa() - 1,
                         new_gets.iou.exponent(),
@@ -2296,6 +2309,31 @@ fn terminal_budget_binds(
             remaining_in,
             &in_for_out_offer(offer_in, take_out, offer_out, rate),
         )
+}
+
+fn input_limited_uses_full_budget(
+    terminal: bool,
+    skip_input_debit: bool,
+    skip_output_credit: bool,
+    offer_out: &Leg,
+) -> bool {
+    terminal || (skip_input_debit && !skip_output_credit && offer_out.is_xrp)
+}
+
+fn should_trim_input_limited_iou_leftover(
+    skip_input_debit: bool,
+    budget_binds: bool,
+    new_gets: &Leg,
+    preserve_input_limited_iou_ulp: bool,
+    net_out: &Leg,
+    remaining_out: &Leg,
+) -> bool {
+    skip_input_debit
+        && budget_binds
+        && !new_gets.is_xrp
+        && !preserve_input_limited_iou_ulp
+        && !leg_ge(net_out, remaining_out)
+        && new_gets.iou.mantissa() > 0
 }
 
 /// Cross a chain of order books (a single resolved path), forwarding each
@@ -6562,10 +6600,10 @@ mod taker_crossing_tests {
     use super::{
         Leg, TakerCrossType, add_iou_balance, composed_quality, crossing_threshold,
         flow_iou_to_iou, flow_iou_to_xrp, flow_xrp_to_iou, full_offer_take, in_for_out,
-        in_for_out_offer, leftover_is_dust, leftover_leg, leg_ge, leg_gt, leg_max, out_for_in,
-        pack_rate, parity_rate, qual_div, qual_mul, reject_quality, remaining_is_filled,
-        remaining_is_filled_at, remaining_offer, select_path, sell_clamp_sub,
-        terminal_budget_binds,
+        in_for_out_offer, input_limited_uses_full_budget, leftover_is_dust, leftover_leg, leg_ge,
+        leg_gt, leg_max, out_for_in, pack_rate, parity_rate, qual_div, qual_mul, reject_quality,
+        remaining_is_filled, remaining_is_filled_at, remaining_offer, select_path, sell_clamp_sub,
+        should_trim_input_limited_iou_leftover, terminal_budget_binds,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, get_rate_round_even, offer_quality};
     use rxrpl_primitives::AccountId;
@@ -6665,6 +6703,34 @@ mod taker_crossing_tests {
             &offer_in,
             &offer_out,
             &rate,
+        ));
+    }
+
+    #[test]
+    fn final_path_iou_to_xrp_spends_full_input_budget() {
+        assert!(input_limited_uses_full_budget(false, true, false, &xrp(1)));
+        assert!(!input_limited_uses_full_budget(
+            false,
+            true,
+            false,
+            &iou("1")
+        ));
+    }
+
+    #[test]
+    fn fulfilled_input_limited_hop_keeps_untrimmed_leftover() {
+        let leftover = iou("321.5569861684434");
+        let requested = iou("0.891729766029164");
+        let partial = iou("0.8");
+
+        assert!(!should_trim_input_limited_iou_leftover(
+            true, false, &leftover, false, &requested, &requested
+        ));
+        assert!(!should_trim_input_limited_iou_leftover(
+            true, true, &leftover, false, &requested, &requested
+        ));
+        assert!(should_trim_input_limited_iou_leftover(
+            true, true, &leftover, false, &partial, &requested
         ));
     }
 
