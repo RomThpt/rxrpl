@@ -1381,6 +1381,14 @@ fn num_le(a: &rxrpl_amount::number::Number, b: &rxrpl_amount::number::Number) ->
     d.is_zero() || d.negative()
 }
 
+/// XRP that Flow may spend after the transaction fee has already been charged.
+/// `accountHolds(..., fhZERO_IF_FROZEN)` delegates native funds to `xrpLiquid`,
+/// which excludes the reserve for the account's current owner count.
+fn xrp_flow_funds(account: &serde_json::Value, fees: &crate::fees::FeeSettings) -> u64 {
+    helpers::get_balance(account)
+        .saturating_sub(fees.account_reserve(helpers::get_owner_count(account)))
+}
+
 /// The AMM pool's holding of one asset as a `Number`: the pseudo-account's XRP
 /// AccountRoot balance for XRP, or its issuer trust-line balance for an IOU.
 fn amm_pool_balance(
@@ -1600,7 +1608,7 @@ fn try_amm_conversion(
             .as_str()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
-        let avail = helpers::get_balance(user_acct);
+        let avail = xrp_flow_funds(user_acct, ctx.fees);
         (Number::from_int(send.min(avail) as i64), Number::ZERO)
     } else {
         let send = Number::from_iou(&crate::amm_helpers::parse_iou_value(

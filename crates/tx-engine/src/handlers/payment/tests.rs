@@ -53,6 +53,21 @@ fn make_payment_tx(account: &str, destination: &str, amount: &str, fee: &str) ->
     })
 }
 
+#[test]
+fn xrp_flow_funds_excludes_owner_reserve() {
+    let fees = FeeSettings {
+        base_fee: 10,
+        reserve_base: 1_000_000,
+        reserve_increment: 200_000,
+    };
+    let account = serde_json::json!({
+        "Balance": "1624314",
+        "OwnerCount": 3,
+    });
+
+    assert_eq!(xrp_flow_funds(&account, &fees), 24314);
+}
+
 // -- preflight tests --
 
 #[test]
