@@ -68,6 +68,22 @@ fn xrp_flow_funds_excludes_owner_reserve() {
     assert_eq!(xrp_flow_funds(&account, &fees), 24314);
 }
 
+#[test]
+fn iou_receive_room_caps_at_holder_limit() {
+    use rxrpl_amount::number::Number;
+
+    let limit = Number::from_iou(&IOUAmount::from_decimal_string("1000000000").unwrap());
+    let holding = Number::from_iou(&IOUAmount::from_decimal_string("993413349.331679").unwrap());
+
+    assert_eq!(
+        iou_receive_room(&limit, &holding)
+            .to_iou()
+            .to_decimal_string(),
+        "6586650.668321"
+    );
+    assert!(iou_receive_room(&holding, &limit).is_zero());
+}
+
 // -- preflight tests --
 
 #[test]

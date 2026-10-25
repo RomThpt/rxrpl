@@ -738,14 +738,9 @@ fn apply_conversion(
     let mut acct: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-    // AMM-routed conversion: when an AMM pool exists for the (SendMax → Amount)
-    // pair, swap through it with exact constant-product math. The pool here is
-    // always the sole/best liquidity for the books we replay (the swap is small
-    // relative to the reserves, so its quality beats any resting offer and
-    // rippled never reaches the CLOB); for those it either spends the whole
-    // budget or delivers the whole target, so the order book is left untouched.
-    // Books with no AMM (every pre-AMM order-book oracle) fall through to the
-    // shared Taker engine unchanged.
+    // Use the direct constant-product quote when an AMM exists. It mirrors the
+    // single synthetic AMM offer selected by BookStep and, unlike the generic
+    // CLOB fallback, can represent a capacity-limited partial AMM delivery.
     let delivered = match try_amm_conversion(ctx, &src_id, &mut acct, &dst_id, &amount, &send_max)?
     {
         Some(delivered) => delivered,
@@ -1413,6 +1408,57 @@ fn amm_pool_balance(
     }
 }
 
+/// Maximum additional IOU balance `account` may receive before reaching its
+/// own trust limit. The RippleState balance is stored from the low account's
+/// perspective, while the applicable limit belongs to the holder side.
+fn iou_receive_capacity(
+    ctx: &ApplyContext<'_>,
+    account: &rxrpl_primitives::AccountId,
+    issuer: &rxrpl_primitives::AccountId,
+    currency: &[u8; 20],
+) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::Number;
+
+    if account == issuer {
+        return Number::from_iou(
+            &IOUAmount::from_parts(9_999_999_999_999_999, 80, false).unwrap_or(IOUAmount::ZERO),
+        );
+    }
+    let Some(bytes) = ctx
+        .view
+        .read(&keylet::trust_line(account, issuer, currency))
+    else {
+        return Number::ZERO;
+    };
+    let Ok(line): Result<Value, _> = serde_json::from_slice(&bytes) else {
+        return Number::ZERO;
+    };
+    let account_is_low = account.as_bytes() < issuer.as_bytes();
+    let limit_field = if account_is_low {
+        "LowLimit"
+    } else {
+        "HighLimit"
+    };
+    let limit = Number::from_iou(&crate::amm_helpers::parse_iou_value(
+        line.get(limit_field)
+            .and_then(|v| v.get("value"))
+            .and_then(Value::as_str)
+            .unwrap_or("0"),
+    ));
+    let holding = crate::amm_helpers::iou_holding_number(ctx.view, account, issuer, currency);
+    iou_receive_room(&limit, &holding)
+}
+
+fn iou_receive_room(
+    limit: &rxrpl_amount::number::Number,
+    holding: &rxrpl_amount::number::Number,
+) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::Number;
+
+    let room = limit.sub(holding);
+    if room.negative() { Number::ZERO } else { room }
+}
+
 /// Attempt to satisfy a cross-currency conversion through an AMM pool. Returns
 /// `Ok(Some(delivered))` with the pool and the user's (= destination, for a
 /// conversion) balances mutated byte-exactly, or `Ok(None)` when there is no AMM
@@ -1589,7 +1635,7 @@ fn try_amm_conversion(
     }
 
     // Target output (Amount).
-    let target_out = if out_xrp {
+    let mut target_out = if out_xrp {
         Number::from_int(
             amount
                 .as_str()
@@ -1601,6 +1647,12 @@ fn try_amm_conversion(
             amount.get("value").and_then(|v| v.as_str()).unwrap_or("0"),
         ))
     };
+    if !out_xrp && dst_id != &out_iss {
+        let capacity = iou_receive_capacity(ctx, dst_id, &out_iss, &out_cur);
+        if num_le(&capacity, &target_out) {
+            target_out = capacity;
+        }
+    }
 
     // Budget input (SendMax), capped at the source's spendable funds.
     let (budget_in, src_in_funds) = if in_xrp {
