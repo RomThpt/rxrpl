@@ -4241,6 +4241,7 @@ fn price_clob_band_reverse(
     let demand_leg = number_to_leg(demanded, &hop.out_leg);
     let budget_leg = unbounded_leg(&hop.in_leg);
     let cp = ctx.view.checkpoint();
+    let taker_acct_before = taker_acct.clone();
     let res = cross_book_hop(
         ctx,
         taker,
@@ -4256,6 +4257,7 @@ fn price_clob_band_reverse(
         /*preserve_input_limited_iou_ulp=*/ false,
     );
     ctx.view.rollback(cp);
+    *taker_acct = taker_acct_before;
     let (delivered, spent) = res.ok()?;
     if delivered.is_zero() || spent.is_zero() {
         return None;
@@ -4635,6 +4637,7 @@ pub(crate) fn flow_multi(
         let mut winner: Option<(usize, StrandPass)> = None;
         for &si in cur.iter() {
             let cp = ctx.view.checkpoint();
+            let taker_acct_before = taker_acct.clone();
             amm_ctx.clear();
             match execute_strand_pass(
                 ctx,
@@ -4659,6 +4662,7 @@ pub(crate) fn flow_multi(
                         eprintln!("[flow]   try={cur_try} strand={si} FAILED pass");
                     }
                     ctx.view.rollback(cp);
+                    *taker_acct = taker_acct_before;
                 }
             }
         }
@@ -8397,6 +8401,74 @@ mod taker_bridge_integration {
         assert_eq!(spent.drops, 10_000_000);
         assert_eq!(xrp_bal(&sandbox, O3), 50_000_000);
         assert_eq!(line_bal(&sandbox, O3, b"BBB"), "100");
+    }
+
+    #[test]
+    fn reverse_clob_pricing_restores_detached_taker_account() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 1);
+        put_acct(&mut ledger, O2, 1_000_000_000, 1);
+        put_line(&mut ledger, TAKER, b"BBB", 0);
+        put_line(&mut ledger, O2, b"BBB", 100);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": O2, "Fee": "12", "Sequence": 1,
+                    "TakerGets": {"currency": "BBB", "issuer": ISS, "value": "100"},
+                    "TakerPays": "100000000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+
+        let taker = decode_account_id(TAKER).unwrap();
+        let offer_key = keylet::offer(&decode_account_id(O2).unwrap(), 1);
+        let offer_before = sandbox.read(&offer_key).unwrap();
+        let account_bytes = sandbox.read(&keylet::account(&taker)).unwrap();
+        let mut taker_acct: Value = serde_json::from_slice(&account_bytes).unwrap();
+        let taker_before = taker_acct.clone();
+        let rules = Rules::from_enabled([feature_id("FlowCross")]);
+        let tx = serde_json::json!({});
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let strand = build_flow_strand(
+            &ctx,
+            &[
+                serde_json::json!("10000000"),
+                serde_json::json!({
+                    "currency": "BBB", "issuer": ISS, "value": "10"
+                }),
+            ],
+        )
+        .unwrap();
+
+        let priced = price_clob_band_reverse(
+            &mut ctx,
+            &taker,
+            &mut taker_acct,
+            &taker,
+            &strand.hops[0],
+            &Number::from_int(10),
+            true,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(priced.0.to_xrp_drops(), 10_000_000);
+        assert_eq!(priced.1.to_iou().to_decimal_string(), "10");
+        assert_eq!(taker_acct, taker_before);
+        assert_eq!(ctx.view.read(&offer_key).unwrap(), offer_before);
     }
 
     #[test]
