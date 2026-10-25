@@ -467,10 +467,15 @@ impl AMMWithdrawTransactor {
             .update(amm_acct_key, amm_acct_data)
             .map_err(|_| TransactionResult::TefInternal)?;
 
-        // Delete the holder's LPToken trust line: unlink from both owner
-        // directories (using the line's LowNode/HighNode page hints, since
-        // intermediate pages may be unseeded) and erase it. The AMM issuer side
-        // carries no reserve.
+        // Delete the holder's LPToken trust line: first stage its drained value
+        // so DeletedNode metadata records Balance=0 and the released reserve,
+        // then unlink it from both owner directories and erase it.
+        stage_drained_lp_line(
+            ctx,
+            &tl_key,
+            &line,
+            holder.as_bytes() < amm_account.as_bytes(),
+        )?;
         let node_of = |field: &str| -> u64 {
             line.get(field)
                 .and_then(|v| v.as_str())
@@ -1055,6 +1060,8 @@ fn delete_lp_line(
         .ok_or(TransactionResult::TecNoEntry)?;
     let line: serde_json::Value =
         serde_json::from_slice(&line_bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let holder_is_low = holder.as_bytes() < amm_account.as_bytes();
+    stage_drained_lp_line(ctx, &tl_key, &line, holder_is_low)?;
     let node_of = |field: &str| -> u64 {
         line.get(field)
             .and_then(|v| v.as_str())
@@ -1063,7 +1070,7 @@ fn delete_lp_line(
     };
     let low_node = node_of("LowNode");
     let high_node = node_of("HighNode");
-    let (low_acct, low_page, high_acct, high_page) = if holder.as_bytes() < amm_account.as_bytes() {
+    let (low_acct, low_page, high_acct, high_page) = if holder_is_low {
         (holder, low_node, amm_account, high_node)
     } else {
         (amm_account, low_node, holder, high_node)
@@ -1084,6 +1091,33 @@ fn delete_lp_line(
             .map_err(|_| TransactionResult::TefInternal)?;
     }
     Ok(())
+}
+
+/// Stage the final value rippled writes before `trustDelete` erases a drained
+/// LPToken line. Sandbox keeps this value as DeletedNode FinalFields while its
+/// first-write snapshot remains available as PreviousFields.
+fn stage_drained_lp_line(
+    ctx: &mut ApplyContext<'_>,
+    tl_key: &rxrpl_primitives::Hash256,
+    line: &serde_json::Value,
+    holder_is_low: bool,
+) -> Result<(), TransactionResult> {
+    const LSF_LOW_RESERVE: u64 = 0x0001_0000;
+    const LSF_HIGH_RESERVE: u64 = 0x0002_0000;
+
+    let mut drained = line.clone();
+    drained["Balance"]["value"] = serde_json::Value::String("0".into());
+    let flags = drained["Flags"].as_u64().unwrap_or(0);
+    let holder_reserve = if holder_is_low {
+        LSF_LOW_RESERVE
+    } else {
+        LSF_HIGH_RESERVE
+    };
+    drained["Flags"] = serde_json::Value::from(flags & !holder_reserve);
+    let data = serde_json::to_vec(&drained).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(*tl_key, data)
+        .map_err(|_| TransactionResult::TefInternal)
 }
 
 /// Subtract `tokens` LP from the holder's seeded LPToken trust line.
@@ -1147,8 +1181,10 @@ mod tests {
     use crate::fees::FeeSettings;
     use crate::transactor::{PreclaimContext, PreflightContext};
     use crate::view::ledger_view::LedgerView;
+    use crate::view::sandbox::Sandbox;
     use rxrpl_amendment::Rules;
     use rxrpl_ledger::Ledger;
+    use std::collections::HashMap;
 
     const ALICE: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
     const BOB: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
@@ -1262,6 +1298,91 @@ mod tests {
         assert_eq!(
             AMMWithdrawTransactor.preflight(&ctx),
             Err(TransactionResult::TemBadAmount)
+        );
+    }
+
+    #[test]
+    fn deleting_drained_lp_line_records_zero_and_released_reserve() {
+        let mut ledger = Ledger::genesis();
+        let holder = decode_account_id(ALICE).unwrap();
+        let amm = decode_account_id(BOB).unwrap();
+        let currency = [0xAB; 20];
+        let currency_hex = hex::encode_upper(currency);
+        let holder_is_low = holder.as_bytes() < amm.as_bytes();
+        let holder_reserve = if holder_is_low {
+            0x0001_0000
+        } else {
+            0x0002_0000
+        };
+        let no_ripple = if holder_is_low {
+            0x0010_0000
+        } else {
+            0x0020_0000
+        };
+        let line_key = keylet::trust_line(&holder, &amm, &currency);
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {
+                "currency": currency_hex,
+                "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji",
+                "value": if holder_is_low { "71186.8490346" } else { "-71186.8490346" },
+            },
+            "Flags": holder_reserve | no_ripple,
+            "LowLimit": {"currency": currency_hex, "issuer": ALICE, "value": "0"},
+            "HighLimit": {"currency": currency_hex, "issuer": BOB, "value": "0"},
+            "LowNode": "0",
+            "HighNode": "0",
+        });
+        ledger
+            .put_state(line_key, serde_json::to_vec(&line).unwrap())
+            .unwrap();
+        let amm_key = keylet::account(&amm);
+        let amm_root = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": BOB,
+            "Balance": "100000000",
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(amm_key, serde_json::to_vec(&amm_root).unwrap())
+            .unwrap();
+
+        let view = LedgerView::new(&ledger);
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+        let tx = serde_json::json!({});
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        delete_lp_line(&mut ctx, &holder, &amm, &currency_hex).unwrap();
+        assert!(!ctx.view.exists(&line_key));
+
+        let metadata = sandbox
+            .into_changes()
+            .build_metadata(0, 0, &HashMap::new(), None)
+            .to_canonical_json();
+        let deleted = metadata["AffectedNodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|node| node.get("DeletedNode"))
+            .filter(|node| node["LedgerIndex"] == line_key.to_string())
+            .unwrap();
+        assert_eq!(deleted["FinalFields"]["Balance"]["value"], "0");
+        assert_eq!(deleted["FinalFields"]["Flags"], no_ripple);
+        assert_eq!(
+            deleted["PreviousFields"]["Balance"]["value"],
+            line["Balance"]["value"]
+        );
+        assert_eq!(
+            deleted["PreviousFields"]["Flags"],
+            holder_reserve | no_ripple
         );
     }
 }
