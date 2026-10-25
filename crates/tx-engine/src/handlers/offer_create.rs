@@ -1456,10 +1456,11 @@ fn try_amm_step(
     } else {
         remaining_out.clone()
     };
-    // partial = !fok: a fill-or-kill offer crosses all-or-nothing, so an AMM that
-    // cannot deliver the full demand within budget delivers zero. A per-band spend
-    // by a FoK offer that later fails to fully cross is rolled back atomically —
-    // the transactor returns tecKILLED and the engine discards all mutations.
+    // A regular fill-or-kill offer requires the full output demand. tfSell changes
+    // that condition: its exact side is the input, so spending the entire input
+    // budget is a complete fill even when the output is below TakerPays. A
+    // per-band spend by a FoK offer that later fails is still rolled back
+    // atomically by the transactor.
     if let Some((delivered, spent)) = amm_hop(
         ctx,
         taker,
@@ -1470,7 +1471,7 @@ fn try_amm_step(
         /*skip_input_debit=*/ false,
         /*skip_output_credit=*/ false,
         /*create_missing_dest_line=*/ true,
-        /*partial=*/ !fok,
+        /*partial=*/ amm_offer_allows_partial_output(fok, is_sell),
         /*target_quality=*/ Some(cq),
     )? {
         // A tfSell fill can deliver more than the remaining TakerPays demand;
@@ -1484,6 +1485,10 @@ fn try_amm_step(
         *crossed = true;
     }
     Ok(())
+}
+
+fn amm_offer_allows_partial_output(fok: bool, is_sell: bool) -> bool {
+    !fok || is_sell
 }
 
 /// Cross the XRP-intermediate autobridge path (`in -> XRP -> out`, a prebuilt
@@ -1938,17 +1943,23 @@ fn cross_book_hop(
             let mut take_out = leg_min(&remaining_out_cap, &avail_out);
             // rippled forks on the INPUT side (StrandFlow reverse-then-forward,
             // maxIn < requiredIn at step 0): the SendMax budget binds only when it
-            // cannot afford the ceilOut input cost of the demanded output. Testing
-            // the demanded output against the floored `budget_out` false-positives
-            // on the flooring tie (105500016: budget_out 12.9959 floors to 12, ties
-            // demand 12, though the 0.0000145 budget can pay the 0.0000134 cost).
+            // cannot afford the ceilOut input cost of the demanded output. A
+            // floored `budget_out` that merely equals demand is not sufficient to
+            // prove the budget binds (105500016), but one strictly below demand is
+            // definitive even if proportional offer-field pricing rounds down.
             // This step-0 forward re-run only applies to a TERMINAL take with a
             // bounded demand (single-book conversion). An interior hop carries the
             // unbounded-demand sentinel, so its ceilOut input cost is meaningless;
             // keep the output-side test there (the #337 walk-stop relies on it).
             let budget_binds = if terminal {
-                let in_for_take = in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate);
-                !leg_ge(&remaining_in, &in_for_take)
+                terminal_budget_binds(
+                    &remaining_in,
+                    &take_out,
+                    &budget_out,
+                    &offer_in,
+                    &offer_out,
+                    &eff_rate,
+                )
             } else {
                 leg_ge(&take_out, &budget_out)
             };
@@ -2203,6 +2214,26 @@ fn cross_book_hop(
     }
 
     Ok((delivered, spent))
+}
+
+fn terminal_budget_binds(
+    remaining_in: &Leg,
+    take_out: &Leg,
+    budget_out: &Leg,
+    offer_in: &Leg,
+    offer_out: &Leg,
+    rate: &IOUAmount,
+) -> bool {
+    // A proportional cost computed from the offer's current fields can round
+    // down enough to fit even when the fixed book quality says the budget buys
+    // strictly less than the requested output. Preserve the proportional check
+    // for floor-equality cases, but always bind when floor(in / quality) is
+    // strictly below the demand (105500074).
+    !leg_ge(budget_out, take_out)
+        || !leg_ge(
+            remaining_in,
+            &in_for_out_offer(offer_in, take_out, offer_out, rate),
+        )
 }
 
 /// Cross a chain of order books (a single resolved path), forwarding each
@@ -6326,9 +6357,10 @@ fn taker_cross(
 mod taker_crossing_tests {
     use super::{
         Leg, TakerCrossType, add_iou_balance, composed_quality, flow_iou_to_iou, flow_iou_to_xrp,
-        flow_xrp_to_iou, in_for_out, leftover_is_dust, leftover_leg, leg_gt, leg_max, pack_rate,
-        parity_rate, qual_div, qual_mul, reject_quality, remaining_is_filled,
-        remaining_is_filled_at, remaining_offer, select_path, sell_clamp_sub,
+        flow_xrp_to_iou, in_for_out, in_for_out_offer, leftover_is_dust, leftover_leg, leg_ge,
+        leg_gt, leg_max, out_for_in, pack_rate, parity_rate, qual_div, qual_mul, reject_quality,
+        remaining_is_filled, remaining_is_filled_at, remaining_offer, select_path, sell_clamp_sub,
+        terminal_budget_binds,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, offer_quality};
     use rxrpl_primitives::AccountId;
@@ -6402,6 +6434,33 @@ mod taker_crossing_tests {
                 .to_decimal_string(),
             "52.38814400000006"
         );
+    }
+
+    #[test]
+    fn ledger_105500074_sendmax_binds_below_requested_output() {
+        let budget = xrp(10_000_000);
+        let offer_in = xrp(8_899_212_829);
+        let offer_out = iou("889921283.0178205");
+        let demand = iou("1000000.000132394");
+        let rate = from_rate(0x5603_8D7E_A4C6_8000).unwrap();
+        let budget_out = out_for_in(&budget, &rate, &offer_out);
+
+        assert_eq!(budget_out.iou.to_decimal_string(), "1000000");
+        assert!(
+            leg_ge(
+                &budget,
+                &in_for_out_offer(&offer_in, &demand, &offer_out, &rate)
+            ),
+            "proportional offer-field pricing reproduces the old non-binding decision"
+        );
+        assert!(terminal_budget_binds(
+            &budget,
+            &demand,
+            &budget_out,
+            &offer_in,
+            &offer_out,
+            &rate,
+        ));
     }
 
     #[test]
@@ -6965,7 +7024,7 @@ mod book_directory_quality_tests {
 
 #[cfg(test)]
 mod amm_quality_gate_tests {
-    use super::num_quality_iou;
+    use super::{amm_offer_allows_partial_output, num_quality_iou};
     use rxrpl_amount::number::Number;
 
     // Mainnet tx 062FDE11 (ledger 105333100): offer sells 1061920 USD for
@@ -6999,6 +7058,18 @@ mod amm_quality_gate_tests {
             !rxrpl_amount::is_better_quality(spq, cq)
                 || rxrpl_amount::within_relative_distance(spq, cq),
             "AMM spot must not beat the offer limit -> no cross"
+        );
+    }
+
+    #[test]
+    fn ledger_105500075_fok_sell_is_input_exact() {
+        assert!(
+            amm_offer_allows_partial_output(true, true),
+            "tfSell + FOK must spend the exact TakerGets input through the AMM"
+        );
+        assert!(
+            !amm_offer_allows_partial_output(true, false),
+            "a regular FOK still requires the full output demand"
         );
     }
 }
