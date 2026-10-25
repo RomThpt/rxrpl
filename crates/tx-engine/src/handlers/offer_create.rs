@@ -2670,6 +2670,14 @@ fn pool_balance_number(
 /// count is bumped on the in-memory `holder_acct` (committed by the caller). The
 /// balance is left at zero here — the caller's `set_iou_holding` writes it with
 /// the correct low/high sign.
+fn can_fund_new_trust_line(account: &Value, next_reserve: u64) -> bool {
+    let owner_count = helpers::get_owner_count(account);
+    // XRPL waives the incremental owner reserve for an account's first two
+    // trust lines. Beyond that bootstrap allowance, an implicit line must be
+    // backed by the account reserve just like an explicitly created line.
+    owner_count < 2 || helpers::get_balance(account) >= next_reserve
+}
+
 fn create_iou_trust_line(
     ctx: &mut ApplyContext<'_>,
     holder: &AccountId,
@@ -2932,6 +2940,30 @@ fn amm_hop(
     } else {
         pool_spent.clone()
     };
+
+    // A missing destination line makes this AMM step dry when accepting the
+    // output would create an unfunded owned object. Check before moving either
+    // side of the swap: Flow discards this liquidity candidate and may continue
+    // with another strand, rather than surfacing a trust-line reserve tec.
+    if !out_xrp && !skip_output_credit && create_missing_dest_line {
+        let tl_key = keylet::trust_line(dest, &demand_out.issuer, &demand_out.currency);
+        if ctx.view.read(&tl_key).is_none() {
+            let dest_account = if dest == taker {
+                Some(taker_acct.clone())
+            } else {
+                ctx.view
+                    .read(&keylet::account(dest))
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            };
+            let can_create = dest_account.as_ref().is_some_and(|account| {
+                let next = helpers::get_owner_count(account).saturating_add(1);
+                can_fund_new_trust_line(account, ctx.fees.account_reserve(next))
+            });
+            if !can_create {
+                return Ok(None);
+            }
+        }
+    }
 
     // --- Apply the input: move `spent` from the source into the pool. ---
     if in_xrp {
@@ -7226,7 +7258,7 @@ mod amm_quality_gate_tests {
 
 #[cfg(test)]
 mod flow_source_balance_tests {
-    use super::{aggregate_flow_source_balance, preserve_flow_output_ulp};
+    use super::{aggregate_flow_source_balance, can_fund_new_trust_line, preserve_flow_output_ulp};
     use rxrpl_amount::IOUAmount;
     use rxrpl_amount::number::Number;
 
@@ -7248,6 +7280,21 @@ mod flow_source_balance_tests {
         let delivered =
             Number::from_iou(&IOUAmount::from_decimal_string("6762.885132533594").unwrap());
         assert!(preserve_flow_output_ulp(&delivered, &delivered, false));
+    }
+
+    #[test]
+    fn rejects_unfunded_implicit_trust_line_after_bootstrap() {
+        let account = serde_json::json!({"Balance": "2635820", "OwnerCount": 8});
+        assert!(!can_fund_new_trust_line(&account, 2_800_000));
+    }
+
+    #[test]
+    fn permits_bootstrap_or_funded_implicit_trust_line() {
+        let bootstrap = serde_json::json!({"Balance": "1000000", "OwnerCount": 1});
+        assert!(can_fund_new_trust_line(&bootstrap, 1_400_000));
+
+        let funded = serde_json::json!({"Balance": "2800000", "OwnerCount": 8});
+        assert!(can_fund_new_trust_line(&funded, 2_800_000));
     }
 }
 
