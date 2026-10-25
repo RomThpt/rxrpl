@@ -1532,6 +1532,11 @@ fn try_bridge_step(
     // limit. Committing each individually-profitable band diverged for both
     // sell and buy OfferCreate transactions (mainnet 105500132 and 105500135).
     let cp = ctx.view.checkpoint();
+    // `taker_acct` is a detached JSON value held by OfferCreate while the rest
+    // of the candidate lives in the sandbox. Candidate execution may update its
+    // OwnerCount (for example while creating a temporary trust line), so a view
+    // rollback must restore this value as well.
+    let taker_acct_before = taker_acct.clone();
     let mut pass_ins = Vec::new();
     let mut pass_outs = Vec::new();
     let mut demand = if is_sell {
@@ -1581,6 +1586,7 @@ fn try_bridge_step(
 
     if pass_ins.is_empty() {
         ctx.view.rollback(cp);
+        *taker_acct = taker_acct_before;
         return Ok(());
     }
     let total_in = sum_smallest_to_largest(&pass_ins);
@@ -1595,6 +1601,7 @@ fn try_bridge_step(
     .unwrap_or(u64::MAX);
     if !rxrpl_amount::is_better_quality(eff_q, cq) {
         ctx.view.rollback(cp);
+        *taker_acct = taker_acct_before;
         return Ok(());
     }
 
@@ -2029,10 +2036,14 @@ fn cross_book_hop(
 
             // Paying the offer's TakerPays must consume TakerGets. out_for_in
             // of exact Pays can floor short of Gets (30000099 0C0344E7).
-            let full_take = leg_ge(&take_out, &offer_out)
-                || (leg_ge(&remaining_in, &offer_in) && leg_ge(&remaining_out_cap, &offer_out))
-                || (legs_eq_or_one_ulp(&remaining_in, &offer_in)
-                    && leg_ge(&remaining_out_cap, &offer_out));
+            let full_take = full_offer_take(
+                &take_out,
+                &avail_out,
+                &remaining_in,
+                &remaining_out_cap,
+                &offer_in,
+                &offer_out,
+            );
             if full_take {
                 consumed_whole_offer = true;
             }
@@ -5406,6 +5417,23 @@ fn leg_gt(a: &Leg, b: &Leg) -> bool {
     !leg_ge(b, a)
 }
 
+/// Whether this fill consumes the resting offer itself, as opposed to merely
+/// exhausting the maker's currently available funds. The budget/demand
+/// shortcut is valid only when the entire TakerGets side is funded.
+fn full_offer_take(
+    take_out: &Leg,
+    avail_out: &Leg,
+    remaining_in: &Leg,
+    remaining_out: &Leg,
+    offer_in: &Leg,
+    offer_out: &Leg,
+) -> bool {
+    leg_ge(avail_out, offer_out)
+        && (leg_ge(take_out, offer_out)
+            || (leg_ge(remaining_in, offer_in) && leg_ge(remaining_out, offer_out))
+            || (legs_eq_or_one_ulp(remaining_in, offer_in) && leg_ge(remaining_out, offer_out)))
+}
+
 /// Pack an `IOUAmount` rate into a book-directory quality u64 (rippled
 /// `Quality(uint64)` layout: `(exponent+100)<<56 | mantissa`).
 fn pack_rate(rate: &IOUAmount) -> u64 {
@@ -6533,9 +6561,9 @@ fn taker_cross(
 mod taker_crossing_tests {
     use super::{
         Leg, TakerCrossType, add_iou_balance, composed_quality, crossing_threshold,
-        flow_iou_to_iou, flow_iou_to_xrp, flow_xrp_to_iou, in_for_out, in_for_out_offer,
-        leftover_is_dust, leftover_leg, leg_ge, leg_gt, leg_max, out_for_in, pack_rate,
-        parity_rate, qual_div, qual_mul, reject_quality, remaining_is_filled,
+        flow_iou_to_iou, flow_iou_to_xrp, flow_xrp_to_iou, full_offer_take, in_for_out,
+        in_for_out_offer, leftover_is_dust, leftover_leg, leg_ge, leg_gt, leg_max, out_for_in,
+        pack_rate, parity_rate, qual_div, qual_mul, reject_quality, remaining_is_filled,
         remaining_is_filled_at, remaining_offer, select_path, sell_clamp_sub,
         terminal_budget_binds,
     };
@@ -6802,6 +6830,32 @@ mod taker_crossing_tests {
         assert!(!rxrpl_amount::is_better_quality(
             aggregate_quality,
             threshold
+        ));
+    }
+
+    #[test]
+    fn maker_funds_gate_full_offer_take() {
+        let offer_out = iou("2.325403");
+        let funded_out = iou("0.696834");
+        let offer_in = iou("2.088622");
+        let remaining_in = iou("2.694554");
+        let remaining_out = offer_out.clone();
+
+        assert!(!full_offer_take(
+            &funded_out,
+            &funded_out,
+            &remaining_in,
+            &remaining_out,
+            &offer_in,
+            &offer_out,
+        ));
+        assert!(full_offer_take(
+            &offer_out,
+            &offer_out,
+            &remaining_in,
+            &remaining_out,
+            &offer_in,
+            &offer_out,
         ));
     }
 
