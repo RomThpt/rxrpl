@@ -4428,18 +4428,26 @@ pub(crate) fn flow_multi(
 
     let actual_out = sum_smallest_to_largest(&saved_outs);
     let actual_in = sum_smallest_to_largest(&saved_ins);
+    let input_exhausted = actual_in.sub(send_max).is_zero();
     // rippled's source DirectStep settles the aggregate Flow input. Our
     // collapsed book/AMM hop settles each synthetic offer separately, which
     // can accumulate a one-ULP drift on a nearly drained trust line. Restore
     // the source endpoint from its pre-flow balance and the canonical
     // smallest-to-largest total while leaving pool/maker settlement per pass.
-    if saved_ins.len() > 1
+    // When the source budget is exhausted, however, the terminal forward pass
+    // keeps its upward endpoint rounding. Replacing those per-pass debits with
+    // the exact SendMax loses one ULP on a nearly drained line (105500117).
+    if !input_exhausted
+        && saved_ins.len() > 1
         && let Some(source) = source_balance.as_ref()
     {
         reconcile_flow_source_balance(ctx, source, &actual_in);
     }
-    let preserve_output_ulp =
-        preserve_flow_output_ulp(&actual_out, deliver_req, preserve_output_ulp);
+    let preserve_output_ulp = preserve_flow_output_ulp(
+        &actual_out,
+        deliver_req,
+        preserve_output_ulp || input_exhausted,
+    );
     (actual_out, actual_in, preserve_output_ulp)
 }
 
