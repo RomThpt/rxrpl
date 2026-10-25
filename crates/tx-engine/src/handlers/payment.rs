@@ -1225,16 +1225,17 @@ fn apply_paths_payment_multi(
     let send_max_num = value_to_number(&send_max);
 
     let mut amm_ctx = crate::handlers::flow::AmmContext::new(strands.len() > 1);
-    let (delivered_num, _spent_num) = crate::handlers::offer_create::flow_multi(
-        ctx,
-        &src_id,
-        &mut acct,
-        &dst_id,
-        &strands,
-        &deliver_req,
-        &send_max_num,
-        &mut amm_ctx,
-    );
+    let (delivered_num, _spent_num, preserve_output_ulp) =
+        crate::handlers::offer_create::flow_multi(
+            ctx,
+            &src_id,
+            &mut acct,
+            &dst_id,
+            &strands,
+            &deliver_req,
+            &send_max_num,
+            &mut amm_ctx,
+        );
 
     if delivered_num.is_zero() {
         // Zero delivery is dry, not partial (rippled StrandFlow.h:805).
@@ -1252,7 +1253,7 @@ fn apply_paths_payment_multi(
             );
             delivered_num.to_iou()
         };
-        if delivered_iou.mantissa() > 0 {
+        if !preserve_output_ulp && delivered_iou.mantissa() > 0 {
             delivered_iou = rxrpl_amount::IOUAmount::from_parts(
                 delivered_iou.mantissa() - 1,
                 delivered_iou.exponent(),

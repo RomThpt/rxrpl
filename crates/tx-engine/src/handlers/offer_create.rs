@@ -1699,6 +1699,7 @@ pub(crate) fn cross_book_payment(
         /*skip_output_credit=*/ false,
         /*single_band=*/ false,
         /*lq_stop=*/ None,
+        /*preserve_input_limited_iou_ulp=*/ false,
     )?;
     Ok((
         delivered.with_amount(&delivered.iou, delivered.drops),
@@ -1733,6 +1734,7 @@ fn cross_book_hop(
     skip_output_credit: bool,
     single_band: bool,
     lq_stop: Option<(u64, u64)>,
+    preserve_input_limited_iou_ulp: bool,
 ) -> Result<(Leg, Leg), TransactionResult> {
     let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
     let inverse_book = keylet::book_dir(
@@ -2134,6 +2136,7 @@ fn cross_book_hop(
                 if skip_input_debit
                     && budget_binds
                     && !new_gets.is_xrp
+                    && !preserve_input_limited_iou_ulp
                     && new_gets.iou.mantissa() > 0
                 {
                     if let Ok(trimmed) = IOUAmount::from_parts(
@@ -2432,6 +2435,7 @@ pub(crate) fn cross_path_payment(
             /*skip_output_credit=*/ !is_last,
             /*single_band=*/ limit_quality && is_last && reverse_amts.is_none(),
             lq_stop,
+            /*preserve_input_limited_iou_ulp=*/ false,
         )?;
 
         // Residual liquidity from the AMM pool for this pair, on the budget not
@@ -3568,6 +3572,7 @@ struct StrandPass {
     in_amt: Number,
     out_amt: Number,
     offers_used: u32,
+    preserve_output_ulp: bool,
 }
 
 /// The best-page (tip) quality of an order book, or `None` when empty.
@@ -3833,6 +3838,7 @@ fn price_clob_band_reverse(
         /*skip_output_credit=*/ !is_last,
         /*single_band=*/ true,
         /*lq_stop=*/ None,
+        /*preserve_input_limited_iou_ulp=*/ false,
     );
     ctx.view.rollback(cp);
     let (delivered, spent) = res.ok()?;
@@ -4064,6 +4070,8 @@ fn execute_strand_pass(
                     /*skip_output_credit=*/ !is_last,
                     /*single_band=*/ true,
                     /*lq_stop=*/ None,
+                    /*preserve_input_limited_iou_ulp=*/
+                    h > 0 && h > limiting && kinds[h - 1] == HopKindR::Amm,
                 )
                 .ok()?;
                 if delivered.is_zero() || spent.is_zero() {
@@ -4091,6 +4099,10 @@ fn execute_strand_pass(
         in_amt: source_in,
         out_amt: carry,
         offers_used: 0,
+        preserve_output_ulp: n > 1
+            && limiting < n - 1
+            && kinds[n - 2] == HopKindR::Amm
+            && kinds[n - 1] == HopKindR::Clob,
     })
 }
 
@@ -4111,7 +4123,7 @@ pub(crate) fn flow_multi(
     deliver_req: &Number,
     send_max: &Number,
     amm_ctx: &mut AmmContext,
-) -> (Number, Number) {
+) -> (Number, Number, bool) {
     let trace = std::env::var("RXRPL_FLOW_TRACE").is_ok();
     if trace {
         eprintln!(
@@ -4136,6 +4148,7 @@ pub(crate) fn flow_multi(
     let mut saved_ins: Vec<Number> = Vec::new();
     let mut saved_outs: Vec<Number> = Vec::new();
     let mut offers_considered = 0u32;
+    let mut preserve_output_ulp = false;
 
     for cur_try in 0..FLOW_MAX_TRIES {
         let remaining_out = {
@@ -4247,6 +4260,7 @@ pub(crate) fn flow_multi(
         }
         saved_ins.push(res.in_amt);
         saved_outs.push(res.out_amt);
+        preserve_output_ulp |= res.preserve_output_ulp;
         // (E) advance the fib counter once per committed winner.
         amm_ctx.update();
 
@@ -4258,6 +4272,7 @@ pub(crate) fn flow_multi(
     (
         sum_smallest_to_largest(&saved_outs),
         sum_smallest_to_largest(&saved_ins),
+        preserve_output_ulp,
     )
 }
 
