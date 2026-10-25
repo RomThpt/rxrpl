@@ -1137,6 +1137,7 @@ fn cross_offers(
                     dir_quality,
                     fok,
                     is_sell,
+                    /*cap_ending_spot_price=*/ true,
                 )?;
                 if remaining_out.is_zero() || remaining_in.is_zero() {
                     break 'walk; // AMM alone met the demand (or exhausted the taker's funds)
@@ -1406,6 +1407,7 @@ fn cross_offers(
                 threshold,
                 fok,
                 is_sell,
+                /*cap_ending_spot_price=*/ false,
             )?;
         }
     }
@@ -1435,6 +1437,7 @@ fn try_amm_step(
     cq: u64,
     fok: bool,
     is_sell: bool,
+    cap_ending_spot_price: bool,
 ) -> Result<(), TransactionResult> {
     // rippled's flowCross limits the crossing input to the taker's funds
     // (`sendMax = min(takerAmount.in, accountFunds)`, OfferCreate.cpp:400): the
@@ -1473,6 +1476,7 @@ fn try_amm_step(
         /*create_missing_dest_line=*/ true,
         /*partial=*/ amm_offer_allows_partial_output(fok, is_sell),
         /*target_quality=*/ Some(cq),
+        cap_ending_spot_price,
     )? {
         // A tfSell fill can deliver more than the remaining TakerPays demand;
         // clamp the demand at zero rather than underflowing the drops/mantissa.
@@ -1831,6 +1835,7 @@ fn cross_book_hop(
                     /*create_missing_dest_line=*/ true,
                     /*partial=*/ true,
                     /*target_quality=*/ Some(dir_quality),
+                    /*cap_ending_spot_price=*/ true,
                 )? {
                     remaining_out = leg_sub_round(&remaining_out, &amm_out);
                     remaining_in = leg_sub_round(&remaining_in, &amm_spent);
@@ -2460,6 +2465,7 @@ pub(crate) fn cross_path_payment(
                 /*create_missing_dest_line=*/ false,
                 /*partial=*/ true,
                 /*target_quality=*/ None,
+                /*cap_ending_spot_price=*/ false,
             )? {
                 got = leg_add(&got, &amm_out);
                 spent = leg_add(&spent, &amm_spent);
@@ -2775,6 +2781,7 @@ fn amm_hop(
     create_missing_dest_line: bool,
     partial: bool,
     target_quality: Option<u64>,
+    cap_ending_spot_price: bool,
 ) -> Result<Option<(Leg, Leg)>, TransactionResult> {
     let in_xrp = budget_in.is_xrp;
     let out_xrp = demand_out.is_xrp;
@@ -2864,19 +2871,49 @@ fn amm_hop(
     // (fill-or-kill) crossing is all-or-nothing: it delivers the FULL demand or
     // nothing (never a partial spend), matching rippled's flow() with
     // partialPayment=false.
-    let out_full =
-        crate::amm_helpers::swap_asset_in(&pool_in, &pool_out, &budget_num, tfee, out_xrp);
+    // A single-path AMM competes only down to the current CLOB/taker quality.
+    // Size the synthetic offer at that boundary before applying sendmax or
+    // deliver limits; otherwise tfSell consumes its whole input even after the
+    // AMM curve has become worse than the resting book.
+    let quality_cap = if let Some(cq) = target_quality {
+        if cap_ending_spot_price {
+            crate::amm_helpers::change_spot_price_quality(
+                &pool_in, &pool_out, cq, tfee, in_xrp, out_xrp,
+            )
+        } else {
+            crate::amm_helpers::limit_input_quality(&pool_in, &pool_out, cq, tfee, in_xrp, out_xrp)
+        }
+    } else {
+        Some((
+            budget_num,
+            crate::amm_helpers::swap_asset_in(&pool_in, &pool_out, &budget_num, tfee, out_xrp),
+        ))
+    };
+    let Some((quality_budget, quality_output)) = quality_cap else {
+        return Ok(None);
+    };
+    let capped_by_quality = num_le(&quality_budget, &budget_num);
+    let capped_budget = if capped_by_quality {
+        quality_budget
+    } else {
+        budget_num
+    };
+    let out_full = if capped_by_quality {
+        quality_output
+    } else {
+        crate::amm_helpers::swap_asset_in(&pool_in, &pool_out, &capped_budget, tfee, out_xrp)
+    };
     let (spent_num, deliver_num) = if !partial {
         match crate::amm_helpers::swap_asset_out(&pool_in, &pool_out, &demand_num, tfee, in_xrp) {
-            Some(needed) if num_le(&needed, &budget_num) => (needed, demand_num),
+            Some(needed) if num_le(&needed, &capped_budget) => (needed, demand_num),
             _ => return Ok(None),
         }
     } else if num_le(&out_full, &demand_num) {
-        (budget_num, out_full)
+        (capped_budget, out_full)
     } else {
         match crate::amm_helpers::swap_asset_out(&pool_in, &pool_out, &demand_num, tfee, in_xrp) {
             Some(needed) if num_le(&needed, &budget_num) => (needed, demand_num),
-            _ => (budget_num, out_full),
+            _ => (capped_budget, out_full),
         }
     };
     if deliver_num.is_zero() || spent_num.is_zero() {

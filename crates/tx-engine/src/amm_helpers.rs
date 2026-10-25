@@ -172,6 +172,207 @@ pub fn swap_asset_out(
     }
 }
 
+/// Size a single-path AMM offer so its ending spot price or realised quality
+/// reaches `target_quality` (rippled `changeSpotPriceQuality`, fixAMMv1_1).
+///
+/// `target_quality` is the packed XRPL input/output rate.  The returned input
+/// and output are rounded down on their respective asset grids, then the input
+/// is recomputed by [`swap_asset_out`] when the output side is economically
+/// coarser.  This is the depth cap used when an AMM competes with a CLOB band:
+/// consuming beyond it would cross at a worse quality than the resting book.
+#[allow(clippy::too_many_arguments)]
+pub fn change_spot_price_quality(
+    pool_in: &rxrpl_amount::number::Number,
+    pool_out: &rxrpl_amount::number::Number,
+    target_quality: u64,
+    tfee: u16,
+    in_is_xrp: bool,
+    out_is_xrp: bool,
+) -> Option<(rxrpl_amount::number::Number, rxrpl_amount::number::Number)> {
+    use rxrpl_amount::number::{
+        MantissaScale, MantissaScaleGuard, Number, RoundModeGuard, RoundingMode, root2,
+    };
+
+    let _scale = MantissaScaleGuard::new(MantissaScale::Small);
+    let _round = RoundModeGuard::new(RoundingMode::ToNearest);
+    let rate = Number::from_iou(&rxrpl_amount::from_rate(target_quality).ok()?);
+    if rate.is_zero() {
+        return None;
+    }
+    let one = Number::from_int(1);
+    let two = Number::from_int(2);
+    let four = Number::from_int(4);
+    let fee = Number::from_int(tfee as i64).div(&Number::from_int(100_000));
+    let f = one.sub(&fee);
+
+    let solve_smallest = |a: Number, b: Number, c: Number| -> Option<Number> {
+        let d = b.mul(&b).sub(&four.mul(&a).mul(&c));
+        if d.negative() {
+            return None;
+        }
+        let root = root2(d);
+        let denominator = if b.negative() {
+            b.negate().add(&root)
+        } else {
+            b.negate().sub(&root)
+        };
+        if denominator.is_zero() {
+            return None;
+        }
+        Some(two.mul(&c).div(&denominator))
+    };
+    let grid_down = |n: &Number, is_xrp: bool| -> Number {
+        let _g = RoundModeGuard::new(RoundingMode::Downward);
+        if is_xrp {
+            Number::from_int(n.to_xrp_drops_mode() as i64)
+        } else {
+            Number::from_iou(&n.to_iou())
+        }
+    };
+
+    // fixAMMv1_1 chooses the economically coarser integral side first.  For
+    // XRP/IOU this preserves the historical split: XRP output starts from the
+    // output, while XRP input starts from the input.
+    let start_with_output = out_is_xrp && (!in_is_xrp || !rate.sub(&one).negative());
+    let (mut amount_in, mut amount_out) = if start_with_output {
+        let a = one;
+        let b = pool_in
+            .mul(&one.sub(&one.div(&f)))
+            .div(&rate)
+            .sub(&two.mul(pool_out));
+        let c = pool_out
+            .mul(pool_out)
+            .sub(&pool_in.mul(pool_out).div(&rate));
+        let proposed = solve_smallest(a, b, c)?;
+        let constraint = pool_out.sub(&pool_in.div(&rate.mul(&f)));
+        let selected = if num_is_less(&constraint, &proposed) {
+            constraint
+        } else {
+            proposed
+        };
+        if selected.is_zero() || selected.negative() {
+            return None;
+        }
+        let out = grid_down(&selected, out_is_xrp);
+        let input = swap_asset_out(pool_in, pool_out, &out, tfee, in_is_xrp)?;
+        (input, out)
+    } else {
+        let a = f;
+        let b = pool_in.mul(&one.add(&f));
+        let c = pool_in.mul(pool_in).sub(&pool_in.mul(pool_out).mul(&rate));
+        let proposed = solve_smallest(a, b, c)?;
+        let constraint = pool_out.mul(&rate).sub(&pool_in.div(&f));
+        let selected = if num_is_less(&constraint, &proposed) {
+            constraint
+        } else {
+            proposed
+        };
+        if selected.is_zero() || selected.negative() {
+            return None;
+        }
+        let input = grid_down(&selected, in_is_xrp);
+        let output = swap_asset_in(pool_in, pool_out, &input, tfee, out_is_xrp);
+        (input, output)
+    };
+
+    if amount_in.is_zero() || amount_out.is_zero() {
+        return None;
+    }
+    if amm_amount_quality(&amount_in, in_is_xrp, &amount_out, out_is_xrp)? > target_quality {
+        // `reduceOffer`: improve a result that landed just below the requested
+        // quality because one side was rounded onto an integral asset grid.
+        let reduced = Number::from_int(9_999).div(&Number::from_int(10_000));
+        if start_with_output {
+            amount_out = grid_down(&amount_out.mul(&reduced), out_is_xrp);
+            amount_in = swap_asset_out(pool_in, pool_out, &amount_out, tfee, in_is_xrp)?;
+        } else {
+            amount_in = grid_down(&amount_in.mul(&reduced), in_is_xrp);
+            amount_out = swap_asset_in(pool_in, pool_out, &amount_in, tfee, out_is_xrp);
+        }
+    }
+    Some((amount_in, amount_out))
+}
+
+/// Largest input whose realised AMM offer quality is no worse than the taker's
+/// overall limit. Unlike [`change_spot_price_quality`], this does not also cap
+/// the ending spot price: that stricter cap is only needed against a CLOB tip.
+pub fn limit_input_quality(
+    pool_in: &rxrpl_amount::number::Number,
+    pool_out: &rxrpl_amount::number::Number,
+    target_quality: u64,
+    tfee: u16,
+    in_is_xrp: bool,
+    out_is_xrp: bool,
+) -> Option<(rxrpl_amount::number::Number, rxrpl_amount::number::Number)> {
+    use rxrpl_amount::number::{
+        MantissaScale, MantissaScaleGuard, Number, RoundModeGuard, RoundingMode,
+    };
+
+    let _scale = MantissaScaleGuard::new(MantissaScale::Small);
+    // The reserves were read before this helper installed the Small scale.
+    // Re-materialize them so their mantissas belong to the same Number context
+    // as every intermediate, matching rippled's transaction-wide scale.
+    let pool_in = if in_is_xrp {
+        Number::from_int(pool_in.to_xrp_drops() as i64)
+    } else {
+        Number::from_iou(&pool_in.to_iou())
+    };
+    let pool_out = if out_is_xrp {
+        Number::from_int(pool_out.to_xrp_drops() as i64)
+    } else {
+        Number::from_iou(&pool_out.to_iou())
+    };
+    let rate = Number::from_iou(&rxrpl_amount::from_rate(target_quality).ok()?);
+    if rate.is_zero() {
+        return None;
+    }
+    // QualityFunction(AMM): q(out) = m*out + b, where q is output/input.
+    let fee = Number::from_int(tfee as i64).div(&Number::from_int(100_000));
+    let fee_mult = Number::from_int(1).sub(&fee);
+    let m = fee_mult.negate().div(&pool_in);
+    let b = pool_out.mul(&fee_mult).div(&pool_in);
+    let raw_output = {
+        // QualityFunction::outFromAvgQ performs the whole solve upward.
+        let _g = RoundModeGuard::new(RoundingMode::Upward);
+        let raw = Number::from_int(1).div(&rate).sub(&b).div(&m);
+        if raw.is_zero() || raw.negative() {
+            return None;
+        }
+        raw
+    };
+    let output = {
+        let _g = RoundModeGuard::new(RoundingMode::Downward);
+        if out_is_xrp {
+            Number::from_int(raw_output.to_xrp_drops_mode() as i64)
+        } else {
+            Number::from_iou(&raw_output.to_iou())
+        }
+    };
+    let input = swap_asset_out(&pool_in, &pool_out, &output, tfee, in_is_xrp)?;
+    Some((input, output))
+}
+
+fn num_is_less(lhs: &rxrpl_amount::number::Number, rhs: &rxrpl_amount::number::Number) -> bool {
+    lhs.sub(rhs).negative()
+}
+
+fn amm_amount_quality(
+    input: &rxrpl_amount::number::Number,
+    in_is_xrp: bool,
+    output: &rxrpl_amount::number::Number,
+    out_is_xrp: bool,
+) -> Option<u64> {
+    use rxrpl_amount::IOUAmount;
+    let as_iou = |n: &rxrpl_amount::number::Number, is_xrp: bool| {
+        if is_xrp {
+            IOUAmount::from_decimal_string(&n.to_xrp_drops().to_string()).unwrap_or(IOUAmount::ZERO)
+        } else {
+            n.to_iou()
+        }
+    };
+    rxrpl_amount::get_rate(&as_iou(input, in_is_xrp), &as_iou(output, out_is_xrp)).ok()
+}
+
 /// Single-asset deposit: LP tokens issued for depositing `deposit` of an asset
 /// whose pool balance is `pool`, against `total_lp` outstanding, with trading
 /// fee `tfee` (1/100000). Mirrors rippled `lpTokensOut` under fixAMMv1_3
@@ -1037,6 +1238,19 @@ mod tests {
             cost.to_xrp_drops_mode() > 11_767_578,
             "FoK offer must be killed"
         );
+    }
+
+    #[test]
+    fn change_spot_price_quality_octopus_depth() {
+        let pool_in = Number::from_int(70_747_282);
+        let pool_out = Number::from_iou(&parse_iou_value("448506502.6369784"));
+        let offer_in = rxrpl_amount::IOUAmount::from_decimal_string("15000000").unwrap();
+        let offer_out = rxrpl_amount::IOUAmount::from_decimal_string("78132661.5888966").unwrap();
+        let quality = rxrpl_amount::get_rate_round_even(&offer_in, &offer_out).unwrap();
+        let (input, output) =
+            limit_input_quality(&pool_in, &pool_out, quality, 503, true, false).unwrap();
+        assert_eq!(input.to_xrp_drops_mode(), 14_999_865);
+        assert_eq!(output.to_iou().to_decimal_string(), "78131955.81042515");
     }
 
     // A Large-scale computation (deposit/withdraw default) must be unaffected by
