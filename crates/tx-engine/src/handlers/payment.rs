@@ -1,6 +1,8 @@
 use rxrpl_amendment::feature::feature_id;
+use rxrpl_amount::IOUAmount;
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::{TransactionResult, keylet};
+use serde_json::Value;
 
 use crate::amount_helpers::{compute_holder_balance, compute_new_iou_balance};
 use crate::helpers;
@@ -176,7 +178,24 @@ impl Transactor for PaymentTransactor {
                     && sm_iss == account_str
                     && am_iss == destination_str
                     && ctx.tx.get("Paths").is_none();
-                if !redeem_to_dest {
+                if redeem_to_dest {
+                    let amount_value = ctx.tx["Amount"]
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .ok_or(TransactionResult::TemBadAmount)?;
+                    let send_max_value = send_max
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .ok_or(TransactionResult::TemBadAmount)?;
+                    return apply_issuer_to_issuer(
+                        ctx,
+                        account_str,
+                        destination_str,
+                        &sm_cur,
+                        amount_value,
+                        send_max_value,
+                    );
+                } else {
                     // Multi-path Flow: a Payment with two or more alternative `Paths`
                     // that each resolve to a pure book/AMM boundary chain. rippled
                     // runs these through the multi-pass Flow loop, consuming any
@@ -514,6 +533,50 @@ fn apply_iou(
             .map_err(|_| TransactionResult::TefInternal)?;
     }
 
+    Ok(TransactionResult::TesSuccess)
+}
+
+/// Apply a same-currency payment where the source issues `SendMax` and the
+/// destination issues `Amount`. This is a direct ripple across their shared
+/// trust line: the source creates its obligation to the destination, with no
+/// order-book liquidity or source holder balance required.
+fn apply_issuer_to_issuer(
+    ctx: &mut ApplyContext<'_>,
+    source: &str,
+    destination: &str,
+    currency: &str,
+    value: &str,
+    send_max: &str,
+) -> Result<TransactionResult, TransactionResult> {
+    let value_amount =
+        IOUAmount::from_decimal_string(value).map_err(|_| TransactionResult::TemBadAmount)?;
+    let send_max_amount =
+        IOUAmount::from_decimal_string(send_max).map_err(|_| TransactionResult::TemBadAmount)?;
+    if value_amount > send_max_amount {
+        return Err(TransactionResult::TecPathPartial);
+    }
+
+    let source_id =
+        decode_account_id(source).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let destination_id =
+        decode_account_id(destination).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let line_key = keylet::trust_line(
+        &source_id,
+        &destination_id,
+        &helpers::currency_to_bytes(currency),
+    );
+    let line_bytes = ctx
+        .view
+        .read(&line_key)
+        .ok_or(TransactionResult::TecPathDry)?;
+    let mut line: Value =
+        serde_json::from_slice(&line_bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let new_value = compute_new_iou_balance(&line, value, &source_id, &destination_id)?;
+    line["Balance"]["value"] = Value::String(new_value);
+    let data = serde_json::to_vec(&line).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(line_key, data)
+        .map_err(|_| TransactionResult::TefInternal)?;
     Ok(TransactionResult::TesSuccess)
 }
 
