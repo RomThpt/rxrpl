@@ -2089,6 +2089,7 @@ fn cross_book_hop(
                 &order_out,
                 number_switchover,
                 skip_output_credit,
+                TransferFeeRounding::Down,
             )?;
             // Debiting Gets (e=-19) into a 22.45 BTC line (e=-14) truncates 1
             // ULP vs mainnet (30000099 0C0344E7). Give it back when the line
@@ -2784,7 +2785,14 @@ fn amm_hop(
         return Ok(None);
     }
 
-    let budget_num = leg_to_number(budget_in);
+    let input_fee_applies =
+        !skip_input_debit && !in_xrp && budget_in.issuer != *taker && budget_in.issuer != pool_id;
+    let pool_budget = if input_fee_applies {
+        div_nearest(budget_in, &transfer_rate(ctx, &budget_in.issuer), budget_in)
+    } else {
+        budget_in.clone()
+    };
+    let budget_num = leg_to_number(&pool_budget);
     let demand_num = leg_to_number(demand_out);
     if budget_num.is_zero() || budget_num.negative() {
         return Ok(None);
@@ -2843,6 +2851,19 @@ fn amm_hop(
         return Ok(None);
     }
 
+    // The AMM math prices the NET amount received by the pool. When the input
+    // issuer charges a transfer fee, the source spends the corresponding GROSS
+    // amount. Return that gross amount to the route driver; otherwise it treats
+    // the fee as unspent budget and incorrectly crosses a CLOB with the residue.
+    let pool_spent = number_to_leg(&spent_num, budget_in);
+    let source_spent = if input_fee_applies {
+        let mut gross = pool_spent.clone();
+        gross.iou = grossed(&pool_spent.iou, &transfer_rate(ctx, &budget_in.issuer));
+        gross
+    } else {
+        pool_spent.clone()
+    };
+
     // --- Apply the input: move `spent` from the source into the pool. ---
     if in_xrp {
         let drops = spent_num.to_xrp_drops() as i64;
@@ -2855,38 +2876,23 @@ fn amm_hop(
         }
         credit_xrp(ctx, &pool_id, drops)?;
     } else {
-        if !skip_input_debit {
-            let funds = crate::amm_helpers::iou_holding_number(
-                ctx.view,
-                taker,
-                &budget_in.issuer,
-                &budget_in.currency,
-            );
-            crate::amm_helpers::set_iou_holding(
-                ctx.view,
-                taker,
-                &budget_in.issuer,
-                &budget_in.currency,
-                &funds.sub(&spent_num),
-            )?;
-        }
-        let pool_h = crate::amm_helpers::iou_holding_number(
-            ctx.view,
+        pay_in(
+            ctx,
+            taker,
+            taker_acct,
             &pool_id,
-            &budget_in.issuer,
-            &budget_in.currency,
-        );
-        crate::amm_helpers::set_iou_holding(
-            ctx.view,
-            &pool_id,
-            &budget_in.issuer,
-            &budget_in.currency,
-            &pool_h.add(&spent_num),
+            &pool_spent,
+            ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+            skip_input_debit,
         )?;
     }
 
-    // --- Apply the output: move `delivered` from the pool to the recipient. ---
-    if out_xrp {
+    // --- Apply the output: move the pool's GROSS delivery to the recipient. ---
+    // For an IOU whose issuer charges a transfer fee, the pool loses the full
+    // swap output while the recipient receives the net amount. Keep that net as
+    // the hop's realised delivery so PartialPayment metadata and subsequent
+    // flow accounting agree with the trust-line movement.
+    let delivered = if out_xrp {
         let drops = deliver_num.to_xrp_drops() as i64;
         credit_xrp(ctx, &pool_id, -drops)?;
         if !skip_output_credit {
@@ -2896,20 +2902,8 @@ fn amm_hop(
                 credit_xrp(ctx, dest, drops)?;
             }
         }
+        number_to_leg(&deliver_num, demand_out)
     } else {
-        let pool_h = crate::amm_helpers::iou_holding_number(
-            ctx.view,
-            &pool_id,
-            &demand_out.issuer,
-            &demand_out.currency,
-        );
-        crate::amm_helpers::set_iou_holding(
-            ctx.view,
-            &pool_id,
-            &demand_out.issuer,
-            &demand_out.currency,
-            &pool_h.sub(&deliver_num),
-        )?;
         if !skip_output_credit {
             // rippled's rippleCredit auto-creates the receiver's trust line the
             // first time an AMM swap delivers an IOU it has never held.
@@ -2925,26 +2919,22 @@ fn amm_hop(
                     )?;
                 }
             }
-            let dest_h = crate::amm_helpers::iou_holding_number(
-                ctx.view,
-                dest,
-                &demand_out.issuer,
-                &demand_out.currency,
-            );
-            crate::amm_helpers::set_iou_holding(
-                ctx.view,
-                dest,
-                &demand_out.issuer,
-                &demand_out.currency,
-                &dest_h.add(&deliver_num),
-            )?;
         }
-    }
+        let gross = number_to_leg(&deliver_num, demand_out);
+        pay_out_gross(
+            ctx,
+            taker,
+            taker_acct,
+            &pool_id,
+            dest,
+            &gross,
+            ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+            skip_output_credit,
+            TransferFeeRounding::Nearest,
+        )?
+    };
 
-    Ok(Some((
-        number_to_leg(&deliver_num, demand_out),
-        number_to_leg(&spent_num, budget_in),
-    )))
+    Ok(Some((delivered, source_spent)))
 }
 
 /// Per-hop AMM pool snapshot for the reverse-then-forward strand flow.
@@ -3056,6 +3046,7 @@ fn apply_amm_move(
             &amount,
             ctx.rules.enabled(&feature_id("fixUniversalNumber")),
             skip_output_credit,
+            TransferFeeRounding::Down,
         )?;
         Ok(leg_to_number(&net))
     }
@@ -4491,13 +4482,19 @@ fn pay_out(
 /// path, where `amount` is the GROSS the offer provides — exactly the offer's
 /// TakerGets reduction and the owner's debit. The output issuer's transfer fee
 /// is charged out of that gross: the recipient receives `amount / transfer_rate`
-/// rounded DOWN (rippled never delivers more), and the difference is the burned
+/// with the caller's execution-path rounding, and the difference is the burned
 /// fee. rippled skips the fee whenever the issuer is itself a party (owner or
 /// recipient), so the net then equals the gross. XRP carries no transfer fee, so
 /// net == gross there. When `recipient` is the taker, its XRP credit goes
 /// through `taker_acct` (the caller's working copy) so the apply's final account
 /// write does not clobber it; a distinct recipient (cross-currency payment to
 /// another account) is credited through the view instead.
+#[derive(Clone, Copy)]
+enum TransferFeeRounding {
+    Down,
+    Nearest,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pay_out_gross(
     ctx: &mut ApplyContext<'_>,
@@ -4508,6 +4505,7 @@ fn pay_out_gross(
     amount: &Leg,
     round: bool,
     skip_recipient_credit: bool,
+    fee_rounding: TransferFeeRounding,
 ) -> Result<Leg, TransactionResult> {
     if amount.is_xrp {
         credit_xrp(ctx, owner, -amount.drops)?;
@@ -4534,7 +4532,15 @@ fn pay_out_gross(
         let rate = transfer_rate(ctx, &amount.issuer);
         let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
         if rate > one {
-            IOUAmount::div_round(&amount.iou, &rate, /*round_up*/ false).unwrap_or(amount.iou)
+            match fee_rounding {
+                TransferFeeRounding::Down => {
+                    IOUAmount::div_round(&amount.iou, &rate, /*round_up*/ false)
+                        .unwrap_or(amount.iou)
+                }
+                TransferFeeRounding::Nearest => rxrpl_amount::number::Number::from_iou(&amount.iou)
+                    .div(&rxrpl_amount::number::Number::from_iou(&rate))
+                    .to_iou(),
+            }
         } else {
             amount.iou
         }
@@ -6976,6 +6982,140 @@ mod amm_quality_gate_tests {
             !rxrpl_amount::is_better_quality(spq, cq)
                 || rxrpl_amount::within_relative_distance(spq, cq),
             "AMM spot must not beat the offer limit -> no cross"
+        );
+    }
+}
+
+#[cfg(test)]
+mod amm_transfer_fee_tests {
+    use super::*;
+    use crate::fees::FeeSettings;
+    use crate::view::ledger_view::LedgerView;
+    use crate::view::read_view::ReadView;
+    use crate::view::sandbox::Sandbox;
+    use rxrpl_amendment::Rules;
+    use rxrpl_ledger::Ledger;
+
+    const ISSUER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    const POOL: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
+    const RECIPIENT: &str = "rGWrZyQqhTp9Xu7G5Pkayo7bXjH4k4QYpf";
+
+    #[test]
+    fn amm_input_reports_the_source_gross_spend() {
+        let pool_net = IOUAmount::from_decimal_string("1.066554203744208").unwrap();
+        let rate = IOUAmount::from_parts(1_002_000_000, -9, false).unwrap();
+
+        assert_eq!(
+            grossed(&pool_net, &rate).to_decimal_string(),
+            "1.068687312151697"
+        );
+    }
+
+    fn put_line(ledger: &mut Ledger, holder: &str, value: &str) {
+        let holder_id = decode_account_id(holder).unwrap();
+        let issuer_id = decode_account_id(ISSUER).unwrap();
+        let currency = helpers::currency_to_bytes("USD");
+        let holder_is_low = holder_id.as_bytes() < issuer_id.as_bytes();
+        let amount = IOUAmount::from_decimal_string(value).unwrap();
+        let stored = if holder_is_low {
+            amount
+        } else {
+            amount.negate()
+        };
+        let (low, high) = if holder_is_low {
+            (holder, ISSUER)
+        } else {
+            (ISSUER, holder)
+        };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": stored.to_decimal_string()},
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "0"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "1000"},
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&holder_id, &issuer_id, &currency),
+                serde_json::to_vec(&line).unwrap(),
+            )
+            .unwrap();
+    }
+
+    fn holding(view: &dyn ReadView, holder: &str) -> IOUAmount {
+        let holder_id = decode_account_id(holder).unwrap();
+        let issuer_id = decode_account_id(ISSUER).unwrap();
+        let key = keylet::trust_line(&holder_id, &issuer_id, &helpers::currency_to_bytes("USD"));
+        let line: Value = serde_json::from_slice(&view.read(&key).unwrap()).unwrap();
+        let stored =
+            IOUAmount::from_decimal_string(line["Balance"]["value"].as_str().unwrap()).unwrap();
+        if holder_id.as_bytes() < issuer_id.as_bytes() {
+            stored
+        } else {
+            stored.negate()
+        }
+    }
+
+    #[test]
+    fn amm_output_charges_transfer_fee_from_gross_delivery() {
+        let mut ledger = Ledger::genesis();
+        for (address, transfer_rate) in [
+            (ISSUER, Some(1_002_000_000u64)),
+            (POOL, None),
+            (RECIPIENT, None),
+        ] {
+            let id = decode_account_id(address).unwrap();
+            let mut account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": address,
+                "Balance": "100000000", "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+            });
+            if let Some(rate) = transfer_rate {
+                account["TransferRate"] = Value::from(rate);
+            }
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        put_line(&mut ledger, POOL, "10");
+        put_line(&mut ledger, RECIPIENT, "0");
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({});
+        let mut taker_account = serde_json::json!({"Balance": "100000000"});
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let gross = Leg::parse(&serde_json::json!({
+            "currency": "USD", "issuer": ISSUER, "value": "1.070824686776"
+        }))
+        .unwrap();
+        let net = pay_out_gross(
+            &mut ctx,
+            &decode_account_id(RECIPIENT).unwrap(),
+            &mut taker_account,
+            &decode_account_id(POOL).unwrap(),
+            &decode_account_id(RECIPIENT).unwrap(),
+            &gross,
+            false,
+            false,
+            TransferFeeRounding::Nearest,
+        )
+        .unwrap();
+
+        assert_eq!(net.iou.to_decimal_string(), "1.068687312151697");
+        assert_eq!(
+            holding(&sandbox, POOL).to_decimal_string(),
+            "8.929175313224"
+        );
+        assert_eq!(
+            holding(&sandbox, RECIPIENT).to_decimal_string(),
+            "1.068687312151697"
         );
     }
 }
