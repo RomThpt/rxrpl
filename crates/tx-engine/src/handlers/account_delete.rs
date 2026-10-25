@@ -137,6 +137,10 @@ impl Transactor for AccountDeleteTransactor {
 
         // Get remaining balance (fee already deducted by engine)
         let remaining = helpers::get_balance(&src_obj);
+        // AccountDelete reports the XRP transferred to the destination through
+        // sfDeliveredAmount, just like rippled's DeleteAccount transactor.
+        ctx.view
+            .set_delivered_amount(Value::String(remaining.to_string()));
 
         // Transfer remaining balance to destination
         if remaining > 0 {
@@ -585,6 +589,10 @@ mod tests {
 
         let result = AccountDeleteTransactor.apply(&mut ctx).unwrap();
         assert_eq!(result, TransactionResult::TesSuccess);
+        assert_eq!(
+            sandbox.take_delivered_amount(),
+            Some(Value::String("10000000".to_string()))
+        );
 
         // Source should be erased
         let src_id = decode_account_id(SRC_ADDRESS).unwrap();
