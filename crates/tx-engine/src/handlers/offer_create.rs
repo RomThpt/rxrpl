@@ -3900,6 +3900,9 @@ pub(crate) fn build_flow_strand(
                                 Some(AmmLiquidity {
                                     in_is_xrp: in_leg.is_xrp,
                                     out_is_xrp: out_leg.is_xrp,
+                                    round_even_quality: ctx
+                                        .rules
+                                        .enabled(&feature_id("fixUniversalNumber")),
                                     tfee,
                                     initial_pool_in: pool_in,
                                     initial_pool_out: pool_out,

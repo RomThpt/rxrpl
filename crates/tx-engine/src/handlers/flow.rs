@@ -23,7 +23,9 @@
 use rxrpl_amount::number::{
     MantissaScale, MantissaScaleGuard, Number, RoundModeGuard, RoundingMode,
 };
-use rxrpl_amount::{IOUAmount, from_rate, get_rate, is_better_quality, within_relative_distance};
+use rxrpl_amount::{
+    Amount, IOUAmount, from_rate, get_rate, is_better_quality, within_relative_distance,
+};
 
 /// rippled `AMMContext::kMaxIterations` — an AMM may contribute at most 30 fib
 /// chunks across the whole multi-path payment.
@@ -116,6 +118,21 @@ fn quality_iou(n: &Number, is_xrp: bool) -> IOUAmount {
     }
 }
 
+fn number_amount(n: &Number, is_xrp: bool) -> Amount {
+    if is_xrp {
+        Amount::Xrp(n.to_xrp_drops() as i64)
+    } else {
+        Amount::Iou(n.to_iou())
+    }
+}
+
+fn amount_number(amount: Amount) -> Number {
+    match amount {
+        Amount::Xrp(drops) => Number::from_int(drops),
+        Amount::Iou(iou) => Number::from_iou(&iou),
+    }
+}
+
 /// `a >= b` for two `Number`s.
 fn num_ge(a: &Number, b: &Number) -> bool {
     let d = a.sub(b);
@@ -130,6 +147,7 @@ fn num_ge(a: &Number, b: &Number) -> bool {
 pub struct AmmLiquidity {
     pub in_is_xrp: bool,
     pub out_is_xrp: bool,
+    pub round_even_quality: bool,
     pub tfee: u16,
     pub initial_pool_in: Number,
     pub initial_pool_out: Number,
@@ -155,8 +173,10 @@ impl AmmLiquidity {
         // kInitialFibSeqPct = 5/20000 = 0.00025.
         let pct = Number::from_int(5).div(&Number::from_int(20_000));
         let seed_in = {
-            let _g = RoundModeGuard::new(RoundingMode::Upward);
+            // The product is evaluated before `toAmount` installs its directed
+            // conversion guard, so it keeps the ambient nearest rounding.
             let raw = pct.mul(&self.initial_pool_in);
+            let _g = RoundModeGuard::new(RoundingMode::Upward);
             to_amount_grid(&raw, self.in_is_xrp)
         };
         // cur.out = swapAssetIn(initialBalances, cur.in, tfee) (rounds OUT down).
@@ -183,8 +203,10 @@ impl AmmLiquidity {
 
         // cur.out = toAmount<Out>(seed_out * kFib[idx], Downward).
         let cur_out = {
-            let _g = RoundModeGuard::new(RoundingMode::Downward);
+            // As above, only the asset-grid conversion is directed. Applying
+            // Downward to the multiplication itself loses IOU ULPs per chunk.
             let raw = seed_out.mul(&Number::from_int(FIB[idx] as i64));
+            let _g = RoundModeGuard::new(RoundingMode::Downward);
             to_amount_grid(&raw, self.out_is_xrp)
         };
         // Overflow: fixAMMOverflowOffer active => nil.
@@ -230,11 +252,16 @@ impl AmmLiquidity {
 
         // Spot-price-quality gate: the AMM must STRICTLY beat the CLOB and not be
         // within 1e-7 of it.
-        let spq = get_rate(
-            &quality_iou(pool_in, self.in_is_xrp),
-            &quality_iou(pool_out, self.out_is_xrp),
-        )
-        .ok()?;
+        let quality_rate = |input: &Number, input_xrp: bool, output: &Number, output_xrp: bool| {
+            let input = quality_iou(input, input_xrp);
+            let output = quality_iou(output, output_xrp);
+            if self.round_even_quality {
+                rxrpl_amount::get_rate_round_even(&input, &output)
+            } else {
+                get_rate(&input, &output)
+            }
+        };
+        let spq = quality_rate(pool_in, self.in_is_xrp, pool_out, self.out_is_xrp).ok()?;
         if let Some(cq) = clob_quality {
             if !is_better_quality(spq, cq) || within_relative_distance(spq, cq) {
                 return None;
@@ -243,11 +270,7 @@ impl AmmLiquidity {
 
         // multiPath branch: the fib-sized chunk.
         let (off_in, off_out) = self.generate_fib_seq_offer(pool_in, pool_out, ctx)?;
-        let oq = get_rate(
-            &quality_iou(&off_in, self.in_is_xrp),
-            &quality_iou(&off_out, self.out_is_xrp),
-        )
-        .ok()?;
+        let oq = quality_rate(&off_in, self.in_is_xrp, &off_out, self.out_is_xrp).ok()?;
         if let Some(cq) = clob_quality {
             // Quality{amounts} < clobQuality => decline (chunk worse than CLOB).
             if is_better_quality(cq, oq) {
@@ -294,15 +317,15 @@ impl AmmOffer {
         if !num_gt(&self.out_num, limit) {
             return (self.in_num, self.out_num);
         }
-        let rate = Number::from_iou(&from_rate(self.quality).unwrap_or(IOUAmount::ZERO));
-        let new_in = {
-            let _g = RoundModeGuard::new(if round_up {
-                RoundingMode::Upward
-            } else {
-                RoundingMode::Downward
-            });
-            to_amount_grid(&limit.mul(&rate), self.in_is_xrp)
-        };
+        let rate = Amount::Iou(from_rate(self.quality).unwrap_or(IOUAmount::ZERO));
+        let new_in = Amount::mul_round_strict(
+            &number_amount(limit, self.out_is_xrp),
+            &rate,
+            self.in_is_xrp,
+            round_up,
+        )
+        .map(amount_number)
+        .unwrap_or(self.in_num);
         let new_in = if num_gt(&new_in, &self.in_num) {
             self.in_num
         } else {
@@ -319,21 +342,15 @@ impl AmmOffer {
         if !num_gt(&self.in_num, limit) {
             return (self.in_num, self.out_num);
         }
-        let rate = Number::from_iou(&from_rate(self.quality).unwrap_or(IOUAmount::ZERO));
-        let new_out = {
-            let _g = RoundModeGuard::new(if round_up {
-                RoundingMode::Upward
-            } else {
-                RoundingMode::Downward
-            });
-            // out = limit / rate
-            let raw = if rate.is_zero() {
-                Number::ZERO
-            } else {
-                limit.div(&rate)
-            };
-            to_amount_grid(&raw, self.out_is_xrp)
-        };
+        let rate = Amount::Iou(from_rate(self.quality).unwrap_or(IOUAmount::ZERO));
+        let new_out = Amount::div_round(
+            &number_amount(limit, self.in_is_xrp),
+            &rate,
+            self.out_is_xrp,
+            round_up,
+        )
+        .map(amount_number)
+        .unwrap_or(Number::ZERO);
         let new_out = if num_gt(&new_out, &self.out_num) {
             self.out_num
         } else {
@@ -361,6 +378,7 @@ mod tests {
         AmmLiquidity {
             in_is_xrp: false,
             out_is_xrp: true,
+            round_even_quality: true,
             tfee: 994,
             initial_pool_in: Number::from_iou(
                 &IOUAmount::from_decimal_string("651.8857291500754").unwrap(),
@@ -605,5 +623,76 @@ mod tests {
         let q = get_rate(&lin.to_iou(), &quality_iou(&lout, true)).unwrap();
         let approx = (q as f64 - offer.quality as f64).abs() / offer.quality as f64;
         assert!(approx < 0.01, "quality drift {approx}");
+    }
+
+    #[test]
+    fn modern_amm_quality_rounding_pins_sendmax_limited_chunk() {
+        // Ledger 105500174, final AmeriCoin/EuroCoin fib chunk. The synthetic
+        // offer quality is constructed after fixUniversalNumber, so getRate's
+        // quotient must reduce half-to-even before ceilInStrict prices the
+        // remaining SendMax.
+        let in_num =
+            Number::from_iou(&IOUAmount::from_decimal_string("567398397.3026964").unwrap());
+        let out_num = Number::from_iou(&IOUAmount::from_decimal_string("676942644.39939").unwrap());
+        let modern_quality =
+            rxrpl_amount::get_rate_round_even(&in_num.to_iou(), &out_num.to_iou()).unwrap();
+        let offer = AmmOffer {
+            in_num,
+            out_num,
+            bal_in: Number::ZERO,
+            bal_out: Number::ZERO,
+            in_is_xrp: false,
+            out_is_xrp: false,
+            quality: modern_quality,
+        };
+        let limit = Number::from_iou(&IOUAmount::from_decimal_string("225309064.044909").unwrap());
+        let (priced_in, priced_out) = offer.limit_in(&limit, false);
+        assert_eq!(priced_in.to_iou().to_decimal_string(), "225309064.044909");
+        assert_eq!(priced_out.to_iou().to_decimal_string(), "268808150.2287799");
+    }
+
+    #[test]
+    fn modern_amm_quality_rounding_prices_path_chunk() {
+        // The AmeriCoin/XRP hop selected at AMM iteration 10 in ledger
+        // 105500174. Its generated quality differs by one packed-rate ULP after
+        // fixUniversalNumber; ceilOutStrict must use the modern value.
+        let _scale = MantissaScaleGuard::new(MantissaScale::Small);
+        let initial_in =
+            Number::from_iou(&IOUAmount::from_decimal_string("45338846767.35569").unwrap());
+        let initial_out = Number::from_int(42_720_824);
+        let amm = AmmLiquidity {
+            in_is_xrp: false,
+            out_is_xrp: true,
+            round_even_quality: true,
+            tfee: 1000,
+            initial_pool_in: initial_in,
+            initial_pool_out: initial_out,
+        };
+        let pool_in = initial_in
+            .add(&Number::from_iou(
+                &IOUAmount::from_decimal_string("43088831.32872305").unwrap(),
+            ))
+            .add(&Number::from_iou(
+                &IOUAmount::from_decimal_string("183223338.4376844").unwrap(),
+            ));
+        let pool_out = Number::from_int(42_720_824 - 40_145 - 169_707);
+        let mut ctx = AmmContext::new(true);
+        for _ in 0..10 {
+            ctx.set_amm_used();
+            ctx.update();
+        }
+        let offer = amm
+            .get_offer(&pool_in, &pool_out, None, &ctx)
+            .expect("iteration-10 offer");
+        let legacy_quality = get_rate(
+            &quality_iou(&offer.in_num, false),
+            &quality_iou(&offer.out_num, true),
+        )
+        .unwrap();
+        assert_ne!(offer.quality, legacy_quality);
+
+        let (priced_in, priced_out) = offer.limit_out(&Number::from_int(739_489), true);
+        assert_eq!(priced_out.to_xrp_drops(), 739_489);
+        assert_eq!(priced_in.to_iou().to_decimal_string(), "818741605.6922346");
     }
 }

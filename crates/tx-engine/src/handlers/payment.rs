@@ -1229,6 +1229,12 @@ fn apply_paths_payment_multi(
     send_max: serde_json::Value,
 ) -> Result<TransactionResult, TransactionResult> {
     use rxrpl_amount::number::Number;
+    // Flow's totals, remaining SendMax, strand ranking, and AMM offer math all
+    // share rippled's per-transaction Number mantissa scale. Without this outer
+    // guard, the AMM helpers temporarily used Small while the surrounding Flow
+    // sums fell back to the process-default Large scale, shifting the final
+    // input-limited chunk by a few IOU ULPs.
+    let _number_scale = crate::amm_helpers::amm_number_scale_guard(ctx.rules);
     let src_id =
         decode_account_id(account_str).map_err(|_| TransactionResult::TemInvalidAccountId)?;
     let dst_id =
