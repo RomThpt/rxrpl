@@ -51,10 +51,12 @@ impl Transactor for NFTokenCancelOfferTransactor {
             let offer_key = Hash256::from_slice(&offer_key_bytes)
                 .map_err(|_| TransactionResult::TemMalformed)?;
 
-            let offer_bytes = ctx
-                .view
-                .read(&offer_key)
-                .ok_or(TransactionResult::TecNoEntry)?;
+            // The offer may have been consumed between transaction creation and
+            // application. rippled treats an absent child as already cancelled
+            // and continues processing the remaining IDs.
+            let Some(offer_bytes) = ctx.view.read(&offer_key) else {
+                continue;
+            };
             let offer: Value =
                 serde_json::from_slice(&offer_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
@@ -255,6 +257,68 @@ mod tests {
         let acct_bytes = sandbox.read(&acct_key).unwrap();
         let acct: Value = serde_json::from_slice(&acct_bytes).unwrap();
         assert_eq!(acct["OwnerCount"].as_u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn ignore_already_consumed_offer() {
+        let (ledger, _) = setup_with_offer();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let missing_offer = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenCancelOffer",
+            "Account": ACCOUNT,
+            "NFTokenOffers": [missing_offer],
+            "Fee": "12",
+            "Sequence": 2,
+        });
+
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+
+        assert_eq!(
+            NFTokenCancelOfferTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+    }
+
+    #[test]
+    fn cancel_existing_offer_and_ignore_consumed_offer() {
+        let (ledger, offer_id) = setup_with_offer();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let missing_offer = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenCancelOffer",
+            "Account": ACCOUNT,
+            "NFTokenOffers": [missing_offer, offer_id],
+            "Fee": "12",
+            "Sequence": 2,
+        });
+
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+
+        assert_eq!(
+            NFTokenCancelOfferTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+
+        let offer_bytes = hex::decode(&offer_id).unwrap();
+        let offer_key = Hash256::from_slice(&offer_bytes).unwrap();
+        assert!(sandbox.read(&offer_key).is_none());
     }
 
     #[test]
