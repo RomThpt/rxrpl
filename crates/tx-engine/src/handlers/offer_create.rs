@@ -3612,6 +3612,93 @@ struct StrandPass {
     preserve_output_ulp: bool,
 }
 
+struct FlowSourceBalance {
+    key: Hash256,
+    balance: IOUAmount,
+    holder_is_high: bool,
+}
+
+fn flow_source_balance(
+    ctx: &ApplyContext<'_>,
+    taker: &AccountId,
+    strands: &[FlowStrand],
+) -> Option<FlowSourceBalance> {
+    let source = &strands.first()?.hops.first()?.in_leg;
+    if source.is_xrp || source.issuer == *taker {
+        return None;
+    }
+    // Reconciliation is only valid when every strand starts in the same issue
+    // and that issue is not revisited later in the path.
+    for strand in strands {
+        let first = &strand.hops.first()?.in_leg;
+        if first.is_xrp || first.currency != source.currency || first.issuer != source.issuer {
+            return None;
+        }
+        if strand.hops.iter().any(|hop| {
+            !hop.out_leg.is_xrp
+                && hop.out_leg.currency == source.currency
+                && hop.out_leg.issuer == source.issuer
+        }) {
+            return None;
+        }
+    }
+    let one = IOUAmount::from_parts(1_000_000_000, -9, false).ok()?;
+    if transfer_rate(ctx, &source.issuer) != one {
+        return None;
+    }
+    let key = keylet::trust_line(taker, &source.issuer, &source.currency);
+    let line: Value = serde_json::from_slice(&ctx.view.read(&key)?).ok()?;
+    let balance = IOUAmount::from_decimal_string(line["Balance"]["value"].as_str()?).ok()?;
+    Some(FlowSourceBalance {
+        key,
+        balance,
+        holder_is_high: taker.as_bytes() > source.issuer.as_bytes(),
+    })
+}
+
+fn aggregate_flow_source_balance(
+    balance: &IOUAmount,
+    spent: &IOUAmount,
+    holder_is_high: bool,
+) -> Option<IOUAmount> {
+    let delta = if holder_is_high {
+        *spent
+    } else {
+        spent.negate()
+    };
+    IOUAmount::add_round(balance, &delta).ok()
+}
+
+fn reconcile_flow_source_balance(
+    ctx: &mut ApplyContext<'_>,
+    source: &FlowSourceBalance,
+    spent: &Number,
+) {
+    let Some(bytes) = ctx.view.read(&source.key) else {
+        return;
+    };
+    let Ok(mut line) = serde_json::from_slice::<Value>(&bytes) else {
+        return;
+    };
+    let Some(balance) =
+        aggregate_flow_source_balance(&source.balance, &spent.to_iou(), source.holder_is_high)
+    else {
+        return;
+    };
+    line["Balance"]["value"] = Value::String(balance.to_decimal_string());
+    if let Ok(bytes) = serde_json::to_vec(&line) {
+        let _ = ctx.view.update(source.key, bytes);
+    }
+}
+
+fn preserve_flow_output_ulp(
+    delivered: &Number,
+    requested: &Number,
+    path_requires_preservation: bool,
+) -> bool {
+    path_requires_preservation || delivered.sub(requested).is_zero()
+}
+
 /// The best-page (tip) quality of an order book, or `None` when empty.
 fn book_tip_quality(ctx: &ApplyContext<'_>, inverse_book: &Hash256) -> Option<u64> {
     let probe = book_dir_with_quality(inverse_book, 0);
@@ -4162,6 +4249,7 @@ pub(crate) fn flow_multi(
     amm_ctx: &mut AmmContext,
 ) -> (Number, Number, bool) {
     let trace = std::env::var("RXRPL_FLOW_TRACE").is_ok();
+    let source_balance = flow_source_balance(ctx, taker, strands);
     if trace {
         eprintln!(
             "[flow] ENTER strands={} deliver_req={} send_max={}",
@@ -4306,11 +4394,21 @@ pub(crate) fn flow_multi(
         }
     }
 
-    (
-        sum_smallest_to_largest(&saved_outs),
-        sum_smallest_to_largest(&saved_ins),
-        preserve_output_ulp,
-    )
+    let actual_out = sum_smallest_to_largest(&saved_outs);
+    let actual_in = sum_smallest_to_largest(&saved_ins);
+    // rippled's source DirectStep settles the aggregate Flow input. Our
+    // collapsed book/AMM hop settles each synthetic offer separately, which
+    // can accumulate a one-ULP drift on a nearly drained trust line. Restore
+    // the source endpoint from its pre-flow balance and the canonical
+    // smallest-to-largest total while leaving pool/maker settlement per pass.
+    if saved_ins.len() > 1
+        && let Some(source) = source_balance.as_ref()
+    {
+        reconcile_flow_source_balance(ctx, source, &actual_in);
+    }
+    let preserve_output_ulp =
+        preserve_flow_output_ulp(&actual_out, deliver_req, preserve_output_ulp);
+    (actual_out, actual_in, preserve_output_ulp)
 }
 
 /// `a + b` for like-typed legs (same asset).
@@ -7123,6 +7221,33 @@ mod amm_quality_gate_tests {
             !amm_offer_allows_partial_output(true, false),
             "a regular FOK still requires the full output demand"
         );
+    }
+}
+
+#[cfg(test)]
+mod flow_source_balance_tests {
+    use super::{aggregate_flow_source_balance, preserve_flow_output_ulp};
+    use rxrpl_amount::IOUAmount;
+    use rxrpl_amount::number::Number;
+
+    #[test]
+    fn aggregates_multi_pass_source_debit_before_rounding() {
+        let balance = IOUAmount::from_decimal_string("0.28961595565").unwrap();
+        let spent = IOUAmount::from_decimal_string("0.2872378014634366").unwrap();
+
+        assert_eq!(
+            aggregate_flow_source_balance(&balance, &spent, false)
+                .unwrap()
+                .to_decimal_string(),
+            "0.0023781541865634"
+        );
+    }
+
+    #[test]
+    fn preserves_exact_requested_delivery() {
+        let delivered =
+            Number::from_iou(&IOUAmount::from_decimal_string("6762.885132533594").unwrap());
+        assert!(preserve_flow_output_ulp(&delivered, &delivered, false));
     }
 }
 
