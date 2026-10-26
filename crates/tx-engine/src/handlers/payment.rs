@@ -1399,7 +1399,7 @@ fn apply_paths_payment_multi(
             .then(|| send_max_num.div(&deliver_req));
 
     let mut amm_ctx = crate::handlers::flow::AmmContext::new(strands.len() > 1);
-    let (mut delivered_num, _spent_num, mut preserve_output_ulp) =
+    let (delivered_num, _spent_num, mut preserve_output_ulp) =
         crate::handlers::offer_create::flow_multi(
             ctx,
             &src_id,
@@ -1421,21 +1421,6 @@ fn apply_paths_payment_multi(
         let settled = before.saturating_sub(helpers::get_balance(&acct));
         source_xrp_exhausted = settled == send_max_drops;
         preserve_output_ulp |= source_xrp_exhausted;
-    }
-    if source_xrp_exhausted
-        && strands.len() == 1
-        && strands[0].terminal_has_amm()
-        && let Some((false, _, issuer)) = amm_asset_of(&amount)
-    {
-        let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap_or(IOUAmount::ZERO);
-        if crate::handlers::offer_create::transfer_rate(ctx, &issuer) > one {
-            let delivered = delivered_num.to_iou();
-            if let Ok(bumped) =
-                IOUAmount::from_parts(delivered.mantissa() + 1, delivered.exponent(), false)
-            {
-                delivered_num = Number::from_iou(&bumped);
-            }
-        }
     }
     let mut delivered_iou_override = None;
     if let Some((before, currency, issuer)) = output_holding_before {
@@ -1592,6 +1577,30 @@ fn add_iou_number_round(
     let value = IOUAmount::add_round(&balance.to_iou(), &delta.to_iou())
         .map_err(|_| TransactionResult::TefInternal)?;
     Ok(Number::from_iou(&value))
+}
+
+/// Apply the terminal DirectStep transfer rate to an AMM's gross output.
+/// rippled performs this division in `Number` and only then projects the net
+/// delivery onto the 16-digit IOU grid; a directed IOU division can undershoot
+/// by one ULP.
+fn terminal_amm_output(
+    gross: &rxrpl_amount::number::Number,
+    rate: Option<IOUAmount>,
+    number_switchover: bool,
+) -> rxrpl_amount::number::Number {
+    use rxrpl_amount::number::Number;
+
+    let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap_or(IOUAmount::ZERO);
+    match rate {
+        Some(rate) if rate > one && number_switchover => {
+            let _scale = rxrpl_amount::number::MantissaScaleGuard::new(
+                rxrpl_amount::number::MantissaScale::Large,
+            );
+            Number::from_iou(&gross.to_iou()).div(&Number::from_iou(&rate))
+        }
+        Some(rate) if rate > one => Number::from_iou(&gross.to_iou()).div(&Number::from_iou(&rate)),
+        _ => *gross,
+    }
 }
 
 /// XRP that Flow may spend after the transaction fee has already been charged.
@@ -1932,7 +1941,14 @@ fn try_amm_conversion(
     if pool_delivered.is_zero() || pool_spent.is_zero() || source_spent.is_zero() {
         return Ok(None);
     }
-    let delivered = crate::handlers::offer_create::flow_net_input(&pool_delivered, output_rate);
+    let delivered = {
+        let _number_scale = crate::amm_helpers::amm_number_scale_guard(ctx.rules);
+        terminal_amm_output(
+            &pool_delivered,
+            output_rate,
+            ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+        )
+    };
 
     // --- Apply: debit gross from the user and move net into the pool. ---
     if in_xrp {

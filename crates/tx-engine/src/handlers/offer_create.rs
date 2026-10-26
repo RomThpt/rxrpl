@@ -3565,7 +3565,7 @@ fn apply_amm_move(
             ctx.rules.enabled(&feature_id("fixUniversalNumber")),
             BalanceRounding::HalfUpward,
             skip_output_credit,
-            TransferFeeRounding::Down,
+            TransferFeeRounding::Nearest,
         )?;
         Ok(leg_to_number(&net))
     }
@@ -4616,7 +4616,13 @@ fn price_clob_band_reverse(
         dest,
         &demand_leg,
         &budget_leg,
-        /*skip_input_debit=*/ !is_first,
+        // A multi-hop reverse pass only quotes this book. In particular, its
+        // first hop may require more than the account currently holds: the
+        // source budget limits that quote during the forward pass below. Do not
+        // reject the speculative walk as `tecUNFUNDED_OFFER` before that cap is
+        // applied. A single-hop quote keeps the terminal bookkeeping semantics.
+        /*skip_input_debit=*/
+        !is_first || !is_last,
         /*skip_output_credit=*/ !is_last,
         /*single_band=*/ true,
         /*allow_amm=*/ false,
@@ -5489,7 +5495,7 @@ fn pay_out_gross(
     owner: &AccountId,
     recipient: &AccountId,
     amount: &Leg,
-    _round: bool,
+    round: bool,
     balance_rounding: BalanceRounding,
     skip_recipient_credit: bool,
     fee_rounding: TransferFeeRounding,
@@ -5528,6 +5534,14 @@ fn pay_out_gross(
                         false,
                     )
                     .unwrap_or(amount.iou),
+                TransferFeeRounding::Nearest if round => {
+                    let _scale = rxrpl_amount::number::MantissaScaleGuard::new(
+                        rxrpl_amount::number::MantissaScale::Large,
+                    );
+                    rxrpl_amount::number::Number::from_iou(&amount.iou)
+                        .div(&rxrpl_amount::number::Number::from_iou(&rate))
+                        .to_iou()
+                }
                 TransferFeeRounding::Nearest => rxrpl_amount::number::Number::from_iou(&amount.iou)
                     .div(&rxrpl_amount::number::Number::from_iou(&rate))
                     .to_iou(),
@@ -9052,10 +9066,10 @@ mod taker_bridge_integration {
     }
 
     #[test]
-    fn reverse_clob_pricing_restores_detached_taker_account() {
+    fn reverse_clob_pricing_ignores_multihop_source_balance() {
         let mut ledger = Ledger::genesis();
         put_acct(&mut ledger, ISS, 1_000_000_000, 0);
-        put_acct(&mut ledger, TAKER, 1_000_000_000, 1);
+        put_acct(&mut ledger, TAKER, 5_000_000, 1);
         put_acct(&mut ledger, O2, 1_000_000_000, 1);
         put_line(&mut ledger, TAKER, b"BBB", 0);
         put_line(&mut ledger, O2, b"BBB", 100);
@@ -9110,7 +9124,7 @@ mod taker_bridge_integration {
             &Number::from_int(10),
             None,
             true,
-            true,
+            false,
         )
         .unwrap();
 

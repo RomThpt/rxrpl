@@ -88,6 +88,36 @@ fn amm_iou_balance_addition_avoids_mixed_scale_double_rounding() {
 }
 
 #[test]
+fn terminal_amm_transfer_fee_uses_number_rounding() {
+    use rxrpl_amount::number::{MantissaScale, MantissaScaleGuard, Number};
+
+    let _scale = MantissaScaleGuard::new(MantissaScale::Small);
+    let gross = Number::from_iou(&IOUAmount::from_decimal_string("1.2881970142210").unwrap());
+    let rate = IOUAmount::from_decimal_string("1.002").unwrap();
+
+    assert_eq!(
+        terminal_amm_output(&gross, Some(rate), true)
+            .to_iou()
+            .to_decimal_string(),
+        "1.285625762695609"
+    );
+
+    for (gross, rate, expected) in [
+        ("19.90717339109", "1.0001", "19.90518287280272"),
+        ("0.074437261237451", "1.003", "0.07421461738529511"),
+    ] {
+        let gross = Number::from_iou(&IOUAmount::from_decimal_string(gross).unwrap());
+        let rate = IOUAmount::from_decimal_string(rate).unwrap();
+        assert_eq!(
+            terminal_amm_output(&gross, Some(rate), true)
+                .to_iou()
+                .to_decimal_string(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn iou_receive_room_caps_at_holder_limit() {
     use rxrpl_amount::number::Number;
 
