@@ -1110,7 +1110,7 @@ fn cross_offers(
         // Interleave the AMM at this quality band BEFORE the resting CLOB offers.
         // rippled crosses whichever of the synthetic AMM offer / CLOB tip is
         // better at each quality level (BookStep tryAMM/execOffer). `amm_hop`'s
-        // fee-adjusted spot gate admits the AMM only when it strictly beats
+        // raw reserve-ratio spot gate admits the AMM only when it strictly beats
         // `dir_quality`, so this fires exactly when the AMM is at least as good
         // as the offers about to cross at this band; it is a no-op otherwise.
         if !remaining_out.is_zero() && !remaining_in.is_zero() {
@@ -1434,7 +1434,7 @@ fn cross_offers(
 /// Cross the book's AMM pool (if present and strictly better than `cq`) up to the
 /// target quality `cq`, limited to the taker's funds, updating the remaining
 /// demand/budget and `crossed` in place. Mirrors rippled's per-quality-band AMM
-/// injection (`BookStep::tryAMM`): `amm_hop`'s fee-adjusted spot gate admits the
+/// injection (`BookStep::tryAMM`): `amm_hop`'s raw spot gate admits the
 /// AMM only when it strictly beats `cq`, so this is a no-op unless the AMM is at
 /// least as good as the CLOB at this band.
 #[allow(clippy::too_many_arguments)]
@@ -1838,6 +1838,7 @@ fn cross_book_hop(
     // its ULP, so the subtraction would round to 0 and starve the next hop.
     let mut delivered = leg_from_magnitude(&IOUAmount::ZERO, demand_out);
     delivered.drops = 0;
+    let mut delivered_parts: Vec<Number> = Vec::new();
     let mut spent = leg_from_magnitude(&IOUAmount::ZERO, budget_in);
     spent.drops = 0;
     let book_prefix = inverse_book.as_bytes()[0..24].to_vec();
@@ -1873,14 +1874,68 @@ fn cross_book_hop(
                 }
             }
         }
+        let Some(dir_bytes) = ctx.view.read(&dir_key) else {
+            continue;
+        };
+        let Ok(dir) = serde_json::from_slice::<Value>(&dir_bytes) else {
+            continue;
+        };
+        let offers: Vec<rxrpl_primitives::Hash256> = dir
+            .get("Indexes")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().and_then(|s| s.parse().ok()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // BookStep asks the AMM to compete with the first crossable offer, not
+        // merely the first directory. Empty, expired, self-owned, or unfunded
+        // pages are skipped before their quality can cap the synthetic offer.
+        let funded_tip = offers.iter().any(|offer_key| {
+            let Some(ob) = ctx.view.read(offer_key) else {
+                return false;
+            };
+            let Ok(offer) = serde_json::from_slice::<Value>(&ob) else {
+                return false;
+            };
+            if offer.get("LedgerEntryType").and_then(|v| v.as_str()) != Some("Offer") {
+                return false;
+            }
+            if offer
+                .get("Expiration")
+                .and_then(|v| v.as_u64())
+                .is_some_and(|exp| exp <= ctx.view.parent_close_time() as u64)
+            {
+                return false;
+            }
+            let Some(owner) = offer
+                .get("Account")
+                .and_then(|v| v.as_str())
+                .and_then(|s| decode_account_id(s).ok())
+            else {
+                return false;
+            };
+            if &owner == taker {
+                return false;
+            }
+            let Some(offer_out) = Leg::parse(&offer["TakerGets"]) else {
+                return false;
+            };
+            !owner_funds_leg(ctx, &owner, &offer_out).is_zero()
+        });
         // Interleave the AMM at this quality band BEFORE crossing the resting
         // CLOB offers, mirroring cross_offers' try_amm_step (rippled BookStep
-        // tryAMM/execOffer): amm_hop's fee-adjusted spot gate admits the pool
+        // tryAMM/execOffer): amm_hop's raw spot gate admits the pool
         // only when it strictly beats this band's quality, so it crosses exactly
         // where the AMM is at least as good as the offers about to fill and is a
         // no-op on a pure-CLOB book. The output lands on `dest`; interior hops
         // carry the previous hop's delivery so their input is not funds-capped.
-        if allow_amm && !remaining_in.is_zero() && !hop_out_done(&remaining_out, demand_out) {
+        if allow_amm
+            && funded_tip
+            && !remaining_in.is_zero()
+            && !hop_out_done(&remaining_out, demand_out)
+        {
             let amm_budget = if skip_input_debit {
                 remaining_in.clone()
             } else {
@@ -1905,6 +1960,7 @@ fn cross_book_hop(
                     remaining_out = leg_sub_round(&remaining_out, &amm_out);
                     remaining_in = leg_sub_round(&remaining_in, &amm_spent);
                     delivered = leg_add(&delivered, &amm_out);
+                    delivered_parts.push(leg_to_number(&amm_out));
                     spent = leg_add(&spent, &amm_spent);
                 }
             }
@@ -1913,21 +1969,6 @@ fn cross_book_hop(
             }
         }
         let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
-        let Some(dir_bytes) = ctx.view.read(&dir_key) else {
-            continue;
-        };
-        let Ok(dir) = serde_json::from_slice::<Value>(&dir_bytes) else {
-            continue;
-        };
-        let offers: Vec<rxrpl_primitives::Hash256> = dir
-            .get("Indexes")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().and_then(|s| s.parse().ok()))
-                    .collect()
-            })
-            .unwrap_or_default();
 
         for offer_key in offers {
             if remaining_in.is_zero() || hop_out_done(&remaining_out, demand_out) {
@@ -2254,6 +2295,7 @@ fn cross_book_hop(
             remaining_out = leg_sub_round(&remaining_out, &net_out);
             remaining_in = leg_sub_round(&remaining_in, &order_in);
             delivered = leg_add(&delivered, &net_out);
+            delivered_parts.push(leg_to_number(&net_out));
             spent = leg_add(&spent, &order_in);
             // Lock the band on the first funded fill: subsequent pages of a worse
             // quality are not consumed this call.
@@ -2261,6 +2303,13 @@ fn cross_book_hop(
                 band_quality = Some(dir_quality);
             }
         }
+    }
+
+    // Flow accumulates pass results in a sorted multiset, then folds from the
+    // smallest amount upward. Preserve that order here even though this legacy
+    // single-book driver walks all bands in one call.
+    if !demand_out.is_xrp && delivered_parts.len() > 1 {
+        delivered = number_to_leg(&sum_smallest_to_largest(&delivered_parts), demand_out);
     }
 
     // Per-fill dest credits truncate; their sum sat 5e-14 below Amount on
@@ -3009,21 +3058,18 @@ fn amm_hop(
     // 184-190): an offer crossing may consume the AMM only when its spot quality
     // STRICTLY beats the taker's limit quality and is not within 1e-7 of it —
     // otherwise deliver nothing so cross_offers rests the full offer. The spot
-    // must be FEE-ADJUSTED: the taker pays the trading fee on the input, so the
-    // effective in/out is spot / (1 - fee) (worse than the fee-free spot). An AMM
-    // whose raw spot beats the limit but whose fee-adjusted price does not must
-    // not cross. Payments pass None (any quality is acceptable,
-    // BookPaymentStep::checkQualityThreshold == true).
+    // is the raw reserve ratio. Trading fees affect the generated synthetic
+    // offer, not this initial eligibility check (`AMMLiquidity::getOffer`).
+    // Payments pass None when no competing CLOB quality is available.
     if let Some(cq) = target_quality {
-        let one_minus_fee = IOUAmount::divide(
-            &IOUAmount::from_decimal_string(&(100_000u32 - u32::from(tfee)).to_string())
-                .unwrap_or(IOUAmount::ZERO),
-            &IOUAmount::from_decimal_string("100000").unwrap_or(IOUAmount::ZERO),
-        )
-        .unwrap_or(IOUAmount::ZERO);
-        let out_q = num_quality_iou(&pool_out, out_xrp);
-        let out_adj = IOUAmount::multiply(&out_q, &one_minus_fee).unwrap_or(out_q);
-        let spq = rxrpl_amount::get_rate(&num_quality_iou(&pool_in, in_xrp), &out_adj).ok();
+        let pool_in_q = num_quality_iou(&pool_in, in_xrp);
+        let pool_out_q = num_quality_iou(&pool_out, out_xrp);
+        let spq = if ctx.rules.enabled(&feature_id("fixUniversalNumber")) {
+            rxrpl_amount::get_rate_round_even(&pool_in_q, &pool_out_q)
+        } else {
+            rxrpl_amount::get_rate(&pool_in_q, &pool_out_q)
+        }
+        .ok();
         let Some(spq) = spq else {
             return Ok(None);
         };

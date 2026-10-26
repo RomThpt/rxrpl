@@ -289,6 +289,9 @@ pub fn change_spot_price_quality(
             amount_in = grid_down(&amount_in.mul(&reduced), in_is_xrp);
             amount_out = swap_asset_in(pool_in, pool_out, &amount_in, tfee, out_is_xrp);
         }
+        if amm_amount_quality(&amount_in, in_is_xrp, &amount_out, out_is_xrp)? > target_quality {
+            return None;
+        }
     }
     Some((amount_in, amount_out))
 }
@@ -1251,6 +1254,33 @@ mod tests {
             limit_input_quality(&pool_in, &pool_out, quality, 503, true, false).unwrap();
         assert_eq!(input.to_xrp_drops_mode(), 14_999_865);
         assert_eq!(output.to_iou().to_decimal_string(), "78131955.81042515");
+    }
+
+    // Mainnet tx 6B2B088C… (ledger 105500212): rounding the XRP-input offer
+    // down and reducing it once still leaves it worse than this CLOB tier.
+    // AMMLiquidity must suppress that synthetic offer and let the CLOB cross.
+    #[test]
+    fn change_spot_price_rejects_offer_still_worse_after_reduction() {
+        let pool_in = Number::from_int(1_856_924_879_509);
+        let pool_out = Number::from_iou(&parse_iou_value("2070778.109173476"));
+
+        assert!(
+            change_spot_price_quality(
+                &pool_in,
+                &pool_out,
+                0x5A1F_ECB2_097F_4E55,
+                208,
+                true,
+                false,
+            )
+            .is_none()
+        );
+
+        let (input, output) =
+            change_spot_price_quality(&pool_in, &pool_out, 0x5A1F_ECBF_4B58_B92D, 208, true, false)
+                .unwrap();
+        assert_eq!(input.to_xrp_drops_mode(), 12_215_645);
+        assert_eq!(output.to_iou().to_decimal_string(), "13.594038922");
     }
 
     // A Large-scale computation (deposit/withdraw default) must be unaffected by

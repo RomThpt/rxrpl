@@ -1615,8 +1615,8 @@ fn try_amm_conversion(
     // an offer whose quality strictly beats the AMM's fee-adjusted spot price,
     // rippled crosses that CLOB offer first, not the pool. Defer to the CLOB
     // (`cross_book_payment`) in that case instead of consuming the AMM here. The
-    // spot must be fee-adjusted — the taker pays the trading fee on the input, so
-    // the effective in/out is spot / (1 - fee) — matching `amm_hop`'s band gate.
+    // This direct-AMM shortcut uses a conservative fee-adjusted prefilter; when
+    // it declines, `cross_book_payment` performs the full per-band interleave.
     if let Some(cq) =
         best_book_dir_quality(ctx, user_id, &in_cur, &in_iss, &out_cur, &out_iss, out_xrp)?
     {
