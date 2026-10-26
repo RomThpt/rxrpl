@@ -2324,7 +2324,12 @@ fn cross_book_hop(
             let leftover_dust = remaining_is_filled(&remaining_out, demand_out);
             let credit = if remaining_out.is_zero() || leftover_dust {
                 demand_out.iou
-            } else if skip_input_debit && !consumed_whole_offer {
+            } else if should_bump_partial_path_credit(
+                skip_input_debit,
+                consumed_whole_offer,
+                taker,
+                dest,
+            ) {
                 let d = delivered.iou;
                 IOUAmount::from_parts(d.mantissa() + 1, d.exponent(), false).unwrap_or(d)
             } else {
@@ -2448,6 +2453,18 @@ fn should_trim_input_limited_iou_leftover(
         && !preserve_input_limited_iou_ulp
         && !leg_ge(net_out, remaining_out)
         && new_gets.iou.mantissa() > 0
+}
+
+fn should_bump_partial_path_credit(
+    skip_input_debit: bool,
+    consumed_whole_offer: bool,
+    taker: &AccountId,
+    dest: &AccountId,
+) -> bool {
+    // A self-payment already carries the final hop output back to the same
+    // account. Its destination line must use the delivered amount verbatim;
+    // adding the path-credit ULP would count that rounding correction twice.
+    skip_input_debit && !consumed_whole_offer && taker != dest
 }
 
 /// Cross a chain of order books (a single resolved path), forwarding each
@@ -6988,7 +7005,8 @@ mod taker_crossing_tests {
         leftover_is_dust, leftover_leg, leg_ge, leg_gt, leg_max, out_for_in, pack_rate,
         parity_rate, qual_div, qual_mul, reject_quality, remaining_is_filled,
         remaining_is_filled_at, remaining_offer, scale_funds_limited_input, select_path,
-        sell_clamp_sub, should_trim_input_limited_iou_leftover, terminal_budget_binds,
+        sell_clamp_sub, should_bump_partial_path_credit, should_trim_input_limited_iou_leftover,
+        terminal_budget_binds,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, get_rate_round_even, offer_quality};
     use rxrpl_primitives::AccountId;
@@ -7144,6 +7162,21 @@ mod taker_crossing_tests {
         ));
         assert!(should_trim_input_limited_iou_leftover(
             true, true, &leftover, false, &partial, &requested
+        ));
+    }
+
+    #[test]
+    fn self_payment_does_not_bump_partial_path_credit() {
+        let taker = AccountId::from([1u8; 20]);
+        let other = AccountId::from([2u8; 20]);
+
+        assert!(!should_bump_partial_path_credit(
+            true, false, &taker, &taker
+        ));
+        assert!(should_bump_partial_path_credit(true, false, &taker, &other));
+        assert!(!should_bump_partial_path_credit(true, true, &taker, &other));
+        assert!(!should_bump_partial_path_credit(
+            false, false, &taker, &other
         ));
     }
 
