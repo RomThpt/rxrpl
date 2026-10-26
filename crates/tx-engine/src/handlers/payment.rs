@@ -1287,6 +1287,9 @@ fn apply_paths_payment_multi(
     // Source-funds cap on the SendMax (cannot spend more than held).
     let deliver_req = value_to_number(&amount);
     let send_max_num = value_to_number(&send_max);
+    let limit_rate =
+        (helpers::get_flags(ctx.tx) & rxrpl_protocol::flags::payment::TF_LIMIT_QUALITY != 0)
+            .then(|| send_max_num.div(&deliver_req));
 
     let mut amm_ctx = crate::handlers::flow::AmmContext::new(strands.len() > 1);
     let (delivered_num, _spent_num, preserve_output_ulp) =
@@ -1298,6 +1301,7 @@ fn apply_paths_payment_multi(
             &strands,
             &deliver_req,
             &send_max_num,
+            limit_rate.as_ref(),
             &mut amm_ctx,
         );
 

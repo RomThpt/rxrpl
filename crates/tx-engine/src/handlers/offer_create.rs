@@ -4036,16 +4036,67 @@ fn preserve_flow_output_ulp(
     path_requires_preservation || delivered.sub(requested).is_zero()
 }
 
-/// The best-page (tip) quality of an order book, or `None` when empty.
-fn book_tip_quality(ctx: &ApplyContext<'_>, inverse_book: &Hash256) -> Option<u64> {
-    let probe = book_dir_with_quality(inverse_book, 0);
-    let dir_key = ctx.view.succ(&probe)?;
-    if dir_key.as_bytes()[0..24] != inverse_book.as_bytes()[0..24] {
-        return None;
+fn flow_book_input_rate(ctx: &ApplyContext<'_>, leg: &Leg, dest: &AccountId) -> Option<IOUAmount> {
+    (!leg.is_xrp && leg.issuer != *dest).then(|| transfer_rate(ctx, &leg.issuer))
+}
+
+fn flow_gross_input(amount: &Number, rate: Option<IOUAmount>) -> Number {
+    rate.and_then(|rate| IOUAmount::mul_round(&amount.to_iou(), &rate, true).ok())
+        .map(|amount| Number::from_iou(&amount))
+        .unwrap_or(*amount)
+}
+
+fn flow_net_input(amount: &Number, rate: Option<IOUAmount>) -> Number {
+    rate.and_then(|rate| IOUAmount::div_round(&amount.to_iou(), &rate, false).ok())
+        .map(|amount| Number::from_iou(&amount))
+        .unwrap_or(*amount)
+}
+
+/// Whether a directory tier contains at least one offer on any page.
+fn book_dir_has_entries(ctx: &ApplyContext<'_>, root: &Hash256) -> bool {
+    let mut page = 0u64;
+    loop {
+        let key = if page == 0 {
+            *root
+        } else {
+            keylet::dir_node(root, page)
+        };
+        let Some(bytes) = ctx.view.read(&key) else {
+            return false;
+        };
+        let Ok(dir) = serde_json::from_slice::<Value>(&bytes) else {
+            return false;
+        };
+        if dir
+            .get("Indexes")
+            .and_then(Value::as_array)
+            .is_some_and(|indexes| !indexes.is_empty())
+        {
+            return true;
+        }
+        page = dir.get("IndexNext").and_then(Value::as_u64).unwrap_or(0);
+        if page == 0 {
+            return false;
+        }
     }
-    Some(u64::from_be_bytes(
-        dir_key.as_bytes()[24..32].try_into().unwrap(),
-    ))
+}
+
+/// The best non-empty page (tip) quality of an order book.
+fn book_tip_quality(ctx: &ApplyContext<'_>, inverse_book: &Hash256) -> Option<u64> {
+    let prefix = &inverse_book.as_bytes()[0..24];
+    let mut probe = book_dir_with_quality(inverse_book, 0);
+    while let Some(dir_key) = ctx.view.succ(&probe) {
+        if &dir_key.as_bytes()[0..24] != prefix {
+            return None;
+        }
+        probe = dir_key;
+        if book_dir_has_entries(ctx, &dir_key) {
+            return Some(u64::from_be_bytes(
+                dir_key.as_bytes()[24..32].try_into().ok()?,
+            ));
+        }
+    }
+    None
 }
 
 /// Build a strand from a boundary chain, snapshotting each hop's AMM pool (with
@@ -4161,7 +4212,12 @@ pub(crate) fn build_flow_strand(
 /// `amm_ctx` iteration), NOT the raw spot price — the raw spot over-ranks a
 /// pure-AMM strand and flips the first-survivor pick (StrandFlow `getTipQuality`,
 /// go-xrpl `step_book.go:869`).
-fn strand_quality_ub(ctx: &ApplyContext<'_>, strand: &FlowStrand, amm_ctx: &AmmContext) -> Number {
+fn strand_quality_ub(
+    ctx: &ApplyContext<'_>,
+    strand: &FlowStrand,
+    dest: &AccountId,
+    amm_ctx: &AmmContext,
+) -> Option<Number> {
     let mut rate = Number::from_int(1);
     for hop in &strand.hops {
         // AMM fib-offer quality for this iteration (fee + impact), as rippled's
@@ -4202,11 +4258,24 @@ fn strand_quality_ub(ctx: &ApplyContext<'_>, strand: &FlowStrand, amm_ctx: &AmmC
             }
             (Some(a), None) => a,
             (None, Some(c)) => c,
-            (None, None) => Number::from_int(1),
+            (None, None) => return None,
         };
+        // Every collapsed hop represents a payment BookStep. Its preceding
+        // step redeems, so the input issuer's transfer rate composes into the
+        // upper bound (unless that issuer is the strand destination).
+        if !hop.in_leg.is_xrp && hop.in_leg.issuer != *dest {
+            rate = rate.mul(&Number::from_iou(&transfer_rate(ctx, &hop.in_leg.issuer)));
+        }
         rate = rate.mul(&hop_rate);
     }
-    rate
+    // The explicit rippled strand ends with a DirectStep from the delivered
+    // issue's issuer to the destination. Preserve that step's transfer rate in
+    // the collapsed representation as well.
+    let terminal = &strand.hops.last()?.out_leg;
+    if !terminal.is_xrp && terminal.issuer != *dest {
+        rate = rate.mul(&Number::from_iou(&transfer_rate(ctx, &terminal.issuer)));
+    }
+    Some(rate)
 }
 
 /// Sum a slice of `Number`s smallest-magnitude first (rippled
@@ -4229,6 +4298,12 @@ fn sum_smallest_to_largest(v: &[Number]) -> Number {
         acc = acc.add(n);
     }
     acc
+}
+
+fn next_flow_strands(cur: &[usize], winner_pos: usize) -> Vec<usize> {
+    let mut next = Vec::with_capacity(cur.len() - winner_pos);
+    next.extend_from_slice(&cur[winner_pos..]);
+    next
 }
 
 /// `a >= b` for two `Number`s.
@@ -4403,10 +4478,28 @@ fn execute_strand_pass(
 
         if let Some(offer) = amm_offer {
             kinds[h] = HopKindR::Amm;
-            if num_ge(&offer.out_num, &demanded) {
+            let pool_id = amm_hops[h].as_ref()?.pool_id;
+            // `demanded` is the NET amount the destination must receive, while
+            // an AMM synthetic offer's output is the GROSS amount removed from
+            // the pool. On the terminal hop, gross the reverse demand when the
+            // output issuer charges a transfer fee. The forward application
+            // then burns that fee and returns the original net carry.
+            let pool_demanded = if is_last
+                && !hop.out_leg.is_xrp
+                && hop.out_leg.issuer != pool_id
+                && hop.out_leg.issuer != *dest
+            {
+                Number::from_iou(&grossed(
+                    &demanded.to_iou(),
+                    &transfer_rate(ctx, &hop.out_leg.issuer),
+                ))
+            } else {
+                demanded
+            };
+            if num_ge(&offer.out_num, &pool_demanded) {
                 // The chunk covers the demand: clamp output to demand at constant
                 // quality (`ceilOutStrict`, round the cost up).
-                let (i, o) = offer.limit_out(&demanded, true);
+                let (i, o) = offer.limit_out(&pool_demanded, true);
                 ins[h] = i;
                 outs[h] = o;
             } else {
@@ -4437,12 +4530,25 @@ fn execute_strand_pass(
         if ins[h].is_zero() || outs[h].is_zero() || ins[h].negative() {
             return None;
         }
-        demanded = ins[h];
+        demanded = if h > 0 {
+            flow_gross_input(&ins[h], flow_book_input_rate(ctx, &hop.in_leg, dest))
+        } else {
+            ins[h]
+        };
     }
 
-    // The source (hop 0) is input-limited when its required input exceeds the
-    // remaining SendMax budget: drive it forward from the budget instead.
-    let source_capped = num_gt(&ins[0], remaining_in);
+    // The source DirectStep feeds the first BookStep. When that book's IOU
+    // input charges a transfer rate, SendMax is the gross source amount while
+    // `ins[0]` is the net amount received by the book/pool.
+    let source = &strand.hops[0].in_leg;
+    let source_rate = flow_book_input_rate(ctx, source, dest);
+    let required_source = flow_gross_input(&ins[0], source_rate);
+    let source_capped = num_gt(&required_source, remaining_in);
+    let source_available = if source_capped {
+        flow_net_input(remaining_in, source_rate)
+    } else {
+        *remaining_in
+    };
     if source_capped {
         limiting = 0;
     }
@@ -4455,6 +4561,11 @@ fn execute_strand_pass(
         let is_first = h == 0;
         let is_last = h == n - 1;
         let clob_q = book_tip_quality(ctx, &hop.inverse_book);
+        let available_input = if is_first {
+            source_available
+        } else {
+            flow_net_input(&carry, flow_book_input_rate(ctx, &hop.in_leg, dest))
+        };
 
         match kinds[h] {
             HopKindR::Amm => {
@@ -4463,7 +4574,7 @@ fn execute_strand_pass(
                     // Source-limited: re-price hop 0 forward from the budget.
                     let liq = hop.liquidity.as_ref()?;
                     let offer = liq.get_offer(&amm.pool_in, &amm.pool_out, clob_q, amm_ctx)?;
-                    offer.limit_in(remaining_in, false)
+                    offer.limit_in(&source_available, false)
                 } else if h <= limiting {
                     // Reverse-priced; conserved by construction (outs[h-1] == ins[h]).
                     (ins[h], outs[h])
@@ -4472,8 +4583,8 @@ fn execute_strand_pass(
                     // carry (`limitStepIn`, round the output down), keeping quality.
                     let liq = hop.liquidity.as_ref()?;
                     let offer = liq.get_offer(&amm.pool_in, &amm.pool_out, clob_q, amm_ctx)?;
-                    if num_ge(&offer.in_num, &carry) {
-                        offer.limit_in(&carry, false)
+                    if num_ge(&offer.in_num, &available_input) {
+                        offer.limit_in(&available_input, false)
                     } else {
                         (offer.in_num, offer.out_num)
                     }
@@ -4482,9 +4593,6 @@ fn execute_strand_pass(
                 {
                     return None;
                 }
-                // Conservation: an interior hop takes exactly what the previous hop
-                // delivered (`carry`); otherwise the intermediate does not balance.
-                let in_num = if is_first { in_num } else { carry };
                 let actual_out = apply_amm_move(
                     ctx, taker, taker_acct, dest, amm, &in_num, &out_num,
                     /*skip_input_debit=*/ !is_first, /*skip_output_credit=*/ !is_last,
@@ -4493,9 +4601,10 @@ fn execute_strand_pass(
                 amm_ctx.set_amm_used();
                 if trace {
                     eprintln!(
-                        "[flow]     hop{h} AMM in={} out={} (iter={} limiting={limiting})",
+                        "[flow]     hop{h} AMM in={} out={} net={} (iter={} limiting={limiting})",
                         in_num.to_iou().to_decimal_string(),
                         out_num.to_iou().to_decimal_string(),
+                        actual_out.to_iou().to_decimal_string(),
                         amm_ctx.cur_iters(),
                     );
                 }
@@ -4511,7 +4620,7 @@ fn execute_strand_pass(
                 let (demand_leg, budget_leg) = if is_first && source_capped {
                     (
                         unbounded_leg(&hop.out_leg),
-                        number_to_leg(remaining_in, &hop.in_leg),
+                        number_to_leg(&source_available, &hop.in_leg),
                     )
                 } else if h <= limiting {
                     let budget = if is_first {
@@ -4523,7 +4632,7 @@ fn execute_strand_pass(
                 } else {
                     (
                         unbounded_leg(&hop.out_leg),
-                        number_to_leg(&carry, &hop.in_leg),
+                        number_to_leg(&available_input, &hop.in_leg),
                     )
                 };
                 let (delivered, spent) = cross_book_hop(
@@ -4563,6 +4672,7 @@ fn execute_strand_pass(
     if source_in.is_zero() || carry.is_zero() {
         return None;
     }
+    source_in = flow_gross_input(&source_in, source_rate);
     Some(StrandPass {
         in_amt: source_in,
         out_amt: carry,
@@ -4590,6 +4700,7 @@ pub(crate) fn flow_multi(
     strands: &[FlowStrand],
     deliver_req: &Number,
     send_max: &Number,
+    limit_rate: Option<&Number>,
     amm_ctx: &mut AmmContext,
 ) -> (Number, Number, bool) {
     let trace = std::env::var("RXRPL_FLOW_TRACE").is_ok();
@@ -4618,6 +4729,7 @@ pub(crate) fn flow_multi(
     let mut saved_outs: Vec<Number> = Vec::new();
     let mut offers_considered = 0u32;
     let mut preserve_output_ulp = false;
+    let mut next: Vec<usize> = (0..strands.len()).collect();
 
     for cur_try in 0..FLOW_MAX_TRIES {
         let remaining_out = {
@@ -4635,22 +4747,20 @@ pub(crate) fn flow_multi(
             r
         };
 
-        // (A) activateNext: rank ALL strands best-quality-first each pass.
-        //
-        // Unlike rippled's `ActiveStrands` (which drops a strand once its rev
-        // pass returns dry, shrinking the active set), we keep every strand live
-        // for the whole payment. A strand that delivers nothing this pass simply
-        // loses the first-survivor race, but its PRESENCE keeps `multi_path > 1`
-        // — which is what sustains the fib-chunked AMM consumption across all
-        // passes (a shared AMM first hop drains in fib increments only while two
-        // or more strands are live). Dropping the dry strand would collapse the
-        // payment to a single full swap (over-delivery).
-
-        let mut cur: Vec<usize> = (0..strands.len()).collect();
+        // (A) activateNext: discard dry/over-limit strands and rank the survivors.
+        // After a winner is chosen only that strand and the untried suffix remain
+        // eligible, matching rippled's `ActiveStrands` lifecycle.
+        let mut cur: Vec<usize> = next
+            .drain(..)
+            .filter(|&i| {
+                strand_quality_ub(ctx, &strands[i], dest, amm_ctx)
+                    .is_some_and(|q| limit_rate.is_none_or(|limit| !num_gt(&q, limit)))
+            })
+            .collect();
         if cur.len() > 1 {
             cur.sort_by(|&a, &b| {
-                let ra = strand_quality_ub(ctx, &strands[a], amm_ctx);
-                let rb = strand_quality_ub(ctx, &strands[b], amm_ctx);
+                let ra = strand_quality_ub(ctx, &strands[a], dest, amm_ctx).unwrap();
+                let rb = strand_quality_ub(ctx, &strands[b], dest, amm_ctx).unwrap();
                 let d = ra.sub(&rb);
                 if d.is_zero() {
                     std::cmp::Ordering::Equal
@@ -4670,7 +4780,8 @@ pub(crate) fn flow_multi(
                 .map(|&i| {
                     format!(
                         "s{i}={}",
-                        strand_quality_ub(ctx, &strands[i], amm_ctx)
+                        strand_quality_ub(ctx, &strands[i], dest, amm_ctx)
+                            .unwrap()
                             .to_iou()
                             .to_decimal_string()
                     )
@@ -4685,7 +4796,8 @@ pub(crate) fn flow_multi(
         // (D) pick the FIRST surviving strand (checkpoint per trial; roll back
         // losers; keep the winner's mutation).
         let mut winner: Option<(usize, StrandPass)> = None;
-        for &si in cur.iter() {
+        let mut winner_pos = None;
+        for (pos, &si) in cur.iter().enumerate() {
             let cp = ctx.view.checkpoint();
             let taker_acct_before = taker_acct.clone();
             amm_ctx.clear();
@@ -4700,8 +4812,23 @@ pub(crate) fn flow_multi(
                 amm_ctx,
             ) {
                 Some(res) if !res.out_amt.is_zero() => {
+                    let realised_rate = res.in_amt.div(&res.out_amt);
+                    if limit_rate.is_some_and(|limit| num_gt(&realised_rate, limit)) {
+                        if trace {
+                            eprintln!(
+                                "[flow]   try={cur_try} strand={si} misses limit realised={} limit={}",
+                                realised_rate.to_iou().to_decimal_string(),
+                                limit_rate.unwrap().to_iou().to_decimal_string(),
+                            );
+                        }
+                        ctx.view.rollback(cp);
+                        *taker_acct = taker_acct_before;
+                        amm_ctx.clear();
+                        continue;
+                    }
                     offers_considered += res.offers_used;
                     winner = Some((si, res));
+                    winner_pos = Some(pos);
                     break;
                 }
                 other => {
@@ -4720,6 +4847,8 @@ pub(crate) fn flow_multi(
         let Some((si, res)) = winner else {
             break;
         };
+        let pos = winner_pos.expect("winner position");
+        next = next_flow_strands(&cur, pos);
         if trace {
             eprintln!(
                 "[flow] try={cur_try} strand={si} multi={} amm_iter={} in={} out={}",
@@ -7686,8 +7815,8 @@ mod amm_quality_gate_tests {
 #[cfg(test)]
 mod flow_source_balance_tests {
     use super::{
-        Leg, aggregate_flow_source_balance, can_fund_new_trust_line, leftover_leg,
-        preserve_flow_output_ulp,
+        Leg, aggregate_flow_source_balance, can_fund_new_trust_line, flow_gross_input,
+        flow_net_input, leftover_leg, next_flow_strands, preserve_flow_output_ulp,
     };
     use rxrpl_amount::IOUAmount;
     use rxrpl_amount::number::Number;
@@ -7703,6 +7832,30 @@ mod flow_source_balance_tests {
                 .to_decimal_string(),
             "0.0023781541865634"
         );
+    }
+
+    #[test]
+    fn transfer_rates_match_ledger_105500237_flow_amounts() {
+        let rate = IOUAmount::from_parts(1_001_000_000, -9, false).unwrap();
+        let source_net =
+            Number::from_iou(&IOUAmount::from_decimal_string("8.438055169911182").unwrap());
+        assert_eq!(
+            flow_gross_input(&source_net, Some(rate))
+                .to_iou()
+                .to_decimal_string(),
+            "8.446493225081094"
+        );
+
+        let terminal_gross =
+            Number::from_iou(&IOUAmount::from_decimal_string("0.1531269004849731").unwrap());
+        let book_net = flow_net_input(&terminal_gross, Some(rate));
+        assert_eq!(book_net.to_iou().to_decimal_string(), "0.1529739265584146");
+    }
+
+    #[test]
+    fn active_strands_drop_failed_prefix_after_winner() {
+        assert_eq!(next_flow_strands(&[1, 5, 2], 1), vec![5, 2]);
+        assert_eq!(next_flow_strands(&[2, 5], 0), vec![2, 5]);
     }
 
     #[test]
