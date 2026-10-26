@@ -141,6 +141,27 @@ fn is_threading_only(
         .all(|k| k == "PreviousTxnID" || k == "PreviousTxnLgrSeq" || prev.get(k) == fin.get(k))
 }
 
+/// `trustDelete` threads both owners of the removed RippleState. Unlike other
+/// thread-only owner touches, rippled includes the AccountRoot's FinalFields in
+/// this case. Detect the account side from the deleted line's two limits.
+fn owns_deleted_trust_line(account: Option<&str>, nodes: &[AffectedNode]) -> bool {
+    let Some(account) = account else {
+        return false;
+    };
+    nodes.iter().any(|node| {
+        if node.change_type != ChangeType::Deleted || node.ledger_entry_type != "RippleState" {
+            return false;
+        }
+        let line = decode_sle(&node.final_fields);
+        ["LowLimit", "HighLimit"].iter().any(|field| {
+            line.get(*field)
+                .and_then(|limit| limit.get("issuer"))
+                .and_then(serde_json::Value::as_str)
+                == Some(account)
+        })
+    })
+}
+
 /// True when the final node gained a metadata-eligible field that was absent
 /// (or at its default) in the original — i.e. a pure field addition. rippled
 /// still emits a (possibly empty) `PreviousFields` container in that case.
@@ -281,8 +302,14 @@ impl TxMeta {
                     // AccountRoot, or an issuer restamped because a new object was
                     // linked into its directory — is threaded in rippled via
                     // threadOwners and carries NO FinalFields or PreviousFields,
-                    // only the node-level PreviousTxnID/LgrSeq.
-                    if !is_threading_only(&prev, &fin) {
+                    // only the node-level PreviousTxnID/LgrSeq. trustDelete is
+                    // the exception: both RippleState owners include FinalFields.
+                    let trust_delete_owner = n.ledger_entry_type == "AccountRoot"
+                        && owns_deleted_trust_line(
+                            fin.get("Account").and_then(serde_json::Value::as_str),
+                            &nodes,
+                        );
+                    if !is_threading_only(&prev, &fin) || trust_delete_owner {
                         let finals = section_fields(&fin, SMD_ALWAYS | SMD_CHANGE_NEW, false);
                         if !finals.is_empty() {
                             inner.insert("FinalFields".into(), finals.into());
@@ -400,5 +427,72 @@ mod tests {
         // The deleted node carries its final state (here equal to the original,
         // since nothing mutated it before deletion).
         assert!(meta.affected_nodes[0].final_fields.is_some());
+    }
+
+    #[test]
+    fn trust_delete_thread_owner_keeps_account_final_fields() {
+        let account_key = Hash256::new([0x04; 32]);
+        let line_key = Hash256::new([0x05; 32]);
+        let account = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let other = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
+        let original = serde_json::to_vec(&serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": account,
+            "Balance": "1000",
+            "Flags": 0,
+            "OwnerCount": 0,
+            "PreviousTxnID": "11".repeat(32),
+            "PreviousTxnLgrSeq": 10,
+        }))
+        .unwrap();
+        let final_fields = serde_json::to_vec(&serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": account,
+            "Balance": "1000",
+            "Flags": 0,
+            "OwnerCount": 0,
+            "PreviousTxnID": "22".repeat(32),
+            "PreviousTxnLgrSeq": 11,
+        }))
+        .unwrap();
+        let line = serde_json::to_vec(&serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "LowLimit": { "issuer": account, "currency": "USD", "value": "0" },
+            "HighLimit": { "issuer": other, "currency": "USD", "value": "0" },
+        }))
+        .unwrap();
+        let meta = TxMeta {
+            affected_nodes: vec![
+                AffectedNode {
+                    change_type: ChangeType::Modified,
+                    key: account_key,
+                    ledger_entry_type: "AccountRoot".into(),
+                    previous: Some(original),
+                    final_fields: Some(final_fields),
+                    prev_txn: Some((serde_json::json!("11".repeat(32)), serde_json::json!(10))),
+                },
+                AffectedNode {
+                    change_type: ChangeType::Deleted,
+                    key: line_key,
+                    ledger_entry_type: "RippleState".into(),
+                    previous: Some(line.clone()),
+                    final_fields: Some(line),
+                    prev_txn: None,
+                },
+            ],
+            tx_index: 0,
+            result_code: 0,
+            delivered_amount: None,
+        };
+
+        let json = meta.to_canonical_json();
+        let modified = json["AffectedNodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|node| node.get("ModifiedNode"))
+            .unwrap();
+        assert_eq!(modified["FinalFields"]["Account"], account);
+        assert_eq!(modified["FinalFields"]["Balance"], "1000");
     }
 }

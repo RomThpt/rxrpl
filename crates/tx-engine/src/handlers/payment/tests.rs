@@ -544,6 +544,91 @@ fn apply_iou_transfer_rate_deducts_fee_from_source() {
 }
 
 #[test]
+fn apply_iou_redemption_reaps_default_source_trust_line() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, ALICE, "50000000", None);
+
+    let holder_id = decode_account_id(ALICE).unwrap();
+    let issuer_id = decode_account_id(ISSUER).unwrap();
+    let currency = helpers::currency_to_bytes("USD");
+    let line_key = keylet::trust_line(&holder_id, &issuer_id, &currency);
+    let holder_is_low = holder_id.as_bytes() < issuer_id.as_bytes();
+    let (low, high) = if holder_is_low {
+        (ALICE, ISSUER)
+    } else {
+        (ISSUER, ALICE)
+    };
+    let holder_reserve = if holder_is_low {
+        0x0001_0000
+    } else {
+        0x0002_0000
+    };
+    let balance = if holder_is_low { "100" } else { "-100" };
+    let line = serde_json::json!({
+        "LedgerEntryType": "RippleState",
+        "Balance": { "currency": "USD", "issuer": ISSUER, "value": balance },
+        "LowLimit": { "currency": "USD", "issuer": low, "value": "0" },
+        "HighLimit": { "currency": "USD", "issuer": high, "value": "0" },
+        "LowNode": "0",
+        "HighNode": "0",
+        "Flags": holder_reserve,
+    });
+    ledger
+        .put_state(line_key, serde_json::to_vec(&line).unwrap())
+        .unwrap();
+
+    for (id, address) in [(holder_id, ALICE), (issuer_id, ISSUER)] {
+        let root = keylet::owner_dir(&id);
+        let directory = serde_json::json!({
+            "LedgerEntryType": "DirectoryNode",
+            "Flags": 0,
+            "Indexes": [line_key.to_string()],
+            "Owner": address,
+            "RootIndex": root.to_string(),
+        });
+        ledger
+            .put_state(root, serde_json::to_vec(&directory).unwrap())
+            .unwrap();
+    }
+
+    let holder_key = keylet::account(&holder_id);
+    let mut holder: Value = serde_json::from_slice(ledger.get_state(&holder_key).unwrap()).unwrap();
+    holder["OwnerCount"] = serde_json::json!(1);
+    ledger
+        .put_state(holder_key, serde_json::to_vec(&holder).unwrap())
+        .unwrap();
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ISSUER,
+        "Amount": iou("USD", ISSUER, "100"),
+        "Fee": "10",
+    });
+    let rules = Rules::new();
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+
+    assert_eq!(
+        PaymentTransactor.apply(&mut ctx),
+        Ok(TransactionResult::TesSuccess)
+    );
+    assert!(sandbox.read(&line_key).is_none());
+    assert!(sandbox.read(&keylet::owner_dir(&holder_id)).is_none());
+    assert!(sandbox.read(&keylet::owner_dir(&issuer_id)).is_none());
+    let holder: Value = serde_json::from_slice(&sandbox.read(&holder_key).unwrap()).unwrap();
+    assert_eq!(holder["OwnerCount"], serde_json::json!(0));
+}
+
+#[test]
 fn apply_iou_transfer_rate_send_max_too_low_fails() {
     let mut ledger = Ledger::genesis();
     put_account(&mut ledger, ISSUER, "100000000", Some(1_200_000_000));

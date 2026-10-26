@@ -513,6 +513,31 @@ fn apply_iou(
         .update(src_trust_key, src_trust_data)
         .map_err(|_| TransactionResult::TefInternal)?;
 
+    // `directSendNoFeeIOU` ultimately uses `rippleCredit`, which reaps a
+    // source trust line when redeeming its entire balance leaves the line in
+    // the default state. Keep the source AccountRoot as the working copy so
+    // trustDelete can release its reserve and thread both owner directories.
+    let src_key = keylet::account(&src_id);
+    let src_bytes = ctx
+        .view
+        .read(&src_key)
+        .ok_or(TransactionResult::TerNoAccount)?;
+    let mut src_account: Value =
+        serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
+    if crate::handlers::trust_set::maybe_delete_drained_trust_line(
+        ctx,
+        &src_id,
+        &mut src_account,
+        &issuer_id,
+        &cur_bytes,
+    )? {
+        let src_data =
+            serde_json::to_vec(&src_account).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(src_key, src_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+    }
+
     // If destination is the issuer, we just burned IOU -- no trust line on
     // the issuer's side to credit. Otherwise credit destination's RippleState.
     if dest_id != issuer_id {
