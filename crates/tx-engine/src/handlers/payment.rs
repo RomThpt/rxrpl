@@ -204,8 +204,47 @@ impl Transactor for PaymentTransactor {
                     // narrowly (>= 2 resolvable boundary chains) so single-path
                     // cross-currency and AMM-routed payments keep their existing
                     // byte-exact single-strand engine.
-                    if count_flow_strands(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]) >= 2
-                        && flow_strands_have_amm(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"])
+                    let flow_strand_count =
+                        count_flow_strands(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]);
+                    let single_native_amm_strand = flow_strand_count == 1
+                        && account_str == destination_str
+                        && send_max.is_string()
+                        && ctx.tx.get("DeliverMin").is_some()
+                        && ctx
+                            .tx
+                            .get("Paths")
+                            .and_then(Value::as_array)
+                            .is_some_and(|paths| {
+                                paths.len() == 1
+                                    && paths.iter().any(|path| {
+                                        path.as_array()
+                                            .and_then(|steps| {
+                                                build_path_boundaries(
+                                                    ctx.view,
+                                                    steps,
+                                                    send_max,
+                                                    &ctx.tx["Amount"],
+                                                    account_str,
+                                                )
+                                            })
+                                            .is_some_and(|boundaries| boundaries.len() >= 2)
+                                    })
+                            })
+                        && flow_strands_have_amm(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]);
+                    let direct_native_amm_book = account_str == destination_str
+                        && send_max.is_string()
+                        && ctx.tx.get("DeliverMin").is_some()
+                        && ctx.tx.get("Paths").is_none()
+                        && direct_pair_has_amm_and_clob(
+                            ctx,
+                            account_str,
+                            send_max,
+                            &ctx.tx["Amount"].clone(),
+                        )?;
+                    if direct_native_amm_book
+                        || single_native_amm_strand
+                        || (flow_strand_count >= 2
+                            && flow_strands_have_amm(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]))
                     {
                         return apply_paths_payment_multi(
                             ctx,
@@ -762,7 +801,6 @@ fn apply_conversion(
         .ok_or(TransactionResult::TerNoAccount)?;
     let mut acct: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
-
     // Use the direct constant-product quote when an AMM exists. It mirrors the
     // single synthetic AMM offer selected by BookStep and, unlike the generic
     // CLOB fallback, can represent a capacity-limited partial AMM delivery.
@@ -1083,15 +1121,23 @@ fn apply_paths_payment(
             Err(_) => continue,
         }
     }
+    let no_delivery_result = if limit_quality && ctx.tx.get("DeliverMin").is_some() {
+        // A quality-limited path that cannot reach DeliverMin is partial rather
+        // than dry: the path exists, but its admissible liquidity is
+        // insufficient (105500249 indices 145/152/159/164/173/204).
+        TransactionResult::TecPathPartial
+    } else {
+        TransactionResult::TecPathDry
+    };
     let Some(delivered) = delivered else {
-        return Err(TransactionResult::TecPathDry);
+        return Err(no_delivery_result);
     };
 
     // A path that delivers exactly zero is dry (tecPATH_DRY), even under
     // tfPartialPayment — mirrors rippled StrandFlow and lets the build-ledger
     // loop retry once a sibling funds the path.
     if delivered_amount(&delivered) <= 0.0 {
-        return Err(TransactionResult::TecPathDry);
+        return Err(no_delivery_result);
     }
 
     // Partial-payment gate. Without tfPartialPayment the full Amount must be
@@ -1224,6 +1270,32 @@ fn flow_strands_have_amm(
     false
 }
 
+/// Whether the implicit direct strand has both AMM and funded CLOB liquidity.
+/// Such a strand must use Flow's per-quality interleave; the direct AMM shortcut
+/// cannot split one input budget across both liquidity sources.
+fn direct_pair_has_amm_and_clob(
+    ctx: &mut ApplyContext<'_>,
+    account: &str,
+    send_max: &serde_json::Value,
+    amount: &serde_json::Value,
+) -> Result<bool, TransactionResult> {
+    if helpers::get_flags(ctx.tx) & rxrpl_protocol::flags::payment::TF_NO_RIPPLE_DIRECT != 0
+        || !flow_strands_have_amm(ctx.view, ctx.tx, send_max, amount)
+    {
+        return Ok(false);
+    }
+    let taker = decode_account_id(account).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let (Some((_, in_cur, in_iss)), Some((out_xrp, out_cur, out_iss))) =
+        (amm_asset_of(send_max), amm_asset_of(amount))
+    else {
+        return Ok(false);
+    };
+    Ok(
+        best_book_dir_quality(ctx, &taker, &in_cur, &in_iss, &out_cur, &out_iss, out_xrp)?
+            .is_some(),
+    )
+}
+
 /// A SendMax / Amount value as a `Number` magnitude (XRP drops as an integer,
 /// IOU as its decimal value).
 fn value_to_number(v: &serde_json::Value) -> rxrpl_amount::number::Number {
@@ -1271,13 +1343,23 @@ fn apply_paths_payment_multi(
         .ok_or(TransactionResult::TerNoAccount)?;
     let mut acct: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let source_xrp_before = send_max.is_string().then(|| helpers::get_balance(&acct));
+    let output_holding_before = amm_asset_of(&amount).and_then(|(is_xrp, currency, issuer)| {
+        (!is_xrp && dst_id != issuer).then(|| {
+            (
+                crate::amm_helpers::iou_holding_number(ctx.view, &dst_id, &issuer, &currency),
+                currency,
+                issuer,
+            )
+        })
+    });
 
     let paths = ctx
         .tx
         .get("Paths")
         .and_then(|v| v.as_array())
-        .ok_or(TransactionResult::TemBadPath)?
-        .clone();
+        .cloned()
+        .unwrap_or_default();
 
     // Build every distinct strand, including the implicit direct path unless
     // tfNoRippleDirect disables it.
@@ -1317,7 +1399,7 @@ fn apply_paths_payment_multi(
             .then(|| send_max_num.div(&deliver_req));
 
     let mut amm_ctx = crate::handlers::flow::AmmContext::new(strands.len() > 1);
-    let (delivered_num, _spent_num, preserve_output_ulp) =
+    let (mut delivered_num, _spent_num, mut preserve_output_ulp) =
         crate::handlers::offer_create::flow_multi(
             ctx,
             &src_id,
@@ -1329,10 +1411,77 @@ fn apply_paths_payment_multi(
             limit_rate.as_ref(),
             &mut amm_ctx,
         );
+    let mut source_xrp_exhausted = false;
+    if let (Some(before), Some(send_max_drops)) = (
+        source_xrp_before,
+        send_max
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok()),
+    ) {
+        let settled = before.saturating_sub(helpers::get_balance(&acct));
+        source_xrp_exhausted = settled == send_max_drops;
+        preserve_output_ulp |= source_xrp_exhausted;
+    }
+    if source_xrp_exhausted
+        && strands.len() == 1
+        && strands[0].terminal_has_amm()
+        && let Some((false, _, issuer)) = amm_asset_of(&amount)
+    {
+        let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap_or(IOUAmount::ZERO);
+        if crate::handlers::offer_create::transfer_rate(ctx, &issuer) > one {
+            let delivered = delivered_num.to_iou();
+            if let Ok(bumped) =
+                IOUAmount::from_parts(delivered.mantissa() + 1, delivered.exponent(), false)
+            {
+                delivered_num = Number::from_iou(&bumped);
+            }
+        }
+    }
+    let mut delivered_iou_override = None;
+    if let Some((before, currency, issuer)) = output_holding_before {
+        let preserve_exact_zero_balance = before.is_zero()
+            && source_xrp_exhausted
+            && strands.len() == 1
+            && strands[0].terminal_has_amm()
+            && ctx.tx.get("Paths").is_none();
+        if preserve_exact_zero_balance {
+            delivered_iou_override = exact_iou_holding(ctx.view, &dst_id, &issuer, &currency);
+            preserve_output_ulp = true;
+        } else {
+            let after =
+                crate::amm_helpers::iou_holding_number(ctx.view, &dst_id, &issuer, &currency);
+            let credited = after.sub(&before).to_iou();
+            let aggregate = delivered_num.to_iou();
+            if credited.exponent() == aggregate.exponent()
+                && credited.mantissa().checked_add(1) == Some(aggregate.mantissa())
+                && let Ok(ulp) =
+                    IOUAmount::from_parts(1_000_000_000_000_000, aggregate.exponent() - 15, false)
+            {
+                crate::handlers::offer_create::credit_line(
+                    ctx,
+                    &dst_id,
+                    &issuer,
+                    &currency,
+                    &ulp,
+                    ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+                )?;
+                preserve_output_ulp = true;
+            }
+        }
+    }
 
     if delivered_num.is_zero() {
-        // Zero delivery is dry, not partial (rippled StrandFlow.h:805).
-        return Err(TransactionResult::TecPathDry);
+        return Err(
+            if helpers::get_flags(ctx.tx) & rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT != 0
+                && ctx.tx.get("DeliverMin").is_some()
+                && strands.len() == 1
+                && strands[0].is_two_hop_clob_path()
+            {
+                TransactionResult::TecPathPartial
+            } else {
+                TransactionResult::TecPathDry
+            },
+        );
     }
 
     // The delivered magnitude in the Amount asset, for the partial-payment gate.
@@ -1340,12 +1489,12 @@ fn apply_paths_payment_multi(
     let delivered = if amount.is_string() {
         serde_json::Value::String(delivered_num.to_xrp_drops().to_string())
     } else {
-        let mut delivered_iou = {
+        let mut delivered_iou = delivered_iou_override.unwrap_or_else(|| {
             let _round = rxrpl_amount::number::RoundModeGuard::new(
                 rxrpl_amount::number::RoundingMode::Downward,
             );
             delivered_num.to_iou()
-        };
+        });
         if !preserve_output_ulp && delivered_iou.mantissa() > 0 {
             delivered_iou = rxrpl_amount::IOUAmount::from_parts(
                 delivered_iou.mantissa() - 1,
@@ -1403,6 +1552,22 @@ fn amm_asset_of(v: &serde_json::Value) -> Option<(bool, [u8; 20], rxrpl_primitiv
     let cur_b = helpers::currency_to_bytes(cur);
     let iss_id = decode_account_id(iss).ok()?;
     Some((false, cur_b, iss_id))
+}
+
+fn exact_iou_holding(
+    view: &dyn ReadView,
+    account: &rxrpl_primitives::AccountId,
+    issuer: &rxrpl_primitives::AccountId,
+    currency: &[u8; 20],
+) -> Option<IOUAmount> {
+    let bytes = view.read(&keylet::trust_line(account, issuer, currency))?;
+    let line: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let stored = IOUAmount::from_decimal_string(line["Balance"]["value"].as_str()?).ok()?;
+    Some(if account.as_bytes() < issuer.as_bytes() {
+        stored
+    } else {
+        stored.negate()
+    })
 }
 
 /// `a <= b` for two like-asset `Number`s.
@@ -1738,24 +1903,40 @@ fn try_amm_conversion(
         return Ok(None);
     }
 
+    // The source budget is GROSS when a third-party issuer charges a transfer
+    // fee, while the constant-product swap is priced on the NET amount that
+    // reaches the pool. Keep both amounts: the source is debited gross and the
+    // pool reserve grows only by net (105500246 3583375C).
+    let input_rate = (!in_xrp && in_iss != *user_id && in_iss != pool_id)
+        .then(|| crate::handlers::offer_create::transfer_rate(ctx, &in_iss));
+    let pool_budget = crate::handlers::offer_create::flow_net_input(&budget_in, input_rate);
+    let output_rate = (!out_xrp && out_iss != pool_id && out_iss != *dst_id)
+        .then(|| crate::handlers::offer_create::transfer_rate(ctx, &out_iss));
+    let pool_target_out = crate::handlers::offer_create::flow_gross_input(&target_out, output_rate);
+
     // Choose the binding limit. Output-limited when the input needed for the
     // full target fits the budget; otherwise input-limited (spend the budget).
     let in_needed =
-        crate::amm_helpers::swap_asset_out(&pool_in, &pool_out, &target_out, tfee, in_xrp);
-    let (spent, delivered) = match in_needed {
-        Some(needed) if num_le(&needed, &budget_in) => (needed, target_out),
+        crate::amm_helpers::swap_asset_out(&pool_in, &pool_out, &pool_target_out, tfee, in_xrp);
+    let (pool_spent, source_spent, pool_delivered) = match in_needed {
+        Some(needed) if num_le(&needed, &pool_budget) => {
+            let gross = crate::handlers::offer_create::flow_gross_input(&needed, input_rate);
+            (needed, gross, pool_target_out)
+        }
         _ => (
+            pool_budget,
             budget_in,
-            crate::amm_helpers::swap_asset_in(&pool_in, &pool_out, &budget_in, tfee, out_xrp),
+            crate::amm_helpers::swap_asset_in(&pool_in, &pool_out, &pool_budget, tfee, out_xrp),
         ),
     };
-    if delivered.is_zero() || spent.is_zero() {
+    if pool_delivered.is_zero() || pool_spent.is_zero() || source_spent.is_zero() {
         return Ok(None);
     }
+    let delivered = crate::handlers::offer_create::flow_net_input(&pool_delivered, output_rate);
 
-    // --- Apply: move `spent` in from the user to the pool. ---
+    // --- Apply: debit gross from the user and move net into the pool. ---
     if in_xrp {
-        let drops = spent.to_xrp_drops();
+        let drops = source_spent.to_xrp_drops();
         let ubal = helpers::get_balance(user_acct);
         helpers::set_balance(user_acct, ubal.saturating_sub(drops));
         let pkey = keylet::account(&pool_id);
@@ -1769,21 +1950,21 @@ fn try_amm_conversion(
             .update(pkey, pd)
             .map_err(|_| TransactionResult::TefInternal)?;
     } else {
-        let source_after = add_iou_number_round(&src_in_funds, &spent.negate())?;
+        let source_after = add_iou_number_round(&src_in_funds, &source_spent.negate())?;
         crate::amm_helpers::set_iou_holding(ctx.view, user_id, &in_iss, &in_cur, &source_after)?;
         // rippled's rippleCredit deletes a line drained to zero in the default
         // state (trustDelete); fires inline after the debit.
         crate::handlers::trust_set::maybe_delete_drained_trust_line(
             ctx, user_id, user_acct, &in_iss, &in_cur,
         )?;
-        let pool_after = add_iou_number_round(&pool_in, &spent)?;
+        let pool_after = add_iou_number_round(&pool_in, &pool_spent)?;
         crate::amm_helpers::set_iou_holding(ctx.view, &pool_id, &in_iss, &in_cur, &pool_after)?;
     }
 
     // --- Apply: move `delivered` out from the pool to the destination. ---
     let dst_is_src = dst_id.as_bytes() == user_id.as_bytes();
     if out_xrp {
-        let drops = delivered.to_xrp_drops();
+        let drops = pool_delivered.to_xrp_drops();
         let pkey = keylet::account(&pool_id);
         let pbytes = ctx.view.read(&pkey).ok_or(TransactionResult::TecNoEntry)?;
         let mut pacct: serde_json::Value =
@@ -1810,7 +1991,7 @@ fn try_amm_conversion(
                 .map_err(|_| TransactionResult::TefInternal)?;
         }
     } else {
-        let pool_after = add_iou_number_round(&pool_out, &delivered.negate())?;
+        let pool_after = add_iou_number_round(&pool_out, &pool_delivered.negate())?;
         crate::amm_helpers::set_iou_holding(ctx.view, &pool_id, &out_iss, &out_cur, &pool_after)?;
         // Delivering the output IOU to its own issuer redeems it: the pool's
         // holding decrease above already reflects the burn, and the issuer holds

@@ -227,7 +227,7 @@ impl AmmLiquidity {
         Some((cur_in, cur_out))
     }
 
-    /// `AMMLiquidity::getOffer` (AMMLiquidity.cpp:154-257), multi-path branch.
+    /// `AMMLiquidity::getOffer` (AMMLiquidity.cpp:154-257).
     ///
     /// Returns the next fib-sized synthetic offer, or `None` when the AMM should
     /// decline this pass: the iteration cap is hit, the pool is frozen, the AMM
@@ -268,15 +268,48 @@ impl AmmLiquidity {
             }
         }
 
-        // multiPath branch: the fib-sized chunk.
-        let (off_in, off_out) = self.generate_fib_seq_offer(pool_in, pool_out, ctx)?;
-        let oq = quality_rate(&off_in, self.in_is_xrp, &off_out, self.out_is_xrp).ok()?;
-        if let Some(cq) = clob_quality {
-            // Quality{amounts} < clobQuality => decline (chunk worse than CLOB).
-            if is_better_quality(cq, oq) {
-                return None;
+        let (off_in, off_out, oq) = if ctx.multi_path() {
+            // Multiple active strands consume fibonacci-sized synthetic offers.
+            let (off_in, off_out) = self.generate_fib_seq_offer(pool_in, pool_out, ctx)?;
+            let oq = quality_rate(&off_in, self.in_is_xrp, &off_out, self.out_is_xrp).ok()?;
+            if let Some(cq) = clob_quality {
+                // Quality{amounts} < clobQuality => decline (chunk worse than CLOB).
+                if is_better_quality(cq, oq) {
+                    return None;
+                }
             }
-        }
+            (off_in, off_out, oq)
+        } else if let Some(cq) = clob_quality {
+            // A single strand consumes the AMM until its ending spot price
+            // reaches the competing CLOB quality.
+            let (off_in, off_out) = crate::amm_helpers::change_spot_price_quality(
+                pool_in,
+                pool_out,
+                cq,
+                self.tfee,
+                self.in_is_xrp,
+                self.out_is_xrp,
+            )?;
+            let oq = quality_rate(&off_in, self.in_is_xrp, &off_out, self.out_is_xrp).ok()?;
+            (off_in, off_out, oq)
+        } else {
+            // With no competing book, rippled exposes a maximum offer covering
+            // 99% of the output reserve. A later limit operation prices the
+            // actual demand with the constant-product swap function.
+            let pct = Number::from_int(99).div(&Number::from_int(100));
+            let off_out = {
+                let _round = RoundModeGuard::new(RoundingMode::Downward);
+                to_amount_grid(&pool_out.mul(&pct), self.out_is_xrp)
+            };
+            let off_in = crate::amm_helpers::swap_asset_out(
+                pool_in,
+                pool_out,
+                &off_out,
+                self.tfee,
+                self.in_is_xrp,
+            )?;
+            (off_in, off_out, spq)
+        };
         if off_in.is_zero() || off_out.is_zero() {
             return None;
         }
@@ -287,6 +320,8 @@ impl AmmLiquidity {
             bal_out: *pool_out,
             in_is_xrp: self.in_is_xrp,
             out_is_xrp: self.out_is_xrp,
+            multi_path: ctx.multi_path(),
+            tfee: self.tfee,
             quality: oq,
         })
     }
@@ -304,6 +339,8 @@ pub struct AmmOffer {
     pub bal_out: Number,
     pub in_is_xrp: bool,
     pub out_is_xrp: bool,
+    pub multi_path: bool,
+    pub tfee: u16,
     /// Packed quality rate (`in/out`) of this chunk.
     pub quality: u64,
 }
@@ -316,6 +353,17 @@ impl AmmOffer {
     pub fn limit_out(&self, limit: &Number, round_up: bool) -> (Number, Number) {
         if !num_gt(&self.out_num, limit) {
             return (self.in_num, self.out_num);
+        }
+        if !self.multi_path {
+            let new_in = crate::amm_helpers::swap_asset_out(
+                &self.bal_in,
+                &self.bal_out,
+                limit,
+                self.tfee,
+                self.in_is_xrp,
+            )
+            .unwrap_or(self.in_num);
+            return (new_in, *limit);
         }
         let rate = Amount::Iou(from_rate(self.quality).unwrap_or(IOUAmount::ZERO));
         let new_in = Amount::mul_round_strict(
@@ -341,6 +389,16 @@ impl AmmOffer {
     pub fn limit_in(&self, limit: &Number, round_up: bool) -> (Number, Number) {
         if !num_gt(&self.in_num, limit) {
             return (self.in_num, self.out_num);
+        }
+        if !self.multi_path {
+            let new_out = crate::amm_helpers::swap_asset_in(
+                &self.bal_in,
+                &self.bal_out,
+                limit,
+                self.tfee,
+                self.out_is_xrp,
+            );
+            return (*limit, new_out);
         }
         let rate = Amount::Iou(from_rate(self.quality).unwrap_or(IOUAmount::ZERO));
         let new_out = Amount::div_round(
@@ -626,6 +684,51 @@ mod tests {
     }
 
     #[test]
+    fn single_path_amm_limit_in_reprices_the_swap() {
+        let amm = xjoy_xrp_pool();
+        let ctx = AmmContext::new(false);
+        let offer = amm
+            .get_offer(&amm.initial_pool_in, &amm.initial_pool_out, None, &ctx)
+            .expect("maximum single-path offer");
+        let limit = Number::from_iou(&IOUAmount::from_decimal_string("1").unwrap());
+        let expected = crate::amm_helpers::swap_asset_in(
+            &amm.initial_pool_in,
+            &amm.initial_pool_out,
+            &limit,
+            amm.tfee,
+            amm.out_is_xrp,
+        );
+
+        let (priced_in, priced_out) = offer.limit_in(&limit, false);
+
+        assert_eq!(priced_in, limit);
+        assert_eq!(priced_out, expected);
+    }
+
+    #[test]
+    fn single_path_amm_limit_out_reprices_the_swap() {
+        let amm = xjoy_xrp_pool();
+        let ctx = AmmContext::new(false);
+        let offer = amm
+            .get_offer(&amm.initial_pool_in, &amm.initial_pool_out, None, &ctx)
+            .expect("maximum single-path offer");
+        let limit = Number::from_int(1_000_000);
+        let expected = crate::amm_helpers::swap_asset_out(
+            &amm.initial_pool_in,
+            &amm.initial_pool_out,
+            &limit,
+            amm.tfee,
+            amm.in_is_xrp,
+        )
+        .expect("priced output");
+
+        let (priced_in, priced_out) = offer.limit_out(&limit, true);
+
+        assert_eq!(priced_in, expected);
+        assert_eq!(priced_out, limit);
+    }
+
+    #[test]
     fn modern_amm_quality_rounding_pins_sendmax_limited_chunk() {
         // Ledger 105500174, final AmeriCoin/EuroCoin fib chunk. The synthetic
         // offer quality is constructed after fixUniversalNumber, so getRate's
@@ -643,6 +746,8 @@ mod tests {
             bal_out: Number::ZERO,
             in_is_xrp: false,
             out_is_xrp: false,
+            multi_path: true,
+            tfee: 1000,
             quality: modern_quality,
         };
         let limit = Number::from_iou(&IOUAmount::from_decimal_string("225309064.044909").unwrap());

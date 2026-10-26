@@ -883,8 +883,17 @@ fn currency_code_str(currency: &[u8; 20]) -> String {
 
 /// The issuer's transfer rate as an `IOUAmount` multiplier (1.0 = no fee).
 /// rippled charges the fee only when neither party is the issuer.
-fn transfer_rate(ctx: &ApplyContext<'_>, issuer: &AccountId) -> IOUAmount {
+pub(crate) fn transfer_rate(ctx: &ApplyContext<'_>, issuer: &AccountId) -> IOUAmount {
     let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
+    let rate = transfer_rate_value(ctx, issuer);
+    if rate > 1_000_000_000 {
+        IOUAmount::from_parts(u64::from(rate), -9, false).unwrap_or(one)
+    } else {
+        one
+    }
+}
+
+fn transfer_rate_value(ctx: &ApplyContext<'_>, issuer: &AccountId) -> u32 {
     let key = keylet::account(issuer);
     let rate = ctx
         .view
@@ -892,8 +901,8 @@ fn transfer_rate(ctx: &ApplyContext<'_>, issuer: &AccountId) -> IOUAmount {
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .and_then(|a| a.get("TransferRate").and_then(|v| v.as_u64()));
     match rate {
-        Some(r) if r > 1_000_000_000 => IOUAmount::from_parts(r, -9, false).unwrap_or(one),
-        _ => one,
+        Some(r) if r > 1_000_000_000 && r <= u64::from(u32::MAX) => r as u32,
+        _ => 1_000_000_000,
     }
 }
 
@@ -909,17 +918,114 @@ fn add_iou_balance(
     }
 }
 
+#[derive(Clone, Copy)]
+enum BalanceRounding {
+    Legacy,
+    Nearest,
+    HalfUpward,
+}
+
+fn add_iou_balance_towards_zero(
+    a: &IOUAmount,
+    b: &IOUAmount,
+) -> Result<IOUAmount, rxrpl_amount::AmountError> {
+    if a.is_zero() {
+        return Ok(*b);
+    }
+    if b.is_zero() {
+        return Ok(*a);
+    }
+    let lo = a.exponent().min(b.exponent());
+    let hi = a.exponent().max(b.exponent());
+    if hi - lo > 19 {
+        return Ok(if a.exponent() == hi { *a } else { *b });
+    }
+    let ma = i128::from(a.mantissa()) * 10i128.pow((a.exponent() - lo) as u32);
+    let mb = i128::from(b.mantissa()) * 10i128.pow((b.exponent() - lo) as u32);
+    let va = if a.is_negative() { -ma } else { ma };
+    let vb = if b.is_negative() { -mb } else { mb };
+    let sum = va + vb;
+    if sum == 0 {
+        return Ok(IOUAmount::ZERO);
+    }
+    let negative = sum < 0;
+    let mut magnitude = sum.unsigned_abs();
+    let mut exponent = lo;
+    const MAX_MANTISSA: u128 = 9_999_999_999_999_999;
+    while magnitude > MAX_MANTISSA {
+        magnitude /= 10;
+        exponent += 1;
+    }
+    IOUAmount::from_parts(magnitude as u64, exponent, negative)
+}
+
+fn iou_sum_is_halfway(a: &IOUAmount, b: &IOUAmount) -> bool {
+    if a.is_zero() || b.is_zero() {
+        return false;
+    }
+    let lo = a.exponent().min(b.exponent());
+    let hi = a.exponent().max(b.exponent());
+    if hi - lo > 19 {
+        return false;
+    }
+    let ma = i128::from(a.mantissa()) * 10i128.pow((a.exponent() - lo) as u32);
+    let mb = i128::from(b.mantissa()) * 10i128.pow((b.exponent() - lo) as u32);
+    let va = if a.is_negative() { -ma } else { ma };
+    let vb = if b.is_negative() { -mb } else { mb };
+    let magnitude = (va + vb).unsigned_abs();
+    const MAX_MANTISSA: u128 = 9_999_999_999_999_999;
+    if magnitude <= MAX_MANTISSA {
+        return false;
+    }
+    let mut probe = magnitude;
+    let mut digits_over = 0u32;
+    while probe > MAX_MANTISSA {
+        probe /= 10;
+        digits_over += 1;
+    }
+    let divisor = 10u128.pow(digits_over);
+    magnitude % divisor == divisor / 2
+}
+
+fn add_iou_balance_half_upward(
+    a: &IOUAmount,
+    b: &IOUAmount,
+) -> Result<IOUAmount, rxrpl_amount::AmountError> {
+    let nearest = IOUAmount::add_round(a, b)?;
+    if nearest.is_negative() && iou_sum_is_halfway(a, b) {
+        add_iou_balance_towards_zero(a, b)
+    } else {
+        Ok(nearest)
+    }
+}
+
 /// Apply a signed IOU change to a holder's trust line toward `issuer`.
 /// `gain` > 0 credits the holder, < 0 debits. Balance is stored from the low
 /// account's perspective, so a high-account holder's balance moves opposite to
 /// its gain. Byte-exact via `IOUAmount` (no floating point).
-fn credit_line(
+pub(crate) fn credit_line(
     ctx: &mut ApplyContext<'_>,
     holder: &AccountId,
     issuer: &AccountId,
     currency: &[u8; 20],
     gain: &IOUAmount,
     round: bool,
+) -> Result<(), TransactionResult> {
+    let rounding = if round {
+        BalanceRounding::Nearest
+    } else {
+        BalanceRounding::Legacy
+    };
+    credit_line_with_rounding(ctx, holder, issuer, currency, gain, rounding)
+}
+
+fn credit_line_with_rounding(
+    ctx: &mut ApplyContext<'_>,
+    holder: &AccountId,
+    issuer: &AccountId,
+    currency: &[u8; 20],
+    gain: &IOUAmount,
+    rounding: BalanceRounding,
 ) -> Result<(), TransactionResult> {
     let key = keylet::trust_line(holder, issuer, currency);
     let bytes = ctx.view.read(&key).ok_or(TransactionResult::TecPathDry)?;
@@ -936,8 +1042,12 @@ fn credit_line(
     let delta = if holder_is_high { gain.negate() } else { *gain };
     // Legacy crossing (pre-Number 2013 ledgers) truncates the smaller term;
     // modern Flow conversions round to nearest. See [`IOUAmount::add_round`].
-    let new =
-        add_iou_balance(&balance, &delta, round).map_err(|_| TransactionResult::TefInternal)?;
+    let new = match rounding {
+        BalanceRounding::Legacy => add_iou_balance(&balance, &delta, false),
+        BalanceRounding::Nearest => add_iou_balance(&balance, &delta, true),
+        BalanceRounding::HalfUpward => add_iou_balance_half_upward(&balance, &delta),
+    }
+    .map_err(|_| TransactionResult::TefInternal)?;
     line["Balance"]["value"] = Value::String(new.to_decimal_string());
     let nb = serde_json::to_vec(&line).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view
@@ -1242,14 +1352,24 @@ fn cross_offers(
                 continue;
             }
             let avail_out = leg_min(&offer_out, &funds);
+            // flowCross cannot spend more TakerGets than the taker currently
+            // holds. Recompute after every fill; the unspent offer remainder
+            // stays based on the original amount and is dropped later when the
+            // post-crossing source balance reaches zero (105500248 B88F1D1B).
+            let taker_funds = owner_funds_leg(ctx, taker, &in_leg);
+            let spendable_in = leg_min(&remaining_in, &taker_funds);
+            if spendable_in.is_zero() {
+                break 'walk;
+            }
             // A tfSell take is bounded by what the taker's remaining input can buy
             // at this offer's quality (it sells its whole TakerGets); a buy take is
             // bounded by the taker's remaining TakerPays demand.
+            let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
+            let affordable_out = out_for_in(&spendable_in, &rate, &offer_out);
             let take_out = if is_sell {
-                let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
-                leg_min(&avail_out, &out_for_in(&remaining_in, &rate, &offer_out))
+                leg_min(&avail_out, &affordable_out)
             } else {
-                leg_min(&remaining_out, &avail_out)
+                leg_min(&leg_min(&remaining_out, &avail_out), &affordable_out)
             };
 
             // Full take when the taker consumes the whole original offer;
@@ -1263,9 +1383,8 @@ fn cross_offers(
                 // remaining input at this quality, so the taker gives exactly that
                 // input — not a re-multiplied approximation that would leave a dust
                 // remainder unsold and diverge the maker's residual TakerPays.
-                (take_out.clone(), remaining_in.clone())
+                (take_out.clone(), spendable_in)
             } else {
-                let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
                 let order_in = if !leg_ge(&take_out, &avail_out) {
                     // Demand-limited (funded offer, take bounded by the taker's
                     // remaining demand): the taker pays the strict ceil price at
@@ -1576,6 +1695,7 @@ fn try_bridge_step(
             &ri,
             &ro,
             &mut amm_ctx,
+            /*offer_create_bridge=*/ true,
         ) else {
             break;
         };
@@ -1755,8 +1875,14 @@ pub(crate) fn cross_book_payment(
     let mut budget = in_tmpl.clone();
     let funds = owner_funds_leg(ctx, taker, &in_tmpl);
     if leg_ge(&budget, &funds) {
-        budget = funds;
+        budget = funds.clone();
     }
+    let source_input_rate =
+        if !in_tmpl.is_xrp && taker != &in_tmpl.issuer && dest != &in_tmpl.issuer {
+            transfer_rate_value(ctx, &in_tmpl.issuer)
+        } else {
+            1_000_000_000
+        };
 
     let (delivered, spent) = cross_book_hop(
         ctx,
@@ -1771,6 +1897,8 @@ pub(crate) fn cross_book_payment(
         /*allow_amm=*/ true,
         /*lq_stop=*/ None,
         /*preserve_input_limited_iou_ulp=*/ false,
+        /*force_full_input_budget=*/ false,
+        source_input_rate,
     )?;
     Ok((
         delivered.with_amount(&delivered.iou, delivered.drops),
@@ -1807,6 +1935,8 @@ fn cross_book_hop(
     allow_amm: bool,
     lq_stop: Option<(u64, u64)>,
     preserve_input_limited_iou_ulp: bool,
+    force_full_input_budget: bool,
+    source_input_rate: u32,
 ) -> Result<(Leg, Leg), TransactionResult> {
     let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
     let inverse_book = keylet::book_dir(
@@ -1975,7 +2105,7 @@ fn cross_book_hop(
         let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
 
         for offer_key in offers {
-            if remaining_in.is_zero() || hop_out_done(&remaining_out, demand_out) {
+            if hop_out_done(&remaining_out, demand_out) {
                 break 'walk;
             }
             let Some(ob) = ctx.view.read(&offer_key) else {
@@ -2012,6 +2142,13 @@ fn cross_book_hop(
             if funds.is_zero() {
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
                 continue;
+            }
+            // OfferStream continues stepping invalid entries after source funds
+            // are exhausted, so expired/unfunded offers are still reaped. Stop
+            // only when the next live funded offer would require an actual fill
+            // (105500249 50312732).
+            if remaining_in.is_zero() {
+                break 'walk;
             }
             let avail_out = leg_min(&offer_out, &funds);
 
@@ -2064,7 +2201,12 @@ fn cross_book_hop(
             } else {
                 remaining_out.clone()
             };
-            let budget_out = out_for_in(&remaining_in, &eff_rate, &offer_out);
+            // BookPaymentStep accounts input in two domains: the offer receives
+            // net TakerPays (`order_in`), while the source budget/funds are gross
+            // of the input issuer's transfer fee (`step_in`). Price the offer
+            // against the net amount that the remaining gross budget can fund.
+            let net_remaining_in = net_book_payment_input(&remaining_in, source_input_rate);
+            let budget_out = out_for_in(&net_remaining_in, &eff_rate, &offer_out);
             let mut take_out = leg_min(&remaining_out_cap, &avail_out);
             // rippled forks on the INPUT side (StrandFlow reverse-then-forward,
             // maxIn < requiredIn at step 0): the SendMax budget binds only when it
@@ -2078,18 +2220,28 @@ fn cross_book_hop(
             // keep the output-side test there (the #337 walk-stop relies on it).
             let budget_binds = if terminal {
                 terminal_budget_binds(
-                    &remaining_in,
+                    &net_remaining_in,
                     &take_out,
                     &budget_out,
                     &offer_in,
                     &offer_out,
                     &eff_rate,
                 )
+            } else if force_full_input_budget && offer_out.is_xrp {
+                // OfferCreate's first autobridge leg is reverse-priced to the
+                // exact XRP demand of the second leg. A quality-floor estimate
+                // can sit one drop below that demand even though the reverse
+                // budget covers its proportional ceilOut cost (105500249
+                // 4C84DE5C). Preserve the reverse demand when it is affordable.
+                !leg_ge(
+                    &net_remaining_in,
+                    &in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate),
+                )
             } else {
                 leg_ge(&take_out, &budget_out)
             };
             if budget_binds {
-                take_out = budget_out;
+                take_out = budget_out.clone();
             }
             // The remaining input budget can no longer buy even one unit of this
             // book's output (a sub-drop / sub-ULP residual left after the binding
@@ -2124,6 +2276,7 @@ fn cross_book_hop(
                     skip_input_debit,
                     skip_output_credit,
                     &offer_out,
+                    force_full_input_budget,
                 ) {
                     // ceilIn: the SendMax input is the binding limit (it cannot
                     // afford the ceilOut cost of the demanded output), so rippled
@@ -2134,7 +2287,7 @@ fn cross_book_hop(
                     // IOU->XRP hop: drops are discrete, so repricing the floored
                     // output can leave an artificial IOU residual and dry the
                     // otherwise valid strand (ledger 105500157).
-                    leg_min(&remaining_in, &offer_in)
+                    leg_min(&net_remaining_in, &offer_in)
                 } else {
                     // Interior hop: charge the ceilOut price for the delivered
                     // output and leave the sub-drop budget remainder unspent, never
@@ -2145,7 +2298,7 @@ fn cross_book_hop(
                             &in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate),
                             &offer_in,
                         ),
-                        &remaining_in,
+                        &net_remaining_in,
                     )
                 };
                 (take_out.clone(), order_in)
@@ -2158,7 +2311,7 @@ fn cross_book_hop(
                 let order_in = if terminal && !offer_in.is_xrp {
                     leg_min(
                         &leg_min(&in_for_out(&take_out, &eff_rate, &offer_in), &offer_in),
-                        &remaining_in,
+                        &net_remaining_in,
                     )
                 } else {
                     let scaled = scale_funds_limited_input(&offer_in, &avail_out, &offer_out);
@@ -2192,7 +2345,7 @@ fn cross_book_hop(
                 } else {
                     in_for_out_taker(&take_out, &eff_rate, &offer_in)
                 };
-                let order_in = leg_min(&leg_min(&priced, &offer_in), &remaining_in);
+                let order_in = leg_min(&leg_min(&priced, &offer_in), &net_remaining_in);
                 (take_out.clone(), order_in)
             };
 
@@ -2202,7 +2355,7 @@ fn cross_book_hop(
                     && offer_in.is_xrp
                     && order_in.drops >= 100_000_000
                     && order_in.drops < 200_000_000
-                    && order_in.drops + 2 <= remaining_in.drops
+                    && order_in.drops + 2 <= net_remaining_in.drops
                     && order_in.drops + 2 <= offer_in.drops
                 {
                     order_in.drops += 2;
@@ -2210,15 +2363,30 @@ fn cross_book_hop(
                 (order_out, order_in)
             };
 
-            pay_in(
-                ctx,
-                taker,
-                taker_acct,
-                &owner,
-                &order_in,
-                number_switchover,
-                skip_input_debit,
-            )?;
+            let step_in =
+                gross_book_payment_input(&order_in, &remaining_in, source_input_rate, budget_binds);
+            if source_input_rate == 1_000_000_000 {
+                pay_in(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    &owner,
+                    &order_in,
+                    number_switchover,
+                    skip_input_debit,
+                )?;
+            } else {
+                pay_in_book_payment(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    &owner,
+                    &order_in,
+                    &step_in,
+                    number_switchover,
+                    skip_input_debit,
+                )?;
+            }
             // `order_out` is the GROSS the offer/owner gives (the TakerGets it
             // reduces by); `net_out` is what `dest` actually receives after the
             // output issuer's transfer fee. The book demand (`remaining_out`) is
@@ -2231,6 +2399,11 @@ fn cross_book_hop(
                 dest,
                 &order_out,
                 number_switchover,
+                if number_switchover {
+                    BalanceRounding::Nearest
+                } else {
+                    BalanceRounding::Legacy
+                },
                 skip_output_credit,
                 TransferFeeRounding::Down,
             )?;
@@ -2297,10 +2470,10 @@ fn cross_book_hop(
             }
 
             remaining_out = leg_sub_round(&remaining_out, &net_out);
-            remaining_in = leg_sub_round(&remaining_in, &order_in);
+            remaining_in = leg_sub_round(&remaining_in, &step_in);
             delivered = leg_add(&delivered, &net_out);
             delivered_parts.push(leg_to_number(&net_out));
-            spent = leg_add(&spent, &order_in);
+            spent = leg_add(&spent, &step_in);
             // Lock the band on the first funded fill: subsequent pages of a worse
             // quality are not consumed this call.
             if single_band {
@@ -2435,8 +2608,11 @@ fn input_limited_uses_full_budget(
     skip_input_debit: bool,
     skip_output_credit: bool,
     offer_out: &Leg,
+    force_full_input_budget: bool,
 ) -> bool {
-    terminal || (skip_input_debit && !skip_output_credit && offer_out.is_xrp)
+    terminal
+        || force_full_input_budget
+        || (skip_input_debit && !skip_output_credit && offer_out.is_xrp)
 }
 
 fn should_trim_input_limited_iou_leftover(
@@ -2668,7 +2844,15 @@ pub(crate) fn cross_path_payment(
             /*single_band=*/ limit_quality && is_last && reverse_amts.is_none(),
             /*allow_amm=*/ true,
             lq_stop,
-            /*preserve_input_limited_iou_ulp=*/ false,
+            // A partial self-payment's terminal BookStep forwards the input
+            // limited result back to the source account. Its offer remainder
+            // keeps the untrimmed Number subtraction; applying the generic
+            // intermediate-hop correction consumes one extra IOU ULP
+            // (105500244 DCF6A69A).
+            /*preserve_input_limited_iou_ulp=*/
+            is_last && taker == dest && ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+            /*force_full_input_budget=*/ false,
+            /*source_input_rate=*/ 1_000_000_000,
         )?;
 
         // Residual liquidity from the AMM pool for this pair, on the budget not
@@ -3062,8 +3246,11 @@ fn amm_hop(
         return Ok(None);
     }
 
-    let input_fee_applies =
-        !skip_input_debit && !in_xrp && budget_in.issuer != *taker && budget_in.issuer != pool_id;
+    // An intermediate book output is a gross IOU amount just like a direct
+    // source payment. Even when the previous hop already performed the debit,
+    // the issuer still burns its transfer fee before the net reaches this pool
+    // (105500248 6CE529A8, CLOB -> CLOB -> AMM).
+    let input_fee_applies = !in_xrp && budget_in.issuer != *taker && budget_in.issuer != pool_id;
     let pool_budget = if input_fee_applies {
         div_nearest(budget_in, &transfer_rate(ctx, &budget_in.issuer), budget_in)
     } else {
@@ -3259,6 +3446,7 @@ fn amm_hop(
             dest,
             &gross,
             ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+            BalanceRounding::HalfUpward,
             skip_output_credit,
             TransferFeeRounding::Nearest,
         )?
@@ -3375,6 +3563,7 @@ fn apply_amm_move(
             dest,
             &amount,
             ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+            BalanceRounding::HalfUpward,
             skip_output_credit,
             TransferFeeRounding::Down,
         )?;
@@ -3821,7 +4010,17 @@ fn reverse_amm_strand(
         };
         outs[h] = out_num;
         ins[h] = in_num;
-        out_num = in_num;
+        // `in_num` is what this pool must receive. The preceding pool must
+        // emit the gross intermediate amount when neither pool is the issuer.
+        out_num = if h > 0
+            && !hop.in_xrp
+            && hop.in_iss != hops[h - 1].pool_id
+            && hop.in_iss != hop.pool_id
+        {
+            Number::from_iou(&grossed(&in_num.to_iou(), &transfer_rate(ctx, &hop.in_iss)))
+        } else {
+            in_num
+        };
     }
 
     let first = &hops[0];
@@ -3858,7 +4057,20 @@ fn reverse_amm_strand(
                 return Ok(None);
             }
             outs[h] = out;
-            current = out;
+            // The next pool receives the intermediate output net of the
+            // issuer's transfer fee (105500248 6CE529A8).
+            current = if h + 1 < n - 1
+                && !hop.out_xrp
+                && hop.out_iss != hop.pool_id
+                && hop.out_iss != hops[h + 1].pool_id
+            {
+                Number::from_iou(
+                    &IOUAmount::div_round(&out.to_iou(), &transfer_rate(ctx, &hop.out_iss), false)
+                        .unwrap_or(out.to_iou()),
+                )
+            } else {
+                out
+            };
         }
         source_spent = number_to_leg(&ins[0], budget);
         if first_fee_applies {
@@ -3956,6 +4168,16 @@ pub(crate) struct FlowHop {
 /// A resolved strand = an ordered boundary chain of hops.
 pub(crate) struct FlowStrand {
     hops: Vec<FlowHop>,
+}
+
+impl FlowStrand {
+    pub(crate) fn terminal_has_amm(&self) -> bool {
+        self.hops.last().is_some_and(|hop| hop.amm_pool.is_some())
+    }
+
+    pub(crate) fn is_two_hop_clob_path(&self) -> bool {
+        self.hops.len() == 2 && self.hops.iter().all(|hop| hop.has_clob)
+    }
 }
 
 /// The realised result of executing one pass of a strand.
@@ -4057,13 +4279,13 @@ fn flow_book_input_rate(ctx: &ApplyContext<'_>, leg: &Leg, dest: &AccountId) -> 
     (!leg.is_xrp && leg.issuer != *dest).then(|| transfer_rate(ctx, &leg.issuer))
 }
 
-fn flow_gross_input(amount: &Number, rate: Option<IOUAmount>) -> Number {
+pub(crate) fn flow_gross_input(amount: &Number, rate: Option<IOUAmount>) -> Number {
     rate.and_then(|rate| IOUAmount::mul_round(&amount.to_iou(), &rate, true).ok())
         .map(|amount| Number::from_iou(&amount))
         .unwrap_or(*amount)
 }
 
-fn flow_net_input(amount: &Number, rate: Option<IOUAmount>) -> Number {
+pub(crate) fn flow_net_input(amount: &Number, rate: Option<IOUAmount>) -> Number {
     rate.and_then(|rate| IOUAmount::div_round(&amount.to_iou(), &rate, false).ok())
         .map(|amount| Number::from_iou(&amount))
         .unwrap_or(*amount)
@@ -4377,11 +4599,14 @@ fn price_clob_band_reverse(
     dest: &AccountId,
     hop: &FlowHop,
     demanded: &Number,
+    source_budget: Option<&Number>,
     is_first: bool,
     is_last: bool,
 ) -> Option<(Number, Number)> {
     let demand_leg = number_to_leg(demanded, &hop.out_leg);
-    let budget_leg = unbounded_leg(&hop.in_leg);
+    let budget_leg = source_budget
+        .map(|budget| number_to_leg(budget, &hop.in_leg))
+        .unwrap_or_else(|| unbounded_leg(&hop.in_leg));
     let cp = ctx.view.checkpoint();
     let taker_acct_before = taker_acct.clone();
     let res = cross_book_hop(
@@ -4397,6 +4622,8 @@ fn price_clob_band_reverse(
         /*allow_amm=*/ false,
         /*lq_stop=*/ None,
         /*preserve_input_limited_iou_ulp=*/ false,
+        /*force_full_input_budget=*/ false,
+        /*source_input_rate=*/ 1_000_000_000,
     );
     ctx.view.rollback(cp);
     *taker_acct = taker_acct_before;
@@ -4447,6 +4674,7 @@ fn execute_strand_pass(
     remaining_in: &Number,
     remaining_out: &Number,
     amm_ctx: &mut AmmContext,
+    offer_create_bridge: bool,
 ) -> Option<StrandPass> {
     let trace = std::env::var("RXRPL_FLOW_TRACE").is_ok();
     let n = strand.hops.len();
@@ -4532,7 +4760,15 @@ fn execute_strand_pass(
             // and commits the offer consumption / reaps.
             kinds[h] = HopKindR::Clob;
             let (i, o) = price_clob_band_reverse(
-                ctx, taker, taker_acct, dest, hop, &demanded, is_first, is_last,
+                ctx,
+                taker,
+                taker_acct,
+                dest,
+                hop,
+                &demanded,
+                (n == 1 && is_first && hop.liquidity.is_some()).then_some(remaining_in),
+                is_first,
+                is_last,
             )?;
             ins[h] = i;
             outs[h] = o;
@@ -4634,6 +4870,8 @@ fn execute_strand_pass(
                 // Drive the CLOB band: at/below the limiting step deliver the
                 // reverse-priced output; above it (or source-capped) drive by the
                 // available input (`BookStep::fwd`, input-limited).
+                let bridge_xrp_reverse =
+                    offer_create_bridge && is_first && !is_last && hop.out_leg.is_xrp;
                 let (demand_leg, budget_leg) = if is_first && source_capped {
                     (
                         unbounded_leg(&hop.out_leg),
@@ -4666,6 +4904,14 @@ fn execute_strand_pass(
                     /*lq_stop=*/ None,
                     /*preserve_input_limited_iou_ulp=*/
                     h > 0 && h > limiting && kinds[h - 1] == HopKindR::Amm,
+                    // OfferCreate autobridging conserves the discrete XRP
+                    // produced by the first book: its terminal XRP -> IOU
+                    // BookStep forwards the entire drop budget instead of
+                    // repricing the floored IOU output one drop lower
+                    // (105500249 4C84DE5C).
+                    /*force_full_input_budget=*/
+                    bridge_xrp_reverse,
+                    /*source_input_rate=*/ 1_000_000_000,
                 )
                 .ok()?;
                 if delivered.is_zero() || spent.is_zero() {
@@ -4827,6 +5073,7 @@ pub(crate) fn flow_multi(
                 &remaining_in,
                 &remaining_out,
                 amm_ctx,
+                /*offer_create_bridge=*/ false,
             ) {
                 Some(res) if !res.out_amt.is_zero() => {
                     let realised_rate = res.in_amt.div(&res.out_amt);
@@ -5067,6 +5314,18 @@ fn pay_in(
             transfer_rate(ctx, &amount.issuer)
         };
         let gross = grossed(&amount.iou, &rate);
+        let source_funds = owner_funds_leg(ctx, taker, amount);
+        let mut gross_leg = amount.clone();
+        gross_leg.iou = gross;
+        let source_ulp = IOUAmount::from_parts(
+            1_000_000_000_000_000,
+            source_funds.iou.exponent() - 15,
+            false,
+        )
+        .unwrap_or(IOUAmount::ZERO);
+        let mut gross_with_ulp = gross_leg.clone();
+        gross_with_ulp.iou = IOUAmount::add_round(&gross, &source_ulp).unwrap_or(gross);
+        let drains_source = !source_funds.is_zero() && leg_ge(&gross_with_ulp, &source_funds);
         credit_line(
             ctx,
             taker,
@@ -5075,6 +5334,15 @@ fn pay_in(
             &gross.negate(),
             round,
         )?;
+        if drains_source {
+            crate::amm_helpers::set_iou_holding(
+                ctx.view,
+                taker,
+                &amount.issuer,
+                &amount.currency,
+                &Number::ZERO,
+            )?;
+        }
     }
     if owner == &amount.issuer {
         return Ok(());
@@ -5102,6 +5370,37 @@ fn pay_in(
         &amount.iou,
         round,
     )
+}
+
+/// Settle a Payment BookStep whose input transfer fee is accounted separately
+/// from the resting offer amount. `net` reduces TakerPays and is credited to the
+/// maker; `gross` is charged to the source and consumes its SendMax/funds.
+#[allow(clippy::too_many_arguments)]
+fn pay_in_book_payment(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    owner: &AccountId,
+    net: &Leg,
+    gross: &Leg,
+    round: bool,
+    skip_taker_debit: bool,
+) -> Result<(), TransactionResult> {
+    debug_assert!(!net.is_xrp && !gross.is_xrp);
+    debug_assert_eq!(net.currency, gross.currency);
+    debug_assert_eq!(net.issuer, gross.issuer);
+
+    if !skip_taker_debit && taker != &net.issuer {
+        credit_line(
+            ctx,
+            taker,
+            &net.issuer,
+            &net.currency,
+            &gross.iou.negate(),
+            round,
+        )?;
+    }
+    pay_in(ctx, taker, taker_acct, owner, net, round, true)
 }
 
 /// Move the offer owner's output to `recipient`: XRP via balances, IOU via the
@@ -5190,7 +5489,8 @@ fn pay_out_gross(
     owner: &AccountId,
     recipient: &AccountId,
     amount: &Leg,
-    round: bool,
+    _round: bool,
+    balance_rounding: BalanceRounding,
     skip_recipient_credit: bool,
     fee_rounding: TransferFeeRounding,
 ) -> Result<Leg, TransactionResult> {
@@ -5220,10 +5520,14 @@ fn pay_out_gross(
         let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
         if rate > one {
             match fee_rounding {
-                TransferFeeRounding::Down => {
-                    IOUAmount::div_round(&amount.iou, &rate, /*round_up*/ false)
-                        .unwrap_or(amount.iou)
-                }
+                TransferFeeRounding::Down => amount
+                    .iou
+                    .mul_ratio(
+                        1_000_000_000,
+                        transfer_rate_value(ctx, &amount.issuer),
+                        false,
+                    )
+                    .unwrap_or(amount.iou),
                 TransferFeeRounding::Nearest => rxrpl_amount::number::Number::from_iou(&amount.iou)
                     .div(&rxrpl_amount::number::Number::from_iou(&rate))
                     .to_iou(),
@@ -5241,23 +5545,23 @@ fn pay_out_gross(
     // nonexistent self-line otherwise fails the crossing with tecPATH_DRY, exactly
     // as `pay_out` did for issuer-owned offers before the guard.
     if amount.issuer != *owner {
-        credit_line(
+        credit_line_with_rounding(
             ctx,
             owner,
             &amount.issuer,
             &amount.currency,
             &amount.iou.negate(),
-            round,
+            balance_rounding,
         )?;
     }
     if !skip_recipient_credit && amount.issuer != *recipient {
-        credit_line(
+        credit_line_with_rounding(
             ctx,
             recipient,
             &amount.issuer,
             &amount.currency,
             &net,
-            round,
+            balance_rounding,
         )?;
     }
     let mut net_leg = amount.clone();
@@ -5275,6 +5579,38 @@ fn grossed(amount: &IOUAmount, rate: &IOUAmount) -> IOUAmount {
         Ok(rxrpl_amount::Amount::Iou(v)) => v,
         _ => *amount,
     }
+}
+
+/// Convert a BookPaymentStep's remaining gross source budget to the net input
+/// that can be offered to the current CLOB offer.
+fn net_book_payment_input(gross: &Leg, rate: u32) -> Leg {
+    if gross.is_xrp || rate == 1_000_000_000 {
+        return gross.clone();
+    }
+    let mut net = gross.clone();
+    net.iou = gross
+        .iou
+        .mul_ratio(1_000_000_000, rate, false)
+        .unwrap_or(IOUAmount::ZERO);
+    net
+}
+
+/// Gross the net TakerPays amount for BookPaymentStep source accounting. If the
+/// gross source budget binds, rippled consumes it exactly after limiting the
+/// offer with the corresponding round-down net amount.
+fn gross_book_payment_input(net: &Leg, remaining_gross: &Leg, rate: u32, binds: bool) -> Leg {
+    if net.is_xrp || rate == 1_000_000_000 {
+        return net.clone();
+    }
+    if binds {
+        return remaining_gross.clone();
+    }
+    let mut gross = net.clone();
+    gross.iou = net
+        .iou
+        .mul_ratio(rate, 1_000_000_000, true)
+        .unwrap_or(net.iou);
+    leg_min(&gross, remaining_gross)
 }
 
 fn reap_walk_offer(
@@ -6999,14 +7335,14 @@ fn taker_cross(
 #[cfg(test)]
 mod taker_crossing_tests {
     use super::{
-        Leg, TakerCrossType, add_iou_balance, composed_quality, crossing_threshold,
-        flow_iou_to_iou, flow_iou_to_xrp, flow_xrp_to_iou, full_offer_take,
-        funds_limited_xrp_rounds_up, in_for_out, in_for_out_offer, input_limited_uses_full_budget,
-        leftover_is_dust, leftover_leg, leg_ge, leg_gt, leg_max, out_for_in, pack_rate,
-        parity_rate, qual_div, qual_mul, reject_quality, remaining_is_filled,
-        remaining_is_filled_at, remaining_offer, scale_funds_limited_input, select_path,
-        sell_clamp_sub, should_bump_partial_path_credit, should_trim_input_limited_iou_leftover,
-        terminal_budget_binds,
+        Leg, TakerCrossType, add_iou_balance, add_iou_balance_half_upward, composed_quality,
+        crossing_threshold, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou,
+        full_offer_take, funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out,
+        in_for_out_offer, input_limited_uses_full_budget, leftover_is_dust, leftover_leg, leg_ge,
+        leg_gt, leg_max, net_book_payment_input, out_for_in, pack_rate, parity_rate, qual_div,
+        qual_mul, reject_quality, remaining_is_filled, remaining_is_filled_at, remaining_offer,
+        scale_funds_limited_input, select_path, sell_clamp_sub, should_bump_partial_path_credit,
+        should_trim_input_limited_iou_leftover, terminal_budget_binds,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, get_rate_round_even, offer_quality};
     use rxrpl_primitives::AccountId;
@@ -7139,12 +7475,26 @@ mod taker_crossing_tests {
 
     #[test]
     fn final_path_iou_to_xrp_spends_full_input_budget() {
-        assert!(input_limited_uses_full_budget(false, true, false, &xrp(1)));
+        assert!(input_limited_uses_full_budget(
+            false,
+            true,
+            false,
+            &xrp(1),
+            false
+        ));
         assert!(!input_limited_uses_full_budget(
             false,
             true,
             false,
-            &iou("1")
+            &iou("1"),
+            false
+        ));
+        assert!(input_limited_uses_full_budget(
+            false,
+            true,
+            false,
+            &iou("1"),
+            true
         ));
     }
 
@@ -7162,6 +7512,9 @@ mod taker_crossing_tests {
         ));
         assert!(should_trim_input_limited_iou_leftover(
             true, true, &leftover, false, &partial, &requested
+        ));
+        assert!(!should_trim_input_limited_iou_leftover(
+            true, true, &leftover, true, &partial, &requested
         ));
     }
 
@@ -7369,6 +7722,62 @@ mod taker_crossing_tests {
             &offer_in,
             &offer_out,
         ));
+    }
+
+    #[test]
+    fn book_payment_source_budget_is_gross_of_transfer_fee() {
+        let gross = iou("19.90518287280272");
+        let net = net_book_payment_input(&gross, 1_000_100_000);
+        assert_eq!(net.iou.to_decimal_string(), "19.90319255354736");
+
+        let charged = gross_book_payment_input(&net, &gross, 1_000_100_000, true);
+        assert_eq!(charged.iou, gross.iou);
+    }
+
+    #[test]
+    fn amm_balance_settlement_rounds_halfway_sum_upward() {
+        let tie = add_iou_balance_half_upward(
+            &IOUAmount::from_decimal_string("-27.66112374802621").unwrap(),
+            &IOUAmount::from_decimal_string("0.180231474079375").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tie.to_decimal_string(), "-27.48089227394683");
+
+        let coarse = add_iou_balance_half_upward(
+            &IOUAmount::from_decimal_string("2849.407740863407").unwrap(),
+            &IOUAmount::from_decimal_string("-0.9938176775876362").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(coarse.to_decimal_string(), "2848.413923185819");
+
+        let positive_tie = add_iou_balance_half_upward(
+            &IOUAmount::from_decimal_string("0.0373881425673948").unwrap(),
+            &IOUAmount::from_decimal_string("-0.001542493738460875").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(positive_tie.to_decimal_string(), "0.03584564882893392");
+    }
+
+    #[test]
+    fn amm_output_fee_preserves_sgb_precision() {
+        let gross = rxrpl_amount::number::Number::from_iou(
+            &IOUAmount::from_decimal_string("131.84642063").unwrap(),
+        );
+        let rate = IOUAmount::from_decimal_string("1.003").unwrap();
+        assert_eq!(
+            flow_net_input(&gross, Some(rate))
+                .to_iou()
+                .to_decimal_string(),
+            "131.4520644366899"
+        );
+        assert_eq!(
+            gross
+                .to_iou()
+                .mul_ratio(1_000_000_000, 1_003_000_000, false)
+                .unwrap()
+                .to_decimal_string(),
+            "131.4520644366899"
+        );
     }
 
     // select_path picks the better (smaller packed rate) of the direct tip and the
@@ -8046,6 +8455,7 @@ mod amm_transfer_fee_tests {
             &decode_account_id(RECIPIENT).unwrap(),
             &gross,
             false,
+            BalanceRounding::Legacy,
             false,
             TransferFeeRounding::Nearest,
         )
@@ -8630,6 +9040,8 @@ mod taker_bridge_integration {
             false,
             None,
             false,
+            false,
+            1_000_000_000,
         )
         .unwrap();
 
@@ -8696,6 +9108,7 @@ mod taker_bridge_integration {
             &taker,
             &strand.hops[0],
             &Number::from_int(10),
+            None,
             true,
             true,
         )
