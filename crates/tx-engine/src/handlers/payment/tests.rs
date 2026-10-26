@@ -69,6 +69,25 @@ fn xrp_flow_funds_excludes_owner_reserve() {
 }
 
 #[test]
+fn amm_iou_balance_addition_avoids_mixed_scale_double_rounding() {
+    use rxrpl_amount::number::{MantissaScale, MantissaScaleGuard, Number};
+
+    let pool = Number::from_iou(&IOUAmount::from_decimal_string("98.76596494735793").unwrap());
+    let input = {
+        let _scale = MantissaScaleGuard::new(MantissaScale::Small);
+        Number::from_iou(&IOUAmount::from_decimal_string("0.01861244389908496").unwrap())
+    };
+
+    assert_eq!(
+        add_iou_number_round(&pool, &input)
+            .unwrap()
+            .to_iou()
+            .to_decimal_string(),
+        "98.78457739125701"
+    );
+}
+
+#[test]
 fn iou_receive_room_caps_at_holder_limit() {
     use rxrpl_amount::number::Number;
 

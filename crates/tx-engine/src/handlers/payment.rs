@@ -1382,6 +1382,24 @@ fn num_le(a: &rxrpl_amount::number::Number, b: &rxrpl_amount::number::Number) ->
     d.is_zero() || d.negative()
 }
 
+/// Apply an IOU delta using modern STAmount/Number round-to-nearest semantics.
+///
+/// AMM swap helpers intentionally return a 16-digit `Number` produced under
+/// the Small mantissa scale. Adding that representation directly to a pool
+/// balance represented at the Large scale can round twice around `i64::MAX`.
+/// Balance mutation happens on the IOU asset grid in rippled, so canonicalize
+/// both operands to `IOUAmount` before adding and convert the final value back.
+fn add_iou_number_round(
+    balance: &rxrpl_amount::number::Number,
+    delta: &rxrpl_amount::number::Number,
+) -> Result<rxrpl_amount::number::Number, TransactionResult> {
+    use rxrpl_amount::number::Number;
+
+    let value = IOUAmount::add_round(&balance.to_iou(), &delta.to_iou())
+        .map_err(|_| TransactionResult::TefInternal)?;
+    Ok(Number::from_iou(&value))
+}
+
 /// XRP that Flow may spend after the transaction fee has already been charged.
 /// `accountHolds(..., fhZERO_IF_FROZEN)` delegates native funds to `xrpLiquid`,
 /// which excludes the reserve for the account's current owner count.
@@ -1722,25 +1740,15 @@ fn try_amm_conversion(
             .update(pkey, pd)
             .map_err(|_| TransactionResult::TefInternal)?;
     } else {
-        crate::amm_helpers::set_iou_holding(
-            ctx.view,
-            user_id,
-            &in_iss,
-            &in_cur,
-            &src_in_funds.sub(&spent),
-        )?;
+        let source_after = add_iou_number_round(&src_in_funds, &spent.negate())?;
+        crate::amm_helpers::set_iou_holding(ctx.view, user_id, &in_iss, &in_cur, &source_after)?;
         // rippled's rippleCredit deletes a line drained to zero in the default
         // state (trustDelete); fires inline after the debit.
         crate::handlers::trust_set::maybe_delete_drained_trust_line(
             ctx, user_id, user_acct, &in_iss, &in_cur,
         )?;
-        crate::amm_helpers::set_iou_holding(
-            ctx.view,
-            &pool_id,
-            &in_iss,
-            &in_cur,
-            &pool_in.add(&spent),
-        )?;
+        let pool_after = add_iou_number_round(&pool_in, &spent)?;
+        crate::amm_helpers::set_iou_holding(ctx.view, &pool_id, &in_iss, &in_cur, &pool_after)?;
     }
 
     // --- Apply: move `delivered` out from the pool to the destination. ---
@@ -1773,25 +1781,21 @@ fn try_amm_conversion(
                 .map_err(|_| TransactionResult::TefInternal)?;
         }
     } else {
-        crate::amm_helpers::set_iou_holding(
-            ctx.view,
-            &pool_id,
-            &out_iss,
-            &out_cur,
-            &pool_out.sub(&delivered),
-        )?;
+        let pool_after = add_iou_number_round(&pool_out, &delivered.negate())?;
+        crate::amm_helpers::set_iou_holding(ctx.view, &pool_id, &out_iss, &out_cur, &pool_after)?;
         // Delivering the output IOU to its own issuer redeems it: the pool's
         // holding decrease above already reflects the burn, and the issuer holds
         // no trust line to itself, so there is no destination balance to credit.
         if dst_id.as_bytes() != out_iss.as_bytes() {
             let dst_out =
                 crate::amm_helpers::iou_holding_number(ctx.view, dst_id, &out_iss, &out_cur);
+            let destination_after = add_iou_number_round(&dst_out, &delivered)?;
             crate::amm_helpers::set_iou_holding(
                 ctx.view,
                 dst_id,
                 &out_iss,
                 &out_cur,
-                &dst_out.add(&delivered),
+                &destination_after,
             )?;
         }
     }

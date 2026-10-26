@@ -1211,6 +1211,16 @@ mod tests {
         assert_eq!(out.to_iou().to_decimal_string(), "932.437210367");
     }
 
+    // Mainnet tx 57A8F25F… (ledger 105500224): exact-output wAVGO/USDV swap.
+    #[test]
+    fn swap_asset_out_wavgo_usdv_byte_exact() {
+        let pool_in = Number::from_iou(&parse_iou_value("98.76596494735793"));
+        let pool_out = Number::from_iou(&parse_iou_value("39242.65159245358"));
+        let asset_out = Number::from_iou(&parse_iou_value("7.39351381865708"));
+        let input = swap_asset_out(&pool_in, &pool_out, &asset_out, 5, false).unwrap();
+        assert_eq!(input.to_iou().to_decimal_string(), "0.01861244389908496");
+    }
+
     // Mainnet tx 955856C7… (ledger 105333100): a tfFillOrKill OfferCreate whose
     // book has no resting CLOB offer crosses the V4X/XRP AMM (pool 921658042
     // drops XRP + 641921.2615094566 V4X, tfee 269). Requesting 8070.85058826842
