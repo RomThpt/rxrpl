@@ -1192,9 +1192,6 @@ fn cross_offers(
             let Ok(owner) = decode_account_id(owner_str) else {
                 continue;
             };
-            if &owner == taker {
-                continue; // never cross our own offer (rippled steps over it)
-            }
             // offer.out = what the offer gives = taker receives = offer.TakerGets.
             // offer.in  = what the offer wants = taker pays   = offer.TakerPays.
             let Some(offer_out) = Leg::parse(&offer["TakerGets"]) else {
@@ -1209,21 +1206,21 @@ fn cross_offers(
             // gated, so it applies on every ledger.
             if let Some(exp) = offer.get("Expiration").and_then(|v| v.as_u64()) {
                 if exp <= ctx.view.parent_close_time() as u64 {
-                    reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                    reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, &dir_key)?;
                     continue;
                 }
             }
             // A bad offer with a zero amount on either side is removed 0-fill
             // (rippled `OfferStream`: `amount.empty()`).
             if offer_out.is_zero() || offer_in.is_zero() {
-                reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, &dir_key)?;
                 continue;
             }
             // A maker whose IN asset (what it receives) is deep-frozen can neither
             // receive nor send it, so the offer is removed 0-fill (rippled
             // `OfferStream`: `isDeepFrozen(owner, assetIn)`).
             if is_deep_frozen(ctx, &owner, &offer_in) {
-                reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, &dir_key)?;
                 continue;
             }
             // Owner-funds clamp: an offer can give at most what its owner
@@ -1234,6 +1231,13 @@ fn cross_offers(
             let funds = owner_funds_leg(ctx, &owner, &offer_out);
             let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
             if offer_cannot_pay(&funds, &offer_out, flags, &owner == taker) {
+                reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, &dir_key)?;
+                continue;
+            }
+            if &owner == taker {
+                // Flow's direct BookStep treats a self-owned inverse offer as
+                // unfunded: remove it instead of crossing it. This applies to
+                // funded offers too (mainnet 105500215 / 91B10CB9).
                 reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, &dir_key)?;
                 continue;
             }
@@ -8983,6 +8987,86 @@ mod flow_cross_own_unfunded {
         let b = sandbox.read(&keylet::account(&id)).unwrap();
         let v: Value = serde_json::from_slice(&b).unwrap();
         v["OwnerCount"].as_u64().unwrap()
+    }
+
+    /// 105500215 91B10CB9: Flow's direct book removes funded inverse offers
+    /// owned by the taker rather than silently stepping over them.
+    #[test]
+    fn flow_cross_reaps_funded_own_inverse_offers() {
+        let mut ledger = Ledger::genesis();
+        let taker_id = decode_account_id(TAKER).unwrap();
+        let iss_id = decode_account_id(ISS).unwrap();
+        for (addr, drops) in [(ISS, "1000000000"), (TAKER, "10000000000")] {
+            let id = decode_account_id(addr).unwrap();
+            let acct = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": addr,
+                "Balance": drops, "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&acct).unwrap())
+                .unwrap();
+        }
+        let usd = helpers::currency_to_bytes("USD");
+        let holder_is_low = taker_id.as_bytes() < iss_id.as_bytes();
+        let (low, high) = if holder_is_low {
+            (TAKER, ISS)
+        } else {
+            (ISS, TAKER)
+        };
+        let tl = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {
+                "currency": "USD", "issuer": ISS,
+                "value": if holder_is_low { "400" } else { "-400" },
+            },
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "0"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "1000"},
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&taker_id, &iss_id, &usd),
+                serde_json::to_vec(&tl).unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        for (sequence, pays) in [(1, "1000301600"), (2, "997863470")] {
+            assert_eq!(
+                apply_flow(
+                    &mut sandbox,
+                    &fees,
+                    &serde_json::json!({
+                        "TransactionType": "OfferCreate", "Account": TAKER,
+                        "Fee": "10", "Sequence": sequence,
+                        "TakerGets": {"currency": "USD", "issuer": ISS, "value": "199"},
+                        "TakerPays": pays,
+                    }),
+                ),
+                TransactionResult::TesSuccess
+            );
+        }
+        assert_eq!(owner_count(&sandbox, TAKER), 2);
+
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER,
+                    "Fee": "10", "Sequence": 3,
+                    "TakerGets": "1002105230",
+                    "TakerPays": {"currency": "USD", "issuer": ISS, "value": "199"},
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert!(sandbox.read(&keylet::offer(&taker_id, 1)).is_none());
+        assert!(sandbox.read(&keylet::offer(&taker_id, 2)).is_none());
+        assert!(sandbox.read(&keylet::offer(&taker_id, 3)).is_some());
+        assert_eq!(owner_count(&sandbox, TAKER), 1);
     }
 
     #[test]
