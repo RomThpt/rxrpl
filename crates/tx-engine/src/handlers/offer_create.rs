@@ -1261,21 +1261,7 @@ fn cross_offers(
                 }
             }
         }
-        let Some(dir_bytes) = ctx.view.read(&dir_key) else {
-            continue;
-        };
-        let Ok(dir) = serde_json::from_slice::<Value>(&dir_bytes) else {
-            continue;
-        };
-        let offers: Vec<rxrpl_primitives::Hash256> = dir
-            .get("Indexes")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().and_then(|s| s.parse().ok()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let offers = book_dir_indexes(ctx, &dir_key);
 
         for offer_key in offers {
             // A tfSell offer sells its whole TakerGets and accepts any TakerPays
@@ -2008,21 +1994,7 @@ fn cross_book_hop(
                 }
             }
         }
-        let Some(dir_bytes) = ctx.view.read(&dir_key) else {
-            continue;
-        };
-        let Ok(dir) = serde_json::from_slice::<Value>(&dir_bytes) else {
-            continue;
-        };
-        let offers: Vec<rxrpl_primitives::Hash256> = dir
-            .get("Indexes")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().and_then(|s| s.parse().ok()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let offers = book_dir_indexes(ctx, &dir_key);
         // BookStep asks the AMM to compete with the first crossable offer, not
         // merely the first directory. Empty, expired, self-owned, or unfunded
         // pages are skipped before their quality can cap the synthetic offer.
@@ -4320,6 +4292,37 @@ fn book_dir_has_entries(ctx: &ApplyContext<'_>, root: &Hash256) -> bool {
     }
 }
 
+/// Offer indexes in a quality directory, including linked overflow pages.
+fn book_dir_indexes(ctx: &ApplyContext<'_>, root: &Hash256) -> Vec<Hash256> {
+    let mut indexes = Vec::new();
+    let mut page = 0u64;
+    loop {
+        let key = if page == 0 {
+            *root
+        } else {
+            keylet::dir_node(root, page)
+        };
+        let Some(bytes) = ctx.view.read(&key) else {
+            break;
+        };
+        let Ok(dir) = serde_json::from_slice::<Value>(&bytes) else {
+            break;
+        };
+        indexes.extend(
+            dir.get("Indexes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|value| value.as_str()?.parse::<Hash256>().ok()),
+        );
+        page = dir.get("IndexNext").and_then(Value::as_u64).unwrap_or(0);
+        if page == 0 {
+            break;
+        }
+    }
+    indexes
+}
+
 /// The best non-empty page (tip) quality of an order book.
 fn book_tip_quality(ctx: &ApplyContext<'_>, inverse_book: &Hash256) -> Option<u64> {
     let prefix = &inverse_book.as_bytes()[0..24];
@@ -4333,6 +4336,68 @@ fn book_tip_quality(ctx: &ApplyContext<'_>, inverse_book: &Hash256) -> Option<u6
             return Some(u64::from_be_bytes(
                 dir_key.as_bytes()[24..32].try_into().ok()?,
             ));
+        }
+    }
+    None
+}
+
+/// Best quality with an offer that this taker can actually cross. Expired and
+/// unfunded offers are reaped while probing so an AMM is compared against the
+/// next live CLOB tip, not a stale directory that disappears during the book
+/// walk.
+fn funded_book_tip_quality(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    inverse_book: &Hash256,
+) -> Option<u64> {
+    let prefix = &inverse_book.as_bytes()[0..24];
+    let mut probe = book_dir_with_quality(inverse_book, 0);
+    while let Some(dir_key) = ctx.view.succ(&probe) {
+        if &dir_key.as_bytes()[0..24] != prefix {
+            return None;
+        }
+        probe = dir_key;
+        let quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().ok()?);
+        for offer_key in book_dir_indexes(ctx, &dir_key) {
+            let Some(offer_bytes) = ctx.view.read(&offer_key) else {
+                continue;
+            };
+            let Ok(offer) = serde_json::from_slice::<Value>(&offer_bytes) else {
+                continue;
+            };
+            if offer.get("LedgerEntryType").and_then(Value::as_str) != Some("Offer") {
+                continue;
+            }
+            let Some(owner) = offer
+                .get("Account")
+                .and_then(Value::as_str)
+                .and_then(|value| decode_account_id(value).ok())
+            else {
+                continue;
+            };
+            if owner == *taker {
+                continue;
+            }
+            let (Some(_offer_in), Some(offer_out)) = (
+                offer.get("TakerPays").and_then(Leg::parse),
+                offer.get("TakerGets").and_then(Leg::parse),
+            ) else {
+                continue;
+            };
+            let expired = offer
+                .get("Expiration")
+                .and_then(Value::as_u64)
+                .is_some_and(|expiration| expiration <= ctx.view.parent_close_time() as u64);
+            let unfunded = owner_funds_leg(ctx, &owner, &offer_out).is_zero();
+            if expired || unfunded {
+                let cp = ctx.view.checkpoint();
+                if reap_offer(ctx, &owner, &offer_key, &dir_key).is_err() {
+                    ctx.view.rollback(cp);
+                    return None;
+                }
+                continue;
+            }
+            return Some(quality);
         }
     }
     None
@@ -4717,7 +4782,7 @@ fn execute_strand_pass(
         let hop = &strand.hops[h];
         let is_first = h == 0;
         let is_last = h == n - 1;
-        let clob_quality = book_tip_quality(ctx, &hop.inverse_book);
+        let clob_quality = funded_book_tip_quality(ctx, taker, &hop.inverse_book);
 
         // Try the AMM fib chunk first, gated to the CLOB tip quality.
         let amm_offer = match (hop.liquidity.as_ref(), amm_hops[h].as_ref()) {
@@ -4819,7 +4884,7 @@ fn execute_strand_pass(
         let hop = &strand.hops[h];
         let is_first = h == 0;
         let is_last = h == n - 1;
-        let clob_q = book_tip_quality(ctx, &hop.inverse_book);
+        let clob_q = funded_book_tip_quality(ctx, taker, &hop.inverse_book);
         let available_input = if is_first {
             source_available
         } else {
@@ -6081,7 +6146,7 @@ fn remove_from_book_dir(
                 .and_then(|v| v.as_array())
                 .map(|a| a.is_empty())
                 .unwrap_or(true);
-            if empty && page == 0 {
+            if empty && page == 0 && next_page == 0 {
                 let _ = view.erase(&page_key);
             } else {
                 let new_bytes =
@@ -9132,6 +9197,129 @@ mod taker_bridge_integration {
         assert_eq!(priced.1.to_iou().to_decimal_string(), "10");
         assert_eq!(taker_acct, taker_before);
         assert_eq!(ctx.view.read(&offer_key).unwrap(), offer_before);
+    }
+
+    #[test]
+    fn funded_tip_probe_reaps_unfunded_offer_and_follows_directory_pages() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 0);
+        put_acct(&mut ledger, O2, 1_000_000_000, 1);
+        put_acct(&mut ledger, O3, 1_000_000_000, 1);
+        put_line(&mut ledger, O3, b"BBB", 100);
+
+        let taker = decode_account_id(TAKER).unwrap();
+        let owner = decode_account_id(O2).unwrap();
+        let funded_owner = decode_account_id(O3).unwrap();
+        let issuer = decode_account_id(ISS).unwrap();
+        let zero = AccountId::from([0u8; 20]);
+        let currency = ccy(b"BBB");
+        let book = keylet::book_dir(&[0u8; 20], &zero, &currency, &issuer);
+        let quality = get_rate(
+            &IOUAmount::from_decimal_string("1000000").unwrap(),
+            &IOUAmount::from_decimal_string("100").unwrap(),
+        )
+        .unwrap();
+        let directory = book_dir_with_quality(&book, quality);
+        let offer_key = keylet::offer(&owner, 1);
+        let funded_offer_key = keylet::offer(&funded_owner, 1);
+        let offer = serde_json::json!({
+            "LedgerEntryType": "Offer",
+            "Account": O2,
+            "Sequence": 1,
+            "TakerPays": "1000000",
+            "TakerGets": {"currency": "BBB", "issuer": ISS, "value": "100"},
+            "BookDirectory": directory.to_string(),
+            "OwnerNode": "0000000000000000",
+            "BookNode": "0000000000000000",
+            "Flags": 0,
+        });
+        ledger
+            .put_state(offer_key, serde_json::to_vec(&offer).unwrap())
+            .unwrap();
+        let funded_offer = serde_json::json!({
+            "LedgerEntryType": "Offer",
+            "Account": O3,
+            "Sequence": 1,
+            "TakerPays": "1000000",
+            "TakerGets": {"currency": "BBB", "issuer": ISS, "value": "100"},
+            "BookDirectory": directory.to_string(),
+            "OwnerNode": "0000000000000000",
+            "BookNode": "0000000000000001",
+            "Flags": 0,
+        });
+        ledger
+            .put_state(funded_offer_key, serde_json::to_vec(&funded_offer).unwrap())
+            .unwrap();
+        let dir = serde_json::json!({
+            "LedgerEntryType": "DirectoryNode",
+            "RootIndex": directory.to_string(),
+            "Indexes": [offer_key.to_string()],
+            "IndexNext": 1,
+            "IndexPrevious": 0,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(directory, serde_json::to_vec(&dir).unwrap())
+            .unwrap();
+        let page_key = keylet::dir_node(&directory, 1);
+        let page = serde_json::json!({
+            "LedgerEntryType": "DirectoryNode",
+            "RootIndex": directory.to_string(),
+            "Indexes": [funded_offer_key.to_string()],
+            "IndexNext": 0,
+            "IndexPrevious": 0,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(page_key, serde_json::to_vec(&page).unwrap())
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({});
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+
+        assert_eq!(
+            funded_book_tip_quality(&mut ctx, &taker, &book),
+            Some(quality)
+        );
+        assert!(ctx.view.read(&offer_key).is_none());
+        assert!(ctx.view.read(&directory).is_some());
+        assert!(ctx.view.read(&funded_offer_key).is_some());
+
+        let account_bytes = ctx.view.read(&keylet::account(&taker)).unwrap();
+        let mut taker_acct: Value = serde_json::from_slice(&account_bytes).unwrap();
+        let demand = Leg::parse(&serde_json::json!({
+            "currency": "BBB", "issuer": ISS, "value": "10"
+        }))
+        .unwrap();
+        let budget = Leg::parse(&serde_json::json!("1000000")).unwrap();
+        let (delivered, spent) = cross_book_hop(
+            &mut ctx,
+            &taker,
+            &mut taker_acct,
+            &taker,
+            &demand,
+            &budget,
+            true,
+            true,
+            true,
+            false,
+            None,
+            false,
+            false,
+            1_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(delivered.iou.to_decimal_string(), "10");
+        assert_eq!(spent.drops, 100_000);
     }
 
     #[test]
