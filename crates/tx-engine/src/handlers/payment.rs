@@ -1414,6 +1414,16 @@ fn apply_paths_payment_multi(
     // Source-funds cap on the SendMax (cannot spend more than held).
     let deliver_req = value_to_number(&amount);
     let send_max_num = value_to_number(&send_max);
+    let flow_send_max = if send_max.is_string() {
+        let funds = Number::from_int(xrp_flow_funds(&acct, ctx.fees) as i64);
+        if num_le(&send_max_num, &funds) {
+            send_max_num
+        } else {
+            funds
+        }
+    } else {
+        send_max_num
+    };
     let limit_rate =
         (helpers::get_flags(ctx.tx) & rxrpl_protocol::flags::payment::TF_LIMIT_QUALITY != 0)
             .then(|| send_max_num.div(&deliver_req));
@@ -1427,19 +1437,14 @@ fn apply_paths_payment_multi(
             &dst_id,
             &strands,
             &deliver_req,
-            &send_max_num,
+            &flow_send_max,
             limit_rate.as_ref(),
             &mut amm_ctx,
         );
     let mut source_xrp_exhausted = false;
-    if let (Some(before), Some(send_max_drops)) = (
-        source_xrp_before,
-        send_max
-            .as_str()
-            .and_then(|value| value.parse::<u64>().ok()),
-    ) {
+    if let Some(before) = source_xrp_before {
         let settled = before.saturating_sub(helpers::get_balance(&acct));
-        source_xrp_exhausted = settled == send_max_drops;
+        source_xrp_exhausted = settled == flow_send_max.to_xrp_drops();
         preserve_output_ulp |= source_xrp_exhausted;
     }
     let mut delivered_iou_override = None;

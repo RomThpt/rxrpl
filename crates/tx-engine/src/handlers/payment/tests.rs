@@ -78,6 +78,12 @@ fn xrp_flow_funds_excludes_owner_reserve() {
     });
 
     assert_eq!(xrp_flow_funds(&account, &fees), 24314);
+
+    let ledger_105500264_source = serde_json::json!({
+        "Balance": "2635100",
+        "OwnerCount": 8,
+    });
+    assert_eq!(xrp_flow_funds(&ledger_105500264_source, &fees), 35100);
 }
 
 #[test]
