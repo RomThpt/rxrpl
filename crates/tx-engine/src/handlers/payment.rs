@@ -1313,6 +1313,26 @@ fn value_to_number(v: &serde_json::Value) -> rxrpl_amount::number::Number {
     }
 }
 
+/// Return the single IOU ULP by which endpoint settlement and Flow's aggregate
+/// both rounded above the requested delivery. The final DeliveredAmount path
+/// already clamps this one-ULP overshoot; applying the same correction to the
+/// trust line keeps metadata and ledger state consistent.
+fn exact_delivery_excess_ulp(
+    credited: &IOUAmount,
+    delivered: &rxrpl_amount::number::Number,
+    requested: &rxrpl_amount::number::Number,
+) -> Option<IOUAmount> {
+    let delivered_iou = delivered.to_iou();
+    let requested_iou = requested.to_iou();
+    if credited != &delivered_iou
+        || delivered_iou.exponent() != requested_iou.exponent()
+        || requested_iou.mantissa().checked_add(1) != Some(delivered_iou.mantissa())
+    {
+        return None;
+    }
+    IOUAmount::from_parts(1_000_000_000_000_000, requested_iou.exponent() - 15, false).ok()
+}
+
 /// Apply a multi-path cross-currency Payment through the multi-pass Flow loop.
 /// Builds every resolvable strand, runs `flow_multi` (fib-chunked shared-AMM
 /// consumption when two or more strands are live), enforces the partial-payment
@@ -1437,7 +1457,18 @@ fn apply_paths_payment_multi(
                 crate::amm_helpers::iou_holding_number(ctx.view, &dst_id, &issuer, &currency);
             let credited = after.sub(&before).to_iou();
             let aggregate = delivered_num.to_iou();
-            if credited.exponent() == aggregate.exponent()
+            if let Some(ulp) = exact_delivery_excess_ulp(&credited, &delivered_num, &deliver_req) {
+                crate::handlers::offer_create::credit_line(
+                    ctx,
+                    &dst_id,
+                    &issuer,
+                    &currency,
+                    &ulp.negate(),
+                    ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+                )?;
+                delivered_iou_override = Some(deliver_req.to_iou());
+                preserve_output_ulp = true;
+            } else if credited.exponent() == aggregate.exponent()
                 && credited.mantissa().checked_add(1) == Some(aggregate.mantissa())
                 && let Ok(ulp) =
                     IOUAmount::from_parts(1_000_000_000_000_000, aggregate.exponent() - 15, false)

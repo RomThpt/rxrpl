@@ -54,6 +54,18 @@ fn make_payment_tx(account: &str, destination: &str, amount: &str, fee: &str) ->
 }
 
 #[test]
+fn exact_flow_delivery_reconciles_one_excess_endpoint_ulp() {
+    let requested_iou = IOUAmount::from_decimal_string("0.1987120275960489").unwrap();
+    let credited = IOUAmount::from_decimal_string("0.198712027596049").unwrap();
+    let requested = rxrpl_amount::number::Number::from_iou(&requested_iou);
+    let delivered = rxrpl_amount::number::Number::from_iou(&credited);
+
+    let ulp = exact_delivery_excess_ulp(&credited, &delivered, &requested).unwrap();
+    assert_eq!(ulp.to_decimal_string(), "0.0000000000000001");
+    assert!(exact_delivery_excess_ulp(&requested_iou, &delivered, &requested).is_none());
+}
+
+#[test]
 fn xrp_flow_funds_excludes_owner_reserve() {
     let fees = FeeSettings {
         base_fee: 10,

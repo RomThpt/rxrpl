@@ -2656,7 +2656,8 @@ pub(crate) fn cross_path_payment(
     // tecPATH_PARTIAL.
     let mut carry = Leg::parse(budget_in).ok_or(TransactionResult::TemBadAmount)?;
     let funds = owner_funds_leg(ctx, taker, &carry);
-    if leg_ge(&carry, &funds) {
+    let source_funds_limited = leg_ge(&carry, &funds);
+    if source_funds_limited {
         carry = funds;
     }
     let final_demand = Leg::parse(target_out).ok_or(TransactionResult::TemBadAmount)?;
@@ -2804,6 +2805,16 @@ pub(crate) fn cross_path_payment(
         } else {
             None
         };
+        let source_input_rate = if is_first
+            && source_funds_limited
+            && !in_tmpl.is_xrp
+            && taker != &in_tmpl.issuer
+            && dest != &in_tmpl.issuer
+        {
+            transfer_rate_value(ctx, &in_tmpl.issuer)
+        } else {
+            1_000_000_000
+        };
         let (clob_out, clob_spent) = cross_book_hop(
             ctx,
             taker,
@@ -2824,7 +2835,7 @@ pub(crate) fn cross_path_payment(
             /*preserve_input_limited_iou_ulp=*/
             is_last && taker == dest && ctx.rules.enabled(&feature_id("fixUniversalNumber")),
             /*force_full_input_budget=*/ false,
-            /*source_input_rate=*/ 1_000_000_000,
+            source_input_rate,
         )?;
 
         // Residual liquidity from the AMM pool for this pair, on the budget not
@@ -2867,12 +2878,18 @@ pub(crate) fn cross_path_payment(
         }
         // rippled charges the intermediate issuer's transfer fee once as the IOU
         // ripples through the interior account between two consecutive books. Net
-        // the carry (the next hop's input budget) by that rate on an interior IOU
-        // boundary whose issuer is a third party. The final delivery, XRP
-        // boundaries, issuer-party hops, and fee-free issuers carry no fee, so the
-        // guard leaves net == gross exactly as before for those.
+        // the carry here for the legacy parity-input path. A source-fee-aware
+        // BookPayment already carries the gross book output into the next step,
+        // whose input settlement applies that boundary fee; dividing here would
+        // charge it twice. Final delivery, XRP boundaries, and issuer-party hops
+        // carry no fee at this boundary.
         carry = got.clone();
-        if !is_last && !out_tmpl.is_xrp && out_tmpl.issuer != *taker && out_tmpl.issuer != *dest {
+        if !is_last
+            && source_input_rate == 1_000_000_000
+            && !out_tmpl.is_xrp
+            && out_tmpl.issuer != *taker
+            && out_tmpl.issuer != *dest
+        {
             let rate = transfer_rate(ctx, &out_tmpl.issuer);
             let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
             if rate != one {
@@ -7810,6 +7827,16 @@ mod taker_crossing_tests {
         assert_eq!(net.iou.to_decimal_string(), "19.90319255354736");
 
         let charged = gross_book_payment_input(&net, &gross, 1_000_100_000, true);
+        assert_eq!(charged.iou, gross.iou);
+    }
+
+    #[test]
+    fn path_payment_source_budget_is_net_of_transfer_fee() {
+        let gross = iou("0.1987120275960489");
+        let net = net_book_payment_input(&gross, 1_003_000_000);
+        assert_eq!(net.iou.to_decimal_string(), "0.1981176745723319");
+
+        let charged = gross_book_payment_input(&net, &gross, 1_003_000_000, true);
         assert_eq!(charged.iou, gross.iou);
     }
 
