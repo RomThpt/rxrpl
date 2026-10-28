@@ -2708,6 +2708,68 @@ fn conversion_send_max_binds_partial_delivery() {
 }
 
 #[test]
+fn conversion_reaps_offer_when_native_side_reaches_zero() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, MM, "100000000", None);
+    put_account(&mut ledger, ALICE, "100000000", None);
+    put_trust_line(&mut ledger, MM, ISSUER, "CNY", 100.0);
+    put_trust_line(&mut ledger, ALICE, ISSUER, "CNY", 0.0);
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+
+    let offer_tx = serde_json::json!({
+        "TransactionType": "OfferCreate",
+        "Account": MM,
+        "TakerGets": iou("CNY", ISSUER, "36.83615357192347"),
+        "TakerPays": "4871218",
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut offer_ctx = ApplyContext {
+        tx: &offer_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        crate::handlers::offer_create::OfferCreateTransactor
+            .apply(&mut offer_ctx)
+            .unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let payment_tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": ALICE,
+        "Amount": iou("CNY", ISSUER, "36.83615357192308"),
+        "DeliverMin": iou("CNY", ISSUER, "36.79931741835116"),
+        "SendMax": "4871218",
+        "Flags": rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT,
+        "Sequence": 1,
+        "Fee": "10",
+    });
+    let mut payment_ctx = ApplyContext {
+        tx: &payment_tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut payment_ctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let mm_id = decode_account_id(MM).unwrap();
+    assert!(sandbox.read(&keylet::offer(&mm_id, 1)).is_none());
+    assert!((holder_balance(&sandbox, ALICE, ISSUER, "CNY") - 36.83615357192308).abs() < 1e-12);
+}
+
+#[test]
 fn conversion_iou_to_iou_caps_at_source_balance() {
     // BOB sells 100 EUR for 50 USD (0.5 USD/EUR). ALICE holds only 10 USD and
     // converts USD->EUR with SendMax 40 USD. The source-funds cap binds before

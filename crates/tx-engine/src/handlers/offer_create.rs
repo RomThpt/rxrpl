@@ -2500,6 +2500,14 @@ fn cross_book_hop(
                 ctx.view
                     .update(offer_key, rb)
                     .map_err(|_| TransactionResult::TefInternal)?;
+                // A proportional fill can exhaust one side exactly while
+                // leaving representable dust on the other. rippled records
+                // those asymmetric residuals in DeletedNode.FinalFields, then
+                // removes the dry offer. Leaving the zero-sided Offer in the
+                // sandbox violates NoBadOffers and rolls back the transaction.
+                if new_gets.is_zero() || new_pays.is_zero() {
+                    reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                }
             }
 
             remaining_out = leg_sub_round(&remaining_out, &net_out);
