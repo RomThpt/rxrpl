@@ -142,8 +142,9 @@ fn is_threading_only(
 }
 
 /// `trustDelete` threads both owners of the removed RippleState. Unlike other
-/// thread-only owner touches, rippled includes the AccountRoot's FinalFields in
-/// this case. Detect the account side from the deleted line's two limits.
+/// thread-only owner touches, rippled includes the AccountRoot's FinalFields
+/// when a payment redeemed a non-zero balance before deleting the line. A
+/// TrustSet that deletes an already-zero line still emits thread-only owners.
 fn owns_deleted_trust_line(account: Option<&str>, nodes: &[AffectedNode]) -> bool {
     let Some(account) = account else {
         return false;
@@ -152,7 +153,11 @@ fn owns_deleted_trust_line(account: Option<&str>, nodes: &[AffectedNode]) -> boo
         if node.change_type != ChangeType::Deleted || node.ledger_entry_type != "RippleState" {
             return false;
         }
+        let previous = decode_sle(&node.previous);
         let line = decode_sle(&node.final_fields);
+        if previous.get("Balance") == line.get("Balance") {
+            return false;
+        }
         ["LowLimit", "HighLimit"].iter().any(|field| {
             line.get(*field)
                 .and_then(|limit| limit.get("issuer"))
@@ -455,8 +460,16 @@ mod tests {
             "PreviousTxnLgrSeq": 11,
         }))
         .unwrap();
-        let line = serde_json::to_vec(&serde_json::json!({
+        let previous_line = serde_json::to_vec(&serde_json::json!({
             "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": other, "value": "1"},
+            "LowLimit": { "issuer": account, "currency": "USD", "value": "0" },
+            "HighLimit": { "issuer": other, "currency": "USD", "value": "0" },
+        }))
+        .unwrap();
+        let final_line = serde_json::to_vec(&serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "USD", "issuer": other, "value": "0"},
             "LowLimit": { "issuer": account, "currency": "USD", "value": "0" },
             "HighLimit": { "issuer": other, "currency": "USD", "value": "0" },
         }))
@@ -467,16 +480,16 @@ mod tests {
                     change_type: ChangeType::Modified,
                     key: account_key,
                     ledger_entry_type: "AccountRoot".into(),
-                    previous: Some(original),
-                    final_fields: Some(final_fields),
+                    previous: Some(original.clone()),
+                    final_fields: Some(final_fields.clone()),
                     prev_txn: Some((serde_json::json!("11".repeat(32)), serde_json::json!(10))),
                 },
                 AffectedNode {
                     change_type: ChangeType::Deleted,
                     key: line_key,
                     ledger_entry_type: "RippleState".into(),
-                    previous: Some(line.clone()),
-                    final_fields: Some(line),
+                    previous: Some(previous_line),
+                    final_fields: Some(final_line.clone()),
                     prev_txn: None,
                 },
             ],
@@ -494,5 +507,37 @@ mod tests {
             .unwrap();
         assert_eq!(modified["FinalFields"]["Account"], account);
         assert_eq!(modified["FinalFields"]["Balance"], "1000");
+
+        let trust_set_meta = TxMeta {
+            affected_nodes: vec![
+                AffectedNode {
+                    change_type: ChangeType::Modified,
+                    key: account_key,
+                    ledger_entry_type: "AccountRoot".into(),
+                    previous: Some(original),
+                    final_fields: Some(final_fields),
+                    prev_txn: Some((serde_json::json!("11".repeat(32)), serde_json::json!(10))),
+                },
+                AffectedNode {
+                    change_type: ChangeType::Deleted,
+                    key: line_key,
+                    ledger_entry_type: "RippleState".into(),
+                    previous: Some(final_line.clone()),
+                    final_fields: Some(final_line),
+                    prev_txn: None,
+                },
+            ],
+            tx_index: 0,
+            result_code: 0,
+            delivered_amount: None,
+        };
+        let trust_set_json = trust_set_meta.to_canonical_json();
+        let issuer_thread = trust_set_json["AffectedNodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|node| node.get("ModifiedNode"))
+            .unwrap();
+        assert!(issuer_thread.get("FinalFields").is_none());
     }
 }
