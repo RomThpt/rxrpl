@@ -189,26 +189,6 @@ impl Transactor for NFTokenMintTransactor {
     }
 }
 
-/// True when an offer amount is zero (XRP `"0"` drops or IOU value `0`). A
-/// zero-amount (gift) sell offer omits sfAmount, matching rippled's default-drop
-/// serialization. Mirrors the helper in `nftoken_create_offer`.
-fn amount_is_zero(amount: &Value) -> bool {
-    match amount {
-        Value::String(s) => s.parse::<u128>().map(|n| n == 0).unwrap_or(false),
-        Value::Object(o) => o
-            .get("value")
-            .and_then(|v| v.as_str())
-            .map(|s| {
-                s.trim_start_matches('-')
-                    .trim_matches('0')
-                    .trim_matches('.')
-                    .is_empty()
-            })
-            .unwrap_or(false),
-        _ => false,
-    }
-}
-
 impl NFTokenMintTransactor {
     /// NFTokenMintOffer: atomically create the sell NFTokenOffer for the token
     /// just minted. Mirrors rippled `nft::tokenOfferCreateApply` with the
@@ -254,9 +234,10 @@ impl NFTokenMintTransactor {
             .get("Amount")
             .cloned()
             .unwrap_or_else(|| Value::String("0".to_string()));
-        if !amount_is_zero(&amount_value) {
-            offer["Amount"] = amount_value;
-        }
+        // sfAmount is SoeRequired on NFTokenOffer. The metadata NewFields omits
+        // a default XRP zero, but the state SLE must still serialize Amount="0"
+        // for a gift offer (105500289).
+        offer["Amount"] = amount_value;
         if let Some(dest) = helpers::get_str_field(ctx.tx, "Destination") {
             offer["Destination"] = Value::String(dest.to_string());
         }
@@ -372,6 +353,40 @@ mod tests {
         assert_eq!(acct["Sequence"].as_u64().unwrap(), 2);
         assert_eq!(acct["FirstNFTokenSequence"].as_u64().unwrap(), 1);
         assert_eq!(acct["MintedNFTokens"].as_u64().unwrap(), 1);
+    }
+
+    #[test]
+    fn mint_gift_offer_serializes_required_zero_amount() {
+        let ledger = setup_ledger();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenMint",
+            "Account": MINTER,
+            "NFTokenTaxon": 0,
+            "Amount": "0",
+            "Fee": "12",
+            "Sequence": 1,
+        });
+
+        crate::handlers::central_consume_for_test(&mut sandbox, &tx);
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            NFTokenMintTransactor.apply(&mut ctx).unwrap(),
+            TransactionResult::TesSuccess
+        );
+
+        let minter = decode_account_id(MINTER).unwrap();
+        let offer = sandbox.read(&keylet::nftoken_offer(&minter, 1)).unwrap();
+        let offer: Value = serde_json::from_slice(&offer).unwrap();
+        assert_eq!(offer["Amount"], "0");
     }
 
     #[test]
