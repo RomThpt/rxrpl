@@ -546,6 +546,14 @@ impl Transactor for OfferCreateTransactor {
             ),
             _ => keylet::book_dir(&gets_currency, &gets_issuer, &pays_currency, &pays_issuer),
         };
+        // Flow fixes the source `sendMax` before walking the book. Removing one
+        // of the taker's own inverse offers during the walk may release owner
+        // reserve, but those newly-liquid funds are not available to this
+        // crossing.
+        let flow_source_budget = Leg::parse(&taker_gets).map(|gets| {
+            let funds = owner_funds_leg(ctx, &account_id, &gets);
+            leg_min(&gets, &funds)
+        });
         reap_own_unfunded_inverse_tip(
             ctx,
             &account_id,
@@ -563,7 +571,7 @@ impl Transactor for OfferCreateTransactor {
         // the legacy `Taker` (with its XRP autobridge) when not. Every mainnet
         // ledger past 2018 has `FlowCross` enabled, so the legacy arm is dead on
         // any recent replay; it exists for byte-exact pre-`FlowCross` ledgers.
-        let (remaining_pays, remaining_gets, crossed) =
+        let (remaining_pays, remaining_gets, crossed, source_exhausted) =
             if ctx.rules.enabled(&feature_id("FlowCross")) {
                 cross_offers(
                     ctx,
@@ -574,9 +582,12 @@ impl Transactor for OfferCreateTransactor {
                     &inverse_book,
                     is_sell,
                     domain_only,
+                    flow_source_budget
+                        .as_ref()
+                        .ok_or(TransactionResult::TemBadOffer)?,
                 )?
             } else {
-                taker_cross(
+                let (remaining_pays, remaining_gets, crossed) = taker_cross(
                     ctx,
                     &account_id,
                     &mut acct,
@@ -585,7 +596,8 @@ impl Transactor for OfferCreateTransactor {
                     &inverse_book,
                     is_sell,
                     domain_only,
-                )?
+                )?;
+                (remaining_pays, remaining_gets, crossed, false)
             };
 
         // Flow returns the independently consumed input and output amounts. A
@@ -648,12 +660,15 @@ impl Transactor for OfferCreateTransactor {
         // post-crossing liquid funds are computed from `acct`.
         if crossed {
             if let Some(gets_leg) = Leg::parse(&taker_gets) {
-                let unfunded = if gets_leg.is_xrp {
-                    let oc = acct.get("OwnerCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    helpers::get_balance(&acct) as i64 - ctx.fees.account_reserve(oc) as i64 <= 0
-                } else {
-                    owner_funds_leg(ctx, &account_id, &gets_leg).is_zero()
-                };
+                let unfunded = source_exhausted
+                    || if gets_leg.is_xrp {
+                        let oc =
+                            acct.get("OwnerCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        helpers::get_balance(&acct) as i64 - ctx.fees.account_reserve(oc) as i64
+                            <= 0
+                    } else {
+                        owner_funds_leg(ctx, &account_id, &gets_leg).is_zero()
+                    };
                 if unfunded {
                     commit_acct(ctx, &acct)?;
                     return Ok(TransactionResult::TesSuccess);
@@ -1132,14 +1147,29 @@ fn cross_offers(
     inverse_book: &rxrpl_primitives::Hash256,
     is_sell: bool,
     domain_only: bool,
-) -> Result<(Value, Value, bool), TransactionResult> {
+    source_budget: &Leg,
+) -> Result<(Value, Value, bool, bool), TransactionResult> {
     let out_leg = match Leg::parse(taker_pays) {
         Some(l) => l,
-        None => return Ok((taker_pays.clone(), taker_gets.clone(), false)),
+        None => {
+            return Ok((
+                taker_pays.clone(),
+                taker_gets.clone(),
+                false,
+                source_budget.is_zero(),
+            ));
+        }
     };
     let in_leg = match Leg::parse(taker_gets) {
         Some(l) => l,
-        None => return Ok((taker_pays.clone(), taker_gets.clone(), false)),
+        None => {
+            return Ok((
+                taker_pays.clone(),
+                taker_gets.clone(),
+                false,
+                source_budget.is_zero(),
+            ));
+        }
     };
 
     // Taker's quality limit in the inverse book = TakerGets / TakerPays.
@@ -1161,11 +1191,17 @@ fn cross_offers(
     let passive = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_PASSIVE != 0;
     let threshold = crossing_threshold(orig_quality, passive);
     if threshold == 0 {
-        return Ok((taker_pays.clone(), taker_gets.clone(), false));
+        return Ok((
+            taker_pays.clone(),
+            taker_gets.clone(),
+            false,
+            source_budget.is_zero(),
+        ));
     }
 
     let mut remaining_out = out_leg.clone();
     let mut remaining_in = in_leg.clone();
+    let mut source_remaining = source_budget.clone();
     let mut crossed = false;
     // Flow's OfferStream advances once more after fully consuming a tip. While
     // doing so it reaps every unfunded offer it encounters, even across quality
@@ -1241,6 +1277,7 @@ fn cross_offers(
                     &out_leg,
                     &mut remaining_out,
                     &mut remaining_in,
+                    &mut source_remaining,
                     &mut crossed,
                     dir_quality,
                     is_sell,
@@ -1254,9 +1291,9 @@ fn cross_offers(
                     ctx,
                     taker,
                     taker_acct,
-                    &in_leg,
                     &mut remaining_out,
                     &mut remaining_in,
+                    &mut source_remaining,
                     &mut crossed,
                     dir_quality,
                     fok,
@@ -1345,12 +1382,12 @@ fn cross_offers(
                 continue;
             }
             let avail_out = leg_min(&offer_out, &funds);
-            // flowCross cannot spend more TakerGets than the taker currently
-            // holds. Recompute after every fill; the unspent offer remainder
-            // stays based on the original amount and is dropped later when the
-            // post-crossing source balance reaches zero (105500248 B88F1D1B).
-            let taker_funds = owner_funds_leg(ctx, taker, &in_leg);
-            let spendable_in = leg_min(&remaining_in, &taker_funds);
+            // flowCross cannot spend more than the source `sendMax` captured
+            // before the walk. Decrement that shared budget after every fill;
+            // the unspent offer remainder stays based on the original amount and
+            // is dropped when the source budget reaches zero (105500248
+            // B88F1D1B, 105500305 E05D37B2).
+            let spendable_in = leg_min(&remaining_in, &source_remaining);
             if spendable_in.is_zero() {
                 break 'walk;
             }
@@ -1499,6 +1536,7 @@ fn cross_offers(
             // truncating each subtraction can leave one extra ULP for the next
             // offer and make a tfSell cross spend above its TakerGets ceiling.
             remaining_in = leftover_leg(&remaining_in, &order_in, number_switchover);
+            source_remaining = leftover_leg(&source_remaining, &order_in, number_switchover);
             crossed = true;
         }
     }
@@ -1520,6 +1558,7 @@ fn cross_offers(
                 &out_leg,
                 &mut remaining_out,
                 &mut remaining_in,
+                &mut source_remaining,
                 &mut crossed,
                 threshold,
                 is_sell,
@@ -1530,9 +1569,9 @@ fn cross_offers(
                 ctx,
                 taker,
                 taker_acct,
-                &in_leg,
                 &mut remaining_out,
                 &mut remaining_in,
+                &mut source_remaining,
                 &mut crossed,
                 threshold,
                 fok,
@@ -1546,6 +1585,7 @@ fn cross_offers(
         remaining_out.with_amount(&remaining_out.iou, remaining_out.drops),
         remaining_in.with_amount(&remaining_in.iou, remaining_in.drops),
         crossed,
+        source_remaining.is_zero(),
     ))
 }
 
@@ -1612,9 +1652,9 @@ fn try_amm_step(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
     taker_acct: &mut Value,
-    in_leg: &Leg,
     remaining_out: &mut Leg,
     remaining_in: &mut Leg,
+    source_remaining: &mut Leg,
     crossed: &mut bool,
     cq: u64,
     fok: bool,
@@ -1625,8 +1665,7 @@ fn try_amm_step(
     // (`sendMax = min(takerAmount.in, accountFunds)`, OfferCreate.cpp:400): the
     // AMM swap would otherwise overdraw the taker (its sold-asset balance goes
     // negative) when TakerGets exceeds what it holds.
-    let taker_funds = owner_funds_leg(ctx, taker, in_leg);
-    let budget = leg_min(remaining_in, &taker_funds);
+    let budget = leg_min(remaining_in, source_remaining);
     if budget.is_zero() {
         return Ok(());
     }
@@ -1669,6 +1708,7 @@ fn try_amm_step(
             leg_sub(remaining_out, &delivered)
         };
         *remaining_in = leg_sub(remaining_in, &spent);
+        *source_remaining = leg_sub(source_remaining, &spent);
         *crossed = true;
     }
     Ok(())
@@ -1695,12 +1735,12 @@ fn try_bridge_step(
     out_leg: &Leg,
     remaining_out: &mut Leg,
     remaining_in: &mut Leg,
+    source_remaining: &mut Leg,
     crossed: &mut bool,
     cq: u64,
     is_sell: bool,
 ) -> Result<(), TransactionResult> {
-    let taker_funds = owner_funds_leg(ctx, taker, in_leg);
-    let mut budget = leg_min(remaining_in, &taker_funds);
+    let mut budget = leg_min(remaining_in, source_remaining);
     // Persist the AMM fib counter across passes (rippled `AMMContext`): each
     // committed pass advances `amm_iters`, growing the synthetic AMM offer
     // geometrically so the strand converges in a handful of passes. A fresh
@@ -1791,6 +1831,7 @@ fn try_bridge_step(
     let spent = leg_from_magnitude(&total_in.to_iou(), in_leg);
     let delivered = leg_from_magnitude(&total_out.to_iou(), out_leg);
     *remaining_in = leg_sub(remaining_in, &spent);
+    *source_remaining = leg_sub(source_remaining, &spent);
     *remaining_out = if leg_ge(&delivered, remaining_out) {
         leg_sub(remaining_out, remaining_out)
     } else {
@@ -9863,6 +9904,7 @@ mod flow_cross_own_unfunded {
 
     const TAKER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
     const MAKER: &str = "rpP2JgiMyTF5jR5hLG3xHCPi1knBb1v9cM";
+    const MAKER2: &str = "rf1BiGeXwwQoi8Z2ueFYTEXSwuJYfV2Jpn";
     const ISS: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
 
     fn apply_flow(
@@ -9885,6 +9927,13 @@ mod flow_cross_own_unfunded {
         let b = sandbox.read(&keylet::account(&id)).unwrap();
         let v: Value = serde_json::from_slice(&b).unwrap();
         v["OwnerCount"].as_u64().unwrap()
+    }
+
+    fn xrp_balance(sandbox: &Sandbox<'_>, addr: &str) -> u64 {
+        let id = decode_account_id(addr).unwrap();
+        let b = sandbox.read(&keylet::account(&id)).unwrap();
+        let v: Value = serde_json::from_slice(&b).unwrap();
+        v["Balance"].as_str().unwrap().parse().unwrap()
     }
 
     fn put_usd_line(ledger: &mut Ledger, holder: &str, balance: i64) {
@@ -9921,6 +9970,98 @@ mod flow_cross_own_unfunded {
                 serde_json::to_vec(&line).unwrap(),
             )
             .unwrap();
+    }
+
+    /// 105500305 E05D37B2: removing the taker's own inverse offer releases one
+    /// owner reserve, but Flow's source sendMax remains fixed to the XRP that was
+    /// liquid before the book walk.
+    #[test]
+    fn source_budget_ignores_reserve_released_during_crossing() {
+        let mut ledger = Ledger::genesis();
+        for (addr, drops, owner_count) in [
+            (ISS, 1_000_000_000_u64, 0_u64),
+            (TAKER, 4_034_048, 10),
+            (MAKER, 1_000_000_000, 0),
+            (MAKER2, 1_000_000_000, 0),
+        ] {
+            let id = decode_account_id(addr).unwrap();
+            let acct = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": addr,
+                "Balance": drops.to_string(), "Sequence": 1,
+                "OwnerCount": owner_count, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&acct).unwrap())
+                .unwrap();
+        }
+        put_usd_line(&mut ledger, TAKER, 10);
+        put_usd_line(&mut ledger, MAKER, 1);
+        put_usd_line(&mut ledger, MAKER2, 1);
+
+        let fees = FeeSettings {
+            base_fee: 10,
+            reserve_base: 1_000_000,
+            reserve_increment: 200_000,
+        };
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let usd =
+            |value: &str| serde_json::json!({"currency": "USD", "issuer": ISS, "value": value});
+
+        // This crossable self-owned offer raises the initial OwnerCount to 11.
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER,
+                    "Fee": "12", "Sequence": 1,
+                    "TakerGets": usd("0.1"), "TakerPays": "80000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert_eq!(owner_count(&sandbox, TAKER), 11);
+
+        for (maker, sequence, gets, pays) in [
+            (MAKER, 1_u64, "0.5", "400000"),
+            (MAKER2, 1_u64, "1", "800000"),
+        ] {
+            assert_eq!(
+                apply_flow(
+                    &mut sandbox,
+                    &fees,
+                    &serde_json::json!({
+                        "TransactionType": "OfferCreate", "Account": maker,
+                        "Fee": "12", "Sequence": sequence,
+                        "TakerGets": usd(gets), "TakerPays": pays,
+                    }),
+                ),
+                TransactionResult::TesSuccess
+            );
+        }
+
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER,
+                    "Fee": "12", "Sequence": 2, "Flags": TF_PASSIVE,
+                    "TakerGets": "2000000", "TakerPays": usd("2"),
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+
+        let taker_id = decode_account_id(TAKER).unwrap();
+        assert_eq!(xrp_balance(&sandbox, TAKER), 3_200_000);
+        assert_eq!(owner_count(&sandbox, TAKER), 10);
+        assert!(sandbox.read(&keylet::offer(&taker_id, 1)).is_none());
+        assert!(
+            sandbox.read(&keylet::offer(&taker_id, 2)).is_none(),
+            "an exhausted source budget must not leave a new resting offer"
+        );
     }
 
     /// 105500215 91B10CB9: Flow's direct book removes funded inverse offers
