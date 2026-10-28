@@ -1167,6 +1167,12 @@ fn cross_offers(
     let mut remaining_out = out_leg.clone();
     let mut remaining_in = in_leg.clone();
     let mut crossed = false;
+    // Flow's OfferStream advances once more after fully consuming a tip. While
+    // doing so it reaps every unfunded offer it encounters, even across quality
+    // directories, and only then exposes the next funded offer for the quality
+    // check. Do not do this on the initial probe: already-unfunded offers beyond
+    // the taker's limit stay untouched when no preceding tip was consumed.
+    let mut advance_after_exhausted_tip = false;
     let book_prefix = &inverse_book.as_bytes()[0..24];
     let fok = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_FILL_OR_KILL != 0;
 
@@ -1211,11 +1217,12 @@ fn cross_offers(
         probe = dir_key;
         let dir_quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
         if dir_quality > threshold {
-            // Quality rejection happens before dereferencing the page's offers.
-            // In particular, unfunded third-party offers beyond the taker's
-            // limit remain untouched (105500120). The taker's own unfunded tip
-            // is handled separately by `reap_own_unfunded_inverse_tip`.
-            break;
+            if !advance_after_exhausted_tip
+                || advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key)?
+            {
+                break;
+            }
+            continue;
         }
         // Interleave the AMM at this quality band BEFORE the resting CLOB offers.
         // rippled crosses whichever of the synthetic AMM offer / CLOB tip is
@@ -1458,6 +1465,7 @@ fn cross_offers(
                     .update(offer_key, cb)
                     .map_err(|_| TransactionResult::TefInternal)?;
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                advance_after_exhausted_tip = true;
             } else {
                 // Reduce the resting offer in place by the filled amounts. Both
                 // sides round to nearest once fixUniversalNumber is on (Number
@@ -1476,6 +1484,7 @@ fn cross_offers(
                 ctx.view
                     .update(offer_key, rb)
                     .map_err(|_| TransactionResult::TefInternal)?;
+                advance_after_exhausted_tip = false;
             }
 
             // A tfSell fill can deliver more than the remaining TakerPays demand;
@@ -1538,6 +1547,58 @@ fn cross_offers(
         remaining_in.with_amount(&remaining_in.iou, remaining_in.drops),
         crossed,
     ))
+}
+
+/// Continue Flow's post-fill OfferStream advance into a quality directory that
+/// is already worse than the taker's limit. Unfunded/invalid tips disappear,
+/// but the first funded offer stops the walk and remains untouched.
+fn advance_past_unfunded_quality(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dir_key: &Hash256,
+) -> Result<bool, TransactionResult> {
+    for offer_key in book_dir_indexes(ctx, dir_key) {
+        let Some(bytes) = ctx.view.read(&offer_key) else {
+            continue;
+        };
+        let Ok(offer) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if offer.get("LedgerEntryType").and_then(Value::as_str) != Some("Offer") {
+            continue;
+        }
+        let Some(owner) = offer
+            .get("Account")
+            .and_then(Value::as_str)
+            .and_then(|value| decode_account_id(value).ok())
+        else {
+            continue;
+        };
+        let (Some(offer_in), Some(offer_out)) = (
+            offer.get("TakerPays").and_then(Leg::parse),
+            offer.get("TakerGets").and_then(Leg::parse),
+        ) else {
+            continue;
+        };
+        let expired = offer
+            .get("Expiration")
+            .and_then(Value::as_u64)
+            .is_some_and(|expiration| expiration <= ctx.view.parent_close_time() as u64);
+        let funds = owner_funds_leg(ctx, &owner, &offer_out);
+        let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+        let removable = expired
+            || offer_in.is_zero()
+            || offer_out.is_zero()
+            || is_deep_frozen(ctx, &owner, &offer_in)
+            || offer_cannot_pay(&funds, &offer_out, flags, &owner == taker)
+            || owner == *taker;
+        if !removable {
+            return Ok(true);
+        }
+        reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, dir_key)?;
+    }
+    Ok(false)
 }
 
 /// Cross the book's AMM pool (if present and strictly better than `cq`) up to the
@@ -9793,6 +9854,7 @@ mod flow_cross_own_unfunded {
     use rxrpl_ledger::Ledger;
 
     const TAKER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    const MAKER: &str = "rpP2JgiMyTF5jR5hLG3xHCPi1knBb1v9cM";
     const ISS: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
 
     fn apply_flow(
@@ -9815,6 +9877,42 @@ mod flow_cross_own_unfunded {
         let b = sandbox.read(&keylet::account(&id)).unwrap();
         let v: Value = serde_json::from_slice(&b).unwrap();
         v["OwnerCount"].as_u64().unwrap()
+    }
+
+    fn put_usd_line(ledger: &mut Ledger, holder: &str, balance: i64) {
+        let holder_id = decode_account_id(holder).unwrap();
+        let issuer_id = decode_account_id(ISS).unwrap();
+        let currency = helpers::currency_to_bytes("USD");
+        let holder_is_low = holder_id.as_bytes() < issuer_id.as_bytes();
+        let stored = if balance == 0 {
+            "0".to_string()
+        } else if holder_is_low {
+            balance.to_string()
+        } else {
+            format!("-{}", balance)
+        };
+        let (low, high) = if holder_is_low {
+            (holder, ISS)
+        } else {
+            (ISS, holder)
+        };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {
+                "currency": "USD",
+                "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji",
+                "value": stored,
+            },
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "1000"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "1000"},
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&holder_id, &issuer_id, &currency),
+                serde_json::to_vec(&line).unwrap(),
+            )
+            .unwrap();
     }
 
     /// 105500215 91B10CB9: Flow's direct book removes funded inverse offers
@@ -10173,6 +10271,75 @@ mod flow_cross_own_unfunded {
             sandbox.read(&maker_offer).is_some(),
             "expired offer beyond the taker's quality must remain untouched"
         );
+    }
+
+    /// 105500288 736AFECC: after a funded tip drains its maker, OfferStream
+    /// advances beyond the taker's quality and reaps the maker's now-unfunded
+    /// offers before rejecting the next funded tip.
+    #[test]
+    fn exhausted_tip_reaps_unfunded_offers_past_quality_threshold() {
+        let mut ledger = Ledger::genesis();
+        for addr in [ISS, TAKER, MAKER] {
+            let id = decode_account_id(addr).unwrap();
+            let account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot",
+                "Account": addr,
+                "Balance": "10000000000",
+                "Sequence": 1,
+                "OwnerCount": 0,
+                "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        put_usd_line(&mut ledger, TAKER, 0);
+        put_usd_line(&mut ledger, MAKER, 1);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        for (sequence, xrp) in [(1, "1000000"), (2, "2000000")] {
+            assert_eq!(
+                apply_flow(
+                    &mut sandbox,
+                    &fees,
+                    &serde_json::json!({
+                        "TransactionType": "OfferCreate",
+                        "Account": MAKER,
+                        "Fee": "10",
+                        "Sequence": sequence,
+                        "Flags": TF_PASSIVE,
+                        "TakerGets": {"currency": "USD", "issuer": ISS, "value": "1"},
+                        "TakerPays": xrp,
+                    }),
+                ),
+                TransactionResult::TesSuccess
+            );
+        }
+
+        assert_eq!(owner_count(&sandbox, MAKER), 2);
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate",
+                    "Account": TAKER,
+                    "Fee": "10",
+                    "Sequence": 1,
+                    "Flags": TF_IMMEDIATE_OR_CANCEL,
+                    "TakerGets": "3000000",
+                    "TakerPays": {"currency": "USD", "issuer": ISS, "value": "2"},
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+
+        let maker = decode_account_id(MAKER).unwrap();
+        assert!(sandbox.read(&keylet::offer(&maker, 1)).is_none());
+        assert!(sandbox.read(&keylet::offer(&maker, 2)).is_none());
+        assert_eq!(owner_count(&sandbox, MAKER), 0);
     }
 
     #[test]
