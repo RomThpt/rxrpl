@@ -1405,7 +1405,15 @@ fn cross_offers(
             // Full take when the taker consumes the whole original offer;
             // otherwise a partial take of `take_out`, priced at the offer's
             // quality (`order_in = take_out * rate`, clamped to the offer).
-            let full_take = leg_ge(&take_out, &offer_out);
+            let full_take = consumes_full_offer(
+                &take_out,
+                &offer_out,
+                &spendable_in,
+                &offer_in,
+                &remaining_out,
+                &avail_out,
+                is_sell,
+            );
             let (order_out, order_in) = if full_take {
                 (offer_out.clone(), offer_in.clone())
             } else if is_sell && !leg_ge(&take_out, &avail_out) {
@@ -1521,7 +1529,17 @@ fn cross_offers(
                 ctx.view
                     .update(offer_key, rb)
                     .map_err(|_| TransactionResult::TefInternal)?;
-                advance_after_exhausted_tip = false;
+                // Quality quantisation can make `take_out` compare just below
+                // the original offer even though canonical subtraction rounds
+                // one residual side to zero. Such a dry offer is consumed and
+                // deleted by Flow's OfferStream, with the zero residual retained
+                // in DeletedNode.FinalFields.
+                if new_gets.is_zero() || new_pays.is_zero() {
+                    reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                    advance_after_exhausted_tip = true;
+                } else {
+                    advance_after_exhausted_tip = false;
+                }
             }
 
             // A tfSell fill can deliver more than the remaining TakerPays demand;
@@ -1860,6 +1878,22 @@ fn out_for_in(in_amt: &Leg, rate: &IOUAmount, offer_out: &Leg) -> Leg {
     let out_iou =
         IOUAmount::div_round(&in_iou, rate, /*round_up*/ false).unwrap_or(IOUAmount::ZERO);
     leg_from_magnitude(&out_iou, offer_out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consumes_full_offer(
+    take_out: &Leg,
+    offer_out: &Leg,
+    spendable_in: &Leg,
+    offer_in: &Leg,
+    remaining_out: &Leg,
+    avail_out: &Leg,
+    is_sell: bool,
+) -> bool {
+    leg_ge(take_out, offer_out)
+        || (leg_ge(avail_out, offer_out)
+            && leg_ge(spendable_in, offer_in)
+            && (is_sell || leg_ge(remaining_out, offer_out)))
 }
 
 /// Build a leg in `template`'s asset carrying magnitude `mag`. For XRP the
@@ -7542,13 +7576,14 @@ fn taker_cross(
 mod taker_crossing_tests {
     use super::{
         Leg, TakerCrossType, add_iou_balance, add_iou_balance_half_upward, composed_quality,
-        crossing_threshold, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou,
-        full_offer_take, funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out,
-        in_for_out_offer, input_limited_uses_full_budget, leftover_is_dust, leftover_leg, leg_ge,
-        leg_gt, leg_max, net_book_payment_input, out_for_in, pack_rate, parity_rate, qual_div,
-        qual_mul, reject_quality, remaining_is_filled, remaining_is_filled_at, remaining_offer,
-        scale_funds_limited_input, select_path, sell_clamp_sub, should_bump_partial_path_credit,
-        should_trim_input_limited_iou_leftover, terminal_budget_binds,
+        consumes_full_offer, crossing_threshold, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input,
+        flow_xrp_to_iou, full_offer_take, funds_limited_xrp_rounds_up, gross_book_payment_input,
+        in_for_out, in_for_out_offer, input_limited_uses_full_budget, leftover_is_dust,
+        leftover_leg, leg_ge, leg_gt, leg_max, net_book_payment_input, out_for_in, pack_rate,
+        parity_rate, qual_div, qual_mul, reject_quality, remaining_is_filled,
+        remaining_is_filled_at, remaining_offer, scale_funds_limited_input, select_path,
+        sell_clamp_sub, should_bump_partial_path_credit, should_trim_input_limited_iou_leftover,
+        terminal_budget_binds,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, get_rate_round_even, offer_quality};
     use rxrpl_primitives::AccountId;
@@ -7622,6 +7657,19 @@ mod taker_crossing_tests {
                 .to_decimal_string(),
             "52.38814400000006"
         );
+    }
+
+    #[test]
+    fn ledger_105500113_full_input_consumes_quality_dust() {
+        let offer_out = iou("300");
+        let offer_in = xrp(271_787_432);
+        let rate = from_rate(0x5A20_2FA4_174A_E2AB).unwrap();
+        let take_out = out_for_in(&offer_in, &rate, &offer_out);
+
+        assert_eq!(take_out.iou.to_decimal_string(), "299.9999999999999");
+        assert!(consumes_full_offer(
+            &take_out, &offer_out, &offer_in, &offer_in, &offer_out, &offer_out, false,
+        ));
     }
 
     #[test]
