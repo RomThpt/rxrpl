@@ -141,11 +141,14 @@ fn is_threading_only(
         .all(|k| k == "PreviousTxnID" || k == "PreviousTxnLgrSeq" || prev.get(k) == fin.get(k))
 }
 
-/// `trustDelete` threads both owners of the removed RippleState. Unlike other
-/// thread-only owner touches, rippled includes the AccountRoot's FinalFields
-/// when a payment redeemed a non-zero balance before deleting the line. A
-/// TrustSet that deletes an already-zero line still emits thread-only owners.
-fn owns_deleted_trust_line(account: Option<&str>, nodes: &[AffectedNode]) -> bool {
+/// `trustDelete` threads both owners of the removed RippleState. Unlike the
+/// opposite thread-only owner, rippled includes FinalFields for the side whose
+/// reserve bit was cleared while redeeming and deleting the line. A TrustSet
+/// that deletes an already-zero line still emits thread-only owners.
+fn released_deleted_trust_line_reserve(account: Option<&str>, nodes: &[AffectedNode]) -> bool {
+    const LSF_LOW_RESERVE: u64 = 0x0001_0000;
+    const LSF_HIGH_RESERVE: u64 = 0x0002_0000;
+
     let Some(account) = account else {
         return false;
     };
@@ -158,11 +161,26 @@ fn owns_deleted_trust_line(account: Option<&str>, nodes: &[AffectedNode]) -> boo
         if previous.get("Balance") == line.get("Balance") {
             return false;
         }
-        ["LowLimit", "HighLimit"].iter().any(|field| {
+        let previous_flags = previous
+            .get("Flags")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let final_flags = line
+            .get("Flags")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        [
+            ("LowLimit", LSF_LOW_RESERVE),
+            ("HighLimit", LSF_HIGH_RESERVE),
+        ]
+        .iter()
+        .any(|(field, reserve)| {
             line.get(*field)
                 .and_then(|limit| limit.get("issuer"))
                 .and_then(serde_json::Value::as_str)
                 == Some(account)
+                && previous_flags & reserve != 0
+                && final_flags & reserve == 0
         })
     })
 }
@@ -310,7 +328,7 @@ impl TxMeta {
                     // only the node-level PreviousTxnID/LgrSeq. trustDelete is
                     // the exception: both RippleState owners include FinalFields.
                     let trust_delete_owner = n.ledger_entry_type == "AccountRoot"
-                        && owns_deleted_trust_line(
+                        && released_deleted_trust_line_reserve(
                             fin.get("Account").and_then(serde_json::Value::as_str),
                             &nodes,
                         );
@@ -465,6 +483,7 @@ mod tests {
             "Balance": {"currency": "USD", "issuer": other, "value": "1"},
             "LowLimit": { "issuer": account, "currency": "USD", "value": "0" },
             "HighLimit": { "issuer": other, "currency": "USD", "value": "0" },
+            "Flags": 0x0001_0000_u64,
         }))
         .unwrap();
         let final_line = serde_json::to_vec(&serde_json::json!({
@@ -472,6 +491,7 @@ mod tests {
             "Balance": {"currency": "USD", "issuer": other, "value": "0"},
             "LowLimit": { "issuer": account, "currency": "USD", "value": "0" },
             "HighLimit": { "issuer": other, "currency": "USD", "value": "0" },
+            "Flags": 0,
         }))
         .unwrap();
         let meta = TxMeta {
@@ -507,6 +527,10 @@ mod tests {
             .unwrap();
         assert_eq!(modified["FinalFields"]["Account"], account);
         assert_eq!(modified["FinalFields"]["Balance"], "1000");
+        assert!(
+            !released_deleted_trust_line_reserve(Some(other), &meta.affected_nodes),
+            "the non-reserve issuer remains a field-less thread owner"
+        );
 
         let trust_set_meta = TxMeta {
             affected_nodes: vec![
