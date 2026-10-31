@@ -1446,12 +1446,14 @@ fn cross_offers(
                         .unwrap_or(IOUAmount::ZERO);
                     leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in)
                 } else {
-                    // Funds-limited IOU take: BasicTaker's `qual_mul` uses the
-                    // canonical quality multiplication (nearest), not the strict
-                    // demand-side ceil. Ceil prices BA71A68E one input ULP high
-                    // (52.38814400000006 vs rippled's ...005), which survives in
-                    // the DeletedNode residue even though the ledger state agrees.
-                    qual_mul(&take_out, &rate, &offer_in)
+                    // Funds-limited IOU take: BookStep limits the offer at its
+                    // book quality with `ceilOutStrict(..., roundUp=false)`.
+                    // This preserves BA71A68E's ...005 while rounding
+                    // 105500333/49DE960D down from ...484 to ...483.
+                    leg_min(
+                        &in_for_out_round(&take_out, &rate, &offer_in, false),
+                        &offer_in,
+                    )
                 };
                 (take_out.clone(), order_in)
             };
@@ -1925,11 +1927,15 @@ fn leg_from_magnitude(mag: &IOUAmount, template: &Leg) -> Leg {
 /// canonicalisation rounds up a fractional drop below 0.1 that the legacy
 /// `mul_round` truncates, so an XRP take is not under-priced by a drop.
 fn in_for_out(out_amt: &Leg, rate: &IOUAmount, in_template: &Leg) -> Leg {
+    in_for_out_round(out_amt, rate, in_template, true)
+}
+
+fn in_for_out_round(out_amt: &Leg, rate: &IOUAmount, in_template: &Leg, round_up: bool) -> Leg {
     let amt = rxrpl_amount::Amount::mul_round_strict(
         &leg_to_amount(out_amt),
         &rxrpl_amount::Amount::Iou(*rate),
         in_template.is_xrp,
-        true,
+        round_up,
     )
     .unwrap_or(leg_to_amount(in_template));
     amount_to_leg(&amt, in_template)
@@ -2420,11 +2426,16 @@ fn cross_book_hop(
                 // Interior hops: scale TakerPays * funded / TakerGets rounded
                 // DOWN so a ceil-priced input does not over-charge the next book.
                 // Terminal hops: BookStep ceils IOU input (`Quality::ceilOutStrict`)
-                // — 30000046 rMTDcus ETC line. XRP TakerPays stays scale-down:
-                // ceiling it over-spent 2127 drops on 63B72EB4.
+                // after limiting the offer itself with `roundUp=false`; the
+                // transfer-rate gross-up happens later in `step_in`. XRP
+                // TakerPays stays proportional: ceiling it over-spent 2127
+                // drops on 30000046/63B72EB4.
                 let order_in = if terminal && !offer_in.is_xrp {
                     leg_min(
-                        &leg_min(&in_for_out(&take_out, &eff_rate, &offer_in), &offer_in),
+                        &leg_min(
+                            &in_for_out_round(&take_out, &eff_rate, &offer_in, false),
+                            &offer_in,
+                        ),
                         &net_remaining_in,
                     )
                 } else {
@@ -7686,11 +7697,11 @@ mod taker_crossing_tests {
         Leg, TakerCrossType, add_iou_balance, add_iou_balance_half_upward, composed_quality,
         consumes_full_offer, crossing_threshold, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input,
         flow_xrp_to_iou, full_offer_take, funds_limited_xrp_rounds_up, gross_book_payment_input,
-        in_for_out, in_for_out_offer, input_limited_uses_full_budget, leftover_is_dust,
-        leftover_leg, leg_as_quality_iou, leg_ge, leg_gt, leg_max, net_book_payment_input,
-        out_for_in, pack_rate, parity_rate, qual_div, qual_mul, reject_quality,
-        remaining_is_filled, remaining_is_filled_at, remaining_offer, scale_funds_limited_input,
-        select_path, sell_clamp_sub, should_bump_partial_path_credit,
+        in_for_out, in_for_out_offer, in_for_out_round, input_limited_uses_full_budget,
+        leftover_is_dust, leftover_leg, leg_as_quality_iou, leg_ge, leg_gt, leg_max,
+        net_book_payment_input, out_for_in, pack_rate, parity_rate, qual_div, qual_mul,
+        reject_quality, remaining_is_filled, remaining_is_filled_at, remaining_offer,
+        scale_funds_limited_input, select_path, sell_clamp_sub, should_bump_partial_path_credit,
         should_reap_tiny_increased_quality, should_trim_input_limited_iou_leftover,
         terminal_budget_binds, zero_cost_funded_xrp_offer, zero_cost_xrp_clob_fill,
     };
@@ -7791,10 +7802,36 @@ mod taker_crossing_tests {
             "52.38814400000005"
         );
         assert_eq!(
+            in_for_out_round(&take_out, &rate, &offer_in, false)
+                .iou
+                .to_decimal_string(),
+            "52.38814400000005"
+        );
+        assert_eq!(
             in_for_out(&take_out, &rate, &offer_in)
                 .iou
                 .to_decimal_string(),
             "52.38814400000006"
+        );
+    }
+
+    #[test]
+    fn ledger_105500333_funded_xrp_limits_offer_input_downward() {
+        let offer_in = iou("17.539466");
+        let funded_xrp = xrp(15_328_768);
+        let rate = from_rate(0x4F03_F4BD_1BA9_5CC8).unwrap();
+
+        assert_eq!(
+            in_for_out(&funded_xrp, &rate, &offer_in)
+                .iou
+                .to_decimal_string(),
+            "17.06885878250484"
+        );
+        assert_eq!(
+            in_for_out_round(&funded_xrp, &rate, &offer_in, false)
+                .iou
+                .to_decimal_string(),
+            "17.06885878250483"
         );
     }
 
