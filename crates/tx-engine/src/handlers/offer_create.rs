@@ -7480,7 +7480,7 @@ fn remaining_offer(
             &leg_to_amount(remaining_in),
             &rxrpl_amount::Amount::Iou(rate),
             out_leg.is_xrp,
-            true,
+            false,
         )
         .map(|x| amount_to_leg(&x, out_leg))
         .unwrap_or_else(|_| out_leg.clone());
@@ -8657,6 +8657,27 @@ mod taker_crossing_tests {
         // sell: gets = remaining_in = 50; pays = divRound(50, gets/pays=2.0) = 25.
         assert_eq!(gets["value"], "50");
         assert_eq!(pays["value"], "25");
+    }
+
+    #[test]
+    fn ledger_105500434_sell_remainder_rounds_output_down() {
+        let pays = iou("0.078815052");
+        let gets = xrp(126_900_000);
+        let orig_q =
+            get_rate_round_even(&leg_as_quality_iou(&gets), &leg_as_quality_iou(&pays)).unwrap();
+
+        let (remaining_pays, remaining_gets) = remaining_offer(
+            true,
+            orig_q,
+            &iou("0.04880669731935999"),
+            &xrp(78_583_592),
+            &pays,
+            &gets,
+            true,
+        );
+
+        assert_eq!(remaining_gets.as_str(), Some("78583592"));
+        assert_eq!(remaining_pays["value"], "0.04880669731935998");
     }
 
     #[test]
