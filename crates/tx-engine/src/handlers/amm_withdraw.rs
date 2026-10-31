@@ -1365,7 +1365,7 @@ mod tests {
 
         let metadata = sandbox
             .into_changes()
-            .build_metadata(0, 0, &HashMap::new(), None)
+            .build_metadata(0, 0, &HashMap::new(), None, None)
             .to_canonical_json();
         let deleted = metadata["AffectedNodes"]
             .as_array()

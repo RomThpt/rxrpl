@@ -13,6 +13,10 @@ pub struct TxMeta {
     pub tx_index: u32,
     /// Result code.
     pub result_code: i32,
+    /// A node that was explicitly placed in rippled's ApplyStateTable as a
+    /// modification before transaction threading. When threading is its only
+    /// serialized change, rippled still emits FinalFields for this node.
+    pub force_final_fields: Option<Hash256>,
     /// Delivered amount for payments (if applicable). An XRP-drops string or an
     /// IOU/MPT amount object, mirroring rippled's `sfDeliveredAmount`.
     pub delivered_amount: Option<serde_json::Value>,
@@ -221,6 +225,7 @@ impl SandboxChanges {
         tx_index: u32,
         result_code: i32,
         node_prev_txn: &HashMap<Hash256, (serde_json::Value, serde_json::Value)>,
+        force_final_fields: Option<Hash256>,
         delivered_amount: Option<serde_json::Value>,
     ) -> TxMeta {
         let mut affected_nodes = Vec::new();
@@ -269,6 +274,7 @@ impl SandboxChanges {
             affected_nodes,
             tx_index,
             result_code,
+            force_final_fields,
             delivered_amount,
         }
     }
@@ -332,7 +338,8 @@ impl TxMeta {
                             fin.get("Account").and_then(serde_json::Value::as_str),
                             &nodes,
                         );
-                    if !is_threading_only(&prev, &fin) || trust_delete_owner {
+                    let explicit_modify = self.force_final_fields == Some(n.key);
+                    if !is_threading_only(&prev, &fin) || trust_delete_owner || explicit_modify {
                         let finals = section_fields(&fin, SMD_ALWAYS | SMD_CHANGE_NEW, false);
                         if !finals.is_empty() {
                             inner.insert("FinalFields".into(), finals.into());
@@ -403,7 +410,7 @@ mod tests {
             destroyed_drops: 0,
         };
 
-        let meta = changes.build_metadata(0, 0, &HashMap::new(), None);
+        let meta = changes.build_metadata(0, 0, &HashMap::new(), None, None);
         assert_eq!(meta.affected_nodes.len(), 1);
         assert_eq!(meta.affected_nodes[0].change_type, ChangeType::Created);
         assert_eq!(meta.affected_nodes[0].ledger_entry_type, "AccountRoot");
@@ -424,7 +431,7 @@ mod tests {
             destroyed_drops: 10,
         };
 
-        let meta = changes.build_metadata(1, 0, &HashMap::new(), None);
+        let meta = changes.build_metadata(1, 0, &HashMap::new(), None, None);
         assert_eq!(meta.affected_nodes.len(), 1);
         assert_eq!(meta.affected_nodes[0].change_type, ChangeType::Modified);
         assert!(meta.affected_nodes[0].previous.is_some());
@@ -443,7 +450,7 @@ mod tests {
             destroyed_drops: 0,
         };
 
-        let meta = changes.build_metadata(0, 0, &HashMap::new(), None);
+        let meta = changes.build_metadata(0, 0, &HashMap::new(), None, None);
         assert_eq!(meta.affected_nodes.len(), 1);
         assert_eq!(meta.affected_nodes[0].change_type, ChangeType::Deleted);
         assert!(meta.affected_nodes[0].previous.is_some());
@@ -515,6 +522,7 @@ mod tests {
             ],
             tx_index: 0,
             result_code: 0,
+            force_final_fields: None,
             delivered_amount: None,
         };
 
@@ -553,6 +561,7 @@ mod tests {
             ],
             tx_index: 0,
             result_code: 0,
+            force_final_fields: None,
             delivered_amount: None,
         };
         let trust_set_json = trust_set_meta.to_canonical_json();
@@ -563,5 +572,57 @@ mod tests {
             .find_map(|node| node.get("ModifiedNode"))
             .unwrap();
         assert!(issuer_thread.get("FinalFields").is_none());
+    }
+
+    #[test]
+    fn ledger_105500241_keeps_payment_destination_final_fields() {
+        let account_key = Hash256::new([0x46; 32]);
+        let account = "robeyK1nxGh6AKUSSXf3eqyigAWS6Frmw";
+        let original = serde_json::to_vec(&serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": account,
+            "Balance": "1999869",
+            "Flags": 12124160,
+            "OwnerCount": 0,
+            "RegularKey": "rrrrrrrrrrrrrrrrrrrrBZbvji",
+            "Sequence": 91959243,
+            "PreviousTxnID": "C04A23768566C17857A7B774DDDEB52C0AC7BEBADC65DB92A61E4CA0F5D4DA95",
+            "PreviousTxnLgrSeq": 105491000,
+        }))
+        .unwrap();
+        let mut final_fields: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        final_fields["PreviousTxnID"] =
+            serde_json::json!("7D0047C4DD0CFAAD3418BC9B6FB6DFFAB2038953306ABD4BCFFAE146B1669CF7");
+        final_fields["PreviousTxnLgrSeq"] = serde_json::json!(105500241);
+
+        let meta = TxMeta {
+            affected_nodes: vec![AffectedNode {
+                change_type: ChangeType::Modified,
+                key: account_key,
+                ledger_entry_type: "AccountRoot".into(),
+                previous: Some(original),
+                final_fields: Some(serde_json::to_vec(&final_fields).unwrap()),
+                prev_txn: Some((
+                    serde_json::json!(
+                        "C04A23768566C17857A7B774DDDEB52C0AC7BEBADC65DB92A61E4CA0F5D4DA95"
+                    ),
+                    serde_json::json!(105491000),
+                )),
+            }],
+            tx_index: 42,
+            result_code: 0,
+            force_final_fields: Some(account_key),
+            delivered_amount: None,
+        };
+        let json = meta.to_canonical_json();
+        let destination = json["AffectedNodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|node| node.get("ModifiedNode"))
+            .unwrap();
+        assert_eq!(destination["FinalFields"]["Account"], account);
+        assert_eq!(destination["FinalFields"]["Balance"], "1999869");
+        assert!(destination.get("PreviousFields").is_none());
     }
 }

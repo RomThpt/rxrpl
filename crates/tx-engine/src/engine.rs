@@ -590,10 +590,24 @@ impl TxEngine {
             // transaction SHAMap leaf in rippled's canonical form,
             // `VL(tx) || VL(meta)`, so the transaction tree root (tx_hash)
             // matches the validated chain.
+            // Payment::doApply explicitly marks an existing destination
+            // AccountRoot as modified before entering RippleCalc. If a later
+            // trustDelete only rethreads that account, rippled still includes
+            // its FinalFields (105500241 7D0047C4).
+            let force_final_fields =
+                if tx.get("TransactionType").and_then(Value::as_str) == Some("Payment") {
+                    helpers::get_destination(tx)
+                        .ok()
+                        .and_then(|account| decode_account_id(account).ok())
+                        .map(|account| keylet::account(&account))
+                } else {
+                    None
+                };
             let meta = changes.build_metadata(
                 ledger.tx_count(),
                 result.code(),
                 &node_prev_txn,
+                force_final_fields,
                 node_delivered,
             );
             let meta_json = meta.to_canonical_json();
