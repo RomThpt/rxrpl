@@ -1333,6 +1333,29 @@ fn exact_delivery_excess_ulp(
     IOUAmount::from_parts(1_000_000_000_000_000, requested_iou.exponent() - 15, false).ok()
 }
 
+/// Return the endpoint-balance ULP missing after per-hop settlement. Flow
+/// aggregates delivery before applying the destination DirectStep, while the
+/// collapsed executor credits each synthetic offer separately. Re-adding the
+/// aggregate to the pre-flow holding reproduces the canonical endpoint rounding.
+fn endpoint_credit_shortfall_ulp(
+    strand_count: usize,
+    before: &rxrpl_amount::number::Number,
+    after: &rxrpl_amount::number::Number,
+    delivered: &rxrpl_amount::number::Number,
+) -> Option<IOUAmount> {
+    if strand_count != 1 {
+        return None;
+    }
+    let expected = IOUAmount::add_round(&before.to_iou(), &delivered.to_iou()).ok()?;
+    let actual = after.to_iou();
+    if actual.exponent() != expected.exponent()
+        || actual.mantissa().checked_add(1) != Some(expected.mantissa())
+    {
+        return None;
+    }
+    IOUAmount::from_parts(1_000_000_000_000_000, expected.exponent() - 15, false).ok()
+}
+
 /// Apply a multi-path cross-currency Payment through the multi-pass Flow loop.
 /// Builds every resolvable strand, runs `flow_multi` (fib-chunked shared-AMM
 /// consumption when two or more strands are live), enforces the partial-payment
@@ -1413,6 +1436,17 @@ fn apply_paths_payment_multi(
 
     // Source-funds cap on the SendMax (cannot spend more than held).
     let deliver_req = value_to_number(&amount);
+    let flow_deliver_req = match amm_asset_of(&amount) {
+        Some((false, currency, issuer)) if dst_id != issuer => {
+            let capacity = iou_receive_capacity(ctx, &dst_id, &issuer, &currency);
+            if num_le(&capacity, &deliver_req) {
+                capacity
+            } else {
+                deliver_req
+            }
+        }
+        _ => deliver_req,
+    };
     let send_max_num = value_to_number(&send_max);
     let flow_send_max = if send_max.is_string() {
         let funds = Number::from_int(xrp_flow_funds(&acct, ctx.fees) as i64);
@@ -1436,7 +1470,7 @@ fn apply_paths_payment_multi(
             &mut acct,
             &dst_id,
             &strands,
-            &deliver_req,
+            &flow_deliver_req,
             &flow_send_max,
             limit_rate.as_ref(),
             &mut amm_ctx,
@@ -1462,7 +1496,21 @@ fn apply_paths_payment_multi(
                 crate::amm_helpers::iou_holding_number(ctx.view, &dst_id, &issuer, &currency);
             let credited = after.sub(&before).to_iou();
             let aggregate = delivered_num.to_iou();
-            if let Some(ulp) = exact_delivery_excess_ulp(&credited, &delivered_num, &deliver_req) {
+            if let Some(ulp) =
+                endpoint_credit_shortfall_ulp(strands.len(), &before, &after, &delivered_num)
+            {
+                crate::handlers::offer_create::credit_line(
+                    ctx,
+                    &dst_id,
+                    &issuer,
+                    &currency,
+                    &ulp,
+                    ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+                )?;
+                preserve_output_ulp = true;
+            } else if let Some(ulp) =
+                exact_delivery_excess_ulp(&credited, &delivered_num, &flow_deliver_req)
+            {
                 crate::handlers::offer_create::credit_line(
                     ctx,
                     &dst_id,
@@ -1471,7 +1519,7 @@ fn apply_paths_payment_multi(
                     &ulp.negate(),
                     ctx.rules.enabled(&feature_id("fixUniversalNumber")),
                 )?;
-                delivered_iou_override = Some(deliver_req.to_iou());
+                delivered_iou_override = Some(flow_deliver_req.to_iou());
                 preserve_output_ulp = true;
             } else if credited.exponent() == aggregate.exponent()
                 && credited.mantissa().checked_add(1) == Some(aggregate.mantissa())

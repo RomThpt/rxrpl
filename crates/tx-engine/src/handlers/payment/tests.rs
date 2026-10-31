@@ -66,6 +66,33 @@ fn exact_flow_delivery_reconciles_one_excess_endpoint_ulp() {
 }
 
 #[test]
+fn ledger_105500117_reconciles_endpoint_credit_rounding() {
+    let number = |value: &str| {
+        rxrpl_amount::number::Number::from_iou(&IOUAmount::from_decimal_string(value).unwrap())
+    };
+    let before = number("1.909908954949105");
+    let delivered = number("0.1805078978855195");
+    let actual = number("2.090416852834623");
+    let expected = number("2.090416852834624");
+
+    let ulp = endpoint_credit_shortfall_ulp(1, &before, &actual, &delivered).unwrap();
+    assert_eq!(ulp.to_decimal_string(), "0.000000000000001");
+    assert!(endpoint_credit_shortfall_ulp(1, &before, &expected, &delivered).is_none());
+}
+
+#[test]
+fn ledger_105500237_preserves_multi_strand_endpoint_rounding() {
+    let number = |value: &str| {
+        rxrpl_amount::number::Number::from_iou(&IOUAmount::from_decimal_string(value).unwrap())
+    };
+    let before = number("46313.57145397704");
+    let actual = number("46317.91145397703");
+    let delivered = number("4.34");
+
+    assert!(endpoint_credit_shortfall_ulp(6, &before, &actual, &delivered).is_none());
+}
+
+#[test]
 fn xrp_flow_funds_excludes_owner_reserve() {
     let fees = FeeSettings {
         base_fee: 10,
@@ -2532,6 +2559,99 @@ fn apply_cross_currency_amm_partial_scales_to_send_max() {
     let amm: serde_json::Value = serde_json::from_slice(&amm_bytes).unwrap();
     let new_gbp: u64 = amm["PoolBalance1"].as_str().unwrap().parse().unwrap();
     assert!((970..1000).contains(&new_gbp), "pool GBP {new_gbp}");
+}
+
+#[test]
+fn flow_multi_caps_delivery_at_destination_trust_limit() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", None);
+    put_account(&mut ledger, ALICE, "50000000", None);
+    put_account(&mut ledger, BOB, "50000000", None);
+    put_account(&mut ledger, MM, "50000000", None);
+    put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+    put_trust_line(&mut ledger, MM, ISSUER, "USD", 1000.0);
+    put_trust_line(&mut ledger, MM, ISSUER, "GBP", 1000.0);
+
+    let bob_id = decode_account_id(BOB).unwrap();
+    let issuer_id = decode_account_id(ISSUER).unwrap();
+    let currency = helpers::currency_to_bytes("GBP");
+    let bob_is_low = bob_id.as_bytes() < issuer_id.as_bytes();
+    let (low, high) = if bob_is_low {
+        (BOB, ISSUER)
+    } else {
+        (ISSUER, BOB)
+    };
+    let bob_line = serde_json::json!({
+        "LedgerEntryType": "RippleState",
+        "Balance": { "currency": "GBP", "issuer": ISSUER, "value": "0" },
+        "LowLimit": {
+            "currency": "GBP",
+            "issuer": low,
+            "value": if bob_is_low { "10" } else { "0" },
+        },
+        "HighLimit": {
+            "currency": "GBP",
+            "issuer": high,
+            "value": if bob_is_low { "0" } else { "10" },
+        },
+        "Flags": 0,
+    });
+    ledger
+        .put_state(
+            keylet::trust_line(&bob_id, &issuer_id, &currency),
+            serde_json::to_vec(&bob_line).unwrap(),
+        )
+        .unwrap();
+
+    let amm_key = keylet::amm(
+        &helpers::currency_to_bytes("USD"),
+        &issuer_id,
+        &currency,
+        &issuer_id,
+    );
+    let amm = serde_json::json!({
+        "LedgerEntryType": "AMM",
+        "Account": MM,
+        "TradingFee": 0,
+        "Flags": 0,
+    });
+    ledger
+        .put_state(amm_key, serde_json::to_vec(&amm).unwrap())
+        .unwrap();
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": BOB,
+        "Amount": iou("GBP", ISSUER, "50"),
+        "SendMax": iou("USD", ISSUER, "100"),
+        "DeliverMin": iou("GBP", ISSUER, "20"),
+        "Flags": rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT,
+        "Paths": [[{ "currency": "GBP", "issuer": ISSUER }]],
+        "Fee": "10",
+    });
+    let rules = Rules::new();
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+
+    assert_eq!(
+        apply_paths_payment_multi(
+            &mut ctx,
+            ALICE,
+            BOB,
+            tx["Amount"].clone(),
+            tx["SendMax"].clone(),
+        ),
+        Err(TransactionResult::TecPathPartial)
+    );
+    assert_eq!(holder_balance(&sandbox, BOB, ISSUER, "GBP"), 10.0);
 }
 
 #[test]
