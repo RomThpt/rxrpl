@@ -42,6 +42,20 @@ fn dir_page(obj: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Prepare an existing directory page for central transaction threading.
+///
+/// Pages created before `fixPreviousTxnID` do not carry `PreviousTxnID`, but
+/// rippled starts threading them as soon as they are modified after the
+/// amendment activates. The zero placeholder lets `stamp_previous_txn` record
+/// the current transaction while preserving the legacy pre-stamp value used by
+/// metadata generation.
+fn prepare_directory_update(view: &dyn ApplyView, node: &mut Value) {
+    if view.thread_directories() && node.get("PreviousTxnID").is_none() {
+        node["PreviousTxnID"] =
+            Value::from("0000000000000000000000000000000000000000000000000000000000000000");
+    }
+}
+
 /// Insert `entry_key` into a paginated directory rooted at `root_key`, mirroring
 /// rippled's `ApplyView::dirAdd`. Owner directories sort each touched page
 /// (`sorted = true`); book directories preserve insertion order. `describe` is
@@ -86,7 +100,11 @@ pub fn dir_insert(
         Value::Object(m)
     };
     let put = |view: &mut dyn ApplyView, key: Hash256, v: &Value, insert: bool| {
-        let bytes = serde_json::to_vec(v).map_err(|_| TransactionResult::TefInternal)?;
+        let mut value = v.clone();
+        if !insert {
+            prepare_directory_update(view, &mut value);
+        }
+        let bytes = serde_json::to_vec(&value).map_err(|_| TransactionResult::TefInternal)?;
         if insert {
             view.insert(key, bytes)
         } else {
@@ -246,6 +264,7 @@ fn dir_remove_page_impl(
                 .unwrap_or(false);
             if keep_root || prev != 0 || root_has_entries {
                 node["Indexes"] = Value::Array(vec![]);
+                prepare_directory_update(view, &mut node);
                 let nb = serde_json::to_vec(&node).map_err(|_| TransactionResult::TefInternal)?;
                 view.update(page_key, nb)
                     .map_err(|_| TransactionResult::TefInternal)?;
@@ -277,6 +296,7 @@ fn dir_remove_page_impl(
             .map_err(|_| TransactionResult::TefInternal)?;
     } else {
         node["Indexes"] = Value::Array(indexes.into_iter().map(Value::from).collect());
+        prepare_directory_update(view, &mut node);
         let nb = serde_json::to_vec(&node).map_err(|_| TransactionResult::TefInternal)?;
         view.update(page_key, nb)
             .map_err(|_| TransactionResult::TefInternal)?;
@@ -303,6 +323,7 @@ fn relink(
                 } else {
                     n[field] = u64_hex(val).into();
                 }
+                prepare_directory_update(view, &mut n);
                 if let Ok(nb) = serde_json::to_vec(&n) {
                     let _ = view.update(key, nb);
                 }
@@ -827,6 +848,50 @@ mod tests {
         assert!(sandbox.read(&page1).is_none());
         let page2 = keylet::dir_node(&keylet::owner_dir(&account), 2);
         assert!(sandbox.read(&page2).is_some());
+    }
+
+    #[test]
+    fn modified_legacy_page_is_threaded_after_amendment() {
+        let (mut ledger, fees) = fresh_sandbox();
+        let account = id();
+        let root_key = keylet::owner_dir(&account);
+        let page_key = keylet::dir_node(&root_key, 0x282);
+        let removed = entry(1);
+        let retained = entry(2);
+        let legacy_page = serde_json::json!({
+            "LedgerEntryType": "DirectoryNode",
+            "Flags": 0,
+            "RootIndex": root_key.to_string(),
+            "Owner": ACCT,
+            "IndexPrevious": u64_hex(0x281),
+            "IndexNext": u64_hex(0x283),
+            "Indexes": [removed.to_string(), retained.to_string()],
+        });
+        ledger
+            .put_state(page_key, serde_json::to_vec(&legacy_page).unwrap())
+            .unwrap();
+
+        let view = LedgerView::with_fees(&ledger, fees);
+        let mut sandbox = Sandbox::new(&view);
+        sandbox.set_thread_directories(true);
+        remove_from_owner_dir_page(&mut sandbox, &account, 0x282, &removed).unwrap();
+
+        let tx_id = "EA0243AE0DA6C1A1E807B7B50032CDCE18CEB4580F99859AFDAF40B9961C2877";
+        let mut changes = sandbox.into_changes();
+        let pre_stamp = changes.stamp_previous_txn(tx_id, 105_500_356);
+        let updated: Value =
+            serde_json::from_slice(changes.updates.get(&page_key).unwrap()).unwrap();
+
+        assert_eq!(dir_page(&updated), vec![retained.to_string()]);
+        assert_eq!(updated["PreviousTxnID"], tx_id);
+        assert_eq!(updated["PreviousTxnLgrSeq"], 105_500_356);
+        assert_eq!(
+            pre_stamp.get(&page_key),
+            Some(&(
+                Value::from("0000000000000000000000000000000000000000000000000000000000000000"),
+                Value::Null
+            ))
+        );
     }
 
     #[test]
