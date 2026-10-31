@@ -2403,10 +2403,11 @@ fn cross_book_hop(
                     // re-runs the terminal book forward with `in = maxIn` and spends
                     // the WHOLE remaining budget — the forward re-run asserts
                     // `result.in == limit` and ceilIn pins in=limit,
-                    // out=floor(limit/rate). The same applies to a path's final
-                    // IOU->XRP hop: drops are discrete, so repricing the floored
-                    // output can leave an artificial IOU residual and dry the
-                    // otherwise valid strand (ledger 105500157).
+                    // out=floor(limit/rate). The same applies to every
+                    // input-limited IOU->XRP BookStep: drops are discrete, so
+                    // repricing the floored output can leave an artificial IOU
+                    // residual at the source or between steps and can dry the
+                    // otherwise valid strand (ledgers 105500157, 105500352).
                     leg_min(&net_remaining_in, &offer_in)
                 } else {
                     // Interior hop: charge the ceilOut price for the delivered
@@ -2751,14 +2752,12 @@ fn zero_cost_funded_xrp_offer(
 
 fn input_limited_uses_full_budget(
     terminal: bool,
-    skip_input_debit: bool,
-    skip_output_credit: bool,
+    _skip_input_debit: bool,
+    _skip_output_credit: bool,
     offer_out: &Leg,
     force_full_input_budget: bool,
 ) -> bool {
-    terminal
-        || force_full_input_budget
-        || (skip_input_debit && !skip_output_credit && offer_out.is_xrp)
+    terminal || force_full_input_budget || offer_out.is_xrp
 }
 
 fn should_trim_input_limited_iou_leftover(
@@ -2775,6 +2774,13 @@ fn should_trim_input_limited_iou_leftover(
         && !preserve_input_limited_iou_ulp
         && !leg_ge(net_out, remaining_out)
         && new_gets.iou.mantissa() > 0
+}
+
+fn preserve_flow_input_limited_iou_ulp(hop: usize, limiting: usize, input_is_xrp: bool) -> bool {
+    // A forward BookStep fed by discrete XRP drops keeps the offer remainder
+    // produced by limitStepIn. Re-trimming that IOU remainder loses one ULP per
+    // pass, regardless of whether the drops came from an AMM or another book.
+    hop > 0 && hop > limiting && input_is_xrp
 }
 
 fn should_bump_partial_path_credit(
@@ -5250,7 +5256,7 @@ fn execute_strand_pass(
                     /*allow_amm=*/ false,
                     /*lq_stop=*/ None,
                     /*preserve_input_limited_iou_ulp=*/
-                    h > 0 && h > limiting && kinds[h - 1] == HopKindR::Amm,
+                    preserve_flow_input_limited_iou_ulp(h, limiting, hop.in_leg.is_xrp),
                     // OfferCreate autobridging conserves the discrete XRP
                     // produced by the first book: its terminal XRP -> IOU
                     // BookStep forwards the entire drop budget instead of
@@ -7728,9 +7734,10 @@ mod taker_crossing_tests {
         flow_xrp_to_iou, full_offer_take, funds_limited_xrp_rounds_up, gross_book_payment_input,
         in_for_out, in_for_out_offer, in_for_out_round, input_limited_uses_full_budget,
         leftover_is_dust, leftover_leg, leg_as_quality_iou, leg_ge, leg_gt, leg_max,
-        net_book_payment_input, out_for_in, pack_rate, parity_rate, qual_div, qual_mul,
-        reject_quality, remaining_is_filled, remaining_is_filled_at, remaining_offer,
-        scale_funds_limited_input, select_path, sell_clamp_sub, should_bump_partial_path_credit,
+        net_book_payment_input, out_for_in, pack_rate, parity_rate,
+        preserve_flow_input_limited_iou_ulp, qual_div, qual_mul, reject_quality,
+        remaining_is_filled, remaining_is_filled_at, remaining_offer, scale_funds_limited_input,
+        select_path, sell_clamp_sub, should_bump_partial_path_credit,
         should_reap_tiny_increased_quality, should_trim_input_limited_iou_leftover,
         terminal_budget_binds, zero_cost_funded_xrp_offer, zero_cost_xrp_clob_fill,
     };
@@ -7959,7 +7966,21 @@ mod taker_crossing_tests {
     }
 
     #[test]
-    fn final_path_iou_to_xrp_spends_full_input_budget() {
+    fn input_limited_iou_to_xrp_spends_full_budget_at_any_path_position() {
+        assert!(input_limited_uses_full_budget(
+            false,
+            false,
+            true,
+            &xrp(1),
+            false
+        ));
+        assert!(input_limited_uses_full_budget(
+            false,
+            true,
+            true,
+            &xrp(1),
+            false
+        ));
         assert!(input_limited_uses_full_budget(
             false,
             true,
@@ -7981,6 +8002,15 @@ mod taker_crossing_tests {
             &iou("1"),
             true
         ));
+    }
+
+    #[test]
+    fn forward_xrp_carry_preserves_input_limited_iou_leftover() {
+        assert!(preserve_flow_input_limited_iou_ulp(1, 0, true));
+        assert!(preserve_flow_input_limited_iou_ulp(2, 0, true));
+        assert!(!preserve_flow_input_limited_iou_ulp(0, 0, true));
+        assert!(!preserve_flow_input_limited_iou_ulp(1, 1, true));
+        assert!(!preserve_flow_input_limited_iou_ulp(1, 0, false));
     }
 
     #[test]
