@@ -6225,7 +6225,11 @@ fn reap_own_unfunded_inverse_tip(
     let passive = ctx.tx.get("Flags").and_then(Value::as_u64).unwrap_or(0) & TF_PASSIVE != 0;
     let threshold = crossing_threshold(quality, passive);
     let best_quality = u64::from_be_bytes(best_dir.as_bytes()[24..32].try_into().unwrap());
-    if threshold == 0 || (passive && reject_quality(best_quality, threshold)) {
+    // Before fixReducedOffersV1, the active path advanced through an
+    // underfunded own tip before its quality gate (ledger 30000048). The fixed
+    // path gates first; passive offers have always tightened the threshold.
+    let enforce_quality = passive || ctx.rules.enabled(&feature_id("fixReducedOffersV1"));
+    if !own_tip_can_be_reaped(best_quality, threshold, enforce_quality) {
         return Ok(());
     }
     let entries = crate::owner_dir::collect_owner_dir_entries(ctx.view, taker);
@@ -6658,6 +6662,10 @@ fn select_path(have_direct: bool, direct_q: u64, have_bridge: bool, bridge_q: u6
 /// not crossed.
 fn reject_quality(quality: u64, threshold: u64) -> bool {
     quality > threshold
+}
+
+fn own_tip_can_be_reaped(quality: u64, threshold: u64, enforce_quality: bool) -> bool {
+    threshold != 0 && (!enforce_quality || !reject_quality(quality, threshold))
 }
 
 /// Tighten a passive offer's crossing limit by one packed-rate ULP. This makes
@@ -7747,12 +7755,13 @@ mod taker_crossing_tests {
         flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou, full_offer_take,
         funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
         in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
-        leg_as_quality_iou, leg_ge, leg_gt, leg_max, net_book_payment_input, out_for_in, pack_rate,
-        parity_rate, preserve_flow_input_limited_iou_ulp, qual_div, qual_mul, reject_quality,
-        remaining_is_filled, remaining_is_filled_at, remaining_offer, scale_funds_limited_input,
-        select_path, sell_clamp_sub, should_bump_partial_path_credit,
-        should_reap_tiny_increased_quality, should_trim_input_limited_iou_leftover,
-        terminal_budget_binds, zero_cost_funded_xrp_offer, zero_cost_xrp_clob_fill,
+        leg_as_quality_iou, leg_ge, leg_gt, leg_max, net_book_payment_input, out_for_in,
+        own_tip_can_be_reaped, pack_rate, parity_rate, preserve_flow_input_limited_iou_ulp,
+        qual_div, qual_mul, reject_quality, remaining_is_filled, remaining_is_filled_at,
+        remaining_offer, scale_funds_limited_input, select_path, sell_clamp_sub,
+        should_bump_partial_path_credit, should_reap_tiny_increased_quality,
+        should_trim_input_limited_iou_leftover, terminal_budget_binds, zero_cost_funded_xrp_offer,
+        zero_cost_xrp_clob_fill,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, get_rate_round_even, offer_quality};
     use rxrpl_primitives::AccountId;
@@ -8216,6 +8225,16 @@ mod taker_crossing_tests {
         assert!(reject_quality(quality, passive));
         assert!(!reject_quality(quality - 2, passive));
         assert_eq!(crossing_threshold(quality, false), quality);
+    }
+
+    #[test]
+    fn ledger_105500369_rejects_out_of_quality_own_tip() {
+        let threshold = 0x5107_73a8_7855_8652;
+        let own_tip = 0x5811_2e96_d787_0186;
+
+        assert!(!own_tip_can_be_reaped(own_tip, threshold, true));
+        assert!(own_tip_can_be_reaped(threshold, threshold, true));
+        assert!(own_tip_can_be_reaped(own_tip, threshold, false));
     }
 
     #[test]
