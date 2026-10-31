@@ -1192,6 +1192,13 @@ fn cross_offers(
     let passive = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_PASSIVE != 0;
     let threshold =
         flow_crossing_threshold(ctx, taker, &in_leg, &out_leg, number_switchover, passive);
+    // Flow grosses `sendMax` by the source transfer rate so BookStep may walk
+    // far enough to reap self-owned/unfunded tips and to compare AMM strands.
+    // A direct CLOB step, however, charges that rate as part of the strand's
+    // quality. Compare its raw directory against the ungrossed taker limit;
+    // otherwise an external offer just beyond the limit is crossed
+    // (testnet ledger 105500436).
+    let clob_threshold = crossing_quality_threshold(&in_leg, &out_leg, number_switchover, passive);
     if threshold == 0 {
         return Ok((
             taker_pays.clone(),
@@ -1381,6 +1388,9 @@ fn cross_offers(
                 // funded offers too (mainnet 105500215 / 91B10CB9).
                 reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, &dir_key)?;
                 continue;
+            }
+            if reject_quality(dir_quality, clob_threshold) {
+                break 'walk;
             }
             let avail_out = leg_min(&offer_out, &funds);
             // flowCross cannot spend more than the source `sendMax` captured
@@ -6888,11 +6898,30 @@ fn flow_crossing_threshold(
         let rate = transfer_rate(ctx, &input.issuer);
         send_max = IOUAmount::mul_round(&send_max, &rate, true).unwrap_or(send_max);
     }
+    quality_threshold(&send_max, output, number_switchover, passive)
+}
+
+fn crossing_quality_threshold(
+    input: &Leg,
+    output: &Leg,
+    number_switchover: bool,
+    passive: bool,
+) -> u64 {
+    let input = leg_as_quality_iou(input);
+    quality_threshold(&input, output, number_switchover, passive)
+}
+
+fn quality_threshold(
+    input: &IOUAmount,
+    output: &Leg,
+    number_switchover: bool,
+    passive: bool,
+) -> u64 {
     let output = leg_as_quality_iou(output);
     let quality = if number_switchover {
-        rxrpl_amount::get_rate_round_even(&send_max, &output)
+        rxrpl_amount::get_rate_round_even(input, &output)
     } else {
-        rxrpl_amount::get_rate(&send_max, &output)
+        rxrpl_amount::get_rate(input, &output)
     }
     .unwrap_or(0);
     crossing_threshold(quality, passive)
@@ -8525,6 +8554,20 @@ mod taker_crossing_tests {
             !reject_quality(own_tip, threshold),
             "fee-adjusted passive threshold {threshold:#x} should admit own tip {own_tip:#x}"
         );
+    }
+
+    #[test]
+    fn ledger_105500436_transfer_fee_rejects_external_clob_tip() {
+        let gets = IOUAmount::from_decimal_string("7.247").unwrap();
+        let pays = IOUAmount::from_decimal_string("13017.771606").unwrap();
+        let rate = IOUAmount::from_parts(1_001_500_000, -9, false).unwrap();
+        let send_max = IOUAmount::mul_round(&gets, &rate, true).unwrap();
+        let traversal = crossing_threshold(get_rate_round_even(&send_max, &pays).unwrap(), true);
+        let clob = crossing_threshold(get_rate_round_even(&gets, &pays).unwrap(), true);
+        let external_tip = 0x5113_c9f6_5683_7af7;
+
+        assert!(!reject_quality(external_tip, traversal));
+        assert!(reject_quality(external_tip, clob));
     }
 
     #[test]
