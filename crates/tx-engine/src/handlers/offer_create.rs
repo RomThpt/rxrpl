@@ -2251,14 +2251,18 @@ fn cross_book_hop(
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
                 continue;
             }
+            let avail_out = leg_min(&offer_out, &funds);
             // OfferStream continues stepping invalid entries after source funds
-            // are exhausted, so expired/unfunded offers are still reaped. Stop
-            // only when the next live funded offer would require an actual fill
-            // (105500249 50312732).
-            if remaining_in.is_zero() {
+            // are exhausted, so expired/unfunded offers are still reaped. A
+            // funded IOU remainder may also cost less than one XRP drop; rippled
+            // consumes that zero-cost remainder before moving to the next band
+            // (105500212 6B2B088C). Stop only when the next live offer requires
+            // a representable input (105500249 50312732).
+            let zero_cost_funded =
+                zero_cost_funded_xrp_offer(&remaining_in, &offer_in, &avail_out, &offer_out);
+            if remaining_in.is_zero() && !zero_cost_funded {
                 break 'walk;
             }
-            let avail_out = leg_min(&offer_out, &funds);
 
             // Pricing rate: the offer's book-directory quality (`in/out`). A
             // degenerate page quality of zero only arises in synthetic ledgers
@@ -2326,7 +2330,9 @@ fn cross_book_hop(
             // bounded demand (single-book conversion). An interior hop carries the
             // unbounded-demand sentinel, so its ceilOut input cost is meaningless;
             // keep the output-side test there (the #337 walk-stop relies on it).
-            let budget_binds = if terminal {
+            let budget_binds = if zero_cost_funded {
+                false
+            } else if terminal {
                 terminal_budget_binds(
                     &net_remaining_in,
                     &take_out,
@@ -2717,6 +2723,19 @@ fn scale_funds_limited_input(offer_in: &Leg, available: &Leg, offer_out: &Leg) -
     let scaled =
         IOUAmount::multiply(&leg_as_quality_iou(offer_in), &ratio).unwrap_or(IOUAmount::ZERO);
     leg_from_magnitude(&scaled, offer_in)
+}
+
+fn zero_cost_funded_xrp_offer(
+    remaining_in: &Leg,
+    offer_in: &Leg,
+    available: &Leg,
+    offer_out: &Leg,
+) -> bool {
+    remaining_in.is_zero()
+        && offer_in.is_xrp
+        && !available.is_zero()
+        && !leg_ge(available, offer_out)
+        && scale_funds_limited_input(offer_in, available, offer_out).is_zero()
 }
 
 fn input_limited_uses_full_budget(
@@ -4771,6 +4790,15 @@ fn next_flow_strands(cur: &[usize], winner_pos: usize) -> Vec<usize> {
     next
 }
 
+/// A funded IOU remainder can be smaller than one drop at the offer's quality.
+/// rippled still consumes that remainder in an XRP -> IOU BookStep: the maker
+/// delivers the representable IOU while the taker's input rounds to zero. This
+/// must remain a single-hop exception; accepting a zero-input interior hop
+/// would manufacture carry between path steps.
+fn zero_cost_xrp_clob_fill(spent: &Leg, delivered: &Leg, single_hop: bool) -> bool {
+    single_hop && spent.is_xrp && spent.drops == 0 && !delivered.is_zero()
+}
+
 /// `a >= b` for two `Number`s.
 fn num_ge(a: &Number, b: &Number) -> bool {
     !num_gt(b, a)
@@ -4860,7 +4888,9 @@ fn price_clob_band_reverse(
     ctx.view.rollback(cp);
     *taker_acct = taker_acct_before;
     let (delivered, spent) = res.ok()?;
-    if delivered.is_zero() || spent.is_zero() {
+    if delivered.is_zero()
+        || (spent.is_zero() && !zero_cost_xrp_clob_fill(&spent, &delivered, is_first && is_last))
+    {
         return None;
     }
     Some((leg_to_number(&spent), leg_to_number(&delivered)))
@@ -5012,7 +5042,12 @@ fn execute_strand_pass(
             // Dry hop: neither AMM liquidity nor a resting CLOB offer.
             return None;
         }
-        if ins[h].is_zero() || outs[h].is_zero() || ins[h].negative() {
+        let zero_cost_xrp_clob = n == 1
+            && kinds[h] == HopKindR::Clob
+            && hop.in_leg.is_xrp
+            && ins[h].is_zero()
+            && !outs[h].is_zero();
+        if (ins[h].is_zero() && !zero_cost_xrp_clob) || outs[h].is_zero() || ins[h].negative() {
             return None;
         }
         demanded = if h > 0 {
@@ -5146,7 +5181,9 @@ fn execute_strand_pass(
                     /*source_input_rate=*/ 1_000_000_000,
                 )
                 .ok()?;
-                if delivered.is_zero() || spent.is_zero() {
+                if delivered.is_zero()
+                    || (spent.is_zero() && !zero_cost_xrp_clob_fill(&spent, &delivered, n == 1))
+                {
                     return None;
                 }
                 if trace {
@@ -5164,7 +5201,12 @@ fn execute_strand_pass(
         }
     }
 
-    if source_in.is_zero() || carry.is_zero() {
+    let zero_cost_xrp_clob = n == 1
+        && kinds[0] == HopKindR::Clob
+        && strand.hops[0].in_leg.is_xrp
+        && source_in.is_zero()
+        && !carry.is_zero();
+    if (source_in.is_zero() && !zero_cost_xrp_clob) || carry.is_zero() {
         return None;
     }
     source_in = flow_gross_input(&source_in, source_rate);
@@ -7583,7 +7625,7 @@ mod taker_crossing_tests {
         parity_rate, qual_div, qual_mul, reject_quality, remaining_is_filled,
         remaining_is_filled_at, remaining_offer, scale_funds_limited_input, select_path,
         sell_clamp_sub, should_bump_partial_path_credit, should_trim_input_limited_iou_leftover,
-        terminal_budget_binds,
+        terminal_budget_binds, zero_cost_funded_xrp_offer, zero_cost_xrp_clob_fill,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, get_rate_round_even, offer_quality};
     use rxrpl_primitives::AccountId;
@@ -7698,6 +7740,32 @@ mod taker_crossing_tests {
             scale_funds_limited_input(&offer_in, &available, &offer_out).drops,
             1_914_188
         );
+    }
+
+    #[test]
+    fn ledger_105500212_allows_single_hop_iou_dust_below_one_drop() {
+        let spent = xrp(0);
+        let delivered = iou("0.0000009147578795");
+
+        assert!(zero_cost_xrp_clob_fill(&spent, &delivered, true));
+        assert!(!zero_cost_xrp_clob_fill(&spent, &delivered, false));
+        assert!(!zero_cost_xrp_clob_fill(&spent, &iou("0"), true));
+        assert!(!zero_cost_xrp_clob_fill(&xrp(1), &delivered, true));
+
+        let offer_in = xrp(1);
+        let offer_out = iou("1");
+        assert!(zero_cost_funded_xrp_offer(
+            &xrp(0),
+            &offer_in,
+            &delivered,
+            &offer_out,
+        ));
+        assert!(!zero_cost_funded_xrp_offer(
+            &xrp(1),
+            &offer_in,
+            &delivered,
+            &offer_out,
+        ));
     }
 
     #[test]
