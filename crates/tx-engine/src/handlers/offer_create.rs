@@ -4558,7 +4558,7 @@ fn funded_book_tip_quality(
             if owner == *taker {
                 continue;
             }
-            let (Some(_offer_in), Some(offer_out)) = (
+            let (Some(offer_in), Some(offer_out)) = (
                 offer.get("TakerPays").and_then(Leg::parse),
                 offer.get("TakerGets").and_then(Leg::parse),
             ) else {
@@ -4568,8 +4568,16 @@ fn funded_book_tip_quality(
                 .get("Expiration")
                 .and_then(Value::as_u64)
                 .is_some_and(|expiration| expiration <= ctx.view.parent_close_time() as u64);
-            let unfunded = owner_funds_leg(ctx, &owner, &offer_out).is_zero();
-            if expired || unfunded {
+            let owner_funds = owner_funds_leg(ctx, &owner, &offer_out);
+            let unfunded = owner_funds.is_zero();
+            let tiny_increased_quality = should_reap_tiny_increased_quality(
+                &owner,
+                &offer_in,
+                &offer_out,
+                &owner_funds,
+                quality,
+            );
+            if expired || unfunded || tiny_increased_quality {
                 let cp = ctx.view.checkpoint();
                 if reap_offer(ctx, &owner, &offer_key, &dir_key).is_err() {
                     ctx.view.rollback(cp);
@@ -4581,6 +4589,54 @@ fn funded_book_tip_quality(
         }
     }
     None
+}
+
+/// Mirrors `OfferStream::shouldRmSmallIncreasedQOffer`. A severely underfunded
+/// offer can round its effective `TakerPays` down to the minimum amount (or
+/// zero), worsening its quality enough to block the book. rippled permanently
+/// removes that offer while probing, even when an AMM ultimately supplies the
+/// swap.
+fn should_reap_tiny_increased_quality(
+    owner: &AccountId,
+    offer_in: &Leg,
+    offer_out: &Leg,
+    owner_funds: &Leg,
+    quality: u64,
+) -> bool {
+    if offer_out.is_xrp || owner == &offer_out.issuer || leg_ge(owner_funds, offer_out) {
+        return false;
+    }
+    if !offer_in.is_xrp && leg_ge(offer_in, offer_out) {
+        return false;
+    }
+    let Ok(rate) = from_rate(quality) else {
+        return false;
+    };
+    let Ok(effective_amount) = rxrpl_amount::Amount::mul_round_strict(
+        &leg_to_amount(owner_funds),
+        &rxrpl_amount::Amount::Iou(rate),
+        offer_in.is_xrp,
+        false,
+    ) else {
+        return false;
+    };
+    let effective_in = amount_to_leg(&effective_amount, offer_in);
+    if effective_in.is_zero() || owner_funds.is_zero() {
+        return true;
+    }
+    let above_minimum = if effective_in.is_xrp {
+        effective_in.drops > 1
+    } else {
+        effective_in.iou > IOUAmount::MIN_POSITIVE
+    };
+    if above_minimum {
+        return false;
+    }
+    get_rate(
+        &leg_as_quality_iou(&effective_in),
+        &leg_as_quality_iou(owner_funds),
+    )
+    .is_ok_and(|effective_quality| effective_quality > quality)
 }
 
 /// Build a strand from a boundary chain, snapshotting each hop's AMM pool (with
@@ -6829,6 +6885,16 @@ impl OfferStream {
                 reap_offer(ctx, &owner, &offer_key, &self.dir)?;
                 continue;
             }
+            if should_reap_tiny_increased_quality(
+                &owner,
+                &offer_in,
+                &offer_out,
+                &funds,
+                self.quality,
+            ) {
+                reap_offer(ctx, &owner, &offer_key, &self.dir)?;
+                continue;
+            }
             if is_self {
                 // Taker::unfunded is true for owner==taker: cancel self-crossing
                 // inverse offers instead of skipping them (30000073 3D88107D).
@@ -7621,10 +7687,11 @@ mod taker_crossing_tests {
         consumes_full_offer, crossing_threshold, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input,
         flow_xrp_to_iou, full_offer_take, funds_limited_xrp_rounds_up, gross_book_payment_input,
         in_for_out, in_for_out_offer, input_limited_uses_full_budget, leftover_is_dust,
-        leftover_leg, leg_ge, leg_gt, leg_max, net_book_payment_input, out_for_in, pack_rate,
-        parity_rate, qual_div, qual_mul, reject_quality, remaining_is_filled,
-        remaining_is_filled_at, remaining_offer, scale_funds_limited_input, select_path,
-        sell_clamp_sub, should_bump_partial_path_credit, should_trim_input_limited_iou_leftover,
+        leftover_leg, leg_as_quality_iou, leg_ge, leg_gt, leg_max, net_book_payment_input,
+        out_for_in, pack_rate, parity_rate, qual_div, qual_mul, reject_quality,
+        remaining_is_filled, remaining_is_filled_at, remaining_offer, scale_funds_limited_input,
+        select_path, sell_clamp_sub, should_bump_partial_path_credit,
+        should_reap_tiny_increased_quality, should_trim_input_limited_iou_leftover,
         terminal_budget_binds, zero_cost_funded_xrp_offer, zero_cost_xrp_clob_fill,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, get_rate_round_even, offer_quality};
@@ -7649,6 +7716,36 @@ mod taker_crossing_tests {
             currency: [0u8; 20],
             issuer: AccountId::from([0u8; 20]),
         }
+    }
+
+    #[test]
+    fn ledger_105500329_reaps_sub_drop_funded_offer() {
+        let owner = AccountId::from([3u8; 20]);
+        let offer_in = xrp(1_230_000);
+        let offer_out = iou("1232257.040353");
+        let owner_funds = iou("0.200820528");
+        let quality = get_rate(
+            &leg_as_quality_iou(&offer_in),
+            &leg_as_quality_iou(&offer_out),
+        )
+        .unwrap();
+
+        assert!(should_reap_tiny_increased_quality(
+            &owner,
+            &offer_in,
+            &offer_out,
+            &owner_funds,
+            quality,
+        ));
+
+        let material_funds = iou("100");
+        assert!(!should_reap_tiny_increased_quality(
+            &owner,
+            &offer_in,
+            &offer_out,
+            &material_funds,
+            quality,
+        ));
     }
 
     fn rate(inn: &str, out: &str) -> IOUAmount {
