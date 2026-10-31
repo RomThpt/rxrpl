@@ -1179,17 +1179,10 @@ fn cross_offers(
     // otherwise it truncates. Using the truncating `get_rate` here while the
     // dir qualities are round-even left the threshold 1 ULP low, so the walk
     // broke before an exactly-equal-priced resting offer and crossed nothing.
-    let pays_iou = leg_as_quality_iou(&out_leg);
-    let gets_iou = leg_as_quality_iou(&in_leg);
     let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
-    let orig_quality = if number_switchover {
-        rxrpl_amount::get_rate_round_even(&gets_iou, &pays_iou)
-    } else {
-        rxrpl_amount::get_rate(&gets_iou, &pays_iou)
-    }
-    .unwrap_or(0);
     let passive = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_PASSIVE != 0;
-    let threshold = crossing_threshold(orig_quality, passive);
+    let threshold =
+        flow_crossing_threshold(ctx, taker, &in_leg, &out_leg, number_switchover, passive);
     if threshold == 0 {
         return Ok((
             taker_pays.clone(),
@@ -6236,17 +6229,9 @@ fn reap_own_unfunded_inverse_tip(
         return Ok(());
     };
     let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
-    let quality = if number_switchover {
-        rxrpl_amount::get_rate_round_even(
-            &leg_as_quality_iou(&in_leg),
-            &leg_as_quality_iou(&out_leg),
-        )
-    } else {
-        rxrpl_amount::get_rate(&leg_as_quality_iou(&in_leg), &leg_as_quality_iou(&out_leg))
-    }
-    .unwrap_or(0);
     let passive = ctx.tx.get("Flags").and_then(Value::as_u64).unwrap_or(0) & TF_PASSIVE != 0;
-    let threshold = crossing_threshold(quality, passive);
+    let threshold =
+        flow_crossing_threshold(ctx, taker, &in_leg, &out_leg, number_switchover, passive);
     let best_quality = u64::from_be_bytes(best_dir.as_bytes()[24..32].try_into().unwrap());
     // Before fixReducedOffersV1, the active path advanced through an
     // underfunded own tip before its quality gate (ledger 30000048). The fixed
@@ -6700,6 +6685,33 @@ fn crossing_threshold(quality: u64, passive: bool) -> u64 {
     } else {
         quality
     }
+}
+
+/// OfferCreate's Flow quality limit includes the source asset's transfer fee.
+/// rippled computes `sendMax = multiplyRound(TakerGets, rate, roundUp=true)`
+/// before constructing `Quality{TakerPays, sendMax}`. Omitting that gross-up
+/// rejects liquidity that the fee-adjusted threshold admits (ledger 105500432).
+fn flow_crossing_threshold(
+    ctx: &ApplyContext<'_>,
+    taker: &AccountId,
+    input: &Leg,
+    output: &Leg,
+    number_switchover: bool,
+    passive: bool,
+) -> u64 {
+    let mut send_max = leg_as_quality_iou(input);
+    if !input.is_xrp && taker != &input.issuer {
+        let rate = transfer_rate(ctx, &input.issuer);
+        send_max = IOUAmount::mul_round(&send_max, &rate, true).unwrap_or(send_max);
+    }
+    let output = leg_as_quality_iou(output);
+    let quality = if number_switchover {
+        rxrpl_amount::get_rate_round_even(&send_max, &output)
+    } else {
+        rxrpl_amount::get_rate(&send_max, &output)
+    }
+    .unwrap_or(0);
+    crossing_threshold(quality, passive)
 }
 
 /// rippled `BasicTaker::done` (funds limb handled by the pricer clamps): the
@@ -8296,6 +8308,22 @@ mod taker_crossing_tests {
         assert!(!own_tip_can_be_reaped(own_tip, threshold, true));
         assert!(own_tip_can_be_reaped(threshold, threshold, true));
         assert!(own_tip_can_be_reaped(own_tip, threshold, false));
+    }
+
+    #[test]
+    fn ledger_105500432_transfer_fee_admits_passive_own_tip() {
+        let gets = IOUAmount::from_decimal_string("0.886").unwrap();
+        let pays = IOUAmount::from_decimal_string("1593.30477").unwrap();
+        let rate = IOUAmount::from_parts(1_001_500_000, -9, false).unwrap();
+        let send_max = IOUAmount::mul_round(&gets, &rate, true).unwrap();
+        let quality = get_rate_round_even(&send_max, &pays).unwrap();
+        let threshold = crossing_threshold(quality, true);
+        let own_tip = 0x5113_c4d3_a3b2_e906;
+
+        assert!(
+            !reject_quality(own_tip, threshold),
+            "fee-adjusted passive threshold {threshold:#x} should admit own tip {own_tip:#x}"
+        );
     }
 
     #[test]
