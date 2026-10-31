@@ -4408,6 +4408,19 @@ fn aggregate_flow_source_balance(
     IOUAmount::add_round(balance, &delta).ok()
 }
 
+fn flow_holder_funds(balance: &IOUAmount, holder_is_high: bool) -> Number {
+    let holding = if holder_is_high {
+        balance.negate()
+    } else {
+        *balance
+    };
+    if holding.is_negative() {
+        Number::ZERO
+    } else {
+        Number::from_iou(&holding)
+    }
+}
+
 fn reconcile_flow_source_balance(
     ctx: &mut ApplyContext<'_>,
     source: &FlowSourceBalance,
@@ -5309,12 +5322,28 @@ pub(crate) fn flow_multi(
 ) -> (Number, Number, bool) {
     let trace = std::env::var("RXRPL_FLOW_TRACE").is_ok();
     let source_balance = flow_source_balance(ctx, taker, strands);
+    // SendMax is only the transaction's ceiling. An IOU source DirectStep is
+    // additionally bounded by the holder's balance at Flow entry. Keep that
+    // cap across every pass: recomputing only `SendMax - savedIn` can otherwise
+    // launch a second strand pass after the first one has drained the source.
+    let input_limit = source_balance
+        .as_ref()
+        .map(|source| flow_holder_funds(&source.balance, source.holder_is_high))
+        .map(|funds| {
+            if num_le(&funds, send_max) {
+                funds
+            } else {
+                *send_max
+            }
+        })
+        .unwrap_or(*send_max);
     if trace {
         eprintln!(
-            "[flow] ENTER strands={} deliver_req={} send_max={}",
+            "[flow] ENTER strands={} deliver_req={} send_max={} input_limit={}",
             strands.len(),
             deliver_req.to_iou().to_decimal_string(),
             send_max.to_iou().to_decimal_string(),
+            input_limit.to_iou().to_decimal_string(),
         );
         for (si, s) in strands.iter().enumerate() {
             let desc: Vec<String> = s
@@ -5344,7 +5373,7 @@ pub(crate) fn flow_multi(
             d
         };
         let remaining_in = {
-            let r = send_max.sub(&sum_smallest_to_largest(&saved_ins));
+            let r = input_limit.sub(&sum_smallest_to_largest(&saved_ins));
             if r.is_zero() || r.negative() {
                 break;
             }
@@ -5476,7 +5505,7 @@ pub(crate) fn flow_multi(
 
     let actual_out = sum_smallest_to_largest(&saved_outs);
     let actual_in = sum_smallest_to_largest(&saved_ins);
-    let input_exhausted = actual_in.sub(send_max).is_zero();
+    let input_exhausted = actual_in.sub(&input_limit).is_zero();
     // rippled's source DirectStep settles the aggregate Flow input. Our
     // collapsed book/AMM hop settles each synthetic offer separately, which
     // can accumulate a one-ULP drift on a nearly drained trust line. Restore
@@ -8724,7 +8753,8 @@ mod amm_quality_gate_tests {
 mod flow_source_balance_tests {
     use super::{
         Leg, aggregate_flow_source_balance, can_fund_new_trust_line, flow_gross_input,
-        flow_net_input, leftover_leg, next_flow_strands, preserve_flow_output_ulp,
+        flow_holder_funds, flow_net_input, leftover_leg, next_flow_strands,
+        preserve_flow_output_ulp,
     };
     use rxrpl_amount::IOUAmount;
     use rxrpl_amount::number::Number;
@@ -8740,6 +8770,26 @@ mod flow_source_balance_tests {
                 .to_decimal_string(),
             "0.0023781541865634"
         );
+    }
+
+    #[test]
+    fn source_funds_follow_trust_line_orientation() {
+        let positive = IOUAmount::from_decimal_string("1031126.522400319").unwrap();
+        let negative = positive.negate();
+
+        assert_eq!(
+            flow_holder_funds(&positive, false)
+                .to_iou()
+                .to_decimal_string(),
+            "1031126.522400319"
+        );
+        assert_eq!(
+            flow_holder_funds(&negative, true)
+                .to_iou()
+                .to_decimal_string(),
+            "1031126.522400319"
+        );
+        assert!(flow_holder_funds(&negative, false).is_zero());
     }
 
     #[test]

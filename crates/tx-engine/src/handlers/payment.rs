@@ -231,6 +231,23 @@ impl Transactor for PaymentTransactor {
                                     })
                             })
                         && flow_strands_have_amm(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]);
+                    // A self-payment from an IOU into XRP can also contain a
+                    // mixed AMM/CLOB strand.  The legacy forward-only path
+                    // cannot conserve two AMM intermediates before a terminal
+                    // IOU->XRP book, so it reports tecPATH_DRY even though
+                    // Flow's reverse/forward pass can consume the strand.
+                    // Keep this gate to the mainnet shape: one explicit path,
+                    // one resolved strand, IOU source, native destination.
+                    let single_iou_to_native_amm_strand = flow_strand_count == 1
+                        && account_str == destination_str
+                        && !send_max.is_string()
+                        && ctx.tx["Amount"].is_string()
+                        && ctx
+                            .tx
+                            .get("Paths")
+                            .and_then(Value::as_array)
+                            .is_some_and(|paths| paths.len() == 1)
+                        && flow_strands_have_amm(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]);
                     let direct_native_amm_book = account_str == destination_str
                         && send_max.is_string()
                         && ctx.tx.get("DeliverMin").is_some()
@@ -243,6 +260,7 @@ impl Transactor for PaymentTransactor {
                         )?;
                     if direct_native_amm_book
                         || single_native_amm_strand
+                        || single_iou_to_native_amm_strand
                         || (flow_strand_count >= 2
                             && flow_strands_have_amm(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]))
                     {
