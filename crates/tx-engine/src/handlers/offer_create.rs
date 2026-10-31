@@ -4387,10 +4387,6 @@ fn flow_source_balance(
             return None;
         }
     }
-    let one = IOUAmount::from_parts(1_000_000_000, -9, false).ok()?;
-    if transfer_rate(ctx, &source.issuer) != one {
-        return None;
-    }
     let key = keylet::trust_line(taker, &source.issuer, &source.currency);
     let line: Value = serde_json::from_slice(&ctx.view.read(&key)?).ok()?;
     let balance = IOUAmount::from_decimal_string(line["Balance"]["value"].as_str()?).ok()?;
@@ -4425,6 +4421,19 @@ fn flow_holder_funds(balance: &IOUAmount, holder_is_high: bool) -> Number {
     } else {
         Number::from_iou(&holding)
     }
+}
+
+fn flow_input_limit(send_max: &Number, source: Option<&FlowSourceBalance>) -> Number {
+    source
+        .map(|source| flow_holder_funds(&source.balance, source.holder_is_high))
+        .map(|funds| {
+            if num_le(&funds, send_max) {
+                funds
+            } else {
+                *send_max
+            }
+        })
+        .unwrap_or(*send_max)
 }
 
 fn reconcile_flow_source_balance(
@@ -5332,17 +5341,7 @@ pub(crate) fn flow_multi(
     // additionally bounded by the holder's balance at Flow entry. Keep that
     // cap across every pass: recomputing only `SendMax - savedIn` can otherwise
     // launch a second strand pass after the first one has drained the source.
-    let input_limit = source_balance
-        .as_ref()
-        .map(|source| flow_holder_funds(&source.balance, source.holder_is_high))
-        .map(|funds| {
-            if num_le(&funds, send_max) {
-                funds
-            } else {
-                *send_max
-            }
-        })
-        .unwrap_or(*send_max);
+    let input_limit = flow_input_limit(send_max, source_balance.as_ref());
     if trace {
         eprintln!(
             "[flow] ENTER strands={} deliver_req={} send_max={} input_limit={}",
@@ -8807,7 +8806,7 @@ mod amm_quality_gate_tests {
 mod flow_source_balance_tests {
     use super::{
         Leg, aggregate_flow_source_balance, can_fund_new_trust_line, flow_gross_input,
-        flow_holder_funds, flow_net_input, leftover_leg, next_flow_strands,
+        flow_holder_funds, flow_input_limit, flow_net_input, leftover_leg, next_flow_strands,
         preserve_flow_output_ulp,
     };
     use rxrpl_amount::IOUAmount;
@@ -8862,6 +8861,27 @@ mod flow_source_balance_tests {
             Number::from_iou(&IOUAmount::from_decimal_string("0.1531269004849731").unwrap());
         let book_net = flow_net_input(&terminal_gross, Some(rate));
         assert_eq!(book_net.to_iou().to_decimal_string(), "0.1529739265584146");
+    }
+
+    #[test]
+    fn ledger_105500360_transfer_fee_source_is_funds_capped() {
+        let send_max =
+            Number::from_iou(&IOUAmount::from_decimal_string("0.000002190135839932516").unwrap());
+        let source = super::FlowSourceBalance {
+            key: rxrpl_primitives::Hash256::new([0; 32]),
+            balance: IOUAmount::from_decimal_string("0.00000146009055995501").unwrap(),
+            holder_is_high: false,
+        };
+        let limit = flow_input_limit(&send_max, Some(&source));
+        let rate = IOUAmount::from_parts(1_001_500_000, -9, false).unwrap();
+
+        assert_eq!(limit.to_iou().to_decimal_string(), "0.00000146009055995501");
+        assert_eq!(
+            flow_net_input(&limit, Some(rate))
+                .to_iou()
+                .to_decimal_string(),
+            "0.000001457903704398412"
+        );
     }
 
     #[test]
