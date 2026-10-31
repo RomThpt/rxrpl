@@ -5618,6 +5618,28 @@ fn leftover_is_dust(part: &Leg, whole: &Leg) -> bool {
     }
 }
 
+/// Whether an IOU debit exhausts the source after Flow's 16-digit arithmetic.
+///
+/// The quality calculation can price a funds-limited take a few representable
+/// ULPs below the holder's balance. rippled treats a relative remainder at the
+/// STAmount precision boundary as fully consumed instead of persisting dust on
+/// the trust line.
+fn debit_drains_source(source_funds: &Leg, debit: &Leg) -> bool {
+    if source_funds.is_zero() {
+        return false;
+    }
+    if leg_ge(debit, source_funds) {
+        return true;
+    }
+    let remainder = leftover_leg(source_funds, debit, true);
+    let Ok(relative) = IOUAmount::divide(&remainder.iou, &source_funds.iou) else {
+        return false;
+    };
+    let precision = IOUAmount::from_parts(1_000_000_000_000_000, -30, false)
+        .expect("1e-15 is a canonical IOU amount");
+    relative <= precision
+}
+
 fn hop_out_done(remaining: &Leg, demand: &Leg) -> bool {
     remaining.is_zero() || remaining_is_filled(remaining, demand)
 }
@@ -5693,15 +5715,7 @@ fn pay_in(
         let source_funds = owner_funds_leg(ctx, taker, amount);
         let mut gross_leg = amount.clone();
         gross_leg.iou = gross;
-        let source_ulp = IOUAmount::from_parts(
-            1_000_000_000_000_000,
-            source_funds.iou.exponent() - 15,
-            false,
-        )
-        .unwrap_or(IOUAmount::ZERO);
-        let mut gross_with_ulp = gross_leg.clone();
-        gross_with_ulp.iou = IOUAmount::add_round(&gross, &source_ulp).unwrap_or(gross);
-        let drains_source = !source_funds.is_zero() && leg_ge(&gross_with_ulp, &source_funds);
+        let drains_source = debit_drains_source(&source_funds, &gross_leg);
         credit_line(
             ctx,
             taker,
@@ -7730,12 +7744,12 @@ fn taker_cross(
 mod taker_crossing_tests {
     use super::{
         Leg, TakerCrossType, add_iou_balance, add_iou_balance_half_upward, composed_quality,
-        consumes_full_offer, crossing_threshold, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input,
-        flow_xrp_to_iou, full_offer_take, funds_limited_xrp_rounds_up, gross_book_payment_input,
-        in_for_out, in_for_out_offer, in_for_out_round, input_limited_uses_full_budget,
-        leftover_is_dust, leftover_leg, leg_as_quality_iou, leg_ge, leg_gt, leg_max,
-        net_book_payment_input, out_for_in, pack_rate, parity_rate,
-        preserve_flow_input_limited_iou_ulp, qual_div, qual_mul, reject_quality,
+        consumes_full_offer, crossing_threshold, debit_drains_source, flow_iou_to_iou,
+        flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou, full_offer_take,
+        funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
+        in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
+        leg_as_quality_iou, leg_ge, leg_gt, leg_max, net_book_payment_input, out_for_in, pack_rate,
+        parity_rate, preserve_flow_input_limited_iou_ulp, qual_div, qual_mul, reject_quality,
         remaining_is_filled, remaining_is_filled_at, remaining_offer, scale_funds_limited_input,
         select_path, sell_clamp_sub, should_bump_partial_path_credit,
         should_reap_tiny_increased_quality, should_trim_input_limited_iou_leftover,
@@ -7882,6 +7896,16 @@ mod taker_crossing_tests {
         assert!(consumes_full_offer(
             &take_out, &offer_out, &offer_in, &offer_in, &offer_out, &offer_out, false,
         ));
+    }
+
+    #[test]
+    fn ledger_105500357_funds_limited_debit_drains_iou_dust() {
+        let source_funds = iou("0.679235696862605");
+        let priced_debit = iou("0.6792356968626046");
+        let material_remainder = iou("0.6792356968625");
+
+        assert!(debit_drains_source(&source_funds, &priced_debit));
+        assert!(!debit_drains_source(&source_funds, &material_remainder));
     }
 
     #[test]
