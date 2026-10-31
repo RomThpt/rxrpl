@@ -938,6 +938,14 @@ enum BalanceRounding {
     Legacy,
     Nearest,
     HalfUpward,
+    Downward,
+}
+
+fn add_iou_balance_downward(a: &IOUAmount, b: &IOUAmount) -> IOUAmount {
+    use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode};
+
+    let _round = RoundModeGuard::new(RoundingMode::Downward);
+    Number::from_iou(a).add(&Number::from_iou(b)).to_iou()
 }
 
 fn add_iou_balance_towards_zero(
@@ -1061,6 +1069,7 @@ fn credit_line_with_rounding(
         BalanceRounding::Legacy => add_iou_balance(&balance, &delta, false),
         BalanceRounding::Nearest => add_iou_balance(&balance, &delta, true),
         BalanceRounding::HalfUpward => add_iou_balance_half_upward(&balance, &delta),
+        BalanceRounding::Downward => Ok(add_iou_balance_downward(&balance, &delta)),
     }
     .map_err(|_| TransactionResult::TefInternal)?;
     line["Balance"]["value"] = Value::String(new.to_decimal_string());
@@ -1209,7 +1218,6 @@ fn cross_offers(
     let mut advance_after_exhausted_tip = false;
     let book_prefix = &inverse_book.as_bytes()[0..24];
     let fok = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_FILL_OR_KILL != 0;
-
     // Autobridge: when NEITHER leg is XRP, the offer also competes an
     // XRP-intermediate path (`in -> XRP -> out`) against the direct book. Prebuild
     // that two-hop strand once; `try_bridge_step` crosses it per band by quality.
@@ -1224,19 +1232,6 @@ fn cross_offers(
                 taker_pays.clone(),
             ],
         )
-        .map(|mut s| {
-            // rippled's offer-crossing autobridge bridges two RESTING book offers
-            // through XRP; it does not inject AMM liquidity into the synthetic
-            // bridge (the AMM competes only on the DIRECT book). Injecting the AMM
-            // makes the blended two-hop bridge quality marginally better than the
-            // offer's own, so the offer over-crosses a sliver that rippled leaves
-            // resting. Keep the bridge CLOB-only.
-            for hop in &mut s.hops {
-                hop.amm_pool = None;
-                hop.liquidity = None;
-            }
-            s
-        })
     } else {
         None
     };
@@ -1791,6 +1786,7 @@ fn try_bridge_step(
     let taker_acct_before = taker_acct.clone();
     let mut pass_ins = Vec::new();
     let mut pass_outs = Vec::new();
+    let mut quality_adjusted = false;
     let mut demand = if is_sell {
         unbounded_leg(out_leg)
     } else {
@@ -1813,6 +1809,7 @@ fn try_bridge_step(
             &ro,
             &mut amm_ctx,
             /*offer_create_bridge=*/ true,
+            Some(cq),
         ) else {
             break;
         };
@@ -1824,6 +1821,8 @@ fn try_bridge_step(
         if spent.is_zero() || delivered.is_zero() {
             break;
         }
+        let pass_quality_adjusted = res.quality_adjusted;
+        quality_adjusted |= pass_quality_adjusted;
         pass_ins.push(res.in_amt);
         pass_outs.push(res.out_amt);
         budget = leg_sub(&budget, &spent);
@@ -1835,6 +1834,9 @@ fn try_bridge_step(
             };
         }
         amm_ctx.update();
+        if pass_quality_adjusted {
+            break;
+        }
     }
 
     if pass_ins.is_empty() {
@@ -1852,7 +1854,9 @@ fn try_bridge_step(
         rxrpl_amount::get_rate(&in_q, &out_q)
     }
     .unwrap_or(u64::MAX);
-    if !rxrpl_amount::is_better_quality(eff_q, cq) {
+    if !(rxrpl_amount::is_better_quality(eff_q, cq)
+        || quality_adjusted && rxrpl_amount::within_relative_distance(eff_q, cq))
+    {
         ctx.view.rollback(cp);
         *taker_acct = taker_acct_before;
         return Ok(());
@@ -3684,6 +3688,7 @@ fn apply_amm_move(
     out_num: &rxrpl_amount::number::Number,
     skip_input_debit: bool,
     skip_output_credit: bool,
+    waive_output_transfer_fee: bool,
 ) -> Result<rxrpl_amount::number::Number, TransactionResult> {
     // Input: source / previous-pool -> this pool.
     if hop.in_xrp {
@@ -3740,6 +3745,32 @@ fn apply_amm_move(
                 drops: 0,
             },
         );
+        if waive_output_transfer_fee && !skip_output_credit {
+            // BookOfferCrossingStep uses parity for an AMM's output transfer
+            // rate. Move the same gross amount off the pool line and onto the
+            // taker's line; unlike Payment flow, no issuer fee is burned.
+            if amount.issuer != hop.pool_id {
+                credit_line_with_rounding(
+                    ctx,
+                    &hop.pool_id,
+                    &amount.issuer,
+                    &amount.currency,
+                    &amount.iou.negate(),
+                    BalanceRounding::Downward,
+                )?;
+            }
+            if amount.issuer != *dest {
+                credit_line_with_rounding(
+                    ctx,
+                    dest,
+                    &amount.issuer,
+                    &amount.currency,
+                    &amount.iou,
+                    BalanceRounding::HalfUpward,
+                )?;
+            }
+            return Ok(*out_num);
+        }
         let net = pay_out_gross(
             ctx,
             taker,
@@ -4298,6 +4329,7 @@ fn reverse_amm_strand(
             &outs[h],
             /*skip_input_debit=*/ h != 0,
             /*skip_output_credit=*/ h != n - 2,
+            /*waive_output_transfer_fee=*/ false,
         )?;
     }
 
@@ -4371,6 +4403,7 @@ struct StrandPass {
     out_amt: Number,
     offers_used: u32,
     preserve_output_ulp: bool,
+    quality_adjusted: bool,
 }
 
 struct FlowSourceBalance {
@@ -5038,6 +5071,120 @@ fn price_clob_band_reverse(
 /// cannot deliver this pass (a pool is frozen, a hop is dry, or the demand cannot
 /// be priced).
 #[allow(clippy::too_many_arguments)]
+fn limit_strand_output_by_quality(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    dest: &AccountId,
+    strand: &FlowStrand,
+    amm_hops: &[Option<AmmHop>],
+    remaining_out: &Number,
+    limit_quality: u64,
+    amm_ctx: &AmmContext,
+    offer_create_bridge: bool,
+) -> Number {
+    use rxrpl_amount::number::{RoundModeGuard, RoundingMode};
+
+    // rippled `QualityFunction`: average output/input quality is linear in the
+    // terminal output, q(out) = m*out + b. Compose the collapsed DirectStep /
+    // BookStep chain in forward order, then solve it at the taker's limit.
+    let mut m = Number::ZERO;
+    let mut b = Number::from_int(1);
+    for (h, hop) in strand.hops.iter().enumerate() {
+        if let Some(rate) = flow_book_input_rate(ctx, &hop.in_leg, dest) {
+            b = b.div(&Number::from_iou(&rate));
+        }
+
+        let clob_quality = funded_book_tip_quality(ctx, taker, &hop.inverse_book);
+        let amm_offer = if offer_create_bridge && clob_quality.is_some() {
+            None
+        } else {
+            match (hop.liquidity.as_ref(), amm_hops[h].as_ref()) {
+                (Some(liq), Some(amm)) => {
+                    liq.get_offer(&amm.pool_in, &amm.pool_out, clob_quality, amm_ctx)
+                }
+                _ => None,
+            }
+        };
+
+        let (step_m, step_b) = if let (Some(offer), Some(amm)) = (amm_offer, amm_hops[h].as_ref()) {
+            if amm_ctx.multi_path() {
+                let rate =
+                    Number::from_iou(&from_rate(offer.quality).ok().unwrap_or(IOUAmount::ZERO));
+                if rate.is_zero() {
+                    return *remaining_out;
+                }
+                (Number::ZERO, Number::from_int(1).div(&rate))
+            } else {
+                let fee = Number::from_int(hop.amm_tfee as i64).div(&Number::from_int(100_000));
+                let fee_mult = Number::from_int(1).sub(&fee);
+                (
+                    fee_mult.negate().div(&amm.pool_in),
+                    amm.pool_out.mul(&fee_mult).div(&amm.pool_in),
+                )
+            }
+        } else if let Some(quality) = clob_quality {
+            let Ok(rate) = from_rate(quality) else {
+                return *remaining_out;
+            };
+            let rate = Number::from_iou(&rate);
+            if rate.is_zero() {
+                return *remaining_out;
+            }
+            (Number::ZERO, Number::from_int(1).div(&rate))
+        } else {
+            return *remaining_out;
+        };
+        m = m.add(&b.mul(&step_m));
+        b = b.mul(&step_b);
+    }
+
+    // BookOfferCrossingStep waives the AMM output transfer fee (`trOut` is
+    // parity). The terminal issue therefore contributes no extra constant
+    // quality term here, even though settlement still moves the gross pool
+    // output through the issuer's trust lines.
+    if m.is_zero() {
+        return *remaining_out;
+    }
+    let Ok(rate) = from_rate(limit_quality) else {
+        return *remaining_out;
+    };
+    let rate = Number::from_iou(&rate);
+    if rate.is_zero() {
+        return *remaining_out;
+    }
+    let raw = {
+        let _round = RoundModeGuard::new(RoundingMode::Upward);
+        Number::from_int(1).div(&rate).sub(&b).div(&m)
+    };
+    if raw.is_zero() || raw.negative() {
+        return *remaining_out;
+    }
+    let output = {
+        let _round = RoundModeGuard::new(RoundingMode::Downward);
+        let out_leg = &strand.hops.last().expect("non-empty strand").out_leg;
+        if out_leg.is_xrp {
+            Number::from_int(raw.to_xrp_drops_mode() as i64)
+        } else {
+            Number::from_iou(&raw.to_iou())
+        }
+    };
+    let delta = output.sub(remaining_out);
+    let abs_delta = if delta.negative() {
+        delta.negate()
+    } else {
+        delta
+    };
+    let tolerance = remaining_out.div(&Number::from_int(1_000_000_000));
+    if num_le(&abs_delta, &tolerance) {
+        *remaining_out
+    } else if num_le(&output, remaining_out) {
+        output
+    } else {
+        *remaining_out
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute_strand_pass(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
@@ -5048,6 +5195,7 @@ fn execute_strand_pass(
     remaining_out: &Number,
     amm_ctx: &mut AmmContext,
     offer_create_bridge: bool,
+    limit_quality: Option<u64>,
 ) -> Option<StrandPass> {
     let trace = std::env::var("RXRPL_FLOW_TRACE").is_ok();
     let n = strand.hops.len();
@@ -5061,6 +5209,24 @@ fn execute_strand_pass(
     for hop in &strand.hops {
         amm_hops.push(hop_amm_snapshot(ctx, hop).map(|(a, _, _)| a));
     }
+    let requested_out = *remaining_out;
+    let remaining_out = limit_quality
+        .filter(|_| !amm_ctx.multi_path())
+        .map(|quality| {
+            limit_strand_output_by_quality(
+                ctx,
+                taker,
+                dest,
+                strand,
+                &amm_hops,
+                remaining_out,
+                quality,
+                amm_ctx,
+                offer_create_bridge,
+            )
+        })
+        .unwrap_or(*remaining_out);
+    let quality_adjusted = !remaining_out.sub(&requested_out).is_zero();
 
     // Whether a hop consumes its AMM fib chunk this pass, or its CLOB tip band.
     // rippled's `BookStep` tries the AMM FIRST at the CLOB tip quality; the AMM
@@ -5079,7 +5245,7 @@ fn execute_strand_pass(
     // The lowest-index hop whose band cannot meet the demand pulled back to it;
     // `n` means "no interior limit" (only the source budget may bind).
     let mut limiting = n;
-    let mut demanded = *remaining_out;
+    let mut demanded = remaining_out;
     for h in (0..n).rev() {
         let hop = &strand.hops[h];
         let is_first = h == 0;
@@ -5087,11 +5253,18 @@ fn execute_strand_pass(
         let clob_quality = funded_book_tip_quality(ctx, taker, &hop.inverse_book);
 
         // Try the AMM fib chunk first, gated to the CLOB tip quality.
-        let amm_offer = match (hop.liquidity.as_ref(), amm_hops[h].as_ref()) {
-            (Some(liq), Some(amm)) => {
-                liq.get_offer(&amm.pool_in, &amm.pool_out, clob_quality, amm_ctx)
+        let amm_offer = if offer_create_bridge && clob_quality.is_some() {
+            // OfferCreate's explicit XRP bridge keeps a funded book hop CLOB-only.
+            // Once OfferStream reaps the last stale/unfunded tip, the AMM may
+            // provide that otherwise-dry hop (ledger 105500435).
+            None
+        } else {
+            match (hop.liquidity.as_ref(), amm_hops[h].as_ref()) {
+                (Some(liq), Some(amm)) => {
+                    liq.get_offer(&amm.pool_in, &amm.pool_out, clob_quality, amm_ctx)
+                }
+                _ => None,
             }
-            _ => None,
         };
 
         if let Some(offer) = amm_offer {
@@ -5103,6 +5276,7 @@ fn execute_strand_pass(
             // output issuer charges a transfer fee. The forward application
             // then burns that fee and returns the original net carry.
             let pool_demanded = if is_last
+                && !offer_create_bridge
                 && !hop.out_leg.is_xrp
                 && hop.out_leg.issuer != pool_id
                 && hop.out_leg.issuer != *dest
@@ -5225,8 +5399,16 @@ fn execute_strand_pass(
                     return None;
                 }
                 let actual_out = apply_amm_move(
-                    ctx, taker, taker_acct, dest, amm, &in_num, &out_num,
-                    /*skip_input_debit=*/ !is_first, /*skip_output_credit=*/ !is_last,
+                    ctx,
+                    taker,
+                    taker_acct,
+                    dest,
+                    amm,
+                    &in_num,
+                    &out_num,
+                    /*skip_input_debit=*/ !is_first,
+                    /*skip_output_credit=*/ !is_last,
+                    /*waive_output_transfer_fee=*/ offer_create_bridge && is_last,
                 )
                 .ok()?;
                 amm_ctx.set_amm_used();
@@ -5325,6 +5507,7 @@ fn execute_strand_pass(
         in_amt: source_in,
         out_amt: carry,
         offers_used: 0,
+        quality_adjusted,
         preserve_output_ulp: n > 1
             && limiting < n - 1
             && kinds[n - 2] == HopKindR::Amm
@@ -5465,6 +5648,7 @@ pub(crate) fn flow_multi(
                 &remaining_out,
                 amm_ctx,
                 /*offer_create_bridge=*/ false,
+                None,
             ) {
                 Some(res) if !res.out_amt.is_zero() => {
                     let realised_rate = res.in_amt.div(&res.out_amt);
@@ -7785,14 +7969,14 @@ fn taker_cross(
 #[cfg(test)]
 mod taker_crossing_tests {
     use super::{
-        Leg, TakerCrossType, add_iou_balance, add_iou_balance_half_upward, composed_quality,
-        consumes_full_offer, crossing_threshold, debit_drains_source, flow_iou_to_iou,
-        flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou, full_offer_take,
-        funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
-        in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
-        leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number, net_book_payment_input,
-        number_to_leg, out_for_in, own_tip_can_be_reaped, pack_rate, parity_rate,
-        preserve_flow_input_limited_iou_ulp, qual_div, qual_mul, reject_quality,
+        Leg, TakerCrossType, add_iou_balance, add_iou_balance_downward,
+        add_iou_balance_half_upward, composed_quality, consumes_full_offer, crossing_threshold,
+        debit_drains_source, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou,
+        full_offer_take, funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out,
+        in_for_out_offer, in_for_out_round, input_limited_uses_full_budget, leftover_is_dust,
+        leftover_leg, leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
+        net_book_payment_input, number_to_leg, out_for_in, own_tip_can_be_reaped, pack_rate,
+        parity_rate, preserve_flow_input_limited_iou_ulp, qual_div, qual_mul, reject_quality,
         remaining_is_filled, remaining_is_filled_at, remaining_offer, scale_funds_limited_input,
         select_path, sell_clamp_sub, should_bump_partial_path_credit,
         should_reap_tiny_increased_quality, should_trim_input_limited_iou_leftover,
@@ -7879,6 +8063,23 @@ mod taker_crossing_tests {
                 .unwrap()
                 .to_decimal_string(),
             "-2178.567102560522"
+        );
+    }
+
+    #[test]
+    fn ledger_105500435_amm_pool_debit_rounds_downward() {
+        let before = IOUAmount::from_decimal_string("-0.01387908469263376").unwrap();
+        let delta = IOUAmount::from_decimal_string("0.00005820841462248592").unwrap();
+
+        assert_eq!(
+            add_iou_balance_downward(&before, &delta).to_decimal_string(),
+            "-0.01382087627801128"
+        );
+        assert_eq!(
+            add_iou_balance(&before, &delta, true)
+                .unwrap()
+                .to_decimal_string(),
+            "-0.01382087627801127"
         );
     }
 
