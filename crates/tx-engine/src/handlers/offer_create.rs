@@ -1200,6 +1200,11 @@ fn cross_offers(
     }
 
     let mut remaining_out = out_leg.clone();
+    // FlowCross carries the aggregate output remainder as a Number. Keeping
+    // that extra precision across several fills matters when the final offer
+    // is partial: ledger 105500430 reaches 9889.176237768096 after summing the
+    // preceding fills, while canonicalising every subtraction yields ...8100.
+    let mut remaining_out_num = leg_to_number(&out_leg);
     let mut remaining_in = in_leg.clone();
     let mut source_remaining = source_budget.clone();
     let mut crossed = false;
@@ -1268,6 +1273,7 @@ fn cross_offers(
         // as the offers about to cross at this band; it is a no-op otherwise.
         if !remaining_out.is_zero() && !remaining_in.is_zero() {
             if let Some(b) = &bridge {
+                let before = remaining_out.clone();
                 try_bridge_step(
                     ctx,
                     taker,
@@ -1282,11 +1288,15 @@ fn cross_offers(
                     dir_quality,
                     is_sell,
                 )?;
+                if !leg_ge(&before, &remaining_out) || !leg_ge(&remaining_out, &before) {
+                    remaining_out_num = leg_to_number(&remaining_out);
+                }
                 if remaining_out.is_zero() || remaining_in.is_zero() {
                     break 'walk;
                 }
             }
             if !domain_only {
+                let before = remaining_out.clone();
                 try_amm_step(
                     ctx,
                     taker,
@@ -1300,6 +1310,9 @@ fn cross_offers(
                     is_sell,
                     /*cap_ending_spot_price=*/ true,
                 )?;
+                if !leg_ge(&before, &remaining_out) || !leg_ge(&remaining_out, &before) {
+                    remaining_out_num = leg_to_number(&remaining_out);
+                }
                 if remaining_out.is_zero() || remaining_in.is_zero() {
                     break 'walk; // AMM alone met the demand (or exhausted the taker's funds)
                 }
@@ -1546,8 +1559,12 @@ fn cross_offers(
 
             // A tfSell fill can deliver more than the remaining TakerPays demand;
             // clamp the demand at zero rather than underflowing the drops/mantissa.
-            remaining_out = if is_sell && leg_ge(&order_out, &remaining_out) {
+            remaining_out = if leg_ge(&order_out, &remaining_out) {
+                remaining_out_num = rxrpl_amount::number::Number::ZERO;
                 leg_sub(&remaining_out, &remaining_out)
+            } else if number_switchover {
+                remaining_out_num = remaining_out_num.sub(&leg_to_number(&order_out));
+                number_to_leg(&remaining_out_num, &out_leg)
             } else {
                 leg_sub(&remaining_out, &order_out)
             };
@@ -7761,13 +7778,13 @@ mod taker_crossing_tests {
         flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou, full_offer_take,
         funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
         in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
-        leg_as_quality_iou, leg_ge, leg_gt, leg_max, net_book_payment_input, out_for_in,
-        own_tip_can_be_reaped, pack_rate, parity_rate, preserve_flow_input_limited_iou_ulp,
-        qual_div, qual_mul, reject_quality, remaining_is_filled, remaining_is_filled_at,
-        remaining_offer, scale_funds_limited_input, select_path, sell_clamp_sub,
-        should_bump_partial_path_credit, should_reap_tiny_increased_quality,
-        should_trim_input_limited_iou_leftover, terminal_budget_binds, zero_cost_funded_xrp_offer,
-        zero_cost_xrp_clob_fill,
+        leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number, net_book_payment_input,
+        number_to_leg, out_for_in, own_tip_can_be_reaped, pack_rate, parity_rate,
+        preserve_flow_input_limited_iou_ulp, qual_div, qual_mul, reject_quality,
+        remaining_is_filled, remaining_is_filled_at, remaining_offer, scale_funds_limited_input,
+        select_path, sell_clamp_sub, should_bump_partial_path_credit,
+        should_reap_tiny_increased_quality, should_trim_input_limited_iou_leftover,
+        terminal_budget_binds, zero_cost_funded_xrp_offer, zero_cost_xrp_clob_fill,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, get_rate_round_even, offer_quality};
     use rxrpl_primitives::AccountId;
@@ -8026,6 +8043,19 @@ mod taker_crossing_tests {
             &rate,
             true,
         ));
+    }
+
+    #[test]
+    fn ledger_105500430_reduced_offer_preserves_quality() {
+        let mut remaining = leg_to_number(&iou("10401.686462"));
+        for fill in ["115.057164", "250.958543", "146.4945172319043"] {
+            remaining = remaining.sub(&leg_to_number(&iou(fill)));
+        }
+        let consumed_out = number_to_leg(&remaining, &iou("0"));
+        let remaining_out = leftover_leg(&iou("9994.4743452889"), &consumed_out, true);
+
+        assert_eq!(consumed_out.iou.to_decimal_string(), "9889.176237768096");
+        assert_eq!(remaining_out.iou.to_decimal_string(), "105.298107520804");
     }
 
     #[test]
