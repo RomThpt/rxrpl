@@ -1253,6 +1253,14 @@ fn cross_offers(
         probe = dir_key;
         let dir_quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
         if dir_quality > threshold {
+            if !advance_after_exhausted_tip {
+                // OfferStream materialises the first CLOB tip before BookStep
+                // rejects its quality. Preserve the historical rule that an
+                // ordinary unfunded offer beyond the taker's limit is left
+                // alone, but remove a partially funded tip whose strict
+                // reduction would worsen its quality (105500437).
+                reap_out_of_quality_tiny_tips(ctx, taker, taker_acct, &dir_key)?;
+            }
             if !advance_after_exhausted_tip
                 || advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key)?
             {
@@ -1260,6 +1268,13 @@ fn cross_offers(
             }
             continue;
         }
+        // BookStep materialises the CLOB tip before comparing it with the
+        // synthetic AMM offer. OfferStream therefore removes invalid,
+        // self-owned, and unfunded tips even when the AMM subsequently fills
+        // the taker's entire demand. Do the same before AMM selection; the
+        // regular offer loop below will resume at the first funded external
+        // offer (testnet ledger 105500437).
+        let _ = advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key)?;
         // Interleave the AMM at this quality band BEFORE the resting CLOB offers.
         // rippled crosses whichever of the synthetic AMM offer / CLOB tip is
         // better at each quality level (BookStep tryAMM/execOffer). `amm_hop`'s
@@ -1378,7 +1393,14 @@ fn cross_offers(
             // (30000048 45874350: 0.008 BTC vs 2.011).
             let funds = owner_funds_leg(ctx, &owner, &offer_out);
             let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
-            if offer_cannot_pay(&funds, &offer_out, flags, &owner == taker) {
+            if should_reap_tiny_increased_quality(
+                &owner,
+                &offer_in,
+                &offer_out,
+                &funds,
+                dir_quality,
+            ) || offer_cannot_pay(&funds, &offer_out, flags, &owner == taker)
+            {
                 reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, &dir_key)?;
                 continue;
             }
@@ -1624,6 +1646,45 @@ fn cross_offers(
     ))
 }
 
+fn reap_out_of_quality_tiny_tips(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dir_key: &Hash256,
+) -> Result<(), TransactionResult> {
+    let quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
+    for offer_key in book_dir_indexes(ctx, dir_key) {
+        let Some(bytes) = ctx.view.read(&offer_key) else {
+            continue;
+        };
+        let Ok(offer) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if offer.get("LedgerEntryType").and_then(Value::as_str) != Some("Offer") {
+            continue;
+        }
+        let Some(owner) = offer
+            .get("Account")
+            .and_then(Value::as_str)
+            .and_then(|value| decode_account_id(value).ok())
+        else {
+            continue;
+        };
+        let (Some(offer_in), Some(offer_out)) = (
+            offer.get("TakerPays").and_then(Leg::parse),
+            offer.get("TakerGets").and_then(Leg::parse),
+        ) else {
+            continue;
+        };
+        let funds = owner_funds_leg(ctx, &owner, &offer_out);
+        if !should_reap_tiny_increased_quality(&owner, &offer_in, &offer_out, &funds, quality) {
+            break;
+        }
+        reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, dir_key)?;
+    }
+    Ok(())
+}
+
 /// Continue Flow's post-fill OfferStream advance into a quality directory that
 /// is already worse than the taker's limit. Unfunded/invalid tips disappear,
 /// but the first funded offer stops the walk and remains untouched.
@@ -1633,6 +1694,7 @@ fn advance_past_unfunded_quality(
     taker_acct: &mut Value,
     dir_key: &Hash256,
 ) -> Result<bool, TransactionResult> {
+    let quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
     for offer_key in book_dir_indexes(ctx, dir_key) {
         let Some(bytes) = ctx.view.read(&offer_key) else {
             continue;
@@ -1666,6 +1728,7 @@ fn advance_past_unfunded_quality(
             || offer_in.is_zero()
             || offer_out.is_zero()
             || is_deep_frozen(ctx, &owner, &offer_in)
+            || should_reap_tiny_increased_quality(&owner, &offer_in, &offer_out, &funds, quality)
             || offer_cannot_pay(&funds, &offer_out, flags, &owner == taker)
             || owner == *taker;
         if !removable {
