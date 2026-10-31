@@ -2346,6 +2346,7 @@ fn cross_book_hop(
                     &offer_in,
                     &offer_out,
                     &eff_rate,
+                    leg_ge(&take_out, &avail_out),
                 )
             } else if force_full_input_budget && offer_out.is_xrp {
                 // OfferCreate's first autobridge leg is reverse-priced to the
@@ -2684,17 +2685,22 @@ fn terminal_budget_binds(
     offer_in: &Leg,
     offer_out: &Leg,
     rate: &IOUAmount,
+    funds_cap: bool,
 ) -> bool {
     // A proportional cost computed from the offer's current fields can round
     // down enough to fit even when the fixed book quality says the budget buys
     // strictly less than the requested output. Preserve the proportional check
-    // for floor-equality cases, but always bind when floor(in / quality) is
-    // strictly below the demand (105500074).
-    !leg_ge(budget_out, take_out)
-        || !leg_ge(
-            remaining_in,
-            &in_for_out_offer(offer_in, take_out, offer_out, rate),
-        )
+    // for floor-equality cases, but bind when floor(in / quality) is strictly
+    // below an ordinary demand (105500074). An underfunded maker is different:
+    // rippled reduces the offer first and compares that reduced cost (105500388).
+    let proportional_cost = in_for_out_offer(offer_in, take_out, offer_out, rate);
+    if funds_cap {
+        let funds_cost = scale_funds_limited_input(offer_in, take_out, offer_out);
+        if leg_ge(remaining_in, &funds_cost) {
+            return false;
+        }
+    }
+    !leg_ge(budget_out, take_out) || !leg_ge(remaining_in, &proportional_cost)
 }
 
 fn funds_limited_xrp_rounds_up(
@@ -7994,6 +8000,31 @@ mod taker_crossing_tests {
             &offer_in,
             &offer_out,
             &rate,
+            false,
+        ));
+    }
+
+    #[test]
+    fn ledger_105500388_funded_output_beats_quality_floor() {
+        let budget = xrp(900_890);
+        let offer_in = xrp(738_865_700);
+        let offer_out = iou("19317717.7763431");
+        let funded = iou("23553.87758628668");
+        let rate = from_rate(0x560d_96a4_9c6c_5b91).unwrap();
+        let budget_out = out_for_in(&budget, &rate, &offer_out);
+
+        assert_eq!(budget_out.iou.to_decimal_string(), "23553.85933807691");
+        let funds_cost = scale_funds_limited_input(&offer_in, &funded, &offer_out);
+        assert_eq!(funds_cost.drops, 900_890);
+        assert!(leg_ge(&budget, &funds_cost));
+        assert!(!terminal_budget_binds(
+            &budget,
+            &funded,
+            &budget_out,
+            &offer_in,
+            &offer_out,
+            &rate,
+            true,
         ));
     }
 
