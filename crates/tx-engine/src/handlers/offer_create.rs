@@ -4646,6 +4646,25 @@ fn flow_source_balance(
     })
 }
 
+fn flow_destination_balance(
+    ctx: &ApplyContext<'_>,
+    dest: &AccountId,
+    strands: &[FlowStrand],
+) -> Option<FlowSourceBalance> {
+    let output = &strands.first()?.hops.last()?.out_leg;
+    if output.is_xrp || dest == &output.issuer {
+        return None;
+    }
+    let key = keylet::trust_line(dest, &output.issuer, &output.currency);
+    let line: Value = serde_json::from_slice(&ctx.view.read(&key)?).ok()?;
+    let balance = IOUAmount::from_decimal_string(line["Balance"]["value"].as_str()?).ok()?;
+    Some(FlowSourceBalance {
+        key,
+        balance,
+        holder_is_high: dest.as_bytes() > output.issuer.as_bytes(),
+    })
+}
+
 fn aggregate_flow_source_balance_number(
     balance: &IOUAmount,
     spent: &Number,
@@ -4671,6 +4690,22 @@ fn aggregate_flow_source_balance_passes(
             spent
         } else {
             spent.negate()
+        };
+        IOUAmount::add_round(&balance, &delta).ok()
+    })
+}
+
+fn aggregate_flow_destination_balance_passes(
+    balance: &IOUAmount,
+    saved_outs: &[Number],
+    holder_is_high: bool,
+) -> Option<IOUAmount> {
+    saved_outs.iter().try_fold(*balance, |balance, delivered| {
+        let delivered = delivered.to_iou();
+        let delta = if holder_is_high {
+            delivered.negate()
+        } else {
+            delivered
         };
         IOUAmount::add_round(&balance, &delta).ok()
     })
@@ -4723,6 +4758,21 @@ fn reconcile_flow_source_balance_passes(
         return;
     };
     set_flow_source_balance(ctx, source, &balance);
+}
+
+fn reconcile_flow_destination_balance_passes(
+    ctx: &mut ApplyContext<'_>,
+    destination: &FlowSourceBalance,
+    saved_outs: &[Number],
+) {
+    let Some(balance) = aggregate_flow_destination_balance_passes(
+        &destination.balance,
+        saved_outs,
+        destination.holder_is_high,
+    ) else {
+        return;
+    };
+    set_flow_source_balance(ctx, destination, &balance);
 }
 
 fn set_flow_source_balance(
@@ -5805,6 +5855,7 @@ pub(crate) fn flow_multi(
 ) -> (Number, Number, bool) {
     let trace = std::env::var("RXRPL_FLOW_TRACE").is_ok();
     let source_balance = flow_source_balance(ctx, taker, strands);
+    let destination_balance = flow_destination_balance(ctx, dest, strands);
     // SendMax is only the transaction's ceiling. An IOU source DirectStep is
     // additionally bounded by the holder's balance at Flow entry. Keep that
     // cap across every pass: recomputing only `SendMax - savedIn` can otherwise
@@ -5997,6 +6048,20 @@ pub(crate) fn flow_multi(
         } else if !input_exhausted {
             reconcile_flow_source_balance(ctx, source, &actual_in);
         }
+    }
+    // Each winning rippled strand applies its destination DirectStep to the
+    // accumulated sandbox immediately. For an input-exhausted self-payment,
+    // replay those credits in commit order: replacing them with one aggregate
+    // credit loses an ULP against a large existing balance (105500595).
+    if taker == dest
+        && input_exhausted
+        && saved_outs.len() > 1
+        && let Some(destination) = destination_balance.as_ref()
+        && source_balance
+            .as_ref()
+            .is_none_or(|source| source.key != destination.key)
+    {
+        reconcile_flow_destination_balance_passes(ctx, destination, &saved_outs);
     }
     let preserve_output_ulp = preserve_flow_output_ulp(
         &actual_out,
@@ -9619,10 +9684,10 @@ mod amm_quality_gate_tests {
 #[cfg(test)]
 mod flow_source_balance_tests {
     use super::{
-        Leg, aggregate_flow_source_balance_number, aggregate_flow_source_balance_passes,
-        can_fund_new_trust_line, flow_gross_input, flow_holder_funds, flow_input_limit,
-        flow_net_input, leftover_leg, next_flow_strands, preserve_flow_output_ulp,
-        sum_smallest_to_largest,
+        Leg, aggregate_flow_destination_balance_passes, aggregate_flow_source_balance_number,
+        aggregate_flow_source_balance_passes, can_fund_new_trust_line, flow_gross_input,
+        flow_holder_funds, flow_input_limit, flow_net_input, leftover_leg, next_flow_strands,
+        preserve_flow_output_ulp, sum_smallest_to_largest,
     };
     use rxrpl_amount::IOUAmount;
     use rxrpl_amount::number::{MantissaScale, MantissaScaleGuard, Number};
@@ -9680,6 +9745,44 @@ mod flow_source_balance_tests {
             &Number::from_int(1),
             true
         ));
+    }
+
+    #[test]
+    fn ledger_105500595_replays_destination_credits_in_pass_order() {
+        let balance = IOUAmount::from_decimal_string("-200000000000").unwrap();
+        let saved_outs = [
+            "975339.266587",
+            "17552924.87249",
+            "1950678.533174",
+            "2926017.799761",
+            "87764624.36245",
+            "7802714.132696",
+            "12679410.465631",
+            "368611422.32229",
+            "33161535.063958",
+            "53643659.662285",
+            "1562210313.65161",
+            "140448854.388528",
+            "227254049.114771",
+            "3740091895.31832",
+        ]
+        .map(|value| Number::from_iou(&IOUAmount::from_decimal_string(value).unwrap()));
+        let _scale = MantissaScaleGuard::new(MantissaScale::Small);
+
+        let aggregate = sum_smallest_to_largest(&saved_outs);
+        assert_eq!(aggregate.to_iou().to_decimal_string(), "6257073438.954551");
+        assert_eq!(
+            IOUAmount::add_round(&balance, &aggregate.to_iou().negate())
+                .unwrap()
+                .to_decimal_string(),
+            "-206257073438.9546"
+        );
+        assert_eq!(
+            aggregate_flow_destination_balance_passes(&balance, &saved_outs, true)
+                .unwrap()
+                .to_decimal_string(),
+            "-206257073438.9547"
+        );
     }
 
     #[test]
