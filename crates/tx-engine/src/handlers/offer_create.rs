@@ -1332,6 +1332,7 @@ fn cross_offers(
         // raw reserve-ratio spot gate admits the AMM only when it strictly beats
         // `dir_quality`, so this fires exactly when the AMM is at least as good
         // as the offers about to cross at this band; it is a no-op otherwise.
+        let mut amm_consumed_in_band = false;
         if !remaining_out.is_zero() && !remaining_in.is_zero() {
             if let Some(b) = &bridge {
                 let before = remaining_out.clone();
@@ -1372,16 +1373,15 @@ fn cross_offers(
                     is_sell,
                     /*cap_ending_spot_price=*/ true,
                 )?;
+                amm_consumed_in_band = leg_gt(&source_before_amm, &source_remaining);
                 if continue_to_clob {
                     // execOffer evaluates self-cross removal before its CLOB
                     // callback checks the now-remaining budget. Mirror that
                     // ordering when an AMM offer asks BookStep to continue.
                     let funded_tip_remains =
                         advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, false)?;
-                    terminal_amm_allowed &= clob_band_allows_terminal_amm(
-                        leg_gt(&source_before_amm, &source_remaining),
-                        funded_tip_remains,
-                    );
+                    terminal_amm_allowed &=
+                        clob_band_allows_terminal_amm(amm_consumed_in_band, funded_tip_remains);
                 }
                 if !leg_ge(&before, &remaining_out) || !leg_ge(&remaining_out, &before) {
                     remaining_out_num = leg_to_number(&remaining_out);
@@ -1558,6 +1558,30 @@ fn cross_offers(
                 };
                 (take_out.clone(), order_in)
             };
+
+            // Flow commits a quality-capped AMM fragment as one pass, then
+            // reevaluates the residual CLOB take in a fresh strand pass. The
+            // directory quality can still equal the taker's limit while the
+            // integral/canonical partial amounts realize a rate one ULP worse.
+            // That second pass is dry (with no relative-distance tolerance),
+            // so leave the CLOB untouched and rest the residual offer.
+            if amm_consumed_in_band {
+                let mut effective_in = leg_as_quality_iou(&order_in);
+                if !order_in.is_xrp && taker != &order_in.issuer && owner != order_in.issuer {
+                    effective_in = IOUAmount::mul_round(
+                        &effective_in,
+                        &transfer_rate(ctx, &order_in.issuer),
+                        true,
+                    )
+                    .unwrap_or(effective_in);
+                }
+                let realized =
+                    quality_threshold(&effective_in, &order_out, number_switchover, false);
+                if reject_quality(realized, threshold) {
+                    terminal_amm_allowed = false;
+                    break 'walk;
+                }
+            }
 
             // Move funds: taker pays order_in (grossed), owner pays order_out.
             // Legacy Taker semantics: `order_out` is the NET the taker receives;
@@ -8464,11 +8488,12 @@ mod taker_crossing_tests {
     use super::{
         Leg, TakerCrossType, add_iou_balance, add_iou_balance_downward,
         add_iou_balance_half_upward, amm_step_allows_clob, book_step_input_exhausted,
-        clob_band_allows_terminal_amm, composed_quality, consumes_full_offer, crossing_threshold,
-        debit_drains_source, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou,
-        full_offer_take, funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out,
-        in_for_out_offer, in_for_out_round, input_limited_uses_full_budget, leftover_is_dust,
-        leftover_leg, leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
+        clob_band_allows_terminal_amm, composed_quality, consumes_full_offer,
+        crossing_quality_threshold, crossing_threshold, debit_drains_source, flow_iou_to_iou,
+        flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou, full_offer_take,
+        funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
+        in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
+        leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
         legacy_intermediate_xrp_rounding_applies, net_book_payment_input, number_to_leg,
         out_for_in, own_tip_can_be_reaped, pack_rate, parity_rate,
         preserve_flow_input_limited_iou_ulp, qual_div, qual_mul, reject_quality,
@@ -8791,6 +8816,20 @@ mod taker_crossing_tests {
         assert!(!clob_band_allows_terminal_amm(true, false));
         assert!(clob_band_allows_terminal_amm(true, true));
         assert!(clob_band_allows_terminal_amm(false, false));
+    }
+
+    #[test]
+    fn ledger_105500743_rejects_rounded_clob_residual_after_amm() {
+        let original_in = iou("46");
+        let original_out = xrp(462_371);
+        let residual_in = iou("30.57659758073063");
+        let residual_out = xrp(307_342);
+
+        let threshold = crossing_quality_threshold(&original_in, &original_out, true, false);
+        let realized = crossing_quality_threshold(&residual_in, &residual_out, true, false);
+
+        assert!(!reject_quality(threshold, threshold));
+        assert!(reject_quality(realized, threshold));
     }
 
     #[test]
