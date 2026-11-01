@@ -1318,12 +1318,27 @@ fn cross_offers(
                 // alone, but remove a partially funded tip whose strict
                 // reduction would worsen its quality (105500437).
                 reap_out_of_quality_tiny_tips(ctx, taker, taker_acct, &dir_key)?;
+                // A single-path AMM can keep the strand active even though the
+                // CLOB tip is worse than the taker's limit. rippled constructs
+                // OfferStream before trying that AMM, so expired/invalid tips
+                // are removed first (105500799). If neither CLOB nor AMM can
+                // reach the limit, the strand is rejected before OfferStream
+                // runs and the funded expired tip stays untouched (105500455).
+                if !offer_crossing_strand_reaches_limit(
+                    ctx, taker, taker_gets, taker_pays, threshold,
+                ) {
+                    deferred_out_of_quality_dir = Some(dir_key);
+                    break;
+                }
             }
-            let permanent_only =
-                post_clob_cleanup && preserve_next_quality_self_offer(is_sell, &remaining_out);
-            if !post_clob_cleanup
-                || advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, permanent_only)?
-            {
+            let mode = if !post_clob_cleanup {
+                QualityAdvanceMode::PreQuality
+            } else if preserve_next_quality_self_offer(is_sell, &remaining_out) {
+                QualityAdvanceMode::Speculative
+            } else {
+                QualityAdvanceMode::Executing
+            };
+            if advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, mode)? {
                 deferred_out_of_quality_dir = Some(dir_key);
                 break;
             }
@@ -1335,7 +1350,13 @@ fn cross_offers(
         // if execOffer later selects the CLOB. Do the permanent-only cleanup
         // before AMM selection; the regular offer loop performs self-cross
         // cleanup if the AMM does not finish the crossing.
-        let _ = advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, true)?;
+        let _ = advance_past_unfunded_quality(
+            ctx,
+            taker,
+            taker_acct,
+            &dir_key,
+            QualityAdvanceMode::Speculative,
+        )?;
         // Interleave the AMM at this quality band BEFORE the resting CLOB offers.
         // rippled crosses whichever of the synthetic AMM offer / CLOB tip is
         // better at each quality level (BookStep tryAMM/execOffer). `amm_hop`'s
@@ -1388,8 +1409,13 @@ fn cross_offers(
                     // execOffer evaluates self-cross removal before its CLOB
                     // callback checks the now-remaining budget. Mirror that
                     // ordering when an AMM offer asks BookStep to continue.
-                    let funded_tip_remains =
-                        advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, false)?;
+                    let funded_tip_remains = advance_past_unfunded_quality(
+                        ctx,
+                        taker,
+                        taker_acct,
+                        &dir_key,
+                        QualityAdvanceMode::Executing,
+                    )?;
                     terminal_amm_allowed &=
                         clob_band_allows_terminal_amm(amm_consumed_in_band, funded_tip_remains);
                 }
@@ -1776,7 +1802,13 @@ fn cross_offers(
                 &remaining_out,
             ) && let Some(dir_key) = deferred_out_of_quality_dir
             {
-                let _ = advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, false)?;
+                let _ = advance_past_unfunded_quality(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    &dir_key,
+                    QualityAdvanceMode::Executing,
+                )?;
             }
         }
     }
@@ -1833,12 +1865,23 @@ fn reap_out_of_quality_tiny_tips(
 /// Continue Flow's post-fill OfferStream advance into a quality directory that
 /// is already worse than the taker's limit. Unfunded/invalid tips disappear,
 /// but the first funded offer stops the walk and remains untouched.
+#[derive(Clone, Copy)]
+enum QualityAdvanceMode {
+    /// A speculative AMM probe: keep funded expired and self-owned offers.
+    Speculative,
+    /// OfferStream has been selected: remove expired and self-owned offers.
+    Executing,
+    /// OfferStream is materialising its first tip before the quality check:
+    /// remove expired entries, but preserve an out-of-quality self offer.
+    PreQuality,
+}
+
 fn advance_past_unfunded_quality(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
     taker_acct: &mut Value,
     dir_key: &Hash256,
-    permanent_only: bool,
+    mode: QualityAdvanceMode,
 ) -> Result<bool, TransactionResult> {
     let quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
     for offer_key in book_dir_indexes(ctx, dir_key) {
@@ -1873,7 +1916,7 @@ fn advance_past_unfunded_quality(
         let tiny_increased_quality =
             should_reap_tiny_increased_quality(&owner, &offer_in, &offer_out, &funds, quality);
         if tiny_increased_quality {
-            if !permanent_only
+            if !matches!(mode, QualityAdvanceMode::Speculative)
                 || tiny_offer_is_permanently_reapable(ctx, &owner, &offer_out, &funds)
             {
                 reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, dir_key)?;
@@ -1885,12 +1928,12 @@ fn advance_past_unfunded_quality(
         // expired offer untouched in that case (105500455), and likewise keep
         // a funded self-offer until the CLOB is actually selected (105500679).
         // A retained CLOB walk or post-fill advance removes either normally.
-        let removable = (!permanent_only && expired)
+        let removable = (!matches!(mode, QualityAdvanceMode::Speculative) && expired)
             || offer_in.is_zero()
             || offer_out.is_zero()
             || is_deep_frozen(ctx, &owner, &offer_in)
             || offer_cannot_pay(&funds, &offer_out, flags, &owner == taker)
-            || (!permanent_only && owner == *taker);
+            || (matches!(mode, QualityAdvanceMode::Executing) && owner == *taker);
         if !removable {
             return Ok(true);
         }
@@ -5370,6 +5413,29 @@ fn strand_quality_ub(
         rate = rate.mul(&Number::from_iou(&transfer_rate(ctx, &terminal.issuer)));
     }
     Some(rate)
+}
+
+/// Whether the default OfferCreate strand survives Flow's quality-upper-bound
+/// gate. A viable AMM can activate the strand even when the first CLOB page is
+/// worse than the transaction limit; OfferStream then reaps invalid tips before
+/// the AMM's fee-adjusted quality is checked.
+fn offer_crossing_strand_reaches_limit(
+    ctx: &ApplyContext<'_>,
+    taker: &AccountId,
+    taker_gets: &Value,
+    taker_pays: &Value,
+    threshold: u64,
+) -> bool {
+    let Some(strand) = build_flow_strand(ctx, &[taker_gets.clone(), taker_pays.clone()]) else {
+        return false;
+    };
+    let Some(rate) = strand_quality_ub(ctx, &strand, taker, &AmmContext::new(false)) else {
+        return false;
+    };
+    let Ok(limit) = from_rate(threshold) else {
+        return false;
+    };
+    num_le(&rate, &Number::from_iou(&limit))
 }
 
 /// Sum a slice of `Number`s smallest-magnitude first (rippled
@@ -11736,8 +11802,14 @@ mod taker_bridge_integration {
         };
 
         assert!(
-            advance_past_unfunded_quality(&mut ctx, &taker, &mut taker_acct, &directory, true,)
-                .unwrap()
+            advance_past_unfunded_quality(
+                &mut ctx,
+                &taker,
+                &mut taker_acct,
+                &directory,
+                QualityAdvanceMode::Speculative,
+            )
+            .unwrap()
         );
         assert_eq!(ctx.view.read(&offer_key).unwrap(), offer_before);
         assert!(ctx.view.read(&directory).is_some());
@@ -11748,8 +11820,14 @@ mod taker_bridge_integration {
         assert_eq!(taker_acct["OwnerCount"].as_u64(), Some(1));
 
         assert!(
-            !advance_past_unfunded_quality(&mut ctx, &taker, &mut taker_acct, &directory, false,)
-                .unwrap()
+            !advance_past_unfunded_quality(
+                &mut ctx,
+                &taker,
+                &mut taker_acct,
+                &directory,
+                QualityAdvanceMode::Executing,
+            )
+            .unwrap()
         );
         assert!(ctx.view.read(&offer_key).is_none());
         assert!(ctx.view.read(&directory).is_none());
