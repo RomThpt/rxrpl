@@ -1262,7 +1262,7 @@ fn cross_offers(
                 reap_out_of_quality_tiny_tips(ctx, taker, taker_acct, &dir_key)?;
             }
             if !advance_after_exhausted_tip
-                || advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key)?
+                || advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, false)?
             {
                 break;
             }
@@ -1274,7 +1274,7 @@ fn cross_offers(
         // the taker's entire demand. Do the same before AMM selection; the
         // regular offer loop below will resume at the first funded external
         // offer (testnet ledger 105500437).
-        let _ = advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key)?;
+        let _ = advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, true)?;
         // Interleave the AMM at this quality band BEFORE the resting CLOB offers.
         // rippled crosses whichever of the synthetic AMM offer / CLOB tip is
         // better at each quality level (BookStep tryAMM/execOffer). `amm_hop`'s
@@ -1393,14 +1393,18 @@ fn cross_offers(
             // (30000048 45874350: 0.008 BTC vs 2.011).
             let funds = owner_funds_leg(ctx, &owner, &offer_out);
             let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
-            if should_reap_tiny_increased_quality(
+            let tiny_increased_quality = should_reap_tiny_increased_quality(
                 &owner,
                 &offer_in,
                 &offer_out,
                 &funds,
                 dir_quality,
-            ) || offer_cannot_pay(&funds, &offer_out, flags, &owner == taker)
-            {
+            );
+            if tiny_increased_quality {
+                reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, &dir_key)?;
+                continue;
+            }
+            if offer_cannot_pay(&funds, &offer_out, flags, &owner == taker) {
                 reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, &dir_key)?;
                 continue;
             }
@@ -1680,7 +1684,9 @@ fn reap_out_of_quality_tiny_tips(
         if !should_reap_tiny_increased_quality(&owner, &offer_in, &offer_out, &funds, quality) {
             break;
         }
-        reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, dir_key)?;
+        if tiny_offer_is_permanently_reapable(ctx, &owner, &offer_out, &funds) {
+            reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, dir_key)?;
+        }
     }
     Ok(())
 }
@@ -1693,6 +1699,7 @@ fn advance_past_unfunded_quality(
     taker: &AccountId,
     taker_acct: &mut Value,
     dir_key: &Hash256,
+    permanent_only: bool,
 ) -> Result<bool, TransactionResult> {
     let quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
     for offer_key in book_dir_indexes(ctx, dir_key) {
@@ -1724,11 +1731,20 @@ fn advance_past_unfunded_quality(
             .is_some_and(|expiration| expiration <= ctx.view.parent_close_time() as u64);
         let funds = owner_funds_leg(ctx, &owner, &offer_out);
         let flags = offer.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+        let tiny_increased_quality =
+            should_reap_tiny_increased_quality(&owner, &offer_in, &offer_out, &funds, quality);
+        if tiny_increased_quality {
+            if !permanent_only
+                || tiny_offer_is_permanently_reapable(ctx, &owner, &offer_out, &funds)
+            {
+                reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, dir_key)?;
+            }
+            continue;
+        }
         let removable = expired
             || offer_in.is_zero()
             || offer_out.is_zero()
             || is_deep_frozen(ctx, &owner, &offer_in)
-            || should_reap_tiny_increased_quality(&owner, &offer_in, &offer_out, &funds, quality)
             || offer_cannot_pay(&funds, &offer_out, flags, &owner == taker)
             || owner == *taker;
         if !removable {
@@ -4800,6 +4816,11 @@ fn funded_book_tip_quality(
                 &owner_funds,
                 quality,
             );
+            if tiny_increased_quality
+                && !tiny_offer_is_permanently_reapable(ctx, &owner, &offer_out, &owner_funds)
+            {
+                continue;
+            }
             if expired || unfunded || tiny_increased_quality {
                 let cp = ctx.view.checkpoint();
                 if reap_offer(ctx, &owner, &offer_key, &dir_key).is_err() {
@@ -4826,7 +4847,15 @@ fn should_reap_tiny_increased_quality(
     owner_funds: &Leg,
     quality: u64,
 ) -> bool {
-    if offer_out.is_xrp || owner == &offer_out.issuer || leg_ge(owner_funds, offer_out) {
+    // OfferStream handles zero owner funds in its ordinary unfunded branch
+    // before it asks whether a partially funded offer became too small. Keeping
+    // the cases separate prevents an out-of-quality zero-funded tip from being
+    // reaped by the special tiny-tip probe (105500440).
+    if owner_funds.is_zero()
+        || offer_out.is_xrp
+        || owner == &offer_out.issuer
+        || leg_ge(owner_funds, offer_out)
+    {
         return false;
     }
     if !offer_in.is_xrp && leg_ge(offer_in, offer_out) {
@@ -4844,7 +4873,7 @@ fn should_reap_tiny_increased_quality(
         return false;
     };
     let effective_in = amount_to_leg(&effective_amount, offer_in);
-    if effective_in.is_zero() || owner_funds.is_zero() {
+    if effective_in.is_zero() {
         return true;
     }
     let above_minimum = if effective_in.is_xrp {
@@ -4860,6 +4889,20 @@ fn should_reap_tiny_increased_quality(
         &leg_as_quality_iou(owner_funds),
     )
     .is_ok_and(|effective_quality| effective_quality > quality)
+}
+
+/// FlowOfferStream only adds a tiny reduced-quality offer to its permanent
+/// removal set when the cancel view reports the same owner funds. If an earlier
+/// step in this transaction made the offer tiny, the stream skips it locally
+/// but does not add it to the cross-strand permanent-removal side channel.
+fn tiny_offer_is_permanently_reapable(
+    ctx: &ApplyContext<'_>,
+    owner: &AccountId,
+    offer_out: &Leg,
+    current_funds: &Leg,
+) -> bool {
+    let original_funds = original_owner_funds_leg(ctx, owner, offer_out);
+    leg_ge(&original_funds, current_funds) && leg_ge(current_funds, &original_funds)
 }
 
 /// Build a strand from a boundary chain, snapshotting each hop's AMM pool (with
@@ -6661,6 +6704,19 @@ fn reap_maker_short_sells(
 }
 
 fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) -> Leg {
+    owner_funds_leg_with(ctx.fees, owner, gets, |key| ctx.view.read(key))
+}
+
+fn original_owner_funds_leg(ctx: &ApplyContext<'_>, owner: &AccountId, gets: &Leg) -> Leg {
+    owner_funds_leg_with(ctx.fees, owner, gets, |key| ctx.view.read_parent(key))
+}
+
+fn owner_funds_leg_with(
+    fees: &crate::fees::FeeSettings,
+    owner: &AccountId,
+    gets: &Leg,
+    mut read: impl FnMut(&Hash256) -> Option<Vec<u8>>,
+) -> Leg {
     let zero = Leg {
         is_xrp: gets.is_xrp,
         drops: 0,
@@ -6670,10 +6726,7 @@ fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) ->
     };
     if gets.is_xrp {
         let key = keylet::account(owner);
-        let acct = ctx
-            .view
-            .read(&key)
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+        let acct = read(&key).and_then(|b| serde_json::from_slice::<Value>(&b).ok());
         let bal = acct
             .as_ref()
             .and_then(|a| {
@@ -6687,7 +6740,7 @@ fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) ->
         // spendable XRP, not the reserve-locked portion. Using the raw balance let
         // a reserve-constrained offer over-fill (execute instead of being reaped).
         let owner_count = acct.as_ref().map(helpers::get_owner_count).unwrap_or(0);
-        let liquid = bal - ctx.fees.account_reserve(owner_count) as i64;
+        let liquid = bal - fees.account_reserve(owner_count) as i64;
         if liquid <= 0 {
             return zero;
         }
@@ -6703,7 +6756,7 @@ fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) ->
         return gets.clone();
     }
     let tl_key = keylet::trust_line(owner, &gets.issuer, &gets.currency);
-    let Some(tl_bytes) = ctx.view.read(&tl_key) else {
+    let Some(tl_bytes) = read(&tl_key) else {
         return zero;
     };
     let Ok(tl) = serde_json::from_slice::<Value>(&tl_bytes) else {
@@ -6738,9 +6791,7 @@ fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) ->
     const LSF_GLOBAL_FREEZE: u64 = 0x0040_0000;
     const LSF_REQUIRE_AUTH: u64 = 0x0004_0000;
     let tl_flags = tl.get("Flags").and_then(Value::as_u64).unwrap_or(0);
-    let issuer_flags = ctx
-        .view
-        .read(&keylet::account(&gets.issuer))
+    let issuer_flags = read(&keylet::account(&gets.issuer))
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .and_then(|a| a.get("Flags").and_then(Value::as_u64))
         .unwrap_or(0);
@@ -8189,6 +8240,14 @@ mod taker_crossing_tests {
             &offer_in,
             &offer_out,
             &owner_funds,
+            quality,
+        ));
+
+        assert!(!should_reap_tiny_increased_quality(
+            &owner,
+            &offer_in,
+            &offer_out,
+            &iou("0"),
             quality,
         ));
 
@@ -10836,13 +10895,20 @@ mod flow_cross_own_unfunded {
         tx: &serde_json::Value,
     ) -> TransactionResult {
         let rules = Rules::from_enabled([feature_id("FlowCross")]);
-        let mut ctx = ApplyContext {
-            tx,
-            view: sandbox,
-            rules: &rules,
-            fees,
+        let mut child = sandbox.child();
+        let result = {
+            let mut ctx = ApplyContext {
+                tx,
+                view: &mut child,
+                rules: &rules,
+                fees,
+            };
+            OfferCreateTransactor.apply(&mut ctx).unwrap()
         };
-        OfferCreateTransactor.apply(&mut ctx).unwrap()
+        if result.is_success() {
+            sandbox.merge_child_changes(child.into_changes());
+        }
+        result
     }
 
     fn owner_count(sandbox: &Sandbox<'_>, addr: &str) -> u64 {

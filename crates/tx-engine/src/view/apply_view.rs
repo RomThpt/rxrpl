@@ -7,6 +7,14 @@ use crate::view::read_view::ReadView;
 /// Extends `ReadView` with write operations. Used inside `Sandbox`
 /// to track mutations that can be committed or rolled back.
 pub trait ApplyView: ReadView {
+    /// Read the entry from this mutation layer's parent, bypassing writes made
+    /// by the current transaction handler. OfferStream uses this cancel-view
+    /// value to distinguish a pre-existing tiny offer from one made tiny by an
+    /// earlier step in the same transaction.
+    fn read_parent(&self, key: &Hash256) -> Option<Vec<u8>> {
+        self.read(key)
+    }
+
     /// Insert a new state entry. Errors if already exists.
     fn insert(&mut self, key: Hash256, data: Vec<u8>) -> Result<(), ApplyError>;
 

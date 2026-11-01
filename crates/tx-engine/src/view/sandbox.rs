@@ -210,6 +210,10 @@ impl ReadView for Sandbox<'_> {
 }
 
 impl ApplyView for Sandbox<'_> {
+    fn read_parent(&self, key: &Hash256) -> Option<Vec<u8>> {
+        self.parent.read(key)
+    }
+
     fn insert(&mut self, key: Hash256, data: Vec<u8>) -> Result<(), ApplyError> {
         if self.exists(&key) {
             return Err(ApplyError::AlreadyExists);
@@ -571,8 +575,15 @@ mod tests {
         let mut sandbox = Sandbox::new(&view);
         sandbox.update(key, vec![2]).unwrap();
 
-        let child = sandbox.child();
+        let mut child = sandbox.child();
         assert_eq!(child.read(&key), Some(vec![2]));
+        child.update(key, vec![3]).unwrap();
+        assert_eq!(child.read(&key), Some(vec![3]));
+        assert_eq!(
+            child.read_parent(&key),
+            Some(vec![2]),
+            "cancel-view reads bypass current handler mutations"
+        );
     }
 
     #[test]
