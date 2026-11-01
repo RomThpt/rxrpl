@@ -6550,6 +6550,44 @@ fn pay_out(
             round,
         )?;
     }
+    // FlowCross settles the taker's output through rippleCredit, which creates
+    // a zero-limit trust line on demand when this is the first delivery of the
+    // IOU. Without it the first maker debit is rolled back as tecPATH_DRY and
+    // an IOC offer can be deferred until the book has already been consumed.
+    if recipient != &amount.issuer {
+        let tl_key = keylet::trust_line(recipient, &amount.issuer, &amount.currency);
+        if ctx.view.read(&tl_key).is_none() {
+            if recipient == taker {
+                create_iou_trust_line(
+                    ctx,
+                    recipient,
+                    taker_acct,
+                    &amount.issuer,
+                    &amount.currency,
+                )?;
+            } else {
+                let recipient_key = keylet::account(recipient);
+                let bytes = ctx
+                    .view
+                    .read(&recipient_key)
+                    .ok_or(TransactionResult::TefInternal)?;
+                let mut recipient_acct: Value =
+                    serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+                create_iou_trust_line(
+                    ctx,
+                    recipient,
+                    &mut recipient_acct,
+                    &amount.issuer,
+                    &amount.currency,
+                )?;
+                let bytes = serde_json::to_vec(&recipient_acct)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+                ctx.view
+                    .update(recipient_key, bytes)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+            }
+        }
+    }
     credit_line(
         ctx,
         recipient,
@@ -11748,6 +11786,88 @@ mod flow_cross_own_unfunded {
                 serde_json::to_vec(&line).unwrap(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn flow_cross_creates_missing_taker_output_line() {
+        let mut ledger = Ledger::genesis();
+        for addr in [ISS, TAKER, MAKER] {
+            let id = decode_account_id(addr).unwrap();
+            let account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot",
+                "Account": addr,
+                "Balance": "1000000000",
+                "Sequence": 1,
+                "OwnerCount": 0,
+                "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        put_usd_line(&mut ledger, MAKER, 100);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let usd =
+            |value: &str| serde_json::json!({"currency": "USD", "issuer": ISS, "value": value});
+
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate",
+                    "Account": MAKER,
+                    "Fee": "10",
+                    "Sequence": 1,
+                    "TakerGets": usd("100"),
+                    "TakerPays": "100000000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+
+        let taker = decode_account_id(TAKER).unwrap();
+        let issuer = decode_account_id(ISS).unwrap();
+        let currency = helpers::currency_to_bytes("USD");
+        assert!(
+            sandbox
+                .read(&keylet::trust_line(&taker, &issuer, &currency))
+                .is_none()
+        );
+
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate",
+                    "Account": TAKER,
+                    "Fee": "10",
+                    "Sequence": 1,
+                    "Flags": TF_IMMEDIATE_OR_CANCEL,
+                    "TakerGets": "100000000",
+                    "TakerPays": usd("100"),
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+
+        let line: Value = serde_json::from_slice(
+            &sandbox
+                .read(&keylet::trust_line(&taker, &issuer, &currency))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            line["Balance"]["value"]
+                .as_str()
+                .map(|value| value.trim_start_matches('-')),
+            Some("100")
+        );
+        assert_eq!(owner_count(&sandbox, TAKER), 1);
     }
 
     /// 105500305 E05D37B2: removing the taker's own inverse offer releases one
