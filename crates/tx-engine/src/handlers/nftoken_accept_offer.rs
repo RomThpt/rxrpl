@@ -209,7 +209,7 @@ impl NFTokenAcceptOfferTransactor {
 
         let from_balance = helpers::get_balance(&from_acct);
         if from_balance < amount {
-            return Err(TransactionResult::TecUnfundedPayment);
+            return Err(TransactionResult::TecInsufficientFunds);
         }
         helpers::set_balance(&mut from_acct, from_balance - amount);
         let from_data =
@@ -748,6 +748,32 @@ mod tests {
         assert_eq!(
             NFTokenAcceptOfferTransactor.preclaim(&ctx),
             Err(TransactionResult::TecObjectNotFound)
+        );
+    }
+
+    #[test]
+    fn xrp_payment_with_insufficient_funds_uses_nft_result() {
+        let (ledger, _, _) = setup_with_sell_offer();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenAcceptOffer",
+            "Account": BUYER,
+            "Fee": "12",
+            "Sequence": 1,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+
+        assert_eq!(
+            NFTokenAcceptOfferTransactor::transfer_xrp(&mut ctx, BUYER, SELLER, 100_000_001,),
+            Err(TransactionResult::TecInsufficientFunds)
         );
     }
 }
