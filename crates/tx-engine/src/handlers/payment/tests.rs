@@ -4359,3 +4359,64 @@ fn ledger_30000103_second_path_consumes_jpy_cny_book() {
         }
     }
 }
+
+#[test]
+fn ledger_105500727_rejects_frozen_terminal_direct_step() {
+    const HOLDER: &str = "rhfeRRWvLYTZVTCaBMJmgUA6FWMLaWL8P7";
+    const ISSUER: &str = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De";
+    const LSF_LOW_FREEZE: u64 = 0x0040_0000;
+    const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
+    const LSF_LOW_DEEP_FREEZE: u64 = 0x0200_0000;
+
+    let holder = decode_account_id(HOLDER).unwrap();
+    let issuer = decode_account_id(ISSUER).unwrap();
+    assert!(holder.as_bytes() < issuer.as_bytes());
+    let amount = serde_json::json!({
+        "currency": "RLUSD",
+        "issuer": ISSUER,
+        "value": "1000000000",
+    });
+
+    let is_frozen = |line_flags: u64, destination_flags: u64| {
+        let mut ledger = Ledger::genesis();
+        add_account(&mut ledger, HOLDER, 100_000_000);
+        add_account(&mut ledger, ISSUER, 100_000_000);
+
+        let destination = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": HOLDER,
+            "Balance": "100000000",
+            "Sequence": 1,
+            "OwnerCount": 1,
+            "Flags": destination_flags,
+        });
+        ledger
+            .put_state(
+                keylet::account(&holder),
+                serde_json::to_vec(&destination).unwrap(),
+            )
+            .unwrap();
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": { "currency": "RLUSD", "issuer": ISSUER, "value": "0" },
+            "LowLimit": { "currency": "RLUSD", "issuer": HOLDER, "value": "1000000000" },
+            "HighLimit": { "currency": "RLUSD", "issuer": ISSUER, "value": "0" },
+            "Flags": line_flags,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&holder, &issuer, &helpers::currency_to_bytes("RLUSD")),
+                serde_json::to_vec(&line).unwrap(),
+            )
+            .unwrap();
+
+        let view = LedgerView::with_fees(&ledger, FeeSettings::default());
+        terminal_direct_step_frozen(&view, &holder, &amount)
+    };
+
+    assert!(is_frozen(LSF_LOW_FREEZE, 0));
+    assert!(!is_frozen(LSF_HIGH_FREEZE, 0));
+    assert!(is_frozen(LSF_LOW_DEEP_FREEZE, 0));
+    assert!(is_frozen(0, 0x0040_0000));
+    assert!(!is_frozen(0, 0));
+}
