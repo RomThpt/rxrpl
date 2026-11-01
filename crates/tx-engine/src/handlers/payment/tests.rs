@@ -4361,12 +4361,14 @@ fn ledger_30000103_second_path_consumes_jpy_cny_book() {
 }
 
 #[test]
-fn ledger_105500727_rejects_frozen_terminal_direct_step() {
+fn terminal_direct_step_rejects_freeze_and_issuer_no_ripple() {
     const HOLDER: &str = "rhfeRRWvLYTZVTCaBMJmgUA6FWMLaWL8P7";
     const ISSUER: &str = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De";
     const LSF_LOW_FREEZE: u64 = 0x0040_0000;
     const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
     const LSF_LOW_DEEP_FREEZE: u64 = 0x0200_0000;
+    const LSF_LOW_NO_RIPPLE: u64 = 0x0010_0000;
+    const LSF_HIGH_NO_RIPPLE: u64 = 0x0020_0000;
 
     let holder = decode_account_id(HOLDER).unwrap();
     let issuer = decode_account_id(ISSUER).unwrap();
@@ -4411,12 +4413,14 @@ fn ledger_105500727_rejects_frozen_terminal_direct_step() {
             .unwrap();
 
         let view = LedgerView::with_fees(&ledger, FeeSettings::default());
-        terminal_direct_step_frozen(&view, &holder, &amount)
+        terminal_direct_step_blocked(&view, &holder, &amount)
     };
 
     assert!(is_frozen(LSF_LOW_FREEZE, 0));
     assert!(!is_frozen(LSF_HIGH_FREEZE, 0));
     assert!(is_frozen(LSF_LOW_DEEP_FREEZE, 0));
     assert!(is_frozen(0, 0x0040_0000));
+    assert!(is_frozen(LSF_HIGH_NO_RIPPLE, 0));
+    assert!(!is_frozen(LSF_LOW_NO_RIPPLE, 0));
     assert!(!is_frozen(0, 0));
 }

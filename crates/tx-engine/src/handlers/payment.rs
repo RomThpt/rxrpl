@@ -196,6 +196,15 @@ impl Transactor for PaymentTransactor {
                         send_max_value,
                     );
                 } else {
+                    // Every cross-asset conversion ends in a book followed by
+                    // the destination issuer's DirectStep. Reject strands that
+                    // rippled cannot construct before selecting the specialized
+                    // single- or multi-strand executor below.
+                    let destination_id = decode_account_id(destination_str)
+                        .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+                    if terminal_direct_step_blocked(ctx.view, &destination_id, &ctx.tx["Amount"]) {
+                        return Err(TransactionResult::TecPathDry);
+                    }
                     // Multi-path Flow: a Payment with two or more alternative `Paths`
                     // that each resolve to a pure book/AMM boundary chain. rippled
                     // runs these through the multi-pass Flow loop, consuming any
@@ -1319,7 +1328,7 @@ fn direct_pair_has_amm_and_clob(
 /// pure issue/redeem paths, so the terminal step must honor the destination's
 /// regular freeze bit, either side's deep-freeze bit, and destination global
 /// freeze before any liquidity is consumed.
-fn terminal_direct_step_frozen(
+fn terminal_direct_step_blocked(
     view: &dyn crate::view::read_view::ReadView,
     destination: &rxrpl_primitives::AccountId,
     amount: &serde_json::Value,
@@ -1329,6 +1338,8 @@ fn terminal_direct_step_frozen(
     const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
     const LSF_LOW_DEEP_FREEZE: u64 = 0x0200_0000;
     const LSF_HIGH_DEEP_FREEZE: u64 = 0x0400_0000;
+    const LSF_LOW_NO_RIPPLE: u64 = 0x0010_0000;
+    const LSF_HIGH_NO_RIPPLE: u64 = 0x0020_0000;
 
     let Some((is_xrp, currency, issuer)) = amm_asset_of(amount) else {
         return false;
@@ -1356,7 +1367,17 @@ fn terminal_direct_step_frozen(
     } else {
         LSF_LOW_FREEZE
     };
-    line_flags & (destination_freeze | LSF_LOW_DEEP_FREEZE | LSF_HIGH_DEEP_FREEZE) != 0
+    // This DirectStep always follows a book. rippled therefore also applies
+    // the issuer side's NoRipple flag (DirectIPaymentStep::check), rejecting
+    // the strand before any book or AMM liquidity is consumed.
+    let issuer_no_ripple = if issuer.as_bytes() > destination.as_bytes() {
+        LSF_HIGH_NO_RIPPLE
+    } else {
+        LSF_LOW_NO_RIPPLE
+    };
+    line_flags
+        & (destination_freeze | LSF_LOW_DEEP_FREEZE | LSF_HIGH_DEEP_FREEZE | issuer_no_ripple)
+        != 0
 }
 
 /// A SendMax / Amount value as a `Number` magnitude (XRP drops as an integer,
@@ -1459,10 +1480,6 @@ fn apply_paths_payment_multi(
             )
         })
     });
-
-    if terminal_direct_step_frozen(ctx.view, &dst_id, &amount) {
-        return Err(TransactionResult::TecPathDry);
-    }
 
     let paths = ctx
         .tx
