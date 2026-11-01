@@ -343,13 +343,16 @@ pub fn limit_input_quality(
         }
         raw
     };
-    let output = {
+    let output = if out_is_xrp {
+        // StrandFlow::limitOut constructs XRPAmount directly from the
+        // continuous QualityFunction result. Before featureMPTokensV2 that
+        // conversion uses Number's default nearest rounding, rather than the
+        // downward grid used by AMM swap payouts themselves.
+        let _g = RoundModeGuard::new(RoundingMode::ToNearest);
+        Number::from_int(raw_output.to_xrp_drops_mode() as i64)
+    } else {
         let _g = RoundModeGuard::new(RoundingMode::Downward);
-        if out_is_xrp {
-            Number::from_int(raw_output.to_xrp_drops_mode() as i64)
-        } else {
-            Number::from_iou(&raw_output.to_iou())
-        }
+        Number::from_iou(&raw_output.to_iou())
     };
     let input = swap_asset_out(&pool_in, &pool_out, &output, tfee, in_is_xrp)?;
     Some((input, output))
@@ -1264,6 +1267,21 @@ mod tests {
             limit_input_quality(&pool_in, &pool_out, quality, 503, true, false).unwrap();
         assert_eq!(input.to_xrp_drops_mode(), 14_999_865);
         assert_eq!(output.to_iou().to_decimal_string(), "78131955.81042515");
+    }
+
+    // Mainnet ledger 105500477, FAD8D95E: the average-quality cap lands above
+    // the half-drop boundary. StrandFlow rounds the XRP output to 42,260,747
+    // before recomputing the ARMY input through swapAssetOut.
+    #[test]
+    fn limit_quality_rounds_native_output_to_nearest() {
+        let pool_in = Number::from_iou(&parse_iou_value("44014238.41050589"));
+        let pool_out = Number::from_int(230_161_408_450);
+        let (input, output) =
+            limit_input_quality(&pool_in, &pool_out, 0x5106_CB90_95F0_CBEB, 0, false, true)
+                .unwrap();
+
+        assert_eq!(output.to_xrp_drops_mode(), 42_260_747);
+        assert_eq!(input.to_iou().to_decimal_string(), "8083.09352975");
     }
 
     // Mainnet tx 6B2B088C… (ledger 105500212): rounding the XRP-input offer
