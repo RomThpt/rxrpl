@@ -2360,6 +2360,13 @@ fn cross_book_hop(
             if hop_out_done(&remaining_out, demand_out) {
                 break 'walk;
             }
+            // Once this BookStep has consumed its available input, rippled's
+            // callback returns false before OfferStream advances again. Do not
+            // inspect or reap a later offer. A step that starts at zero still
+            // walks invalid tips and may consume representable zero-cost dust.
+            if book_step_input_exhausted(&spent, &remaining_in) {
+                break 'walk;
+            }
             let Some(ob) = ctx.view.read(&offer_key) else {
                 continue;
             };
@@ -2900,6 +2907,10 @@ fn zero_cost_funded_xrp_offer(
         && !available.is_zero()
         && !leg_ge(available, offer_out)
         && scale_funds_limited_input(offer_in, available, offer_out).is_zero()
+}
+
+fn book_step_input_exhausted(spent_so_far: &Leg, remaining_in: &Leg) -> bool {
+    !spent_so_far.is_zero() && remaining_in.is_zero()
 }
 
 fn input_limited_uses_full_budget(
@@ -8359,11 +8370,12 @@ fn taker_cross(
 mod taker_crossing_tests {
     use super::{
         Leg, TakerCrossType, add_iou_balance, add_iou_balance_downward,
-        add_iou_balance_half_upward, composed_quality, consumes_full_offer, crossing_threshold,
-        debit_drains_source, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou,
-        full_offer_take, funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out,
-        in_for_out_offer, in_for_out_round, input_limited_uses_full_budget, leftover_is_dust,
-        leftover_leg, leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
+        add_iou_balance_half_upward, book_step_input_exhausted, composed_quality,
+        consumes_full_offer, crossing_threshold, debit_drains_source, flow_iou_to_iou,
+        flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou, full_offer_take,
+        funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
+        in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
+        leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
         legacy_intermediate_xrp_rounding_applies, net_book_payment_input, number_to_leg,
         out_for_in, own_tip_can_be_reaped, pack_rate, parity_rate,
         preserve_flow_input_limited_iou_ulp, qual_div, qual_mul, reject_quality,
@@ -8626,6 +8638,19 @@ mod taker_crossing_tests {
             &offer_in,
             &owner_funds,
             &offer_out,
+        ));
+    }
+
+    #[test]
+    fn ledger_105500652_stops_before_reaping_later_unfunded_offer() {
+        assert!(book_step_input_exhausted(
+            &iou("1.16496250827378"),
+            &iou("0")
+        ));
+        assert!(!book_step_input_exhausted(&iou("0"), &iou("0")));
+        assert!(!book_step_input_exhausted(
+            &iou("1.16496250827378"),
+            &iou("0.00000000000001"),
         ));
     }
 
