@@ -1311,8 +1311,10 @@ fn cross_offers(
                 // reduction would worsen its quality (105500437).
                 reap_out_of_quality_tiny_tips(ctx, taker, taker_acct, &dir_key)?;
             }
+            let permanent_only =
+                post_clob_cleanup && preserve_next_quality_self_offer(is_sell, &remaining_out);
             if !post_clob_cleanup
-                || advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, false)?
+                || advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, permanent_only)?
             {
                 deferred_out_of_quality_dir = Some(dir_key);
                 break;
@@ -1497,10 +1499,35 @@ fn cross_offers(
             // bounded by the taker's remaining TakerPays demand.
             let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
             let affordable_out = out_for_in(&spendable_in, &rate, &offer_out);
+            let desired_out = if is_sell {
+                avail_out.clone()
+            } else {
+                leg_min(&remaining_out, &avail_out)
+            };
+            let input_rate =
+                if offer_in.is_xrp || taker == &offer_in.issuer || owner == offer_in.issuer {
+                    1_000_000_000
+                } else {
+                    transfer_rate_value(ctx, &offer_in.issuer)
+                };
+            let source_funds_bind = source_funds_limited
+                && input_rate == 1_000_000_000
+                && terminal_budget_binds(
+                    &spendable_in,
+                    &desired_out,
+                    &affordable_out,
+                    &offer_in,
+                    &offer_out,
+                    &rate,
+                    leg_ge(&desired_out, &avail_out),
+                );
+            let use_full_input = is_sell
+                || (source_funds_bind
+                    && input_limited_uses_full_budget(true, false, false, &offer_out, false));
             let take_out = if is_sell {
                 leg_min(&avail_out, &affordable_out)
             } else {
-                leg_min(&leg_min(&remaining_out, &avail_out), &affordable_out)
+                leg_min(&desired_out, &affordable_out)
             };
 
             // Full take when the taker consumes the whole original offer;
@@ -1517,11 +1544,12 @@ fn cross_offers(
             );
             let (order_out, order_in) = if full_take {
                 (offer_out.clone(), offer_in.clone())
-            } else if is_sell && !leg_ge(&take_out, &avail_out) {
-                // tfSell input-bound: `take_out` was derived from the taker's whole
-                // remaining input at this quality, so the taker gives exactly that
-                // input — not a re-multiplied approximation that would leave a dust
-                // remainder unsold and diverge the maker's residual TakerPays.
+            } else if use_full_input && !leg_ge(&take_out, &avail_out) {
+                // Input-bound: `take_out` was derived from the taker's whole
+                // remaining input at this quality, so the taker gives exactly
+                // that input. This is always true for tfSell and also for a
+                // fee-free source whose available funds bind a non-sell pass;
+                // repricing the integral output would leave artificial IOU dust.
                 (take_out.clone(), spendable_in)
             } else {
                 let order_in = if !leg_ge(&take_out, &avail_out) {
@@ -1942,6 +1970,10 @@ fn amm_step_allows_clob(is_sell: bool, remaining_out: &Leg) -> bool {
 
 fn clob_band_allows_terminal_amm(amm_consumed: bool, funded_tip_remains: bool) -> bool {
     !amm_consumed || funded_tip_remains
+}
+
+fn preserve_next_quality_self_offer(is_sell: bool, remaining_out: &Leg) -> bool {
+    !is_sell && remaining_out.is_zero()
 }
 
 fn terminal_amm_reaches_deferred_clob(
@@ -6387,6 +6419,16 @@ fn pay_in(
                 &Number::ZERO,
             )?;
         }
+        // Flow's rippleCredit immediately removes a default trust line once
+        // the source debit drains it to zero. Besides releasing the reserve,
+        // this updates both owner directories and threads the issuer account.
+        crate::handlers::trust_set::maybe_delete_drained_trust_line(
+            ctx,
+            taker,
+            taker_acct,
+            &amount.issuer,
+            &amount.currency,
+        )?;
     }
     if owner == &amount.issuer {
         return Ok(());
@@ -8496,9 +8538,9 @@ mod taker_crossing_tests {
         leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
         legacy_intermediate_xrp_rounding_applies, net_book_payment_input, number_to_leg,
         out_for_in, own_tip_can_be_reaped, pack_rate, parity_rate,
-        preserve_flow_input_limited_iou_ulp, qual_div, qual_mul, reject_quality,
-        remaining_is_filled, remaining_is_filled_at, remaining_offer, scale_funds_limited_input,
-        select_path, sell_clamp_sub, should_bump_partial_path_credit,
+        preserve_flow_input_limited_iou_ulp, preserve_next_quality_self_offer, qual_div, qual_mul,
+        reject_quality, remaining_is_filled, remaining_is_filled_at, remaining_offer,
+        scale_funds_limited_input, select_path, sell_clamp_sub, should_bump_partial_path_credit,
         should_reap_tiny_increased_quality, should_trim_input_limited_iou_leftover,
         terminal_amm_reaches_deferred_clob, terminal_budget_binds, zero_cost_funded_xrp_offer,
         zero_cost_xrp_clob_fill,
@@ -8830,6 +8872,54 @@ mod taker_crossing_tests {
 
         assert!(!reject_quality(threshold, threshold));
         assert!(reject_quality(realized, threshold));
+    }
+
+    #[test]
+    fn ledger_105500749_source_funds_bind_before_xrp_rounding() {
+        let source_funds = iou("0.00419404338858");
+        let desired_out = xrp(28_077_251);
+        let offer_out = xrp(134_435_250);
+        let offer_in = iou("150");
+        let rate = from_rate(0x4F03_F6CB_7E2B_609C).unwrap();
+
+        let affordable_out = out_for_in(&source_funds, &rate, &offer_out);
+        let repriced = in_for_out(&affordable_out, &rate, &offer_in);
+
+        assert_eq!(affordable_out.drops, 3_758);
+        assert!(terminal_budget_binds(
+            &source_funds,
+            &desired_out,
+            &affordable_out,
+            &offer_in,
+            &offer_out,
+            &rate,
+            false,
+        ));
+        assert!(input_limited_uses_full_budget(
+            true, false, false, &offer_out, false,
+        ));
+        assert_eq!(repriced.iou.to_decimal_string(), "0.004193096676652889");
+        assert_eq!(
+            leftover_leg(&source_funds, &repriced, true)
+                .iou
+                .to_decimal_string(),
+            "0.000000946711927111"
+        );
+        assert!(leftover_leg(&source_funds, &source_funds, true).is_zero());
+        assert_eq!(
+            leftover_leg(&offer_in, &source_funds, true)
+                .iou
+                .to_decimal_string(),
+            "149.9958059566114"
+        );
+        assert_eq!(offer_out.drops - affordable_out.drops, 134_431_492);
+    }
+
+    #[test]
+    fn ledger_105500749_preserves_funded_self_offer_at_next_quality() {
+        assert!(preserve_next_quality_self_offer(false, &xrp(0)));
+        assert!(!preserve_next_quality_self_offer(false, &xrp(1)));
+        assert!(!preserve_next_quality_self_offer(true, &xrp(0)));
     }
 
     #[test]
