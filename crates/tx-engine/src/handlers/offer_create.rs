@@ -2794,6 +2794,11 @@ fn cross_book_hop(
             // reduces by); `net_out` is what `dest` actually receives after the
             // output issuer's transfer fee. The book demand (`remaining_out`) is
             // tracked in NET terms, so it decrements by `net_out`, not the gross.
+            let balance_rounding = if number_switchover {
+                BalanceRounding::Nearest
+            } else {
+                BalanceRounding::Legacy
+            };
             let net_out = pay_out_gross(
                 ctx,
                 taker,
@@ -2802,11 +2807,8 @@ fn cross_book_hop(
                 dest,
                 &order_out,
                 number_switchover,
-                if number_switchover {
-                    BalanceRounding::Nearest
-                } else {
-                    BalanceRounding::Legacy
-                },
+                balance_rounding,
+                balance_rounding,
                 skip_output_credit,
                 TransferFeeRounding::Down,
             )?;
@@ -3974,6 +3976,7 @@ fn amm_hop(
             dest,
             &gross,
             ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+            BalanceRounding::Downward,
             BalanceRounding::HalfUpward,
             skip_output_credit,
             TransferFeeRounding::Nearest,
@@ -4121,6 +4124,7 @@ fn apply_amm_move(
             dest,
             &amount,
             ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+            BalanceRounding::Downward,
             BalanceRounding::HalfUpward,
             skip_output_credit,
             TransferFeeRounding::Nearest,
@@ -6625,7 +6629,8 @@ fn pay_out_gross(
     recipient: &AccountId,
     amount: &Leg,
     round: bool,
-    balance_rounding: BalanceRounding,
+    owner_rounding: BalanceRounding,
+    recipient_rounding: BalanceRounding,
     skip_recipient_credit: bool,
     fee_rounding: TransferFeeRounding,
 ) -> Result<Leg, TransactionResult> {
@@ -6694,7 +6699,7 @@ fn pay_out_gross(
             &amount.issuer,
             &amount.currency,
             &amount.iou.negate(),
-            balance_rounding,
+            owner_rounding,
         )?;
         // BookPaymentStep settles the maker's TakerGets through rippleCredit.
         // If this redemption drains a default trust line, trustDelete runs
@@ -6728,7 +6733,7 @@ fn pay_out_gross(
             &amount.issuer,
             &amount.currency,
             &net,
-            balance_rounding,
+            recipient_rounding,
         )?;
     }
     let mut net_leg = amount.clone();
@@ -8693,6 +8698,23 @@ mod taker_crossing_tests {
     }
 
     #[test]
+    fn ledger_105500789_amm_pool_and_recipient_use_distinct_rounding() {
+        let pool_before = IOUAmount::from_decimal_string("-341.3073048793806").unwrap();
+        let delivery = IOUAmount::from_decimal_string("6.64285325496125").unwrap();
+
+        assert_eq!(
+            add_iou_balance_downward(&pool_before, &delivery).to_decimal_string(),
+            "-334.6644516244194"
+        );
+        assert_eq!(
+            add_iou_balance_half_upward(&pool_before, &delivery)
+                .unwrap()
+                .to_decimal_string(),
+            "-334.6644516244193"
+        );
+    }
+
+    #[test]
     fn ledger_105500053_funds_limited_iou_uses_nearest_quality() {
         let offer_in = iou("52.3881452157");
         let take_out = iou("10.15254433053624");
@@ -10355,6 +10377,7 @@ mod amm_transfer_fee_tests {
             &gross,
             false,
             BalanceRounding::Legacy,
+            BalanceRounding::Legacy,
             false,
             TransferFeeRounding::Nearest,
         )
@@ -11473,6 +11496,7 @@ mod taker_bridge_integration {
             &taker,
             &amount,
             false,
+            BalanceRounding::Legacy,
             BalanceRounding::Legacy,
             false,
             TransferFeeRounding::Down,
