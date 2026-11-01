@@ -472,6 +472,55 @@ pub fn replay_forward(
     })
 }
 
+/// Replay transactions in an already-observed final apply order.
+///
+/// Historical closed-ledger data contains only claimed transactions. When the
+/// original consensus candidate set also contained a transaction that was not
+/// applied, its SHAMap root (the canonical-ordering salt) cannot be reconstructed
+/// from the closed ledger alone. XSCP packs retain each claimed transaction's
+/// metadata `TransactionIndex`, so the offline differential worker can use this
+/// path to verify execution and state fidelity without inventing the missing
+/// candidate-set member. Live consensus continues to use [`replay_forward`].
+pub fn replay_forward_observed_order(
+    parent: &Ledger,
+    txs: TxSet,
+    header: &LedgerHeader,
+    tx_engine: &TxEngine,
+    fees: &FeeSettings,
+) -> Result<ReplayOutcome, NodeError> {
+    let total = txs.len();
+    let mut ledger = Ledger::new_open(parent);
+    ledger.header.close_time_resolution = header.close_time_resolution;
+    ledger.header.close_time = parent.header.close_time + u32::from(header.close_time_resolution);
+
+    let rules = rules_for_ledger(&ledger);
+    let mut applied = 0usize;
+    for (_id, blob) in txs {
+        let Ok(json) = rxrpl_codec::binary::decode(&blob) else {
+            continue;
+        };
+        if let Ok(result) = tx_engine.apply(&json, &mut ledger, &rules, fees)
+            && result.is_claimed()
+        {
+            applied += 1;
+        }
+    }
+
+    ledger
+        .close(header.close_time, header.close_flags)
+        .map_err(|e| NodeError::Server(format!("observed-order replay close failed: {e}")))?;
+
+    Ok(ReplayOutcome {
+        account_hash_match: ledger.header.account_hash == header.account_hash,
+        tx_hash_match: ledger.header.tx_hash == header.tx_hash,
+        ledger_hash_match: ledger.header.hash == header.hash,
+        drops_match: ledger.header.drops == header.drops,
+        applied,
+        failed: total - applied,
+        ledger,
+    })
+}
+
 /// A `TxEngine` with every transactor phase registered and signature checks
 /// disabled — the byte-exact replay engine shared by the play-forward oracle and
 /// the blob-fed segment worker (replayed mainnet txs are already validated).

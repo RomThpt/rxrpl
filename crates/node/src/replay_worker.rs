@@ -18,7 +18,10 @@ use rxrpl_ledger::{Ledger, LedgerHeader};
 use rxrpl_primitives::Hash256;
 use rxrpl_shamap::{SHAMap, transaction_set_root};
 
-use crate::play_forward::{all_handlers_engine, fees_for_ledger, replay_forward, transaction_id};
+use crate::play_forward::{
+    TxSet, all_handlers_engine, fees_for_ledger, replay_forward, replay_forward_observed_order,
+    transaction_id,
+};
 
 /// `XSCP` pack framing (mirror of `xrpl-state-compare` `core/pack.py`).
 const MAGIC: &[u8; 4] = b"XSCP";
@@ -63,6 +66,9 @@ pub struct TxReport {
 /// Per-ledger replay result: the three hashes computed vs the mainnet header.
 pub struct LedgerReport {
     pub seq: u64,
+    /// True when the closed-ledger `TransactionIndex` order was required because
+    /// the original consensus candidate-set salt was absent from the XSCP pack.
+    pub observed_order_replay: bool,
     pub account_hash_match: bool,
     pub tx_hash_match: bool,
     pub ledger_hash_match: bool,
@@ -92,7 +98,29 @@ pub struct ReplaySummary {
     pub tx_hash_mismatches: usize,
     pub ledger_hash_mismatches: usize,
     pub drops_mismatches: usize,
+    pub observed_order_replays: usize,
     pub stopped_early: bool,
+}
+
+fn observed_order_txset(rec: &LedgerRecord) -> Result<TxSet, String> {
+    let mut ordered = Vec::with_capacity(rec.txs.len());
+    for tx in &rec.txs {
+        let meta = rxrpl_codec::binary::decode(&tx.meta_blob)
+            .map_err(|e| format!("invalid metadata for observed-order replay: {e:?}"))?;
+        let index = meta
+            .get("TransactionIndex")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or("metadata missing TransactionIndex")?;
+        ordered.push((index, transaction_id(&tx.tx_blob), tx.tx_blob.clone()));
+    }
+    ordered.sort_by_key(|(index, _, _)| *index);
+    if ordered.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err("duplicate metadata TransactionIndex".into());
+    }
+    Ok(ordered
+        .into_iter()
+        .map(|(_, txid, blob)| (txid, blob))
+        .collect())
 }
 
 fn take<'a>(b: &'a [u8], off: &mut usize, n: usize) -> Result<&'a [u8], String> {
@@ -475,6 +503,7 @@ where
         tx_hash_mismatches: 0,
         ledger_hash_mismatches: 0,
         drops_mismatches: 0,
+        observed_order_replays: 0,
         stopped_early: false,
     };
 
@@ -494,8 +523,20 @@ where
         let set_hash = transaction_set_root(&txids);
         let fees = fees_for_ledger(&parent);
 
-        let outcome = replay_forward(&parent, set_hash, txset, &hdr, &engine, &fees)
+        let canonical_outcome = replay_forward(&parent, set_hash, txset, &hdr, &engine, &fees)
             .map_err(|e| format!("replay of ledger {seq} failed: {e:?}"))?;
+        let mut outcome = canonical_outcome;
+        let mut observed_order_replay = false;
+        if (!outcome.is_faithful() || outcome.failed != 0)
+            && let Ok(ordered) = observed_order_txset(rec)
+            && let Ok(observed) =
+                replay_forward_observed_order(&parent, ordered, &hdr, &engine, &fees)
+            && observed.is_faithful()
+            && observed.failed == 0
+        {
+            outcome = observed;
+            observed_order_replay = true;
+        }
 
         let txs = emitted_meta(&outcome.ledger, &rec.txs)?;
         if txs.len() != outcome.applied {
@@ -507,6 +548,7 @@ where
         }
         let report = LedgerReport {
             seq,
+            observed_order_replay,
             account_hash_match: outcome.account_hash_match,
             tx_hash_match: outcome.tx_hash_match,
             ledger_hash_match: outcome.ledger_hash_match,
@@ -531,6 +573,7 @@ where
         summary.tx_hash_mismatches += usize::from(!report.tx_hash_match);
         summary.ledger_hash_mismatches += usize::from(!report.ledger_hash_match);
         summary.drops_mismatches += usize::from(!report.drops_match);
+        summary.observed_order_replays += usize::from(report.observed_order_replay);
         let must_stop = !report.account_hash_match || !report.drops_match || report.failed != 0;
 
         // Seed the next ledger's parent hash from mainnet's real value rather
@@ -651,6 +694,36 @@ mod tests {
             tx_blob: blob.to_vec(),
             meta_blob: vec![0xF1],
         }
+    }
+
+    #[test]
+    fn observed_order_uses_metadata_transaction_index() {
+        let record = |blob: &[u8], index: u64| TxRecord {
+            tx_hash: *transaction_id(blob).as_bytes(),
+            tx_blob: blob.to_vec(),
+            meta_blob: rxrpl_codec::binary::encode(&serde_json::json!({
+                "TransactionIndex": index,
+                "TransactionResult": 0,
+                "AffectedNodes": [],
+            }))
+            .unwrap(),
+        };
+        let ledger = LedgerRecord {
+            seq: 2,
+            header_blob: Vec::new(),
+            txs: vec![
+                record(b"third", 2),
+                record(b"first", 0),
+                record(b"second", 1),
+            ],
+        };
+
+        let ordered = observed_order_txset(&ledger).unwrap();
+        let blobs: Vec<Vec<u8>> = ordered.into_iter().map(|(_, blob)| blob).collect();
+        assert_eq!(
+            blobs,
+            [b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+        );
     }
 
     fn empty_parent(sequence: u32) -> Ledger {

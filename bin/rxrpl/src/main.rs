@@ -602,6 +602,7 @@ fn cmd_replay_segment(
                 .collect();
             let line = serde_json::json!({
                 "seq": r.seq,
+                "observed_order_replay": r.observed_order_replay,
                 "account_hash_match": r.account_hash_match,
                 "tx_hash_match": r.tx_hash_match,
                 "ledger_hash_match": r.ledger_hash_match,
@@ -659,6 +660,7 @@ fn cmd_replay_segment(
             "tx_hash_mismatches": summary.tx_hash_mismatches,
             "ledger_hash_mismatches": summary.ledger_hash_mismatches,
             "drops_mismatches": summary.drops_mismatches,
+            "observed_order_replays": summary.observed_order_replays,
             "stopped_early": summary.stopped_early,
         }
     });
