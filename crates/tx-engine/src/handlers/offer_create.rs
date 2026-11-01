@@ -1249,6 +1249,11 @@ fn cross_offers(
     let mut remaining_in = in_leg.clone();
     let mut source_remaining = source_budget.clone();
     let mut crossed = false;
+    // A CLOB-bounded AMM pass can leave only a self/unfunded tip behind. In
+    // rippled, the next pass removes that tip, delivers nothing, and ends the
+    // strand as dry. Do not turn that dry pass into a second AMM crossing at
+    // the looser taker threshold in the terminal tail.
+    let mut terminal_amm_allowed = true;
     // Flow's OfferStream advances once more after fully consuming a tip. While
     // doing so it reaps every unfunded offer it encounters, even across quality
     // directories, and only then exposes the next funded offer for the quality
@@ -1341,6 +1346,7 @@ fn cross_offers(
             }
             if !domain_only {
                 let before = remaining_out.clone();
+                let source_before_amm = source_remaining.clone();
                 let continue_to_clob = try_amm_step(
                     ctx,
                     taker,
@@ -1358,7 +1364,12 @@ fn cross_offers(
                     // execOffer evaluates self-cross removal before its CLOB
                     // callback checks the now-remaining budget. Mirror that
                     // ordering when an AMM offer asks BookStep to continue.
-                    let _ = advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, false)?;
+                    let funded_tip_remains =
+                        advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, false)?;
+                    terminal_amm_allowed &= clob_band_allows_terminal_amm(
+                        leg_gt(&source_before_amm, &source_remaining),
+                        funded_tip_remains,
+                    );
                 }
                 if !leg_ge(&before, &remaining_out) || !leg_ge(&remaining_out, &before) {
                     remaining_out_num = leg_to_number(&remaining_out);
@@ -1561,6 +1572,7 @@ fn cross_offers(
                 &order_out,
                 number_switchover,
             )?;
+            terminal_amm_allowed = true;
 
             // The offer's available liquidity is exhausted when the take
             // consumes all of `avail_out` — either the whole offer (`full_take`)
@@ -1665,7 +1677,7 @@ fn cross_offers(
                 is_sell,
             )?;
         }
-        if !domain_only {
+        if !domain_only && terminal_amm_allowed {
             let source_before_amm = source_remaining.clone();
             let _ = try_amm_step(
                 ctx,
@@ -1885,6 +1897,10 @@ fn try_amm_step(
 
 fn amm_step_allows_clob(is_sell: bool, remaining_out: &Leg) -> bool {
     is_sell || !remaining_out.is_zero()
+}
+
+fn clob_band_allows_terminal_amm(amm_consumed: bool, funded_tip_remains: bool) -> bool {
+    !amm_consumed || funded_tip_remains
 }
 
 fn terminal_amm_reaches_deferred_clob(
@@ -8404,11 +8420,11 @@ mod taker_crossing_tests {
     use super::{
         Leg, TakerCrossType, add_iou_balance, add_iou_balance_downward,
         add_iou_balance_half_upward, amm_step_allows_clob, book_step_input_exhausted,
-        composed_quality, consumes_full_offer, crossing_threshold, debit_drains_source,
-        flow_iou_to_iou, flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou, full_offer_take,
-        funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
-        in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
-        leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
+        clob_band_allows_terminal_amm, composed_quality, consumes_full_offer, crossing_threshold,
+        debit_drains_source, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou,
+        full_offer_take, funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out,
+        in_for_out_offer, in_for_out_round, input_limited_uses_full_budget, leftover_is_dust,
+        leftover_leg, leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
         legacy_intermediate_xrp_rounding_applies, net_book_payment_input, number_to_leg,
         out_for_in, own_tip_can_be_reaped, pack_rate, parity_rate,
         preserve_flow_input_limited_iou_ulp, qual_div, qual_mul, reject_quality,
@@ -8724,6 +8740,13 @@ mod taker_crossing_tests {
             &iou("0"),
             &xrp(1),
         ));
+    }
+
+    #[test]
+    fn ledger_105500731_dry_clob_pass_stops_terminal_amm() {
+        assert!(!clob_band_allows_terminal_amm(true, false));
+        assert!(clob_band_allows_terminal_amm(true, true));
+        assert!(clob_band_allows_terminal_amm(false, false));
     }
 
     #[test]
