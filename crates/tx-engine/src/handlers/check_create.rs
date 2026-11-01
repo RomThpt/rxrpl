@@ -74,6 +74,18 @@ impl Transactor for CheckCreateTransactor {
         let mut src_account: serde_json::Value =
             serde_json::from_slice(&src_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
+        // rippled CheckCreate::doApply checks the balance from before the fee
+        // was charged against the reserve for one additional owned object. The
+        // engine has already deducted the fee when the handler runs, so restore
+        // it for this comparison. Failure is a claimed tec: fee and sequence
+        // remain consumed, but no Check or owner-directory entry is created.
+        let owner_count = helpers::get_owner_count(&src_account);
+        let prior_balance =
+            helpers::get_balance(&src_account).saturating_add(helpers::get_fee(ctx.tx));
+        if prior_balance < ctx.fees.account_reserve(owner_count + 1) {
+            return Err(TransactionResult::TecInsufficientReserve);
+        }
+
         // The Check's keylet/Sequence is the TX seq-proxy value (the engine
         // already consumed the sender's Sequence/Ticket centrally, so the
         // account Sequence is one ahead and must not be used here).
@@ -255,5 +267,51 @@ mod tests {
             dst_dir["Indexes"][0].as_str().unwrap().to_uppercase(),
             check_key.to_string().to_uppercase()
         );
+    }
+
+    #[test]
+    fn ledger_105500823_rejects_check_below_next_owner_reserve() {
+        let mut ledger = setup_two_accounts();
+        let src_id = decode_account_id(SRC).unwrap();
+        let src_key = keylet::account(&src_id);
+        let mut src: serde_json::Value =
+            serde_json::from_slice(ledger.get_state(&src_key).unwrap()).unwrap();
+        src["Balance"] = serde_json::Value::String("1799978".into());
+        src["OwnerCount"] = serde_json::Value::from(4);
+        ledger
+            .put_state(src_key, serde_json::to_vec(&src).unwrap())
+            .unwrap();
+
+        let fees = FeeSettings {
+            base_fee: 10,
+            reserve_base: 1_000_000,
+            reserve_increment: 200_000,
+        };
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "CheckCreate",
+            "Account": SRC,
+            "Destination": DST,
+            "SendMax": "5000000",
+            "Fee": "12",
+            "Sequence": 1,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+
+        assert_eq!(
+            CheckCreateTransactor.apply(&mut ctx),
+            Err(TransactionResult::TecInsufficientReserve)
+        );
+        assert!(ctx.view.read(&keylet::check(&src_id, 1)).is_none());
+        let src: serde_json::Value =
+            serde_json::from_slice(&ctx.view.read(&src_key).unwrap()).unwrap();
+        assert_eq!(src["OwnerCount"].as_u64(), Some(4));
     }
 }
