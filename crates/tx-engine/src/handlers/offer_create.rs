@@ -3703,17 +3703,31 @@ fn amm_hop(
     if deliver_num.is_zero() || spent_num.is_zero() {
         return Ok(None);
     }
+
+    // The AMM math prices the NET amount received by the pool. When the input
+    // issuer charges a transfer fee, the source spends the corresponding GROSS
+    // amount. The strand quality check must include that gross debit; comparing
+    // the pool input against a sendMax threshold that was itself grossed admits
+    // a path one transfer fee worse than the taker's limit (105500536).
+    let pool_spent = number_to_leg(&spent_num, budget_in);
+    let source_spent = if input_fee_applies {
+        let mut gross = pool_spent.clone();
+        gross.iou = grossed(&pool_spent.iou, &transfer_rate(ctx, &budget_in.issuer));
+        gross
+    } else {
+        pool_spent.clone()
+    };
     if let Some(cq) = target_quality {
         // StrandFlow::limitOut checks the realised quality after integral-grid
-        // conversion. An adjusted output that rounds worse than the requested
-        // quality by more than 1e-7 makes the whole strand dry. The CLOB-band
-        // spot cap performs its own quality validation in
-        // change_spot_price_quality; this gate is for the tail average-quality
+        // conversion and source transfer fees. An adjusted output that rounds
+        // worse than the requested quality by more than 1e-7 makes the whole
+        // strand dry. The CLOB-band spot cap performs its own quality validation
+        // in change_spot_price_quality; this gate is for the tail average-quality
         // cap only.
         if !cap_ending_spot_price
             && capped_by_quality
             && !adjusted_amm_quality_allows(
-                &spent_num,
+                &leg_to_number(&source_spent),
                 in_xrp,
                 &deliver_num,
                 out_xrp,
@@ -3724,19 +3738,6 @@ fn amm_hop(
             return Ok(None);
         }
     }
-
-    // The AMM math prices the NET amount received by the pool. When the input
-    // issuer charges a transfer fee, the source spends the corresponding GROSS
-    // amount. Return that gross amount to the route driver; otherwise it treats
-    // the fee as unspent budget and incorrectly crosses a CLOB with the residue.
-    let pool_spent = number_to_leg(&spent_num, budget_in);
-    let source_spent = if input_fee_applies {
-        let mut gross = pool_spent.clone();
-        gross.iou = grossed(&pool_spent.iou, &transfer_rate(ctx, &budget_in.issuer));
-        gross
-    } else {
-        pool_spent.clone()
-    };
 
     // A missing destination line makes this AMM step dry when accepting the
     // output would create an unfunded owned object. Check before moving either
@@ -9532,6 +9533,53 @@ mod amm_quality_gate_tests {
         assert_eq!(output.to_decimal_string(), "42260747");
         assert!(adjusted_amm_quality_allows(
             &input, false, &output, true, target, true,
+        ));
+    }
+
+    // Testnet ledger 105500536, 6FB245AE: the USDC issuer charges 0.3%.
+    // limit_input_quality sizes the pool's net input at the already-grossed
+    // sendMax quality, but StrandFlow evaluates the source's gross debit. The
+    // extra transfer fee pushes the realised strand below the offer limit, so
+    // the AMM path is dry and the complete offer must rest on the book.
+    #[test]
+    fn transfer_fee_is_included_in_tail_amm_quality() {
+        let pool_in = Number::from_iou(
+            &rxrpl_amount::IOUAmount::from_decimal_string("50269.83163890537").unwrap(),
+        );
+        let pool_out = Number::from_int(45_266_478_323);
+        let offer_in = rxrpl_amount::IOUAmount::from_decimal_string("9974.282158").unwrap();
+        let offer_out = rxrpl_amount::IOUAmount::from_decimal_string("8989149974").unwrap();
+        let transfer_rate = rxrpl_amount::IOUAmount::from_decimal_string("1.003").unwrap();
+        let gross_limit =
+            rxrpl_amount::IOUAmount::mul_round(&offer_in, &transfer_rate, true).unwrap();
+        let target = rxrpl_amount::get_rate_round_even(&gross_limit, &offer_out).unwrap();
+        let (pool_input, output) =
+            crate::amm_helpers::limit_input_quality(&pool_in, &pool_out, target, 54, false, true)
+                .unwrap();
+
+        assert_eq!(pool_input.to_decimal_string(), "80.97812541029156");
+        assert_eq!(output.to_xrp_drops_mode(), 72_761_855);
+        assert!(adjusted_amm_quality_allows(
+            &pool_input,
+            false,
+            &output,
+            true,
+            target,
+            true,
+        ));
+
+        let source_input = Number::from_iou(
+            &rxrpl_amount::IOUAmount::mul_round(&pool_input.to_iou(), &transfer_rate, true)
+                .unwrap(),
+        );
+        assert_eq!(source_input.to_decimal_string(), "81.22105978652244");
+        assert!(!adjusted_amm_quality_allows(
+            &source_input,
+            false,
+            &output,
+            true,
+            target,
+            true,
         ));
     }
 }
