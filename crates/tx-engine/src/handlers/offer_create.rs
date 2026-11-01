@@ -1741,7 +1741,11 @@ fn advance_past_unfunded_quality(
             }
             continue;
         }
-        let removable = expired
+        // The pre-AMM probe is speculative: an AMM may satisfy the whole
+        // demand before this CLOB tip is selected. Keep an otherwise funded
+        // expired offer untouched in that case (105500455); a retained CLOB
+        // walk or post-fill advance removes it normally.
+        let removable = (!permanent_only && expired)
             || offer_in.is_zero()
             || offer_out.is_zero()
             || is_deep_frozen(ctx, &owner, &offer_in)
