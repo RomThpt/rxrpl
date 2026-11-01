@@ -553,7 +553,7 @@ impl Transactor for OfferCreateTransactor {
         // crossing.
         let flow_source_budget = Leg::parse(&taker_gets).map(|gets| {
             let funds = owner_funds_leg(ctx, &account_id, &gets);
-            leg_min(&gets, &funds)
+            (leg_min(&gets, &funds), leg_ge(&gets, &funds))
         });
         reap_own_unfunded_inverse_tip(
             ctx,
@@ -585,7 +585,11 @@ impl Transactor for OfferCreateTransactor {
                     domain_only,
                     flow_source_budget
                         .as_ref()
+                        .map(|(budget, _)| budget)
                         .ok_or(TransactionResult::TemBadOffer)?,
+                    flow_source_budget
+                        .as_ref()
+                        .is_some_and(|(_, funds_limited)| *funds_limited),
                 ) {
                     Ok(remaining) => remaining,
                     // rippled's flowCross does not propagate a claimed Flow
@@ -1189,6 +1193,7 @@ fn cross_offers(
     is_sell: bool,
     domain_only: bool,
     source_budget: &Leg,
+    source_funds_limited: bool,
 ) -> Result<(Value, Value, bool, bool), TransactionResult> {
     let out_leg = match Leg::parse(taker_pays) {
         Some(l) => l,
@@ -1260,6 +1265,11 @@ fn cross_offers(
     // check. Do not do this on the initial probe: already-unfunded offers beyond
     // the taker's limit stay untouched when no preceding tip was consumed.
     let mut advance_after_exhausted_tip = false;
+    // Once a real CLOB callback has run, BookStep materialises the next tip and
+    // applies permanent self/unfunded cleanup before checking its quality. Keep
+    // the initial probe non-destructive, including when the preceding external
+    // offer was only partially consumed.
+    let mut clob_offer_attempted = false;
     let book_prefix = &inverse_book.as_bytes()[0..24];
     let fok = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_FILL_OR_KILL != 0;
     // Autobridge: when NEITHER leg is XRP, the offer also competes an
@@ -1291,7 +1301,8 @@ fn cross_offers(
         probe = dir_key;
         let dir_quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
         if dir_quality > threshold {
-            if !advance_after_exhausted_tip {
+            let post_clob_cleanup = advance_after_exhausted_tip || clob_offer_attempted;
+            if !post_clob_cleanup {
                 // OfferStream materialises the first CLOB tip before BookStep
                 // rejects its quality. Preserve the historical rule that an
                 // ordinary unfunded offer beyond the taker's limit is left
@@ -1299,7 +1310,7 @@ fn cross_offers(
                 // reduction would worsen its quality (105500437).
                 reap_out_of_quality_tiny_tips(ctx, taker, taker_acct, &dir_key)?;
             }
-            if !advance_after_exhausted_tip
+            if !post_clob_cleanup
                 || advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, false)?
             {
                 deferred_out_of_quality_dir = Some(dir_key);
@@ -1382,17 +1393,6 @@ fn cross_offers(
         let offers = book_dir_indexes(ctx, &dir_key);
 
         for offer_key in offers {
-            // A tfSell offer sells its whole TakerGets and accepts any TakerPays
-            // (rippled: deliver = kMaxNative), so the walk is bounded by the
-            // taker's remaining input, not its TakerPays demand.
-            let done = if is_sell {
-                remaining_in.is_zero()
-            } else {
-                remaining_out.is_zero()
-            };
-            if done {
-                break 'walk;
-            }
             let Some(ob) = ctx.view.read(&offer_key) else {
                 continue;
             };
@@ -1465,6 +1465,18 @@ fn cross_offers(
                 // funded offers too (mainnet 105500215 / 91B10CB9).
                 reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, &dir_key)?;
                 continue;
+            }
+            // OfferStream materialises and permanently removes invalid or
+            // self-crossing tips before BookStep's callback observes that the
+            // taker's budget is exhausted. Only a funded external tip stops
+            // the walk once the requested crossing is complete.
+            let done = if is_sell {
+                remaining_in.is_zero()
+            } else {
+                remaining_out.is_zero()
+            };
+            if done {
+                break 'walk;
             }
             if reject_quality(dir_quality, clob_threshold) {
                 break 'walk;
@@ -1561,7 +1573,10 @@ fn cross_offers(
                 &owner,
                 &order_in,
                 number_switchover,
-                false,
+                PayInOptions {
+                    skip_taker_debit: false,
+                    allow_dust_drain: source_funds_limited,
+                },
             )?;
             pay_out(
                 ctx,
@@ -1572,6 +1587,7 @@ fn cross_offers(
                 &order_out,
                 number_switchover,
             )?;
+            clob_offer_attempted = true;
             terminal_amm_allowed = true;
 
             // The offer's available liquidity is exhausted when the take
@@ -2700,7 +2716,10 @@ fn cross_book_hop(
                     &owner,
                     &order_in,
                     number_switchover,
-                    skip_input_debit,
+                    PayInOptions {
+                        skip_taker_debit: skip_input_debit,
+                        allow_dust_drain: true,
+                    },
                 )?;
             } else {
                 pay_in_book_payment(
@@ -3849,7 +3868,10 @@ fn amm_hop(
             &pool_id,
             &pool_spent,
             ctx.rules.enabled(&feature_id("fixUniversalNumber")),
-            skip_input_debit,
+            PayInOptions {
+                skip_taker_debit: skip_input_debit,
+                allow_dust_drain: true,
+            },
         )?;
     }
 
@@ -3979,7 +4001,10 @@ fn apply_amm_move(
             &hop.pool_id,
             &amount,
             ctx.rules.enabled(&feature_id("fixUniversalNumber")),
-            skip_input_debit,
+            PayInOptions {
+                skip_taker_debit: skip_input_debit,
+                allow_dust_drain: true,
+            },
         )?;
     }
     // Output: this pool -> dest / next pool.
@@ -6279,6 +6304,12 @@ fn leftover_leg(a: &Leg, b: &Leg, number_switchover: bool) -> Leg {
 
 /// Move the taker's input to the offer owner: XRP via balances, IOU via the
 /// grossed trust-line debit / net credit.
+#[derive(Clone, Copy)]
+struct PayInOptions {
+    skip_taker_debit: bool,
+    allow_dust_drain: bool,
+}
+
 fn pay_in(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
@@ -6286,10 +6317,10 @@ fn pay_in(
     owner: &AccountId,
     amount: &Leg,
     round: bool,
-    skip_taker_debit: bool,
+    options: PayInOptions,
 ) -> Result<(), TransactionResult> {
     if amount.is_xrp {
-        if !skip_taker_debit {
+        if !options.skip_taker_debit {
             let bal = helpers::get_balance(taker_acct) as i64 - amount.drops;
             if bal < 0 {
                 return Err(TransactionResult::TecUnfundedOffer);
@@ -6298,7 +6329,7 @@ fn pay_in(
         }
         return credit_xrp(ctx, owner, amount.drops);
     }
-    if !skip_taker_debit && taker != &amount.issuer {
+    if !options.skip_taker_debit && taker != &amount.issuer {
         // Redeeming an IOU directly to its issuer carries no transfer fee.
         // Likewise, an issuer paying its own IOU creates value without a
         // self-line debit. Only a third-party-to-third-party transfer is
@@ -6312,7 +6343,8 @@ fn pay_in(
         let source_funds = owner_funds_leg(ctx, taker, amount);
         let mut gross_leg = amount.clone();
         gross_leg.iou = gross;
-        let drains_source = debit_drains_source(&source_funds, &gross_leg);
+        let drains_source =
+            options.allow_dust_drain && debit_drains_source(&source_funds, &gross_leg);
         credit_line(
             ctx,
             taker,
@@ -6387,7 +6419,18 @@ fn pay_in_book_payment(
             round,
         )?;
     }
-    pay_in(ctx, taker, taker_acct, owner, net, round, true)
+    pay_in(
+        ctx,
+        taker,
+        taker_acct,
+        owner,
+        net,
+        round,
+        PayInOptions {
+            skip_taker_debit: true,
+            allow_dust_drain: true,
+        },
+    )
 }
 
 /// Move the offer owner's output to `recipient`: XRP via balances, IOU via the
@@ -10224,7 +10267,10 @@ mod amm_transfer_fee_tests {
             &issuer,
             &amount,
             true,
-            false,
+            PayInOptions {
+                skip_taker_debit: false,
+                allow_dust_drain: true,
+            },
         )
         .unwrap();
 
