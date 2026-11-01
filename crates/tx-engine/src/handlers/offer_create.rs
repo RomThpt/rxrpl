@@ -1301,11 +1301,11 @@ fn cross_offers(
             continue;
         }
         // BookStep materialises the CLOB tip before comparing it with the
-        // synthetic AMM offer. OfferStream therefore removes invalid,
-        // self-owned, and unfunded tips even when the AMM subsequently fills
-        // the taker's entire demand. Do the same before AMM selection; the
-        // regular offer loop below will resume at the first funded external
-        // offer (testnet ledger 105500437).
+        // synthetic AMM offer. OfferStream permanently removes invalid and
+        // unfunded tips at that point, but a funded self-offer is removed only
+        // if execOffer later selects the CLOB. Do the permanent-only cleanup
+        // before AMM selection; the regular offer loop performs self-cross
+        // cleanup if the AMM does not finish the crossing.
         let _ = advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, true)?;
         // Interleave the AMM at this quality band BEFORE the resting CLOB offers.
         // rippled crosses whichever of the synthetic AMM offer / CLOB tip is
@@ -1775,14 +1775,15 @@ fn advance_past_unfunded_quality(
         }
         // The pre-AMM probe is speculative: an AMM may satisfy the whole
         // demand before this CLOB tip is selected. Keep an otherwise funded
-        // expired offer untouched in that case (105500455); a retained CLOB
-        // walk or post-fill advance removes it normally.
+        // expired offer untouched in that case (105500455), and likewise keep
+        // a funded self-offer until the CLOB is actually selected (105500679).
+        // A retained CLOB walk or post-fill advance removes either normally.
         let removable = (!permanent_only && expired)
             || offer_in.is_zero()
             || offer_out.is_zero()
             || is_deep_frozen(ctx, &owner, &offer_in)
             || offer_cannot_pay(&funds, &offer_out, flags, &owner == taker)
-            || owner == *taker;
+            || (!permanent_only && owner == *taker);
         if !removable {
             return Ok(true);
         }
@@ -11317,6 +11318,76 @@ mod taker_bridge_integration {
             "new buy leftover is placed"
         );
         assert_eq!(oc(&sandbox, O1), 1, "two inverse offers reaped, one placed");
+    }
+
+    #[test]
+    fn ledger_105500679_speculative_probe_keeps_funded_self_offer() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 0);
+        put_line(&mut ledger, TAKER, b"SHR", 0);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER,
+                    "Fee": "12", "Sequence": 1,
+                    "TakerGets": "460655",
+                    "TakerPays": {"currency": "SHR", "issuer": ISS, "value": "46"},
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+
+        let taker = decode_account_id(TAKER).unwrap();
+        let offer_key = keylet::offer(&taker, 1);
+        let offer_before = sandbox.read(&offer_key).unwrap();
+        let offer: Value = serde_json::from_slice(&offer_before).unwrap();
+        let directory = offer["BookDirectory"]
+            .as_str()
+            .unwrap()
+            .parse::<Hash256>()
+            .unwrap();
+        let owner_dir_before = crate::owner_dir::collect_owner_dir_entries(&sandbox, &taker);
+        let account_bytes = sandbox.read(&keylet::account(&taker)).unwrap();
+        let mut taker_acct: Value = serde_json::from_slice(&account_bytes).unwrap();
+        let rules = Rules::new();
+        let tx = serde_json::json!({});
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+
+        assert!(
+            advance_past_unfunded_quality(&mut ctx, &taker, &mut taker_acct, &directory, true,)
+                .unwrap()
+        );
+        assert_eq!(ctx.view.read(&offer_key).unwrap(), offer_before);
+        assert!(ctx.view.read(&directory).is_some());
+        assert_eq!(
+            crate::owner_dir::collect_owner_dir_entries(ctx.view, &taker),
+            owner_dir_before
+        );
+        assert_eq!(taker_acct["OwnerCount"].as_u64(), Some(1));
+
+        assert!(
+            !advance_past_unfunded_quality(&mut ctx, &taker, &mut taker_acct, &directory, false,)
+                .unwrap()
+        );
+        assert!(ctx.view.read(&offer_key).is_none());
+        assert!(ctx.view.read(&directory).is_none());
+        assert!(
+            !crate::owner_dir::collect_owner_dir_entries(ctx.view, &taker)
+                .contains(&offer_key.to_string())
+        );
+        assert_eq!(taker_acct["OwnerCount"].as_u64(), Some(0));
     }
 }
 
