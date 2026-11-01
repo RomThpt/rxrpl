@@ -535,6 +535,7 @@ impl Transactor for OfferCreateTransactor {
             .and_then(|s| <rxrpl_primitives::Hash256 as std::str::FromStr>::from_str(s).ok());
         let tx_is_hybrid =
             ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_HYBRID != 0;
+        let tx_flags = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
         let domain_only = domain_id_hash.is_some() && !tx_is_hybrid;
         let inverse_book = match &domain_id_hash {
             Some(d) if domain_only => keylet::book_dir_domain(
@@ -573,7 +574,7 @@ impl Transactor for OfferCreateTransactor {
         // any recent replay; it exists for byte-exact pre-`FlowCross` ledgers.
         let (remaining_pays, remaining_gets, crossed, source_exhausted) =
             if ctx.rules.enabled(&feature_id("FlowCross")) {
-                cross_offers(
+                match cross_offers(
                     ctx,
                     &account_id,
                     &mut acct,
@@ -585,7 +586,19 @@ impl Transactor for OfferCreateTransactor {
                     flow_source_budget
                         .as_ref()
                         .ok_or(TransactionResult::TemBadOffer)?,
-                )?
+                ) {
+                    Ok(remaining) => remaining,
+                    // rippled's flowCross does not propagate a claimed Flow
+                    // failure. It leaves the offer unchanged and returns
+                    // tesSUCCESS to applyGuts, whose FillOrKill tail converts
+                    // that remainder to tecKILLED. Preserve that terminal code
+                    // here so build-ledger claims the FOK in its canonical pass
+                    // instead of retrying a transient tecUNFUNDED/tecPATH code.
+                    Err(result) if tx_flags & TF_FILL_OR_KILL != 0 && result.is_tec() => {
+                        return Ok(TransactionResult::TecKilled);
+                    }
+                    Err(result) => return Err(result),
+                }
             } else {
                 let (remaining_pays, remaining_gets, crossed) = taker_cross(
                     ctx,
@@ -599,6 +612,26 @@ impl Transactor for OfferCreateTransactor {
                 )?;
                 (remaining_pays, remaining_gets, crossed, false)
             };
+
+        // FlowCross returns the independently unfilled input and output before
+        // `remaining_offer` normalises a source-exhausted remainder to two
+        // zeroes. FillOrKill must inspect its exact side before that collapse:
+        // a regular offer requires all requested output, while tfSell requires
+        // all offered input to be consumed. Otherwise a funds-limited partial
+        // cross can look fully filled and escape the tecKILLED rollback.
+        if ctx.rules.enabled(&feature_id("FlowCross")) && tx_flags & TF_FILL_OR_KILL != 0 {
+            let (exact_remainder, exact_total) = if is_sell {
+                (&remaining_gets, &taker_gets)
+            } else {
+                (&remaining_pays, &taker_pays)
+            };
+            let fully_filled = Leg::parse(exact_remainder)
+                .zip(Leg::parse(exact_total))
+                .is_some_and(|(remaining, total)| remaining_is_filled(&remaining, &total));
+            if !fully_filled {
+                return Ok(TransactionResult::TecKilled);
+            }
+        }
 
         // Flow returns the independently consumed input and output amounts. A
         // resting remainder must nevertheless retain the offer's original
@@ -678,7 +711,6 @@ impl Transactor for OfferCreateTransactor {
 
         // A remainder survives crossing. Time-in-force flags decide its fate
         // before any resting offer is placed.
-        let tx_flags = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0);
         if tx_flags & TF_FILL_OR_KILL != 0 {
             // FillOrKill: failure to fully cross kills the whole operation.
             commit_acct(ctx, &acct)?;
@@ -1798,11 +1830,10 @@ fn try_amm_step(
     } else {
         remaining_out.clone()
     };
-    // A regular fill-or-kill offer requires the full output demand. tfSell changes
-    // that condition: its exact side is the input, so spending the entire input
-    // budget is a complete fill even when the output is below TakerPays. A
-    // per-band spend by a FoK offer that later fails is still rolled back
-    // atomically by the transactor.
+    // FillOrKill atomicity applies to the aggregate Flow result, not to each
+    // liquidity source. The AMM may contribute a partial step that combines
+    // with CLOB liquidity; the exact-side check in the transactor either keeps
+    // the complete aggregate fill or rolls every step back with tecKILLED.
     if let Some((delivered, spent)) = amm_hop(
         ctx,
         taker,
@@ -1832,8 +1863,8 @@ fn try_amm_step(
     Ok(())
 }
 
-fn amm_offer_allows_partial_output(fok: bool, is_sell: bool) -> bool {
-    !fok || is_sell
+fn amm_offer_allows_partial_output(_fok: bool, _is_sell: bool) -> bool {
+    true
 }
 
 /// Cross the XRP-intermediate autobridge path (`in -> XRP -> out`, a prebuilt
@@ -9384,14 +9415,14 @@ mod amm_quality_gate_tests {
     }
 
     #[test]
-    fn ledger_105500075_fok_sell_is_input_exact() {
+    fn fok_amm_step_can_combine_partial_liquidity() {
         assert!(
             amm_offer_allows_partial_output(true, true),
             "tfSell + FOK must spend the exact TakerGets input through the AMM"
         );
         assert!(
-            !amm_offer_allows_partial_output(true, false),
-            "a regular FOK still requires the full output demand"
+            amm_offer_allows_partial_output(true, false),
+            "a regular FOK may combine a partial AMM step with other liquidity"
         );
     }
 }
@@ -11055,6 +11086,79 @@ mod flow_cross_own_unfunded {
             sandbox.read(&keylet::offer(&taker_id, 2)).is_none(),
             "an exhausted source budget must not leave a new resting offer"
         );
+    }
+
+    /// 105500477 684D7816: a non-sell FillOrKill that exhausts its
+    /// underfunded source after a partial cross must roll the cross back.
+    #[test]
+    fn fill_or_kill_rolls_back_when_source_is_exhausted() {
+        let mut ledger = Ledger::genesis();
+        for addr in [ISS, TAKER, MAKER] {
+            let id = decode_account_id(addr).unwrap();
+            let account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot",
+                "Account": addr,
+                "Balance": "1000000000",
+                "Sequence": 1,
+                "OwnerCount": 0,
+                "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        put_usd_line(&mut ledger, TAKER, 60);
+        put_usd_line(&mut ledger, MAKER, 0);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let usd =
+            |value: &str| serde_json::json!({"currency": "USD", "issuer": ISS, "value": value});
+
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate",
+                    "Account": MAKER,
+                    "Fee": "10",
+                    "Sequence": 1,
+                    "TakerGets": "100000000",
+                    "TakerPays": usd("100"),
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+
+        let maker = decode_account_id(MAKER).unwrap();
+        let maker_offer = keylet::offer(&maker, 1);
+        let offer_before = sandbox.read(&maker_offer).unwrap();
+        let taker_xrp_before = xrp_balance(&sandbox, TAKER);
+        let maker_xrp_before = xrp_balance(&sandbox, MAKER);
+
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate",
+                    "Account": TAKER,
+                    "Fee": "10",
+                    "Sequence": 1,
+                    "Flags": TF_FILL_OR_KILL,
+                    "TakerGets": usd("100"),
+                    "TakerPays": "100000000",
+                }),
+            ),
+            TransactionResult::TecKilled
+        );
+
+        assert_eq!(sandbox.read(&maker_offer).unwrap(), offer_before);
+        assert_eq!(xrp_balance(&sandbox, TAKER), taker_xrp_before);
+        assert_eq!(xrp_balance(&sandbox, MAKER), maker_xrp_before);
+        assert_eq!(owner_count(&sandbox, MAKER), 1);
     }
 
     /// 105500215 91B10CB9: Flow's direct book removes funded inverse offers
