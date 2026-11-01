@@ -3529,6 +3529,26 @@ fn num_quality_iou(n: &rxrpl_amount::number::Number, is_xrp: bool) -> IOUAmount 
     }
 }
 
+fn adjusted_amm_quality_allows(
+    input: &rxrpl_amount::number::Number,
+    in_xrp: bool,
+    output: &rxrpl_amount::number::Number,
+    out_xrp: bool,
+    target: u64,
+    round_even: bool,
+) -> bool {
+    let input = num_quality_iou(input, in_xrp);
+    let output = num_quality_iou(output, out_xrp);
+    let realised = if round_even {
+        rxrpl_amount::get_rate_round_even(&input, &output)
+    } else {
+        rxrpl_amount::get_rate(&input, &output)
+    }
+    .unwrap_or(u64::MAX);
+    rxrpl_amount::is_better_quality(realised, target)
+        || rxrpl_amount::within_relative_distance(realised, target)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn amm_hop(
     ctx: &mut ApplyContext<'_>,
@@ -3682,6 +3702,27 @@ fn amm_hop(
     };
     if deliver_num.is_zero() || spent_num.is_zero() {
         return Ok(None);
+    }
+    if let Some(cq) = target_quality {
+        // StrandFlow::limitOut checks the realised quality after integral-grid
+        // conversion. An adjusted output that rounds worse than the requested
+        // quality by more than 1e-7 makes the whole strand dry. The CLOB-band
+        // spot cap performs its own quality validation in
+        // change_spot_price_quality; this gate is for the tail average-quality
+        // cap only.
+        if !cap_ending_spot_price
+            && capped_by_quality
+            && !adjusted_amm_quality_allows(
+                &spent_num,
+                in_xrp,
+                &deliver_num,
+                out_xrp,
+                cq,
+                ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+            )
+        {
+            return Ok(None);
+        }
     }
 
     // The AMM math prices the NET amount received by the pool. When the input
@@ -9377,7 +9418,7 @@ mod book_directory_quality_tests {
 
 #[cfg(test)]
 mod amm_quality_gate_tests {
-    use super::{amm_offer_allows_partial_output, num_quality_iou};
+    use super::{adjusted_amm_quality_allows, amm_offer_allows_partial_output, num_quality_iou};
     use rxrpl_amount::number::Number;
 
     // Mainnet tx 062FDE11 (ledger 105333100): offer sells 1061920 USD for
@@ -9424,6 +9465,50 @@ mod amm_quality_gate_tests {
             amm_offer_allows_partial_output(true, false),
             "a regular FOK may combine a partial AMM step with other liquidity"
         );
+    }
+
+    // Testnet ledger 105500478: the average-quality cap produces a synthetic
+    // XRP/WETH quote whose integral XRP input rounds one drop above the exact
+    // boundary. That worsens the realised quality by more than 1e-7, so
+    // StrandFlow rejects the whole path and leaves the offer untouched.
+    #[test]
+    fn rounded_xrp_input_below_limit_quality_is_rejected() {
+        let pool_in = Number::from_int(96_846_030_630);
+        let pool_out = Number::from_iou(
+            &rxrpl_amount::IOUAmount::from_decimal_string("60.71653104558634").unwrap(),
+        );
+        let target = 0x5E05_B95D_F5C6_CFE6;
+        let (input, output) = crate::amm_helpers::limit_input_quality(
+            &pool_in, &pool_out, target, 1_000, true, false,
+        )
+        .unwrap();
+
+        assert_eq!(input.to_decimal_string(), "1478330");
+        assert_eq!(output.to_decimal_string(), "0.0009175397117970489");
+        assert!(!adjusted_amm_quality_allows(
+            &input, true, &output, false, target, true,
+        ));
+    }
+
+    // Testnet ledger 105500477: the corresponding ARMY/XRP tail remains
+    // within the quality tolerance after XRP output rounding and must still be
+    // accepted. This pins the byte-exact predecessor checkpoint.
+    #[test]
+    fn rounded_xrp_output_within_limit_quality_is_allowed() {
+        let pool_in = Number::from_iou(
+            &rxrpl_amount::IOUAmount::from_decimal_string("44014238.41050589").unwrap(),
+        );
+        let pool_out = Number::from_int(230_161_408_450);
+        let target = 0x5106_CB90_95F0_CBEB;
+        let (input, output) =
+            crate::amm_helpers::limit_input_quality(&pool_in, &pool_out, target, 0, false, true)
+                .unwrap();
+
+        assert_eq!(input.to_decimal_string(), "8083.09352975");
+        assert_eq!(output.to_decimal_string(), "42260747");
+        assert!(adjusted_amm_quality_allows(
+            &input, false, &output, true, target, true,
+        ));
     }
 }
 
