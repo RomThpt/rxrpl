@@ -977,6 +977,14 @@ enum BalanceRounding {
     Downward,
 }
 
+fn amm_pool_debit_rounding(intermediate_output: bool) -> BalanceRounding {
+    if intermediate_output {
+        BalanceRounding::HalfUpward
+    } else {
+        BalanceRounding::Downward
+    }
+}
+
 fn add_iou_balance_downward(a: &IOUAmount, b: &IOUAmount) -> IOUAmount {
     use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode};
 
@@ -3976,7 +3984,7 @@ fn amm_hop(
             dest,
             &gross,
             ctx.rules.enabled(&feature_id("fixUniversalNumber")),
-            BalanceRounding::Downward,
+            amm_pool_debit_rounding(skip_output_credit),
             BalanceRounding::HalfUpward,
             skip_output_credit,
             TransferFeeRounding::Nearest,
@@ -4124,7 +4132,7 @@ fn apply_amm_move(
             dest,
             &amount,
             ctx.rules.enabled(&feature_id("fixUniversalNumber")),
-            BalanceRounding::Downward,
+            amm_pool_debit_rounding(skip_output_credit),
             BalanceRounding::HalfUpward,
             skip_output_credit,
             TransferFeeRounding::Nearest,
@@ -8712,6 +8720,36 @@ mod taker_crossing_tests {
                 .to_decimal_string(),
             "-334.6644516244193"
         );
+    }
+
+    #[test]
+    fn ledger_105500795_intermediate_amm_pool_debit_rounds_half_upward() {
+        for (before, delivery, expected) in [
+            (
+                "-48.13676099974311",
+                "0.2133713275912883",
+                "-47.92338967215182",
+            ),
+            (
+                "-27546.71827174122",
+                "42.94068601073885",
+                "-27503.77758573048",
+            ),
+        ] {
+            let before = IOUAmount::from_decimal_string(before).unwrap();
+            let delivery = IOUAmount::from_decimal_string(delivery).unwrap();
+
+            assert_eq!(
+                add_iou_balance_half_upward(&before, &delivery)
+                    .unwrap()
+                    .to_decimal_string(),
+                expected
+            );
+            assert_ne!(
+                add_iou_balance_downward(&before, &delivery).to_decimal_string(),
+                expected
+            );
+        }
     }
 
     #[test]
