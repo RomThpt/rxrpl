@@ -70,7 +70,11 @@ impl Transactor for NFTokenCancelOfferTransactor {
                 .and_then(|v| v.as_str())
                 .map(|d| d == account_str)
                 .unwrap_or(false);
-            if owner != account_str && !is_destination {
+            let is_expired = offer
+                .get("Expiration")
+                .and_then(Value::as_u64)
+                .is_some_and(|expiration| expiration <= ctx.view.parent_close_time() as u64);
+            if owner != account_str && !is_destination && !is_expired {
                 return Err(TransactionResult::TecNoPermission);
             }
 
@@ -164,6 +168,7 @@ mod tests {
     use rxrpl_ledger::Ledger;
 
     const ACCOUNT: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+    const OTHER: &str = "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe";
     const NFTOKEN_ID: &str = "00000000000000000000000000000000B5F762798A53D543A014CAF8B297CFF8";
 
     fn setup_with_offer() -> (Ledger, String) {
@@ -319,6 +324,100 @@ mod tests {
         let offer_bytes = hex::decode(&offer_id).unwrap();
         let offer_key = Hash256::from_slice(&offer_bytes).unwrap();
         assert!(sandbox.read(&offer_key).is_none());
+    }
+
+    fn add_other_account_and_expiration(
+        ledger: &mut Ledger,
+        offer_id: &str,
+        expiration: u64,
+        parent_close_time: u32,
+    ) {
+        let other_id = decode_account_id(OTHER).unwrap();
+        let other = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": OTHER,
+            "Balance": "100000000",
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::account(&other_id),
+                serde_json::to_vec(&other).unwrap(),
+            )
+            .unwrap();
+
+        let offer_key = Hash256::from_slice(&hex::decode(offer_id).unwrap()).unwrap();
+        let offer_bytes = LedgerView::new(ledger).read(&offer_key).unwrap();
+        let mut offer: Value = serde_json::from_slice(&offer_bytes).unwrap();
+        offer["Expiration"] = serde_json::json!(expiration);
+        ledger
+            .put_state(offer_key, serde_json::to_vec(&offer).unwrap())
+            .unwrap();
+        ledger.header.parent_close_time = parent_close_time;
+    }
+
+    #[test]
+    fn allow_third_party_to_cancel_expired_offer() {
+        let (mut ledger, offer_id) = setup_with_offer();
+        add_other_account_and_expiration(&mut ledger, &offer_id, 100, 100);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenCancelOffer",
+            "Account": OTHER,
+            "NFTokenOffers": [offer_id],
+            "Fee": "12",
+            "Sequence": 1,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+
+        assert_eq!(
+            NFTokenCancelOfferTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        let offer_key = Hash256::from_slice(&hex::decode(&offer_id).unwrap()).unwrap();
+        assert!(sandbox.read(&offer_key).is_none());
+    }
+
+    #[test]
+    fn reject_third_party_for_active_offer() {
+        let (mut ledger, offer_id) = setup_with_offer();
+        add_other_account_and_expiration(&mut ledger, &offer_id, 101, 100);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenCancelOffer",
+            "Account": OTHER,
+            "NFTokenOffers": [offer_id],
+            "Fee": "12",
+            "Sequence": 1,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+
+        assert_eq!(
+            NFTokenCancelOfferTransactor.apply(&mut ctx),
+            Err(TransactionResult::TecNoPermission)
+        );
+        let offer_key = Hash256::from_slice(&hex::decode(&offer_id).unwrap()).unwrap();
+        assert!(sandbox.read(&offer_key).is_some());
     }
 
     #[test]
