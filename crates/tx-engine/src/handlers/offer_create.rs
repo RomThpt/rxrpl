@@ -2565,13 +2565,14 @@ fn cross_book_hop(
 
             let (order_out, order_in) = {
                 let mut order_in = order_in;
-                if skip_output_credit
-                    && offer_in.is_xrp
-                    && order_in.drops >= 100_000_000
-                    && order_in.drops < 200_000_000
-                    && order_in.drops + 2 <= net_remaining_in.drops
-                    && order_in.drops + 2 <= offer_in.drops
-                {
+                if legacy_intermediate_xrp_rounding_applies(
+                    skip_input_debit,
+                    skip_output_credit,
+                    offer_in.is_xrp,
+                    order_in.drops,
+                    net_remaining_in.drops,
+                    offer_in.drops,
+                ) {
                     order_in.drops += 2;
                 }
                 (order_out, order_in)
@@ -2869,11 +2870,37 @@ fn should_trim_input_limited_iou_leftover(
         && new_gets.iou.mantissa() > 0
 }
 
-fn preserve_flow_input_limited_iou_ulp(hop: usize, limiting: usize, input_is_xrp: bool) -> bool {
+fn preserve_flow_input_limited_iou_ulp(
+    hop: usize,
+    limiting: usize,
+    input_is_xrp: bool,
+    terminal_self_payment: bool,
+) -> bool {
     // A forward BookStep fed by discrete XRP drops keeps the offer remainder
     // produced by limitStepIn. Re-trimming that IOU remainder loses one ULP per
     // pass, regardless of whether the drops came from an AMM or another book.
-    hop > 0 && hop > limiting && input_is_xrp
+    // A partial self-payment's terminal step has the same Number subtraction
+    // rule even when it is itself the limiting step (105500439 E9D931B0).
+    terminal_self_payment || (hop > 0 && hop > limiting && input_is_xrp)
+}
+
+/// Legacy Flow rounds an interior XRP take two drops above the directory-quality
+/// price (30000103). Applying the same adjustment to a source-facing book moves
+/// those drops out of the final input-limited fill.
+fn legacy_intermediate_xrp_rounding_applies(
+    skip_input_debit: bool,
+    skip_output_credit: bool,
+    offer_in_is_xrp: bool,
+    order_in_drops: i64,
+    remaining_in_drops: i64,
+    offer_in_drops: i64,
+) -> bool {
+    skip_input_debit
+        && skip_output_credit
+        && offer_in_is_xrp
+        && (100_000_000..200_000_000).contains(&order_in_drops)
+        && order_in_drops + 2 <= remaining_in_drops
+        && order_in_drops + 2 <= offer_in_drops
 }
 
 fn should_bump_partial_path_credit(
@@ -4519,17 +4546,34 @@ fn flow_source_balance(
     })
 }
 
-fn aggregate_flow_source_balance(
+fn aggregate_flow_source_balance_number(
     balance: &IOUAmount,
-    spent: &IOUAmount,
+    spent: &Number,
+    holder_is_high: bool,
+) -> IOUAmount {
+    let balance = Number::from_iou(balance);
+    if holder_is_high {
+        balance.add(spent)
+    } else {
+        balance.sub(spent)
+    }
+    .to_iou()
+}
+
+fn aggregate_flow_source_balance_passes(
+    balance: &IOUAmount,
+    saved_ins: &[Number],
     holder_is_high: bool,
 ) -> Option<IOUAmount> {
-    let delta = if holder_is_high {
-        *spent
-    } else {
-        spent.negate()
-    };
-    IOUAmount::add_round(balance, &delta).ok()
+    saved_ins.iter().try_fold(*balance, |balance, spent| {
+        let spent = spent.to_iou();
+        let delta = if holder_is_high {
+            spent
+        } else {
+            spent.negate()
+        };
+        IOUAmount::add_round(&balance, &delta).ok()
+    })
 }
 
 fn flow_holder_funds(balance: &IOUAmount, holder_is_high: bool) -> Number {
@@ -4563,15 +4607,33 @@ fn reconcile_flow_source_balance(
     source: &FlowSourceBalance,
     spent: &Number,
 ) {
+    let balance =
+        aggregate_flow_source_balance_number(&source.balance, spent, source.holder_is_high);
+    set_flow_source_balance(ctx, source, &balance);
+}
+
+fn reconcile_flow_source_balance_passes(
+    ctx: &mut ApplyContext<'_>,
+    source: &FlowSourceBalance,
+    saved_ins: &[Number],
+) {
+    let Some(balance) =
+        aggregate_flow_source_balance_passes(&source.balance, saved_ins, source.holder_is_high)
+    else {
+        return;
+    };
+    set_flow_source_balance(ctx, source, &balance);
+}
+
+fn set_flow_source_balance(
+    ctx: &mut ApplyContext<'_>,
+    source: &FlowSourceBalance,
+    balance: &IOUAmount,
+) {
     let Some(bytes) = ctx.view.read(&source.key) else {
         return;
     };
     let Ok(mut line) = serde_json::from_slice::<Value>(&bytes) else {
-        return;
-    };
-    let Some(balance) =
-        aggregate_flow_source_balance(&source.balance, &spent.to_iou(), source.holder_is_high)
-    else {
         return;
     };
     line["Balance"]["value"] = Value::String(balance.to_decimal_string());
@@ -5536,7 +5598,14 @@ fn execute_strand_pass(
                     /*allow_amm=*/ false,
                     /*lq_stop=*/ None,
                     /*preserve_input_limited_iou_ulp=*/
-                    preserve_flow_input_limited_iou_ulp(h, limiting, hop.in_leg.is_xrp),
+                    preserve_flow_input_limited_iou_ulp(
+                        h,
+                        limiting,
+                        hop.in_leg.is_xrp,
+                        is_last
+                            && taker == dest
+                            && ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+                    ),
                     // OfferCreate autobridging conserves the discrete XRP
                     // produced by the first book: its terminal XRP -> IOU
                     // BookStep forwards the entire drop budget instead of
@@ -5789,14 +5858,18 @@ pub(crate) fn flow_multi(
     // can accumulate a one-ULP drift on a nearly drained trust line. Restore
     // the source endpoint from its pre-flow balance and the canonical
     // smallest-to-largest total while leaving pool/maker settlement per pass.
-    // When the source budget is exhausted, however, the terminal forward pass
-    // keeps its upward endpoint rounding. Replacing those per-pass debits with
-    // the exact SendMax loses one ULP on a nearly drained line (105500117).
-    if !input_exhausted
-        && saved_ins.len() > 1
+    // When the source budget is exhausted, the terminal forward pass normally
+    // keeps its endpoint rounding (105500117). A self-payment can instead retain
+    // a smaller pass-order remainder that disappears from the sorted aggregate;
+    // preserve that DirectStep remainder (105500439).
+    if saved_ins.len() > 1
         && let Some(source) = source_balance.as_ref()
     {
-        reconcile_flow_source_balance(ctx, source, &actual_in);
+        if !input_exhausted {
+            reconcile_flow_source_balance(ctx, source, &actual_in);
+        } else if taker == dest {
+            reconcile_flow_source_balance_passes(ctx, source, &saved_ins);
+        }
     }
     let preserve_output_ulp = preserve_flow_output_ulp(
         &actual_out,
@@ -8067,8 +8140,9 @@ mod taker_crossing_tests {
         full_offer_take, funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out,
         in_for_out_offer, in_for_out_round, input_limited_uses_full_budget, leftover_is_dust,
         leftover_leg, leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
-        net_book_payment_input, number_to_leg, out_for_in, own_tip_can_be_reaped, pack_rate,
-        parity_rate, preserve_flow_input_limited_iou_ulp, qual_div, qual_mul, reject_quality,
+        legacy_intermediate_xrp_rounding_applies, net_book_payment_input, number_to_leg,
+        out_for_in, own_tip_can_be_reaped, pack_rate, parity_rate,
+        preserve_flow_input_limited_iou_ulp, qual_div, qual_mul, reject_quality,
         remaining_is_filled, remaining_is_filled_at, remaining_offer, scale_funds_limited_input,
         select_path, sell_clamp_sub, should_bump_partial_path_credit,
         should_reap_tiny_increased_quality, should_trim_input_limited_iou_leftover,
@@ -8404,11 +8478,32 @@ mod taker_crossing_tests {
 
     #[test]
     fn forward_xrp_carry_preserves_input_limited_iou_leftover() {
-        assert!(preserve_flow_input_limited_iou_ulp(1, 0, true));
-        assert!(preserve_flow_input_limited_iou_ulp(2, 0, true));
-        assert!(!preserve_flow_input_limited_iou_ulp(0, 0, true));
-        assert!(!preserve_flow_input_limited_iou_ulp(1, 1, true));
-        assert!(!preserve_flow_input_limited_iou_ulp(1, 0, false));
+        assert!(preserve_flow_input_limited_iou_ulp(1, 0, true, false));
+        assert!(preserve_flow_input_limited_iou_ulp(2, 0, true, false));
+        assert!(!preserve_flow_input_limited_iou_ulp(0, 0, true, false));
+        assert!(!preserve_flow_input_limited_iou_ulp(1, 1, true, false));
+        assert!(!preserve_flow_input_limited_iou_ulp(1, 0, false, false));
+        assert!(preserve_flow_input_limited_iou_ulp(1, 1, false, true));
+    }
+
+    #[test]
+    fn xrp_rounding_adjustment_only_applies_to_interior_hops() {
+        assert!(legacy_intermediate_xrp_rounding_applies(
+            true,
+            true,
+            true,
+            138_833_977,
+            153_622_477,
+            834_700_000,
+        ));
+        assert!(!legacy_intermediate_xrp_rounding_applies(
+            false,
+            true,
+            true,
+            138_833_977,
+            153_622_477,
+            834_700_000,
+        ));
     }
 
     #[test]
@@ -9241,12 +9336,13 @@ mod amm_quality_gate_tests {
 #[cfg(test)]
 mod flow_source_balance_tests {
     use super::{
-        Leg, aggregate_flow_source_balance, can_fund_new_trust_line, flow_gross_input,
-        flow_holder_funds, flow_input_limit, flow_net_input, leftover_leg, next_flow_strands,
-        preserve_flow_output_ulp,
+        Leg, aggregate_flow_source_balance_number, aggregate_flow_source_balance_passes,
+        can_fund_new_trust_line, flow_gross_input, flow_holder_funds, flow_input_limit,
+        flow_net_input, leftover_leg, next_flow_strands, preserve_flow_output_ulp,
+        sum_smallest_to_largest,
     };
     use rxrpl_amount::IOUAmount;
-    use rxrpl_amount::number::Number;
+    use rxrpl_amount::number::{MantissaScale, MantissaScaleGuard, Number};
 
     #[test]
     fn aggregates_multi_pass_source_debit_before_rounding() {
@@ -9254,10 +9350,27 @@ mod flow_source_balance_tests {
         let spent = IOUAmount::from_decimal_string("0.2872378014634366").unwrap();
 
         assert_eq!(
-            aggregate_flow_source_balance(&balance, &spent, false)
-                .unwrap()
+            aggregate_flow_source_balance_number(&balance, &Number::from_iou(&spent), false)
                 .to_decimal_string(),
             "0.0023781541865634"
+        );
+    }
+
+    #[test]
+    fn preserves_sub_iou_ulp_source_remainder_across_flow_passes() {
+        let balance = IOUAmount::from_decimal_string("14.2391130014").unwrap();
+        let spent = ["5.153878281024355", "6.340204940719714", "2.74502977965593"]
+            .map(|value| Number::from_iou(&IOUAmount::from_decimal_string(value).unwrap()));
+        let _scale = MantissaScaleGuard::new(MantissaScale::Small);
+        let input_limit = Number::from_iou(&balance);
+        let aggregate = sum_smallest_to_largest(&spent);
+
+        assert!(aggregate.sub(&input_limit).is_zero());
+        assert_eq!(
+            aggregate_flow_source_balance_passes(&balance, &spent, false)
+                .unwrap()
+                .to_decimal_string(),
+            "0.000000000000001"
         );
     }
 
