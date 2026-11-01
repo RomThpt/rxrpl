@@ -2398,12 +2398,17 @@ fn cross_book_hop(
             let avail_out = leg_min(&offer_out, &funds);
             // OfferStream continues stepping invalid entries after source funds
             // are exhausted, so expired/unfunded offers are still reaped. A
-            // funded IOU remainder may also cost less than one XRP drop; rippled
-            // consumes that zero-cost remainder before moving to the next band
-            // (105500212 6B2B088C). Stop only when the next live offer requires
-            // a representable input (105500249 50312732).
-            let zero_cost_funded =
-                zero_cost_funded_xrp_offer(&remaining_in, &offer_in, &avail_out, &offer_out);
+            // funded IOU remainder may also cost less than one XRP drop when a
+            // step starts with no representable input (105500212 6B2B088C).
+            // Once this step has spent input, however, BookStep stops before
+            // advancing to a later zero-cost offer (105500592 AFD10F04).
+            let zero_cost_funded = zero_cost_funded_xrp_offer(
+                &spent,
+                &remaining_in,
+                &offer_in,
+                &avail_out,
+                &offer_out,
+            );
             if remaining_in.is_zero() && !zero_cost_funded {
                 break 'walk;
             }
@@ -2883,12 +2888,14 @@ fn scale_funds_limited_input(offer_in: &Leg, available: &Leg, offer_out: &Leg) -
 }
 
 fn zero_cost_funded_xrp_offer(
+    spent_so_far: &Leg,
     remaining_in: &Leg,
     offer_in: &Leg,
     available: &Leg,
     offer_out: &Leg,
 ) -> bool {
-    remaining_in.is_zero()
+    spent_so_far.is_zero()
+        && remaining_in.is_zero()
         && offer_in.is_xrp
         && !available.is_zero()
         && !leg_ge(available, offer_out)
@@ -8520,14 +8527,39 @@ mod taker_crossing_tests {
         let offer_out = iou("1");
         assert!(zero_cost_funded_xrp_offer(
             &xrp(0),
+            &xrp(0),
             &offer_in,
             &delivered,
             &offer_out,
         ));
         assert!(!zero_cost_funded_xrp_offer(
             &xrp(1),
+            &xrp(0),
             &offer_in,
             &delivered,
+            &offer_out,
+        ));
+        assert!(!zero_cost_funded_xrp_offer(
+            &xrp(0),
+            &xrp(1),
+            &offer_in,
+            &delivered,
+            &offer_out,
+        ));
+    }
+
+    #[test]
+    fn ledger_105500592_stops_before_later_zero_cost_offer() {
+        let offer_in = xrp(1_260_798_413);
+        let offer_out = iou("134074406.52");
+        let owner_funds = iou("0.0221");
+
+        assert!(scale_funds_limited_input(&offer_in, &owner_funds, &offer_out).is_zero());
+        assert!(!zero_cost_funded_xrp_offer(
+            &xrp(711_124_873),
+            &xrp(0),
+            &offer_in,
+            &owner_funds,
             &offer_out,
         ));
     }
