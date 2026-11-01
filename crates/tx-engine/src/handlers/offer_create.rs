@@ -1301,7 +1301,8 @@ fn cross_offers(
         probe = dir_key;
         let dir_quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
         if dir_quality > threshold {
-            let post_clob_cleanup = advance_after_exhausted_tip || clob_offer_attempted;
+            let post_clob_cleanup =
+                advance_after_exhausted_tip || (is_sell && clob_offer_attempted);
             if !post_clob_cleanup {
                 // OfferStream materialises the first CLOB tip before BookStep
                 // rejects its quality. Preserve the historical rule that an
