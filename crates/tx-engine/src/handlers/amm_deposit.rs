@@ -936,23 +936,17 @@ fn create_lp_line(
     let mut account_one = [0u8; 20];
     account_one[19] = 1;
     let no_account = encode_account_id(&AccountId::from(account_one));
-    let mut tl_obj = serde_json::json!({
+    let tl_obj = serde_json::json!({
         "LedgerEntryType": "RippleState",
         "Balance": { "currency": lp_currency_hex, "issuer": no_account, "value": balance.to_iou().to_decimal_string() },
         "LowLimit": low_limit,
         "HighLimit": high_limit,
         "Flags": flags,
+        "LowNode": format!("{low_node:016X}"),
+        "HighNode": format!("{high_node:016X}"),
         "PreviousTxnID": "0000000000000000000000000000000000000000000000000000000000000000",
         "PreviousTxnLgrSeq": 0,
     });
-    // LowNode/HighNode are soeDEFAULT(0): rippled omits them when the line lands
-    // on page 0 of an owner directory.
-    if low_node != 0 {
-        tl_obj["LowNode"] = serde_json::Value::String(format!("{low_node:016X}"));
-    }
-    if high_node != 0 {
-        tl_obj["HighNode"] = serde_json::Value::String(format!("{high_node:016X}"));
-    }
     let bytes = serde_json::to_vec(&tl_obj).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view
         .insert(tl_key, bytes)
@@ -995,10 +989,67 @@ mod tests {
     use crate::fees::FeeSettings;
     use crate::transactor::{PreclaimContext, PreflightContext};
     use crate::view::ledger_view::LedgerView;
+    use crate::view::read_view::ReadView;
+    use crate::view::sandbox::Sandbox;
     use rxrpl_amendment::Rules;
     use rxrpl_ledger::Ledger;
 
     const BOB: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
+    const AMM_ACCOUNT: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+
+    #[test]
+    fn new_lp_line_keeps_zero_owner_pages() {
+        let mut ledger = Ledger::genesis();
+        for address in [BOB, AMM_ACCOUNT] {
+            let account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot",
+                "Account": address,
+                "Balance": "50000000",
+                "Sequence": 1,
+                "OwnerCount": 0,
+                "Flags": 0,
+            });
+            ledger
+                .put_state(
+                    keylet::account(&decode_account_id(address).unwrap()),
+                    serde_json::to_vec(&account).unwrap(),
+                )
+                .unwrap();
+        }
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({});
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let holder = decode_account_id(BOB).unwrap();
+        let amm = decode_account_id(AMM_ACCOUNT).unwrap();
+        let currency = "0300000000000000000000000000000000000000";
+        let currency_bytes: [u8; 20] = hex::decode(currency).unwrap().try_into().unwrap();
+        let line_key = keylet::trust_line(&holder, &amm, &currency_bytes);
+
+        create_lp_line(
+            &mut ctx,
+            &holder,
+            &amm,
+            currency,
+            &rxrpl_amount::number::Number::from_int(1),
+            holder.as_bytes() < amm.as_bytes(),
+            line_key,
+        )
+        .unwrap();
+
+        let line: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&line_key).unwrap()).unwrap();
+        assert_eq!(line["LowNode"], "0000000000000000");
+        assert_eq!(line["HighNode"], "0000000000000000");
+    }
 
     #[test]
     fn reject_zero_deposit() {
