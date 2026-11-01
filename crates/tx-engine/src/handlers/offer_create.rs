@@ -5978,23 +5978,23 @@ pub(crate) fn flow_multi(
     // can accumulate a one-ULP drift on a nearly drained trust line. Restore
     // the source endpoint from its pre-flow balance and the canonical
     // smallest-to-largest total while leaving pool/maker settlement per pass.
-    // When the source budget is exhausted, the terminal forward pass normally
-    // keeps its endpoint rounding (105500117). A self-payment can instead retain
-    // a smaller pass-order remainder that disappears from the sorted aggregate;
-    // preserve that DirectStep remainder (105500439).
+    // Self-payments retain the source DirectStep's pass-order rounding rather
+    // than replacing it with a single sorted aggregate. This matters both when
+    // the source is exhausted (105500439) and when several AMM passes consume a
+    // small fraction of SendMax (105500548).
     if saved_ins.len() > 1
         && let Some(source) = source_balance.as_ref()
     {
-        if !input_exhausted {
-            reconcile_flow_source_balance(ctx, source, &actual_in);
-        } else if taker == dest {
+        if taker == dest {
             reconcile_flow_source_balance_passes(ctx, source, &saved_ins);
+        } else if !input_exhausted {
+            reconcile_flow_source_balance(ctx, source, &actual_in);
         }
     }
     let preserve_output_ulp = preserve_flow_output_ulp(
         &actual_out,
         deliver_req,
-        preserve_output_ulp || input_exhausted,
+        preserve_output_ulp || input_exhausted || (taker == dest && saved_outs.len() > 1),
     );
     (actual_out, actual_in, preserve_output_ulp)
 }
@@ -9605,6 +9605,49 @@ mod flow_source_balance_tests {
                 .to_decimal_string(),
             "0.0023781541865634"
         );
+    }
+
+    #[test]
+    fn self_payment_multi_pass_rounding_matches_flow() {
+        let balance = IOUAmount::from_decimal_string("178717.8318043616").unwrap();
+        let saved_ins = [
+            "0.009895616380142929",
+            "0.009900648259554282",
+            "0.01982124843769783",
+            "0.02977699115129875",
+            "0.04975383267345824",
+            "0.07992907373162355",
+        ]
+        .map(|value| Number::from_iou(&IOUAmount::from_decimal_string(value).unwrap()));
+        let saved_outs = [
+            "0.00000562869231097",
+            "0.00000562869231097",
+            "0.00001125738462194",
+            "0.00001688607693291",
+            "0.00002814346155485",
+            "0.00004502953848776",
+        ]
+        .map(|value| Number::from_iou(&IOUAmount::from_decimal_string(value).unwrap()));
+        let _scale = MantissaScaleGuard::new(MantissaScale::Small);
+        let input = sum_smallest_to_largest(&saved_ins);
+        let output = sum_smallest_to_largest(&saved_outs);
+        assert_eq!(input.to_iou().to_decimal_string(), "0.1990774106337756");
+        assert_eq!(output.to_iou().to_decimal_string(), "0.0001125738462194");
+        assert_eq!(
+            aggregate_flow_source_balance_number(&balance, &input, false).to_decimal_string(),
+            "178717.632726951"
+        );
+        assert_eq!(
+            aggregate_flow_source_balance_passes(&balance, &saved_ins, false)
+                .unwrap()
+                .to_decimal_string(),
+            "178717.6327269509"
+        );
+        assert!(preserve_flow_output_ulp(
+            &output,
+            &Number::from_int(1),
+            true
+        ));
     }
 
     #[test]
