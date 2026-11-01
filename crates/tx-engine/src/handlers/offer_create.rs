@@ -1278,6 +1278,7 @@ fn cross_offers(
     // The book base for traversal has the quality (low 64 bits) zeroed;
     // `keylet::book_dir` leaves those as hash bytes, so start the walk there.
     let mut probe = book_dir_with_quality(inverse_book, 0);
+    let mut deferred_out_of_quality_dir = None;
     'walk: while let Some(dir_key) = ctx.view.succ(&probe) {
         if &dir_key.as_bytes()[0..24] != book_prefix {
             break; // left this book
@@ -1296,6 +1297,7 @@ fn cross_offers(
             if !advance_after_exhausted_tip
                 || advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, false)?
             {
+                deferred_out_of_quality_dir = Some(dir_key);
                 break;
             }
             continue;
@@ -1339,7 +1341,7 @@ fn cross_offers(
             }
             if !domain_only {
                 let before = remaining_out.clone();
-                try_amm_step(
+                let continue_to_clob = try_amm_step(
                     ctx,
                     taker,
                     taker_acct,
@@ -1352,10 +1354,16 @@ fn cross_offers(
                     is_sell,
                     /*cap_ending_spot_price=*/ true,
                 )?;
+                if continue_to_clob {
+                    // execOffer evaluates self-cross removal before its CLOB
+                    // callback checks the now-remaining budget. Mirror that
+                    // ordering when an AMM offer asks BookStep to continue.
+                    let _ = advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, false)?;
+                }
                 if !leg_ge(&before, &remaining_out) || !leg_ge(&remaining_out, &before) {
                     remaining_out_num = leg_to_number(&remaining_out);
                 }
-                if remaining_out.is_zero() || remaining_in.is_zero() {
+                if !continue_to_clob || remaining_out.is_zero() || remaining_in.is_zero() {
                     break 'walk; // AMM alone met the demand (or exhausted the taker's funds)
                 }
             }
@@ -1658,7 +1666,8 @@ fn cross_offers(
             )?;
         }
         if !domain_only {
-            try_amm_step(
+            let source_before_amm = source_remaining.clone();
+            let _ = try_amm_step(
                 ctx,
                 taker,
                 taker_acct,
@@ -1671,6 +1680,15 @@ fn cross_offers(
                 is_sell,
                 /*cap_ending_spot_price=*/ false,
             )?;
+            if terminal_amm_reaches_deferred_clob(
+                is_sell,
+                leg_gt(&source_before_amm, &source_remaining),
+                &source_remaining,
+                &remaining_out,
+            ) && let Some(dir_key) = deferred_out_of_quality_dir
+            {
+                let _ = advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, false)?;
+            }
         }
     }
 
@@ -1811,14 +1829,14 @@ fn try_amm_step(
     fok: bool,
     is_sell: bool,
     cap_ending_spot_price: bool,
-) -> Result<(), TransactionResult> {
+) -> Result<bool, TransactionResult> {
     // rippled's flowCross limits the crossing input to the taker's funds
     // (`sendMax = min(takerAmount.in, accountFunds)`, OfferCreate.cpp:400): the
     // AMM swap would otherwise overdraw the taker (its sold-asset balance goes
     // negative) when TakerGets exceeds what it holds.
     let budget = leg_min(remaining_in, source_remaining);
     if budget.is_zero() {
-        return Ok(());
+        return Ok(true);
     }
     // A tfSell offer sells its whole TakerGets and accepts any TakerPays (rippled
     // deliver = kMaxNative), so the AMM crosses the whole input budget rather than
@@ -1860,8 +1878,22 @@ fn try_amm_step(
         *remaining_in = leg_sub(remaining_in, &spent);
         *source_remaining = leg_sub(source_remaining, &spent);
         *crossed = true;
+        return Ok(amm_step_allows_clob(is_sell, remaining_out));
     }
-    Ok(())
+    Ok(true)
+}
+
+fn amm_step_allows_clob(is_sell: bool, remaining_out: &Leg) -> bool {
+    is_sell || !remaining_out.is_zero()
+}
+
+fn terminal_amm_reaches_deferred_clob(
+    is_sell: bool,
+    amm_consumed_input: bool,
+    source_remaining: &Leg,
+    remaining_out: &Leg,
+) -> bool {
+    is_sell && amm_consumed_input && source_remaining.is_zero() && !remaining_out.is_zero()
 }
 
 fn amm_offer_allows_partial_output(_fok: bool, _is_sell: bool) -> bool {
@@ -8371,9 +8403,9 @@ fn taker_cross(
 mod taker_crossing_tests {
     use super::{
         Leg, TakerCrossType, add_iou_balance, add_iou_balance_downward,
-        add_iou_balance_half_upward, book_step_input_exhausted, composed_quality,
-        consumes_full_offer, crossing_threshold, debit_drains_source, flow_iou_to_iou,
-        flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou, full_offer_take,
+        add_iou_balance_half_upward, amm_step_allows_clob, book_step_input_exhausted,
+        composed_quality, consumes_full_offer, crossing_threshold, debit_drains_source,
+        flow_iou_to_iou, flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou, full_offer_take,
         funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
         in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
         leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
@@ -8383,7 +8415,8 @@ mod taker_crossing_tests {
         remaining_is_filled, remaining_is_filled_at, remaining_offer, scale_funds_limited_input,
         select_path, sell_clamp_sub, should_bump_partial_path_credit,
         should_reap_tiny_increased_quality, should_trim_input_limited_iou_leftover,
-        terminal_budget_binds, zero_cost_funded_xrp_offer, zero_cost_xrp_clob_fill,
+        terminal_amm_reaches_deferred_clob, terminal_budget_binds, zero_cost_funded_xrp_offer,
+        zero_cost_xrp_clob_fill,
     };
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, get_rate_round_even, offer_quality};
     use rxrpl_primitives::AccountId;
@@ -8652,6 +8685,44 @@ mod taker_crossing_tests {
         assert!(!book_step_input_exhausted(
             &iou("1.16496250827378"),
             &iou("0.00000000000001"),
+        ));
+    }
+
+    #[test]
+    fn ledgers_105500679_and_710_control_clob_after_amm() {
+        assert!(!amm_step_allows_clob(false, &xrp(0)));
+        assert!(amm_step_allows_clob(false, &xrp(1)));
+        assert!(amm_step_allows_clob(true, &xrp(0)));
+
+        assert!(!terminal_amm_reaches_deferred_clob(
+            false,
+            true,
+            &iou("0"),
+            &xrp(1),
+        ));
+        assert!(!terminal_amm_reaches_deferred_clob(
+            true,
+            false,
+            &iou("0"),
+            &xrp(1),
+        ));
+        assert!(!terminal_amm_reaches_deferred_clob(
+            true,
+            true,
+            &iou("1"),
+            &xrp(1),
+        ));
+        assert!(!terminal_amm_reaches_deferred_clob(
+            true,
+            true,
+            &iou("0"),
+            &xrp(0),
+        ));
+        assert!(terminal_amm_reaches_deferred_clob(
+            true,
+            true,
+            &iou("0"),
+            &xrp(1),
         ));
     }
 
