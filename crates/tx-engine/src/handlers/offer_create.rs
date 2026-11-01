@@ -6415,6 +6415,30 @@ fn pay_out_gross(
             &amount.iou.negate(),
             balance_rounding,
         )?;
+        // BookPaymentStep settles the maker's TakerGets through rippleCredit.
+        // If this redemption drains a default trust line, trustDelete runs
+        // immediately: release its reserve, unlink it from both owner
+        // directories, and thread the issuer account.
+        let owner_key = keylet::account(owner);
+        let owner_bytes = ctx
+            .view
+            .read(&owner_key)
+            .ok_or(TransactionResult::TefInternal)?;
+        let mut owner_acct: Value =
+            serde_json::from_slice(&owner_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        if crate::handlers::trust_set::maybe_delete_drained_trust_line(
+            ctx,
+            owner,
+            &mut owner_acct,
+            &amount.issuer,
+            &amount.currency,
+        )? {
+            let owner_data =
+                serde_json::to_vec(&owner_acct).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(owner_key, owner_data)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
     }
     if !skip_recipient_credit && amount.issuer != *recipient {
         credit_line_with_rounding(
@@ -10845,6 +10869,59 @@ mod taker_bridge_integration {
             0,
             "sender OwnerCount drops with the deleted line"
         );
+    }
+
+    #[test]
+    fn payment_book_output_deletes_drained_maker_line() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 1);
+        put_acct(&mut ledger, O1, 1_000_000_000, 1);
+        put_line(&mut ledger, TAKER, b"AAA", 0);
+        put_default_line(&mut ledger, O1, b"AAA", 100);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({});
+        let taker = decode_account_id(TAKER).unwrap();
+        let owner = decode_account_id(O1).unwrap();
+        let issuer = decode_account_id(ISS).unwrap();
+        let taker_key = keylet::account(&taker);
+        let mut taker_acct: Value =
+            serde_json::from_slice(&sandbox.read(&taker_key).unwrap()).unwrap();
+        let amount = Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: IOUAmount::from_decimal_string("100").unwrap(),
+            currency: ccy(b"AAA"),
+            issuer,
+        };
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+
+        let delivered = pay_out_gross(
+            &mut ctx,
+            &taker,
+            &mut taker_acct,
+            &owner,
+            &taker,
+            &amount,
+            false,
+            BalanceRounding::Legacy,
+            false,
+            TransferFeeRounding::Down,
+        )
+        .unwrap();
+
+        assert_eq!(delivered.iou, amount.iou);
+        assert!(!has_line(&sandbox, O1, b"AAA"));
+        assert_eq!(owner_count(&sandbox, O1), 0);
     }
 
     fn oc(sandbox: &Sandbox<'_>, addr: &str) -> u64 {
