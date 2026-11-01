@@ -45,7 +45,7 @@ impl Transactor for NFTokenAcceptOfferTransactor {
             let key =
                 Hash256::from_slice(&key_bytes).map_err(|_| TransactionResult::TemMalformed)?;
             if !ctx.view.exists(&key) {
-                return Err(TransactionResult::TecNoEntry);
+                return Err(TransactionResult::TecObjectNotFound);
             }
         }
         if let Some(buy_id) = helpers::get_str_field(ctx.tx, "NFTokenBuyOffer") {
@@ -53,7 +53,7 @@ impl Transactor for NFTokenAcceptOfferTransactor {
             let key =
                 Hash256::from_slice(&key_bytes).map_err(|_| TransactionResult::TemMalformed)?;
             if !ctx.view.exists(&key) {
-                return Err(TransactionResult::TecNoEntry);
+                return Err(TransactionResult::TecObjectNotFound);
             }
         }
 
@@ -113,7 +113,10 @@ impl NFTokenAcceptOfferTransactor {
     ) -> Result<(Hash256, Value), TransactionResult> {
         let key_bytes = hex::decode(offer_hex).map_err(|_| TransactionResult::TemMalformed)?;
         let key = Hash256::from_slice(&key_bytes).map_err(|_| TransactionResult::TemMalformed)?;
-        let bytes = ctx.view.read(&key).ok_or(TransactionResult::TecNoEntry)?;
+        let bytes = ctx
+            .view
+            .read(&key)
+            .ok_or(TransactionResult::TecObjectNotFound)?;
         let offer: Value =
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
         Ok((key, offer))
@@ -499,7 +502,7 @@ mod tests {
     use crate::fees::FeeSettings;
     use crate::handlers::nftoken_create_offer::NFTokenCreateOfferTransactor;
     use crate::handlers::nftoken_mint::NFTokenMintTransactor;
-    use crate::transactor::{ApplyContext, PreflightContext};
+    use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext};
     use crate::view::ledger_view::LedgerView;
     use crate::view::read_view::ReadView;
     use crate::view::sandbox::Sandbox;
@@ -720,6 +723,31 @@ mod tests {
         assert_eq!(
             NFTokenAcceptOfferTransactor.preflight(&ctx),
             Err(TransactionResult::TemMalformed)
+        );
+    }
+
+    #[test]
+    fn preclaim_missing_offer_is_object_not_found() {
+        let (ledger, _, _) = setup_with_sell_offer();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenAcceptOffer",
+            "Account": BUYER,
+            "NFTokenSellOffer": "0000000000000000000000000000000000000000000000000000000000000000",
+            "Fee": "12",
+            "Sequence": 1,
+        });
+        let ctx = PreclaimContext {
+            tx: &tx,
+            view: &view,
+            rules: &rules,
+        };
+
+        assert_eq!(
+            NFTokenAcceptOfferTransactor.preclaim(&ctx),
+            Err(TransactionResult::TecObjectNotFound)
         );
     }
 }
