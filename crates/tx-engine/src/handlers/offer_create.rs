@@ -4204,6 +4204,18 @@ fn apply_amm_move(
             }
             return Ok(*out_num);
         }
+        let terminal_transfer_fee = !skip_output_credit
+            && hop.out_iss != hop.pool_id
+            && hop.out_iss != *dest
+            && transfer_rate_value(ctx, &hop.out_iss) > 1_000_000_000;
+        let owner_rounding = if skip_input_debit && terminal_transfer_fee {
+            // A fee-charged terminal path hop debits the pool at a negative
+            // half-ULP tie toward zero (105500249 / TX 126). Without the fee,
+            // nearest-even remains exact (105500789 / TX 54).
+            BalanceRounding::HalfUpward
+        } else {
+            amm_pool_debit_rounding(skip_output_credit)
+        };
         let net = pay_out_gross(
             ctx,
             taker,
@@ -4212,7 +4224,7 @@ fn apply_amm_move(
             dest,
             &amount,
             ctx.rules.enabled(&feature_id("fixUniversalNumber")),
-            amm_pool_debit_rounding(skip_output_credit),
+            owner_rounding,
             BalanceRounding::HalfUpward,
             skip_output_credit,
             TransferFeeRounding::Nearest,
@@ -8902,6 +8914,25 @@ mod taker_crossing_tests {
         assert_eq!(
             add_iou_balance_downward(&before, &debit).to_decimal_string(),
             "3009296060.619702"
+        );
+    }
+
+    #[test]
+    fn ledger_105500249_terminal_path_pool_halfway_debit() {
+        let before = IOUAmount::from_decimal_string("-27.66112374802621").unwrap();
+        let debit = IOUAmount::from_decimal_string("0.180231474079375").unwrap();
+
+        assert_eq!(
+            add_iou_balance_half_upward(&before, &debit)
+                .unwrap()
+                .to_decimal_string(),
+            "-27.48089227394683"
+        );
+        assert_eq!(
+            add_iou_balance(&before, &debit, true)
+                .unwrap()
+                .to_decimal_string(),
+            "-27.48089227394684"
         );
     }
 
