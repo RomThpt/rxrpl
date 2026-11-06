@@ -1616,20 +1616,15 @@ fn cross_offers(
                     // (drifted) amounts under-prices an XRP take by a drop.
                     leg_min(&in_for_out(&take_out, &rate, &offer_in), &offer_in)
                 } else if offer_in.is_xrp {
-                    // Funds-limited XRP take: rippled scales the resting offer's
-                    // TakerPays by the funded output fraction rounded DOWN
-                    // (offer_in * avail_out / offer_out, floored to drops) — the
-                    // same scale-down the multi-hop book path uses. Repricing the
-                    // clamped output at the book's quantized rate ceils a drop high
-                    // and over-charges the taker (105500121/122).
-                    let ratio = IOUAmount::divide(
-                        &leg_as_quality_iou(&avail_out),
-                        &leg_as_quality_iou(&offer_out),
+                    // BookStep limits an underfunded offer at its original
+                    // directory quality, rounding the XRP input down to whole
+                    // drops. The offer's current fields may have drifted after
+                    // earlier fills (105500938); rounding upward instead
+                    // over-charges other funded takes (105500121/122).
+                    leg_min(
+                        &in_for_out_round(&take_out, &rate, &offer_in, false),
+                        &offer_in,
                     )
-                    .unwrap_or(IOUAmount::ZERO);
-                    let scaled = IOUAmount::multiply(&leg_as_quality_iou(&offer_in), &ratio)
-                        .unwrap_or(IOUAmount::ZERO);
-                    leg_min(&leg_from_magnitude(&scaled, &offer_in), &offer_in)
                 } else {
                     // Funds-limited IOU take: BookStep limits the offer at its
                     // book quality with `ceilOutStrict(..., roundUp=false)`.
@@ -9025,6 +9020,23 @@ mod taker_crossing_tests {
         assert_eq!(
             scale_funds_limited_input(&offer_in, &available, &offer_out).drops,
             1_914_188
+        );
+    }
+
+    #[test]
+    fn ledger_105500938_underfunded_xrp_uses_directory_quality() {
+        let offer_in = xrp(192_198_956);
+        let offer_out = iou("214.2469190929406");
+        let available = iou("214.246918526333");
+        let directory_rate = from_rate(0x5A1F_DEFE_770D_555E).unwrap();
+
+        assert_eq!(
+            in_for_out_round(&available, &directory_rate, &offer_in, false).drops,
+            192_198_956
+        );
+        assert_eq!(
+            scale_funds_limited_input(&offer_in, &available, &offer_out).drops,
+            192_198_955
         );
     }
 
