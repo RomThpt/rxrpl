@@ -315,14 +315,11 @@ fn relink(
         let key = keylet::dir_node(root_key, page);
         if let Some(b) = view.read(&key) {
             if let Ok(mut n) = serde_json::from_slice::<Value>(&b) {
-                // A non-root page always carries its links, so IndexPrevious=0
-                // (pointing back at the root) is kept; only the root page drops
-                // a zero link (single-page directory).
-                if val == 0 && page == 0 {
-                    n.as_object_mut().map(|o| o.remove(field));
-                } else {
-                    n[field] = u64_hex(val).into();
-                }
+                // Keep zero links explicit after unlinking the last overflow
+                // page. Their default values do not affect the serialized SLE,
+                // but rippled retains them in the ApplyStateTable so metadata
+                // FinalFields and later PreviousFields include both links.
+                n[field] = u64_hex(val).into();
                 prepare_directory_update(view, &mut n);
                 if let Ok(nb) = serde_json::to_vec(&n) {
                     let _ = view.update(key, nb);
@@ -812,6 +809,10 @@ mod tests {
         remove_from_owner_dir_page(&mut sandbox, &account, 1, &spilled).unwrap();
         let page1 = keylet::dir_node(&keylet::owner_dir(&account), 1);
         assert!(sandbox.read(&page1).is_none());
+        let root: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::owner_dir(&account)).unwrap()).unwrap();
+        assert_eq!(root["IndexNext"], u64_hex(0));
+        assert_eq!(root["IndexPrevious"], u64_hex(0));
     }
 
     #[test]
