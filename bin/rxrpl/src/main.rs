@@ -577,14 +577,13 @@ fn cmd_replay_segment(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let checkpoint = resolve_replay_range(checkpoint, start, end)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    let state_pack = std::fs::read(state)?;
     let ledger_blobs: Vec<Vec<u8>> = ledgers
         .iter()
         .map(std::fs::read)
         .collect::<Result<_, _>>()?;
     let refs: Vec<&[u8]> = ledger_blobs.iter().map(Vec::as_slice).collect();
-    let (summary, resume_ledger) = rxrpl_node::replay_worker::replay_segment_with_state(
-        &state_pack,
+    let (summary, resume_ledger) = rxrpl_node::replay_worker::replay_segment_with_state_file(
+        state,
         &refs,
         checkpoint,
         start,

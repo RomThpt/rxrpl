@@ -12,11 +12,12 @@
 //! localise a divergence to ledger -> tx -> object -> field. No RPC, no network.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 use rxrpl_ledger::{Ledger, LedgerHeader};
 use rxrpl_primitives::Hash256;
-use rxrpl_shamap::{SHAMap, transaction_set_root};
+use rxrpl_shamap::{SHAMap, SHAMapError, transaction_set_root};
 
 use crate::play_forward::{
     TxSet, all_handlers_engine, fees_for_ledger, replay_forward, replay_forward_observed_order,
@@ -422,7 +423,7 @@ pub fn replay_segment_with_state<F>(
     checkpoint: u64,
     start: u64,
     end: u64,
-    mut emit: F,
+    emit: F,
 ) -> Result<(ReplaySummary, Ledger), String>
 where
     F: FnMut(LedgerReport) -> Result<(), String>,
@@ -437,12 +438,126 @@ where
     }
 
     let mut state = SHAMap::account_state();
-    for (index, data) in &sp.entries {
+    for (index, data) in sp.entries {
         state
-            .put(Hash256::new(*index), data.clone())
+            .put(Hash256::new(index), data)
             .map_err(|e| format!("state seed put failed: {e:?}"))?;
     }
 
+    replay_segment_with_seeded_state(state, ledger_packs, checkpoint, start, end, emit)
+}
+
+/// Replay using a STATE pack read from disk, retaining only the SHAMap and one
+/// entry payload in memory while seeding.
+pub fn replay_segment_with_state_file<F>(
+    path: &Path,
+    ledger_packs: &[&[u8]],
+    checkpoint: u64,
+    start: u64,
+    end: u64,
+    emit: F,
+) -> Result<(ReplaySummary, Ledger), String>
+where
+    F: FnMut(LedgerReport) -> Result<(), String>,
+{
+    validate_range(checkpoint, start, end)?;
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(file);
+    let state = seed_state_from_reader(&mut reader, checkpoint)?;
+    replay_segment_with_seeded_state(state, ledger_packs, checkpoint, start, end, emit)
+}
+
+fn read_state_field<const N: usize>(reader: &mut impl Read) -> Result<[u8; N], String> {
+    let mut bytes = [0; N];
+    reader.read_exact(&mut bytes).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            "truncated pack".to_string()
+        } else {
+            e.to_string()
+        }
+    })?;
+    Ok(bytes)
+}
+
+fn seed_state_from_reader<R: Read + Seek>(
+    reader: &mut R,
+    checkpoint: u64,
+) -> Result<SHAMap, String> {
+    let start = reader.stream_position().map_err(|e| e.to_string())?;
+    let end = reader.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+    reader
+        .seek(SeekFrom::Start(start))
+        .map_err(|e| e.to_string())?;
+
+    if read_state_field::<4>(reader)? != *MAGIC {
+        return Err("bad magic".into());
+    }
+    if read_state_field::<1>(reader)?[0] != VERSION {
+        return Err("bad version".into());
+    }
+    if read_state_field::<1>(reader)?[0] != KIND_STATE {
+        return Err("wrong pack kind".into());
+    }
+    let checkpoint_seq = u64::from_be_bytes(read_state_field(reader)?);
+    if checkpoint_seq == 0 || checkpoint_seq > u64::from(u32::MAX) {
+        return Err(format!(
+            "checkpoint {checkpoint_seq} is outside the valid u32 ledger range"
+        ));
+    }
+    if checkpoint_seq != checkpoint {
+        return Err(format!(
+            "state pack checkpoint {checkpoint_seq} != requested checkpoint {checkpoint}"
+        ));
+    }
+    let count = u32::from_be_bytes(read_state_field(reader)?) as u64;
+    let remaining = end.saturating_sub(reader.stream_position().map_err(|e| e.to_string())?);
+    if count > remaining / 36 {
+        return Err("state entry count exceeds remaining pack bytes".into());
+    }
+
+    let mut state = SHAMap::account_state();
+    for _ in 0..count {
+        let index = read_state_field::<32>(reader)?;
+        let key = Hash256::new(index);
+        let len = u32::from_be_bytes(read_state_field(reader)?) as u64;
+        let remaining = end.saturating_sub(reader.stream_position().map_err(|e| e.to_string())?);
+        if len > remaining {
+            return Err("truncated pack".into());
+        }
+        let mut data = vec![0; len as usize];
+        reader.read_exact(&mut data).map_err(|e| e.to_string())?;
+        match state.insert(key, data) {
+            Ok(()) => {}
+            Err(SHAMapError::DuplicateKey) => {
+                return Err(format!(
+                    "duplicate state index {}",
+                    hex::encode_upper(index)
+                ));
+            }
+            Err(e) => return Err(format!("state seed put failed: {e:?}")),
+        }
+    }
+    let position = reader.stream_position().map_err(|e| e.to_string())?;
+    if position != end {
+        return Err(format!(
+            "trailing bytes after STATE pack: {}",
+            end - position
+        ));
+    }
+    Ok(state)
+}
+
+fn replay_segment_with_seeded_state<F>(
+    mut state: SHAMap,
+    ledger_packs: &[&[u8]],
+    checkpoint: u64,
+    start: u64,
+    end: u64,
+    mut emit: F,
+) -> Result<(ReplaySummary, Ledger), String>
+where
+    F: FnMut(LedgerReport) -> Result<(), String>,
+{
     let mut ledgers: BTreeMap<u64, LedgerRecord> = BTreeMap::new();
     for pack in ledger_packs {
         for rec in unpack_ledger_batch(pack)? {
@@ -663,6 +778,120 @@ mod tests {
         assert_eq!(decoded.checkpoint_seq, 42);
         assert_eq!(decoded.entries[0], ([1; 32], b"first".to_vec()));
         assert_eq!(decoded.entries[1], ([2; 32], b"second".to_vec()));
+    }
+
+    #[test]
+    fn reader_seed_matches_byte_slice_state() {
+        let pack = state_pack(42, &[([2; 32], b"second"), ([1; 32], b"first")]);
+        let decoded = unpack_state(&pack).unwrap();
+        let mut expected = SHAMap::account_state();
+        for (index, data) in decoded.entries {
+            expected.insert(Hash256::new(index), data).unwrap();
+        }
+        let mut reader = std::io::Cursor::new(pack);
+        let mut seeded = seed_state_from_reader(&mut reader, 42).unwrap();
+        assert_eq!(seeded.root_hash(), expected.root_hash());
+        assert_eq!(seeded.get(&Hash256::new([1; 32])), Some(&b"first"[..]));
+        assert_eq!(seeded.get(&Hash256::new([2; 32])), Some(&b"second"[..]));
+    }
+
+    #[test]
+    fn reader_seed_rejects_malformed_state_packs() {
+        let mut bad_magic = state_pack(7, &[]);
+        bad_magic[0] = b'N';
+        let mut bad_version = state_pack(7, &[]);
+        bad_version[4] = 2;
+        let mut bad_kind = state_pack(7, &[]);
+        bad_kind[5] = KIND_LEDGER;
+        let mut bad_count = state_pack(7, &[]);
+        bad_count[14..18].copy_from_slice(&1u32.to_be_bytes());
+        let mut truncated_payload = state_pack(7, &[([1; 32], b"payload")]);
+        truncated_payload.pop();
+        let mut oversized_length = state_pack(7, &[([1; 32], b"a")]);
+        oversized_length[50..54].copy_from_slice(&u32::MAX.to_be_bytes());
+        let mut trailing = state_pack(7, &[]);
+        trailing.push(0);
+        let cases = [
+            (bad_magic, "bad magic"),
+            (bad_version, "bad version"),
+            (bad_kind, "wrong pack kind"),
+            (state_pack(0, &[]), "outside the valid u32 ledger range"),
+            (state_pack(8, &[]), "!= requested checkpoint"),
+            (bad_count, "entry count exceeds remaining"),
+            (truncated_payload, "truncated pack"),
+            (oversized_length, "truncated pack"),
+            (
+                state_pack(7, &[([3; 32], b"a"), ([3; 32], b"b")]),
+                "duplicate state index",
+            ),
+            (trailing, "trailing bytes"),
+        ];
+        for (pack, expected) in cases {
+            let error = seed_state_from_reader(&mut std::io::Cursor::new(pack), 7).unwrap_err();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got {error:?}"
+            );
+        }
+        assert_eq!(
+            seed_state_from_reader(&mut std::io::Cursor::new(b"XSCP"), 7).unwrap_err(),
+            "truncated pack"
+        );
+    }
+
+    #[test]
+    fn file_seed_replay_matches_byte_slice_replay() {
+        let mut parent_state = SHAMap::account_state();
+        parent_state
+            .insert(Hash256::new([1; 32]), b"account".to_vec())
+            .unwrap();
+        let mut parent_header = LedgerHeader::new();
+        parent_header.sequence = 1;
+        parent_header.account_hash = parent_state.root_hash();
+        parent_header.hash = parent_header.compute_hash();
+        let mut parent = Ledger::from_catchup(1, parent_header.hash, parent_state);
+        parent.header = parent_header;
+        let expected = replay_empty(&parent).ledger.header;
+        let state = state_pack(1, &[([1; 32], b"account")]);
+        let pack = ledger_pack(
+            1,
+            &[
+                (1, parent.header.to_raw_bytes(), Vec::new()),
+                (2, expected.to_raw_bytes(), Vec::new()),
+            ],
+        );
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&state).unwrap();
+        let (memory_summary, mut memory_resume) =
+            replay_segment_with_state(&state, &[&pack], 1, 2, 2, |_| Ok(())).unwrap();
+        let (file_summary, mut file_resume) =
+            replay_segment_with_state_file(file.path(), &[&pack], 1, 2, 2, |_| Ok(())).unwrap();
+        assert_eq!(file_summary.processed, memory_summary.processed);
+        assert_eq!(file_summary.stopped_early, memory_summary.stopped_early);
+        assert_eq!(
+            file_summary.account_hash_mismatches,
+            memory_summary.account_hash_mismatches
+        );
+        assert_eq!(file_resume.header.hash, memory_resume.header.hash);
+        assert_eq!(
+            file_resume.state_map.root_hash(),
+            memory_resume.state_map.root_hash()
+        );
+        let mut file_output = std::io::Cursor::new(Vec::new());
+        let mut memory_output = std::io::Cursor::new(Vec::new());
+        write_state_pack(
+            &mut file_output,
+            u64::from(file_resume.header.sequence),
+            &file_resume.state_map,
+        )
+        .unwrap();
+        write_state_pack(
+            &mut memory_output,
+            u64::from(memory_resume.header.sequence),
+            &memory_resume.state_map,
+        )
+        .unwrap();
+        assert_eq!(file_output.into_inner(), memory_output.into_inner());
     }
 
     fn ledger_pack(batch_start: u64, records: &[(u64, Vec<u8>, Vec<TxRecord>)]) -> Vec<u8> {
