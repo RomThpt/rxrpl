@@ -1378,11 +1378,15 @@ fn cross_offers(
         if !remaining_out.is_zero() && !remaining_in.is_zero() {
             if let Some(b) = &bridge {
                 let before = remaining_out.clone();
+                let multi_path = offer_crossing_strand_reaches_limit(
+                    ctx, taker, taker_gets, taker_pays, threshold,
+                );
                 try_bridge_step(
                     ctx,
                     taker,
                     taker_acct,
                     b,
+                    multi_path,
                     &in_leg,
                     &out_leg,
                     &mut remaining_out,
@@ -1783,11 +1787,14 @@ fn cross_offers(
     // gated: a single crossed CLOB offer must not suppress better AMM liquidity.
     if !remaining_out.is_zero() && !remaining_in.is_zero() {
         if let Some(b) = &bridge {
+            let multi_path =
+                offer_crossing_strand_reaches_limit(ctx, taker, taker_gets, taker_pays, threshold);
             try_bridge_step(
                 ctx,
                 taker,
                 taker_acct,
                 b,
+                multi_path,
                 &in_leg,
                 &out_leg,
                 &mut remaining_out,
@@ -2071,6 +2078,7 @@ fn try_bridge_step(
     taker: &AccountId,
     taker_acct: &mut Value,
     bridge: &FlowStrand,
+    multi_path: bool,
     in_leg: &Leg,
     out_leg: &Leg,
     remaining_out: &mut Leg,
@@ -2081,10 +2089,11 @@ fn try_bridge_step(
     is_sell: bool,
 ) -> Result<(), TransactionResult> {
     let mut budget = leg_min(remaining_in, source_remaining);
-    // OfferCreate compares the direct and XRP-bridge strands in one Flow call.
-    // Its AMM offers therefore use multi-path fib chunks, with one iteration
-    // counter retained across passes (105500934).
-    let mut amm_ctx = AmmContext::new(true);
+    // Flow uses Fibonacci AMM chunks only while both the direct and bridge
+    // strands remain eligible. A dry direct book leaves a single bridge strand
+    // (105500435); funded direct liquidity keeps the multi-path mode
+    // (105500934). Retain the AMM iteration counter across bridge passes.
+    let mut amm_ctx = AmmContext::new(multi_path);
 
     // One Flow strand execution is an atomic candidate. rippled walks all of
     // its successive book bands, computes quality from the aggregate input and
