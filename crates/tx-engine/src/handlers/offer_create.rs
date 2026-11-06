@@ -2577,6 +2577,16 @@ fn cross_book_hop(
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
                 continue;
             }
+            // Keep inspecting invalid offers after source funds are exhausted,
+            // but do not spend a representable arithmetic remainder on a later
+            // funded offer from the same page (105500929, TX42).
+            if !skip_input_debit
+                && !budget_in.is_xrp
+                && !spent.is_zero()
+                && owner_funds_leg(ctx, taker, budget_in).is_zero()
+            {
+                break 'walk;
+            }
             let avail_out = leg_min(&offer_out, &funds);
             // OfferStream continues stepping invalid entries after source funds
             // are exhausted, so expired/unfunded offers are still reaped. A
