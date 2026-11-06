@@ -978,10 +978,12 @@ enum BalanceRounding {
 }
 
 fn amm_pool_debit_rounding(intermediate_output: bool) -> BalanceRounding {
+    // Terminal AMM settlement uses Number's nearest rounding. The waived-fee
+    // bridge has a separate debit in apply_amm_move.
     if intermediate_output {
         BalanceRounding::HalfUpward
     } else {
-        BalanceRounding::Downward
+        BalanceRounding::Nearest
     }
 }
 
@@ -8645,11 +8647,11 @@ fn taker_cross(
 #[cfg(test)]
 mod taker_crossing_tests {
     use super::{
-        Leg, TakerCrossType, add_iou_balance, add_iou_balance_downward,
-        add_iou_balance_half_upward, amm_step_allows_clob, book_step_input_exhausted,
-        clob_band_allows_terminal_amm, composed_quality, consumes_full_offer,
-        crossing_quality_threshold, crossing_threshold, debit_drains_source, flow_iou_to_iou,
-        flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou, full_offer_take,
+        BalanceRounding, Leg, TakerCrossType, add_iou_balance, add_iou_balance_downward,
+        add_iou_balance_half_upward, amm_pool_debit_rounding, amm_step_allows_clob,
+        book_step_input_exhausted, clob_band_allows_terminal_amm, composed_quality,
+        consumes_full_offer, crossing_quality_threshold, crossing_threshold, debit_drains_source,
+        flow_iou_to_iou, flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou, full_offer_take,
         funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
         in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
         leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
@@ -8777,6 +8779,12 @@ mod taker_crossing_tests {
         let delivery = IOUAmount::from_decimal_string("6.64285325496125").unwrap();
 
         assert_eq!(
+            add_iou_balance(&pool_before, &delivery, true)
+                .unwrap()
+                .to_decimal_string(),
+            "-334.6644516244194"
+        );
+        assert_eq!(
             add_iou_balance_downward(&pool_before, &delivery).to_decimal_string(),
             "-334.6644516244194"
         );
@@ -8785,6 +8793,76 @@ mod taker_crossing_tests {
                 .unwrap()
                 .to_decimal_string(),
             "-334.6644516244193"
+        );
+    }
+
+    #[test]
+    fn ledger_105500849_offer_cross_pool_debit_rounds_nearest() {
+        let before = IOUAmount::from_decimal_string("58255413.05686753").unwrap();
+        let delivery = IOUAmount::from_decimal_string("738866.732999333").unwrap();
+        let debit = delivery.negate();
+
+        assert!(matches!(
+            amm_pool_debit_rounding(false),
+            BalanceRounding::Nearest
+        ));
+        assert!(matches!(
+            amm_pool_debit_rounding(true),
+            BalanceRounding::HalfUpward
+        ));
+
+        assert_eq!(
+            add_iou_balance(&before, &debit, true)
+                .unwrap()
+                .to_decimal_string(),
+            "57516546.3238682"
+        );
+        assert_eq!(
+            add_iou_balance_downward(&before, &debit).to_decimal_string(),
+            "57516546.32386819"
+        );
+    }
+
+    #[test]
+    fn ledger_105500855_direct_amm_pool_debit_rounds_nearest() {
+        let before = IOUAmount::from_decimal_string("-33186471.87677241").unwrap();
+        let delivery = IOUAmount::from_decimal_string("342084.897489097").unwrap();
+
+        assert!(matches!(
+            amm_pool_debit_rounding(false),
+            BalanceRounding::Nearest
+        ));
+        assert_eq!(
+            add_iou_balance(&before, &delivery, true)
+                .unwrap()
+                .to_decimal_string(),
+            "-32844386.97928331"
+        );
+        assert_eq!(
+            add_iou_balance_downward(&before, &delivery).to_decimal_string(),
+            "-32844386.97928332"
+        );
+    }
+
+    #[test]
+    fn ledger_105500863_payment_pool_debit_rounds_nearest() {
+        let before = IOUAmount::from_decimal_string("3009996411.331705").unwrap();
+        let delivery = IOUAmount::from_decimal_string("700350.712002475").unwrap();
+        let debit = delivery.negate();
+
+        assert!(matches!(
+            amm_pool_debit_rounding(false),
+            BalanceRounding::Nearest
+        ));
+        assert_eq!(
+            add_iou_balance(&before, &debit, true)
+                .unwrap()
+                .to_decimal_string(),
+            "3009296060.619703"
+        );
+        assert_eq!(
+            add_iou_balance_downward(&before, &debit).to_decimal_string(),
+            "3009296060.619702"
         );
     }
 
