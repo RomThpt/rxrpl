@@ -2333,6 +2333,7 @@ pub(crate) fn cross_book_payment(
     // it. `pay_in` only prevents a negative balance, not a dip below the reserve.
     let mut budget = in_tmpl.clone();
     let funds = owner_funds_leg(ctx, taker, &in_tmpl);
+    let source_funds_limited = leg_gt(&budget, &funds);
     if leg_ge(&budget, &funds) {
         budget = funds.clone();
     }
@@ -2358,6 +2359,7 @@ pub(crate) fn cross_book_payment(
         /*preserve_input_limited_iou_ulp=*/ false,
         /*force_full_input_budget=*/ false,
         source_input_rate,
+        source_funds_limited,
     )?;
     Ok((
         delivered.with_amount(&delivered.iou, delivered.drops),
@@ -2396,6 +2398,7 @@ fn cross_book_hop(
     preserve_input_limited_iou_ulp: bool,
     force_full_input_budget: bool,
     source_input_rate: u32,
+    source_funds_limited: bool,
 ) -> Result<(Leg, Leg), TransactionResult> {
     let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
     let inverse_book = keylet::book_dir(
@@ -2553,11 +2556,11 @@ fn cross_book_hop(
             if hop_out_done(&remaining_out, demand_out) {
                 break 'walk;
             }
-            // Once this BookStep has consumed its available input, rippled's
-            // callback returns false before OfferStream advances again. Do not
-            // inspect or reap a later offer. A step that starts at zero still
-            // walks invalid tips and may consume representable zero-cost dust.
-            if book_step_input_exhausted(&spent, &remaining_in) {
+            // After an ordinary input exhaustion, BookStep stops before the
+            // next offer. A source-limited direct conversion still inspects
+            // expiration on the next tip (105500249), but does not reap an
+            // unexpired unfunded tip (105500652).
+            if book_step_input_exhausted(&spent, &remaining_in) && !source_funds_limited {
                 break 'walk;
             }
             let Some(ob) = ctx.view.read(&offer_key) else {
@@ -2589,6 +2592,9 @@ fn cross_book_hop(
             {
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
                 continue;
+            }
+            if book_step_input_exhausted(&spent, &remaining_in) {
+                break 'walk;
             }
             let funds = owner_funds_leg(ctx, &owner, &offer_out);
             if funds.is_zero() {
@@ -3413,6 +3419,7 @@ pub(crate) fn cross_path_payment(
             is_last && taker == dest && ctx.rules.enabled(&feature_id("fixUniversalNumber")),
             /*force_full_input_budget=*/ false,
             source_input_rate,
+            /*source_funds_limited=*/ false,
         )?;
 
         // Residual liquidity from the AMM pool for this pair, on the budget not
@@ -5590,6 +5597,7 @@ fn price_clob_band_reverse(
         /*preserve_input_limited_iou_ulp=*/ false,
         /*force_full_input_budget=*/ false,
         /*source_input_rate=*/ 1_000_000_000,
+        /*source_funds_limited=*/ false,
     );
     ctx.view.rollback(cp);
     *taker_acct = taker_acct_before;
@@ -6030,6 +6038,7 @@ fn execute_strand_pass(
                     /*force_full_input_budget=*/
                     bridge_xrp_reverse,
                     /*source_input_rate=*/ 1_000_000_000,
+                    /*source_funds_limited=*/ false,
                 )
                 .ok()?;
                 if delivered.is_zero()
@@ -11210,6 +11219,7 @@ mod taker_bridge_integration {
             false,
             false,
             1_000_000_000,
+            false,
         )
         .unwrap();
 
@@ -11405,6 +11415,7 @@ mod taker_bridge_integration {
             false,
             false,
             1_000_000_000,
+            false,
         )
         .unwrap();
         assert_eq!(delivered.iou.to_decimal_string(), "10");
