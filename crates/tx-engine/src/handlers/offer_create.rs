@@ -2065,12 +2065,10 @@ fn try_bridge_step(
     is_sell: bool,
 ) -> Result<(), TransactionResult> {
     let mut budget = leg_min(remaining_in, source_remaining);
-    // Persist the AMM fib counter across passes (rippled `AMMContext`): each
-    // committed pass advances `amm_iters`, growing the synthetic AMM offer
-    // geometrically so the strand converges in a handful of passes. A fresh
-    // context per pass would reseed the smallest fib chunk every time, delivering
-    // an identical dust sliver and looping ~10^5 times to drain the budget.
-    let mut amm_ctx = AmmContext::new(false);
+    // OfferCreate compares the direct and XRP-bridge strands in one Flow call.
+    // Its AMM offers therefore use multi-path fib chunks, with one iteration
+    // counter retained across passes (105500934).
+    let mut amm_ctx = AmmContext::new(true);
 
     // One Flow strand execution is an atomic candidate. rippled walks all of
     // its successive book bands, computes quality from the aggregate input and
@@ -5624,7 +5622,6 @@ fn limit_strand_output_by_quality(
     remaining_out: &Number,
     limit_quality: u64,
     amm_ctx: &AmmContext,
-    offer_create_bridge: bool,
 ) -> Number {
     use rxrpl_amount::number::{RoundModeGuard, RoundingMode};
 
@@ -5639,15 +5636,11 @@ fn limit_strand_output_by_quality(
         }
 
         let clob_quality = funded_book_tip_quality(ctx, taker, &hop.inverse_book);
-        let amm_offer = if offer_create_bridge && clob_quality.is_some() {
-            None
-        } else {
-            match (hop.liquidity.as_ref(), amm_hops[h].as_ref()) {
-                (Some(liq), Some(amm)) => {
-                    liq.get_offer(&amm.pool_in, &amm.pool_out, clob_quality, amm_ctx)
-                }
-                _ => None,
+        let amm_offer = match (hop.liquidity.as_ref(), amm_hops[h].as_ref()) {
+            (Some(liq), Some(amm)) => {
+                liq.get_offer(&amm.pool_in, &amm.pool_out, clob_quality, amm_ctx)
             }
+            _ => None,
         };
 
         let (step_m, step_b) = if let (Some(offer), Some(amm)) = (amm_offer, amm_hops[h].as_ref()) {
@@ -5766,7 +5759,6 @@ fn execute_strand_pass(
                 remaining_out,
                 quality,
                 amm_ctx,
-                offer_create_bridge,
             )
         })
         .unwrap_or(*remaining_out);
@@ -5797,18 +5789,13 @@ fn execute_strand_pass(
         let clob_quality = funded_book_tip_quality(ctx, taker, &hop.inverse_book);
 
         // Try the AMM fib chunk first, gated to the CLOB tip quality.
-        let amm_offer = if offer_create_bridge && clob_quality.is_some() {
-            // OfferCreate's explicit XRP bridge keeps a funded book hop CLOB-only.
-            // Once OfferStream reaps the last stale/unfunded tip, the AMM may
-            // provide that otherwise-dry hop (ledger 105500435).
-            None
-        } else {
-            match (hop.liquidity.as_ref(), amm_hops[h].as_ref()) {
-                (Some(liq), Some(amm)) => {
-                    liq.get_offer(&amm.pool_in, &amm.pool_out, clob_quality, amm_ctx)
-                }
-                _ => None,
+        // BookOfferCrossingStep compares the AMM's synthetic offer with the
+        // funded CLOB tip even on an XRP autobridge hop (105500934).
+        let amm_offer = match (hop.liquidity.as_ref(), amm_hops[h].as_ref()) {
+            (Some(liq), Some(amm)) => {
+                liq.get_offer(&amm.pool_in, &amm.pool_out, clob_quality, amm_ctx)
             }
+            _ => None,
         };
 
         if let Some(offer) = amm_offer {
@@ -11139,9 +11126,9 @@ mod taker_bridge_integration {
             TransactionResult::TesSuccess
         );
 
-        // The pool's 0.5 XRP/BBB spot is better than the CLOB. A generic book
-        // walk would therefore take the AMM first, but an OfferCreate XRP
-        // autobridge is explicitly CLOB-only.
+        // The pool's 0.5 XRP/BBB spot is better than the CLOB. This helper
+        // invocation is the CLOB portion of the bridge pass; AMM selection is
+        // handled by the enclosing Flow strand.
         let zero = AccountId::from([0u8; 20]);
         let issuer = decode_account_id(ISS).unwrap();
         let amm_key = keylet::amm(&[0u8; 20], &zero, &ccy(b"BBB"), &issuer);
