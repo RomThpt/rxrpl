@@ -1275,10 +1275,9 @@ fn cross_offers(
     // check. Do not do this on the initial probe: already-unfunded offers beyond
     // the taker's limit stay untouched when no preceding tip was consumed.
     let mut advance_after_exhausted_tip = false;
-    // Once a real CLOB callback has run, BookStep materialises the next tip and
-    // applies permanent self/unfunded cleanup before checking its quality. Keep
-    // the initial probe non-destructive, including when the preceding external
-    // offer was only partially consumed.
+    // Once a real CLOB callback has run, BookStep may materialise the next tip
+    // and apply permanent self/unfunded cleanup before checking its quality.
+    // A partial buy fill that satisfies the output stops before this advance.
     let mut clob_offer_attempted = false;
     let book_prefix = &inverse_book.as_bytes()[0..24];
     let fok = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_FILL_OR_KILL != 0;
@@ -1305,6 +1304,16 @@ fn cross_offers(
     let mut probe = book_dir_with_quality(inverse_book, 0);
     let mut deferred_out_of_quality_dir = None;
     'walk: while let Some(dir_key) = ctx.view.succ(&probe) {
+        // A partial buy fill can meet the requested output before spending
+        // the whole input. Flow leaves that BookTip in place and does not
+        // materialise a self-offer at the next quality (105500242 / TX 9).
+        if !is_sell
+            && clob_offer_attempted
+            && remaining_out.is_zero()
+            && !advance_after_exhausted_tip
+        {
+            break;
+        }
         if &dir_key.as_bytes()[0..24] != book_prefix {
             break; // left this book
         }
@@ -1432,6 +1441,13 @@ fn cross_offers(
         let offers = book_dir_indexes(ctx, &dir_key);
 
         for offer_key in offers {
+            if !is_sell
+                && clob_offer_attempted
+                && remaining_out.is_zero()
+                && !advance_after_exhausted_tip
+            {
+                break 'walk;
+            }
             let Some(ob) = ctx.view.read(&offer_key) else {
                 continue;
             };
