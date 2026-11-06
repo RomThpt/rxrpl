@@ -6271,6 +6271,19 @@ pub(crate) fn flow_multi(
             reconcile_flow_source_balance(ctx, source, &actual_in);
         }
     }
+    // A single input-capped self-payment also settles its source DirectStep
+    // with the exact gross SendMax. Reconstructing the gross from the rounded
+    // AMM net can leave one IOU ULP unspent (105500929).
+    if saved_ins.len() == 1
+        && input_exhausted
+        && taker == dest
+        && let Some(source) = source_balance.as_ref()
+        && destination_balance
+            .as_ref()
+            .is_none_or(|destination| source.key != destination.key)
+    {
+        reconcile_flow_source_balance_passes(ctx, source, &saved_ins);
+    }
     // Each winning rippled strand applies its destination DirectStep to the
     // accumulated sandbox immediately. For an input-exhausted self-payment,
     // replay those credits in commit order: replacing them with one aggregate
@@ -10236,6 +10249,20 @@ mod flow_source_balance_tests {
             aggregate_flow_source_balance_number(&balance, &Number::from_iou(&spent), false)
                 .to_decimal_string(),
             "0.0023781541865634"
+        );
+    }
+
+    #[test]
+    fn ledger_105500929_single_pass_source_uses_full_gross_input() {
+        let balance = IOUAmount::from_decimal_string("-0.11365554335").unwrap();
+        let spent = IOUAmount::from_decimal_string("0.1136555433").unwrap();
+        let saved_ins = [Number::from_iou(&spent)];
+
+        assert_eq!(
+            aggregate_flow_source_balance_passes(&balance, &saved_ins, true)
+                .unwrap()
+                .to_decimal_string(),
+            "-0.00000000005"
         );
     }
 
