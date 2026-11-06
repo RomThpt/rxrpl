@@ -1,6 +1,7 @@
 use rxrpl_amendment::feature::feature_id;
 use rxrpl_amount::IOUAmount;
 use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_protocol::flags::account_root::LSF_PASSWORD_SPENT;
 use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
 
@@ -405,6 +406,13 @@ impl Transactor for PaymentTransactor {
                 .ok_or(TransactionResult::TefInternal)?;
 
             helpers::set_balance(&mut dst_account, new_dst_balance);
+            // An XRP payment restores the destination's free regular-key reset.
+            // This flag is cleared on receipt, including when the account
+            // existed with a zero-cost reset already spent (105500999 / TX 43).
+            let flags = dst_account["Flags"].as_u64().unwrap_or(0);
+            if flags & u64::from(LSF_PASSWORD_SPENT) != 0 {
+                dst_account["Flags"] = Value::from(flags & !u64::from(LSF_PASSWORD_SPENT));
+            }
 
             let dst_data =
                 serde_json::to_vec(&dst_account).map_err(|_| TransactionResult::TefInternal)?;

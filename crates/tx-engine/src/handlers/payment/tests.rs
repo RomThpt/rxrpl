@@ -367,6 +367,46 @@ fn apply_transfer_to_existing_account() {
 }
 
 #[test]
+fn ledger_105500999_xrp_receipt_clears_password_spent() {
+    let mut ledger = setup_ledger_with_account(SRC_ADDRESS, 20_000_000);
+    let dst_id = decode_account_id(DST_ADDRESS).unwrap();
+    let dst_key = keylet::account(&dst_id);
+    let dst = serde_json::json!({
+        "LedgerEntryType": "AccountRoot",
+        "Account": DST_ADDRESS,
+        "Balance": "999990",
+        "Sequence": 1,
+        "OwnerCount": 0,
+        "Flags": LSF_PASSWORD_SPENT,
+    });
+    ledger
+        .put_state(dst_key, serde_json::to_vec(&dst).unwrap())
+        .unwrap();
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let tx = make_payment_tx(SRC_ADDRESS, DST_ADDRESS, "1000000", "10");
+    let rules = Rules::new();
+    crate::handlers::central_consume_for_test(&mut sandbox, &tx);
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut ctx).unwrap(),
+        TransactionResult::TesSuccess
+    );
+
+    let bytes = sandbox.read(&dst_key).unwrap();
+    let received: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(received["Balance"], "1999990");
+    assert_eq!(received["Flags"], 0);
+}
+
+#[test]
 fn apply_xrp_payment_with_ticket_consumes_ticket_not_sequence() {
     // Source owns one ticket (OwnerCount=1) and pays via TicketSequence
     // instead of Sequence; the ticket must be consumed and the account
