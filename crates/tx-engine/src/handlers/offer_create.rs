@@ -7,7 +7,7 @@ use rxrpl_primitives::{AccountId, Hash256};
 use rxrpl_protocol::TransactionResult;
 use rxrpl_protocol::keylet;
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use crate::helpers;
 use crate::owner_dir::{add_to_book_dir, add_to_owner_dir};
@@ -2106,6 +2106,7 @@ fn try_bridge_step(
     let taker_acct_before = taker_acct.clone();
     let mut pass_ins = Vec::new();
     let mut pass_outs = Vec::new();
+    let mut bridge_reaps = Vec::new();
     let mut quality_adjusted = false;
     let mut demand = if is_sell {
         unbounded_leg(out_leg)
@@ -2130,6 +2131,7 @@ fn try_bridge_step(
             &mut amm_ctx,
             /*offer_create_bridge=*/ true,
             Some(cq),
+            &mut bridge_reaps,
         ) else {
             break;
         };
@@ -2404,6 +2406,49 @@ fn cross_book_hop(
     source_input_rate: u32,
     source_funds_limited: bool,
 ) -> Result<(Leg, Leg), TransactionResult> {
+    cross_book_hop_with_reaps(
+        ctx,
+        taker,
+        taker_acct,
+        dest,
+        demand_out,
+        budget_in,
+        skip_input_debit,
+        skip_output_credit,
+        single_band,
+        allow_amm,
+        lq_stop,
+        preserve_input_limited_iou_ulp,
+        force_full_input_budget,
+        source_input_rate,
+        source_funds_limited,
+        None,
+    )
+}
+
+/// A reverse quote rolls its sandbox back, but FlowOfferStream keeps offers that
+/// were already invalid in the parent view for deletion after strand selection.
+type PermanentOffer = (AccountId, Hash256, Hash256);
+
+#[allow(clippy::too_many_arguments)]
+fn cross_book_hop_with_reaps(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    demand_out: &Leg,
+    budget_in: &Leg,
+    skip_input_debit: bool,
+    skip_output_credit: bool,
+    single_band: bool,
+    allow_amm: bool,
+    lq_stop: Option<(u64, u64)>,
+    preserve_input_limited_iou_ulp: bool,
+    force_full_input_budget: bool,
+    source_input_rate: u32,
+    source_funds_limited: bool,
+    mut permanent_reaps: Option<&mut Vec<PermanentOffer>>,
+) -> Result<(Leg, Leg), TransactionResult> {
     let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
     let inverse_book = keylet::book_dir(
         &budget_in.currency,
@@ -2595,6 +2640,9 @@ fn cross_book_hop(
                 .is_some_and(|exp| exp <= ctx.view.parent_close_time() as u64)
             {
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                if let Some(reaps) = permanent_reaps.as_mut() {
+                    reaps.push((owner, offer_key, dir_key));
+                }
                 continue;
             }
             if book_step_input_exhausted(&spent, &remaining_in) {
@@ -2602,7 +2650,27 @@ fn cross_book_hop(
             }
             let funds = owner_funds_leg(ctx, &owner, &offer_out);
             if funds.is_zero() {
+                let originally_unfunded =
+                    original_owner_funds_leg(ctx, &owner, &offer_out).is_zero();
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                if originally_unfunded && let Some(reaps) = permanent_reaps.as_mut() {
+                    reaps.push((owner, offer_key, dir_key));
+                }
+                continue;
+            }
+            if should_reap_tiny_increased_quality(
+                &owner,
+                &offer_in,
+                &offer_out,
+                &funds,
+                dir_quality,
+            ) {
+                let originally_tiny =
+                    tiny_offer_is_permanently_reapable(ctx, &owner, &offer_out, &funds);
+                reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                if originally_tiny && let Some(reaps) = permanent_reaps.as_mut() {
+                    reaps.push((owner, offer_key, dir_key));
+                }
                 continue;
             }
             // Keep inspecting invalid offers after source funds are exhausted,
@@ -5585,14 +5653,44 @@ fn price_clob_band_reverse(
     source_budget: Option<&Number>,
     is_first: bool,
     is_last: bool,
+    permanent_reaps: &mut Vec<PermanentOffer>,
 ) -> Option<(Number, Number)> {
     let demand_leg = number_to_leg(demanded, &hop.out_leg);
+    // A BookStep reverse pass starts from the requested output, before
+    // StrandFlow compares its required input with SendMax. The capped quote
+    // below preserves our existing forward pricing, but would stop before
+    // invalid offers following a partially filled funded tip. Explore the
+    // same output demand without SendMax and retain only permanent removals.
+    if source_budget.is_some() {
+        let cp = ctx.view.checkpoint();
+        let taker_acct_before = taker_acct.clone();
+        let _ = cross_book_hop_with_reaps(
+            ctx,
+            taker,
+            taker_acct,
+            dest,
+            &demand_leg,
+            &unbounded_leg(&hop.in_leg),
+            /*skip_input_debit=*/ true,
+            /*skip_output_credit=*/ !is_last,
+            /*single_band=*/ true,
+            /*allow_amm=*/ false,
+            /*lq_stop=*/ None,
+            /*preserve_input_limited_iou_ulp=*/ false,
+            /*force_full_input_budget=*/ false,
+            /*source_input_rate=*/ 1_000_000_000,
+            /*source_funds_limited=*/ false,
+            Some(permanent_reaps),
+        );
+        ctx.view.rollback(cp);
+        *taker_acct = taker_acct_before;
+    }
     let budget_leg = source_budget
         .map(|budget| number_to_leg(budget, &hop.in_leg))
         .unwrap_or_else(|| unbounded_leg(&hop.in_leg));
     let cp = ctx.view.checkpoint();
     let taker_acct_before = taker_acct.clone();
-    let res = cross_book_hop(
+    let res = cross_book_hop_with_reaps(
         ctx,
         taker,
         taker_acct,
@@ -5614,6 +5712,7 @@ fn price_clob_band_reverse(
         /*force_full_input_budget=*/ false,
         /*source_input_rate=*/ 1_000_000_000,
         /*source_funds_limited=*/ false,
+        Some(permanent_reaps),
     );
     ctx.view.rollback(cp);
     *taker_acct = taker_acct_before;
@@ -5626,40 +5725,67 @@ fn price_clob_band_reverse(
     Some((leg_to_number(&spent), leg_to_number(&delivered)))
 }
 
-/// Execute ONE pass of a (multi-hop, AMM and/or CLOB) strand with rippled's
-/// reverse-then-forward `StrandFlow` algorithm (StrandFlow.h:80-281).
-///
-/// Each hop consumes ONE quality band per pass. rippled's `BookStep` tries the
-/// AMM FIRST at the CLOB tip quality ([`AmmLiquidity::get_offer`]); the AMM
-/// declines (returns `None`) when its fib chunk is no better than the resting
-/// book, and the band is then filled by the CLOB tip alone (a one-band
-/// [`cross_book_hop`] walk). A pure-AMM hop is the fib chunk; a pure-CLOB hop is
-/// the tip band; a dry hop (neither) fails the strand this pass.
-///
-/// **Reverse pass**: from the demanded strand output `remaining_out`, pull the
-/// demand back through every hop. An AMM hop's chunk is clamped to the demand via
-/// `limit_out`; a CLOB hop is priced by a one-band `cross_book_hop` on a
-/// checkpoint that is immediately rolled back. The chunk/band's required input
-/// becomes the upstream hop's demand. The hop whose band cannot meet the
-/// back-propagated demand is the *limiting step*. The source (hop 0) is also
-/// limited when its required input exceeds the `remaining_in` budget.
-///
-/// **Forward pass** (mutates the checkpointed view): hops `0..=limiting` keep
-/// their reverse-priced amounts (which already thread — each hop's output equals
-/// the next hop's input); hops past the limiting step are re-priced forward
-/// against the reduced carry (AMM via `limit_in`, CLOB by an input-limited
-/// one-band walk), so the intermediate asset is conserved exactly. The AMM
-/// mutation reuses [`apply_amm_move`]; the CLOB mutation/reap reuses
-/// [`cross_book_hop`]. The SHARED `amm_ctx` threads `curIters` across all AMM
-/// hops of the strand.
-///
-/// Returns the realised `(source-in, delivered-out)`, or `None` when the strand
-/// cannot deliver this pass (a pool is frozen, a hop is dry, or the demand cannot
-/// be priced).
+fn apply_permanent_reaps(ctx: &mut ApplyContext<'_>, reaps: &[PermanentOffer]) {
+    let mut seen = HashSet::new();
+    for &(owner, offer_key, dir_key) in reaps {
+        if !seen.insert(offer_key) {
+            continue;
+        }
+        let Some(bytes) = ctx.view.read(&offer_key) else {
+            continue;
+        };
+        let Ok(offer) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let Some(offer_out) = offer.get("TakerGets").and_then(Leg::parse) else {
+            continue;
+        };
+        let Some(offer_in) = offer.get("TakerPays").and_then(Leg::parse) else {
+            continue;
+        };
+        let expired = offer
+            .get("Expiration")
+            .and_then(Value::as_u64)
+            .is_some_and(|exp| exp <= ctx.view.parent_close_time() as u64);
+        let funds = owner_funds_leg(ctx, &owner, &offer_out);
+        let originally_unfunded = original_owner_funds_leg(ctx, &owner, &offer_out).is_zero();
+        let quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
+        let tiny =
+            should_reap_tiny_increased_quality(&owner, &offer_in, &offer_out, &funds, quality)
+                && tiny_offer_is_permanently_reapable(ctx, &owner, &offer_out, &funds);
+        if !expired && !tiny && (!funds.is_zero() || !originally_unfunded) {
+            continue;
+        }
+        let cp = ctx.view.checkpoint();
+        if reap_offer(ctx, &owner, &offer_key, &dir_key).is_err() {
+            ctx.view.rollback(cp);
+        }
+    }
+}
+
+/// The AMM quality cap for a BookOfferCrossingStep at the current CLOB tip.
+fn offer_crossing_amm_threshold(
+    clob_quality: Option<u64>,
+    limit_quality: Option<u64>,
+    multi_path: bool,
+) -> Option<u64> {
+    // BookOfferCrossingStep::qualityThreshold leaves the CLOB tip out of AMM
+    // offer generation when a single strand's transaction limit is better
+    // than that tip. In a multi-path pass, the CLOB tip always caps the AMM.
+    if !multi_path
+        && clob_quality
+            .zip(limit_quality)
+            .is_some_and(|(clob, limit)| rxrpl_amount::is_better_quality(limit, clob))
+    {
+        None
+    } else {
+        clob_quality
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn limit_strand_output_by_quality(
     ctx: &mut ApplyContext<'_>,
-    taker: &AccountId,
     dest: &AccountId,
     strand: &FlowStrand,
     amm_hops: &[Option<AmmHop>],
@@ -5679,10 +5805,15 @@ fn limit_strand_output_by_quality(
             b = b.div(&Number::from_iou(&rate));
         }
 
-        let clob_quality = funded_book_tip_quality(ctx, taker, &hop.inverse_book);
+        // `limitOut` builds its QualityFunction from `BookStep::tip()`, which
+        // reads the raw BookTip in a local sandbox. OfferStream filters expired
+        // and unfunded offers only when the strand is actually executed.
+        let clob_quality = book_tip_quality(ctx, &hop.inverse_book);
+        let amm_threshold =
+            offer_crossing_amm_threshold(clob_quality, Some(limit_quality), amm_ctx.multi_path());
         let amm_offer = match (hop.liquidity.as_ref(), amm_hops[h].as_ref()) {
             (Some(liq), Some(amm)) => {
-                liq.get_offer(&amm.pool_in, &amm.pool_out, clob_quality, amm_ctx)
+                liq.get_offer(&amm.pool_in, &amm.pool_out, amm_threshold, amm_ctx)
             }
             _ => None,
         };
@@ -5767,6 +5898,36 @@ fn limit_strand_output_by_quality(
     }
 }
 
+/// Execute ONE pass of a (multi-hop, AMM and/or CLOB) strand with rippled's
+/// reverse-then-forward `StrandFlow` algorithm (StrandFlow.h:80-281).
+///
+/// Each hop consumes ONE quality band per pass. rippled's `BookStep` tries the
+/// AMM FIRST at the CLOB tip quality ([`AmmLiquidity::get_offer`]); the AMM
+/// declines (returns `None`) when its fib chunk is no better than the resting
+/// book, and the band is then filled by the CLOB tip alone (a one-band
+/// [`cross_book_hop`] walk). A pure-AMM hop is the fib chunk; a pure-CLOB hop is
+/// the tip band; a dry hop (neither) fails the strand this pass.
+///
+/// **Reverse pass**: from the demanded strand output `remaining_out`, pull the
+/// demand back through every hop. An AMM hop's chunk is clamped to the demand via
+/// `limit_out`; a CLOB hop is priced by a one-band `cross_book_hop` on a
+/// checkpoint that is immediately rolled back. The chunk/band's required input
+/// becomes the upstream hop's demand. The hop whose band cannot meet the
+/// back-propagated demand is the *limiting step*. The source (hop 0) is also
+/// limited when its required input exceeds the `remaining_in` budget.
+///
+/// **Forward pass** (mutates the checkpointed view): hops `0..=limiting` keep
+/// their reverse-priced amounts (which already thread — each hop's output equals
+/// the next hop's input); hops past the limiting step are re-priced forward
+/// against the reduced carry (AMM via `limit_in`, CLOB by an input-limited
+/// one-band walk), so the intermediate asset is conserved exactly. The AMM
+/// mutation reuses [`apply_amm_move`]; the CLOB mutation/reap reuses
+/// [`cross_book_hop`]. The SHARED `amm_ctx` threads `curIters` across all AMM
+/// hops of the strand.
+///
+/// Returns the realised `(source-in, delivered-out)`, or `None` when the strand
+/// cannot deliver this pass (a pool is frozen, a hop is dry, or the demand cannot
+/// be priced).
 #[allow(clippy::too_many_arguments)]
 fn execute_strand_pass(
     ctx: &mut ApplyContext<'_>,
@@ -5779,6 +5940,7 @@ fn execute_strand_pass(
     amm_ctx: &mut AmmContext,
     offer_create_bridge: bool,
     limit_quality: Option<u64>,
+    permanent_reaps: &mut Vec<PermanentOffer>,
 ) -> Option<StrandPass> {
     let trace = std::env::var("RXRPL_FLOW_TRACE").is_ok();
     let n = strand.hops.len();
@@ -5798,7 +5960,6 @@ fn execute_strand_pass(
         .map(|quality| {
             limit_strand_output_by_quality(
                 ctx,
-                taker,
                 dest,
                 strand,
                 &amm_hops,
@@ -5837,9 +5998,14 @@ fn execute_strand_pass(
         // Try the AMM fib chunk first, gated to the CLOB tip quality.
         // BookOfferCrossingStep compares the AMM's synthetic offer with the
         // funded CLOB tip even on an XRP autobridge hop (105500934).
+        let amm_threshold = if offer_create_bridge {
+            offer_crossing_amm_threshold(clob_quality, limit_quality, amm_ctx.multi_path())
+        } else {
+            clob_quality
+        };
         let amm_offer = match (hop.liquidity.as_ref(), amm_hops[h].as_ref()) {
             (Some(liq), Some(amm)) => {
-                liq.get_offer(&amm.pool_in, &amm.pool_out, clob_quality, amm_ctx)
+                liq.get_offer(&amm.pool_in, &amm.pool_out, amm_threshold, amm_ctx)
             }
             _ => None,
         };
@@ -5893,6 +6059,7 @@ fn execute_strand_pass(
                 (n == 1 && is_first && hop.liquidity.is_some()).then_some(remaining_in),
                 is_first,
                 is_last,
+                permanent_reaps,
             )?;
             ins[h] = i;
             outs[h] = o;
@@ -6151,6 +6318,7 @@ pub(crate) fn flow_multi(
     let mut saved_ins: Vec<Number> = Vec::new();
     let mut saved_outs: Vec<Number> = Vec::new();
     let mut offers_considered = 0u32;
+    let mut permanent_reaps = Vec::new();
     let mut preserve_output_ulp = false;
     let mut next: Vec<usize> = (0..strands.len()).collect();
 
@@ -6235,6 +6403,7 @@ pub(crate) fn flow_multi(
                 amm_ctx,
                 /*offer_create_bridge=*/ false,
                 None,
+                &mut permanent_reaps,
             ) {
                 Some(res) if !res.out_amt.is_zero() => {
                     let realised_rate = res.in_amt.div(&res.out_amt);
@@ -6293,6 +6462,11 @@ pub(crate) fn flow_multi(
             break;
         }
     }
+
+    // FlowOfferStream's permanent removal set survives reverse checkpoints and
+    // losing strand sandboxes. Apply it to the selected flow after all passes;
+    // a forward pass may already have removed one of the same offers.
+    apply_permanent_reaps(ctx, &permanent_reaps);
 
     let actual_out = sum_smallest_to_largest(&saved_outs);
     let actual_in = sum_smallest_to_largest(&saved_ins);
@@ -8781,6 +8955,23 @@ mod taker_crossing_tests {
             &material_funds,
             quality,
         ));
+    }
+
+    #[test]
+    fn ledger_105501028_reaps_positive_sub_drop_offers() {
+        let owner = AccountId::from([3u8; 20]);
+        let offer_in = xrp(232_432_013);
+        let offer_out = iou("4321039.7364774");
+        let quality = 6_202_332_163_343_885_242;
+        for balance in ["0.0071883", "0.0128505", "0.0061701", "0.0102685"] {
+            assert!(should_reap_tiny_increased_quality(
+                &owner,
+                &offer_in,
+                &offer_out,
+                &iou(balance),
+                quality,
+            ));
+        }
     }
 
     fn rate(inn: &str, out: &str) -> IOUAmount {
@@ -11345,6 +11536,7 @@ mod taker_bridge_integration {
             None,
             true,
             false,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -11352,6 +11544,142 @@ mod taker_bridge_integration {
         assert_eq!(priced.1.to_iou().to_decimal_string(), "10");
         assert_eq!(taker_acct, taker_before);
         assert_eq!(ctx.view.read(&offer_key).unwrap(), offer_before);
+    }
+
+    #[test]
+    fn reverse_quote_preserves_permanent_reaps_after_forward_input_stop() {
+        let mut ledger = Ledger::genesis();
+        for account in [ISS, TAKER, O2, O3] {
+            put_acct(&mut ledger, account, 1_000_000_000, 0);
+        }
+        for account in [TAKER, O2, O3] {
+            put_line(
+                &mut ledger,
+                account,
+                b"BBB",
+                if account == TAKER { 0 } else { 100 },
+            );
+        }
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut placement = Sandbox::new(&view);
+        for (account, sequence) in [(O2, 1), (O2, 2)]
+            .into_iter()
+            .chain((1..=4).map(|seq| (O3, seq)))
+        {
+            assert_eq!(
+                apply_offer(
+                    &mut placement,
+                    &fees,
+                    &serde_json::json!({
+                        "TransactionType": "OfferCreate", "Account": account,
+                        "Fee": "12", "Sequence": sequence,
+                        "TakerGets": {"currency": "BBB", "issuer": ISS, "value": "100"},
+                        "TakerPays": "100000000",
+                    }),
+                ),
+                TransactionResult::TesSuccess
+            );
+        }
+        let changes = placement.into_changes();
+        for (key, bytes) in changes.inserts.into_iter().chain(changes.updates) {
+            ledger.put_state(key, bytes).unwrap();
+        }
+        for key in changes.deletes.keys() {
+            ledger.delete_state(key).unwrap();
+        }
+        // The four offers existed before this Payment but now have no funds.
+        put_line(&mut ledger, O3, b"BBB", 0);
+
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let taker = decode_account_id(TAKER).unwrap();
+        let funded_key = keylet::offer(&decode_account_id(O2).unwrap(), 1);
+        let became_unfunded_key = keylet::offer(&decode_account_id(O2).unwrap(), 2);
+        let invalid_owner = decode_account_id(O3).unwrap();
+        let invalid_keys: Vec<_> = (1..=4)
+            .map(|sequence| keylet::offer(&invalid_owner, sequence))
+            .collect();
+        let account_bytes = sandbox.read(&keylet::account(&taker)).unwrap();
+        let mut taker_acct: Value = serde_json::from_slice(&account_bytes).unwrap();
+        let rules = Rules::from_enabled([feature_id("FlowCross")]);
+        let tx = serde_json::json!({});
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let strand = build_flow_strand(
+            &ctx,
+            &[
+                serde_json::json!("10000000"),
+                serde_json::json!({"currency": "BBB", "issuer": ISS, "value": "1000"}),
+            ],
+        )
+        .unwrap();
+        let mut reaps = Vec::new();
+        let quoted = price_clob_band_reverse(
+            &mut ctx,
+            &taker,
+            &mut taker_acct,
+            &taker,
+            &strand.hops[0],
+            &Number::from_int(1000),
+            Some(&Number::from_int(10_000_000)),
+            true,
+            true,
+            &mut reaps,
+        )
+        .unwrap();
+        assert_eq!(quoted.0.to_xrp_drops(), 10_000_000);
+        assert_eq!(quoted.1.to_iou().to_decimal_string(), "10");
+        assert_eq!(reaps.len(), 4);
+        assert!(reaps.iter().all(|(_, key, _)| *key != became_unfunded_key));
+        for key in &invalid_keys {
+            assert!(
+                ctx.view.read(key).is_some(),
+                "reverse quote was rolled back"
+            );
+        }
+
+        let (delivered, spent) = cross_book_hop(
+            &mut ctx,
+            &taker,
+            &mut taker_acct,
+            &taker,
+            &number_to_leg(&quoted.1, &strand.hops[0].out_leg),
+            &number_to_leg(&quoted.0, &strand.hops[0].in_leg),
+            false,
+            false,
+            true,
+            false,
+            None,
+            false,
+            false,
+            1_000_000_000,
+            false,
+        )
+        .unwrap();
+        assert_eq!(spent.drops, 10_000_000);
+        assert_eq!(delivered.iou.to_decimal_string(), "10");
+        for key in &invalid_keys {
+            assert!(
+                ctx.view.read(key).is_some(),
+                "forward stopped at the partial tip"
+            );
+        }
+        apply_permanent_reaps(&mut ctx, &reaps);
+        for key in &invalid_keys {
+            assert!(ctx.view.read(key).is_none());
+        }
+        let funded: Value = serde_json::from_slice(&ctx.view.read(&funded_key).unwrap()).unwrap();
+        assert_eq!(funded["TakerGets"]["value"], "90");
+        assert!(ctx.view.read(&became_unfunded_key).is_some());
+        let owner: Value =
+            serde_json::from_slice(&ctx.view.read(&keylet::account(&invalid_owner)).unwrap())
+                .unwrap();
+        assert_eq!(owner["OwnerCount"], 0);
     }
 
     #[test]
