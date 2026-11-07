@@ -133,6 +133,22 @@ fn amm_iou_balance_addition_avoids_mixed_scale_double_rounding() {
 }
 
 #[test]
+fn zero_amm_output_does_not_round_up_to_minimum_iou() {
+    use rxrpl_amount::number::Number;
+
+    let rate = IOUAmount::from_decimal_string("1").unwrap();
+    assert!(crate::handlers::offer_create::flow_gross_input(&Number::ZERO, Some(rate)).is_zero());
+}
+
+#[test]
+fn full_destination_trust_line_has_no_receive_room() {
+    use rxrpl_amount::number::Number;
+
+    let holding = Number::from_iou(&IOUAmount::from_decimal_string("0.00000000000000003").unwrap());
+    assert!(iou_receive_room(&Number::ZERO, &holding).is_zero());
+}
+
+#[test]
 fn terminal_amm_transfer_fee_uses_number_rounding() {
     use rxrpl_amount::number::{MantissaScale, MantissaScaleGuard, Number};
 
@@ -656,6 +672,40 @@ fn apply_iou_transfer_rate_deducts_fee_from_source() {
 
     assert!((holder_balance(&sandbox, ALICE, ISSUER, "USD") - 40.0).abs() < 1e-6);
     assert!((holder_balance(&sandbox, BOB, ISSUER, "USD") - 50.0).abs() < 1e-6);
+}
+
+#[test]
+fn direct_iou_payment_respects_implicit_send_max_with_transfer_fee() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", Some(1_060_000_000));
+    put_account(&mut ledger, ALICE, "50000000", None);
+    put_account(&mut ledger, BOB, "50000000", None);
+    put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 100.0);
+    put_trust_line(&mut ledger, BOB, ISSUER, "USD", 0.0);
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": ALICE,
+        "Destination": BOB,
+        "Amount": iou("USD", ISSUER, "32.2718545806078"),
+        "Fee": "10",
+    });
+    let rules = Rules::new();
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut ctx),
+        Err(TransactionResult::TecPathPartial)
+    );
+    assert_eq!(holder_balance(&sandbox, ALICE, ISSUER, "USD"), 100.0);
+    assert_eq!(holder_balance(&sandbox, BOB, ISSUER, "USD"), 0.0);
 }
 
 #[test]

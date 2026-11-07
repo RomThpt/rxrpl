@@ -551,6 +551,17 @@ fn apply_iou(
     } else {
         send_value * rate
     };
+    // Without SendMax, rippled uses Amount's value as the implicit maximum
+    // source spend (issued by the sender). A third-party transfer fee cannot
+    // be added on top of that budget for a direct, non-partial payment.
+    if ctx.tx.get("SendMax").is_none()
+        && ctx.tx.get("Paths").is_none()
+        && dest_id != issuer_id
+        && rate > 1.0
+        && helpers::get_flags(ctx.tx) & rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT == 0
+    {
+        return Err(TransactionResult::TecPathPartial);
+    }
     if let Some((sm_cur, sm_iss, sm_val)) = get_send_max_iou(ctx.tx) {
         if sm_cur == currency && sm_iss == issuer {
             let sm: f64 = sm_val.parse().unwrap_or(0.0);
@@ -836,6 +847,15 @@ fn apply_conversion(
         .ok_or(TransactionResult::TerNoAccount)?;
     let mut acct: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    if let Some((false, currency, issuer)) = amm_asset_of(&amount) {
+        if dst_id != issuer && iou_receive_capacity(ctx, &dst_id, &issuer, &currency).is_zero() {
+            let holding =
+                crate::amm_helpers::iou_holding_number(ctx.view, &dst_id, &issuer, &currency);
+            if !holding.is_zero() && !holding.negative() {
+                return Err(TransactionResult::TecPathDry);
+            }
+        }
+    }
     // Use the direct constant-product quote when an AMM exists. It mirrors the
     // single synthetic AMM offer selected by BookStep and, unlike the generic
     // CLOB fallback, can represent a capacity-limited partial AMM delivery.
@@ -2063,6 +2083,9 @@ fn try_amm_conversion(
         if num_le(&capacity, &target_out) {
             target_out = capacity;
         }
+    }
+    if target_out.is_zero() || target_out.negative() {
+        return Ok(None);
     }
 
     // Budget input (SendMax), capped at the source's spendable funds.

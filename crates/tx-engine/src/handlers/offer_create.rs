@@ -5146,6 +5146,9 @@ fn flow_book_input_rate(ctx: &ApplyContext<'_>, leg: &Leg, dest: &AccountId) -> 
 }
 
 pub(crate) fn flow_gross_input(amount: &Number, rate: Option<IOUAmount>) -> Number {
+    if amount.is_zero() {
+        return Number::ZERO;
+    }
     rate.and_then(|rate| IOUAmount::mul_round(&amount.to_iou(), &rate, true).ok())
         .map(|amount| Number::from_iou(&amount))
         .unwrap_or(*amount)
