@@ -445,6 +445,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn initial_multipath_amm_quote_can_miss_passive_bridge_limit() {
+        // Ledger 105501035: the bridge's XRP/BTC pool looks competitive at
+        // spot, but the initial Fibonacci chunk is just outside the taker's
+        // RLUSD/BTC limit. Flow filters it before switching to single path.
+        let pool_in = Number::from_int(102_326_553_431);
+        let pool_out =
+            Number::from_iou(&IOUAmount::from_decimal_string("1.770821155866504").unwrap());
+        let amm = AmmLiquidity {
+            in_is_xrp: true,
+            out_is_xrp: false,
+            round_even_quality: true,
+            tfee: 19,
+            initial_pool_in: pool_in,
+            initial_pool_out: pool_out,
+        };
+        let clob_quality = 6_851_581_433_398_921_448;
+        let first_hop = Number::from_iou(&IOUAmount::from_decimal_string("0.00000111259").unwrap());
+        let limit = Number::from_iou(&IOUAmount::from_decimal_string("64305.05495616992").unwrap());
+
+        let multi = amm
+            .get_offer(
+                &pool_in,
+                &pool_out,
+                Some(clob_quality),
+                &AmmContext::new(true),
+            )
+            .unwrap();
+        let multi_rate = Number::from_iou(&from_rate(multi.quality).unwrap());
+        assert!(num_gt(&first_hop.mul(&multi_rate), &limit));
+
+        let single = amm
+            .get_offer(&pool_in, &pool_out, None, &AmmContext::new(false))
+            .unwrap();
+        let single_rate = Number::from_iou(&from_rate(single.quality).unwrap());
+        assert!(!num_gt(&first_hop.mul(&single_rate), &limit));
+    }
+
     /// Standalone simulation of the multi-pass AMM fib consumption for the
     /// L105252961 repro: budget 17 XJOY, books absorb everything (so only the
     /// XJOY/XRP AMM hop matters). Mirrors `flow_multi` + `execute_strand_pass`'s

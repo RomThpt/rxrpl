@@ -2093,6 +2093,29 @@ fn try_bridge_step(
     // (105500934). Retain the AMM iteration counter across bridge passes.
     let mut amm_ctx = AmmContext::new(multi_path);
 
+    // Flow constructs the default and XRP bridge strands before filtering by
+    // quality. The first `activateNext` therefore quotes their AMMs in
+    // multipath mode, even if the direct strand will subsequently be removed.
+    // A single-path spot quote here admits bridge liquidity whose initial
+    // Fibonacci offer cannot meet the transaction limit.
+    let passive = ctx.tx.get("Flags").and_then(Value::as_u64).unwrap_or(0) & TF_PASSIVE != 0;
+    let threshold = flow_crossing_threshold(
+        ctx,
+        taker,
+        in_leg,
+        out_leg,
+        ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+        passive,
+    );
+    let bridge_bound = offer_crossing_initial_bound(ctx, bridge);
+    let bridge_limit = from_rate(threshold)
+        .ok()
+        .map(|rate| Number::from_iou(&rate));
+    if !matches!((bridge_bound, bridge_limit), (Some(bound), Some(limit)) if num_le(&bound, &limit))
+    {
+        return Ok(());
+    }
+
     // One Flow strand execution is an atomic candidate. rippled walks all of
     // its successive book bands, computes quality from the aggregate input and
     // output, then rolls the whole candidate back when that average misses the
@@ -5536,6 +5559,47 @@ fn strand_quality_ub(
     Some(rate)
 }
 
+/// Initial `ActiveStrands::activateNext` bound for an OfferCreate bridge.
+/// At this point Flow still has both the direct and bridge strands, so AMM
+/// quotes are Fibonacci chunks and offer crossing waives book transfer fees.
+fn offer_crossing_initial_bound(ctx: &ApplyContext<'_>, strand: &FlowStrand) -> Option<Number> {
+    let amm_ctx = AmmContext::new(true);
+    let mut rate = Number::from_int(1);
+    for hop in &strand.hops {
+        let clob = book_tip_quality(ctx, &hop.inverse_book);
+        let amm = match (hop.liquidity.as_ref(), hop.amm_pool.as_ref()) {
+            (Some(liq), Some(pool)) => {
+                let pool_in = pool_balance_number(
+                    ctx,
+                    pool,
+                    hop.in_leg.is_xrp,
+                    &hop.in_leg.currency,
+                    &hop.in_leg.issuer,
+                );
+                let pool_out = pool_balance_number(
+                    ctx,
+                    pool,
+                    hop.out_leg.is_xrp,
+                    &hop.out_leg.currency,
+                    &hop.out_leg.issuer,
+                );
+                liq.get_offer(&pool_in, &pool_out, clob, &amm_ctx)
+                    .map(|offer| offer.quality)
+            }
+            _ => None,
+        };
+        let best = match (clob, amm) {
+            (Some(c), Some(a)) if rxrpl_amount::is_better_quality(a, c) => a,
+            (Some(c), _) => c,
+            (None, Some(a)) => a,
+            (None, None) => return None,
+        };
+        let hop_rate = from_rate(best).ok().map(|r| Number::from_iou(&r))?;
+        rate = rate.mul(&hop_rate);
+    }
+    Some(rate)
+}
+
 /// Whether the default OfferCreate strand survives Flow's quality-upper-bound
 /// gate. A viable AMM can activate the strand even when the first CLOB page is
 /// worse than the transaction limit; OfferStream then reaps invalid tips before
@@ -5817,6 +5881,13 @@ fn limit_strand_output_by_quality(
             }
             _ => None,
         };
+        // BookStep::tip uses the raw CLOB tip for limitOut whenever it is at
+        // least as good as the synthetic AMM offer. A constant-quality CLOB
+        // tip leaves the requested output unchanged, so the Flow tolerance
+        // for an adjusted limit must not apply in that case.
+        let amm_offer = amm_offer.filter(|offer| {
+            clob_quality.is_none_or(|clob| rxrpl_amount::is_better_quality(offer.quality, clob))
+        });
 
         let (step_m, step_b) = if let (Some(offer), Some(amm)) = (amm_offer, amm_hops[h].as_ref()) {
             if amm_ctx.multi_path() {
