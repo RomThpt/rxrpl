@@ -974,7 +974,6 @@ enum BalanceRounding {
     Legacy,
     Nearest,
     HalfUpward,
-    Downward,
 }
 
 fn amm_pool_debit_rounding(intermediate_output: bool) -> BalanceRounding {
@@ -987,6 +986,7 @@ fn amm_pool_debit_rounding(intermediate_output: bool) -> BalanceRounding {
     }
 }
 
+#[cfg(test)]
 fn add_iou_balance_downward(a: &IOUAmount, b: &IOUAmount) -> IOUAmount {
     use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode};
 
@@ -1115,7 +1115,6 @@ fn credit_line_with_rounding(
         BalanceRounding::Legacy => add_iou_balance(&balance, &delta, false),
         BalanceRounding::Nearest => add_iou_balance(&balance, &delta, true),
         BalanceRounding::HalfUpward => add_iou_balance_half_upward(&balance, &delta),
-        BalanceRounding::Downward => Ok(add_iou_balance_downward(&balance, &delta)),
     }
     .map_err(|_| TransactionResult::TefInternal)?;
     line["Balance"]["value"] = Value::String(new.to_decimal_string());
@@ -2083,6 +2082,10 @@ fn try_bridge_step(
     cq: u64,
     is_sell: bool,
 ) -> Result<(), TransactionResult> {
+    // Flow evaluates the strand quality limit and its AMM amounts using the
+    // transaction's Number precision. The 16-digit scale applies until the
+    // vault or lending amendments enable the larger mantissa.
+    let _number_scale = crate::amm_helpers::amm_number_scale_guard(ctx.rules);
     let mut budget = leg_min(remaining_in, source_remaining);
     // Flow uses Fibonacci AMM chunks only while both the direct and bridge
     // strands remain eligible. A dry direct book leaves a single bridge strand
@@ -2181,12 +2184,13 @@ fn try_bridge_step(
 
     let spent = leg_from_magnitude(&total_in.to_iou(), in_leg);
     let delivered = leg_from_magnitude(&total_out.to_iou(), out_leg);
-    *remaining_in = leg_sub(remaining_in, &spent);
-    *source_remaining = leg_sub(source_remaining, &spent);
+    let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+    *remaining_in = leftover_leg(remaining_in, &spent, number_switchover);
+    *source_remaining = leftover_leg(source_remaining, &spent, number_switchover);
     *remaining_out = if leg_ge(&delivered, remaining_out) {
         leg_sub(remaining_out, remaining_out)
     } else {
-        leg_sub(remaining_out, &delivered)
+        leftover_leg(remaining_out, &delivered, number_switchover)
     };
     *crossed = true;
     Ok(())
@@ -4189,7 +4193,7 @@ fn apply_amm_move(
                     &amount.issuer,
                     &amount.currency,
                     &amount.iou.negate(),
-                    BalanceRounding::Downward,
+                    BalanceRounding::Nearest,
                 )?;
             }
             if amount.issuer != *dest {
@@ -5737,11 +5741,13 @@ fn limit_strand_output_by_quality(
         return *remaining_out;
     }
     let output = {
-        let _round = RoundModeGuard::new(RoundingMode::Downward);
         let out_leg = &strand.hops.last().expect("non-empty strand").out_leg;
         if out_leg.is_xrp {
+            let _round = RoundModeGuard::new(RoundingMode::Downward);
             Number::from_int(raw.to_xrp_drops_mode() as i64)
         } else {
+            // StrandFlow converts an IOU output under the ambient rounding
+            // mode after outFromAvgQ restores its temporary Upward guard.
             Number::from_iou(&raw.to_iou())
         }
     };
@@ -8844,6 +8850,25 @@ mod taker_crossing_tests {
                 .unwrap()
                 .to_decimal_string(),
             "-334.6644516244193"
+        );
+    }
+
+    #[test]
+    fn ledger_105501026_bridge_output_and_pool_balance_round_nearest() {
+        let output = iou("0.0007164812156765496");
+        let remaining = leftover_leg(&iou("0.02966"), &output, true);
+        assert_eq!(remaining.iou.to_decimal_string(), "0.02894351878432345");
+
+        let pool_before = IOUAmount::from_decimal_string("-1.771537787940604").unwrap();
+        assert_eq!(
+            add_iou_balance(&pool_before, &output.iou, true)
+                .unwrap()
+                .to_decimal_string(),
+            "-1.770821306724927"
+        );
+        assert_eq!(
+            add_iou_balance_downward(&pool_before, &output.iou).to_decimal_string(),
+            "-1.770821306724928"
         );
     }
 
