@@ -1321,6 +1321,26 @@ fn cross_offers(
         if dir_quality > threshold {
             let post_clob_cleanup =
                 advance_after_exhausted_tip || (is_sell && clob_offer_attempted);
+            // Once the strand falls below the taker's quality limit, retain
+            // funded self offers at the next tip. The post-fill walk still
+            // removes unfunded offers left by the exhausted maker.
+            if post_clob_cleanup
+                && !offer_crossing_strand_reaches_limit(
+                    ctx, taker, taker_gets, taker_pays, threshold,
+                )
+            {
+                if advance_past_unfunded_quality(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    &dir_key,
+                    QualityAdvanceMode::Speculative,
+                )? {
+                    deferred_out_of_quality_dir = Some(dir_key);
+                    break;
+                }
+                continue;
+            }
             if !post_clob_cleanup {
                 // OfferStream materialises the first CLOB tip before BookStep
                 // rejects its quality. Preserve the historical rule that an
@@ -13186,7 +13206,7 @@ mod flow_cross_own_unfunded {
     /// advances beyond the taker's quality and reaps the maker's now-unfunded
     /// offers before rejecting the next funded tip.
     #[test]
-    fn exhausted_tip_reaps_unfunded_offers_past_quality_threshold() {
+    fn exhausted_tip_reaps_unfunded_maker_but_keeps_worse_self_offer() {
         let mut ledger = Ledger::genesis();
         for addr in [ISS, TAKER, MAKER] {
             let id = decode_account_id(addr).unwrap();
@@ -13202,12 +13222,28 @@ mod flow_cross_own_unfunded {
                 .put_state(keylet::account(&id), serde_json::to_vec(&account).unwrap())
                 .unwrap();
         }
-        put_usd_line(&mut ledger, TAKER, 0);
+        put_usd_line(&mut ledger, TAKER, 1);
         put_usd_line(&mut ledger, MAKER, 1);
 
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let mut sandbox = Sandbox::new(&view);
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate",
+                    "Account": TAKER,
+                    "Fee": "10",
+                    "Sequence": 1,
+                    "Flags": TF_PASSIVE,
+                    "TakerGets": {"currency": "USD", "issuer": ISS, "value": "1"},
+                    "TakerPays": "2100000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
         for (sequence, xrp) in [(1, "1000000"), (2, "2000000")] {
             assert_eq!(
                 apply_flow(
@@ -13236,7 +13272,7 @@ mod flow_cross_own_unfunded {
                     "TransactionType": "OfferCreate",
                     "Account": TAKER,
                     "Fee": "10",
-                    "Sequence": 1,
+                    "Sequence": 2,
                     "Flags": TF_IMMEDIATE_OR_CANCEL,
                     "TakerGets": "3000000",
                     "TakerPays": {"currency": "USD", "issuer": ISS, "value": "2"},
@@ -13246,8 +13282,10 @@ mod flow_cross_own_unfunded {
         );
 
         let maker = decode_account_id(MAKER).unwrap();
+        let taker = decode_account_id(TAKER).unwrap();
         assert!(sandbox.read(&keylet::offer(&maker, 1)).is_none());
         assert!(sandbox.read(&keylet::offer(&maker, 2)).is_none());
+        assert!(sandbox.read(&keylet::offer(&taker, 1)).is_some());
         assert_eq!(owner_count(&sandbox, MAKER), 0);
     }
 
