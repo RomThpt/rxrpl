@@ -78,5 +78,11 @@ parent, never the divergent child.
   distinct from the closed ledger transaction root containing metadata.
 - Historical fee, reserve, directory ordering, close-time, and arithmetic rules
   must be derived from ledger state and amendments, not current defaults.
+- OfferCreate filters its initial direct and XRP-bridge strands with multipath
+  AMM quotes before reducing the active strand count; a later single-strand
+  pass may use different AMM pricing.
+- After an offer is exhausted, the next out-of-quality book page may contain
+  offers that became unfunded. Reap those without deleting funded self offers
+  whose price is beyond the taker's limit.
 - The local Hive and Confluence checkouts may contain unrelated uncommitted
   client adapters; use clean worktrees and never discard those changes.
