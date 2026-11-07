@@ -7397,17 +7397,32 @@ fn reap_maker_short_sells(
 }
 
 fn owner_funds_leg(ctx: &mut ApplyContext<'_>, owner: &AccountId, gets: &Leg) -> Leg {
-    owner_funds_leg_with(ctx.fees, owner, gets, |key| ctx.view.read(key))
+    // PaymentSandbox keeps the highest owner count reached during a crossing.
+    // Deleting an exhausted offer must not immediately release its XRP reserve
+    // for another offer from the same maker in this transaction.
+    let reserve_count_floor = if gets.is_xrp {
+        ctx.view
+            .read_parent(&keylet::account(owner))
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .map(|a| helpers::get_owner_count(&a))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    owner_funds_leg_with(ctx.fees, owner, gets, reserve_count_floor, |key| {
+        ctx.view.read(key)
+    })
 }
 
 fn original_owner_funds_leg(ctx: &ApplyContext<'_>, owner: &AccountId, gets: &Leg) -> Leg {
-    owner_funds_leg_with(ctx.fees, owner, gets, |key| ctx.view.read_parent(key))
+    owner_funds_leg_with(ctx.fees, owner, gets, 0, |key| ctx.view.read_parent(key))
 }
 
 fn owner_funds_leg_with(
     fees: &crate::fees::FeeSettings,
     owner: &AccountId,
     gets: &Leg,
+    reserve_count_floor: u32,
     mut read: impl FnMut(&Hash256) -> Option<Vec<u8>>,
 ) -> Leg {
     let zero = Leg {
@@ -7432,7 +7447,11 @@ fn owner_funds_leg_with(
         // the account reserve, clamped at zero: an offer can only sell the owner's
         // spendable XRP, not the reserve-locked portion. Using the raw balance let
         // a reserve-constrained offer over-fill (execute instead of being reaped).
-        let owner_count = acct.as_ref().map(helpers::get_owner_count).unwrap_or(0);
+        let owner_count = acct
+            .as_ref()
+            .map(helpers::get_owner_count)
+            .unwrap_or(0)
+            .max(reserve_count_floor);
         let liquid = bal - fees.account_reserve(owner_count) as i64;
         if liquid <= 0 {
             return zero;
@@ -11046,6 +11065,28 @@ mod owner_funds_tests {
             issuer,
         };
         owner_funds_leg(&mut ctx, &maker, &gets)
+    }
+
+    #[test]
+    fn deleted_offer_does_not_release_xrp_reserve_during_crossing() {
+        let maker = decode_account_id(MAKER).unwrap();
+        let gets = Leg::parse(&Value::String("6045815".into())).unwrap();
+        let fees = FeeSettings {
+            base_fee: 10,
+            reserve_base: 1_000_000,
+            reserve_increment: 200_000,
+        };
+        let account = serde_json::to_vec(&serde_json::json!({
+            "Balance": "4600000", "OwnerCount": 17,
+        }))
+        .unwrap();
+
+        let live = owner_funds_leg_with(&fees, &maker, &gets, 0, |_| Some(account.clone()));
+        assert_eq!(live.drops, 200_000);
+
+        let with_parent_count =
+            owner_funds_leg_with(&fees, &maker, &gets, 18, |_| Some(account.clone()));
+        assert_eq!(with_parent_count.drops, 0);
     }
 
     fn freeze_flag() -> u64 {
