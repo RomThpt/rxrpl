@@ -8,13 +8,20 @@ useful comparison points but are not protocol authorities.
 
 ## Build and test
 
-Use Rust 1.85 or newer from the workspace root.
+Use Rust 1.88 or newer for the current workspace lockfile. Full workspace tests
+also require `protoc` on `PATH` or `PROTOC` set to its executable.
 
 ```sh
 cargo build --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+```
+
+The replay executable belongs to `rxrpl-cli`, while `rxrpl` is a library:
+
+```sh
+cargo build --release -p rxrpl-cli --bin rxrpl
 ```
 
 Tests that contact a full-history node are ignored by default. Run them only
