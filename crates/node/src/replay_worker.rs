@@ -510,7 +510,7 @@ fn seed_state_from_reader<R: Read + Seek>(
         ));
     }
     let count = u32::from_be_bytes(read_state_field(reader)?) as u64;
-    let remaining = end.saturating_sub(reader.stream_position().map_err(|e| e.to_string())?);
+    let mut remaining = end.saturating_sub(reader.stream_position().map_err(|e| e.to_string())?);
     if count > remaining / 36 {
         return Err("state entry count exceeds remaining pack bytes".into());
     }
@@ -520,12 +520,13 @@ fn seed_state_from_reader<R: Read + Seek>(
         let index = read_state_field::<32>(reader)?;
         let key = Hash256::new(index);
         let len = u32::from_be_bytes(read_state_field(reader)?) as u64;
-        let remaining = end.saturating_sub(reader.stream_position().map_err(|e| e.to_string())?);
+        remaining = remaining.checked_sub(36).ok_or("truncated pack")?;
         if len > remaining {
             return Err("truncated pack".into());
         }
         let mut data = vec![0; len as usize];
         reader.read_exact(&mut data).map_err(|e| e.to_string())?;
+        remaining -= len;
         match state.insert(key, data) {
             Ok(()) => {}
             Err(SHAMapError::DuplicateKey) => {
@@ -537,12 +538,8 @@ fn seed_state_from_reader<R: Read + Seek>(
             Err(e) => return Err(format!("state seed put failed: {e:?}")),
         }
     }
-    let position = reader.stream_position().map_err(|e| e.to_string())?;
-    if position != end {
-        return Err(format!(
-            "trailing bytes after STATE pack: {}",
-            end - position
-        ));
+    if remaining != 0 {
+        return Err(format!("trailing bytes after STATE pack: {remaining}"));
     }
     Ok(state)
 }
@@ -804,6 +801,41 @@ mod tests {
     }
 
     #[test]
+    fn reader_seed_uses_constant_number_of_seeks() {
+        struct CountingReader {
+            inner: std::io::Cursor<Vec<u8>>,
+            seeks: usize,
+        }
+
+        impl Read for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.inner.read(buf)
+            }
+        }
+
+        impl Seek for CountingReader {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.seeks += 1;
+                self.inner.seek(pos)
+            }
+        }
+
+        let mut reader = CountingReader {
+            inner: std::io::Cursor::new(state_pack(
+                42,
+                &[
+                    ([1; 32], b"first"),
+                    ([2; 32], b"second"),
+                    ([3; 32], b"third"),
+                ],
+            )),
+            seeks: 0,
+        };
+        seed_state_from_reader(&mut reader, 42).unwrap();
+        assert_eq!(reader.seeks, 4);
+    }
+
+    #[test]
     fn reader_seed_rejects_malformed_state_packs() {
         let mut bad_magic = state_pack(7, &[]);
         bad_magic[0] = b'N';
@@ -817,8 +849,12 @@ mod tests {
         truncated_payload.pop();
         let mut oversized_length = state_pack(7, &[([1; 32], b"a")]);
         oversized_length[50..54].copy_from_slice(&u32::MAX.to_be_bytes());
+        let mut truncated_second_header = state_pack(7, &[([1; 32], &[0; 50]), ([2; 32], b"")]);
+        truncated_second_header.truncate(18 + 36 + 50 + 22);
         let mut trailing = state_pack(7, &[]);
         trailing.push(0);
+        let mut trailing_after_entry = state_pack(7, &[([1; 32], b"a")]);
+        trailing_after_entry.push(0);
         let cases = [
             (bad_magic, "bad magic"),
             (bad_version, "bad version"),
@@ -828,11 +864,13 @@ mod tests {
             (bad_count, "entry count exceeds remaining"),
             (truncated_payload, "truncated pack"),
             (oversized_length, "truncated pack"),
+            (truncated_second_header, "truncated pack"),
             (
                 state_pack(7, &[([3; 32], b"a"), ([3; 32], b"b")]),
                 "duplicate state index",
             ),
             (trailing, "trailing bytes"),
+            (trailing_after_entry, "trailing bytes"),
         ];
         for (pack, expected) in cases {
             let error = seed_state_from_reader(&mut std::io::Cursor::new(pack), 7).unwrap_err();
