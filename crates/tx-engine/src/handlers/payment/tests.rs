@@ -2617,6 +2617,24 @@ fn amm_quality_gate_reaps_expired_tip_offer() {
 
 #[test]
 fn direct_iou_to_xrp_conversion_splits_amm_and_book() {
+    run_direct_iou_to_xrp_conversion_splits_amm_and_book("25.3309569946823", "15446876", true);
+}
+
+#[test]
+fn direct_iou_to_xrp_conversion_caps_send_max_at_source_funds() {
+    run_direct_iou_to_xrp_conversion_splits_amm_and_book("26.3309569946823", "15446876", true);
+}
+
+#[test]
+fn direct_iou_to_xrp_conversion_enforces_native_deliver_min() {
+    run_direct_iou_to_xrp_conversion_splits_amm_and_book("25.3309569946823", "30000000", false);
+}
+
+fn run_direct_iou_to_xrp_conversion_splits_amm_and_book(
+    send_max_value: &str,
+    deliver_min: &str,
+    expect_success: bool,
+) {
     let mut ledger = Ledger::genesis();
     put_account(&mut ledger, ISSUER, "1000000000", None);
     put_account(&mut ledger, ALICE, "500000000", None);
@@ -2670,8 +2688,8 @@ fn direct_iou_to_xrp_conversion_splits_amm_and_book() {
     let rules = Rules::new();
     let tx = serde_json::json!({
         "TransactionType": "Payment", "Account": ALICE, "Destination": ALICE,
-        "Amount": "100000000000000000", "DeliverMin": "15446876",
-        "SendMax": iou("USD", ISSUER, "25.3309569946823"),
+        "Amount": "100000000000000000", "DeliverMin": deliver_min,
+        "SendMax": iou("USD", ISSUER, send_max_value),
         "Flags": rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT, "Fee": "12",
     });
     let mut ctx = ApplyContext {
@@ -2680,10 +2698,12 @@ fn direct_iou_to_xrp_conversion_splits_amm_and_book() {
         rules: &rules,
         fees: &fees,
     };
-    assert_eq!(
-        PaymentTransactor.apply(&mut ctx),
-        Ok(TransactionResult::TesSuccess)
-    );
+    let result = PaymentTransactor.apply(&mut ctx);
+    if !expect_success {
+        assert_eq!(result, Err(TransactionResult::TecPathPartial));
+        return;
+    }
+    assert_eq!(result, Ok(TransactionResult::TesSuccess));
     let remaining: Value = serde_json::from_slice(&sandbox.read(&offer_key).unwrap()).unwrap();
     let remaining_pays =
         IOUAmount::from_decimal_string(remaining["TakerPays"]["value"].as_str().unwrap()).unwrap();

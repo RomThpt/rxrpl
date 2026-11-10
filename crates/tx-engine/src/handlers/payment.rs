@@ -1853,6 +1853,23 @@ fn apply_paths_payment_multi(
         } else {
             funds
         }
+    } else if let Some((false, currency, issuer)) = amm_asset_of(&send_max) {
+        // Flow caps SendMax at accountFunds before ranking paths. A source that
+        // holds less IOU than SendMax can still make a valid partial payment;
+        // quoting against the larger value makes the AMM step fail on debit.
+        if src_id == issuer {
+            send_max_num
+        } else {
+            let funds =
+                crate::amm_helpers::iou_holding_number(ctx.view, &src_id, &issuer, &currency);
+            if funds.is_zero() || funds.negative() {
+                Number::ZERO
+            } else if num_le(&send_max_num, &funds) {
+                send_max_num
+            } else {
+                funds
+            }
+        }
     } else {
         send_max_num
     };
@@ -1985,11 +2002,8 @@ fn apply_paths_payment_multi(
         if !delivered_meets_target(&delivered, &amount) {
             return Err(TransactionResult::TecPathPartial);
         }
-    } else if let Some((dm_cur, dm_iss, dm_val)) = get_deliver_min_iou(ctx.tx) {
-        let target = serde_json::json!({
-            "currency": dm_cur, "issuer": dm_iss, "value": dm_val,
-        });
-        if !delivered_meets_target(&delivered, &target) {
+    } else if let Some(target) = ctx.tx.get("DeliverMin") {
+        if !delivered_meets_target(&delivered, target) {
             return Err(TransactionResult::TecPathPartial);
         }
     }
