@@ -177,6 +177,10 @@ impl Transactor for CheckCashTransactor {
             ctx.view
                 .update(account_key, account_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
+            if !is_amount {
+                ctx.view
+                    .set_delivered_amount(serde_json::Value::String(cash_amount.to_string()));
+            }
         } else {
             // IOU CheckCash: SendMax is {currency, issuer, value}. Amount/DeliverMin
             // must match the same currency+issuer. Move IOU from check.Account
@@ -272,6 +276,23 @@ impl Transactor for CheckCashTransactor {
                 .update(src_trust_key, src_trust_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
 
+            // Flow's source DirectStep removes a drained, default trust line
+            // before CheckCash removes the check. Both released reserves must
+            // be reflected in the same source AccountRoot working copy.
+            let src_acct_bytes = ctx
+                .view
+                .read(&check_src_key)
+                .ok_or(TransactionResult::TerNoAccount)?;
+            let mut src_acct: serde_json::Value = serde_json::from_slice(&src_acct_bytes)
+                .map_err(|_| TransactionResult::TefInternal)?;
+            crate::handlers::trust_set::maybe_delete_drained_trust_line(
+                ctx,
+                &check_src_id,
+                &mut src_acct,
+                &issuer_id,
+                &cur_bytes,
+            )?;
+
             // Credit tx.Account's trust line.
             let dst_trust_key = keylet::trust_line(&account_id, &issuer_id, &cur_bytes);
             let dst_trust_bytes = ctx
@@ -280,12 +301,9 @@ impl Transactor for CheckCashTransactor {
                 .ok_or(TransactionResult::TecPathDry)?;
             let mut dst_trust: serde_json::Value = serde_json::from_slice(&dst_trust_bytes)
                 .map_err(|_| TransactionResult::TefInternal)?;
-            let new_dst_value = adjust_iou_balance(
-                &dst_trust,
-                &cash_amount.to_string(),
-                &issuer_id,
-                &account_id,
-            )?;
+            let delivered_value = cash_amount.to_string();
+            let new_dst_value =
+                adjust_iou_balance(&dst_trust, &delivered_value, &issuer_id, &account_id)?;
             dst_trust["Balance"]["value"] = serde_json::Value::String(new_dst_value);
             let dst_trust_data =
                 serde_json::to_vec(&dst_trust).map_err(|_| TransactionResult::TefInternal)?;
@@ -294,12 +312,6 @@ impl Transactor for CheckCashTransactor {
                 .map_err(|_| TransactionResult::TefInternal)?;
 
             // Bump check src owner count down + tx sender sequence.
-            let src_acct_bytes = ctx
-                .view
-                .read(&check_src_key)
-                .ok_or(TransactionResult::TerNoAccount)?;
-            let mut src_acct: serde_json::Value = serde_json::from_slice(&src_acct_bytes)
-                .map_err(|_| TransactionResult::TefInternal)?;
             helpers::adjust_owner_count(&mut src_acct, -1);
             let src_acct_data =
                 serde_json::to_vec(&src_acct).map_err(|_| TransactionResult::TefInternal)?;
@@ -318,6 +330,12 @@ impl Transactor for CheckCashTransactor {
             ctx.view
                 .update(account_key, dst_acct_data)
                 .map_err(|_| TransactionResult::TefInternal)?;
+            // Flow reports the actual IOU output for both Amount and DeliverMin.
+            ctx.view.set_delivered_amount(serde_json::json!({
+                "currency": currency,
+                "issuer": issuer,
+                "value": delivered_value,
+            }));
         }
 
         // Unlink the check from both the creator's and the destination's owner
@@ -470,6 +488,33 @@ mod tests {
         assert_eq!(dst["Balance"].as_str().unwrap(), "53000000");
     }
 
+    #[test]
+    fn xrp_deliver_min_records_actual_delivery() {
+        let (ledger, check_id) = setup_with_check(SRC, DST, 5_000_000);
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "CheckCash", "Account": DST,
+            "CheckID": check_id, "DeliverMin": "3000000", "Fee": "12",
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            CheckCashTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        assert_eq!(
+            sandbox.take_delivered_amount(),
+            Some(serde_json::json!("5000000"))
+        );
+    }
+
     /// Cashing a check must leave both the source's owner directory and the
     /// destination's directory root DirectoryNode in place (empty `Indexes`)
     /// rather than erasing them — rippled CheckCash::doApply removes the check
@@ -528,6 +573,194 @@ mod tests {
                 .unwrap_or(true);
             assert!(empty, "{label} owner-dir root must be empty after cashing");
         }
+    }
+
+    #[test]
+    fn iou_cash_draining_default_source_line_releases_both_reserves() {
+        use crate::owner_dir::add_to_owner_dir;
+        use rxrpl_codec::address::classic::encode_account_id;
+        use rxrpl_primitives::AccountId;
+
+        let issuer_id = AccountId::from([0x11; 20]);
+        let dst_id = AccountId::from([0xDD; 20]);
+        let src_id = AccountId::from([0xEE; 20]);
+        let issuer = encode_account_id(&issuer_id);
+        let dst = encode_account_id(&dst_id);
+        let src = encode_account_id(&src_id);
+        let currency = "USD";
+        let cur_bytes = helpers::currency_to_bytes(currency);
+        let src_line_key = keylet::trust_line(&src_id, &issuer_id, &cur_bytes);
+        let dst_line_key = keylet::trust_line(&dst_id, &issuer_id, &cur_bytes);
+        let check_key = keylet::check(&src_id, 1);
+        let iou = |value: &str| {
+            serde_json::json!({
+                "currency": currency, "issuer": issuer, "value": value,
+            })
+        };
+        let mut ledger = Ledger::genesis();
+        for (id, address, owner_count, flags) in [
+            (&issuer_id, &issuer, 0, 0x0080_0000), // issuer has DefaultRipple
+            (&dst_id, &dst, 0, 0),
+            (&src_id, &src, 17, 0),
+        ] {
+            let account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": address,
+                "Balance": "100000000", "Sequence": 1,
+                "OwnerCount": owner_count, "Flags": flags,
+            });
+            ledger
+                .put_state(keylet::account(id), serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        let source_line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Balance": iou("-532736.404707"),
+            "LowLimit": iou("0"), "HighLimit": iou("0"),
+            "Flags": 0x0022_0000, // source high reserve + default high NoRipple
+            "LowNode": "0000000000000000", "HighNode": "0000000000000000",
+        });
+        let destination_line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Balance": iou("0"),
+            "LowLimit": iou("0"), "HighLimit": iou("0"),
+            "Flags": 0x0020_0000,
+        });
+        ledger
+            .put_state(src_line_key, serde_json::to_vec(&source_line).unwrap())
+            .unwrap();
+        ledger
+            .put_state(dst_line_key, serde_json::to_vec(&destination_line).unwrap())
+            .unwrap();
+        let check = serde_json::json!({
+            "LedgerEntryType": "Check", "Account": src, "Destination": dst,
+            "SendMax": iou("532736.404707"), "Sequence": 1, "Flags": 0,
+            "OwnerNode": "0000000000000000",
+            "DestinationNode": "0000000000000000",
+        });
+        ledger
+            .put_state(check_key, serde_json::to_vec(&check).unwrap())
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        add_to_owner_dir(&mut sandbox, &src_id, &src_line_key).unwrap();
+        add_to_owner_dir(&mut sandbox, &issuer_id, &src_line_key).unwrap();
+        add_to_owner_dir(&mut sandbox, &src_id, &check_key).unwrap();
+        add_to_owner_dir(&mut sandbox, &dst_id, &check_key).unwrap();
+        let default_ripple = "1562511F573A19AE9BD103B5D6B9E01B3B46805AEC5D3C4805C902B514399146"
+            .parse::<Hash256>()
+            .unwrap();
+        let rules = Rules::from_enabled([default_ripple]);
+        let tx = serde_json::json!({
+            "TransactionType": "CheckCash", "Account": dst,
+            "CheckID": check_key.to_string(), "DeliverMin": iou("532736.404707"),
+            "Fee": "12", "Sequence": 1,
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            CheckCashTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+
+        assert!(sandbox.read(&src_line_key).is_none());
+        assert!(sandbox.read(&check_key).is_none());
+        let source: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&keylet::account(&src_id)).unwrap()).unwrap();
+        assert_eq!(source["OwnerCount"], 15);
+        let destination_line: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&dst_line_key).unwrap()).unwrap();
+        assert_eq!(destination_line["Balance"]["value"], "-532736.404707");
+        assert_eq!(sandbox.take_delivered_amount(), Some(iou("532736.404707")));
+        for id in [&src_id, &issuer_id] {
+            if let Some(root) = sandbox.read(&keylet::owner_dir(id)) {
+                let directory: serde_json::Value = serde_json::from_slice(&root).unwrap();
+                assert!(directory["Indexes"].as_array().unwrap().is_empty());
+            }
+        }
+        let changes = sandbox.into_changes();
+        let deleted_line: serde_json::Value =
+            serde_json::from_slice(&changes.deletes[&src_line_key]).unwrap();
+        let original_line: serde_json::Value =
+            serde_json::from_slice(&changes.originals[&src_line_key]).unwrap();
+        assert_eq!(original_line["Flags"], 0x0022_0000);
+        assert_eq!(deleted_line["Flags"], 0x0020_0000);
+    }
+
+    #[test]
+    fn iou_amount_cash_records_actual_delivery() {
+        use rxrpl_codec::address::classic::encode_account_id;
+        use rxrpl_primitives::AccountId;
+
+        let issuer_id = AccountId::from([0x11; 20]);
+        let dst_id = AccountId::from([0xDD; 20]);
+        let src_id = AccountId::from([0xEE; 20]);
+        let issuer = encode_account_id(&issuer_id);
+        let dst = encode_account_id(&dst_id);
+        let src = encode_account_id(&src_id);
+        let cur_bytes = helpers::currency_to_bytes("USD");
+        let iou = |value: &str| {
+            serde_json::json!({
+                "currency": "USD", "issuer": issuer, "value": value,
+            })
+        };
+        let mut ledger = Ledger::genesis();
+        for (id, address, owner_count) in [
+            (&issuer_id, &issuer, 0),
+            (&dst_id, &dst, 0),
+            (&src_id, &src, 1),
+        ] {
+            let account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": address,
+                "Balance": "100000000", "Sequence": 1,
+                "OwnerCount": owner_count, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(id), serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        for (holder, balance) in [(&src_id, "-10"), (&dst_id, "0")] {
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Balance": iou(balance),
+                "LowLimit": iou("0"), "HighLimit": iou("0"), "Flags": 0,
+            });
+            ledger
+                .put_state(
+                    keylet::trust_line(holder, &issuer_id, &cur_bytes),
+                    serde_json::to_vec(&line).unwrap(),
+                )
+                .unwrap();
+        }
+        let check_key = keylet::check(&src_id, 1);
+        let check = serde_json::json!({
+            "LedgerEntryType": "Check", "Account": src, "Destination": dst,
+            "SendMax": iou("10"), "Sequence": 1, "Flags": 0,
+        });
+        ledger
+            .put_state(check_key, serde_json::to_vec(&check).unwrap())
+            .unwrap();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "CheckCash", "Account": dst,
+            "CheckID": check_key.to_string(), "Amount": iou("5"), "Fee": "12",
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            CheckCashTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        assert_eq!(sandbox.take_delivered_amount(), Some(iou("5")));
     }
 
     #[test]
