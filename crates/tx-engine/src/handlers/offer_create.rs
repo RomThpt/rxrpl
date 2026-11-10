@@ -1284,6 +1284,10 @@ fn cross_offers(
     // and apply permanent self/unfunded cleanup before checking its quality.
     // A partial buy fill that satisfies the output stops before this advance.
     let mut clob_offer_attempted = false;
+    // A dry AMM probe followed by removal of the taker's own tip stays in
+    // the same BookStep pass. The next funded tip crosses as CLOB before a
+    // fresh Flow pass can retry the AMM.
+    let mut skip_amm_after_dry_self_tip = false;
     let book_prefix = &inverse_book.as_bytes()[0..24];
     let fok = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_FILL_OR_KILL != 0;
     // Autobridge: when NEITHER leg is XRP, the offer also competes an
@@ -1433,7 +1437,7 @@ fn cross_offers(
                     break 'walk;
                 }
             }
-            if !domain_only {
+            if !domain_only && !skip_amm_after_dry_self_tip {
                 let before = remaining_out.clone();
                 let source_before_amm = source_remaining.clone();
                 let continue_to_clob = try_amm_step(
@@ -1462,6 +1466,8 @@ fn cross_offers(
                         QualityAdvanceMode::Executing,
                     )?;
                     reaped_self_offer |= advance.reaped_self_offer;
+                    skip_amm_after_dry_self_tip |=
+                        !amm_consumed_in_band && advance.reaped_self_offer;
                     terminal_amm_allowed &= clob_band_allows_terminal_amm(
                         amm_consumed_in_band,
                         funded_tip_before_amm,
@@ -1751,6 +1757,7 @@ fn cross_offers(
                 number_switchover,
             )?;
             clob_offer_attempted = true;
+            skip_amm_after_dry_self_tip = false;
             terminal_amm_allowed = true;
 
             // The offer's available liquidity is exhausted when the take
@@ -13143,6 +13150,86 @@ mod flow_cross_own_unfunded {
                 ))
                 .is_some()
         );
+    }
+
+    /// A self-owned book tip can make the first AMM probe dry. Flow then
+    /// removes that tip and crosses the next maker before trying the AMM again.
+    #[test]
+    fn self_tip_does_not_reprobe_amm_before_next_book_offer() {
+        let mut ledger = Ledger::genesis();
+        for addr in [ISS, TAKER, MAKER, MAKER2] {
+            let id = decode_account_id(addr).unwrap();
+            let account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": addr,
+                "Balance": "1000000000", "Sequence": 1,
+                "OwnerCount": 0, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        put_usd_line(&mut ledger, TAKER, 1000);
+        put_usd_line(&mut ledger, MAKER, 0);
+        put_usd_line(&mut ledger, MAKER2, 99_400);
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let usd =
+            |value: &str| serde_json::json!({"currency": "USD", "issuer": ISS, "value": value});
+
+        for (account, gets, pays) in [(TAKER, "463143", "46"), (MAKER, "231001", "23")] {
+            assert_eq!(
+                apply_flow(
+                    &mut sandbox,
+                    &fees,
+                    &serde_json::json!({
+                        "TransactionType": "OfferCreate", "Account": account,
+                        "Fee": "10", "Sequence": 1,
+                        "TakerGets": gets, "TakerPays": usd(pays),
+                    }),
+                ),
+                TransactionResult::TesSuccess
+            );
+        }
+        let zero = AccountId::from([0u8; 20]);
+        let issuer = decode_account_id(ISS).unwrap();
+        let currency = helpers::currency_to_bytes("USD");
+        let amm_key = keylet::amm(&[0u8; 20], &zero, &currency, &issuer);
+        sandbox
+            .insert(
+                amm_key,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "AMM", "Account": MAKER2,
+                    "TradingFee": 0, "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER,
+                    "Fee": "10", "Sequence": 2,
+                    "TakerGets": usd("46"), "TakerPays": "461714",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(TAKER).unwrap(), 1))
+                .is_none()
+        );
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(MAKER).unwrap(), 1))
+                .is_none()
+        );
+        assert_eq!(xrp_balance(&sandbox, MAKER), 999_768_999);
+        assert_eq!(xrp_balance(&sandbox, MAKER2), 999_769_287);
     }
 
     /// 105500215 91B10CB9: Flow's direct book removes funded inverse offers
