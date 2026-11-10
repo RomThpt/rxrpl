@@ -655,10 +655,18 @@ where
 
         let txs = emitted_meta(&outcome.ledger, &rec.txs)?;
         if txs.len() != outcome.applied {
+            let missing: Vec<String> = rec
+                .txs
+                .iter()
+                .map(|tx| transaction_id(&tx.tx_blob))
+                .filter(|id| outcome.ledger.tx_map.get(id).is_none())
+                .map(|id| id.to_string())
+                .collect();
             return Err(format!(
-                "ledger {seq} emitted {} transaction leaves for {} applied transactions",
+                "ledger {seq} emitted {} transaction leaves for {} applied transactions; missing transaction ids: {}",
                 txs.len(),
-                outcome.applied
+                outcome.applied,
+                missing.join(", ")
             ));
         }
         let report = LedgerReport {
