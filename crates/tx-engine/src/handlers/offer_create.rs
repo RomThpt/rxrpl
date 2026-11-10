@@ -1258,6 +1258,24 @@ fn cross_offers(
             source_budget.is_zero(),
         ));
     }
+    // Flow checks the default strand's qualityUpperBound before forEachOffer
+    // materialises its first CLOB tip. In particular, an AMM can win the raw
+    // tip comparison yet fail the offer limit after its input transfer rate is
+    // included. Reject that strand before either the AMM or a self offer is
+    // touched (105501442). An IOU/IOU offer has a second XRP bridge strand, so
+    // a dry direct strand cannot reject the whole crossing here. Domain books
+    // have no AMM and use a separate key.
+    if !domain_only
+        && (in_leg.is_xrp || out_leg.is_xrp)
+        && !offer_crossing_strand_reaches_limit(ctx, taker, taker_gets, taker_pays, threshold)
+    {
+        return Ok((
+            taker_pays.clone(),
+            taker_gets.clone(),
+            false,
+            source_budget.is_zero(),
+        ));
+    }
 
     let mut remaining_out = out_leg.clone();
     // FlowCross carries the aggregate output remainder as a Number. Keeping
@@ -5706,9 +5724,10 @@ fn offer_crossing_initial_bound(ctx: &ApplyContext<'_>, strand: &FlowStrand) -> 
 }
 
 /// Whether the default OfferCreate strand survives Flow's quality-upper-bound
-/// gate. A viable AMM can activate the strand even when the first CLOB page is
-/// worse than the transaction limit; OfferStream then reaps invalid tips before
-/// the AMM's fee-adjusted quality is checked.
+/// gate. BookStep::tip chooses the synthetic AMM offer only when it beats the
+/// CLOB tip. BookOfferCrossingStep adjusts the selected AMM's bound for the
+/// input transfer rate, but deliberately leaves a CLOB bound fee-free: it must
+/// remain an upper bound, including for a self offer within the gross limit.
 fn offer_crossing_strand_reaches_limit(
     ctx: &ApplyContext<'_>,
     taker: &AccountId,
@@ -5719,9 +5738,49 @@ fn offer_crossing_strand_reaches_limit(
     let Some(strand) = build_flow_strand(ctx, &[taker_gets.clone(), taker_pays.clone()]) else {
         return false;
     };
-    let Some(rate) = strand_quality_ub(ctx, &strand, taker, &AmmContext::new(false)) else {
+    let Some(hop) = strand.hops.first() else {
         return false;
     };
+    let clob = book_tip_quality(ctx, &hop.inverse_book);
+    let amm_threshold = offer_crossing_amm_threshold(clob, Some(threshold), false);
+    let amm = match (hop.liquidity.as_ref(), hop.amm_pool.as_ref()) {
+        (Some(liq), Some(pool)) => {
+            let pool_in = pool_balance_number(
+                ctx,
+                pool,
+                hop.in_leg.is_xrp,
+                &hop.in_leg.currency,
+                &hop.in_leg.issuer,
+            );
+            let pool_out = pool_balance_number(
+                ctx,
+                pool,
+                hop.out_leg.is_xrp,
+                &hop.out_leg.currency,
+                &hop.out_leg.issuer,
+            );
+            liq.get_offer(&pool_in, &pool_out, amm_threshold, &AmmContext::new(false))
+                .map(|offer| offer.quality)
+        }
+        _ => None,
+    };
+    let (best, is_amm) = match (clob, amm) {
+        (Some(c), Some(a)) if rxrpl_amount::is_better_quality(a, c) => (a, true),
+        (Some(c), _) => (c, false),
+        (None, Some(a)) => (a, true),
+        (None, None) => return false,
+    };
+    let Ok(best_rate) = from_rate(best) else {
+        return false;
+    };
+    let mut rate = Number::from_iou(&best_rate);
+    if is_amm && !hop.in_leg.is_xrp && hop.in_leg.issuer != *taker {
+        rate = rate.mul(&Number::from_iou(&transfer_rate(ctx, &hop.in_leg.issuer)));
+    }
+    // The terminal DirectStep still contributes its output issuer rate.
+    if !hop.out_leg.is_xrp && hop.out_leg.issuer != *taker {
+        rate = rate.mul(&Number::from_iou(&transfer_rate(ctx, &hop.out_leg.issuer)));
+    }
     let Ok(limit) = from_rate(threshold) else {
         return false;
     };
@@ -12944,6 +13003,198 @@ mod flow_cross_own_unfunded {
                 serde_json::to_vec(&line).unwrap(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn ledger_105501442_rejects_fee_adjusted_amm_before_self_tip() {
+        let mut ledger = Ledger::genesis();
+        for (address, drops) in [
+            (ISS, 1_000_000_000u64),
+            (TAKER, 10_000_000_000),
+            (MAKER2, 102_398_903_505),
+        ] {
+            let id = decode_account_id(address).unwrap();
+            let mut account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": address,
+                "Balance": drops.to_string(), "Sequence": 1,
+                "OwnerCount": 0, "Flags": 0,
+            });
+            if address == ISS {
+                account["TransferRate"] = Value::from(1_001_500_000u64);
+            }
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        let issuer = decode_account_id(ISS).unwrap();
+        let currency = helpers::currency_to_bytes("BTC");
+        for (holder, balance) in [(TAKER, "1"), (MAKER2, "1.769570217575273")] {
+            let holder_id = decode_account_id(holder).unwrap();
+            let holder_is_low = holder_id.as_bytes() < issuer.as_bytes();
+            let stored = if holder_is_low {
+                balance.to_string()
+            } else {
+                format!("-{balance}")
+            };
+            let (low, high) = if holder_is_low {
+                (holder, ISS)
+            } else {
+                (ISS, holder)
+            };
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState",
+                "Balance": {"currency": "BTC", "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": stored},
+                "LowLimit": {"currency": "BTC", "issuer": low, "value": "1000"},
+                "HighLimit": {"currency": "BTC", "issuer": high, "value": "1000"},
+                "Flags": 0,
+            });
+            ledger
+                .put_state(
+                    keylet::trust_line(&holder_id, &issuer, &currency),
+                    serde_json::to_vec(&line).unwrap(),
+                )
+                .unwrap();
+        }
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let btc =
+            |value: &str| serde_json::json!({"currency": "BTC", "issuer": ISS, "value": value});
+        let taker = decode_account_id(TAKER).unwrap();
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER,
+                    "Fee": "12", "Sequence": 1,
+                    "TakerGets": "1000000000", "TakerPays": btc("0.017288"),
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        let self_key = keylet::offer(&taker, 1);
+        let self_before = sandbox.read(&self_key).unwrap();
+        let self_offer: Value = serde_json::from_slice(&self_before).unwrap();
+        let directory: Hash256 = self_offer["BookDirectory"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            u64::from_be_bytes(directory.as_bytes()[24..32].try_into().unwrap()),
+            0x4A06_2455_9DE3_4000
+        );
+        let pool = decode_account_id(MAKER2).unwrap();
+        let amm_key = keylet::amm(&currency, &issuer, &[0u8; 20], &AccountId::from([0u8; 20]));
+        let amm = serde_json::to_vec(&serde_json::json!({
+            "LedgerEntryType": "AMM", "Account": MAKER2, "TradingFee": 19,
+        }))
+        .unwrap();
+        sandbox.insert(amm_key, amm.clone()).unwrap();
+        let pool_line_key = keylet::trust_line(&pool, &issuer, &currency);
+        let pool_line_before = sandbox.read(&pool_line_key).unwrap();
+        let pool_xrp_before = xrp_balance(&sandbox, MAKER2);
+        let tx = serde_json::json!({
+            "TransactionType": "OfferCreate", "Account": TAKER,
+            "Fee": "12", "Sequence": 2,
+            "TakerGets": btc("0.012675345816"), "TakerPays": "734160000",
+        });
+        let rules =
+            Rules::from_enabled([feature_id("FlowCross"), feature_id("fixUniversalNumber")]);
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let input = Leg::parse(&tx["TakerGets"]).unwrap();
+        let output = Leg::parse(&tx["TakerPays"]).unwrap();
+        let threshold = flow_crossing_threshold(&ctx, &taker, &input, &output, true, false);
+        let clob_threshold = crossing_quality_threshold(&input, &output, true, false);
+        assert!(clob_threshold < 0x4A06_2455_9DE3_4000);
+        assert!(0x4A06_2455_9DE3_4000 < threshold);
+        assert!(!offer_crossing_strand_reaches_limit(
+            &ctx,
+            &taker,
+            &tx["TakerGets"],
+            &tx["TakerPays"],
+            threshold
+        ));
+        assert_eq!(
+            OfferCreateTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        assert_eq!(sandbox.read(&self_key).unwrap(), self_before);
+        assert_eq!(sandbox.read(&amm_key).unwrap(), amm);
+        assert_eq!(sandbox.read(&pool_line_key).unwrap(), pool_line_before);
+        assert_eq!(xrp_balance(&sandbox, MAKER2), pool_xrp_before);
+        let placed: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::offer(&taker, 2)).unwrap()).unwrap();
+        assert_eq!(placed["TakerGets"], tx["TakerGets"]);
+        assert_eq!(placed["TakerPays"], tx["TakerPays"]);
+    }
+
+    #[test]
+    fn fee_band_clob_tips_keep_the_initial_strand_viable() {
+        for (gets, pays, quality) in [
+            ("0.886", "1593.30477", 0x5113_c4d3_a3b2_e906u64),
+            ("7.247", "13017.771606", 0x5113_c9f6_5683_d7b2),
+        ] {
+            let mut ledger = Ledger::genesis();
+            let issuer = decode_account_id(ISS).unwrap();
+            let issuer_account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": ISS,
+                "TransferRate": 1_001_500_000u64,
+            });
+            ledger
+                .put_state(
+                    keylet::account(&issuer),
+                    serde_json::to_vec(&issuer_account).unwrap(),
+                )
+                .unwrap();
+            let taker = decode_account_id(TAKER).unwrap();
+            let output_issuer = decode_account_id(MAKER).unwrap();
+            let gets_json = serde_json::json!({
+                "currency": "USD", "issuer": ISS, "value": gets
+            });
+            let pays_json = serde_json::json!({
+                "currency": "EUR", "issuer": MAKER, "value": pays
+            });
+            let input = Leg::parse(&gets_json).unwrap();
+            let output = Leg::parse(&pays_json).unwrap();
+            let book = keylet::book_dir(&input.currency, &issuer, &output.currency, &output_issuer);
+            let dir = book_dir_with_quality(&book, quality);
+            ledger
+                .put_state(
+                    dir,
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "DirectoryNode",
+                        "Indexes": [Hash256::new([1u8; 32]).to_string()],
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            let fees = FeeSettings::default();
+            let view = LedgerView::with_fees(&ledger, fees.clone());
+            let mut sandbox = Sandbox::new(&view);
+            let rules =
+                Rules::from_enabled([feature_id("FlowCross"), feature_id("fixUniversalNumber")]);
+            let tx = serde_json::json!({"Flags": TF_PASSIVE});
+            let ctx = ApplyContext {
+                tx: &tx,
+                view: &mut sandbox,
+                rules: &rules,
+                fees: &fees,
+            };
+            let threshold = flow_crossing_threshold(&ctx, &taker, &input, &output, true, true);
+            let raw = crossing_quality_threshold(&input, &output, true, true);
+            assert!(raw < quality && quality < threshold);
+            assert!(offer_crossing_strand_reaches_limit(
+                &ctx, &taker, &gets_json, &pays_json, threshold,
+            ));
+        }
     }
 
     #[test]
