@@ -5539,6 +5539,7 @@ pub(crate) fn build_flow_strand(
                                     round_even_quality: ctx
                                         .rules
                                         .enabled(&feature_id("fixUniversalNumber")),
+                                    fix_amm_v1_2: ctx.rules.enabled(&feature_id("fixAMMv1_2")),
                                     tfee,
                                     initial_pool_in: pool_in,
                                     initial_pool_out: pool_out,

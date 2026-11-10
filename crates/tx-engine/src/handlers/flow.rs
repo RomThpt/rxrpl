@@ -148,6 +148,7 @@ pub struct AmmLiquidity {
     pub in_is_xrp: bool,
     pub out_is_xrp: bool,
     pub round_even_quality: bool,
+    pub fix_amm_v1_2: bool,
     pub tfee: u16,
     pub initial_pool_in: Number,
     pub initial_pool_out: Number,
@@ -268,6 +269,22 @@ impl AmmLiquidity {
             }
         }
 
+        let max_offer = || {
+            let pct = Number::from_int(99).div(&Number::from_int(100));
+            let off_out = {
+                let _round = RoundModeGuard::new(RoundingMode::Downward);
+                to_amount_grid(&pool_out.mul(&pct), self.out_is_xrp)
+            };
+            let off_in = crate::amm_helpers::swap_asset_out(
+                pool_in,
+                pool_out,
+                &off_out,
+                self.tfee,
+                self.in_is_xrp,
+            )?;
+            Some((off_in, off_out))
+        };
+
         let (off_in, off_out, oq) = if ctx.multi_path() {
             // Multiple active strands consume fibonacci-sized synthetic offers.
             let (off_in, off_out) = self.generate_fib_seq_offer(pool_in, pool_out, ctx)?;
@@ -289,25 +306,26 @@ impl AmmLiquidity {
                 self.tfee,
                 self.in_is_xrp,
                 self.out_is_xrp,
-            )?;
+            )
+            .or_else(|| {
+                // fixAMMv1_2: an extreme CLOB quality may have no finite
+                // spot-price solution. The largest safe AMM offer still beats
+                // that book and can be limited by SendMax in the forward pass.
+                if !self.fix_amm_v1_2 {
+                    return None;
+                }
+                let amounts = max_offer()?;
+                let quality =
+                    quality_rate(&amounts.0, self.in_is_xrp, &amounts.1, self.out_is_xrp).ok()?;
+                is_better_quality(quality, cq).then_some(amounts)
+            })?;
             let oq = quality_rate(&off_in, self.in_is_xrp, &off_out, self.out_is_xrp).ok()?;
             (off_in, off_out, oq)
         } else {
             // With no competing book, rippled exposes a maximum offer covering
             // 99% of the output reserve. A later limit operation prices the
             // actual demand with the constant-product swap function.
-            let pct = Number::from_int(99).div(&Number::from_int(100));
-            let off_out = {
-                let _round = RoundModeGuard::new(RoundingMode::Downward);
-                to_amount_grid(&pool_out.mul(&pct), self.out_is_xrp)
-            };
-            let off_in = crate::amm_helpers::swap_asset_out(
-                pool_in,
-                pool_out,
-                &off_out,
-                self.tfee,
-                self.in_is_xrp,
-            )?;
+            let (off_in, off_out) = max_offer()?;
             (off_in, off_out, spq)
         };
         if off_in.is_zero() || off_out.is_zero() {
@@ -429,6 +447,60 @@ mod tests {
     use super::*;
     use rxrpl_amount::number::Number;
 
+    #[test]
+    fn extreme_book_quality_uses_max_amm_offer_under_fix_amm_v1_2() {
+        // Ledger 105500389: the AMM can pay an input-limited XRP partial
+        // payment even though the competing book quality has no finite spot
+        // price solution on the pool's output grid.
+        let pool_in =
+            Number::from_iou(&IOUAmount::from_decimal_string("66055667.26861406").unwrap());
+        let pool_out = Number::from_int(918_994_268);
+        let clob_quality = 0x6803_8d7e_a4c6_8000;
+        let amm = AmmLiquidity {
+            in_is_xrp: false,
+            out_is_xrp: true,
+            round_even_quality: true,
+            fix_amm_v1_2: true,
+            tfee: 0,
+            initial_pool_in: pool_in,
+            initial_pool_out: pool_out,
+        };
+        assert!(
+            crate::amm_helpers::change_spot_price_quality(
+                &pool_in,
+                &pool_out,
+                clob_quality,
+                0,
+                false,
+                true,
+            )
+            .is_none()
+        );
+        let offer = amm
+            .get_offer(
+                &pool_in,
+                &pool_out,
+                Some(clob_quality),
+                &AmmContext::new(false),
+            )
+            .expect("max AMM offer should beat the book");
+        assert!(is_better_quality(offer.quality, clob_quality));
+        let without_fix = AmmLiquidity {
+            fix_amm_v1_2: false,
+            ..amm
+        };
+        assert!(
+            without_fix
+                .get_offer(
+                    &pool_in,
+                    &pool_out,
+                    Some(clob_quality),
+                    &AmmContext::new(false)
+                )
+                .is_none()
+        );
+    }
+
     fn xjoy_xrp_pool() -> AmmLiquidity {
         // XJOY/XRP AMM at ledger 105252960 (parent of the L105252961 target):
         // pool XJOY (in) = 651.8857291500754, pool XRP (out) = 10401722978 drops,
@@ -437,6 +509,7 @@ mod tests {
             in_is_xrp: false,
             out_is_xrp: true,
             round_even_quality: true,
+            fix_amm_v1_2: true,
             tfee: 994,
             initial_pool_in: Number::from_iou(
                 &IOUAmount::from_decimal_string("651.8857291500754").unwrap(),
@@ -457,6 +530,7 @@ mod tests {
             in_is_xrp: true,
             out_is_xrp: false,
             round_even_quality: true,
+            fix_amm_v1_2: true,
             tfee: 19,
             initial_pool_in: pool_in,
             initial_pool_out: pool_out,
@@ -807,6 +881,7 @@ mod tests {
             in_is_xrp: false,
             out_is_xrp: true,
             round_even_quality: true,
+            fix_amm_v1_2: true,
             tfee: 1000,
             initial_pool_in: initial_in,
             initial_pool_out: initial_out,
