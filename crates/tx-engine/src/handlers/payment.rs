@@ -302,8 +302,11 @@ impl Transactor for PaymentTransactor {
                             .and_then(Value::as_array)
                             .is_some_and(|paths| paths.len() == 1)
                         && flow_strands_have_amm(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]);
+                    // Either native boundary can mix AMM and CLOB liquidity.
+                    // The single-swap shortcut spends all SendMax in the AMM
+                    // before the book gets a turn (105501273, IOU -> XRP).
                     let direct_native_amm_book = account_str == destination_str
-                        && send_max.is_string()
+                        && (send_max.is_string() || ctx.tx["Amount"].is_string())
                         && ctx.tx.get("DeliverMin").is_some()
                         && ctx.tx.get("Paths").is_none()
                         && direct_pair_has_amm_and_clob(

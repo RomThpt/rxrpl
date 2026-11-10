@@ -2565,6 +2565,85 @@ fn amm_quality_gate_reaps_expired_tip_offer() {
     assert!(ctx.view.read(&quality_dir).is_none());
 }
 
+#[test]
+fn direct_iou_to_xrp_conversion_splits_amm_and_book() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "1000000000", None);
+    put_account(&mut ledger, ALICE, "500000000", None);
+    put_account(&mut ledger, MM, "1000000000", None);
+    put_account(&mut ledger, MM2, "229120512", None);
+    put_trust_line(&mut ledger, ALICE, ISSUER, "USD", 25.330_956_994_682_3);
+    put_trust_line(&mut ledger, MM2, ISSUER, "USD", 232.952_071_677_471_5);
+
+    let issuer = decode_account_id(ISSUER).unwrap();
+    let maker = decode_account_id(MM).unwrap();
+    let zero = rxrpl_primitives::AccountId::from([0u8; 20]);
+    let usd = helpers::currency_to_bytes("USD");
+    let xrp = [0u8; 20];
+    let amm_key = keylet::amm(&usd, &issuer, &xrp, &zero);
+    let amm = serde_json::json!({
+        "LedgerEntryType": "AMM", "Account": MM2, "TradingFee": 0,
+        "LPTokenBalance": iou("USD", ISSUER, "1000"), "Flags": 0,
+    });
+    ledger
+        .put_state(amm_key, serde_json::to_vec(&amm).unwrap())
+        .unwrap();
+
+    let quality = rxrpl_amount::get_rate(
+        &IOUAmount::from_decimal_string("6.19962802231866").unwrap(),
+        &IOUAmount::from_decimal_string("5000000").unwrap(),
+    )
+    .unwrap();
+    let book = keylet::book_dir(&usd, &issuer, &xrp, &zero);
+    let directory = crate::handlers::offer_create::book_dir_with_quality(&book, quality);
+    let offer_key = keylet::offer(&maker, 1);
+    let offer = serde_json::json!({
+        "LedgerEntryType": "Offer", "Account": MM, "Sequence": 1,
+        "TakerPays": iou("USD", ISSUER, "6.19962802231866"),
+        "TakerGets": "5000000", "BookDirectory": directory.to_string(),
+        "BookNode": "0000000000000000", "OwnerNode": "0000000000000000", "Flags": 0,
+    });
+    ledger
+        .put_state(offer_key, serde_json::to_vec(&offer).unwrap())
+        .unwrap();
+    let dir = serde_json::json!({
+        "LedgerEntryType": "DirectoryNode", "RootIndex": directory.to_string(),
+        "Indexes": [offer_key.to_string()], "Flags": 0,
+    });
+    ledger
+        .put_state(directory, serde_json::to_vec(&dir).unwrap())
+        .unwrap();
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+    let tx = serde_json::json!({
+        "TransactionType": "Payment", "Account": ALICE, "Destination": ALICE,
+        "Amount": "100000000000000000", "DeliverMin": "15446876",
+        "SendMax": iou("USD", ISSUER, "25.3309569946823"),
+        "Flags": rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT, "Fee": "12",
+    });
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut ctx),
+        Ok(TransactionResult::TesSuccess)
+    );
+    let remaining: Value = serde_json::from_slice(&sandbox.read(&offer_key).unwrap()).unwrap();
+    let remaining_pays =
+        IOUAmount::from_decimal_string(remaining["TakerPays"]["value"].as_str().unwrap()).unwrap();
+    assert!(
+        remaining_pays < IOUAmount::from_decimal_string("6.19962802231866").unwrap(),
+        "Flow must fill the book after the AMM's marginal price falls"
+    );
+    assert_eq!(holder_balance(&sandbox, ALICE, ISSUER, "USD"), 0.0);
+}
+
 /// A book that satisfies part of the target leaves the remainder to
 /// the AMM. The MM offer sells 20 GBP for 20 USD; the strand needs
 /// 30 GBP total, so 10 GBP comes from the constant-product pool.

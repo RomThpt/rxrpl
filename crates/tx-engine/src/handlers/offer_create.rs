@@ -5801,6 +5801,7 @@ fn price_clob_band_reverse(
     is_first: bool,
     is_last: bool,
     permanent_reaps: &mut Vec<PermanentOffer>,
+    uncapped_for_source_limit: bool,
 ) -> Option<(Number, Number)> {
     let demand_leg = number_to_leg(demanded, &hop.out_leg);
     // A BookStep reverse pass starts from the requested output, before
@@ -5808,10 +5809,11 @@ fn price_clob_band_reverse(
     // below preserves our existing forward pricing, but would stop before
     // invalid offers following a partially filled funded tip. Explore the
     // same output demand without SendMax and retain only permanent removals.
+    let mut unbounded_quote = None;
     if source_budget.is_some() {
         let cp = ctx.view.checkpoint();
         let taker_acct_before = taker_acct.clone();
-        let _ = cross_book_hop_with_reaps(
+        unbounded_quote = cross_book_hop_with_reaps(
             ctx,
             taker,
             taker_acct,
@@ -5828,7 +5830,8 @@ fn price_clob_band_reverse(
             /*source_input_rate=*/ 1_000_000_000,
             /*source_funds_limited=*/ false,
             Some(permanent_reaps),
-        );
+        )
+        .ok();
         ctx.view.rollback(cp);
         *taker_acct = taker_acct_before;
     }
@@ -5868,6 +5871,17 @@ fn price_clob_band_reverse(
         || (spent.is_zero() && !zero_cost_xrp_clob_fill(&spent, &delivered, is_first && is_last))
     {
         return None;
+    }
+    // BookStep::rev quotes the requested output before StrandFlow applies
+    // SendMax. For an input-limited IOU -> XRP payment, retaining only the
+    // capped quote hides that limit and the forward pass re-prices the rounded
+    // XRP output, leaving spendable IOU dust at the source (105501273).
+    if uncapped_for_source_limit
+        && let (Some(budget), Some((full_out, full_in))) = (source_budget, unbounded_quote)
+        && num_gt(&leg_to_number(&full_in), budget)
+        && num_gt(&leg_to_number(&full_out), &leg_to_number(&delivered))
+    {
+        return Some((leg_to_number(&full_in), leg_to_number(&full_out)));
     }
     Some((leg_to_number(&spent), leg_to_number(&delivered)))
 }
@@ -6214,6 +6228,7 @@ fn execute_strand_pass(
                 is_first,
                 is_last,
                 permanent_reaps,
+                !offer_create_bridge && n == 1 && !hop.in_leg.is_xrp && hop.out_leg.is_xrp,
             )?;
             ins[h] = i;
             outs[h] = o;
@@ -11759,6 +11774,7 @@ mod taker_bridge_integration {
             true,
             false,
             &mut Vec::new(),
+            false,
         )
         .unwrap();
 
@@ -11852,6 +11868,7 @@ mod taker_bridge_integration {
             true,
             true,
             &mut reaps,
+            false,
         )
         .unwrap();
         assert_eq!(quoted.0.to_xrp_drops(), 10_000_000);
