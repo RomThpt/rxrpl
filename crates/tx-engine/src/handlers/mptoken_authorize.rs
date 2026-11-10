@@ -191,7 +191,7 @@ impl Transactor for MPTokenAuthorizeTransactor {
                     .map_err(|_| TransactionResult::TefInternal)?;
             }
         } else {
-            // Issuer flow: authorize a holder
+            // Issuer flow: set or clear a holder's authorization.
             let holder_str =
                 helpers::get_str_field(ctx.tx, "Holder").ok_or(TransactionResult::TemMalformed)?;
             let holder_id = decode_account_id(holder_str)
@@ -205,15 +205,20 @@ impl Transactor for MPTokenAuthorizeTransactor {
             let mut mptoken: Value = serde_json::from_slice(&mptoken_bytes)
                 .map_err(|_| TransactionResult::TefInternal)?;
 
-            let mut entry_flags = helpers::get_flags(&mptoken);
-            entry_flags |= LSFT_MPT_AUTHORIZED;
-            mptoken["Flags"] = Value::from(entry_flags);
-
-            let mptoken_data =
-                serde_json::to_vec(&mptoken).map_err(|_| TransactionResult::TefInternal)?;
-            ctx.view
-                .update(mptoken_key, mptoken_data)
-                .map_err(|_| TransactionResult::TefInternal)?;
+            let flags_in = helpers::get_flags(&mptoken);
+            let flags_out = if tx_flags & TF_MPT_UNAUTHORIZE != 0 {
+                flags_in & !LSFT_MPT_AUTHORIZED
+            } else {
+                flags_in | LSFT_MPT_AUTHORIZED
+            };
+            if flags_out != flags_in {
+                mptoken["Flags"] = Value::from(flags_out);
+                let mptoken_data =
+                    serde_json::to_vec(&mptoken).map_err(|_| TransactionResult::TefInternal)?;
+                ctx.view
+                    .update(mptoken_key, mptoken_data)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+            }
 
             // Update issuer account sequence
             let acct_key = keylet::account(&account_id);
@@ -457,6 +462,62 @@ mod tests {
         let mptoken: Value = serde_json::from_slice(&mptoken_bytes).unwrap();
         let flags = mptoken["Flags"].as_u64().unwrap() as u32;
         assert!(flags & LSFT_MPT_AUTHORIZED != 0);
+    }
+
+    #[test]
+    fn ledger_105501183_issuer_noop_authorization_does_not_touch_mptoken() {
+        for (initial_flags, tx_flags, expected_flags, changed) in [
+            (LSFT_MPT_AUTHORIZED, 0, LSFT_MPT_AUTHORIZED, false),
+            (0, TF_MPT_UNAUTHORIZE, 0, false),
+            (0, 0, LSFT_MPT_AUTHORIZED, true),
+            (LSFT_MPT_AUTHORIZED, TF_MPT_UNAUTHORIZE, 0, true),
+        ] {
+            let (mut ledger, issuance_key) = setup_with_issuance();
+            let holder = decode_account_id(HOLDER).unwrap();
+            let token_key = keylet::mptoken(issuance_key.as_bytes(), &holder);
+            ledger
+                .put_state(
+                    token_key,
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "MPToken",
+                        "Account": HOLDER,
+                        "MPTokenIssuanceID": issuance_id_hex(&issuance_key),
+                        "MPTAmount": "0",
+                        "Flags": initial_flags,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            let fees = FeeSettings::default();
+            let view = LedgerView::with_fees(&ledger, fees.clone());
+            let mut sandbox = Sandbox::new(&view);
+            let rules = Rules::new();
+            let tx = serde_json::json!({
+                "TransactionType": "MPTokenAuthorize",
+                "Account": ISSUER,
+                "MPTokenIssuanceID": issuance_id_hex(&issuance_key),
+                "Holder": HOLDER,
+                "Flags": tx_flags,
+                "Fee": "12",
+                "Sequence": 1,
+            });
+            let mut ctx = ApplyContext {
+                tx: &tx,
+                view: &mut sandbox,
+                rules: &rules,
+                fees: &fees,
+            };
+            assert_eq!(
+                MPTokenAuthorizeTransactor.apply(&mut ctx),
+                Ok(TransactionResult::TesSuccess)
+            );
+            let token: Value = serde_json::from_slice(&sandbox.read(&token_key).unwrap()).unwrap();
+            assert_eq!(token["Flags"].as_u64(), Some(u64::from(expected_flags)));
+            assert_eq!(
+                sandbox.into_changes().updates.contains_key(&token_key),
+                changed
+            );
+        }
     }
 
     #[test]
