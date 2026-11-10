@@ -134,6 +134,114 @@ fn ledger_105501177_issuer_mints_mpt_to_authorized_holder() {
 }
 
 #[test]
+fn mpt_holder_transfer_uses_implicit_send_max_and_amendment_fee_rounding() {
+    for (exact_rounding, send_max, expected, src_amount, dst_amount, outstanding) in [
+        (
+            false,
+            None,
+            Ok(TransactionResult::TesSuccess),
+            "950",
+            "50",
+            "1000",
+        ),
+        (
+            true,
+            None,
+            Err(TransactionResult::TecPathPartial),
+            "1000",
+            "0",
+            "1000",
+        ),
+        (
+            true,
+            Some("51"),
+            Ok(TransactionResult::TesSuccess),
+            "949",
+            "50",
+            "999",
+        ),
+    ] {
+        let mut ledger = setup_ledger_with_account(SRC_ADDRESS, 200_000_000);
+        add_account(&mut ledger, DST_ADDRESS, 50_000_000);
+        add_account(&mut ledger, BOB, 50_000_000);
+        let issuer = decode_account_id(SRC_ADDRESS).unwrap();
+        let src = decode_account_id(DST_ADDRESS).unwrap();
+        let dst = decode_account_id(BOB).unwrap();
+        let sequence = 1u32;
+        let mut issuance_id = sequence.to_be_bytes().to_vec();
+        issuance_id.extend_from_slice(issuer.as_bytes());
+        let issuance_hex = hex::encode_upper(&issuance_id);
+        let issuance_key = keylet::mptoken_issuance(&issuer, sequence);
+        let src_key = keylet::mptoken(issuance_key.as_bytes(), &src);
+        let dst_key = keylet::mptoken(issuance_key.as_bytes(), &dst);
+        ledger
+            .put_state(
+                issuance_key,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "MPTokenIssuance",
+                    "Issuer": SRC_ADDRESS,
+                    "Sequence": sequence,
+                    "Flags": 0x0020,
+                    "TransferFee": 100,
+                    "MaximumAmount": "2000",
+                    "OutstandingAmount": "1000",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        for (key, account, balance) in [(src_key, DST_ADDRESS, "1000"), (dst_key, BOB, "0")] {
+            ledger
+                .put_state(
+                    key,
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "MPToken",
+                        "Account": account,
+                        "MPTokenIssuanceID": issuance_hex,
+                        "Flags": 0,
+                        "MPTAmount": balance,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = if exact_rounding {
+            Rules::from_enabled([feature_id("fixCleanup3_5_0")])
+        } else {
+            Rules::new()
+        };
+        let mut tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": DST_ADDRESS,
+            "Destination": BOB,
+            "Amount": {"mpt_issuance_id": issuance_hex, "value": "50"},
+            "Fee": "10",
+        });
+        if let Some(max) = send_max {
+            tx["SendMax"] = serde_json::json!({"mpt_issuance_id": issuance_hex, "value": max});
+        }
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(PaymentTransactor.apply(&mut ctx), expected);
+        let read_amount = |key| {
+            let entry: Value = serde_json::from_slice(&sandbox.read(&key).unwrap()).unwrap();
+            entry["MPTAmount"].as_str().unwrap().to_owned()
+        };
+        assert_eq!(read_amount(src_key), src_amount);
+        assert_eq!(read_amount(dst_key), dst_amount);
+        let issuance: Value =
+            serde_json::from_slice(&sandbox.read(&issuance_key).unwrap()).unwrap();
+        assert_eq!(issuance["OutstandingAmount"], outstanding);
+    }
+}
+
+#[test]
 fn exact_flow_delivery_reconciles_one_excess_endpoint_ulp() {
     let requested_iou = IOUAmount::from_decimal_string("0.1987120275960489").unwrap();
     let credited = IOUAmount::from_decimal_string("0.198712027596049").unwrap();

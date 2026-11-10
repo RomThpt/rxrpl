@@ -1,5 +1,5 @@
 use rxrpl_amendment::feature::feature_id;
-use rxrpl_amount::IOUAmount;
+use rxrpl_amount::{IOUAmount, number::Number};
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_primitives::AccountId;
 use rxrpl_protocol::flags::account_root::LSF_PASSWORD_SPENT;
@@ -602,18 +602,35 @@ fn apply_mpt(
         let fee = mpt_entry_amount(&issuance, "TransferFee").unwrap_or(0);
         let rate = 1_000_000_000u128 + 10_000u128 * u128::from(fee);
         let charged = (u128::from(amount.value) * rate).div_ceil(1_000_000_000);
-        u64::try_from(charged).map_err(|_| TransactionResult::TecPathPartial)?
+        if charged > i64::MAX as u128 {
+            return Err(TransactionResult::TecPathPartial);
+        }
+        if ctx.rules.enabled(&feature_id("fixCleanup3_5_0")) {
+            charged as u64
+        } else {
+            // Before fixCleanup3_5_0, rippled's multiply(STAmount, Rate)
+            // converts the Number product back to an integral MPT amount.
+            // That conversion rounds to nearest rather than charging the
+            // exact fee rounded upward.
+            let rate = u64::try_from(rate).map_err(|_| TransactionResult::TecPathPartial)?;
+            let rate = Number::new(false, rate, -9);
+            Number::from_int(amount.value as i64).mul(&rate).to_i64() as u64
+        }
     } else {
         amount.value
     };
     if gross > i64::MAX as u64 {
         return Err(TransactionResult::TecPathPartial);
     }
-    if let Some(send_max) = ctx.tx.get("SendMax") {
-        let max = parse_mpt_payment_amount(send_max)?.ok_or(TransactionResult::TecPathDry)?;
-        if gross > max.value {
-            return Err(TransactionResult::TecPathPartial);
-        }
+    let max_source = if let Some(send_max) = ctx.tx.get("SendMax") {
+        parse_mpt_payment_amount(send_max)?
+            .ok_or(TransactionResult::TecPathDry)?
+            .value
+    } else {
+        amount.value
+    };
+    if gross > max_source {
+        return Err(TransactionResult::TecPathPartial);
     }
 
     if let Some(token) = sender_token.as_mut() {
