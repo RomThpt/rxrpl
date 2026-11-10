@@ -553,7 +553,12 @@ impl Transactor for OfferCreateTransactor {
         // crossing.
         let flow_source_budget = Leg::parse(&taker_gets).map(|gets| {
             let funds = owner_funds_leg(ctx, &account_id, &gets);
-            (leg_min(&gets, &funds), leg_ge(&gets, &funds))
+            let mut send_max = gets.clone();
+            if !gets.is_xrp && account_id != gets.issuer {
+                let rate = transfer_rate(ctx, &gets.issuer);
+                send_max.iou = IOUAmount::mul_round(&gets.iou, &rate, true).unwrap_or(gets.iou);
+            }
+            (leg_min(&send_max, &funds), leg_ge(&send_max, &funds))
         });
         reap_own_unfunded_inverse_tip(
             ctx,
@@ -1565,30 +1570,34 @@ fn cross_offers(
             // the unspent offer remainder stays based on the original amount and
             // is dropped when the source budget reaches zero (105500248
             // B88F1D1B, 105500305 E05D37B2).
-            let spendable_in = leg_min(&remaining_in, &source_remaining);
-            if spendable_in.is_zero() {
-                break 'walk;
-            }
-            // A tfSell take is bounded by what the taker's remaining input can buy
-            // at this offer's quality (it sells its whole TakerGets); a buy take is
-            // bounded by the taker's remaining TakerPays demand.
-            let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
-            let affordable_out = out_for_in(&spendable_in, &rate, &offer_out);
-            let desired_out = if is_sell {
-                avail_out.clone()
-            } else {
-                leg_min(&remaining_out, &avail_out)
-            };
             let input_rate =
                 if offer_in.is_xrp || taker == &offer_in.issuer || owner == offer_in.issuer {
                     1_000_000_000
                 } else {
                     transfer_rate_value(ctx, &offer_in.issuer)
                 };
+            // The source budget includes the issuer's transfer fee. Price the
+            // offer against the net amount that its owner will receive.
+            let net_source_remaining = net_book_payment_input(&source_remaining, input_rate);
+            let net_spendable_in =
+                net_offer_input_budget(&remaining_in, &source_remaining, input_rate);
+            if net_spendable_in.is_zero() {
+                break 'walk;
+            }
+            // A tfSell take is bounded by what the taker's remaining input can buy
+            // at this offer's quality (it sells its whole TakerGets); a buy take is
+            // bounded by the taker's remaining TakerPays demand.
+            let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
+            let affordable_out = out_for_in(&net_spendable_in, &rate, &offer_out);
+            let desired_out = if is_sell {
+                avail_out.clone()
+            } else {
+                leg_min(&remaining_out, &avail_out)
+            };
             let source_funds_bind = source_funds_limited
                 && input_rate == 1_000_000_000
                 && terminal_budget_binds(
-                    &spendable_in,
+                    &net_spendable_in,
                     &desired_out,
                     &affordable_out,
                     &offer_in,
@@ -1611,7 +1620,7 @@ fn cross_offers(
             let full_take = consumes_full_offer(
                 &take_out,
                 &offer_out,
-                &spendable_in,
+                &net_spendable_in,
                 &offer_in,
                 &remaining_out,
                 &avail_out,
@@ -1625,7 +1634,7 @@ fn cross_offers(
                 // that input. This is always true for tfSell and also for a
                 // fee-free source whose available funds bind a non-sell pass;
                 // repricing the integral output would leave artificial IOU dust.
-                (take_out.clone(), spendable_in)
+                (take_out.clone(), net_spendable_in.clone())
             } else {
                 let order_in = if !leg_ge(&take_out, &avail_out) {
                     // Demand-limited (funded offer, take bounded by the taker's
@@ -1681,7 +1690,8 @@ fn cross_offers(
                 }
             }
 
-            // Move funds: taker pays order_in (grossed), owner pays order_out.
+            // Move funds: the maker receives order_in, while the taker pays
+            // gross_in including any input-issuer transfer fee.
             // Legacy Taker semantics: `order_out` is the NET the taker receives;
             // the owner's debit is grossed up by the output issuer's transfer
             // fee inside `pay_out`.
@@ -1689,18 +1699,37 @@ fn cross_offers(
             // updates to nearest (Number); the legacy pre-2013 path truncated the
             // smaller term, which loses precision when a large balance is credited
             // a small amount (e.g. a 10^10 balance minus ~3e3 diverges 3 ULP).
-            pay_in(
-                ctx,
-                taker,
-                taker_acct,
-                &owner,
+            let gross_in = gross_book_payment_input(
                 &order_in,
-                number_switchover,
-                PayInOptions {
-                    skip_taker_debit: false,
-                    allow_dust_drain: source_funds_limited,
-                },
-            )?;
+                &source_remaining,
+                input_rate,
+                leg_ge(&order_in, &net_source_remaining),
+            );
+            if input_rate == 1_000_000_000 {
+                pay_in(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    &owner,
+                    &order_in,
+                    number_switchover,
+                    PayInOptions {
+                        skip_taker_debit: false,
+                        allow_dust_drain: source_funds_limited,
+                    },
+                )?;
+            } else {
+                pay_in_book_payment(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    &owner,
+                    &order_in,
+                    &gross_in,
+                    number_switchover,
+                    false,
+                )?;
+            }
             pay_out(
                 ctx,
                 taker,
@@ -1788,7 +1817,7 @@ fn cross_offers(
             // truncating each subtraction can leave one extra ULP for the next
             // offer and make a tfSell cross spend above its TakerGets ceiling.
             remaining_in = leftover_leg(&remaining_in, &order_in, number_switchover);
-            source_remaining = leftover_leg(&source_remaining, &order_in, number_switchover);
+            source_remaining = leftover_leg(&source_remaining, &gross_in, number_switchover);
             crossed = true;
         }
     }
@@ -7168,6 +7197,16 @@ fn net_book_payment_input(gross: &Leg, rate: u32) -> Leg {
     net
 }
 
+/// OfferCreate tracks the unfilled offer in net units and Flow's source
+/// allowance in gross units. A direct BookStep may spend only the smaller net
+/// amount after the input issuer's transfer fee is removed.
+fn net_offer_input_budget(remaining_net: &Leg, remaining_gross: &Leg, rate: u32) -> Leg {
+    leg_min(
+        remaining_net,
+        &net_book_payment_input(remaining_gross, rate),
+    )
+}
+
 /// Gross the net TakerPays amount for BookPaymentStep source accounting. If the
 /// gross source budget binds, rippled consumes it exactly after limiting the
 /// offer with the corresponding round-down net amount.
@@ -8999,8 +9038,8 @@ mod taker_crossing_tests {
         funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
         in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
         leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
-        legacy_intermediate_xrp_rounding_applies, net_book_payment_input, number_to_leg,
-        out_for_in, own_tip_can_be_reaped, pack_rate, parity_rate,
+        legacy_intermediate_xrp_rounding_applies, net_book_payment_input, net_offer_input_budget,
+        number_to_leg, out_for_in, own_tip_can_be_reaped, pack_rate, parity_rate,
         preserve_flow_input_limited_iou_ulp, preserve_next_quality_self_offer, qual_div, qual_mul,
         reject_quality, remaining_is_filled, remaining_is_filled_at, remaining_offer,
         scale_funds_limited_input, select_path, sell_clamp_sub, should_bump_partial_path_credit,
@@ -9988,6 +10027,23 @@ mod taker_crossing_tests {
 
         let charged = gross_book_payment_input(&net, &gross, 1_000_100_000, true);
         assert_eq!(charged.iou, gross.iou);
+    }
+
+    #[test]
+    fn ledger_105501174_sell_budget_caps_direct_xrp_take() {
+        let source_funds = iou("0.3311164273572643");
+        let rate = from_rate(0x501A98304FF13A42).unwrap();
+        let net = net_offer_input_budget(&source_funds, &source_funds, 1_000_100_000);
+
+        assert_eq!(out_for_in(&net, &rate, &xrp(10_000_000)).drops, 4_422);
+        assert_eq!(
+            out_for_in(&source_funds, &rate, &xrp(10_000_000)).drops,
+            4_423
+        );
+        assert_eq!(
+            gross_book_payment_input(&net, &source_funds, 1_000_100_000, true).iou,
+            source_funds.iou
+        );
     }
 
     #[test]
