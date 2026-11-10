@@ -829,6 +829,56 @@ fn holder_balance(view: &dyn ReadView, holder: &str, issuer: &str, currency: &st
 }
 
 #[test]
+fn ledger_105501274_partial_direct_iou_uses_implicit_send_max() {
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, ISSUER, "100000000", Some(1_002_000_000));
+    put_account(&mut ledger, ALICE, "100000000", None);
+    put_account(&mut ledger, BOB, "100000000", None);
+    put_trust_line(&mut ledger, ALICE, ISSUER, "EVR", 292.088_667_254_599_4);
+    put_trust_line(&mut ledger, BOB, ISSUER, "EVR", 0.0);
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+    let tx = serde_json::json!({
+        "TransactionType": "Payment", "Account": ALICE, "Destination": BOB,
+        "Amount": iou("EVR", ISSUER, "292.088667"),
+        "Flags": rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT,
+        "Fee": "12",
+    });
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut ctx),
+        Ok(TransactionResult::TesSuccess)
+    );
+    let source_key = keylet::trust_line(
+        &decode_account_id(ALICE).unwrap(),
+        &decode_account_id(ISSUER).unwrap(),
+        &helpers::currency_to_bytes("EVR"),
+    );
+    let source: Value = serde_json::from_slice(&sandbox.read(&source_key).unwrap()).unwrap();
+    assert_eq!(source["Balance"]["value"], "0.0000002545994");
+    let destination_key = keylet::trust_line(
+        &decode_account_id(BOB).unwrap(),
+        &decode_account_id(ISSUER).unwrap(),
+        &helpers::currency_to_bytes("EVR"),
+    );
+    let destination: Value =
+        serde_json::from_slice(&sandbox.read(&destination_key).unwrap()).unwrap();
+    assert_eq!(destination["Balance"]["value"], "291.5056556886228");
+    assert_eq!(
+        sandbox.take_delivered_amount(),
+        Some(iou("EVR", ISSUER, "291.5056556886228"))
+    );
+}
+
+#[test]
 fn apply_iou_transfer_rate_deducts_fee_from_source() {
     let mut ledger = Ledger::genesis();
     put_account(&mut ledger, ISSUER, "100000000", Some(1_200_000_000));

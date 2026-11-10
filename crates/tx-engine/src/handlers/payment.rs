@@ -797,15 +797,77 @@ fn apply_iou(
     let mut src_trust: serde_json::Value =
         serde_json::from_slice(&src_trust_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-    let new_src_value = adjust_iou_balance(
-        &src_trust,
-        &format!("-{}", src_debit_value),
-        &issuer_id,
-        &src_id,
-    )?;
+    // Flow gives a pathless payment without SendMax an implicit source cap
+    // equal to Amount. With tfPartialPayment, a transfer fee reduces what the
+    // destination receives; it does not increase that source cap (105501274).
+    let partial_direct = ctx.tx.get("SendMax").is_none()
+        && ctx.tx.get("Paths").is_none()
+        && dest_id != issuer_id
+        && issuer_transfer_rate_units(ctx, &issuer_id) > 1_000_000_000
+        && helpers::get_flags(ctx.tx) & rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT != 0;
+    let partial_quote = if partial_direct {
+        let requested =
+            IOUAmount::from_decimal_string(value).map_err(|_| TransactionResult::TemBadAmount)?;
+        let stored = IOUAmount::from_decimal_string(
+            src_trust["Balance"]["value"]
+                .as_str()
+                .ok_or(TransactionResult::TefInternal)?,
+        )
+        .map_err(|_| TransactionResult::TefInternal)?;
+        let holding = if src_id.as_bytes() < issuer_id.as_bytes() {
+            stored
+        } else {
+            stored.negate()
+        };
+        if holding.is_zero() || holding.is_negative() {
+            return Err(TransactionResult::TecPathDry);
+        }
+        let input = if holding < requested {
+            holding
+        } else {
+            requested
+        };
+        let rate_units = issuer_transfer_rate_units(ctx, &issuer_id);
+        let rate = IOUAmount::from_decimal_string(&format!(
+            "{}.{:09}",
+            rate_units / 1_000_000_000,
+            rate_units % 1_000_000_000
+        ))
+        .map_err(|_| TransactionResult::TefInternal)?;
+        let delivered = Number::from_iou(&input)
+            .div(&Number::from_iou(&rate))
+            .to_iou();
+        if delivered.is_zero() || delivered.is_negative() {
+            return Err(TransactionResult::TecPathDry);
+        }
+        if let Some((dm_cur, dm_iss, dm_value)) = get_deliver_min_iou(ctx.tx) {
+            if dm_cur == currency && dm_iss == issuer {
+                let minimum = IOUAmount::from_decimal_string(dm_value)
+                    .map_err(|_| TransactionResult::TemBadAmount)?;
+                if delivered < minimum {
+                    return Err(TransactionResult::TecPathPartial);
+                }
+            }
+        }
+        Some((input, delivered))
+    } else {
+        None
+    };
+    let debit_text = partial_quote
+        .as_ref()
+        .map(|(input, _)| input.to_decimal_string())
+        .unwrap_or_else(|| src_debit_value.to_string());
+    let delivered_text = partial_quote
+        .as_ref()
+        .map(|(_, output)| output.to_decimal_string())
+        .unwrap_or_else(|| value.to_string());
+
+    let new_src_value =
+        adjust_iou_balance(&src_trust, &format!("-{debit_text}"), &issuer_id, &src_id)?;
     // Source must have sufficient balance (cannot go below 0 from holder's perspective).
-    let src_holder_balance = compute_holder_balance(&src_trust, &issuer_id, &src_id);
-    if src_holder_balance < src_debit_value - 1e-9 {
+    let source_is_short = partial_quote.is_none()
+        && compute_holder_balance(&src_trust, &issuer_id, &src_id) < src_debit_value - 1e-9;
+    if source_is_short {
         return Err(TransactionResult::TecPathPartial);
     }
     src_trust["Balance"]["value"] = serde_json::Value::String(new_src_value);
@@ -851,13 +913,19 @@ fn apply_iou(
         let mut dst_trust: serde_json::Value =
             serde_json::from_slice(&dst_trust_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
-        let new_dst_value = adjust_iou_balance(&dst_trust, value, &issuer_id, &dest_id)?;
+        let new_dst_value = adjust_iou_balance(&dst_trust, &delivered_text, &issuer_id, &dest_id)?;
         dst_trust["Balance"]["value"] = serde_json::Value::String(new_dst_value);
         let dst_trust_data =
             serde_json::to_vec(&dst_trust).map_err(|_| TransactionResult::TefInternal)?;
         ctx.view
             .update(dst_trust_key, dst_trust_data)
             .map_err(|_| TransactionResult::TefInternal)?;
+    }
+
+    if partial_quote.is_some() && delivered_text != value {
+        ctx.view.set_delivered_amount(serde_json::json!({
+            "currency": currency, "issuer": issuer, "value": delivered_text
+        }));
     }
 
     Ok(TransactionResult::TesSuccess)
@@ -972,20 +1040,21 @@ fn get_deliver_min_value(tx: &serde_json::Value) -> Option<f64> {
 }
 
 /// Read the issuer's TransferRate as a multiplier (1.0 = no fee).
-fn issuer_transfer_rate(ctx: &ApplyContext<'_>, issuer_id: &rxrpl_primitives::AccountId) -> f64 {
+fn issuer_transfer_rate_units(
+    ctx: &ApplyContext<'_>,
+    issuer_id: &rxrpl_primitives::AccountId,
+) -> u64 {
     let key = keylet::account(issuer_id);
     ctx.view
         .read(&key)
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|a| a.get("TransferRate").and_then(|v| v.as_u64()))
-        .map(|r| {
-            if r > 1_000_000_000 {
-                r as f64 / 1_000_000_000.0
-            } else {
-                1.0
-            }
-        })
-        .unwrap_or(1.0)
+        .unwrap_or(1_000_000_000)
+        .max(1_000_000_000)
+}
+
+fn issuer_transfer_rate(ctx: &ApplyContext<'_>, issuer_id: &rxrpl_primitives::AccountId) -> f64 {
+    issuer_transfer_rate_units(ctx, issuer_id) as f64 / 1_000_000_000.0
 }
 
 /// Adjust a holder's RippleState balance toward an issuer by `delta`
