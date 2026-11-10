@@ -19,6 +19,11 @@ const TF_ONE_ASSET_WITHDRAW_ALL: u32 = 0x00040000;
 const TF_ONE_ASSET_LP_TOKEN: u32 = 0x00200000;
 const LSF_LOW_RESERVE: u64 = 0x0001_0000;
 const LSF_HIGH_RESERVE: u64 = 0x0002_0000;
+const LSF_LOW_NO_RIPPLE: u64 = 0x0010_0000;
+const LSF_HIGH_NO_RIPPLE: u64 = 0x0020_0000;
+const LSF_LOW_FREEZE: u64 = 0x0040_0000;
+const LSF_HIGH_FREEZE: u64 = 0x0080_0000;
+const LSF_DEFAULT_RIPPLE: u64 = 0x0080_0000;
 const LSF_AMM_NODE: u64 = 0x0100_0000;
 
 impl Transactor for AMMWithdrawTransactor {
@@ -788,8 +793,14 @@ impl AMMWithdrawTransactor {
                 .to_iou()
         };
         let drained = remaining.is_zero();
+        let (release_reserve, amm_has_reserve) = if drained {
+            lp_line_reserve_status(ctx, holder, ctx_amm)?
+        } else {
+            (false, false)
+        };
+        let delete_line = release_reserve && !amm_has_reserve;
 
-        if drained {
+        if delete_line {
             delete_lp_line(ctx, holder, &ctx_amm.account, &ctx_amm.lp_currency_hex)?;
         } else {
             debit_lp_line(
@@ -799,6 +810,21 @@ impl AMMWithdrawTransactor {
                 &ctx_amm.lp_currency_hex,
                 tokens,
             )?;
+            if release_reserve {
+                let tl_key = lp_line_key(holder, ctx_amm)?;
+                let bytes = ctx
+                    .view
+                    .read(&tl_key)
+                    .ok_or(TransactionResult::TecNoEntry)?;
+                let line: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+                stage_drained_lp_line(
+                    ctx,
+                    &tl_key,
+                    &line,
+                    holder.as_bytes() < ctx_amm.account.as_bytes(),
+                )?;
+            }
         }
 
         let acct_key = keylet::account(holder);
@@ -810,7 +836,7 @@ impl AMMWithdrawTransactor {
             serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
         let bal = helpers::get_balance(&account);
         helpers::set_balance(&mut account, bal.saturating_add(xrp_out));
-        if drained {
+        if release_reserve {
             helpers::adjust_owner_count(&mut account, -1);
         }
         let acct_data = serde_json::to_vec(&account).map_err(|_| TransactionResult::TefInternal)?;
@@ -1178,6 +1204,80 @@ fn holder_lp_balance(
             .unwrap_or("0")
             .trim_start_matches('-'),
     ))
+}
+
+fn lp_line_key(
+    holder: &rxrpl_primitives::AccountId,
+    ctx_amm: &AmmContext,
+) -> Result<rxrpl_primitives::Hash256, TransactionResult> {
+    let currency: [u8; 20] = hex::decode(&ctx_amm.lp_currency_hex)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or(TransactionResult::TefInternal)?;
+    Ok(keylet::trust_line(holder, &ctx_amm.account, &currency))
+}
+
+/// `updateTrustLine` clears the holder's reserve only when a zero balance also
+/// leaves that side of the LP line at its default settings. A nonzero trust
+/// limit, as at ledger 105501781, keeps the zero-balance line and OwnerCount.
+fn lp_line_reserve_status(
+    ctx: &ApplyContext<'_>,
+    holder: &rxrpl_primitives::AccountId,
+    ctx_amm: &AmmContext,
+) -> Result<(bool, bool), TransactionResult> {
+    let key = lp_line_key(holder, ctx_amm)?;
+    let bytes = ctx.view.read(&key).ok_or(TransactionResult::TecNoEntry)?;
+    let line: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let account_bytes = ctx
+        .view
+        .read(&keylet::account(holder))
+        .ok_or(TransactionResult::TerNoAccount)?;
+    let account: serde_json::Value =
+        serde_json::from_slice(&account_bytes).map_err(|_| TransactionResult::TefInternal)?;
+
+    let holder_is_low = holder.as_bytes() < ctx_amm.account.as_bytes();
+    let (reserve, other_reserve, no_ripple, freeze, limit, quality_in, quality_out) =
+        if holder_is_low {
+            (
+                LSF_LOW_RESERVE,
+                LSF_HIGH_RESERVE,
+                LSF_LOW_NO_RIPPLE,
+                LSF_LOW_FREEZE,
+                "LowLimit",
+                "LowQualityIn",
+                "LowQualityOut",
+            )
+        } else {
+            (
+                LSF_HIGH_RESERVE,
+                LSF_LOW_RESERVE,
+                LSF_HIGH_NO_RIPPLE,
+                LSF_HIGH_FREEZE,
+                "HighLimit",
+                "HighQualityIn",
+                "HighQualityOut",
+            )
+        };
+    let flags = line["Flags"].as_u64().unwrap_or(0);
+    let account_flags = account["Flags"].as_u64().unwrap_or(0);
+    let limit_zero =
+        amm_helpers::parse_iou_value(line[limit]["value"].as_str().unwrap_or("0")).is_zero();
+    let balance_nonzero = !amm_helpers::parse_iou_value(
+        line["Balance"]["value"]
+            .as_str()
+            .unwrap_or("0")
+            .trim_start_matches('-'),
+    )
+    .is_zero();
+    let release = balance_nonzero
+        && flags & reserve != 0
+        && (flags & no_ripple != 0) != (account_flags & LSF_DEFAULT_RIPPLE != 0)
+        && flags & freeze == 0
+        && limit_zero
+        && line[quality_in].as_u64().unwrap_or(0) == 0
+        && line[quality_out].as_u64().unwrap_or(0) == 0;
+    Ok((release, flags & other_reserve != 0))
 }
 
 /// Parse LPTokenIn (an LP-currency IOU amount) into an `IOUAmount`.
@@ -1604,6 +1704,77 @@ mod tests {
     }
 
     #[test]
+    fn withdraw_all_keeps_lp_line_with_nonzero_holder_limit() {
+        const HOLDER: &str = "rJzG4t1zGn5cBBzjkhbijqRi9P9RcQdPu6";
+        const AMM: &str = "rhWTXC2m2gGGA9WozUaoMm6kLAVPb1tcS3";
+        const LP: &str = "03B245BE580EC4F4386A751C084489EC4B514A2F";
+
+        let holder = decode_account_id(HOLDER).unwrap();
+        let amm = decode_account_id(AMM).unwrap();
+        assert!(holder.as_bytes() > amm.as_bytes());
+        let currency: [u8; 20] = hex::decode(LP).unwrap().try_into().unwrap();
+        let line_key = keylet::trust_line(&holder, &amm, &currency);
+        let mut ledger = Ledger::genesis();
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": LP, "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": "-22139.8766679"},
+            "Flags": LSF_HIGH_RESERVE | LSF_HIGH_NO_RIPPLE,
+            "LowLimit": {"currency": LP, "issuer": AMM, "value": "0"},
+            "HighLimit": {"currency": LP, "issuer": HOLDER, "value": "548012074.25377"},
+            "LowNode": "18", "HighNode": "3",
+        });
+        ledger
+            .put_state(line_key, serde_json::to_vec(&line).unwrap())
+            .unwrap();
+        ledger
+            .put_state(
+                keylet::account(&holder),
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "AccountRoot", "Account": HOLDER,
+                    "Balance": "291054480", "OwnerCount": 1151, "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let view = LedgerView::new(&ledger);
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+        let tx = serde_json::json!({});
+        let ctx_amm = AmmContext {
+            account: amm,
+            asset1: serde_json::Value::Null,
+            asset2: serde_json::Value::Null,
+            tfee: 0,
+            lp_currency_hex: LP.into(),
+            total_lp: amm_helpers::parse_iou_value("30000"),
+        };
+        let tokens = amm_helpers::parse_iou_value("22139.8766679");
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        AMMWithdrawTransactor
+            .finish_withdraw(&mut ctx, &holder, &ctx_amm, &tokens, 0)
+            .unwrap();
+
+        let changes = sandbox.into_changes();
+        assert!(!changes.deletes.contains_key(&line_key));
+        let updated: serde_json::Value =
+            serde_json::from_slice(changes.updates.get(&line_key).unwrap()).unwrap();
+        assert_eq!(updated["Balance"]["value"], "0");
+        assert_eq!(updated["Flags"], LSF_HIGH_RESERVE | LSF_HIGH_NO_RIPPLE);
+        assert_eq!(updated["HighLimit"]["value"], "548012074.25377");
+        let account: serde_json::Value =
+            serde_json::from_slice(changes.updates.get(&keylet::account(&holder)).unwrap())
+                .unwrap();
+        assert_eq!(account["OwnerCount"], 1151);
+    }
+
+    #[test]
     fn last_lp_withdraw_deletes_amm_and_empty_hmt_pool_line() {
         fn put(ledger: &mut Ledger, key: rxrpl_primitives::Hash256, value: serde_json::Value) {
             ledger
@@ -1733,7 +1904,11 @@ mod tests {
                 &amm_address,
                 &lp_hex,
                 "1000",
-                0,
+                if holder.as_bytes() < amm_account.as_bytes() {
+                    LSF_LOW_RESERVE | LSF_LOW_NO_RIPPLE
+                } else {
+                    LSF_HIGH_RESERVE | LSF_HIGH_NO_RIPPLE
+                },
             ),
         );
         put(
