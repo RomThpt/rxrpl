@@ -1,6 +1,7 @@
 use super::*;
 use crate::fees::FeeSettings;
 use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext};
+use crate::view::apply_view::ApplyView;
 use crate::view::ledger_view::LedgerView;
 use crate::view::sandbox::Sandbox;
 use rxrpl_amendment::Rules;
@@ -826,6 +827,60 @@ fn holder_balance(view: &dyn ReadView, holder: &str, issuer: &str, currency: &st
     let bytes = view.read(&key).unwrap();
     let tl: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     compute_holder_balance(&tl, &issuer_id, &holder_id)
+}
+
+#[test]
+fn direct_iou_payment_cannot_increase_full_destination_line() {
+    let mut ledger = Ledger::genesis();
+    for address in [ISSUER, ALICE, BOB] {
+        put_account(
+            &mut ledger,
+            address,
+            "100000000",
+            (address == ISSUER).then_some(1_002_000_000),
+        );
+    }
+    put_trust_line(&mut ledger, ALICE, ISSUER, "EUR", 200.0);
+    put_trust_line(&mut ledger, BOB, ISSUER, "EUR", 100.0);
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let dst = decode_account_id(BOB).unwrap();
+    let issuer = decode_account_id(ISSUER).unwrap();
+    let currency = helpers::currency_to_bytes("EUR");
+    let dst_key = keylet::trust_line(&dst, &issuer, &currency);
+    let mut dst_line: Value = serde_json::from_slice(&sandbox.read(&dst_key).unwrap()).unwrap();
+    let limit_field = if dst.as_bytes() < issuer.as_bytes() {
+        "LowLimit"
+    } else {
+        "HighLimit"
+    };
+    dst_line[limit_field]["value"] = Value::String("0".into());
+    sandbox
+        .update(dst_key, serde_json::to_vec(&dst_line).unwrap())
+        .unwrap();
+    let src_key = keylet::trust_line(&decode_account_id(ALICE).unwrap(), &issuer, &currency);
+    let source_before = sandbox.read(&src_key).unwrap();
+    let dest_before = sandbox.read(&dst_key).unwrap();
+    let rules = Rules::new();
+    let tx = serde_json::json!({
+        "TransactionType": "Payment", "Account": ALICE, "Destination": BOB,
+        "Amount": iou("EUR", ISSUER, "100"),
+        "SendMax": iou("EUR", ISSUER, "100.2"),
+        "Paths": [[{"account": ISSUER}]], "Fee": "12",
+    });
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut ctx),
+        Err(TransactionResult::TecPathDry)
+    );
+    assert_eq!(sandbox.read(&src_key).unwrap(), source_before);
+    assert_eq!(sandbox.read(&dst_key).unwrap(), dest_before);
 }
 
 #[test]

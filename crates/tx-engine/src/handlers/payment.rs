@@ -750,6 +750,15 @@ fn apply_iou(
         return Ok(TransactionResult::TesSuccess);
     }
 
+    // Explicit paths must respect the destination's trust limit. The direct
+    // pathless transfer is handled by the legacy direct-payment rule below.
+    if ctx.tx.get("Paths").is_some()
+        && dest_id != issuer_id
+        && iou_receive_capacity(ctx, &dest_id, &issuer_id, &cur_bytes).is_zero()
+    {
+        return Err(TransactionResult::TecPathDry);
+    }
+
     // Non-issuer IOU send: debit source's RippleState. If the destination is
     // the issuer itself, this is a burn (only debit). Otherwise also credit
     // destination's RippleState with the issuer.
