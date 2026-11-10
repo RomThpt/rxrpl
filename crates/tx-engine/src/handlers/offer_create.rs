@@ -2107,6 +2107,7 @@ fn try_amm_step(
         /*reverse_output_limited=*/ false,
         /*target_quality=*/ Some(cq),
         cap_ending_spot_price,
+        /*waive_output_transfer_fee=*/ true,
     )? {
         // A tfSell fill can deliver more than the remaining TakerPays demand;
         // clamp the demand at zero rather than underflowing the drops/mantissa.
@@ -2705,6 +2706,7 @@ fn cross_book_hop_with_reaps(
                     /*reverse_output_limited=*/ false,
                     /*target_quality=*/ Some(dir_quality),
                     /*cap_ending_spot_price=*/ true,
+                    /*waive_output_transfer_fee=*/ false,
                 )? {
                     remaining_out = leg_sub_round(&remaining_out, &amm_out);
                     remaining_in = leg_sub_round(&remaining_in, &amm_spent);
@@ -3088,6 +3090,7 @@ fn cross_book_hop_with_reaps(
                 balance_rounding,
                 skip_output_credit,
                 TransferFeeRounding::Down,
+                false,
             )?;
             // Debiting Gets (e=-19) into a 22.45 BTC line (e=-14) truncates 1
             // ULP vs mainnet (30000099 0C0344E7). Give it back when the line
@@ -3636,6 +3639,7 @@ pub(crate) fn cross_path_payment(
                 terminal_reverse_amm && is_last,
                 /*target_quality=*/ None,
                 /*cap_ending_spot_price=*/ false,
+                /*waive_output_transfer_fee=*/ false,
             )? {
                 got = leg_add(&got, &amm_out);
                 spent = leg_add(&spent, &amm_spent);
@@ -3987,6 +3991,7 @@ fn amm_hop(
     reverse_output_limited: bool,
     target_quality: Option<u64>,
     cap_ending_spot_price: bool,
+    waive_output_transfer_fee: bool,
 ) -> Result<Option<(Leg, Leg)>, TransactionResult> {
     let in_xrp = budget_in.is_xrp;
     let out_xrp = demand_out.is_xrp;
@@ -4213,10 +4218,9 @@ fn amm_hop(
     }
 
     // --- Apply the output: move the pool's GROSS delivery to the recipient. ---
-    // For an IOU whose issuer charges a transfer fee, the pool loses the full
-    // swap output while the recipient receives the net amount. Keep that net as
-    // the hop's realised delivery so PartialPayment metadata and subsequent
-    // flow accounting agree with the trust-line movement.
+    // OfferCreate's BookOfferCrossingStep waives the AMM output transfer fee.
+    // Payment hops retain their existing fee treatment. The realised delivery
+    // must match the amount credited to the recipient in either case.
     let delivered = if out_xrp {
         let drops = deliver_num.to_xrp_drops() as i64;
         credit_xrp(ctx, &pool_id, -drops)?;
@@ -4258,6 +4262,7 @@ fn amm_hop(
             BalanceRounding::HalfUpward,
             skip_output_credit,
             TransferFeeRounding::Nearest,
+            waive_output_transfer_fee,
         )?
     };
 
@@ -4418,6 +4423,7 @@ fn apply_amm_move(
             BalanceRounding::HalfUpward,
             skip_output_credit,
             TransferFeeRounding::Nearest,
+            false,
         )?;
         Ok(leg_to_number(&net))
     }
@@ -7098,10 +7104,11 @@ fn pay_out(
 /// (what `recipient` actually receives). Used by the cross-currency Payment
 /// path, where `amount` is the GROSS the offer provides — exactly the offer's
 /// TakerGets reduction and the owner's debit. The output issuer's transfer fee
-/// is charged out of that gross: the recipient receives `amount / transfer_rate`
-/// with the caller's execution-path rounding, and the difference is the burned
-/// fee. rippled skips the fee whenever the issuer is itself a party (owner or
-/// recipient), so the net then equals the gross. XRP carries no transfer fee, so
+/// is charged out of that gross unless the caller waives it: the recipient
+/// receives `amount / transfer_rate` with the caller's execution-path rounding,
+/// and the difference is the burned fee. rippled skips the fee whenever the
+/// issuer is itself a party (owner or recipient), so the net then equals the
+/// gross. XRP carries no transfer fee, so
 /// net == gross there. When `recipient` is the taker, its XRP credit goes
 /// through `taker_acct` (the caller's working copy) so the apply's final account
 /// write does not clobber it; a distinct recipient (cross-currency payment to
@@ -7125,6 +7132,7 @@ fn pay_out_gross(
     recipient_rounding: BalanceRounding,
     skip_recipient_credit: bool,
     fee_rounding: TransferFeeRounding,
+    waive_transfer_fee: bool,
 ) -> Result<Leg, TransactionResult> {
     if amount.is_xrp {
         credit_xrp(ctx, owner, -amount.drops)?;
@@ -7145,8 +7153,10 @@ fn pay_out_gross(
     // `gross / rate` rounded down; otherwise net == gross. For an intermediate
     // hop (`skip_recipient_credit`) the output funds the next book directly, so
     // there is no fee-charged recipient and the net carried forward is the gross.
-    let fee_applies =
-        !skip_recipient_credit && amount.issuer != *owner && amount.issuer != *recipient;
+    let fee_applies = !waive_transfer_fee
+        && !skip_recipient_credit
+        && amount.issuer != *owner
+        && amount.issuer != *recipient;
     let net = if fee_applies {
         let rate = transfer_rate(ctx, &amount.issuer);
         let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
@@ -11060,6 +11070,126 @@ mod amm_transfer_fee_tests {
     }
 
     #[test]
+    fn offer_cross_amm_waives_output_fee_while_payment_hop_retains_it() {
+        let demand = "0.0004810006089389414";
+        let mut offer_pool_after = None;
+        for offer_crossing in [true, false] {
+            let mut ledger = Ledger::genesis();
+            for (address, rate) in [
+                (ISSUER, Some(1_001_500_000u64)),
+                (POOL, None),
+                (RECIPIENT, None),
+            ] {
+                let id = decode_account_id(address).unwrap();
+                let mut account = serde_json::json!({
+                    "LedgerEntryType": "AccountRoot", "Account": address,
+                    "Balance": "100000000", "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+                });
+                if let Some(rate) = rate {
+                    account["TransferRate"] = Value::from(rate);
+                }
+                ledger
+                    .put_state(keylet::account(&id), serde_json::to_vec(&account).unwrap())
+                    .unwrap();
+            }
+            put_line(&mut ledger, POOL, "10");
+            put_line(&mut ledger, RECIPIENT, "0");
+            let input = Leg::parse(&serde_json::json!("1000000")).unwrap();
+            let output = Leg::parse(&serde_json::json!({
+                "currency": "USD", "issuer": ISSUER, "value": demand
+            }))
+            .unwrap();
+            let taker = decode_account_id(RECIPIENT).unwrap();
+            ledger
+                .put_state(
+                    keylet::amm(
+                        &input.currency,
+                        &input.issuer,
+                        &output.currency,
+                        &output.issuer,
+                    ),
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "AMM", "Account": POOL, "TradingFee": 0
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+
+            let fees = FeeSettings::default();
+            let view = LedgerView::with_fees(&ledger, fees.clone());
+            let mut sandbox = Sandbox::new(&view);
+            let rules = Rules::new();
+            let tx = serde_json::json!({});
+            let mut taker_account = serde_json::json!({"Balance": "100000000"});
+            let mut ctx = ApplyContext {
+                tx: &tx,
+                view: &mut sandbox,
+                rules: &rules,
+                fees: &fees,
+            };
+            let delivered = if offer_crossing {
+                let mut remaining_out = output.clone();
+                let mut remaining_in = input.clone();
+                let mut source_remaining = input.clone();
+                let mut crossed = false;
+                let quality_input = Leg::parse(&serde_json::json!("20000000")).unwrap();
+                let quality_output = Leg::parse(&serde_json::json!({
+                    "currency": "USD", "issuer": ISSUER, "value": "1"
+                }))
+                .unwrap();
+                let cq = crossing_quality_threshold(&quality_input, &quality_output, false, false);
+                try_amm_step(
+                    &mut ctx,
+                    &taker,
+                    &mut taker_account,
+                    &mut remaining_out,
+                    &mut remaining_in,
+                    &mut source_remaining,
+                    &mut crossed,
+                    cq,
+                    false,
+                    false,
+                    false,
+                )
+                .unwrap();
+                assert!(crossed);
+                assert!(remaining_out.is_zero());
+                output.clone()
+            } else {
+                amm_hop(
+                    &mut ctx,
+                    &taker,
+                    &mut taker_account,
+                    &taker,
+                    &output,
+                    &input,
+                    false,
+                    false,
+                    false,
+                    true,
+                    false,
+                    None,
+                    false,
+                    false,
+                )
+                .unwrap()
+                .unwrap()
+                .0
+            };
+            let pool_after = holding(&sandbox, POOL);
+            assert!(pool_after < IOUAmount::from_decimal_string("10").unwrap());
+            assert_eq!(holding(&sandbox, RECIPIENT), delivered.iou);
+            if offer_crossing {
+                assert_eq!(delivered.iou.to_decimal_string(), demand);
+                offer_pool_after = Some(pool_after);
+            } else {
+                assert_eq!(Some(pool_after), offer_pool_after);
+                assert_eq!(delivered.iou.to_decimal_string(), "0.0004802801886559575");
+            }
+        }
+    }
+
+    #[test]
     fn amm_output_charges_transfer_fee_from_gross_delivery() {
         let mut ledger = Ledger::genesis();
         for (address, transfer_rate) in [
@@ -11110,6 +11240,7 @@ mod amm_transfer_fee_tests {
             BalanceRounding::Legacy,
             false,
             TransferFeeRounding::Nearest,
+            false,
         )
         .unwrap();
 
@@ -12393,6 +12524,7 @@ mod taker_bridge_integration {
             BalanceRounding::Legacy,
             false,
             TransferFeeRounding::Down,
+            false,
         )
         .unwrap();
 
