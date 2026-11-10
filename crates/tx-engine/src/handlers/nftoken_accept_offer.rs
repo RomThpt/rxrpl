@@ -434,7 +434,7 @@ impl NFTokenAcceptOfferTransactor {
         if amount > 0 && transfer_fee != 0 {
             if let Some(issuer) = issuer_from_nftoken_id(&nftoken_id) {
                 if issuer != seller_addr && issuer != buyer_addr {
-                    let cut = (amount as u128 * transfer_fee as u128 / 100_000u128) as u64;
+                    let cut = round_royalty_xrp(amount, transfer_fee);
                     Self::transfer_xrp(ctx, &buyer_addr, &issuer, cut)?;
                     amount = amount.saturating_sub(cut);
                 }
@@ -456,6 +456,16 @@ impl NFTokenAcceptOfferTransactor {
     }
 }
 
+/// rippled multiplies an XRP `STAmount` by the NFT transfer rate and converts
+/// the result back to drops, rounding to nearest with ties to even.
+fn round_royalty_xrp(amount: u64, transfer_fee: u32) -> u64 {
+    let product = u128::from(amount) * u128::from(transfer_fee);
+    let quotient = product / 100_000;
+    let remainder = product % 100_000;
+    let round_up = remainder * 2 > 100_000 || (remainder * 2 == 100_000 && quotient % 2 != 0);
+    (quotient + u128::from(round_up)) as u64
+}
+
 /// Compute (issuer_cut, seller_take) for an NFT sale. issuer_cut is 0 on
 /// primary sale (seller == issuer) or when transfer_fee is 0.
 fn compute_transfer_split(nftoken_id: &str, seller_addr: &str, amount: u64) -> (u64, u64) {
@@ -474,7 +484,7 @@ fn compute_transfer_split(nftoken_id: &str, seller_addr: &str, amount: u64) -> (
         return (0, amount);
     }
     // rippled: transfer_fee in 1/100000 (max 50000 = 50%).
-    let issuer_cut = (amount as u128 * transfer_fee as u128 / 100_000u128) as u64;
+    let issuer_cut = round_royalty_xrp(amount, transfer_fee);
     let seller_take = amount.saturating_sub(issuer_cut);
     (issuer_cut, seller_take)
 }
@@ -775,5 +785,26 @@ mod tests {
             NFTokenAcceptOfferTransactor::transfer_xrp(&mut ctx, BUYER, SELLER, 100_000_001,),
             Err(TransactionResult::TecInsufficientFunds)
         );
+    }
+
+    #[test]
+    fn ledger_105501239_brokered_royalty_rounds_to_nearest_even_drop() {
+        let nft_id = "00190BB8C3E4F7A333009F82AD6AC3B730E4F226CB2161226154CCBE0642D221";
+        assert_eq!(
+            issuer_from_nftoken_id(nft_id).as_deref(),
+            Some("rJiohLVy4aX9J3oWpfzaBos7Bks9GUu3UT")
+        );
+        let buy_price = 5_010_000;
+        let broker_fee = 79_609;
+        let net = buy_price - broker_fee;
+        let (issuer_cut, seller_take) =
+            compute_transfer_split(nft_id, "rsjk3B9W6fcSMLYYxtHDVtnLVY4VnbGJG2", net);
+        assert_eq!(issuer_cut, 147_912);
+        assert_eq!(seller_take, 4_782_479);
+        assert_eq!(issuer_cut + seller_take + broker_fee, buy_price);
+
+        assert_eq!(round_royalty_xrp(1, 50_000), 0); // 0.5 rounds to even 0
+        assert_eq!(round_royalty_xrp(3, 50_000), 2); // 1.5 rounds to even 2
+        assert_eq!(round_royalty_xrp(5, 50_000), 2); // 2.5 rounds to even 2
     }
 }
