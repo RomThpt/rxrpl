@@ -1268,6 +1268,7 @@ fn cross_offers(
     let mut remaining_in = in_leg.clone();
     let mut source_remaining = source_budget.clone();
     let mut crossed = false;
+    let mut reaped_self_offer = false;
     // A CLOB-bounded AMM pass can leave only a self/unfunded tip behind. In
     // rippled, the next pass removes that tip, delivers nothing, and ends the
     // strand as dry. Do not turn that dry pass into a second AMM crossing at
@@ -1340,7 +1341,9 @@ fn cross_offers(
                     taker_acct,
                     &dir_key,
                     QualityAdvanceMode::Speculative,
-                )? {
+                )?
+                .funded_tip_remains
+                {
                     deferred_out_of_quality_dir = Some(dir_key);
                     break;
                 }
@@ -1373,7 +1376,9 @@ fn cross_offers(
             } else {
                 QualityAdvanceMode::Executing
             };
-            if advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, mode)? {
+            let advance = advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, mode)?;
+            reaped_self_offer |= advance.reaped_self_offer;
+            if advance.funded_tip_remains {
                 deferred_out_of_quality_dir = Some(dir_key);
                 break;
             }
@@ -1448,15 +1453,18 @@ fn cross_offers(
                     // execOffer evaluates self-cross removal before its CLOB
                     // callback checks the now-remaining budget. Mirror that
                     // ordering when an AMM offer asks BookStep to continue.
-                    let funded_tip_remains = advance_past_unfunded_quality(
+                    let advance = advance_past_unfunded_quality(
                         ctx,
                         taker,
                         taker_acct,
                         &dir_key,
                         QualityAdvanceMode::Executing,
                     )?;
-                    terminal_amm_allowed &=
-                        clob_band_allows_terminal_amm(amm_consumed_in_band, funded_tip_remains);
+                    reaped_self_offer |= advance.reaped_self_offer;
+                    terminal_amm_allowed &= clob_band_allows_terminal_amm(
+                        amm_consumed_in_band,
+                        advance.funded_tip_remains,
+                    );
                 }
                 if !leg_ge(&before, &remaining_out) || !leg_ge(&remaining_out, &before) {
                     remaining_out_num = leg_to_number(&remaining_out);
@@ -1547,6 +1555,7 @@ fn cross_offers(
                 // unfunded: remove it instead of crossing it. This applies to
                 // funded offers too (mainnet 105500215 / 91B10CB9).
                 reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, &dir_key)?;
+                reaped_self_offer = true;
                 continue;
             }
             // OfferStream materialises and permanently removes invalid or
@@ -1848,7 +1857,11 @@ fn cross_offers(
                 is_sell,
             )?;
         }
-        if !domain_only && terminal_amm_allowed {
+        // BookStep retries AMM with no CLOB quality only when the book was
+        // empty at the start of this pass. Reaping a self-owned tip with no
+        // fill ends that pass dry; it must not reopen the AMM at the looser
+        // taker limit (105501188).
+        if !domain_only && terminal_amm_allowed && (!reaped_self_offer || crossed) {
             let source_before_amm = source_remaining.clone();
             let _ = try_amm_step(
                 ctx,
@@ -1944,14 +1957,20 @@ enum QualityAdvanceMode {
     PreQuality,
 }
 
+struct QualityAdvanceResult {
+    funded_tip_remains: bool,
+    reaped_self_offer: bool,
+}
+
 fn advance_past_unfunded_quality(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
     taker_acct: &mut Value,
     dir_key: &Hash256,
     mode: QualityAdvanceMode,
-) -> Result<bool, TransactionResult> {
+) -> Result<QualityAdvanceResult, TransactionResult> {
     let quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
+    let mut reaped_self_offer = false;
     for offer_key in book_dir_indexes(ctx, dir_key) {
         let Some(bytes) = ctx.view.read(&offer_key) else {
             continue;
@@ -1996,18 +2015,30 @@ fn advance_past_unfunded_quality(
         // expired offer untouched in that case (105500455), and likewise keep
         // a funded self-offer until the CLOB is actually selected (105500679).
         // A retained CLOB walk or post-fill advance removes either normally.
-        let removable = (!matches!(mode, QualityAdvanceMode::Speculative) && expired)
-            || offer_in.is_zero()
+        let otherwise_removable = offer_in.is_zero()
             || offer_out.is_zero()
             || is_deep_frozen(ctx, &owner, &offer_in)
-            || offer_cannot_pay(&funds, &offer_out, flags, &owner == taker)
+            || offer_cannot_pay(&funds, &offer_out, flags, &owner == taker);
+        let self_reap = matches!(mode, QualityAdvanceMode::Executing)
+            && owner == *taker
+            && !expired
+            && !otherwise_removable;
+        let removable = (!matches!(mode, QualityAdvanceMode::Speculative) && expired)
+            || otherwise_removable
             || (matches!(mode, QualityAdvanceMode::Executing) && owner == *taker);
         if !removable {
-            return Ok(true);
+            return Ok(QualityAdvanceResult {
+                funded_tip_remains: true,
+                reaped_self_offer,
+            });
         }
         reap_walk_offer(ctx, &owner, taker, taker_acct, &offer_key, dir_key)?;
+        reaped_self_offer |= self_reap;
     }
-    Ok(false)
+    Ok(QualityAdvanceResult {
+        funded_tip_remains: false,
+        reaped_self_offer,
+    })
 }
 
 /// Cross the book's AMM pool (if present and strictly better than `cq`) up to the
@@ -12482,6 +12513,101 @@ mod taker_bridge_integration {
     }
 
     #[test]
+    fn ledger_105501188_does_not_retry_amm_after_reaping_self_tip() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 0);
+        put_acct(&mut ledger, O3, 1_000_000_000, 0);
+        put_line(&mut ledger, TAKER, b"SHR", 100);
+        put_line(&mut ledger, O3, b"SHR", 100_000);
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+
+        // A funded inverse offer sits at the AMM's spot quality. It is the
+        // taker's own offer, so BookStep will remove it without trading.
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER,
+                    "Fee": "12", "Sequence": 1,
+                    "TakerGets": {"currency": "SHR", "issuer": ISS, "value": "10"},
+                    "TakerPays": "100000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+
+        let zero = AccountId::from([0u8; 20]);
+        let issuer = decode_account_id(ISS).unwrap();
+        let amm_key = keylet::amm(&[0u8; 20], &zero, &ccy(b"SHR"), &issuer);
+        sandbox
+            .insert(
+                amm_key,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "AMM", "Account": O3,
+                    "TradingFee": 0, "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let taker = decode_account_id(TAKER).unwrap();
+        let self_offer: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::offer(&taker, 1)).unwrap()).unwrap();
+        let directory: Hash256 = self_offer["BookDirectory"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let self_quality = u64::from_be_bytes(directory.as_bytes()[24..32].try_into().unwrap());
+        let pool_spot = rxrpl_amount::get_rate(
+            &IOUAmount::from_decimal_string("1000000000").unwrap(),
+            &IOUAmount::from_decimal_string("100000").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(self_quality, pool_spot);
+        let tx = serde_json::json!({
+            "TransactionType": "OfferCreate", "Account": TAKER,
+            "Fee": "12", "Sequence": 2,
+            "TakerGets": "101000",
+            "TakerPays": {"currency": "SHR", "issuer": ISS, "value": "10"},
+        });
+        let threshold = crossing_quality_threshold(
+            &Leg::parse(&tx["TakerGets"]).unwrap(),
+            &Leg::parse(&tx["TakerPays"]).unwrap(),
+            false,
+            false,
+        );
+        assert!(rxrpl_amount::is_better_quality(self_quality, threshold));
+        let rules = Rules::from_enabled([feature_id("FlowCross")]);
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            OfferCreateTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        assert!(sandbox.read(&keylet::offer(&taker, 1)).is_none());
+        assert!(
+            sandbox.read(&keylet::offer(&taker, 2)).is_some(),
+            "pool XRP={}, pool SHR={}, taker XRP={}, taker SHR={}",
+            xrp_bal(&sandbox, O3),
+            line_bal(&sandbox, O3, b"SHR"),
+            xrp_bal(&sandbox, TAKER),
+            line_bal(&sandbox, TAKER, b"SHR"),
+        );
+        assert_eq!(xrp_bal(&sandbox, O3), 1_000_000_000);
+        assert_eq!(line_bal(&sandbox, O3, b"SHR"), "100000");
+        assert_eq!(xrp_bal(&sandbox, TAKER), 1_000_000_000);
+        assert_eq!(line_bal(&sandbox, TAKER, b"SHR"), "100");
+    }
+
+    #[test]
     fn ledger_105500679_speculative_probe_keeps_funded_self_offer() {
         let mut ledger = Ledger::genesis();
         put_acct(&mut ledger, ISS, 1_000_000_000, 0);
@@ -12535,6 +12661,7 @@ mod taker_bridge_integration {
                 QualityAdvanceMode::Speculative,
             )
             .unwrap()
+            .funded_tip_remains
         );
         assert_eq!(ctx.view.read(&offer_key).unwrap(), offer_before);
         assert!(ctx.view.read(&directory).is_some());
@@ -12553,6 +12680,7 @@ mod taker_bridge_integration {
                 QualityAdvanceMode::Executing,
             )
             .unwrap()
+            .funded_tip_remains
         );
         assert!(ctx.view.read(&offer_key).is_none());
         assert!(ctx.view.read(&directory).is_none());
