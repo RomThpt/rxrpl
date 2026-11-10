@@ -322,14 +322,15 @@ impl NFTokenAcceptOfferTransactor {
         // TransferFee: secondary-sale royalty to original issuer.
         // NFTokenID rxrpl layout: flags(8)+transfer_fee(4)+reserved(4)+issuer(40)+seq(8).
         // transfer_fee is in 1/100000 (rippled max 50000 = 50%).
-        let (issuer_cut, seller_take) = compute_transfer_split(&nftoken_id, &seller_addr, amount);
+        let (issuer_cut, seller_take) =
+            compute_transfer_split(&nftoken_id, &seller_addr, buyer_addr, amount);
 
-        Self::transfer_xrp(ctx, buyer_addr, &seller_addr, seller_take)?;
         if issuer_cut > 0 {
             if let Some(issuer_addr) = issuer_from_nftoken_id(&nftoken_id) {
                 Self::transfer_xrp(ctx, buyer_addr, &issuer_addr, issuer_cut)?;
             }
         }
+        Self::transfer_xrp(ctx, buyer_addr, &seller_addr, seller_take)?;
         // Transfer token from seller to buyer
         Self::transfer_token(ctx, &nftoken_id, &seller_addr, buyer_addr)?;
         // Consume the offer (unlink from both directories, erase, owner reserve)
@@ -379,9 +380,16 @@ impl NFTokenAcceptOfferTransactor {
             return Err(TransactionResult::TecNoPermission);
         }
 
-        // The accept caller is the token owner (seller)
-        // Transfer XRP from buyer to seller (caller)
-        Self::transfer_xrp(ctx, &buyer_addr, seller_addr, amount)?;
+        // The accept caller is the token owner (seller). As with a direct
+        // sell-offer acceptance, pay the issuer's royalty before the seller.
+        let (issuer_cut, seller_take) =
+            compute_transfer_split(&nftoken_id, seller_addr, &buyer_addr, amount);
+        if issuer_cut > 0 {
+            if let Some(issuer_addr) = issuer_from_nftoken_id(&nftoken_id) {
+                Self::transfer_xrp(ctx, &buyer_addr, &issuer_addr, issuer_cut)?;
+            }
+        }
+        Self::transfer_xrp(ctx, &buyer_addr, seller_addr, seller_take)?;
         // Transfer token from seller (caller) to buyer
         Self::transfer_token(ctx, &nftoken_id, seller_addr, &buyer_addr)?;
         // Consume the offer (unlink from both directories, erase, owner reserve)
@@ -466,9 +474,14 @@ fn round_royalty_xrp(amount: u64, transfer_fee: u32) -> u64 {
     (quotient + u128::from(round_up)) as u64
 }
 
-/// Compute (issuer_cut, seller_take) for an NFT sale. issuer_cut is 0 on
-/// primary sale (seller == issuer) or when transfer_fee is 0.
-fn compute_transfer_split(nftoken_id: &str, seller_addr: &str, amount: u64) -> (u64, u64) {
+/// Compute (issuer_cut, seller_take) for a direct XRP NFT sale. The issuer
+/// receives no royalty when either party is the issuer.
+fn compute_transfer_split(
+    nftoken_id: &str,
+    seller_addr: &str,
+    buyer_addr: &str,
+    amount: u64,
+) -> (u64, u64) {
     if amount == 0 {
         return (0, 0);
     }
@@ -476,8 +489,8 @@ fn compute_transfer_split(nftoken_id: &str, seller_addr: &str, amount: u64) -> (
         Some(s) => s,
         None => return (0, amount),
     };
-    if issuer == seller_addr {
-        return (0, amount); // primary sale, no royalty
+    if issuer == seller_addr || issuer == buyer_addr {
+        return (0, amount);
     }
     let transfer_fee = u32::from_str_radix(&nftoken_id[4..8], 16).unwrap_or(0);
     if transfer_fee == 0 {
@@ -521,8 +534,17 @@ mod tests {
 
     const SELLER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
     const BUYER: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
+    const ISSUER: &str = "rJiohLVy4aX9J3oWpfzaBos7Bks9GUu3UT";
 
     fn setup_with_sell_offer() -> (Ledger, String, String) {
+        setup_with_sell_offer_for(SELLER, 0, 5_000_000)
+    }
+
+    fn setup_with_sell_offer_for(
+        issuer: &str,
+        transfer_fee: u32,
+        sell_amount: u64,
+    ) -> (Ledger, String, String) {
         let mut ledger = Ledger::genesis();
 
         // Setup seller account
@@ -543,7 +565,7 @@ mod tests {
         // Setup buyer account
         let buyer_id = decode_account_id(BUYER).unwrap();
         let buyer_key = keylet::account(&buyer_id);
-        let buyer_acct = serde_json::json!({
+        let mut buyer_acct = serde_json::json!({
             "LedgerEntryType": "AccountRoot",
             "Account": BUYER,
             "Balance": "100000000",
@@ -551,22 +573,50 @@ mod tests {
             "OwnerCount": 0,
             "Flags": 0,
         });
+        if issuer == BUYER {
+            buyer_acct["NFTokenMinter"] = Value::String(SELLER.to_string());
+        }
         ledger
             .put_state(buyer_key, serde_json::to_vec(&buyer_acct).unwrap())
             .unwrap();
+        if issuer != SELLER && issuer != BUYER {
+            let issuer_id = decode_account_id(issuer).unwrap();
+            let issuer_acct = serde_json::json!({
+                "LedgerEntryType": "AccountRoot",
+                "Account": issuer,
+                "Balance": "100000000",
+                "Sequence": 1,
+                "OwnerCount": 0,
+                "Flags": 0,
+                "NFTokenMinter": SELLER,
+            });
+            ledger
+                .put_state(
+                    keylet::account(&issuer_id),
+                    serde_json::to_vec(&issuer_acct).unwrap(),
+                )
+                .unwrap();
+        }
 
         // Mint token
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let mut sandbox = Sandbox::new(&view);
         let rules = Rules::new();
-        let mint_tx = serde_json::json!({
+        let mut mint_tx = serde_json::json!({
             "TransactionType": "NFTokenMint",
             "Account": SELLER,
             "NFTokenTaxon": 0,
             "Fee": "12",
             "Sequence": 1,
         });
+        if issuer != SELLER {
+            mint_tx["Issuer"] = Value::String(issuer.to_string());
+        }
+        if transfer_fee != 0 {
+            mint_tx["TransferFee"] = Value::from(transfer_fee);
+            mint_tx["Flags"] = Value::from(rxrpl_protocol::flags::nftoken::TF_TRANSFERABLE);
+        }
         let mut ctx = ApplyContext {
             tx: &mint_tx,
             view: &mut sandbox,
@@ -593,7 +643,7 @@ mod tests {
             "TransactionType": "NFTokenCreateOffer",
             "Account": SELLER,
             "NFTokenID": nftoken_id,
-            "Amount": "5000000",
+            "Amount": sell_amount.to_string(),
             "Flags": 1, // sell
             "Fee": "12",
             "Sequence": 2,
@@ -615,6 +665,13 @@ mod tests {
             .unwrap();
 
         (ledger, nftoken_id, offer_id)
+    }
+
+    fn balance(view: &dyn ReadView, address: &str) -> u64 {
+        let account_id = decode_account_id(address).unwrap();
+        let account: Value =
+            serde_json::from_slice(&view.read(&keylet::account(&account_id)).unwrap()).unwrap();
+        helpers::get_balance(&account)
     }
 
     #[test]
@@ -717,6 +774,90 @@ mod tests {
     }
 
     #[test]
+    fn direct_buy_offer_pays_issuer_royalty_with_ties_to_even() {
+        let (mut ledger, nftoken_id, _) = setup_with_sell_offer_for(ISSUER, 50_000, 5);
+        let fees = FeeSettings::default();
+        let rules = Rules::new();
+        let buyer_id = decode_account_id(BUYER).unwrap();
+        let buy_offer_key = keylet::nftoken_offer(&buyer_id, 1);
+        let buy_offer_id = hex::encode_upper(buy_offer_key.as_bytes());
+
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let buy_tx = serde_json::json!({
+            "TransactionType": "NFTokenCreateOffer",
+            "Account": BUYER,
+            "Owner": SELLER,
+            "NFTokenID": nftoken_id,
+            "Amount": "5",
+            "Fee": "12",
+            "Sequence": 1,
+        });
+        let mut ctx = ApplyContext {
+            tx: &buy_tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            NFTokenCreateOfferTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        sandbox.into_changes().apply_to_ledger(&mut ledger).unwrap();
+
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let accept_tx = serde_json::json!({
+            "TransactionType": "NFTokenAcceptOffer",
+            "Account": SELLER,
+            "NFTokenBuyOffer": buy_offer_id,
+            "Fee": "12",
+            "Sequence": 3,
+        });
+        let mut ctx = ApplyContext {
+            tx: &accept_tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            NFTokenAcceptOfferTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        assert_eq!(balance(&sandbox, BUYER), 100_000_000 - 5);
+        assert_eq!(balance(&sandbox, SELLER), 100_000_000 + 3);
+        assert_eq!(balance(&sandbox, ISSUER), 100_000_000 + 2);
+    }
+
+    #[test]
+    fn direct_sell_offer_issuer_buyback_pays_full_price_to_seller() {
+        let (ledger, _, sell_offer_id) = setup_with_sell_offer_for(BUYER, 10_000, 100);
+        let fees = FeeSettings::default();
+        let rules = Rules::new();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let accept_tx = serde_json::json!({
+            "TransactionType": "NFTokenAcceptOffer",
+            "Account": BUYER,
+            "NFTokenSellOffer": sell_offer_id,
+            "Fee": "12",
+            "Sequence": 1,
+        });
+        let mut ctx = ApplyContext {
+            tx: &accept_tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            NFTokenAcceptOfferTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        assert_eq!(balance(&sandbox, BUYER), 100_000_000 - 100);
+        assert_eq!(balance(&sandbox, SELLER), 100_000_000 + 100);
+    }
+
+    #[test]
     fn preflight_no_offer() {
         let tx = serde_json::json!({
             "TransactionType": "NFTokenAcceptOffer",
@@ -798,7 +939,7 @@ mod tests {
         let broker_fee = 79_609;
         let net = buy_price - broker_fee;
         let (issuer_cut, seller_take) =
-            compute_transfer_split(nft_id, "rsjk3B9W6fcSMLYYxtHDVtnLVY4VnbGJG2", net);
+            compute_transfer_split(nft_id, "rsjk3B9W6fcSMLYYxtHDVtnLVY4VnbGJG2", BUYER, net);
         assert_eq!(issuer_cut, 147_912);
         assert_eq!(seller_take, 4_782_479);
         assert_eq!(issuer_cut + seller_take + broker_fee, buy_price);
