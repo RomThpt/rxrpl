@@ -54,6 +54,86 @@ fn make_payment_tx(account: &str, destination: &str, amount: &str, fee: &str) ->
 }
 
 #[test]
+fn ledger_105501177_issuer_mints_mpt_to_authorized_holder() {
+    let mut ledger = setup_ledger_with_account(SRC_ADDRESS, 200_000_000);
+    add_account(&mut ledger, DST_ADDRESS, 50_000_000);
+    let issuer = decode_account_id(SRC_ADDRESS).unwrap();
+    let holder = decode_account_id(DST_ADDRESS).unwrap();
+    let sequence = 1u32;
+    let mut issuance_id = sequence.to_be_bytes().to_vec();
+    issuance_id.extend_from_slice(issuer.as_bytes());
+    let issuance_hex = hex::encode_upper(&issuance_id);
+    let issuance_key = keylet::mptoken_issuance(&issuer, sequence);
+    let token_key = keylet::mptoken(issuance_key.as_bytes(), &holder);
+    ledger
+        .put_state(
+            issuance_key,
+            serde_json::to_vec(&serde_json::json!({
+                "LedgerEntryType": "MPTokenIssuance",
+                "Issuer": SRC_ADDRESS,
+                "Sequence": sequence,
+                "Flags": 0x0004,
+                "MaximumAmount": "100",
+                "OutstandingAmount": "42",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    ledger
+        .put_state(
+            token_key,
+            serde_json::to_vec(&serde_json::json!({
+                "LedgerEntryType": "MPToken",
+                "Account": DST_ADDRESS,
+                "MPTokenIssuanceID": issuance_hex,
+                "Flags": 0x0002,
+                "MPTAmount": "0",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+    let tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": SRC_ADDRESS,
+        "Destination": DST_ADDRESS,
+        "Amount": {"mpt_issuance_id": issuance_hex, "value": "2"},
+        "Fee": "12",
+        "Sequence": 1,
+    });
+    let preflight = PreflightContext {
+        tx: &tx,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(PaymentTransactor.preflight(&preflight), Ok(()));
+    let preclaim = PreclaimContext {
+        tx: &tx,
+        view: &view,
+        rules: &rules,
+    };
+    assert_eq!(PaymentTransactor.preclaim(&preclaim), Ok(()));
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut ctx),
+        Ok(TransactionResult::TesSuccess)
+    );
+    let issuance: Value = serde_json::from_slice(&sandbox.read(&issuance_key).unwrap()).unwrap();
+    let token: Value = serde_json::from_slice(&sandbox.read(&token_key).unwrap()).unwrap();
+    assert_eq!(issuance["OutstandingAmount"], "44");
+    assert_eq!(token["MPTAmount"], "2");
+}
+
+#[test]
 fn exact_flow_delivery_reconciles_one_excess_endpoint_ulp() {
     let requested_iou = IOUAmount::from_decimal_string("0.1987120275960489").unwrap();
     let credited = IOUAmount::from_decimal_string("0.198712027596049").unwrap();

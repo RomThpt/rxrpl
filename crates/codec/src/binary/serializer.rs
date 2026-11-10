@@ -243,6 +243,34 @@ impl BinarySerializer {
             };
             self.write_u64(serialized);
         } else if let Some(obj) = value.as_object() {
+            if let Some(id) = obj.get("mpt_issuance_id") {
+                let id = id.as_str().ok_or_else(|| {
+                    CodecError::UnsupportedType("MPT issuance ID must be a hex string".to_string())
+                })?;
+                let id = hex::decode(id).map_err(|e| CodecError::Hex(e.to_string()))?;
+                if id.len() != 24 {
+                    return Err(CodecError::InvalidLength {
+                        expected: 24,
+                        got: id.len(),
+                    });
+                }
+                let value_str = obj.get("value").and_then(Value::as_str).ok_or_else(|| {
+                    CodecError::UnsupportedType("MPT amount missing value".to_string())
+                })?;
+                let negative = value_str.starts_with('-');
+                let magnitude: u64 = value_str.trim_start_matches('-').parse().map_err(|_| {
+                    CodecError::UnsupportedType("invalid MPT amount value".to_string())
+                })?;
+                if magnitude > i64::MAX as u64 || (negative && magnitude == 0) {
+                    return Err(CodecError::UnsupportedType(
+                        "MPT amount magnitude out of range".to_string(),
+                    ));
+                }
+                self.write_u8(if negative { 0x20 } else { 0x60 });
+                self.write_u64(magnitude);
+                self.write_bytes(&id);
+                return Ok(());
+            }
             // IOU amount
             let value_str = obj.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
                 CodecError::UnsupportedType("IOU amount missing value".to_string())
@@ -733,6 +761,84 @@ mod tests {
         assert_eq!(bytes.len(), 8);
         // Should have the positive bit set
         assert!(bytes[0] & 0x40 != 0);
+    }
+
+    #[test]
+    fn mpt_amount_wire_form_round_trips_and_skips_unknown_field() {
+        let id = format!("00000001{}", "AB".repeat(20));
+        for (value, marker, magnitude) in [
+            ("123456789", 0x60u8, 123456789u64),
+            ("-42", 0x20, 42),
+            ("0", 0x60, 0),
+            ("9223372036854775807", 0x60, i64::MAX as u64),
+        ] {
+            let amount = serde_json::json!({"mpt_issuance_id": id, "value": value});
+            let tx = serde_json::json!({"Amount": amount});
+            let encoded = crate::binary::encode(&tx).unwrap();
+            let mut expected = vec![0x61, marker]; // sfAmount + MPT marker
+            expected.extend_from_slice(&magnitude.to_be_bytes());
+            expected.extend_from_slice(&hex::decode(&id).unwrap());
+            assert_eq!(encoded, expected);
+            if value == "123456789" {
+                assert_eq!(
+                    hex::encode_upper(&encoded),
+                    format!("616000000000075BCD1500000001{}", "AB".repeat(20))
+                );
+            }
+            assert_eq!(crate::binary::decode(&encoded).unwrap(), tx);
+
+            // Unknown Amount fields use the same length rule, including the
+            // final magnitude byte and the issuance ID.
+            let mut with_unknown = vec![0x60, 0xFA];
+            with_unknown.extend_from_slice(&encoded[1..]);
+            with_unknown.extend_from_slice(&encoded);
+            assert_eq!(crate::binary::decode(&with_unknown).unwrap(), tx);
+            assert_eq!(
+                crate::binary::extract_field(&with_unknown, 6, 1).unwrap(),
+                Some(encoded[1..].to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn ledger_105501177_mpt_payment_round_trips_exact_blob() {
+        let blob = hex::decode(concat!(
+            "12000022000000002405F9CBA6201B0649D20B",
+            "6160000000000000000205F9CB84F8EA2AFC8370A32E2BCDF7F0C78E81BB0DE1515E",
+            "68400000000000000C",
+            "73210268A3AFD961A87C9EAEDB634BD50220CA42E5787BF26CC632C367B6D2B8C33296",
+            "7446304402207DFF272712849DDC90A01CF88F1A3D215F38438B1CA440BF7C72592E2E212E27",
+            "02205AC8976068BA2CB37136A45136A65DCE357939A502BA6BAA8069FF2FB0040A6F",
+            "8114F8EA2AFC8370A32E2BCDF7F0C78E81BB0DE1515E",
+            "8314CDF98EA56565DD5B2000B78788C168044F3A9708",
+        ))
+        .unwrap();
+        let decoded = crate::binary::decode(&blob).unwrap();
+        assert_eq!(
+            decoded["Amount"],
+            serde_json::json!({
+                "mpt_issuance_id": "05F9CB84F8EA2AFC8370A32E2BCDF7F0C78E81BB0DE1515E",
+                "value": "2"
+            })
+        );
+        assert_eq!(decoded["Fee"], "12");
+        assert_eq!(crate::binary::encode(&decoded).unwrap(), blob);
+    }
+
+    #[test]
+    fn mpt_amount_rejects_invalid_value_id_and_truncation() {
+        let id = "11".repeat(24);
+        for value in ["-0", "9223372036854775808", "1.5"] {
+            let tx = serde_json::json!({"Amount": {"mpt_issuance_id": id, "value": value}});
+            assert!(crate::binary::encode(&tx).is_err());
+        }
+        let tx = serde_json::json!({"Amount": {"mpt_issuance_id": "AB", "value": "1"}});
+        assert!(crate::binary::encode(&tx).is_err());
+
+        let tx = serde_json::json!({"Amount": {"mpt_issuance_id": id, "value": "1"}});
+        let mut encoded = crate::binary::encode(&tx).unwrap();
+        encoded.pop();
+        assert!(crate::binary::decode(&encoded).is_err());
     }
 
     #[test]

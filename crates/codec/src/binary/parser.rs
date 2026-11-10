@@ -149,9 +149,12 @@ impl<'a> BinaryParser<'a> {
             6 => {
                 // Amount
                 let raw = self.read_u64()?;
-                // IOU amounts have bit 63 set and include currency + issuer
                 if raw & 0x8000_0000_0000_0000 != 0 {
+                    // IOU: currency + issuer
                     self.read_bytes(40)?; // 20-byte currency + 20-byte issuer
+                } else if raw & 0x2000_0000_0000_0000 != 0 {
+                    // MPT: the first eight bytes contain marker + seven value bytes.
+                    self.read_bytes(25)?; // final value byte + 24-byte issuance ID
                 }
             }
             7 | 8 | 19 => {
@@ -400,8 +403,36 @@ impl<'a> BinaryParser<'a> {
     fn parse_amount(&mut self) -> Result<Value, CodecError> {
         let raw = self.read_u64()?;
 
-        // Check if it's XRP (bit 63 is 0) or IOU (bit 63 is 1)
+        // MPT amounts begin with a separate marker byte (0x20 or 0x60),
+        // followed by the full eight-byte magnitude and 24-byte issuance ID.
         if raw & 0x8000_0000_0000_0000 == 0 {
+            if raw & 0x2000_0000_0000_0000 != 0 {
+                let marker = (raw >> 56) as u8;
+                if marker != 0x20 && marker != 0x60 {
+                    return Err(CodecError::UnsupportedType(format!(
+                        "invalid MPT amount marker: {marker:#04x}"
+                    )));
+                }
+                let magnitude = ((raw & 0x00FF_FFFF_FFFF_FFFF) << 8) | self.read_u8()? as u64;
+                if magnitude > i64::MAX as u64 || (magnitude == 0 && marker == 0x20) {
+                    return Err(CodecError::UnsupportedType(
+                        "non-canonical MPT amount magnitude".to_string(),
+                    ));
+                }
+                let id = self.read_bytes(24)?;
+                let value = if marker == 0x20 {
+                    format!("-{magnitude}")
+                } else {
+                    magnitude.to_string()
+                };
+                let mut map = Map::new();
+                map.insert("value".to_string(), Value::String(value));
+                map.insert(
+                    "mpt_issuance_id".to_string(),
+                    Value::String(hex::encode_upper(id)),
+                );
+                return Ok(Value::Object(map));
+            }
             // XRP amount
             let positive = raw & 0x4000_0000_0000_0000 != 0;
             let amount = raw & 0x3FFF_FFFF_FFFF_FFFF;

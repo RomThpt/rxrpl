@@ -1,6 +1,7 @@
 use rxrpl_amendment::feature::feature_id;
 use rxrpl_amount::IOUAmount;
 use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_primitives::AccountId;
 use rxrpl_protocol::flags::account_root::LSF_PASSWORD_SPENT;
 use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
@@ -16,6 +17,38 @@ use crate::view::read_view::ReadView;
 /// accounts, checks sufficient balance, and transfers drops between accounts.
 /// If the destination does not exist, a new AccountRoot is created.
 pub struct PaymentTransactor;
+
+struct MptPaymentAmount {
+    issuance_id: [u8; 24],
+    value: u64,
+}
+
+fn parse_mpt_payment_amount(amount: &Value) -> Result<Option<MptPaymentAmount>, TransactionResult> {
+    let Some(id) = amount.get("mpt_issuance_id") else {
+        return Ok(None);
+    };
+    let id = id.as_str().ok_or(TransactionResult::TemBadAmount)?;
+    let bytes = hex::decode(id).map_err(|_| TransactionResult::TemBadAmount)?;
+    let issuance_id: [u8; 24] = bytes
+        .try_into()
+        .map_err(|_| TransactionResult::TemBadAmount)?;
+    let value = amount
+        .get("value")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|v| *v > 0 && *v <= i64::MAX as u64)
+        .ok_or(TransactionResult::TemBadAmount)?;
+    Ok(Some(MptPaymentAmount { issuance_id, value }))
+}
+
+fn mpt_entry_amount(entry: &Value, field: &str) -> Option<u64> {
+    entry.get(field).and_then(|value| {
+        value
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .or_else(|| value.as_u64())
+    })
+}
 
 impl PaymentTransactor {
     /// Read an AccountRoot from the view and parse it as JSON.
@@ -48,6 +81,10 @@ impl Transactor for PaymentTransactor {
             if !conversion {
                 return Err(TransactionResult::TemBadSend);
             }
+        }
+
+        if parse_mpt_payment_amount(&ctx.tx["Amount"])?.is_some() {
+            return Ok(());
         }
 
         // IOU payment: Amount is an object {currency, issuer, value}
@@ -110,6 +147,9 @@ impl Transactor for PaymentTransactor {
         if helpers::get_iou_amount(ctx.tx).is_some() {
             return Ok(());
         }
+        if parse_mpt_payment_amount(&ctx.tx["Amount"])?.is_some() {
+            return Ok(());
+        }
 
         let amount = helpers::get_xrp_amount(ctx.tx).ok_or(TransactionResult::TemBadAmount)?;
         let fee = helpers::get_fee(ctx.tx);
@@ -163,6 +203,10 @@ impl Transactor for PaymentTransactor {
                     }
                 }
             }
+        }
+
+        if let Some(amount) = parse_mpt_payment_amount(&ctx.tx["Amount"])? {
+            return apply_mpt(ctx, account_str, destination_str, amount);
         }
 
         // Cross-currency Payment (a SendMax in a different asset than Amount):
@@ -468,6 +512,159 @@ impl Transactor for PaymentTransactor {
 
         Ok(TransactionResult::TesSuccess)
     }
+}
+
+/// Apply a direct MPT payment. The issuance ID encodes its sequence and issuer;
+/// MPToken balances and supply use integral units rather than IOU arithmetic.
+fn apply_mpt(
+    ctx: &mut ApplyContext<'_>,
+    account: &str,
+    destination: &str,
+    amount: MptPaymentAmount,
+) -> Result<TransactionResult, TransactionResult> {
+    let src = decode_account_id(account).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    let dst = decode_account_id(destination).map_err(|_| TransactionResult::TemInvalidAccountId)?;
+    if !ctx.view.exists(&keylet::account(&dst)) {
+        return Err(TransactionResult::TecNoDst);
+    }
+    if ctx.tx.get("Paths").is_some() {
+        return Err(TransactionResult::TecPathDry);
+    }
+    if let Some(send_max) = ctx.tx.get("SendMax") {
+        let max = parse_mpt_payment_amount(send_max)?.ok_or(TransactionResult::TecPathDry)?;
+        if max.issuance_id != amount.issuance_id || max.value < amount.value {
+            return Err(TransactionResult::TecPathPartial);
+        }
+    }
+
+    let sequence = u32::from_be_bytes(amount.issuance_id[..4].try_into().unwrap());
+    let issuer = AccountId::from_slice(&amount.issuance_id[4..])
+        .map_err(|_| TransactionResult::TemBadAmount)?;
+    let issuance_key = keylet::mptoken_issuance(&issuer, sequence);
+    let issuance_bytes = ctx
+        .view
+        .read(&issuance_key)
+        .ok_or(TransactionResult::TecObjectNotFound)?;
+    let mut issuance: Value =
+        serde_json::from_slice(&issuance_bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let issuance_flags = helpers::get_flags(&issuance);
+    let outstanding =
+        mpt_entry_amount(&issuance, "OutstandingAmount").ok_or(TransactionResult::TefInternal)?;
+    let maximum = mpt_entry_amount(&issuance, "MaximumAmount").unwrap_or(i64::MAX as u64);
+
+    let sender_key = keylet::mptoken(issuance_key.as_bytes(), &src);
+    let destination_key = keylet::mptoken(issuance_key.as_bytes(), &dst);
+    let mut sender_token = if src == issuer {
+        None
+    } else {
+        let bytes = ctx
+            .view
+            .read(&sender_key)
+            .ok_or(TransactionResult::TecNoAuth)?;
+        Some(serde_json::from_slice::<Value>(&bytes).map_err(|_| TransactionResult::TefInternal)?)
+    };
+    let mut destination_token = if dst == issuer {
+        None
+    } else {
+        let bytes = ctx
+            .view
+            .read(&destination_key)
+            .ok_or(TransactionResult::TecNoAuth)?;
+        Some(serde_json::from_slice::<Value>(&bytes).map_err(|_| TransactionResult::TefInternal)?)
+    };
+
+    const REQUIRE_AUTH: u32 = 0x0004;
+    const AUTHORIZED: u32 = 0x0002;
+    const CAN_TRANSFER: u32 = 0x0020;
+    const LOCKED: u32 = 0x0001;
+    for token in [&sender_token, &destination_token].into_iter().flatten() {
+        if issuance_flags & REQUIRE_AUTH != 0 && helpers::get_flags(token) & AUTHORIZED == 0 {
+            return Err(TransactionResult::TecNoAuth);
+        }
+    }
+    if src != issuer && dst != issuer {
+        if issuance_flags & CAN_TRANSFER == 0 {
+            return Err(TransactionResult::TecNoAuth);
+        }
+        if issuance_flags & LOCKED != 0
+            || sender_token
+                .as_ref()
+                .is_some_and(|t| helpers::get_flags(t) & LOCKED != 0)
+            || destination_token
+                .as_ref()
+                .is_some_and(|t| helpers::get_flags(t) & LOCKED != 0)
+        {
+            return Err(TransactionResult::TecLocked);
+        }
+    }
+
+    let gross = if src != issuer && dst != issuer {
+        let fee = mpt_entry_amount(&issuance, "TransferFee").unwrap_or(0);
+        let rate = 1_000_000_000u128 + 10_000u128 * u128::from(fee);
+        let charged = (u128::from(amount.value) * rate).div_ceil(1_000_000_000);
+        u64::try_from(charged).map_err(|_| TransactionResult::TecPathPartial)?
+    } else {
+        amount.value
+    };
+    if gross > i64::MAX as u64 {
+        return Err(TransactionResult::TecPathPartial);
+    }
+    if let Some(send_max) = ctx.tx.get("SendMax") {
+        let max = parse_mpt_payment_amount(send_max)?.ok_or(TransactionResult::TecPathDry)?;
+        if gross > max.value {
+            return Err(TransactionResult::TecPathPartial);
+        }
+    }
+
+    if let Some(token) = sender_token.as_mut() {
+        let balance = mpt_entry_amount(token, "MPTAmount").unwrap_or(0);
+        if balance < gross {
+            return Err(TransactionResult::TecPathPartial);
+        }
+        token["MPTAmount"] = Value::String((balance - gross).to_string());
+    }
+    if let Some(token) = destination_token.as_mut() {
+        let balance = mpt_entry_amount(token, "MPTAmount").unwrap_or(0);
+        let credited = balance
+            .checked_add(amount.value)
+            .filter(|v| *v <= i64::MAX as u64)
+            .ok_or(TransactionResult::TefInternal)?;
+        token["MPTAmount"] = Value::String(credited.to_string());
+    }
+
+    let new_outstanding = if src == issuer {
+        outstanding
+            .checked_add(amount.value)
+            .filter(|v| *v <= maximum)
+            .ok_or(TransactionResult::TecPathDry)?
+    } else if dst == issuer {
+        outstanding
+            .checked_sub(amount.value)
+            .ok_or(TransactionResult::TefInternal)?
+    } else {
+        outstanding
+            .checked_sub(gross - amount.value)
+            .ok_or(TransactionResult::TefInternal)?
+    };
+    issuance["OutstandingAmount"] = Value::String(new_outstanding.to_string());
+    let issuance_data =
+        serde_json::to_vec(&issuance).map_err(|_| TransactionResult::TefInternal)?;
+    ctx.view
+        .update(issuance_key, issuance_data)
+        .map_err(|_| TransactionResult::TefInternal)?;
+    if let Some(token) = sender_token {
+        let data = serde_json::to_vec(&token).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(sender_key, data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+    }
+    if let Some(token) = destination_token {
+        let data = serde_json::to_vec(&token).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(destination_key, data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+    }
+    Ok(TransactionResult::TesSuccess)
 }
 
 /// Apply a Payment whose Amount is an Issued-Currency object.
