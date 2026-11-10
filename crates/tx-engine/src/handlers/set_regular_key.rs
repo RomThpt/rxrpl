@@ -1,4 +1,4 @@
-use rxrpl_codec::address::classic::decode_account_id;
+use rxrpl_codec::address::classic::{account_id_from_public_key, decode_account_id};
 use rxrpl_protocol::TransactionResult;
 use rxrpl_protocol::keylet;
 use serde_json::Value;
@@ -48,15 +48,19 @@ impl Transactor for SetRegularKeyTransactor {
         let mut obj: Value =
             serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TemMalformed)?;
 
-        // Free (zero-fee) regular-key reset: rippled's SetRegularKey::doApply arms
-        // lsfPasswordSpent whenever the required minimum fee is zero (see
-        // SetRegularKey.cpp: `if (!minimumFee(...)) sle->setFlag(lsfPasswordSpent)`).
-        // The base fee is zero only on the once-per-account free reset — signed by
-        // the account's own key while lsfPasswordSpent is clear — so the account
-        // pays a Fee of 0. Mirror that here: a Fee of 0 means the free path was
-        // taken, so set the flag. A fee-paying SetRegularKey leaves Flags untouched.
-        if helpers::get_fee(ctx.tx) == 0 {
-            let flags = obj.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+        // rippled arms lsfPasswordSpent when the required minimum fee is zero,
+        // regardless of the Fee amount the sender chose to pay. The one-time
+        // zero base fee requires a valid master SigningPubKey and an unspent
+        // password flag (SetRegularKey::calculateBaseFee / doApply).
+        let flags = obj.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+        let master_signed = ctx
+            .tx
+            .get("SigningPubKey")
+            .and_then(Value::as_str)
+            .and_then(|key| hex::decode(key).ok())
+            .filter(|key| rxrpl_crypto::KeyType::from_public_key(key).is_some())
+            .is_some_and(|key| account_id_from_public_key(&key) == account_id);
+        if ctx.fees.base_fee == 0 || (master_signed && flags & LSF_PASSWORD_SPENT == 0) {
             obj["Flags"] = Value::from(flags | LSF_PASSWORD_SPENT);
         }
 
@@ -84,12 +88,11 @@ mod tests {
     use crate::view::read_view::ReadView;
     use crate::view::sandbox::Sandbox;
     use rxrpl_amendment::Rules;
+    use rxrpl_codec::address::classic::encode_account_id;
+    use rxrpl_crypto::{KeyPair, KeyType, Seed};
     use rxrpl_ledger::Ledger;
 
-    const ACCT: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
-    const REG_KEY: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
-
-    fn ledger_with_account(addr: &str) -> Ledger {
+    fn ledger_with_account(addr: &str, flags: u64, regular_key: &str) -> Ledger {
         let mut ledger = Ledger::genesis();
         let id = decode_account_id(addr).unwrap();
         let account = serde_json::json!({
@@ -98,7 +101,8 @@ mod tests {
             "Balance": "100000000",
             "Sequence": 1,
             "OwnerCount": 0,
-            "Flags": 0,
+            "Flags": flags,
+            "RegularKey": regular_key,
         });
         ledger
             .put_state(keylet::account(&id), serde_json::to_vec(&account).unwrap())
@@ -106,18 +110,28 @@ mod tests {
         ledger
     }
 
-    fn apply_set_regular_key(fee: &str) -> serde_json::Value {
-        let ledger = ledger_with_account(ACCT);
+    fn apply_set_regular_key(fee: &str, master_signed: bool, flags: u64) -> serde_json::Value {
+        let master = KeyPair::from_seed(&Seed::from_bytes([1u8; 16]), KeyType::Ed25519);
+        let regular = KeyPair::from_seed(&Seed::from_bytes([2u8; 16]), KeyType::Ed25519);
+        let account = encode_account_id(&account_id_from_public_key(&master.public_key.0));
+        let regular_key = encode_account_id(&account_id_from_public_key(&regular.public_key.0));
+        let signing_key = if master_signed {
+            &master.public_key.0
+        } else {
+            &regular.public_key.0
+        };
+        let ledger = ledger_with_account(&account, flags, &regular_key);
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let mut sandbox = Sandbox::new(&view);
         let rules = Rules::new();
         let tx = serde_json::json!({
             "TransactionType": "SetRegularKey",
-            "Account": ACCT,
-            "RegularKey": REG_KEY,
+            "Account": account,
+            "RegularKey": regular_key,
             "Fee": fee,
             "Sequence": 1,
+            "SigningPubKey": hex::encode_upper(signing_key),
         });
         let mut ctx = ApplyContext {
             tx: &tx,
@@ -129,34 +143,33 @@ mod tests {
             SetRegularKeyTransactor.apply(&mut ctx).unwrap(),
             TransactionResult::TesSuccess
         );
-        let id = decode_account_id(ACCT).unwrap();
+        let id = decode_account_id(&account).unwrap();
         let bytes = sandbox.read(&keylet::account(&id)).unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    /// The free (Fee == 0) regular-key reset arms lsfPasswordSpent on the account,
-    /// matching rippled SetRegularKey::doApply and the L29 oracle (Flags 0 -> 65536).
+    /// A master-signed reset with an unspent password flag has zero required
+    /// minimum fee, even if the sender offers more than that minimum.
     #[test]
-    fn free_reset_sets_password_spent() {
-        let acct = apply_set_regular_key("0");
-        assert_eq!(acct["RegularKey"].as_str().unwrap(), REG_KEY);
-        assert_eq!(
-            acct["Flags"].as_u64().unwrap() & LSF_PASSWORD_SPENT,
-            LSF_PASSWORD_SPENT,
-            "zero-fee SetRegularKey must set lsfPasswordSpent"
-        );
+    fn master_signed_reset_sets_password_spent_regardless_of_paid_fee() {
+        for fee in ["0", "12"] {
+            let acct = apply_set_regular_key(fee, true, 0);
+            assert_eq!(acct["Flags"].as_u64().unwrap(), LSF_PASSWORD_SPENT);
+        }
     }
 
-    /// A fee-paying SetRegularKey leaves Flags untouched (no lsfPasswordSpent),
-    /// preserving mainnet neutrality for fee>0 key changes.
+    /// A regular-key signature does not qualify for the free minimum fee.
     #[test]
-    fn fee_paying_leaves_flags_untouched() {
-        let acct = apply_set_regular_key("12");
-        assert_eq!(acct["RegularKey"].as_str().unwrap(), REG_KEY);
-        assert_eq!(
-            acct["Flags"].as_u64().unwrap(),
-            0,
-            "fee-paying SetRegularKey must not set lsfPasswordSpent"
-        );
+    fn regular_signed_reset_does_not_spend_password_allowance() {
+        for fee in ["0", "12"] {
+            let acct = apply_set_regular_key(fee, false, 0);
+            assert_eq!(acct["Flags"].as_u64().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn already_spent_password_flag_is_preserved() {
+        let acct = apply_set_regular_key("12", true, LSF_PASSWORD_SPENT);
+        assert_eq!(acct["Flags"].as_u64().unwrap(), LSF_PASSWORD_SPENT);
     }
 }
