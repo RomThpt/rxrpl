@@ -1,3 +1,4 @@
+use rxrpl_amendment::feature::feature_id;
 use rxrpl_codec::address::classic::decode_account_id;
 use rxrpl_protocol::{TransactionResult, keylet};
 
@@ -658,6 +659,7 @@ impl AMMWithdrawTransactor {
         };
 
         let mut xrp_out = 0u64;
+        check_withdraw_reserves(ctx, holder, [(&leg1, &payout1), (&leg2, &payout2)])?;
         self.burn_and_update_amm(ctx, amm_key, amm, &ctx_amm, &tokens)?;
         leg1.pay_out(
             ctx,
@@ -848,6 +850,55 @@ enum WithdrawLeg {
         issuer: rxrpl_primitives::AccountId,
         currency: [u8; 20],
     },
+}
+
+/// `withdraw()` checks each new receiver trust line in payout order. The first
+/// line can use the two-owner bootstrap allowance; a later line may need a
+/// reserve even when neither line existed before the transaction.
+fn check_withdraw_reserves(
+    ctx: &ApplyContext<'_>,
+    holder: &rxrpl_primitives::AccountId,
+    legs: [(&WithdrawLeg, &rxrpl_amount::number::Number); 2],
+) -> Result<(), TransactionResult> {
+    if !ctx.rules.enabled(&feature_id("fixAMMv1_2")) {
+        return Ok(());
+    }
+
+    let account_bytes = ctx
+        .view
+        .read(&keylet::account(holder))
+        .ok_or(TransactionResult::TefInternal)?;
+    let account: serde_json::Value =
+        serde_json::from_slice(&account_bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let balance = helpers::get_balance(&account);
+    let prior_balance = balance.saturating_add(helpers::get_fee(ctx.tx));
+    let mut owner_count = helpers::get_owner_count(&account);
+
+    for (leg, payout) in legs {
+        if payout.is_zero() {
+            continue;
+        }
+        let WithdrawLeg::Iou { issuer, currency } = leg else {
+            continue;
+        };
+        if holder == issuer
+            || ctx
+                .view
+                .exists(&keylet::trust_line(holder, issuer, currency))
+        {
+            continue;
+        }
+        let reserve = if owner_count < 2 {
+            0
+        } else {
+            ctx.fees.account_reserve(owner_count.saturating_add(1))
+        };
+        if prior_balance.max(balance) < reserve {
+            return Err(TransactionResult::TecInsufficientReserve);
+        }
+        owner_count = owner_count.saturating_add(1);
+    }
+    Ok(())
 }
 
 impl WithdrawLeg {
@@ -1298,6 +1349,66 @@ mod tests {
         assert_eq!(
             AMMWithdrawTransactor.preflight(&ctx),
             Err(TransactionResult::TemBadAmount)
+        );
+    }
+
+    #[test]
+    fn second_new_payout_line_requires_reserve() {
+        use rxrpl_amount::number::Number;
+
+        let mut ledger = Ledger::genesis();
+        let holder = decode_account_id(ALICE).unwrap();
+        let issuer = decode_account_id(BOB).unwrap();
+        let account = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": ALICE,
+            "Balance": "1199948",
+            "OwnerCount": 1,
+            "Sequence": 2,
+        });
+        ledger
+            .put_state(
+                keylet::account(&holder),
+                serde_json::to_vec(&account).unwrap(),
+            )
+            .unwrap();
+
+        let view = LedgerView::new(&ledger);
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::from_enabled([feature_id("fixAMMv1_2")]);
+        let fees = FeeSettings {
+            base_fee: 10,
+            reserve_base: 1_000_000,
+            reserve_increment: 200_000,
+        };
+        let tx = serde_json::json!({"Fee": "40"});
+        let ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let first = WithdrawLeg::Iou {
+            issuer,
+            currency: helpers::currency_to_bytes("HMT"),
+        };
+        let second = WithdrawLeg::Iou {
+            issuer,
+            currency: helpers::currency_to_bytes("VMONEY"),
+        };
+        let amount = Number::from_iou(&amm_helpers::parse_iou_value("1"));
+
+        assert_eq!(
+            check_withdraw_reserves(&ctx, &holder, [(&first, &amount), (&second, &amount)]),
+            Err(TransactionResult::TecInsufficientReserve)
+        );
+        assert_eq!(
+            check_withdraw_reserves(
+                &ctx,
+                &holder,
+                [(&first, &amount), (&WithdrawLeg::Xrp, &amount)]
+            ),
+            Ok(())
         );
     }
 
