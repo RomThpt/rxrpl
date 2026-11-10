@@ -84,11 +84,11 @@ impl Transactor for MPTokenAuthorizeTransactor {
                 }
             }
         } else {
-            // Issuer flow: MPTokenHolder required, MPToken must exist
-            if helpers::get_str_field(ctx.tx, "MPTokenHolder").is_none() {
+            // Issuer flow: Holder required, MPToken must exist
+            if helpers::get_str_field(ctx.tx, "Holder").is_none() {
                 return Err(TransactionResult::TemMalformed);
             }
-            let holder_str = helpers::get_str_field(ctx.tx, "MPTokenHolder").unwrap();
+            let holder_str = helpers::get_str_field(ctx.tx, "Holder").unwrap();
             let holder_id = decode_account_id(holder_str)
                 .map_err(|_| TransactionResult::TemInvalidAccountId)?;
             let mptoken_key = keylet::mptoken(issuance_key.as_bytes(), &holder_id);
@@ -192,8 +192,8 @@ impl Transactor for MPTokenAuthorizeTransactor {
             }
         } else {
             // Issuer flow: authorize a holder
-            let holder_str = helpers::get_str_field(ctx.tx, "MPTokenHolder")
-                .ok_or(TransactionResult::TemMalformed)?;
+            let holder_str =
+                helpers::get_str_field(ctx.tx, "Holder").ok_or(TransactionResult::TemMalformed)?;
             let holder_id = decode_account_id(holder_str)
                 .map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
@@ -430,10 +430,17 @@ mod tests {
             "TransactionType": "MPTokenAuthorize",
             "Account": ISSUER,
             "MPTokenIssuanceID": issuance_id_hex(&issuance_key),
-            "MPTokenHolder": HOLDER,
+            "Holder": HOLDER,
             "Fee": "12",
             "Sequence": 1,
         });
+
+        let preclaim = PreclaimContext {
+            tx: &tx,
+            view: &view,
+            rules: &rules,
+        };
+        assert_eq!(MPTokenAuthorizeTransactor.preclaim(&preclaim), Ok(()));
 
         let mut ctx = ApplyContext {
             tx: &tx,
