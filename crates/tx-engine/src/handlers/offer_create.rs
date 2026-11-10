@@ -1326,6 +1326,70 @@ fn cross_offers(
         None
     };
 
+    // With an empty direct book and no issuer fees, the direct IOU/IOU AMM
+    // competes with the XRP autobridge on every Flow pass. Walking the bridge
+    // to completion first loses better-quality direct AMM Fibonacci fills.
+    // The sorted strand selector preserves their shared AMM iteration state.
+    if let Some(bridge_strand) = bridge.as_ref()
+        && let Some(direct_strand) =
+            build_flow_strand(ctx, &[taker_gets.clone(), taker_pays.clone()])
+        && ctx.rules.enabled(&feature_id("FlowSortStrands"))
+        && direct_strand.terminal_has_amm()
+        && !direct_strand.hops[0].has_clob
+        && transfer_rate_value(ctx, &in_leg.issuer) == 1_000_000_000
+        && transfer_rate_value(ctx, &out_leg.issuer) == 1_000_000_000
+    {
+        let demand = if is_sell {
+            leg_to_number(&unbounded_leg(&out_leg))
+        } else {
+            leg_to_number(&out_leg)
+        };
+        let budget = leg_to_number(source_budget);
+        let strands = [direct_strand, bridge_strand.clone()];
+        let source_balance = flow_source_balance(ctx, taker, &strands);
+        let limit =
+            Number::from_iou(&from_rate(threshold).map_err(|_| TransactionResult::TefInternal)?);
+        let (delivered, spent_total, _) = flow_multi(
+            ctx,
+            taker,
+            taker_acct,
+            taker,
+            &strands,
+            &demand,
+            &budget,
+            Some(&limit),
+            &mut AmmContext::new(true),
+        );
+        // A tfSell that consumes the source's entire trust-line holding ends
+        // with a zero balance. Replaying each AMM/bridge debit separately can
+        // leave a sub-ULP negative residue even when the aggregate equals the
+        // original holding (105501643 / B6762258).
+        if is_sell
+            && source_funds_limited
+            && spent_total.sub(&budget).is_zero()
+            && let Some(source) = source_balance.as_ref()
+            && flow_holder_funds(&source.balance, source.holder_is_high)
+                .sub(&budget)
+                .is_zero()
+        {
+            set_flow_source_balance(ctx, source, &IOUAmount::ZERO);
+        }
+        let delivered = number_to_leg(&delivered, &out_leg);
+        let spent = number_to_leg(&spent_total, &in_leg);
+        let remaining_out = if leg_ge(&delivered, &out_leg) {
+            leg_sub(&out_leg, &out_leg)
+        } else {
+            leftover_leg(&out_leg, &delivered, number_switchover)
+        };
+        let remaining_in = leftover_leg(&in_leg, &spent, number_switchover);
+        return Ok((
+            remaining_out.with_amount(&remaining_out.iou, remaining_out.drops),
+            remaining_in.with_amount(&remaining_in.iou, remaining_in.drops),
+            !spent.is_zero(),
+            leg_ge(&spent, source_budget),
+        ));
+    }
+
     // The book base for traversal has the quality (low 64 bits) zeroed;
     // `keylet::book_dir` leaves those as hash bytes, so start the walk there.
     let mut probe = book_dir_with_quality(inverse_book, 0);
@@ -5028,6 +5092,7 @@ const FLOW_MAX_OFFERS: u32 = 1500;
 
 /// One hop of a resolved strand: the in→out boundary pair plus the AMM pool
 /// (if any) and whether the book carries resting CLOB offers.
+#[derive(Clone)]
 pub(crate) struct FlowHop {
     in_leg: Leg,
     out_leg: Leg,
@@ -5042,6 +5107,7 @@ pub(crate) struct FlowHop {
 }
 
 /// A resolved strand = an ordered boundary chain of hops.
+#[derive(Clone)]
 pub(crate) struct FlowStrand {
     hops: Vec<FlowHop>,
 }
@@ -6517,7 +6583,7 @@ fn execute_strand_pass(
     })
 }
 
-/// rippled `Flow` multi-pass loop (sorted / first-survivor, `fixFlowSortStrands`
+/// rippled `Flow` multi-pass loop (sorted / first-survivor, `FlowSortStrands`
 /// active). Each pass ranks the live strands best-quality-first, recomputes the
 /// `multi_path` toggle from the live count, then picks the FIRST strand that
 /// delivers (checkpointing before each trial, rolling back failed ones, keeping
@@ -13379,6 +13445,211 @@ mod flow_cross_own_unfunded {
         let pool_account: Value =
             serde_json::from_slice(&sandbox.read(&keylet::account(&pool)).unwrap()).unwrap();
         assert_eq!(pool_account["Balance"], "1267183689");
+    }
+
+    #[test]
+    fn ledger_105501643_direct_amm_competes_with_xrp_bridge() {
+        const OGRE_ISSUER: &str = "rnCHm7VHh5fK98JLXwuuwX1vkuqaiRA868";
+        const RLUSD_ISSUER: &str = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De";
+        const TAKER: &str = "rrhXifoGRLKEfjkjBA9QM6x9MGfJVLDy5p";
+        const MAKER: &str = "rU9Ubyq4aRiUqU9m7BgF8ja6yx8z3Q5ZTn";
+        const DIRECT_POOL: &str = "rUmSLiSeYZnLTka4FC9fL5zUiPJiGjLduC";
+        const BRIDGE_POOL: &str = "rpZQzSYW2snK5Gw2KZogCDU2rLSYLYNG4h";
+        const OGRE: &str = "4F47524500000000000000000000000000000000";
+        const RLUSD: &str = "524C555344000000000000000000000000000000";
+        let mut ledger = Ledger::genesis();
+        for (address, drops) in [
+            (OGRE_ISSUER, "1019922"),
+            (RLUSD_ISSUER, "99926365"),
+            (TAKER, "1730349946"),
+            (MAKER, "90612954"),
+            (DIRECT_POOL, "0"),
+            (BRIDGE_POOL, "8944317817"),
+        ] {
+            let id = decode_account_id(address).unwrap();
+            let account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": address,
+                "Balance": drops, "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        let ogre_issuer = decode_account_id(OGRE_ISSUER).unwrap();
+        let rlusd_issuer = decode_account_id(RLUSD_ISSUER).unwrap();
+        let ogre_currency = helpers::currency_to_bytes(OGRE);
+        let rlusd_currency = helpers::currency_to_bytes(RLUSD);
+        for (holder, issuer_name, currency_name, balance) in [
+            (TAKER, OGRE_ISSUER, OGRE, "986.5"),
+            (TAKER, RLUSD_ISSUER, RLUSD, "2.849695109552994"),
+            (MAKER, RLUSD_ISSUER, RLUSD, "289.8663"),
+            (DIRECT_POOL, OGRE_ISSUER, OGRE, "862.2487593536531"),
+            (DIRECT_POOL, RLUSD_ISSUER, RLUSD, "8.264288407800006"),
+            (BRIDGE_POOL, OGRE_ISSUER, OGRE, "1047552.50502734"),
+        ] {
+            let holder_id = decode_account_id(holder).unwrap();
+            let issuer_id = decode_account_id(issuer_name).unwrap();
+            let low_holder = holder_id.as_bytes() < issuer_id.as_bytes();
+            let (low, high, stored) = if low_holder {
+                (holder, issuer_name, balance.to_string())
+            } else {
+                (issuer_name, holder, format!("-{balance}"))
+            };
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState",
+                "Balance": {"currency": currency_name, "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": stored},
+                "LowLimit": {"currency": currency_name, "issuer": low, "value": "1000000000"},
+                "HighLimit": {"currency": currency_name, "issuer": high, "value": "1000000000"},
+                "Flags": 0,
+            });
+            ledger
+                .put_state(
+                    keylet::trust_line(
+                        &holder_id,
+                        &issuer_id,
+                        &helpers::currency_to_bytes(currency_name),
+                    ),
+                    serde_json::to_vec(&line).unwrap(),
+                )
+                .unwrap();
+        }
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rlusd = |value: &str| serde_json::json!({"currency": RLUSD, "issuer": RLUSD_ISSUER, "value": value});
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": MAKER,
+                    "Fee": "12", "Sequence": 1,
+                    "TakerGets": rlusd("289.8663"), "TakerPays": "261486848",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        for (asset1, issuer1, asset2, issuer2, pool, tfee) in [
+            (
+                ogre_currency,
+                ogre_issuer,
+                rlusd_currency,
+                rlusd_issuer,
+                DIRECT_POOL,
+                500,
+            ),
+            (
+                ogre_currency,
+                ogre_issuer,
+                [0u8; 20],
+                AccountId::from([0u8; 20]),
+                BRIDGE_POOL,
+                343,
+            ),
+        ] {
+            sandbox
+                .insert(
+                    keylet::amm(&asset1, &issuer1, &asset2, &issuer2),
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "AMM", "Account": pool, "TradingFee": tfee,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let tx = serde_json::json!({
+            "TransactionType": "OfferCreate", "Account": TAKER,
+            "Fee": "12", "Sequence": 1,
+            "Flags": TF_SELL | TF_IMMEDIATE_OR_CANCEL,
+            "TakerGets": {"currency": OGRE, "issuer": OGRE_ISSUER, "value": "986.5"},
+            "TakerPays": rlusd("7.284617041433707"),
+        });
+        let rules = Rules::from_enabled([
+            feature_id("FlowCross"),
+            feature_id("fixUniversalNumber"),
+            feature_id("fixAMMv1_2"),
+            feature_id("FlowSortStrands"),
+        ]);
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert!(ctx.rules.enabled(&feature_id("FlowSortStrands")));
+        assert!(!ctx.rules.enabled(&feature_id("fixFlowSortStrands")));
+        let direct =
+            build_flow_strand(&ctx, &[tx["TakerGets"].clone(), tx["TakerPays"].clone()]).unwrap();
+        assert!(direct.terminal_has_amm());
+        assert!(!direct.hops[0].has_clob);
+        assert_eq!(transfer_rate_value(&ctx, &ogre_issuer), 1_000_000_000);
+        assert_eq!(transfer_rate_value(&ctx, &rlusd_issuer), 1_000_000_000);
+        assert_eq!(
+            OfferCreateTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        let maker_id = decode_account_id(MAKER).unwrap();
+        let maker_offer: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::offer(&maker_id, 1)).unwrap()).unwrap();
+        assert_eq!(maker_offer["TakerGets"]["value"], "280.6770894253657");
+        assert_eq!(maker_offer["TakerPays"], "253197310");
+        let direct_id = decode_account_id(DIRECT_POOL).unwrap();
+        let direct_ogre: Value = serde_json::from_slice(
+            &sandbox
+                .read(&keylet::trust_line(
+                    &direct_id,
+                    &ogre_issuer,
+                    &ogre_currency,
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(direct_ogre["Balance"]["value"], "-869.4195010804415");
+        let direct_rlusd: Value = serde_json::from_slice(
+            &sandbox
+                .read(&keylet::trust_line(
+                    &direct_id,
+                    &rlusd_issuer,
+                    &rlusd_currency,
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(direct_rlusd["Balance"]["value"], "8.196465801205923");
+        let taker_id = decode_account_id(TAKER).unwrap();
+        let taker_ogre: Value = serde_json::from_slice(
+            &sandbox
+                .read(&keylet::trust_line(&taker_id, &ogre_issuer, &ogre_currency))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(taker_ogre["Balance"]["value"], "0");
+        let taker_rlusd: Value = serde_json::from_slice(
+            &sandbox
+                .read(&keylet::trust_line(
+                    &taker_id,
+                    &rlusd_issuer,
+                    &rlusd_currency,
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(taker_rlusd["Balance"]["value"], "12.10672829078141");
+        let bridge_id = decode_account_id(BRIDGE_POOL).unwrap();
+        let bridge_account: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::account(&bridge_id)).unwrap()).unwrap();
+        assert_eq!(bridge_account["Balance"], "8936028279");
+        let bridge_ogre: Value = serde_json::from_slice(
+            &sandbox
+                .read(&keylet::trust_line(
+                    &bridge_id,
+                    &ogre_issuer,
+                    &ogre_currency,
+                ))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(bridge_ogre["Balance"]["value"], "1048531.834285613");
     }
 
     #[test]
