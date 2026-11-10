@@ -5777,8 +5777,9 @@ fn offer_crossing_strand_reaches_limit(
     if is_amm && !hop.in_leg.is_xrp && hop.in_leg.issuer != *taker {
         rate = rate.mul(&Number::from_iou(&transfer_rate(ctx, &hop.in_leg.issuer)));
     }
-    // The terminal DirectStep still contributes its output issuer rate.
-    if !hop.out_leg.is_xrp && hop.out_leg.issuer != *taker {
+    // BookOfferCrossingStep::adjustQualityWithFees waives the AMM output fee;
+    // keep the issuer rate for book offers.
+    if !is_amm && !hop.out_leg.is_xrp && hop.out_leg.issuer != *taker {
         rate = rate.mul(&Number::from_iou(&transfer_rate(ctx, &hop.out_leg.issuer)));
     }
     let Ok(limit) = from_rate(threshold) else {
@@ -13134,6 +13135,119 @@ mod flow_cross_own_unfunded {
             serde_json::from_slice(&sandbox.read(&keylet::offer(&taker, 2)).unwrap()).unwrap();
         assert_eq!(placed["TakerGets"], tx["TakerGets"]);
         assert_eq!(placed["TakerPays"], tx["TakerPays"]);
+    }
+
+    #[test]
+    fn ledger_105501572_xrp_to_btc_amm_ignores_output_transfer_rate() {
+        const BTC_ISSUER: &str = "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B";
+        const SELLER: &str = "rLtCVnojydtQy7GYGTmDegkM15hLX8VuZk";
+        const POOL: &str = "rQBeAghWHEwWvKShryBSa5yR3VRX9oyQ5T";
+        let mut ledger = Ledger::genesis();
+        for (address, balance) in [
+            (BTC_ISSUER, "412602491952"),
+            (SELLER, "249777468248"),
+            (POOL, "102398903505"),
+        ] {
+            let id = decode_account_id(address).unwrap();
+            let mut account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": address,
+                "Balance": balance, "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+            });
+            if address == BTC_ISSUER {
+                account["TransferRate"] = Value::from(1_001_500_000u64);
+            }
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        let issuer = decode_account_id(BTC_ISSUER).unwrap();
+        let currency = helpers::currency_to_bytes("BTC");
+        for (holder, balance) in [
+            (SELLER, "0.0004810006089389414"),
+            (POOL, "1.769570217575273"),
+        ] {
+            let holder_id = decode_account_id(holder).unwrap();
+            let holder_is_low = holder_id.as_bytes() < issuer.as_bytes();
+            let (low, high, stored) = if holder_is_low {
+                (holder, BTC_ISSUER, balance.to_string())
+            } else {
+                (BTC_ISSUER, holder, format!("-{balance}"))
+            };
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState",
+                "Balance": {"currency": "BTC", "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": stored},
+                "LowLimit": {"currency": "BTC", "issuer": low, "value": "0"},
+                "HighLimit": {"currency": "BTC", "issuer": high, "value": "999999999"},
+                "Flags": 0,
+            });
+            ledger
+                .put_state(
+                    keylet::trust_line(&holder_id, &issuer, &currency),
+                    serde_json::to_vec(&line).unwrap(),
+                )
+                .unwrap();
+        }
+        let pool = decode_account_id(POOL).unwrap();
+        let amm_key = keylet::amm(&[0u8; 20], &AccountId::from([0u8; 20]), &currency, &issuer);
+        ledger
+            .put_state(
+                amm_key,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "AMM", "Account": POOL, "TradingFee": 19,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "OfferCreate", "Account": SELLER,
+            "Fee": "12", "Sequence": 1, "Flags": TF_SELL,
+            "TakerGets": "142840000",
+            "TakerPays": {"currency": "BTC", "issuer": BTC_ISSUER, "value": "0.002466961072"},
+        });
+        let rules = Rules::from_enabled([
+            feature_id("FlowCross"),
+            feature_id("fixUniversalNumber"),
+            feature_id("fixAMMv1_2"),
+        ]);
+        let seller = decode_account_id(SELLER).unwrap();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let input = Leg::parse(&tx["TakerGets"]).unwrap();
+        let output = Leg::parse(&tx["TakerPays"]).unwrap();
+        let threshold = flow_crossing_threshold(&ctx, &seller, &input, &output, true, false);
+        assert!(offer_crossing_strand_reaches_limit(
+            &ctx,
+            &seller,
+            &tx["TakerGets"],
+            &tx["TakerPays"],
+            threshold,
+        ));
+        assert_eq!(
+            OfferCreateTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        let offer: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::offer(&seller, 1)).unwrap()).unwrap();
+        assert_eq!(offer["TakerGets"], "100968518");
+        assert_eq!(offer["TakerPays"]["value"], "0.001743807080674399");
+        let seller_line: Value = serde_json::from_slice(
+            &sandbox
+                .read(&keylet::trust_line(&seller, &issuer, &currency))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(seller_line["Balance"]["value"], "-0.001204154587974575");
+        let pool_account: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::account(&pool)).unwrap()).unwrap();
+        assert_eq!(pool_account["Balance"], "102440774987");
     }
 
     #[test]
