@@ -429,22 +429,54 @@ where
     F: FnMut(LedgerReport) -> Result<(), String>,
 {
     validate_range(checkpoint, start, end)?;
-    let sp = unpack_state(state_pack)?;
-    if sp.checkpoint_seq != checkpoint {
+    let state = seed_state_from_slice(state_pack, checkpoint)?;
+    replay_segment_with_seeded_state(state, ledger_packs, checkpoint, start, end, emit)
+}
+
+/// Seed directly from a resident pack, avoiding a second collection of all
+/// entries and indexes while the SHAMap is being built.
+fn seed_state_from_slice(blob: &[u8], checkpoint: u64) -> Result<SHAMap, String> {
+    let mut off = 0;
+    read_header(blob, &mut off, KIND_STATE)?;
+    let checkpoint_seq = read_u64(blob, &mut off)?;
+    if checkpoint_seq == 0 || checkpoint_seq > u64::from(u32::MAX) {
         return Err(format!(
-            "state pack checkpoint {} != requested checkpoint {checkpoint}",
-            sp.checkpoint_seq
+            "checkpoint {checkpoint_seq} is outside the valid u32 ledger range"
         ));
+    }
+    let n = read_u32(blob, &mut off)? as usize;
+    if n > blob.len().saturating_sub(off) / 36 {
+        return Err("state entry count exceeds remaining pack bytes".into());
     }
 
     let mut state = SHAMap::account_state();
-    for (index, data) in sp.entries {
+    for _ in 0..n {
+        let index: [u8; 32] = take(blob, &mut off, 32)?.try_into().unwrap();
+        let key = Hash256::new(index);
+        if state.has(&key) {
+            return Err(format!(
+                "duplicate state index {}",
+                hex::encode_upper(index)
+            ));
+        }
+        let dlen = read_u32(blob, &mut off)? as usize;
+        let data = take(blob, &mut off, dlen)?.to_vec();
         state
-            .put(Hash256::new(index), data)
+            .put(key, data)
             .map_err(|e| format!("state seed put failed: {e:?}"))?;
     }
-
-    replay_segment_with_seeded_state(state, ledger_packs, checkpoint, start, end, emit)
+    if off != blob.len() {
+        return Err(format!(
+            "trailing bytes after STATE pack: {}",
+            blob.len() - off
+        ));
+    }
+    if checkpoint_seq != checkpoint {
+        return Err(format!(
+            "state pack checkpoint {checkpoint_seq} != requested checkpoint {checkpoint}"
+        ));
+    }
+    Ok(state)
 }
 
 /// Replay using a STATE pack read from disk, retaining only the SHAMap and one
@@ -793,11 +825,64 @@ mod tests {
         for (index, data) in decoded.entries {
             expected.insert(Hash256::new(index), data).unwrap();
         }
+        let mut slice_seeded = seed_state_from_slice(&pack, 42).unwrap();
+        assert_eq!(slice_seeded.root_hash(), expected.root_hash());
+        assert_eq!(
+            slice_seeded.get(&Hash256::new([1; 32])),
+            Some(&b"first"[..])
+        );
+        assert_eq!(
+            slice_seeded.get(&Hash256::new([2; 32])),
+            Some(&b"second"[..])
+        );
         let mut reader = std::io::Cursor::new(pack);
         let mut seeded = seed_state_from_reader(&mut reader, 42).unwrap();
         assert_eq!(seeded.root_hash(), expected.root_hash());
         assert_eq!(seeded.get(&Hash256::new([1; 32])), Some(&b"first"[..]));
         assert_eq!(seeded.get(&Hash256::new([2; 32])), Some(&b"second"[..]));
+    }
+
+    #[test]
+    fn slice_seed_preserves_decoder_errors_and_order() {
+        let mut bad_magic = state_pack(7, &[]);
+        bad_magic[0] = b'N';
+        let mut bad_version = state_pack(7, &[]);
+        bad_version[4] = 2;
+        let mut bad_kind = state_pack(7, &[]);
+        bad_kind[5] = KIND_LEDGER;
+        let mut bad_count = state_pack(7, &[]);
+        bad_count[14..18].copy_from_slice(&1u32.to_be_bytes());
+        let mut truncated = state_pack(7, &[([1; 32], b"payload")]);
+        truncated.pop();
+        let mut duplicate_before_length = state_pack(7, &[([3; 32], b"a"), ([3; 32], b"b")]);
+        duplicate_before_length.truncate(18 + 36 + 1 + 32);
+        let mut trailing_wrong_checkpoint = state_pack(8, &[([1; 32], b"a")]);
+        trailing_wrong_checkpoint.push(0);
+        let mut trailing = state_pack(7, &[([1; 32], b"a")]);
+        trailing.push(0);
+        let cases = [
+            bad_magic,
+            bad_version,
+            bad_kind,
+            state_pack(0, &[]),
+            state_pack(u64::from(u32::MAX) + 1, &[]),
+            bad_count,
+            truncated,
+            duplicate_before_length,
+            trailing,
+            trailing_wrong_checkpoint,
+            state_pack(8, &[([1; 32], b"a")]),
+        ];
+        for pack in cases {
+            let expected = match unpack_state(&pack) {
+                Err(error) => error,
+                Ok(decoded) => format!(
+                    "state pack checkpoint {} != requested checkpoint 7",
+                    decoded.checkpoint_seq
+                ),
+            };
+            assert_eq!(seed_state_from_slice(&pack, 7).unwrap_err(), expected);
+        }
     }
 
     #[test]
