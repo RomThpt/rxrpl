@@ -51,6 +51,130 @@ pub struct SHAMap {
     store: Option<Arc<dyn NodeStore>>,
 }
 
+/// Builds an account-state map from a stream of keys that is usually sorted.
+/// A descending key switches to ordinary insertion, so unsorted inputs retain
+/// the same behavior and duplicate detection as [`SHAMap::insert`].
+pub struct SortedAccountStateBuilder {
+    frontier: SortedFrame,
+    last_key: Option<Hash256>,
+    fallback: Option<SHAMap>,
+}
+
+/// The rightmost open branch of a sorted radix tree. Earlier branches are
+/// complete and already attached to `inner` with their final hashes.
+struct SortedFrame {
+    depth: u8,
+    inner: InnerNode,
+    active: Option<(u8, SortedBranch)>,
+}
+
+enum SortedBranch {
+    Leaf(LeafNode),
+    Inner(Box<SortedFrame>),
+}
+
+impl SortedBranch {
+    fn finish(self) -> SHAMapNode {
+        match self {
+            Self::Leaf(leaf) => SHAMapNode::Leaf(leaf),
+            Self::Inner(frame) => frame.finish(),
+        }
+    }
+}
+
+impl SortedFrame {
+    fn new(depth: u8) -> Self {
+        Self {
+            depth,
+            inner: InnerNode::new(),
+            active: None,
+        }
+    }
+
+    fn append(&mut self, leaf: LeafNode) {
+        let branch = select_branch(leaf.key(), self.depth);
+        match self.active.take() {
+            None => self.active = Some((branch, SortedBranch::Leaf(leaf))),
+            Some((active_branch, active)) if branch == active_branch => {
+                let next = match active {
+                    SortedBranch::Leaf(previous) => {
+                        let mut child = SortedFrame::new(self.depth + 1);
+                        child.append(previous);
+                        child.append(leaf);
+                        SortedBranch::Inner(Box::new(child))
+                    }
+                    SortedBranch::Inner(mut child) => {
+                        child.append(leaf);
+                        SortedBranch::Inner(child)
+                    }
+                };
+                self.active = Some((branch, next));
+            }
+            Some((active_branch, active)) => {
+                debug_assert!(branch > active_branch);
+                self.inner.set_child(active_branch, active.finish());
+                self.active = Some((branch, SortedBranch::Leaf(leaf)));
+            }
+        }
+    }
+
+    fn finish(mut self) -> SHAMapNode {
+        if let Some((branch, active)) = self.active.take() {
+            self.inner.set_child(branch, active.finish());
+        }
+        self.inner.update_hash();
+        SHAMapNode::inner(self.inner)
+    }
+}
+
+impl Default for SortedAccountStateBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SortedAccountStateBuilder {
+    pub fn new() -> Self {
+        Self {
+            frontier: SortedFrame::new(0),
+            last_key: None,
+            fallback: None,
+        }
+    }
+
+    pub fn push(&mut self, key: Hash256, data: Vec<u8>) -> Result<(), SHAMapError> {
+        if let Some(map) = &mut self.fallback {
+            return map.insert(key, data);
+        }
+        if let Some(previous) = self.last_key {
+            if key == previous {
+                return Err(SHAMapError::DuplicateKey);
+            }
+            if key < previous {
+                let frontier = std::mem::replace(&mut self.frontier, SortedFrame::new(0));
+                let mut map = SHAMap::account_state();
+                map.root = Arc::new(frontier.finish());
+                let result = map.insert(key, data);
+                self.fallback = Some(map);
+                return result;
+            }
+        }
+        self.frontier.append(LeafNode::account_state(key, data));
+        self.last_key = Some(key);
+        Ok(())
+    }
+
+    pub fn finish(self) -> SHAMap {
+        if let Some(map) = self.fallback {
+            map
+        } else {
+            let mut map = SHAMap::account_state();
+            map.root = Arc::new(self.frontier.finish());
+            map
+        }
+    }
+}
+
 impl Clone for SHAMap {
     fn clone(&self) -> Self {
         Self {
@@ -1981,6 +2105,168 @@ mod tests {
         }
 
         assert_eq!(map1.root_hash(), map2.root_hash());
+    }
+
+    fn assert_sorted_builder_equivalent(entries: &[(Hash256, Vec<u8>)]) {
+        let mut inserted = SHAMap::account_state();
+        let mut builder = SortedAccountStateBuilder::new();
+        for (key, data) in entries {
+            inserted.insert(*key, data.clone()).unwrap();
+            builder.push(*key, data.clone()).unwrap();
+        }
+        let mut built = builder.finish();
+        assert_eq!(built.root_hash(), inserted.root_hash());
+        assert_eq!(
+            built.iter().collect::<Vec<_>>(),
+            inserted.iter().collect::<Vec<_>>()
+        );
+
+        let mut probes = vec![Hash256::ZERO, Hash256::new([0xff; 32])];
+        probes.extend(entries.iter().map(|(key, _)| *key));
+        for key in probes {
+            assert_eq!(built.get(&key), inserted.get(&key));
+            assert_eq!(built.succ(&key), inserted.succ(&key));
+        }
+
+        let replacement = vec![0xab; 47];
+        if let Some((key, _)) = entries.first() {
+            inserted.put(*key, replacement.clone()).unwrap();
+            built.put(*key, replacement).unwrap();
+            assert_eq!(built.root_hash(), inserted.root_hash());
+            assert_eq!(built.delete(key), inserted.delete(key));
+        }
+        let new_key = Hash256::new([0x7f; 32]);
+        if !entries.iter().any(|(key, _)| *key == new_key) {
+            inserted.insert(new_key, b"new".to_vec()).unwrap();
+            built.insert(new_key, b"new".to_vec()).unwrap();
+        }
+        assert_eq!(built.root_hash(), inserted.root_hash());
+        assert_eq!(
+            built.iter().collect::<Vec<_>>(),
+            inserted.iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sorted_account_state_builder_matches_insert_and_mutations() {
+        let mut near_end = [0x34; 32];
+        near_end[31] = 0xfe;
+        let mut last_nibble = near_end;
+        last_nibble[31] = 0xff;
+
+        for mut entries in [
+            vec![],
+            vec![(Hash256::ZERO, b"one".to_vec())],
+            vec![
+                (Hash256::new(near_end), b"near end".to_vec()),
+                (Hash256::new(last_nibble), b"last nibble".to_vec()),
+            ],
+            vec![
+                (Hash256::ZERO, vec![]),
+                (Hash256::new([0x10; 32]), vec![1; 19]),
+                (Hash256::new(near_end), vec![2; 256]),
+                (Hash256::new(last_nibble), vec![3; 3]),
+                (Hash256::new([0xff; 32]), vec![4; 7]),
+            ],
+        ] {
+            entries.sort_by_key(|(key, _)| *key);
+            assert_sorted_builder_equivalent(&entries);
+        }
+
+        let mut many: Vec<_> = (0..4096u64)
+            .map(|i| {
+                let mut bytes = [0; 32];
+                bytes[..8].copy_from_slice(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_be_bytes());
+                bytes[24..].copy_from_slice(&i.to_be_bytes());
+                (Hash256::new(bytes), vec![i as u8; (i as usize % 97) + 1])
+            })
+            .collect();
+        many.sort_by_key(|(key, _)| *key);
+        assert_sorted_builder_equivalent(&many);
+    }
+
+    #[test]
+    fn sorted_account_state_builder_accepts_unsorted_and_rejects_duplicates() {
+        let keys = [
+            Hash256::new([0x10; 32]),
+            Hash256::new([0x30; 32]),
+            Hash256::new([0x20; 32]),
+            Hash256::new([0x40; 32]),
+        ];
+        let mut inserted = SHAMap::account_state();
+        let mut builder = SortedAccountStateBuilder::new();
+        for (i, key) in keys.into_iter().enumerate() {
+            inserted.insert(key, vec![i as u8]).unwrap();
+            builder.push(key, vec![i as u8]).unwrap();
+        }
+        let mut built = builder.finish();
+        assert_eq!(built.root_hash(), inserted.root_hash());
+        assert_eq!(
+            built.iter().collect::<Vec<_>>(),
+            inserted.iter().collect::<Vec<_>>()
+        );
+
+        let mut adjacent = SortedAccountStateBuilder::new();
+        adjacent.push(keys[0], vec![]).unwrap();
+        assert_eq!(
+            adjacent.push(keys[0], vec![]),
+            Err(SHAMapError::DuplicateKey)
+        );
+
+        let mut non_adjacent = SortedAccountStateBuilder::new();
+        for key in [keys[0], keys[1], keys[2]] {
+            non_adjacent.push(key, vec![]).unwrap();
+        }
+        assert_eq!(
+            non_adjacent.push(keys[0], vec![]),
+            Err(SHAMapError::DuplicateKey)
+        );
+    }
+
+    #[test]
+    #[ignore = "local microbenchmark; run with --ignored --nocapture"]
+    fn sorted_account_state_builder_microbenchmark() {
+        let count = std::env::var("RXRPL_SHAMAP_BENCH_ENTRIES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(100_000);
+        let mode = std::env::var("RXRPL_SHAMAP_BENCH_MODE").unwrap_or_else(|_| "both".into());
+        assert!(matches!(mode.as_str(), "insert" | "bulk" | "both"));
+        let mut entries: Vec<_> = (0..count)
+            .map(|i| {
+                let mut bytes = [0; 32];
+                bytes[..8].copy_from_slice(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_be_bytes());
+                bytes[24..].copy_from_slice(&i.to_be_bytes());
+                (Hash256::new(bytes), vec![i as u8; 224])
+            })
+            .collect();
+        entries.sort_by_key(|(key, _)| *key);
+
+        let mut inserted = None;
+        if mode != "bulk" {
+            let start = std::time::Instant::now();
+            let mut map = SHAMap::account_state();
+            for (key, data) in &entries {
+                map.insert(*key, data.clone()).unwrap();
+            }
+            inserted = Some((map.root_hash(), start.elapsed()));
+        }
+
+        let mut bulk = None;
+        if mode != "insert" {
+            let start = std::time::Instant::now();
+            let mut builder = SortedAccountStateBuilder::new();
+            for (key, data) in &entries {
+                builder.push(*key, data.clone()).unwrap();
+            }
+            let mut map = builder.finish();
+            bulk = Some((map.root_hash(), start.elapsed()));
+        }
+
+        if let (Some((inserted_root, _)), Some((bulk_root, _))) = (&inserted, &bulk) {
+            assert_eq!(bulk_root, inserted_root);
+        }
+        eprintln!("entries={count} mode={mode} insert={inserted:?} bulk={bulk:?}");
     }
 
     #[test]

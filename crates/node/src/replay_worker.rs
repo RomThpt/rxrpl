@@ -17,7 +17,7 @@ use std::path::Path;
 
 use rxrpl_ledger::{Ledger, LedgerHeader};
 use rxrpl_primitives::Hash256;
-use rxrpl_shamap::{SHAMap, SHAMapError, transaction_set_root};
+use rxrpl_shamap::{SHAMap, SHAMapError, SortedAccountStateBuilder, transaction_set_root};
 
 use crate::play_forward::{
     TxSet, all_handlers_engine, fees_for_ledger, replay_forward, replay_forward_observed_order,
@@ -547,7 +547,7 @@ fn seed_state_from_reader<R: Read + Seek>(
         return Err("state entry count exceeds remaining pack bytes".into());
     }
 
-    let mut state = SHAMap::account_state();
+    let mut state = SortedAccountStateBuilder::new();
     for _ in 0..count {
         let index = read_state_field::<32>(reader)?;
         let key = Hash256::new(index);
@@ -559,7 +559,7 @@ fn seed_state_from_reader<R: Read + Seek>(
         let mut data = vec![0; len as usize];
         reader.read_exact(&mut data).map_err(|e| e.to_string())?;
         remaining -= len;
-        match state.insert(key, data) {
+        match state.push(key, data) {
             Ok(()) => {}
             Err(SHAMapError::DuplicateKey) => {
                 return Err(format!(
@@ -573,7 +573,7 @@ fn seed_state_from_reader<R: Read + Seek>(
     if remaining != 0 {
         return Err(format!("trailing bytes after STATE pack: {remaining}"));
     }
-    Ok(state)
+    Ok(state.finish())
 }
 
 fn replay_segment_with_seeded_state<F>(
@@ -843,6 +843,45 @@ mod tests {
     }
 
     #[test]
+    fn reader_seed_sorted_state_remains_mutable() {
+        let mut first = [0x12; 32];
+        first[31] = 0xfe;
+        let mut second = first;
+        second[31] = 0xff;
+        let pack = state_pack(
+            42,
+            &[
+                ([0; 32], b"zero"),
+                (first, b"first"),
+                (second, b"second"),
+                ([0xff; 32], b"last"),
+            ],
+        );
+        let mut expected = SHAMap::account_state();
+        for (index, data) in unpack_state(&pack).unwrap().entries {
+            expected.insert(Hash256::new(index), data).unwrap();
+        }
+        let mut seeded = seed_state_from_reader(&mut std::io::Cursor::new(pack), 42).unwrap();
+        assert_eq!(seeded.root_hash(), expected.root_hash());
+        assert_eq!(
+            seeded.iter().collect::<Vec<_>>(),
+            expected.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(seeded.succ(&Hash256::ZERO), expected.succ(&Hash256::ZERO));
+        seeded
+            .put(Hash256::new(first), b"changed".to_vec())
+            .unwrap();
+        expected
+            .put(Hash256::new(first), b"changed".to_vec())
+            .unwrap();
+        assert_eq!(
+            seeded.delete(&Hash256::new(second)),
+            expected.delete(&Hash256::new(second))
+        );
+        assert_eq!(seeded.root_hash(), expected.root_hash());
+    }
+
+    #[test]
     fn slice_seed_preserves_decoder_errors_and_order() {
         let mut bad_magic = state_pack(7, &[]);
         bad_magic[0] = b'N';
@@ -954,6 +993,18 @@ mod tests {
                 state_pack(7, &[([3; 32], b"a"), ([3; 32], b"b")]),
                 "duplicate state index",
             ),
+            (
+                state_pack(
+                    7,
+                    &[
+                        ([3; 32], b"a"),
+                        ([4; 32], b"b"),
+                        ([2; 32], b"c"),
+                        ([3; 32], b"d"),
+                    ],
+                ),
+                "duplicate state index",
+            ),
             (trailing, "trailing bytes"),
             (trailing_after_entry, "trailing bytes"),
         ];
@@ -967,6 +1018,33 @@ mod tests {
         assert_eq!(
             seed_state_from_reader(&mut std::io::Cursor::new(b"XSCP"), 7).unwrap_err(),
             "truncated pack"
+        );
+        assert_eq!(
+            seed_state_from_reader(
+                &mut std::io::Cursor::new(state_pack(7, &[([3; 32], b"a"), ([3; 32], b"b")])),
+                7,
+            )
+            .unwrap_err(),
+            format!("duplicate state index {}", hex::encode_upper([3; 32]))
+        );
+        let mut trailing = state_pack(7, &[]);
+        trailing.push(0);
+        assert_eq!(
+            seed_state_from_reader(&mut std::io::Cursor::new(trailing), 7).unwrap_err(),
+            "trailing bytes after STATE pack: 1"
+        );
+        let mut truncated_duplicate = state_pack(7, &[([3; 32], b"a"), ([3; 32], b"payload")]);
+        truncated_duplicate.pop();
+        assert_eq!(
+            seed_state_from_reader(&mut std::io::Cursor::new(truncated_duplicate), 7).unwrap_err(),
+            "truncated pack"
+        );
+        let mut wrong_checkpoint_and_count = state_pack(8, &[]);
+        wrong_checkpoint_and_count[14..18].copy_from_slice(&1u32.to_be_bytes());
+        assert_eq!(
+            seed_state_from_reader(&mut std::io::Cursor::new(wrong_checkpoint_and_count), 7)
+                .unwrap_err(),
+            "state pack checkpoint 8 != requested checkpoint 7"
         );
     }
 
