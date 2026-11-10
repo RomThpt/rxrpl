@@ -17,6 +17,9 @@ const TF_ONE_ASSET_WITHDRAW_ALL: u32 = 0x00040000;
 /// tfOneAssetLPToken flag (0x00200000): single-asset payout for a given
 /// LPTokenIn (`singleWithdrawTokens`).
 const TF_ONE_ASSET_LP_TOKEN: u32 = 0x00200000;
+const LSF_LOW_RESERVE: u64 = 0x0001_0000;
+const LSF_HIGH_RESERVE: u64 = 0x0002_0000;
+const LSF_AMM_NODE: u64 = 0x0100_0000;
 
 impl Transactor for AMMWithdrawTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
@@ -660,7 +663,11 @@ impl AMMWithdrawTransactor {
 
         let mut xrp_out = 0u64;
         check_withdraw_reserves(ctx, holder, [(&leg1, &payout1), (&leg2, &payout2)])?;
-        self.burn_and_update_amm(ctx, amm_key, amm, &ctx_amm, &tokens)?;
+        // deleteAMMAccountIfEmpty erases the original AMM SLE without first
+        // writing a zero LPTokenBalance. Its DeletedNode keeps the old value.
+        if !drains_all {
+            self.burn_and_update_amm(ctx, amm_key, amm, &ctx_amm, &tokens)?;
+        }
         leg1.pay_out(
             ctx,
             holder,
@@ -677,7 +684,19 @@ impl AMMWithdrawTransactor {
             &payout2,
             &mut xrp_out,
         )?;
+        if drains_all {
+            // accountSend clears the AMM side's reserve and removes a drained
+            // pool trust line before rippled deletes the AMM account. Preserve
+            // that final line state in the DeletedNode metadata.
+            leg1.delete_drained_pool_line(ctx, &ctx_amm.account)?;
+            leg2.delete_drained_pool_line(ctx, &ctx_amm.account)?;
+        }
         self.finish_withdraw(ctx, holder, &ctx_amm, &tokens, xrp_out)?;
+        // Once the last LP has redeemed both assets, rippled removes the AMM
+        // account and its now-empty pool trust lines in the same transaction.
+        if drains_all {
+            crate::handlers::amm_delete::delete_amm_account(ctx, amm_key, amm, &ctx_amm.account)?;
+        }
         Ok(TransactionResult::TesSuccess)
     }
 
@@ -902,6 +921,89 @@ fn check_withdraw_reserves(
 }
 
 impl WithdrawLeg {
+    fn delete_drained_pool_line(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+        amm_account: &rxrpl_primitives::AccountId,
+    ) -> Result<(), TransactionResult> {
+        let WithdrawLeg::Iou { issuer, currency } = self else {
+            return Ok(());
+        };
+        let line_key = keylet::trust_line(amm_account, issuer, currency);
+        let bytes = ctx
+            .view
+            .read(&line_key)
+            .ok_or(TransactionResult::TecNoEntry)?;
+        let mut line: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let flags = line["Flags"].as_u64().unwrap_or(0);
+        let amm_is_low = amm_account.as_bytes() < issuer.as_bytes();
+        let amm_reserve = if amm_is_low {
+            LSF_LOW_RESERVE
+        } else {
+            LSF_HIGH_RESERVE
+        };
+        // With additional line settings, accountSend leaves the zero line for
+        // deleteAMMAccount to clean up. The simple AMM-owned line is removed
+        // during the payout itself.
+        if flags != (LSF_AMM_NODE | amm_reserve) {
+            return Ok(());
+        }
+        if !amm_helpers::parse_iou_value(line["Balance"]["value"].as_str().unwrap_or("0")).is_zero()
+        {
+            return Err(TransactionResult::TecAmmBalance);
+        }
+
+        line["Flags"] = serde_json::Value::from(flags & !amm_reserve);
+        let data = serde_json::to_vec(&line).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(line_key, data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        let node_of = |field: &str| -> u64 {
+            line.get(field)
+                .and_then(|v| v.as_str())
+                .and_then(|s| u64::from_str_radix(s, 16).ok())
+                .unwrap_or(0)
+        };
+        let (low, high) = if amm_is_low {
+            (amm_account, issuer)
+        } else {
+            (issuer, amm_account)
+        };
+        crate::owner_dir::remove_from_owner_dir_page(ctx.view, low, node_of("LowNode"), &line_key)?;
+        crate::owner_dir::remove_from_owner_dir_page(
+            ctx.view,
+            high,
+            node_of("HighNode"),
+            &line_key,
+        )?;
+        ctx.view
+            .erase(&line_key)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        let amm_acct_key = keylet::account(amm_account);
+        let acct_bytes = ctx
+            .view
+            .read(&amm_acct_key)
+            .ok_or(TransactionResult::TerNoAccount)?;
+        let mut acct: serde_json::Value =
+            serde_json::from_slice(&acct_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        helpers::adjust_owner_count(&mut acct, -1);
+        let data = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(amm_acct_key, data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+
+        let issuer_key = keylet::account(issuer);
+        if let Some(bytes) = ctx.view.read(&issuer_key) {
+            ctx.view
+                .update(issuer_key, bytes)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
+        Ok(())
+    }
+
     fn parse(field: &serde_json::Value) -> Result<Self, TransactionResult> {
         if field.as_str() == Some("XRP") {
             return Ok(WithdrawLeg::Xrp);
@@ -1232,13 +1334,17 @@ mod tests {
     use crate::fees::FeeSettings;
     use crate::transactor::{PreclaimContext, PreflightContext};
     use crate::view::ledger_view::LedgerView;
+    use crate::view::read_view::ReadView;
     use crate::view::sandbox::Sandbox;
     use rxrpl_amendment::Rules;
+    use rxrpl_codec::address::classic::encode_account_id;
     use rxrpl_ledger::Ledger;
     use std::collections::HashMap;
 
     const ALICE: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
     const BOB: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
+    const HMT_ISSUER: &str = "r4KkwUQwbVdPwQYJMWj1SHirzaeBrPfwnu";
+    const VMONEY: &str = "564D4F4E45590000000000000000000000000000";
 
     fn setup_with_amm(pool1: u64, pool2: u64, lp: u64) -> Ledger {
         let mut ledger = Ledger::genesis();
@@ -1495,5 +1601,231 @@ mod tests {
             deleted["PreviousFields"]["Flags"],
             holder_reserve | no_ripple
         );
+    }
+
+    #[test]
+    fn last_lp_withdraw_deletes_amm_and_empty_hmt_pool_line() {
+        fn put(ledger: &mut Ledger, key: rxrpl_primitives::Hash256, value: serde_json::Value) {
+            ledger
+                .put_state(key, serde_json::to_vec(&value).unwrap())
+                .unwrap();
+        }
+
+        fn dir(
+            owner: &str,
+            root: rxrpl_primitives::Hash256,
+            entries: &[rxrpl_primitives::Hash256],
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "LedgerEntryType": "DirectoryNode",
+                "Owner": owner,
+                "RootIndex": hex::encode_upper(root.as_bytes()),
+                "Indexes": entries.iter().map(|key| hex::encode_upper(key.as_bytes())).collect::<Vec<_>>(),
+                "Flags": 0,
+            })
+        }
+
+        let mut ledger = Ledger::genesis();
+        let holder = decode_account_id(ALICE).unwrap();
+        let vmoney_issuer = decode_account_id(BOB).unwrap();
+        let hmt_issuer = decode_account_id(HMT_ISSUER).unwrap();
+        let asset = serde_json::json!({"currency": VMONEY, "issuer": BOB});
+        let asset2 = serde_json::json!({"currency": "HMT", "issuer": HMT_ISSUER});
+        let amm_key = amm_helpers::compute_amm_key(&asset, &asset2).unwrap();
+        let amm_account = amm_helpers::amm_pseudo_account(&amm_key);
+        let amm_address = encode_account_id(&amm_account);
+        let vmoney = helpers::currency_to_bytes(VMONEY);
+        let hmt = helpers::currency_to_bytes("HMT");
+        let lp_hex = amm_helpers::lp_currency_hex(&amm_key);
+        let lp: [u8; 20] = hex::decode(&lp_hex).unwrap().try_into().unwrap();
+        let vmoney_pool_key = keylet::trust_line(&amm_account, &vmoney_issuer, &vmoney);
+        let vmoney_holder_key = keylet::trust_line(&holder, &vmoney_issuer, &vmoney);
+        let hmt_pool_key = keylet::trust_line(&amm_account, &hmt_issuer, &hmt);
+        let hmt_holder_key = keylet::trust_line(&holder, &hmt_issuer, &hmt);
+        let lp_line_key = keylet::trust_line(&holder, &amm_account, &lp);
+
+        for (account, address, balance, owners) in [
+            (&holder, ALICE, "2000000", 3),
+            (&vmoney_issuer, BOB, "2000000", 0),
+            (&hmt_issuer, HMT_ISSUER, "2000000", 0),
+            (&amm_account, amm_address.as_str(), "0", 2),
+        ] {
+            put(
+                &mut ledger,
+                keylet::account(account),
+                serde_json::json!({
+                    "LedgerEntryType": "AccountRoot", "Account": address,
+                    "Balance": balance, "Sequence": 1, "OwnerCount": owners, "Flags": 0,
+                }),
+            );
+        }
+
+        let line = |a: &rxrpl_primitives::AccountId,
+                    a_address: &str,
+                    b: &rxrpl_primitives::AccountId,
+                    b_address: &str,
+                    currency: &str,
+                    holding: &str,
+                    flags: u64| {
+            let (low, high, balance) = if a.as_bytes() < b.as_bytes() {
+                (a_address, b_address, holding.to_string())
+            } else {
+                (b_address, a_address, format!("-{holding}"))
+            };
+            serde_json::json!({
+                "LedgerEntryType": "RippleState",
+                "Balance": {"currency": currency, "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": balance},
+                "LowLimit": {"currency": currency, "issuer": low, "value": "0"},
+                "HighLimit": {"currency": currency, "issuer": high, "value": "0"},
+                "LowNode": "0000000000000000", "HighNode": "0000000000000000",
+                "Flags": flags,
+            })
+        };
+        for (issuer, address, currency, amount, pool_key, holder_key) in [
+            (
+                &vmoney_issuer,
+                BOB,
+                VMONEY,
+                "7000",
+                vmoney_pool_key,
+                vmoney_holder_key,
+            ),
+            (
+                &hmt_issuer,
+                HMT_ISSUER,
+                "HMT",
+                "5000",
+                hmt_pool_key,
+                hmt_holder_key,
+            ),
+        ] {
+            let pool_reserve = if amm_account.as_bytes() < issuer.as_bytes() {
+                LSF_LOW_RESERVE
+            } else {
+                LSF_HIGH_RESERVE
+            };
+            put(
+                &mut ledger,
+                pool_key,
+                line(
+                    &amm_account,
+                    &amm_address,
+                    issuer,
+                    address,
+                    currency,
+                    amount,
+                    LSF_AMM_NODE | pool_reserve,
+                ),
+            );
+            put(
+                &mut ledger,
+                holder_key,
+                line(&holder, ALICE, issuer, address, currency, "0", 0),
+            );
+        }
+        put(
+            &mut ledger,
+            lp_line_key,
+            line(
+                &holder,
+                ALICE,
+                &amm_account,
+                &amm_address,
+                &lp_hex,
+                "1000",
+                0,
+            ),
+        );
+        put(
+            &mut ledger,
+            amm_key,
+            serde_json::json!({
+                "LedgerEntryType": "AMM", "Account": amm_address,
+                "Asset": asset2, "Asset2": asset,
+                "LPTokenBalance": {"currency": lp_hex, "issuer": amm_address, "value": "1000"},
+                "TradingFee": 0, "OwnerNode": "0000000000000000",
+            }),
+        );
+
+        for (id, address, entries) in [
+            (
+                &holder,
+                ALICE,
+                vec![lp_line_key, vmoney_holder_key, hmt_holder_key],
+            ),
+            (
+                &vmoney_issuer,
+                BOB,
+                vec![vmoney_pool_key, vmoney_holder_key],
+            ),
+            (&hmt_issuer, HMT_ISSUER, vec![hmt_pool_key, hmt_holder_key]),
+            (
+                &amm_account,
+                amm_address.as_str(),
+                vec![amm_key, vmoney_pool_key, hmt_pool_key, lp_line_key],
+            ),
+        ] {
+            let root = keylet::owner_dir(id);
+            put(&mut ledger, root, dir(address, root, &entries));
+        }
+
+        let tx = serde_json::json!({
+            "TransactionType": "AMMWithdraw", "Account": ALICE,
+            "Asset": {"currency": VMONEY, "issuer": BOB},
+            "Asset2": {"currency": "HMT", "issuer": HMT_ISSUER},
+            "Flags": TF_WITHDRAW_ALL, "Fee": "12", "Sequence": 1,
+        });
+        let fees = FeeSettings::default();
+        let rules = Rules::new();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            AMMWithdrawTransactor.apply(&mut ctx).unwrap(),
+            TransactionResult::TesSuccess
+        );
+
+        for key in [
+            amm_key,
+            keylet::account(&amm_account),
+            keylet::owner_dir(&amm_account),
+            vmoney_pool_key,
+            hmt_pool_key,
+            lp_line_key,
+        ] {
+            assert!(!sandbox.exists(&key), "drained AMM object {key} remains");
+        }
+        for (issuer, currency, holder_key, expected) in [
+            (&vmoney_issuer, &vmoney, vmoney_holder_key, "7000"),
+            (&hmt_issuer, &hmt, hmt_holder_key, "5000"),
+        ] {
+            assert!(sandbox.exists(&holder_key), "holder's IOU line remains");
+            let holding = amm_helpers::iou_holding_number(&sandbox, &holder, issuer, currency);
+            assert_eq!(holding.to_iou().to_decimal_string(), expected);
+        }
+        let holder_acct: serde_json::Value =
+            serde_json::from_slice(&sandbox.read(&keylet::account(&holder)).unwrap()).unwrap();
+        assert_eq!(holder_acct["Balance"], "2000000");
+        assert_eq!(holder_acct["OwnerCount"], 2);
+        for issuer in [&vmoney_issuer, &hmt_issuer] {
+            let account: serde_json::Value =
+                serde_json::from_slice(&sandbox.read(&keylet::account(issuer)).unwrap()).unwrap();
+            assert_eq!(account["OwnerCount"], 0);
+        }
+        let changes = sandbox.into_changes();
+        let deleted_amm: serde_json::Value =
+            serde_json::from_slice(changes.deletes.get(&amm_key).unwrap()).unwrap();
+        assert_eq!(deleted_amm["LPTokenBalance"]["value"], "1000");
+        for line_key in [vmoney_pool_key, hmt_pool_key] {
+            let deleted: serde_json::Value =
+                serde_json::from_slice(changes.deletes.get(&line_key).unwrap()).unwrap();
+            assert_eq!(deleted["Flags"], LSF_AMM_NODE);
+            assert_eq!(deleted["Balance"]["value"], "0");
+        }
     }
 }
