@@ -4115,7 +4115,7 @@ fn amm_hop(
             Some(needed) if num_le(&needed, &capped_budget) => (needed, demand_num),
             _ => return Ok(None),
         }
-    } else if num_le(&out_full, &demand_num) {
+    } else if out_full.sub(&demand_num).negative() {
         (capped_budget, out_full)
     } else {
         match crate::amm_helpers::swap_asset_out(&pool_in, &pool_out, &demand_num, tfee, in_xrp) {
@@ -13230,6 +13230,74 @@ mod flow_cross_own_unfunded {
         );
         assert_eq!(xrp_balance(&sandbox, MAKER), 999_768_999);
         assert_eq!(xrp_balance(&sandbox, MAKER2), 999_769_287);
+    }
+
+    /// When the taker asks for four drops and its maximum IOU input would
+    /// also round to four drops, the AMM charges the amount needed for those
+    /// four drops, leaving the rest of the input with the taker.
+    #[test]
+    fn exact_native_output_uses_amm_output_limit() {
+        let mut ledger = Ledger::genesis();
+        for (addr, drops) in [
+            (ISS, 1_000_000_000u64),
+            (TAKER, 1_000_000_000),
+            (MAKER2, 219_684_506_991),
+        ] {
+            let id = decode_account_id(addr).unwrap();
+            let account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": addr,
+                "Balance": drops.to_string(), "Sequence": 1,
+                "OwnerCount": 0, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        put_usd_line(&mut ledger, TAKER, 1);
+        put_usd_line(&mut ledger, MAKER2, 23_599_869_094);
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let issuer = decode_account_id(ISS).unwrap();
+        let currency = helpers::currency_to_bytes("USD");
+        let zero = AccountId::from([0u8; 20]);
+        sandbox
+            .insert(
+                keylet::amm(&[0u8; 20], &zero, &currency, &issuer),
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "AMM", "Account": MAKER2,
+                    "TradingFee": 0, "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER,
+                    "Fee": "10", "Sequence": 1,
+                    "TakerGets": {"currency": "USD", "issuer": ISS, "value": "0.4533786164"},
+                    "TakerPays": "4",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert_eq!(xrp_balance(&sandbox, MAKER2), 219_684_506_987);
+        let taker = decode_account_id(TAKER).unwrap();
+        let remaining =
+            crate::amm_helpers::iou_holding_number(&sandbox, &taker, &issuer, &currency);
+        assert!(
+            !num_le(
+                &remaining,
+                &rxrpl_amount::number::Number::from_iou(
+                    &IOUAmount::from_decimal_string("0.55").unwrap()
+                )
+            ),
+            "the output-limited AMM must leave more than 0.55 USD"
+        );
     }
 
     /// 105500215 91B10CB9: Flow's direct book removes funded inverse offers
