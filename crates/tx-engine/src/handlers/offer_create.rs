@@ -1390,13 +1390,14 @@ fn cross_offers(
         // if execOffer later selects the CLOB. Do the permanent-only cleanup
         // before AMM selection; the regular offer loop performs self-cross
         // cleanup if the AMM does not finish the crossing.
-        let _ = advance_past_unfunded_quality(
+        let funded_tip_before_amm = advance_past_unfunded_quality(
             ctx,
             taker,
             taker_acct,
             &dir_key,
             QualityAdvanceMode::Speculative,
-        )?;
+        )?
+        .funded_tip_remains;
         // Interleave the AMM at this quality band BEFORE the resting CLOB offers.
         // rippled crosses whichever of the synthetic AMM offer / CLOB tip is
         // better at each quality level (BookStep tryAMM/execOffer). `amm_hop`'s
@@ -1463,6 +1464,7 @@ fn cross_offers(
                     reaped_self_offer |= advance.reaped_self_offer;
                     terminal_amm_allowed &= clob_band_allows_terminal_amm(
                         amm_consumed_in_band,
+                        funded_tip_before_amm,
                         advance.funded_tip_remains,
                     );
                 }
@@ -2118,8 +2120,14 @@ fn amm_step_allows_clob(is_sell: bool, remaining_out: &Leg) -> bool {
     is_sell || !remaining_out.is_zero()
 }
 
-fn clob_band_allows_terminal_amm(amm_consumed: bool, funded_tip_remains: bool) -> bool {
-    !amm_consumed || funded_tip_remains
+// A stale directory emptied before AMM selection cannot keep the pool bound
+// to that directory's quality on the next pass.
+fn clob_band_allows_terminal_amm(
+    amm_consumed: bool,
+    funded_tip_before_amm: bool,
+    funded_tip_remains: bool,
+) -> bool {
+    !amm_consumed || !funded_tip_before_amm || funded_tip_remains
 }
 
 fn preserve_next_quality_self_offer(is_sell: bool, remaining_out: &Leg) -> bool {
@@ -9598,9 +9606,9 @@ mod taker_crossing_tests {
 
     #[test]
     fn ledger_105500731_dry_clob_pass_stops_terminal_amm() {
-        assert!(!clob_band_allows_terminal_amm(true, false));
-        assert!(clob_band_allows_terminal_amm(true, true));
-        assert!(clob_band_allows_terminal_amm(false, false));
+        assert!(!clob_band_allows_terminal_amm(true, true, false));
+        assert!(clob_band_allows_terminal_amm(true, true, true));
+        assert!(clob_band_allows_terminal_amm(false, true, false));
     }
 
     #[test]
@@ -13043,6 +13051,97 @@ mod flow_cross_own_unfunded {
         assert_eq!(xrp_balance(&sandbox, TAKER), taker_xrp_before);
         assert_eq!(xrp_balance(&sandbox, MAKER), maker_xrp_before);
         assert_eq!(owner_count(&sandbox, MAKER), 1);
+    }
+
+    /// Ledger 105501294: a stale book tip must not cap an AMM fill after the
+    /// tip has been removed for lack of maker funds.
+    #[test]
+    fn fill_or_kill_retries_amm_after_unfunded_book_tip() {
+        let mut ledger = Ledger::genesis();
+        for addr in [ISS, TAKER, MAKER, MAKER2] {
+            let id = decode_account_id(addr).unwrap();
+            let account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": addr,
+                "Balance": "1000000000", "Sequence": 1,
+                "OwnerCount": 0, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        put_usd_line(&mut ledger, MAKER, 100);
+        put_usd_line(&mut ledger, MAKER2, 10_000);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let usd =
+            |value: &str| serde_json::json!({"currency": "USD", "issuer": ISS, "value": value});
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": MAKER,
+                    "Fee": "10", "Sequence": 1,
+                    "TakerGets": usd("100"), "TakerPays": "10050000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+
+        let maker = decode_account_id(MAKER).unwrap();
+        let issuer = decode_account_id(ISS).unwrap();
+        let currency = helpers::currency_to_bytes("USD");
+        let maker_line = keylet::trust_line(&maker, &issuer, &currency);
+        let mut line: Value = serde_json::from_slice(&sandbox.read(&maker_line).unwrap()).unwrap();
+        line["Balance"]["value"] = Value::from("0");
+        sandbox
+            .update(maker_line, serde_json::to_vec(&line).unwrap())
+            .unwrap();
+
+        let zero = AccountId::from([0u8; 20]);
+        let amm_key = keylet::amm(&[0u8; 20], &zero, &currency, &issuer);
+        sandbox
+            .insert(
+                amm_key,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "AMM", "Account": MAKER2,
+                    "TradingFee": 0, "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER,
+                    "Fee": "10", "Sequence": 1, "Flags": TF_FILL_OR_KILL,
+                    "TakerGets": "11000000", "TakerPays": usd("100"),
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert!(sandbox.read(&keylet::offer(&maker, 1)).is_none());
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(TAKER).unwrap(), 1))
+                .is_none()
+        );
+        assert_eq!(owner_count(&sandbox, MAKER), 0);
+        assert!(xrp_balance(&sandbox, MAKER2) > 1_000_000_000);
+        assert!(
+            sandbox
+                .read(&keylet::trust_line(
+                    &decode_account_id(TAKER).unwrap(),
+                    &issuer,
+                    &currency
+                ))
+                .is_some()
+        );
     }
 
     /// 105500215 91B10CB9: Flow's direct book removes funded inverse offers
