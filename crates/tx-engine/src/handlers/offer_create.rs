@@ -2173,11 +2173,19 @@ fn advance_past_unfunded_quality(
         // demand before this CLOB tip is selected. Keep an otherwise funded
         // expired offer untouched in that case (105500455), and likewise keep
         // a funded self-offer until the CLOB is actually selected (105500679).
-        // A retained CLOB walk or post-fill advance removes either normally.
+        // A short self-owned lsfSell still has funds, so it also stays at an
+        // out-of-quality PreQuality tip. Its insufficiency is acted on only
+        // after the CLOB is selected (105502135 / TX1).
+        let defer_short_self_sell = matches!(mode, QualityAdvanceMode::PreQuality)
+            && owner == *taker
+            && flags & LSF_SELL != 0
+            && !funds.is_zero()
+            && !leg_ge(&funds, &offer_out);
         let otherwise_removable = offer_in.is_zero()
             || offer_out.is_zero()
             || is_deep_frozen(ctx, &owner, &offer_in)
-            || offer_cannot_pay(&funds, &offer_out, flags, &owner == taker);
+            || (offer_cannot_pay(&funds, &offer_out, flags, &owner == taker)
+                && !defer_short_self_sell);
         let self_reap = matches!(mode, QualityAdvanceMode::Executing)
             && owner == *taker
             && !expired
@@ -15281,6 +15289,40 @@ mod flow_cross_own_unfunded {
                 serde_json::to_vec(&line).unwrap(),
             )
             .unwrap();
+
+        // The next passive offer's quality gate is tighter than this old
+        // inverse offer. A speculative AMM quote may still activate the strand,
+        // but materialising its out-of-quality tip must leave the short self
+        // sell in the book (105502135 / TX1).
+        let offer_key = keylet::offer(&taker_id, 1);
+        let old_offer = sandbox.read(&offer_key).unwrap();
+        let old: Value = serde_json::from_slice(&old_offer).unwrap();
+        let dir: Hash256 = old["BookDirectory"].as_str().unwrap().parse().unwrap();
+        let mut taker_acct: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::account(&taker_id)).unwrap()).unwrap();
+        let rules = Rules::new();
+        let probe_tx = serde_json::json!({});
+        {
+            let mut ctx = ApplyContext {
+                tx: &probe_tx,
+                view: &mut sandbox,
+                rules: &rules,
+                fees: &fees,
+            };
+            assert!(
+                advance_past_unfunded_quality(
+                    &mut ctx,
+                    &taker_id,
+                    &mut taker_acct,
+                    &dir,
+                    QualityAdvanceMode::PreQuality,
+                )
+                .unwrap()
+                .funded_tip_remains
+            );
+        }
+        assert_eq!(sandbox.read(&offer_key).unwrap(), old_offer);
+        assert_eq!(owner_count(&sandbox, TAKER), 1);
 
         assert_eq!(
             apply_flow(
