@@ -3049,10 +3049,18 @@ fn cross_book_hop_with_reaps(
                 if rate > one {
                     let mut cap = remaining_out.clone();
                     cap.iou = grossed(&remaining_out.iou, &rate);
-                    // Multi-hop last hop: +1 ULP so dest nets Amount (30000051).
-                    // Single-book (`terminal`) already matches leftover without it
-                    // (30000054 E60BA9E1).
-                    if !terminal {
+                    // A multi-hop last hop may need one extra gross ULP so the
+                    // recipient nets the requested Amount (30000051). Only add
+                    // it when the initial gross-up still nets short: in a later
+                    // strand pass it can already net exactly the remaining
+                    // demand (105501947 / TX21).
+                    if !terminal
+                        && gross_book_output_cap_nets_short(
+                            &cap.iou,
+                            &remaining_out.iou,
+                            transfer_rate_value(ctx, &offer_out.issuer),
+                        )
+                    {
                         if let Ok(bumped) =
                             IOUAmount::from_parts(cap.iou.mantissa() + 1, cap.iou.exponent(), false)
                         {
@@ -7632,6 +7640,12 @@ fn grossed(amount: &IOUAmount, rate: &IOUAmount) -> IOUAmount {
     }
 }
 
+fn gross_book_output_cap_nets_short(gross: &IOUAmount, demand: &IOUAmount, rate: u32) -> bool {
+    gross
+        .mul_ratio(1_000_000_000, rate, false)
+        .is_ok_and(|net| net < *demand)
+}
+
 /// Convert a BookPaymentStep's remaining gross source budget to the net input
 /// that can be offered to the current CLOB offer.
 fn net_book_payment_input(gross: &Leg, rate: u32) -> Leg {
@@ -10254,6 +10268,38 @@ mod taker_crossing_tests {
             false,
             &filled,
             &iou("10000"),
+        ));
+    }
+
+    #[test]
+    fn ledger_105501947_uni_gross_cap_already_nets_remaining_demand() {
+        let prior = [
+            Number::from_iou(&IOUAmount::from_decimal_string("0.6741286976833167").unwrap()),
+            Number::from_iou(&IOUAmount::from_decimal_string("0.6741286976833167").unwrap()),
+        ];
+        let requested = Number::from_iou(&IOUAmount::from_decimal_string("1.62").unwrap());
+        let remaining = requested.sub(&sum_smallest_to_largest(&prior)).to_iou();
+        assert_eq!(remaining.to_decimal_string(), "0.2717426046333666");
+        let rate = IOUAmount::from_parts(1_001_000_000, -9, false).unwrap();
+        let gross = super::grossed(&remaining, &rate);
+        assert_eq!(gross.to_decimal_string(), "0.272014347238");
+        let net = gross
+            .mul_ratio(1_000_000_000, 1_001_000_000, false)
+            .unwrap();
+        assert_eq!(net.to_decimal_string(), remaining.to_decimal_string());
+        assert!(!super::gross_book_output_cap_nets_short(
+            &gross,
+            &remaining,
+            1_001_000_000,
+        ));
+
+        let earlier_demand = IOUAmount::from_decimal_string("0.03666999476872078").unwrap();
+        let earlier_rate = IOUAmount::from_parts(1_003_000_000, -9, false).unwrap();
+        let earlier_gross = super::grossed(&earlier_demand, &earlier_rate);
+        assert!(super::gross_book_output_cap_nets_short(
+            &earlier_gross,
+            &earlier_demand,
+            1_003_000_000,
         ));
     }
 
