@@ -6244,14 +6244,27 @@ fn hop_amm_snapshot(ctx: &ApplyContext<'_>, hop: &FlowHop) -> Option<(AmmHop, Nu
     Some((amm_hop, pool_in, pool_out))
 }
 
-/// Price one CLOB tip band in the reverse direction: how much input the resting
+/// The collapsed XRP bridge cannot feed its next hop when the first reverse
+/// quote stops at a single-drop tip while that hop demands more XRP. Retry the
+/// first book across quality pages, then carry that scope into its forward walk
+/// (105502321/TX7). Other bridge quotes keep rippled's one-band behavior.
+fn bridge_xrp_one_drop_tip_needs_more_pages(
+    bridge_first_xrp: bool,
+    demanded: &Number,
+    initial_out: &Number,
+) -> bool {
+    bridge_first_xrp && demanded.to_xrp_drops() > 1 && initial_out.to_xrp_drops() == 1
+}
+
+/// Price a CLOB hop in the reverse direction: how much input the resting
 /// offers need to deliver `demanded` output, and what they actually deliver
-/// (`min(band capacity, demanded)`). The walk mutates the view (consumes /
+/// (`min(available capacity, demanded)`). The walk mutates the view (consumes /
 /// reaps offers) so it runs on a checkpoint that is immediately rolled back; the
 /// forward pass re-walks and commits the real consumption. Returns
 /// `(input_needed, output_delivered)` as `Number`s, or `None` when the band is
-/// dry. The `skip_*` flags mirror the forward application so the grossed/netted
-/// transfer-fee amounts match.
+/// dry. Most hops quote one quality band. A caller may retry the first XRP
+/// bridge hop across pages after a one-drop tip. The `skip_*` flags mirror the
+/// forward application so the grossed/netted transfer-fee amounts match.
 #[allow(clippy::too_many_arguments)]
 fn price_clob_band_reverse(
     ctx: &mut ApplyContext<'_>,
@@ -6266,8 +6279,10 @@ fn price_clob_band_reverse(
     permanent_reaps: &mut Vec<PermanentOffer>,
     uncapped_for_source_limit: bool,
     bridge_first_xrp: bool,
+    span_quality_pages: bool,
 ) -> Option<(Number, Number)> {
     let demand_leg = number_to_leg(demanded, &hop.out_leg);
+    let single_band = !(bridge_first_xrp && span_quality_pages);
     // A BookStep reverse pass starts from the requested output, before
     // StrandFlow compares its required input with SendMax. The capped quote
     // below preserves our existing forward pricing, but would stop before
@@ -6286,7 +6301,7 @@ fn price_clob_band_reverse(
             &unbounded_leg(&hop.in_leg),
             /*skip_input_debit=*/ true,
             /*skip_output_credit=*/ !is_last,
-            /*single_band=*/ true,
+            /*single_band=*/ single_band,
             /*allow_amm=*/ false,
             /*lq_stop=*/ None,
             /*preserve_input_limited_iou_ulp=*/ false,
@@ -6319,7 +6334,7 @@ fn price_clob_band_reverse(
         /*skip_input_debit=*/
         !is_first || !is_last,
         /*skip_output_credit=*/ !is_last,
-        /*single_band=*/ true,
+        /*single_band=*/ single_band,
         /*allow_amm=*/ false,
         /*lq_stop=*/ None,
         /*preserve_input_limited_iou_ulp=*/ false,
@@ -6540,16 +6555,20 @@ fn strand_quality_cap_reached(requested: &Number, capped: &Number, delivered: &N
 /// Execute ONE pass of a (multi-hop, AMM and/or CLOB) strand with rippled's
 /// reverse-then-forward `StrandFlow` algorithm (StrandFlow.h:80-281).
 ///
-/// Each hop consumes ONE quality band per pass. rippled's `BookStep` tries the
-/// AMM FIRST at the CLOB tip quality ([`AmmLiquidity::get_offer`]); the AMM
+/// Ordinarily each hop consumes one quality band per pass. The first XRP hop
+/// of an OfferCreate bridge can span pages in this collapsed execution when a
+/// one-drop tip leaves the downstream demand unmet (105502321/TX7). This is
+/// a local representation of the route; rippled's BookStep ordinarily keeps
+/// one quality per pass. BookStep tries the AMM first at the
+/// CLOB tip quality ([`AmmLiquidity::get_offer`]); the AMM
 /// declines (returns `None`) when its fib chunk is no better than the resting
-/// book, and the band is then filled by the CLOB tip alone (a one-band
-/// [`cross_book_hop`] walk). A pure-AMM hop is the fib chunk; a pure-CLOB hop is
-/// the tip band; a dry hop (neither) fails the strand this pass.
+/// book, and the band is then filled by the CLOB tip alone. A pure-AMM hop is
+/// the fib chunk; a pure-CLOB hop normally takes the tip band; a dry hop
+/// (neither) fails the strand this pass.
 ///
 /// **Reverse pass**: from the demanded strand output `remaining_out`, pull the
 /// demand back through every hop. An AMM hop's chunk is clamped to the demand via
-/// `limit_out`; a CLOB hop is priced by a one-band `cross_book_hop` on a
+/// `limit_out`; a CLOB hop is priced by `cross_book_hop` on a
 /// checkpoint that is immediately rolled back. The chunk/band's required input
 /// becomes the upstream hop's demand. The hop whose band cannot meet the
 /// back-propagated demand is the *limiting step*. The source (hop 0) is also
@@ -6624,6 +6643,7 @@ fn execute_strand_pass(
     let mut ins: Vec<Number> = vec![Number::ZERO; n];
     let mut outs: Vec<Number> = vec![Number::ZERO; n];
     let mut kinds: Vec<HopKindR> = vec![HopKindR::Amm; n];
+    let mut bridge_xrp_spans_pages = vec![false; n];
     // The lowest-index hop whose band cannot meet the demand pulled back to it;
     // `n` means "no interior limit" (only the source budget may bind).
     let mut limiting = n;
@@ -6696,20 +6716,49 @@ fn execute_strand_pass(
                 ));
             }
             kinds[h] = HopKindR::Clob;
-            let (i, o) = price_clob_band_reverse(
+            let source_budget =
+                (n == 1 && is_first && hop.liquidity.is_some()).then_some(remaining_in);
+            let uncapped_for_source_limit =
+                !offer_create_bridge && n == 1 && !hop.in_leg.is_xrp && hop.out_leg.is_xrp;
+            let bridge_first_xrp =
+                offer_create_bridge && is_first && !is_last && hop.out_leg.is_xrp;
+            let mut quote = price_clob_band_reverse(
                 ctx,
                 taker,
                 taker_acct,
                 dest,
                 hop,
                 &demanded,
-                (n == 1 && is_first && hop.liquidity.is_some()).then_some(remaining_in),
+                source_budget,
                 is_first,
                 is_last,
                 permanent_reaps,
-                !offer_create_bridge && n == 1 && !hop.in_leg.is_xrp && hop.out_leg.is_xrp,
-                offer_create_bridge && is_first && !is_last && hop.out_leg.is_xrp,
+                uncapped_for_source_limit,
+                bridge_first_xrp,
+                false,
             )?;
+            if bridge_xrp_one_drop_tip_needs_more_pages(bridge_first_xrp, &demanded, &quote.1)
+                && let Some(expanded) = price_clob_band_reverse(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    dest,
+                    hop,
+                    &demanded,
+                    source_budget,
+                    is_first,
+                    is_last,
+                    permanent_reaps,
+                    uncapped_for_source_limit,
+                    bridge_first_xrp,
+                    true,
+                )
+                && num_gt(&expanded.1, &quote.1)
+            {
+                quote = expanded;
+                bridge_xrp_spans_pages[h] = true;
+            }
+            let (i, o) = quote;
             ins[h] = i;
             outs[h] = o;
             // The band delivered less than demanded -> this hop limits the pass.
@@ -6841,6 +6890,9 @@ fn execute_strand_pass(
                 // available input (`BookStep::fwd`, input-limited).
                 let bridge_xrp_reverse =
                     offer_create_bridge && is_first && !is_last && hop.out_leg.is_xrp;
+                // Reuse the exact directory scope selected by the reverse
+                // quote; other bridge fills stay within their first band.
+                let single_band = !bridge_xrp_spans_pages[h];
                 let (demand_leg, budget_leg) = if is_first && source_capped {
                     (
                         unbounded_leg(&hop.out_leg),
@@ -6868,7 +6920,7 @@ fn execute_strand_pass(
                     &budget_leg,
                     /*skip_input_debit=*/ !is_first,
                     /*skip_output_credit=*/ !is_last,
-                    /*single_band=*/ true,
+                    /*single_band=*/ single_band,
                     /*allow_amm=*/ false,
                     /*lq_stop=*/ None,
                     /*preserve_input_limited_iou_ulp=*/
@@ -12765,6 +12817,7 @@ mod taker_bridge_integration {
             &mut Vec::new(),
             false,
             false,
+            false,
         )
         .unwrap();
 
@@ -12772,6 +12825,154 @@ mod taker_bridge_integration {
         assert_eq!(priced.1.to_iou().to_decimal_string(), "10");
         assert_eq!(taker_acct, taker_before);
         assert_eq!(ctx.view.read(&offer_key).unwrap(), offer_before);
+    }
+
+    #[test]
+    fn ledger_105502321_bridge_xrp_quote_crosses_one_drop_tip_and_next_quality() {
+        let mut ledger = Ledger::genesis();
+        for account in [ISS, TAKER, O1, O2] {
+            put_acct(&mut ledger, account, 1_000_000_000, 0);
+        }
+        for account in [TAKER, O1, O2] {
+            put_line(
+                &mut ledger,
+                account,
+                b"AAA",
+                if account == TAKER { 1000 } else { 0 },
+            );
+        }
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        for (owner, gets, pays) in [
+            (O1, "1", "0.0000613515"),
+            (O2, "265593709", "16371.85378035912"),
+        ] {
+            assert_eq!(
+                apply_offer(
+                    &mut sandbox,
+                    &fees,
+                    &serde_json::json!({
+                        "TransactionType": "OfferCreate", "Account": owner,
+                        "Fee": "12", "Sequence": 1,
+                        "TakerGets": gets,
+                        "TakerPays": {"currency": "AAA", "issuer": ISS, "value": pays},
+                    }),
+                ),
+                TransactionResult::TesSuccess
+            );
+        }
+        // TX7's leading page retained its directory quality after earlier
+        // partial fills, but its live offer fields had only one drop left.
+        let tiny_key = keylet::offer(&decode_account_id(O1).unwrap(), 1);
+        let mut tiny: Value = serde_json::from_slice(&sandbox.read(&tiny_key).unwrap()).unwrap();
+        tiny["TakerPays"]["value"] = Value::String("0.00000000000012".into());
+        sandbox
+            .update(tiny_key, serde_json::to_vec(&tiny).unwrap())
+            .unwrap();
+
+        let taker = decode_account_id(TAKER).unwrap();
+        let maker = decode_account_id(O2).unwrap();
+        let maker_before = xrp_bal(&sandbox, O2);
+        let mut taker_acct: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::account(&taker)).unwrap()).unwrap();
+        let rules =
+            Rules::from_enabled([feature_id("FlowCross"), feature_id("fixUniversalNumber")]);
+        let tx = serde_json::json!({});
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let strand = build_flow_strand(
+            &ctx,
+            &[
+                serde_json::json!({"currency": "AAA", "issuer": ISS, "value": "1000"}),
+                serde_json::json!("0"),
+            ],
+        )
+        .unwrap();
+        let demanded = Number::from_int(2_702_825);
+        let ordinary_quote = price_clob_band_reverse(
+            &mut ctx,
+            &taker,
+            &mut taker_acct,
+            &taker,
+            &strand.hops[0],
+            &demanded,
+            None,
+            true,
+            false,
+            &mut Vec::new(),
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(ordinary_quote.1.to_xrp_drops(), 1);
+        assert!(bridge_xrp_one_drop_tip_needs_more_pages(
+            true,
+            &demanded,
+            &ordinary_quote.1,
+        ));
+        assert!(!bridge_xrp_one_drop_tip_needs_more_pages(
+            false,
+            &demanded,
+            &ordinary_quote.1,
+        ));
+        let quoted = price_clob_band_reverse(
+            &mut ctx,
+            &taker,
+            &mut taker_acct,
+            &taker,
+            &strand.hops[0],
+            &demanded,
+            None,
+            true,
+            false,
+            &mut Vec::new(),
+            false,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(quoted.1.to_xrp_drops(), 2_702_825);
+        assert!(
+            ctx.view.read(&tiny_key).is_some(),
+            "reverse quote rolls back"
+        );
+
+        let (delivered, spent) = cross_book_hop(
+            &mut ctx,
+            &taker,
+            &mut taker_acct,
+            &taker,
+            &number_to_leg(&quoted.1, &strand.hops[0].out_leg),
+            &number_to_leg(&quoted.0, &strand.hops[0].in_leg),
+            false,
+            true,
+            false,
+            false,
+            None,
+            false,
+            true,
+            1_000_000_000,
+            false,
+        )
+        .unwrap();
+        assert_eq!(delivered.drops, 2_702_825);
+        assert_eq!(spent.iou, quoted.0.to_iou());
+        assert!(ctx.view.read(&tiny_key).is_none());
+        let next: Value =
+            serde_json::from_slice(&ctx.view.read(&keylet::offer(&maker, 1)).unwrap()).unwrap();
+        assert_eq!(next["TakerGets"], "262890885");
+        let maker_after: Value =
+            serde_json::from_slice(&ctx.view.read(&keylet::account(&maker)).unwrap()).unwrap();
+        assert_eq!(
+            maker_after["Balance"],
+            (maker_before - 2_702_824).to_string()
+        );
     }
 
     #[test]
@@ -12858,6 +13059,7 @@ mod taker_bridge_integration {
             true,
             true,
             &mut reaps,
+            false,
             false,
             false,
         )
