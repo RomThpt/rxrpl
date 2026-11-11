@@ -962,6 +962,17 @@ fn create_lp_line(
             .update(holder_key, data)
             .map_err(|_| TransactionResult::TefInternal)?;
     }
+
+    // Applying a newly created RippleState threads both owner AccountRoots.
+    // The AMM peer therefore gets a metadata-only modification here.
+    let amm_key = keylet::account(amm_account);
+    let amm_bytes = ctx
+        .view
+        .read(&amm_key)
+        .ok_or(TransactionResult::TefInternal)?;
+    ctx.view
+        .update(amm_key, amm_bytes)
+        .map_err(|_| TransactionResult::TefInternal)?;
     Ok(())
 }
 
@@ -1125,6 +1136,15 @@ mod tests {
             serde_json::from_slice(&sandbox.read(&line_key).unwrap()).unwrap();
         assert_eq!(line["LowNode"], "0000000000000000");
         assert_eq!(line["HighNode"], "0000000000000000");
+
+        let amm_key = keylet::account(&amm);
+        let changes = sandbox.into_changes();
+        assert!(changes.updates.contains_key(&amm_key));
+        assert_eq!(
+            changes.updates.get(&amm_key),
+            changes.originals.get(&amm_key),
+            "the AMM AccountRoot must be threaded without field changes"
+        );
     }
 
     #[test]
