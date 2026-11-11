@@ -819,6 +819,273 @@ fn iou(currency: &str, issuer: &str, value: &str) -> serde_json::Value {
     serde_json::json!({ "currency": currency, "issuer": issuer, "value": value })
 }
 
+#[test]
+fn ledger_105501848_payment_preserves_one_drop_offer_remainder() {
+    const SOURCE: &str = "rapido5rxPmP4YkMZZEeXSHqWefxHEkqv6";
+    const RLUSD_ISSUER: &str = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De";
+    const USDC_ISSUER: &str = "rGm7WCVp9gb4jZHWTEtGUr4dd74z2XuWhE";
+    const FIRST_MAKER: &str = "rMD4yLkCJR6GRXMWayjDXPe2rEAA4kN7Vo";
+    const XRP_MAKER: &str = "rMJ1ejWzy5AEF2tzFrv8FQpeR83DMLUQYq";
+    const EXPIRED_MAKER: &str = "rnxuVDjxdbyPZmizQG74CNn8KxZQxBfovQ";
+    const RLUSD_USDC_POOL: &str = "rfWfhoLj3LiaBpoxus3h7pEF8jXDMtyGqb";
+    const USDC_XRP_POOL: &str = "rM7cHVPfhe9yxQNk2kDNBEQqoQmMcQGPWE";
+    const RLUSD: &str = "524C555344000000000000000000000000000000";
+    const USDC: &str = "5553444300000000000000000000000000000000";
+
+    let mut ledger = Ledger::genesis();
+    ledger.header.parent_close_time = 836_999_700;
+    for (account, balance) in [
+        (SOURCE, "2184961647"),
+        (RLUSD_ISSUER, "100000000"),
+        (USDC_ISSUER, "100000000"),
+        (FIRST_MAKER, "100000000"),
+        (XRP_MAKER, "211347499"),
+        (EXPIRED_MAKER, "133734652"),
+        (RLUSD_USDC_POOL, "100000000"),
+        (USDC_XRP_POOL, "250209990666"),
+    ] {
+        put_account(&mut ledger, account, balance, None);
+    }
+    let put_exact_line =
+        |ledger: &mut Ledger, holder: &str, issuer: &str, currency: &str, value: &str| {
+            let holder_id = decode_account_id(holder).unwrap();
+            let issuer_id = decode_account_id(issuer).unwrap();
+            let holder_is_low = holder_id.as_bytes() < issuer_id.as_bytes();
+            let (low, high) = if holder_is_low {
+                (holder, issuer)
+            } else {
+                (issuer, holder)
+            };
+            let amount = IOUAmount::from_decimal_string(value).unwrap();
+            let stored = if holder_is_low {
+                amount
+            } else {
+                amount.negate()
+            };
+            let key = keylet::trust_line(
+                &holder_id,
+                &issuer_id,
+                &helpers::currency_to_bytes(currency),
+            );
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState",
+                "Balance": iou(currency, issuer, &stored.to_decimal_string()),
+                "LowLimit": iou(currency, low, "1000000000"),
+                "HighLimit": iou(currency, high, "1000000000"),
+                "Flags": 0,
+            });
+            ledger
+                .put_state(key, serde_json::to_vec(&line).unwrap())
+                .unwrap();
+        };
+    put_exact_line(
+        &mut ledger,
+        SOURCE,
+        RLUSD_ISSUER,
+        RLUSD,
+        "28.02740875124528",
+    );
+    put_exact_line(
+        &mut ledger,
+        FIRST_MAKER,
+        USDC_ISSUER,
+        USDC,
+        "270.8234191461338",
+    );
+    put_exact_line(
+        &mut ledger,
+        FIRST_MAKER,
+        RLUSD_ISSUER,
+        RLUSD,
+        "732.2821185749542",
+    );
+    put_exact_line(
+        &mut ledger,
+        XRP_MAKER,
+        USDC_ISSUER,
+        USDC,
+        "106.2379096501494",
+    );
+    put_exact_line(
+        &mut ledger,
+        RLUSD_USDC_POOL,
+        RLUSD_ISSUER,
+        RLUSD,
+        "26112.22362237784",
+    );
+    put_exact_line(
+        &mut ledger,
+        RLUSD_USDC_POOL,
+        USDC_ISSUER,
+        USDC,
+        "26107.98478271181",
+    );
+    put_exact_line(
+        &mut ledger,
+        USDC_XRP_POOL,
+        USDC_ISSUER,
+        USDC,
+        "278031.9308198443",
+    );
+    for (in_currency, in_issuer, out_currency, out_issuer, pool, trading_fee) in [
+        (RLUSD, RLUSD_ISSUER, USDC, USDC_ISSUER, RLUSD_USDC_POOL, 144),
+        (USDC, USDC_ISSUER, "XRP", "", USDC_XRP_POOL, 202),
+    ] {
+        let in_issue = helpers::currency_to_bytes(in_currency);
+        let out_issue = if out_issuer.is_empty() {
+            [0u8; 20]
+        } else {
+            helpers::currency_to_bytes(out_currency)
+        };
+        let in_id = decode_account_id(in_issuer).unwrap();
+        let out_id = if out_issuer.is_empty() {
+            rxrpl_primitives::AccountId::from([0u8; 20])
+        } else {
+            decode_account_id(out_issuer).unwrap()
+        };
+        let key = keylet::amm(&in_issue, &in_id, &out_issue, &out_id);
+        let amm = serde_json::json!({
+            "LedgerEntryType": "AMM", "Account": pool, "TradingFee": trading_fee,
+            "Asset": iou(in_currency, in_issuer, "0"),
+            "Asset2": if out_issuer.is_empty() { serde_json::json!("XRP") } else { iou(out_currency, out_issuer, "0") },
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&amm).unwrap())
+            .unwrap();
+    }
+
+    let first_key = keylet::offer(&decode_account_id(FIRST_MAKER).unwrap(), 97_841_048);
+    let xrp_key = keylet::offer(&decode_account_id(XRP_MAKER).unwrap(), 103_226_649);
+    let expired_key = keylet::offer(&decode_account_id(EXPIRED_MAKER).unwrap(), 105_077_784);
+    let first_dir: rxrpl_primitives::Hash256 =
+        "7C6A9A828B1706963B14E79B9574970324C5A0486104C7B255038DAAE1F7101B"
+            .parse()
+            .unwrap();
+    let xrp_dir: rxrpl_primitives::Hash256 =
+        "29958A9E8FDB4462AB486E269C735F52ADDAEDF354F9F40E4F03F1C7ECCA3F71"
+            .parse()
+            .unwrap();
+    let expired_dir: rxrpl_primitives::Hash256 =
+        "29958A9E8FDB4462AB486E269C735F52ADDAEDF354F9F40E4F03F334EBCD0D7A"
+            .parse()
+            .unwrap();
+    for (key, dir, owner, sequence, gets, pays, expiration) in [
+        (
+            first_key,
+            first_dir,
+            FIRST_MAKER,
+            97_841_048,
+            iou(USDC, USDC_ISSUER, "270.823419"),
+            iou(RLUSD, RLUSD_ISSUER, "270.874876845385"),
+            None,
+        ),
+        (
+            xrp_key,
+            xrp_dir,
+            XRP_MAKER,
+            103_226_649,
+            serde_json::json!("25239075"),
+            iou(USDC, USDC_ISSUER, "28.02208441078648"),
+            None,
+        ),
+        (
+            expired_key,
+            expired_dir,
+            EXPIRED_MAKER,
+            105_077_784,
+            serde_json::json!("4000000"),
+            iou(USDC, USDC_ISSUER, "4.44733420026007"),
+            Some(836_999_620),
+        ),
+    ] {
+        let mut offer = serde_json::json!({
+            "LedgerEntryType": "Offer", "Account": owner, "Sequence": sequence,
+            "BookDirectory": dir.to_string(), "BookNode": "0", "OwnerNode": "0",
+            "TakerGets": gets, "TakerPays": pays, "Flags": if expiration.is_some() { 65536 } else { 0 },
+        });
+        if let Some(exp) = expiration {
+            offer["Expiration"] = serde_json::json!(exp);
+        }
+        ledger
+            .put_state(key, serde_json::to_vec(&offer).unwrap())
+            .unwrap();
+        let directory = serde_json::json!({
+            "LedgerEntryType": "DirectoryNode", "RootIndex": dir.to_string(),
+            "Indexes": [key.to_string()], "IndexNext": "0", "IndexPrevious": "0", "Flags": 0,
+        });
+        ledger
+            .put_state(dir, serde_json::to_vec(&directory).unwrap())
+            .unwrap();
+        let owner_id = decode_account_id(owner).unwrap();
+        let owner_dir = keylet::owner_dir(&owner_id);
+        let owner_directory = serde_json::json!({
+            "LedgerEntryType": "DirectoryNode", "Owner": owner,
+            "RootIndex": owner_dir.to_string(), "Indexes": [key.to_string()],
+            "IndexNext": "0", "IndexPrevious": "0", "Flags": 0,
+        });
+        ledger
+            .put_state(owner_dir, serde_json::to_vec(&owner_directory).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::from_enabled([feature_id("FlowCross"), feature_id("fixUniversalNumber")]);
+    let tx = serde_json::json!({
+        "TransactionType": "Payment", "Account": SOURCE, "Destination": SOURCE,
+        "Amount": "37858613", "SendMax": iou(RLUSD, RLUSD_ISSUER, "42.04111312686792"),
+        "Paths": [[{"currency": USDC, "issuer": USDC_ISSUER}, {"account": USDC_ISSUER}]],
+        "Flags": 196608, "Fee": "10", "Sequence": 36_955_434,
+    });
+    let boundaries = build_path_boundaries(
+        &view,
+        tx["Paths"][0].as_array().unwrap(),
+        &tx["SendMax"],
+        &tx["Amount"],
+        SOURCE,
+    )
+    .unwrap();
+    assert_eq!(boundaries.len(), 3);
+    assert_eq!(
+        count_flow_strands(&view, &tx, &tx["SendMax"], &tx["Amount"]),
+        1
+    );
+    assert!(flow_strands_have_amm(
+        &view,
+        &tx,
+        &tx["SendMax"],
+        &tx["Amount"]
+    ));
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut ctx),
+        Ok(TransactionResult::TesSuccess)
+    );
+    let remainder: Value =
+        serde_json::from_slice(&sandbox.read(&xrp_key).expect("XRP offer survives")).unwrap();
+    assert_eq!(remainder["TakerGets"], "1");
+    assert_eq!(remainder["TakerPays"]["value"], "0.00000000000001");
+    assert_eq!(
+        sandbox.take_delivered_amount(),
+        Some(serde_json::json!("25239074"))
+    );
+    assert!(
+        sandbox.read(&expired_key).is_none(),
+        "expired offer is reaped"
+    );
+    assert!(
+        sandbox.read(&expired_dir).is_none(),
+        "expired book directory is erased"
+    );
+}
+
 fn holder_balance(view: &dyn ReadView, holder: &str, issuer: &str, currency: &str) -> f64 {
     let holder_id = decode_account_id(holder).unwrap();
     let issuer_id = decode_account_id(issuer).unwrap();

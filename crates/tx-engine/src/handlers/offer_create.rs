@@ -3472,6 +3472,88 @@ fn should_bump_partial_path_credit(
     skip_input_debit && !consumed_whole_offer && taker != dest
 }
 
+/// The reverse BookStep quotes the requested output before the source budget
+/// limits the forward fill. OfferStream advances past a short first quality
+/// band, permanently removing expired offers before checking the next band's
+/// quality. Preserve those removals even if the forward fill stops in that
+/// first band with a one-drop offer remainder.
+fn reap_expired_reverse_xrp_book_tail(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    input: &Leg,
+    output: &Leg,
+    demand: &Leg,
+) -> Vec<PermanentOffer> {
+    let mut reaps = Vec::new();
+    if !output.is_xrp || !demand.is_xrp {
+        return reaps;
+    }
+    let book = keylet::book_dir(
+        &input.currency,
+        &input.issuer,
+        &output.currency,
+        &output.issuer,
+    );
+    let prefix = &book.as_bytes()[..24];
+    let mut probe = book_dir_with_quality(&book, 0);
+    let mut first_quality = None;
+    let mut available = 0u64;
+    while let Some(dir_key) = ctx.view.succ(&probe) {
+        if &dir_key.as_bytes()[..24] != prefix {
+            break;
+        }
+        probe = dir_key;
+        let quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
+        for offer_key in book_dir_indexes(ctx, &dir_key) {
+            let Some(bytes) = ctx.view.read(&offer_key) else {
+                continue;
+            };
+            let Ok(offer) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            if offer.get("LedgerEntryType").and_then(Value::as_str) != Some("Offer") {
+                continue;
+            }
+            let Some(owner) = offer
+                .get("Account")
+                .and_then(Value::as_str)
+                .and_then(|address| decode_account_id(address).ok())
+            else {
+                continue;
+            };
+            if &owner == taker {
+                continue;
+            }
+            if offer
+                .get("Expiration")
+                .and_then(Value::as_u64)
+                .is_some_and(|expiration| expiration <= ctx.view.parent_close_time() as u64)
+            {
+                reaps.push((owner, offer_key, dir_key));
+                continue;
+            }
+            // BookStep checks the next funded offer's quality only after the
+            // stream has discarded expired entries in front of it.
+            if first_quality.is_some_and(|first| first != quality) {
+                return reaps;
+            }
+            let Some(gets) = offer.get("TakerGets").and_then(Leg::parse) else {
+                continue;
+            };
+            let funds = owner_funds_leg(ctx, &owner, &gets);
+            if funds.is_zero() {
+                continue;
+            }
+            first_quality.get_or_insert(quality);
+            available = available.saturating_add(leg_min(&gets, &funds).drops.max(0) as u64);
+            if available >= demand.drops.max(0) as u64 {
+                return reaps;
+            }
+        }
+    }
+    reaps
+}
+
 /// Cross a chain of order books (a single resolved path), forwarding each
 /// book's output as the next book's input budget. `boundaries[0]` is the
 /// source asset (carrying the `SendMax`/budget magnitude on entry), each
@@ -3537,6 +3619,13 @@ pub(crate) fn cross_path_payment(
         &carry,
     )? {
         return Ok(res);
+    }
+
+    if n >= 3 && final_demand.is_xrp && !limit_quality {
+        let input = Leg::parse(&boundaries[n - 2]).ok_or(TransactionResult::TemBadAmount)?;
+        let output = Leg::parse(&boundaries[n - 1]).ok_or(TransactionResult::TemBadAmount)?;
+        let reaps = reap_expired_reverse_xrp_book_tail(ctx, taker, &input, &output, &final_demand);
+        apply_permanent_reaps(ctx, &reaps);
     }
 
     // tfLimitQuality: refuse the path when the composed best-offer quality is
@@ -6363,6 +6452,15 @@ fn execute_strand_pass(
             // CLOB tip band for the demand pulled to this hop. Done on a
             // checkpoint that is rolled back — the forward pass re-runs the walk
             // and commits the offer consumption / reaps.
+            if is_last && hop.out_leg.is_xrp {
+                permanent_reaps.extend(reap_expired_reverse_xrp_book_tail(
+                    ctx,
+                    taker,
+                    &hop.in_leg,
+                    &hop.out_leg,
+                    &number_to_leg(&demanded, &hop.out_leg),
+                ));
+            }
             kinds[h] = HopKindR::Clob;
             let (i, o) = price_clob_band_reverse(
                 ctx,
@@ -8037,8 +8135,7 @@ fn full_offer_take(
 ) -> bool {
     leg_ge(avail_out, offer_out)
         && (leg_ge(take_out, offer_out)
-            || (leg_ge(remaining_in, offer_in) && leg_ge(remaining_out, offer_out))
-            || (legs_eq_or_one_ulp(remaining_in, offer_in) && leg_ge(remaining_out, offer_out)))
+            || (leg_ge(remaining_in, offer_in) && leg_ge(remaining_out, offer_out)))
 }
 
 /// Pack an `IOUAmount` rate into a book-directory quality u64 (rippled
