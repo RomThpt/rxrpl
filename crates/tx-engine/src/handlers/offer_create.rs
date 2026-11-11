@@ -1291,6 +1291,34 @@ fn cross_offers(
     let mut remaining_out_num = leg_to_number(&out_leg);
     let mut remaining_in = in_leg.clone();
     let mut source_remaining = source_budget.clone();
+    // The source DirectStep settles one aggregate input for a CLOB pass. Keep
+    // its pre-crossing balance so multiple offer debits do not round the trust
+    // line after every synthetic fill (105501905 / BB5D7C46).
+    let source_balance = if number_switchover
+        && !in_leg.is_xrp
+        && in_leg.issuer != *taker
+        && (in_leg.currency != out_leg.currency || in_leg.issuer != out_leg.issuer)
+        && transfer_rate_value(ctx, &in_leg.issuer) == 1_000_000_000
+    {
+        let key = keylet::trust_line(taker, &in_leg.issuer, &in_leg.currency);
+        ctx.view
+            .read(&key)
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|line| {
+                IOUAmount::from_decimal_string(line["Balance"]["value"].as_str()?).ok()
+            })
+            .map(|balance| FlowSourceBalance {
+                key,
+                balance,
+                holder_is_high: taker.as_bytes() > in_leg.issuer.as_bytes(),
+            })
+    } else {
+        None
+    };
+    let mut clob_source_spent = Vec::new();
+    let mut clob_quality = None;
+    let mut mixed_clob_quality = false;
+    let mut non_clob_source_spent = false;
     let mut crossed = false;
     let mut reaped_self_offer = false;
     // A CLOB-bounded AMM pass can leave only a self/unfunded tip behind. In
@@ -1500,6 +1528,7 @@ fn cross_offers(
         if !remaining_out.is_zero() && !remaining_in.is_zero() {
             if let Some(b) = &bridge {
                 let before = remaining_out.clone();
+                let source_before_bridge = source_remaining.clone();
                 let multi_path = offer_crossing_strand_reaches_limit(
                     ctx, taker, taker_gets, taker_pays, threshold,
                 );
@@ -1518,6 +1547,7 @@ fn cross_offers(
                     dir_quality,
                     is_sell,
                 )?;
+                non_clob_source_spent |= leg_gt(&source_before_bridge, &source_remaining);
                 if !leg_ge(&before, &remaining_out) || !leg_ge(&remaining_out, &before) {
                     remaining_out_num = leg_to_number(&remaining_out);
                 }
@@ -1542,6 +1572,7 @@ fn cross_offers(
                     /*cap_ending_spot_price=*/ true,
                 )?;
                 amm_consumed_in_band = leg_gt(&source_before_amm, &source_remaining);
+                non_clob_source_spent |= amm_consumed_in_band;
                 if continue_to_clob {
                     // execOffer evaluates self-cross removal before its CLOB
                     // callback checks the now-remaining budget. Mirror that
@@ -1843,6 +1874,11 @@ fn cross_offers(
                 &order_out,
                 number_switchover,
             )?;
+            if source_balance.is_some() {
+                mixed_clob_quality |= clob_quality.is_some_and(|quality| quality != dir_quality);
+                clob_quality = Some(dir_quality);
+                clob_source_spent.push(leg_to_number(&gross_in));
+            }
             clob_offer_attempted = true;
             skip_amm_after_self_tip = false;
             terminal_amm_allowed = true;
@@ -1935,6 +1971,7 @@ fn cross_offers(
     // gated: a single crossed CLOB offer must not suppress better AMM liquidity.
     if !remaining_out.is_zero() && !remaining_in.is_zero() {
         if let Some(b) = &bridge {
+            let source_before_bridge = source_remaining.clone();
             let multi_path =
                 offer_crossing_strand_reaches_limit(ctx, taker, taker_gets, taker_pays, threshold);
             try_bridge_step(
@@ -1952,6 +1989,7 @@ fn cross_offers(
                 threshold,
                 is_sell,
             )?;
+            non_clob_source_spent |= leg_gt(&source_before_bridge, &source_remaining);
         }
         // BookStep retries AMM with no CLOB quality only when the book was
         // empty at the start of this pass. Reaping a self-owned tip with no
@@ -1972,6 +2010,7 @@ fn cross_offers(
                 is_sell,
                 /*cap_ending_spot_price=*/ false,
             )?;
+            non_clob_source_spent |= leg_gt(&source_before_amm, &source_remaining);
             if terminal_amm_reaches_deferred_clob(
                 is_sell,
                 leg_gt(&source_before_amm, &source_remaining),
@@ -1988,6 +2027,17 @@ fn cross_offers(
                 )?;
             }
         }
+    }
+
+    if clob_source_spent.len() > 1
+        && is_sell
+        && remaining_in.is_zero()
+        && !mixed_clob_quality
+        && !non_clob_source_spent
+        && let Some(source) = source_balance.as_ref()
+    {
+        let spent = sum_smallest_to_largest(&clob_source_spent);
+        reconcile_flow_source_balance(ctx, source, &spent);
     }
 
     Ok((
@@ -9331,22 +9381,23 @@ fn taker_cross(
 mod taker_crossing_tests {
     use super::{
         BalanceRounding, Leg, TakerCrossType, add_iou_balance, add_iou_balance_downward,
-        add_iou_balance_half_upward, amm_pool_debit_rounding, amm_step_allows_clob,
-        book_step_input_exhausted, clob_band_allows_terminal_amm, composed_quality,
-        consumes_full_offer, crossing_quality_threshold, crossing_threshold, debit_drains_source,
-        flow_iou_to_iou, flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou, full_offer_take,
-        funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
-        in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
-        leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
+        add_iou_balance_half_upward, aggregate_flow_source_balance_number, amm_pool_debit_rounding,
+        amm_step_allows_clob, book_step_input_exhausted, clob_band_allows_terminal_amm,
+        composed_quality, consumes_full_offer, crossing_quality_threshold, crossing_threshold,
+        debit_drains_source, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou,
+        full_offer_take, funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out,
+        in_for_out_offer, in_for_out_round, input_limited_uses_full_budget, leftover_is_dust,
+        leftover_leg, leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
         legacy_intermediate_xrp_rounding_applies, net_book_payment_input, net_offer_input_budget,
         number_to_leg, out_for_in, own_tip_can_be_reaped, pack_rate, parity_rate,
         preserve_flow_input_limited_iou_ulp, preserve_next_quality_self_offer, qual_div, qual_mul,
         reject_quality, remaining_is_filled, remaining_is_filled_at, remaining_offer,
         scale_funds_limited_input, select_path, sell_clamp_sub, should_bump_partial_path_credit,
         should_reap_tiny_increased_quality, should_trim_input_limited_iou_leftover,
-        terminal_amm_reaches_deferred_clob, terminal_budget_binds, zero_cost_funded_xrp_offer,
-        zero_cost_xrp_clob_fill,
+        sum_smallest_to_largest, terminal_amm_reaches_deferred_clob, terminal_budget_binds,
+        zero_cost_funded_xrp_offer, zero_cost_xrp_clob_fill,
     };
+    use rxrpl_amount::number::Number;
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, get_rate_round_even, offer_quality};
     use rxrpl_primitives::AccountId;
     use rxrpl_protocol::keylet;
@@ -9453,6 +9504,24 @@ mod taker_crossing_tests {
                 .unwrap()
                 .to_decimal_string(),
             "-2178.567102560522"
+        );
+    }
+
+    #[test]
+    fn ledger_105501905_direct_clob_source_debits_once() {
+        let before = IOUAmount::from_decimal_string("1535.346215477393").unwrap();
+        let debits = ["243.6968029113126", "779.8129600886874"]
+            .map(|value| IOUAmount::from_decimal_string(value).unwrap());
+        let sequential = debits.iter().fold(before, |balance, debit| {
+            IOUAmount::add_round(&balance, &debit.negate()).unwrap()
+        });
+        assert_eq!(sequential.to_decimal_string(), "511.8364524773926");
+
+        let spent = sum_smallest_to_largest(&debits.map(|debit| Number::from_iou(&debit)));
+        assert_eq!(spent.to_iou().to_decimal_string(), "1023.509763");
+        assert_eq!(
+            aggregate_flow_source_balance_number(&before, &spent, false).to_decimal_string(),
+            "511.836452477393"
         );
     }
 
@@ -13220,6 +13289,163 @@ mod flow_cross_own_unfunded {
                 serde_json::to_vec(&line).unwrap(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn ledger_105501905_two_offer_cross_preserves_taker_bbrl_balance() {
+        const BBRL_ISSUER: &str = "rH5CJsqvNqZGxrMyGaqLEoMWRYcVTAPZMt";
+        const RLUSD_ISSUER: &str = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De";
+        const TAKER: &str = "rEariHxzoKiUAe5wZ5jVA8YkZnankoQGUo";
+        const FIRST: &str = "rsevkvX1VDf6CiLNEaCJnChJewVt9rGeEc";
+        const SECOND: &str = "rnhHK8HbgNQMT7Wj7giUC2ez3j5CcgDDgT";
+        const BBRL: &str = "4242524C00000000000000000000000000000000";
+        const RLUSD: &str = "524C555344000000000000000000000000000000";
+
+        let mut ledger = Ledger::genesis();
+        for address in [BBRL_ISSUER, RLUSD_ISSUER, TAKER, FIRST, SECOND] {
+            let id = decode_account_id(address).unwrap();
+            let account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": address,
+                "Balance": "1000000000", "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        for (holder, issuer, currency, balance) in [
+            (TAKER, BBRL_ISSUER, BBRL, "1535.346215477393"),
+            (TAKER, RLUSD_ISSUER, RLUSD, "686.5101154185002"),
+            (FIRST, BBRL_ISSUER, BBRL, "974.7302373571656"),
+            (FIRST, RLUSD_ISSUER, RLUSD, "47.2390484049222"),
+            (SECOND, BBRL_ISSUER, BBRL, "0.000000149825"),
+            (SECOND, RLUSD_ISSUER, RLUSD, "248.0038304841648"),
+        ] {
+            let holder_id = decode_account_id(holder).unwrap();
+            let issuer_id = decode_account_id(issuer).unwrap();
+            let (low, high, stored) = if holder_id.as_bytes() < issuer_id.as_bytes() {
+                (holder, issuer, balance.to_string())
+            } else {
+                (issuer, holder, format!("-{balance}"))
+            };
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState",
+                "Balance": {"currency": currency, "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": stored},
+                "LowLimit": {"currency": currency, "issuer": low, "value": "1000000000"},
+                "HighLimit": {"currency": currency, "issuer": high, "value": "1000000000"},
+                "Flags": 0,
+            });
+            ledger
+                .put_state(
+                    keylet::trust_line(
+                        &holder_id,
+                        &issuer_id,
+                        &helpers::currency_to_bytes(currency),
+                    ),
+                    serde_json::to_vec(&line).unwrap(),
+                )
+                .unwrap();
+        }
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let bbrl = |value: &str| {
+            serde_json::json!({
+                "currency": BBRL, "issuer": BBRL_ISSUER, "value": value,
+            })
+        };
+        let rlusd = |value: &str| {
+            serde_json::json!({
+                "currency": RLUSD, "issuer": RLUSD_ISSUER, "value": value,
+            })
+        };
+        let rules =
+            Rules::from_enabled([feature_id("FlowCross"), feature_id("fixUniversalNumber")]);
+        for (owner, gets, pays) in [
+            (FIRST, "47.2390485466388", "243.6968036424"),
+            (SECOND, "248.003831", "1279.4021633628"),
+        ] {
+            let tx = serde_json::json!({
+                "TransactionType": "OfferCreate", "Account": owner,
+                "Fee": "10", "Sequence": 1, "Flags": TF_PASSIVE | TF_SELL,
+                "TakerGets": rlusd(gets), "TakerPays": bbrl(pays),
+            });
+            let mut child = sandbox.child();
+            let mut ctx = ApplyContext {
+                tx: &tx,
+                view: &mut child,
+                rules: &rules,
+                fees: &fees,
+            };
+            assert_eq!(
+                OfferCreateTransactor.apply(&mut ctx),
+                Ok(TransactionResult::TesSuccess)
+            );
+            sandbox.merge_child_changes(child.into_changes());
+        }
+        let first = decode_account_id(FIRST).unwrap();
+        let second = decode_account_id(SECOND).unwrap();
+        let first_key = keylet::offer(&first, 1);
+        let second_key = keylet::offer(&second, 1);
+        let mut first_offer: Value =
+            serde_json::from_slice(&sandbox.read(&first_key).unwrap()).unwrap();
+        let second_offer: Value =
+            serde_json::from_slice(&sandbox.read(&second_key).unwrap()).unwrap();
+        // The first offer had been partly filled before this ledger. Its
+        // amounts drifted one quality ULP, while BookDirectory stayed at the
+        // original quality shared with the second offer.
+        let old_dir: Hash256 = first_offer["BookDirectory"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let oracle_dir: Hash256 = second_offer["BookDirectory"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            oracle_dir.to_string(),
+            "623BC4019CE424B43F7088AF6BDE6CBFEAF4A41CB32D5EF7551253E6B977A000"
+        );
+        remove_from_book_dir(&mut sandbox, &old_dir, &first_key).unwrap();
+        add_to_book_dir(&mut sandbox, &oracle_dir, &first_key, &[]).unwrap();
+        first_offer["BookDirectory"] = Value::String(oracle_dir.to_string());
+        sandbox
+            .update(first_key, serde_json::to_vec(&first_offer).unwrap())
+            .unwrap();
+        let mut dir: Value = serde_json::from_slice(&sandbox.read(&oracle_dir).unwrap()).unwrap();
+        dir["Indexes"] = serde_json::json!([first_key.to_string(), second_key.to_string()]);
+        sandbox
+            .update(oracle_dir, serde_json::to_vec(&dir).unwrap())
+            .unwrap();
+
+        let tx = serde_json::json!({
+            "TransactionType": "OfferCreate", "Account": TAKER,
+            "Fee": "10", "Sequence": 1, "Flags": TF_SELL | TF_IMMEDIATE_OR_CANCEL,
+            "TakerGets": bbrl("1023.509763"), "TakerPays": rlusd("198.043623"),
+        });
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            OfferCreateTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        let taker = decode_account_id(TAKER).unwrap();
+        let issuer = decode_account_id(BBRL_ISSUER).unwrap();
+        let key = keylet::trust_line(&taker, &issuer, &helpers::currency_to_bytes(BBRL));
+        let line: Value = serde_json::from_slice(&sandbox.read(&key).unwrap()).unwrap();
+        assert_eq!(line["Balance"]["value"], "511.836452477393");
+        let first = decode_account_id(FIRST).unwrap();
+        let second = decode_account_id(SECOND).unwrap();
+        assert!(sandbox.read(&keylet::offer(&first, 1)).is_none());
+        let offer: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::offer(&second, 1)).unwrap()).unwrap();
+        assert_ne!(offer["TakerPays"]["value"], "1279.4021633628");
     }
 
     #[test]
