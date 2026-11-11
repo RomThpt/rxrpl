@@ -5586,6 +5586,14 @@ pub(crate) fn flow_net_input(amount: &Number, rate: Option<IOUAmount>) -> Number
         .unwrap_or(*amount)
 }
 
+/// The input-limited forward AMM BookStep divides its carried gross input by
+/// the issuer rate in Flow's `Number` domain before landing on the IOU grid.
+/// Truncating the STAmount quotient can lose one input ULP, which the terminal
+/// swap amplifies to three output ULPs (105502136 / TX32).
+fn flow_net_input_amm_forward(amount: &Number, rate: IOUAmount) -> Number {
+    Number::from_iou(&amount.div(&Number::from_iou(&rate)).to_iou())
+}
+
 /// Whether a directory tier contains at least one offer on any page.
 fn book_dir_has_entries(ctx: &ApplyContext<'_>, root: &Hash256) -> bool {
     let mut page = 0u64;
@@ -6711,7 +6719,16 @@ fn execute_strand_pass(
         let available_input = if is_first {
             source_available
         } else {
-            flow_net_input(&carry, flow_book_input_rate(ctx, &hop.in_leg, dest))
+            let input_rate = flow_book_input_rate(ctx, &hop.in_leg, dest);
+            if is_last
+                && h > limiting
+                && kinds[h] == HopKindR::Amm
+                && let Some(rate) = input_rate.filter(|rate| *rate > parity_rate())
+            {
+                flow_net_input_amm_forward(&carry, rate)
+            } else {
+                flow_net_input(&carry, input_rate)
+            }
         };
 
         match kinds[h] {
@@ -9915,6 +9932,35 @@ mod taker_crossing_tests {
 
         assert!(debit_drains_source(&source_funds, &priced_debit));
         assert!(!debit_drains_source(&source_funds, &material_remainder));
+    }
+
+    #[test]
+    fn ledger_105502136_terminal_amm_uses_number_fee_division() {
+        let gross = IOUAmount::from_decimal_string("3104710.380568").unwrap();
+        let rate = IOUAmount::from_decimal_string("1.005").unwrap();
+        let _small = rxrpl_amount::number::MantissaScaleGuard::new(
+            rxrpl_amount::number::MantissaScale::Small,
+        );
+        let down = flow_net_input(&Number::from_iou(&gross), Some(rate));
+        let net = super::flow_net_input_amm_forward(&Number::from_iou(&gross), rate);
+        assert_eq!(down.to_iou().to_decimal_string(), "3089264.060266666");
+        assert_eq!(net.to_iou().to_decimal_string(), "3089264.060266667");
+
+        let pool_in =
+            Number::from_iou(&IOUAmount::from_decimal_string("300399418.3320585").unwrap());
+        let pool_out =
+            Number::from_iou(&IOUAmount::from_decimal_string("823022.855571103").unwrap());
+        let old_out = crate::amm_helpers::swap_asset_in(&pool_in, &pool_out, &down, 1000, false);
+        let new_out = crate::amm_helpers::swap_asset_in(&pool_in, &pool_out, &net, 1000, false);
+        assert_eq!(old_out.to_iou().to_decimal_string(), "8294.7601419893");
+        assert_eq!(new_out.to_iou().to_decimal_string(), "8294.7601419896");
+        // Both input ULPs settle to the same pool trust-line balance.
+        assert_eq!(
+            IOUAmount::add_round(&pool_in.to_iou(), &net.to_iou())
+                .unwrap()
+                .to_decimal_string(),
+            "303488682.3923252"
+        );
     }
 
     #[test]
