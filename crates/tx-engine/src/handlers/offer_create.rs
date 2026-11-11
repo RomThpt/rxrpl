@@ -1511,13 +1511,13 @@ fn cross_offers(
                     break;
                 }
             }
-            let mode = if !post_clob_cleanup {
-                QualityAdvanceMode::PreQuality
-            } else if preserve_next_quality_self_offer(is_sell, &remaining_out) {
-                QualityAdvanceMode::Speculative
-            } else {
-                QualityAdvanceMode::Executing
-            };
+            let mode = quality_advance_mode(
+                dir_quality,
+                threshold,
+                post_clob_cleanup,
+                is_sell,
+                &remaining_out,
+            );
             let advance = advance_past_unfunded_quality(ctx, taker, taker_acct, &dir_key, mode)?;
             reaped_self_offer |= advance.reaped_self_offer;
             if advance.funded_tip_remains {
@@ -2187,6 +2187,26 @@ enum QualityAdvanceMode {
     /// OfferStream is materialising its first tip before the quality check:
     /// remove expired entries, but preserve an out-of-quality self offer.
     PreQuality,
+}
+
+fn quality_advance_mode(
+    dir_quality: u64,
+    threshold: u64,
+    post_clob_cleanup: bool,
+    is_sell: bool,
+    remaining_out: &Leg,
+) -> QualityAdvanceMode {
+    // A successful AMM quote can keep the strand active after a CLOB fill,
+    // but it cannot make a worse-quality funded self offer crossable. rippled's
+    // BookOfferCrossingStep only removes a self offer when its own quality meets
+    // the offer-crossing limit. PreQuality still reaps invalid/unfunded tips.
+    if !post_clob_cleanup || reject_quality(dir_quality, threshold) {
+        QualityAdvanceMode::PreQuality
+    } else if preserve_next_quality_self_offer(is_sell, remaining_out) {
+        QualityAdvanceMode::Speculative
+    } else {
+        QualityAdvanceMode::Executing
+    }
 }
 
 struct QualityAdvanceResult {
@@ -16938,6 +16958,102 @@ mod flow_cross_own_unfunded {
         assert!(sandbox.read(&keylet::offer(&maker, 2)).is_none());
         assert!(sandbox.read(&keylet::offer(&taker, 1)).is_some());
         assert_eq!(owner_count(&sandbox, MAKER), 0);
+    }
+
+    #[test]
+    fn ledger_105502788_post_fill_keeps_worse_funded_self_offers() {
+        let mut ledger = Ledger::genesis();
+        for addr in [ISS, TAKER, MAKER] {
+            let id = decode_account_id(addr).unwrap();
+            ledger
+                .put_state(
+                    keylet::account(&id),
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "AccountRoot", "Account": addr,
+                        "Balance": "1000000000", "Sequence": 1,
+                        "OwnerCount": 0, "Flags": 0,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        put_usd_line(&mut ledger, TAKER, 10);
+        put_usd_line(&mut ledger, MAKER, 1);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        for (account, sequence) in [(MAKER, 1), (TAKER, 1), (TAKER, 2)] {
+            assert_eq!(
+                apply_flow(
+                    &mut sandbox,
+                    &fees,
+                    &serde_json::json!({
+                        "TransactionType": "OfferCreate", "Account": account,
+                        "Fee": "10", "Sequence": sequence,
+                        "TakerGets": {"currency": "USD", "issuer": ISS, "value": "1"},
+                        "TakerPays": "1000000",
+                    }),
+                ),
+                TransactionResult::TesSuccess
+            );
+        }
+        let maker = decode_account_id(MAKER).unwrap();
+        let taker = decode_account_id(TAKER).unwrap();
+        let maker_offer = keylet::offer(&maker, 1);
+        let own_offers = [keylet::offer(&taker, 1), keylet::offer(&taker, 2)];
+        let own_before = own_offers.map(|key| sandbox.read(&key).unwrap());
+        let offer: Value = serde_json::from_slice(&own_before[0]).unwrap();
+        let dir: Hash256 = offer["BookDirectory"].as_str().unwrap().parse().unwrap();
+        let quality = u64::from_be_bytes(dir.as_bytes()[24..32].try_into().unwrap());
+        let maker_bytes = sandbox.read(&maker_offer).unwrap();
+        let maker_value: Value = serde_json::from_slice(&maker_bytes).unwrap();
+        assert_eq!(maker_value["BookDirectory"], offer["BookDirectory"]);
+
+        // The first maker has spent its USD in the prior fill; OfferStream
+        // must remove that unfunded tip, then stop at the funded self tips.
+        let line_key = keylet::trust_line(
+            &maker,
+            &decode_account_id(ISS).unwrap(),
+            &helpers::currency_to_bytes("USD"),
+        );
+        let mut line: Value = serde_json::from_slice(&sandbox.read(&line_key).unwrap()).unwrap();
+        line["Balance"]["value"] = Value::String("0".into());
+        sandbox
+            .update(line_key, serde_json::to_vec(&line).unwrap())
+            .unwrap();
+
+        let remaining_out = Leg::parse(&serde_json::json!({
+            "currency": "USD", "issuer": ISS, "value": "2"
+        }))
+        .unwrap();
+        let mode = quality_advance_mode(quality, quality - 1, true, true, &remaining_out);
+        assert!(matches!(mode, QualityAdvanceMode::PreQuality));
+        assert!(matches!(
+            quality_advance_mode(quality, quality, true, true, &remaining_out),
+            QualityAdvanceMode::Executing
+        ));
+        let mut taker_acct: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::account(&taker)).unwrap()).unwrap();
+        let tx = serde_json::json!({});
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert!(
+            advance_past_unfunded_quality(&mut ctx, &taker, &mut taker_acct, &dir, mode)
+                .unwrap()
+                .funded_tip_remains
+        );
+        assert!(ctx.view.read(&maker_offer).is_none());
+        for (key, before) in own_offers.iter().zip(&own_before) {
+            assert_eq!(ctx.view.read(key).unwrap(), *before);
+        }
+        assert_eq!(owner_count(&sandbox, MAKER), 0);
+        assert_eq!(owner_count(&sandbox, TAKER), 2);
     }
 
     #[test]
