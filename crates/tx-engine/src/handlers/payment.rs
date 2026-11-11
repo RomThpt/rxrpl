@@ -294,6 +294,13 @@ impl Transactor for PaymentTransactor {
                     if terminal_direct_step_blocked(ctx.view, &destination_id, &ctx.tx["Amount"]) {
                         return Err(TransactionResult::TecPathDry);
                     }
+                    if ctx.tx.get("Paths").is_none() {
+                        let source_id = decode_account_id(account_str)
+                            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+                        if source_book_step_blocked(ctx.view, &source_id, send_max) {
+                            return Err(TransactionResult::TecPathDry);
+                        }
+                    }
                     // Multi-path Flow: a Payment with two or more alternative `Paths`
                     // that each resolve to a pure book/AMM boundary chain. rippled
                     // runs these through the multi-pass Flow loop, consuming any
@@ -1749,6 +1756,31 @@ fn terminal_direct_step_blocked(
     line_flags
         & (destination_freeze | LSF_LOW_DEEP_FREEZE | LSF_HIGH_DEEP_FREEZE | issuer_no_ripple)
         != 0
+}
+
+/// A direct IOU source step followed by a book (including an AMM offer) must
+/// honor NoRipple on the issuer side of the source trust line. BookStep::check
+/// rejects this strand before any pool or offer liquidity can be consumed.
+fn source_book_step_blocked(
+    view: &dyn crate::view::read_view::ReadView,
+    source: &AccountId,
+    send_max: &Value,
+) -> bool {
+    let Some((is_xrp, currency, issuer)) = amm_asset_of(send_max) else {
+        return false;
+    };
+    if is_xrp || issuer == *source {
+        return false;
+    }
+    let issuer_no_ripple = if issuer.as_bytes() > source.as_bytes() {
+        0x0020_0000u64
+    } else {
+        0x0010_0000u64
+    };
+    view.read(&keylet::trust_line(source, &issuer, &currency))
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|line| line.get("Flags").and_then(Value::as_u64))
+        .is_some_and(|flags| flags & issuer_no_ripple != 0)
 }
 
 /// A SendMax / Amount value as a `Number` magnitude (XRP drops as an integer,

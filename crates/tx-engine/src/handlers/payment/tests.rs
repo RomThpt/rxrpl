@@ -5173,3 +5173,38 @@ fn terminal_direct_step_rejects_freeze_and_issuer_no_ripple() {
     assert!(!is_frozen(LSF_LOW_NO_RIPPLE, 0));
     assert!(!is_frozen(0, 0));
 }
+
+#[test]
+fn ledger_105502446_source_book_step_rejects_issuer_no_ripple() {
+    const HOLDER: &str = "rhfeRRWvLYTZVTCaBMJmgUA6FWMLaWL8P7";
+    const ISSUER: &str = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De";
+    let holder = decode_account_id(HOLDER).unwrap();
+    let issuer = decode_account_id(ISSUER).unwrap();
+    assert!(holder.as_bytes() < issuer.as_bytes());
+    let send_max = serde_json::json!({
+        "currency": "RLUSD", "issuer": ISSUER, "value": "73625000"
+    });
+    let blocked = |line_flags: u64| {
+        let mut ledger = Ledger::genesis();
+        add_account(&mut ledger, HOLDER, 100_000_000);
+        add_account(&mut ledger, ISSUER, 100_000_000);
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {"currency": "RLUSD", "issuer": ISSUER, "value": "73625000"},
+            "LowLimit": {"currency": "RLUSD", "issuer": HOLDER, "value": "1000000000"},
+            "HighLimit": {"currency": "RLUSD", "issuer": ISSUER, "value": "0"},
+            "Flags": line_flags,
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&holder, &issuer, &helpers::currency_to_bytes("RLUSD")),
+                serde_json::to_vec(&line).unwrap(),
+            )
+            .unwrap();
+        let view = LedgerView::with_fees(&ledger, FeeSettings::default());
+        source_book_step_blocked(&view, &holder, &send_max)
+    };
+    assert!(blocked(0x0020_0000));
+    assert!(!blocked(0x0010_0000));
+    assert!(!blocked(0));
+}
