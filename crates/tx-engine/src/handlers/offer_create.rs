@@ -2429,6 +2429,7 @@ fn try_bridge_step(
             &ro,
             &mut amm_ctx,
             /*offer_create_bridge=*/ true,
+            /*source_funds_limited=*/ false,
             Some(cq),
             &mut bridge_reaps,
         ) else {
@@ -5504,6 +5505,10 @@ fn flow_input_limit(send_max: &Number, source: Option<&FlowSourceBalance>) -> Nu
         .unwrap_or(*send_max)
 }
 
+fn flow_source_funds_limit_binds(tx_send_max: Option<&Leg>, input_limit: &Number) -> bool {
+    tx_send_max.is_some_and(|max| num_gt(&leg_to_number(max), input_limit))
+}
+
 fn reconcile_flow_source_balance(
     ctx: &mut ApplyContext<'_>,
     source: &FlowSourceBalance,
@@ -5592,6 +5597,25 @@ pub(crate) fn flow_net_input(amount: &Number, rate: Option<IOUAmount>) -> Number
 /// swap amplifies to three output ULPs (105502136 / TX32).
 fn flow_net_input_amm_forward(amount: &Number, rate: IOUAmount) -> Number {
     Number::from_iou(&amount.div(&Number::from_iou(&rate)).to_iou())
+}
+
+/// When a self-payment's source funds cap the first interior IOU book, its
+/// forward pass spends the entire net input. Repricing the floored output at
+/// book quality can leave one source ULP on the resting offer (105502166/TX31).
+fn flow_first_book_spends_source_funds(
+    source_funds_limited: bool,
+    source_capped: bool,
+    first_interior_clob: bool,
+    self_payment: bool,
+    input_rate: Option<IOUAmount>,
+    output_is_xrp: bool,
+) -> bool {
+    source_funds_limited
+        && source_capped
+        && first_interior_clob
+        && self_payment
+        && input_rate == Some(parity_rate())
+        && !output_is_xrp
 }
 
 /// Whether a directory tier contains at least one offer on any page.
@@ -6532,6 +6556,7 @@ fn execute_strand_pass(
     remaining_out: &Number,
     amm_ctx: &mut AmmContext,
     offer_create_bridge: bool,
+    source_funds_limited: bool,
     limit_quality: Option<u64>,
     permanent_reaps: &mut Vec<PermanentOffer>,
 ) -> Option<StrandPass> {
@@ -6838,7 +6863,15 @@ fn execute_strand_pass(
                     // repricing the floored IOU output one drop lower
                     // (105500249 4C84DE5C).
                     /*force_full_input_budget=*/
-                    bridge_xrp_reverse,
+                    bridge_xrp_reverse
+                        || flow_first_book_spends_source_funds(
+                            source_funds_limited,
+                            source_capped,
+                            is_first && !is_last,
+                            taker == dest,
+                            source_rate,
+                            hop.out_leg.is_xrp,
+                        ),
                     /*source_input_rate=*/ 1_000_000_000,
                     /*source_funds_limited=*/ false,
                 )
@@ -6912,6 +6945,11 @@ pub(crate) fn flow_multi(
     // cap across every pass: recomputing only `SendMax - savedIn` can otherwise
     // launch a second strand pass after the first one has drained the source.
     let input_limit = flow_input_limit(send_max, source_balance.as_ref());
+    // Payment may already have capped the `send_max` argument to accountFunds.
+    // Compare against the signed transaction's original SendMax instead.
+    let tx_send_max = ctx.tx.get("SendMax").and_then(Leg::parse);
+    let source_funds_limited = source_balance.is_some()
+        && flow_source_funds_limit_binds(tx_send_max.as_ref(), &input_limit);
     if trace {
         eprintln!(
             "[flow] ENTER strands={} deliver_req={} send_max={} input_limit={}",
@@ -7020,6 +7058,7 @@ pub(crate) fn flow_multi(
                 &remaining_out,
                 amm_ctx,
                 /*offer_create_bridge=*/ false,
+                source_funds_limited,
                 None,
                 &mut permanent_reaps,
             ) {
@@ -9545,8 +9584,9 @@ mod taker_crossing_tests {
         add_iou_balance_half_upward, aggregate_flow_source_balance_number, amm_pool_debit_rounding,
         amm_step_allows_clob, book_payment_dust_drain, book_step_input_exhausted,
         clob_band_allows_terminal_amm, composed_quality, consumes_full_offer,
-        crossing_quality_threshold, crossing_threshold, debit_drains_source, flow_iou_to_iou,
-        flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou, full_offer_take,
+        crossing_quality_threshold, crossing_threshold, debit_drains_source,
+        flow_first_book_spends_source_funds, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input,
+        flow_source_funds_limit_binds, flow_xrp_to_iou, full_offer_take,
         funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
         in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
         leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
@@ -9960,6 +10000,99 @@ mod taker_crossing_tests {
                 .unwrap()
                 .to_decimal_string(),
             "303488682.3923252"
+        );
+    }
+
+    #[test]
+    fn ledger_105502166_source_capped_first_book_spends_full_funds() {
+        let tx_send_max = iou("636.3656581626093");
+        let source_funds = iou("423.8210353901292");
+        let effective_send_max = leg_to_number(&source_funds);
+        assert!(flow_source_funds_limit_binds(
+            Some(&tx_send_max),
+            &effective_send_max
+        ));
+        assert!(!flow_source_funds_limit_binds(
+            Some(&source_funds),
+            &effective_send_max
+        ));
+        let offer_pays = iou("835.1094273846246");
+        let offer_gets = iou("46266.45027061632");
+        let quality = from_rate(0x5306_69A3_4FD1_D000).unwrap();
+        let output = out_for_in(&source_funds, &quality, &offer_gets);
+        let repriced = in_for_out_offer(&offer_pays, &output, &offer_gets, &quality);
+        assert_eq!(output.iou.to_decimal_string(), "23480.38977230632");
+        assert_eq!(repriced.iou.to_decimal_string(), "423.8210353901291");
+
+        let full_budget =
+            flow_first_book_spends_source_funds(true, true, true, true, Some(parity_rate()), false);
+        assert!(full_budget);
+        assert!(!flow_first_book_spends_source_funds(
+            false,
+            true,
+            true,
+            true,
+            Some(parity_rate()),
+            false,
+        ));
+        assert!(!flow_first_book_spends_source_funds(
+            true,
+            false,
+            true,
+            true,
+            Some(parity_rate()),
+            false,
+        ));
+        assert!(!flow_first_book_spends_source_funds(
+            true,
+            true,
+            false,
+            true,
+            Some(parity_rate()),
+            false,
+        ));
+        assert!(!flow_first_book_spends_source_funds(
+            true,
+            true,
+            true,
+            false,
+            Some(parity_rate()),
+            false,
+        ));
+        assert!(!flow_first_book_spends_source_funds(
+            true,
+            true,
+            true,
+            true,
+            Some(IOUAmount::from_decimal_string("1.005").unwrap()),
+            false,
+        ));
+        assert!(!flow_first_book_spends_source_funds(
+            true,
+            true,
+            true,
+            true,
+            Some(parity_rate()),
+            true,
+        ));
+        let spent = if input_limited_uses_full_budget(false, false, true, &offer_gets, full_budget)
+        {
+            super::leg_min(&source_funds, &offer_pays)
+        } else {
+            super::leg_min(&repriced, &source_funds)
+        };
+        assert_eq!(spent.iou, source_funds.iou);
+        assert_eq!(
+            leftover_leg(&offer_pays, &spent, true)
+                .iou
+                .to_decimal_string(),
+            "411.2883919944954"
+        );
+        assert_eq!(
+            leftover_leg(&offer_gets, &output, true)
+                .iou
+                .to_decimal_string(),
+            "22786.06049831"
         );
     }
 
