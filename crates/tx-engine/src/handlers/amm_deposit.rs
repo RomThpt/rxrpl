@@ -357,7 +357,7 @@ impl AMMDepositTransactor {
             .to_string();
         let amm_account =
             decode_account_id(&amm_account_str).map_err(|_| TransactionResult::TefInternal)?;
-        let tfee = amm["TradingFee"].as_u64().unwrap_or(0) as u16;
+        let tfee = deposit_trading_fee(amm, depositor, ctx.view.parent_close_time());
         let lpt = amm
             .get("LPTokenBalance")
             .ok_or(TransactionResult::TefInternal)?;
@@ -469,7 +469,7 @@ impl AMMDepositTransactor {
                 .ok_or(TransactionResult::TefInternal)?,
         )
         .map_err(|_| TransactionResult::TefInternal)?;
-        let tfee = amm["TradingFee"].as_u64().unwrap_or(0) as u16;
+        let tfee = deposit_trading_fee(amm, depositor, ctx.view.parent_close_time());
         let lpt = amm
             .get("LPTokenBalance")
             .ok_or(TransactionResult::TefInternal)?;
@@ -976,6 +976,34 @@ fn parse_signed_iou(s: &str) -> rxrpl_amount::number::Number {
     if neg { n.negate() } else { n }
 }
 
+/// The auction discount applies to its owner and authorized accounts until
+/// the parent ledger's close time reaches the slot expiration.
+fn deposit_trading_fee(
+    amm: &serde_json::Value,
+    depositor: &AccountId,
+    parent_close_time: u32,
+) -> u16 {
+    let regular_fee = amm["TradingFee"].as_u64().unwrap_or(0) as u16;
+    let Some(slot) = amm.get("AuctionSlot") else {
+        return regular_fee;
+    };
+    if slot["Expiration"].as_u64().unwrap_or(0) <= u64::from(parent_close_time) {
+        return regular_fee;
+    }
+    let account = encode_account_id(depositor);
+    let is_owner = slot["Account"].as_str() == Some(account.as_str());
+    let is_authorized = slot["AuthAccounts"].as_array().is_some_and(|accounts| {
+        accounts
+            .iter()
+            .any(|entry| entry["AuthAccount"]["Account"].as_str() == Some(account.as_str()))
+    });
+    if is_owner || is_authorized {
+        slot["DiscountedFee"].as_u64().unwrap_or(regular_fee as u64) as u16
+    } else {
+        regular_fee
+    }
+}
+
 fn xrp_drops_from_amount_opt(amount: Option<&serde_json::Value>) -> u64 {
     amount
         .and_then(|v| v.as_str())
@@ -996,6 +1024,54 @@ mod tests {
 
     const BOB: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
     const AMM_ACCOUNT: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+
+    #[test]
+    fn auction_discount_applies_to_owner_and_auth_accounts_until_expiration() {
+        let owner = decode_account_id(BOB).unwrap();
+        let auth = decode_account_id(AMM_ACCOUNT).unwrap();
+        let other = decode_account_id("rGLEgQdktoN4Be5thhk6seg1HifGPBxY5Q").unwrap();
+        let amm = serde_json::json!({
+            "TradingFee": 250,
+            "AuctionSlot": {
+                "Account": BOB,
+                "AuthAccounts": [{"AuthAccount": {"Account": AMM_ACCOUNT}}],
+                "DiscountedFee": 25,
+                "Expiration": 837013550
+            }
+        });
+        assert_eq!(deposit_trading_fee(&amm, &owner, 837013549), 25);
+        assert_eq!(deposit_trading_fee(&amm, &auth, 837013549), 25);
+        assert_eq!(deposit_trading_fee(&amm, &other, 837013549), 250);
+        assert_eq!(deposit_trading_fee(&amm, &owner, 837013550), 250);
+    }
+
+    #[test]
+    fn discounted_single_iou_deposit_mints_oracle_lp_balance() {
+        use rxrpl_amount::number::Number;
+
+        let amm = serde_json::json!({
+            "TradingFee": 250,
+            "AuctionSlot": {
+                "Account": "r9DW7jqMXqa32TaTujSxdxcpwnPgJayG8V",
+                "DiscountedFee": 25,
+                "Expiration": 837013550
+            }
+        });
+        let depositor = decode_account_id("r9DW7jqMXqa32TaTujSxdxcpwnPgJayG8V").unwrap();
+        let _scale = rxrpl_amount::number::MantissaScaleGuard::new(
+            rxrpl_amount::number::MantissaScale::Small,
+        );
+        let fee = deposit_trading_fee(&amm, &depositor, 837013549);
+        let pool = Number::from_iou(&amm_helpers::parse_iou_value("8718.055400427291"));
+        let deposit = Number::from_iou(&amm_helpers::parse_iou_value("66.2467688604373"));
+        let total_lp = amm_helpers::parse_iou_value("4202.003136735028");
+        let r = deposit.div(&pool);
+        let tokens = amm_helpers::lp_tokens_out_ratio(&r, &total_lp, fee);
+        let new_total = Number::from_iou(&total_lp)
+            .add(&Number::from_iou(&tokens))
+            .to_iou();
+        assert_eq!(new_total.to_decimal_string(), "4217.936023425574");
+    }
 
     #[test]
     fn new_lp_line_keeps_zero_owner_pages() {
