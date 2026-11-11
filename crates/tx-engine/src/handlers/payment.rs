@@ -2355,6 +2355,9 @@ fn best_book_dir_quality(
                 !h.is_zero() && !h.negative()
             };
             if !funded {
+                // FlowOfferStream permanently removes an offer found unfunded
+                // while probing the book, even if the AMM wins the swap.
+                crate::handlers::offer_create::reap_offer(ctx, &owner, &h, &dir_key)?;
                 continue;
             }
             return Ok(Some(dir_quality));

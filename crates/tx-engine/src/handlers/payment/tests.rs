@@ -2938,6 +2938,120 @@ fn amm_quality_gate_reaps_expired_tip_offer() {
 }
 
 #[test]
+fn ledger_105502719_unfunded_book_tip_is_reaped_before_amm_swap() {
+    const SOURCE: &str = "rDLsGUd5yar9RV4kVWBEMmJMdejTW2eFET";
+    const ISSUER: &str = "raP7o5zVFyZNbNybmriT3YSAkQ4xqNLHMN";
+    const OWNER: &str = "rszLaHi8EYSDTEgQ4GqZLpmXuQssvs1zeD";
+    const POOL: &str = "rneWbJSn86AzBfR1diEdW3xsp9EkVxiP4y";
+    const CURRENCY: &str = "24444F4E54425559000000000000000000000000";
+
+    let mut ledger = Ledger::genesis();
+    for (account, balance) in [
+        (SOURCE, "29862799"),
+        (ISSUER, "100000000"),
+        (OWNER, "923174444"),
+        (POOL, "342451665"),
+    ] {
+        put_account(&mut ledger, account, balance, None);
+    }
+    let owner_id = decode_account_id(OWNER).unwrap();
+    let owner_key = keylet::account(&owner_id);
+    let mut owner: Value = serde_json::from_slice(ledger.get_state(&owner_key).unwrap()).unwrap();
+    owner["OwnerCount"] = serde_json::json!(1);
+    ledger
+        .put_state(owner_key, serde_json::to_vec(&owner).unwrap())
+        .unwrap();
+    // The owner has no CURRENCY trust line in the parent ledger: the resting
+    // offer cannot deliver any IOU, despite its better book price.
+    put_trust_line(&mut ledger, POOL, ISSUER, CURRENCY, 73_192_207.62629262);
+
+    let issuer_id = decode_account_id(ISSUER).unwrap();
+    let pool_id = decode_account_id(POOL).unwrap();
+    let currency = helpers::currency_to_bytes(CURRENCY);
+    let xrp = [0u8; 20];
+    let zero = rxrpl_primitives::AccountId::from([0u8; 20]);
+    let amm_key = keylet::amm(&xrp, &zero, &currency, &issuer_id);
+    let amm = serde_json::json!({
+        "LedgerEntryType": "AMM", "Account": POOL, "TradingFee": 714,
+        "Asset": "XRP", "Asset2": iou(CURRENCY, ISSUER, "0"), "Flags": 0,
+    });
+    ledger
+        .put_state(amm_key, serde_json::to_vec(&amm).unwrap())
+        .unwrap();
+
+    let book = keylet::book_dir(&xrp, &zero, &currency, &issuer_id);
+    let book_dir: rxrpl_primitives::Hash256 =
+        "098E69C3104F82B2360DCF0B378329D89E7FA2E7773B969D5510B1F2AAB18437"
+            .parse()
+            .unwrap();
+    assert_eq!(&book.as_bytes()[..24], &book_dir.as_bytes()[..24]);
+    let offer_key = keylet::offer(&owner_id, 103_312_986);
+    let offer = serde_json::json!({
+        "LedgerEntryType": "Offer", "Account": OWNER, "Sequence": 103_312_986,
+        "TakerGets": iou(CURRENCY, ISSUER, "12410.689491603"),
+        "TakerPays": "58321", "BookDirectory": book_dir.to_string(),
+        "BookNode": "0", "OwnerNode": "0", "Flags": 65536,
+    });
+    ledger
+        .put_state(offer_key, serde_json::to_vec(&offer).unwrap())
+        .unwrap();
+    let owner_dir = keylet::owner_dir(&owner_id);
+    for (key, root) in [(book_dir, book_dir), (owner_dir, owner_dir)] {
+        let dir = serde_json::json!({
+            "LedgerEntryType": "DirectoryNode", "RootIndex": root.to_string(),
+            "Indexes": [offer_key.to_string()], "IndexNext": "0", "IndexPrevious": "0",
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&dir).unwrap())
+            .unwrap();
+    }
+
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::new();
+    let tx = serde_json::json!({
+        "TransactionType": "Payment", "Account": SOURCE, "Destination": ISSUER,
+        "Amount": iou(CURRENCY, ISSUER, "1118.217353844"),
+        "SendMax": "2500", "DeliverMin": iou(CURRENCY, ISSUER, "5.619182682633"),
+        "Flags": rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT,
+        "Fee": "40", "Sequence": 105_489_290,
+    });
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut ctx),
+        Ok(TransactionResult::TesSuccess)
+    );
+    assert_eq!(
+        sandbox.take_delivered_amount(),
+        Some(iou(CURRENCY, ISSUER, "530.50617043"))
+    );
+    assert!(sandbox.read(&offer_key).is_none(), "unfunded offer removed");
+    assert!(
+        sandbox.read(&book_dir).is_none(),
+        "empty book directory removed"
+    );
+    assert!(
+        sandbox.read(&owner_dir).is_none(),
+        "empty owner directory removed"
+    );
+    let owner_after: Value = serde_json::from_slice(&sandbox.read(&owner_key).unwrap()).unwrap();
+    assert_eq!(owner_after["OwnerCount"], 0);
+    let pool_after: Value =
+        serde_json::from_slice(&sandbox.read(&keylet::account(&pool_id)).unwrap()).unwrap();
+    assert_eq!(pool_after["Balance"], "342454165");
+    let pool_line = keylet::trust_line(&pool_id, &issuer_id, &currency);
+    let line_after: Value = serde_json::from_slice(&sandbox.read(&pool_line).unwrap()).unwrap();
+    assert_eq!(line_after["Balance"]["value"], "73191677.12012219");
+}
+
+#[test]
 fn direct_iou_to_xrp_conversion_splits_amm_and_book() {
     run_direct_iou_to_xrp_conversion_splits_amm_and_book("25.3309569946823", "15446876", true);
 }
