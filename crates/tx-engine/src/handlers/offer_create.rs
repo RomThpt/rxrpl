@@ -2227,6 +2227,25 @@ fn try_amm_step(
     } else {
         remaining_out.clone()
     };
+    // OfferCreate's sendMax quality is gross of the input issuer's transfer
+    // fee, while the AMM curve is priced in the net amount reaching the pool.
+    // The terminal quality cap must therefore use the original net offer
+    // quality; the realised-quality check below still uses the gross limit.
+    let pool_quality = if cap_ending_spot_price {
+        cq
+    } else {
+        let input = ctx.tx.get("TakerGets").and_then(Leg::parse);
+        let output = ctx.tx.get("TakerPays").and_then(Leg::parse);
+        match (input, output) {
+            (Some(input), Some(output)) => crossing_quality_threshold(
+                &input,
+                &output,
+                ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+                ctx.tx.get("Flags").and_then(Value::as_u64).unwrap_or(0) & TF_PASSIVE != 0,
+            ),
+            _ => cq,
+        }
+    };
     // FillOrKill atomicity applies to the aggregate Flow result, not to each
     // liquidity source. The AMM may contribute a partial step that combines
     // with CLOB liquidity; the exact-side check in the transactor either keeps
@@ -2244,6 +2263,7 @@ fn try_amm_step(
         /*partial=*/ amm_offer_allows_partial_output(fok, is_sell),
         /*reverse_output_limited=*/ false,
         /*target_quality=*/ Some(cq),
+        /*pool_target_quality=*/ Some(pool_quality),
         cap_ending_spot_price,
         /*waive_output_transfer_fee=*/ true,
     )? {
@@ -2880,6 +2900,7 @@ fn cross_book_hop_with_reaps(
                     /*partial=*/ true,
                     /*reverse_output_limited=*/ false,
                     /*target_quality=*/ Some(dir_quality),
+                    /*pool_target_quality=*/ Some(dir_quality),
                     /*cap_ending_spot_price=*/ true,
                     /*waive_output_transfer_fee=*/ false,
                 )? {
@@ -3905,6 +3926,7 @@ pub(crate) fn cross_path_payment(
                 /*partial=*/ true,
                 terminal_reverse_amm && is_last,
                 /*target_quality=*/ None,
+                /*pool_target_quality=*/ None,
                 /*cap_ending_spot_price=*/ false,
                 /*waive_output_transfer_fee=*/ false,
             )? {
@@ -4257,6 +4279,7 @@ fn amm_hop(
     partial: bool,
     reverse_output_limited: bool,
     target_quality: Option<u64>,
+    pool_target_quality: Option<u64>,
     cap_ending_spot_price: bool,
     waive_output_transfer_fee: bool,
 ) -> Result<Option<(Leg, Leg)>, TransactionResult> {
@@ -4324,7 +4347,7 @@ fn amm_hop(
     // is the raw reserve ratio. Trading fees affect the generated synthetic
     // offer, not this initial eligibility check (`AMMLiquidity::getOffer`).
     // Payments pass None when no competing CLOB quality is available.
-    if let Some(cq) = target_quality {
+    if let Some(cq) = pool_target_quality {
         let pool_in_q = num_quality_iou(&pool_in, in_xrp);
         let pool_out_q = num_quality_iou(&pool_out, out_xrp);
         let spq = if ctx.rules.enabled(&feature_id("fixUniversalNumber")) {
@@ -4352,7 +4375,7 @@ fn amm_hop(
     // Size the synthetic offer at that boundary before applying sendmax or
     // deliver limits; otherwise tfSell consumes its whole input even after the
     // AMM curve has become worse than the resting book.
-    let quality_cap = if let Some(cq) = target_quality {
+    let quality_cap = if let Some(cq) = pool_target_quality {
         if cap_ending_spot_price {
             crate::amm_helpers::change_spot_price_quality(
                 &pool_in, &pool_out, cq, tfee, in_xrp, out_xrp,
@@ -11558,6 +11581,7 @@ mod amm_transfer_fee_tests {
                     true,
                     false,
                     None,
+                    None,
                     false,
                     false,
                 )
@@ -13837,6 +13861,47 @@ mod flow_cross_own_unfunded {
             serde_json::from_slice(&sandbox.read(&keylet::offer(&taker, 2)).unwrap()).unwrap();
         assert_eq!(placed["TakerGets"], tx["TakerGets"]);
         assert_eq!(placed["TakerPays"], tx["TakerPays"]);
+    }
+
+    #[test]
+    fn ledger_105501940_btc_pool_quality_cap_uses_net_input() {
+        let input = IOUAmount::from_decimal_string("0.012672409176").unwrap();
+        let output = IOUAmount::from_decimal_string("734160000").unwrap();
+        let fee = IOUAmount::from_parts(1_001_500_000, -9, false).unwrap();
+        let gross = IOUAmount::mul_round(&input, &fee, true).unwrap();
+        let gross_quality = rxrpl_amount::get_rate_round_even(&gross, &output).unwrap();
+        let net_quality = rxrpl_amount::get_rate_round_even(&input, &output).unwrap();
+        let pool_in =
+            Number::from_iou(&IOUAmount::from_decimal_string("1.768361324152221").unwrap());
+        let pool_out = Number::from_int(102_468_919_112);
+        let (net_spend, drops) = crate::amm_helpers::limit_input_quality(
+            &pool_in,
+            &pool_out,
+            net_quality,
+            19,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(gross_quality > net_quality);
+        let (gross_cap, _) = crate::amm_helpers::limit_input_quality(
+            &pool_in,
+            &pool_out,
+            gross_quality,
+            19,
+            false,
+            true,
+        )
+        .unwrap();
+        let funded =
+            Number::from_iou(&IOUAmount::from_decimal_string("0.0016898940319902").unwrap());
+        assert!(num_gt(&gross_cap, &funded));
+        assert_eq!(
+            net_spend.to_iou().to_decimal_string(),
+            "0.00002888303315329913"
+        );
+        assert_eq!(drops.to_xrp_drops(), 1_673_302);
+        assert_eq!(734_160_000 - drops.to_xrp_drops(), 732_486_698);
     }
 
     #[test]
