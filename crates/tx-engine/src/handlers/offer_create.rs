@@ -3372,8 +3372,7 @@ fn cross_book_hop_with_reaps(
             } else {
                 BalanceRounding::Legacy
             };
-            let fee_rounding =
-                book_output_fee_rounding(budget_binds, skip_input_debit, skip_output_credit);
+            let fee_rounding = book_output_fee_rounding(budget_binds, skip_output_credit);
             let net_out = pay_out_gross(
                 ctx,
                 taker,
@@ -7784,15 +7783,11 @@ enum TransferFeeRounding {
     Nearest,
 }
 
-fn book_output_fee_rounding(
-    budget_binds: bool,
-    skip_input_debit: bool,
-    skip_output_credit: bool,
-) -> TransferFeeRounding {
-    // Only an input-limited last hop forwarded from a preceding step needs
-    // BookStep's retained ratio digits (105502369/TX41). A demand-limited last
-    // hop must keep its existing truncation (105502169/TX86).
-    if budget_binds && skip_input_debit && !skip_output_credit {
+fn book_output_fee_rounding(budget_binds: bool, skip_output_credit: bool) -> TransferFeeRounding {
+    // Input-limited terminal BookSteps retain ratio digits whether the book
+    // was reached from a preceding step (105502369/TX41) or directly from an
+    // XRP source (105502605/TX24). Demand-limited hops keep truncation.
+    if budget_binds && !skip_output_credit {
         TransferFeeRounding::BookStepRatio
     } else {
         TransferFeeRounding::Down
@@ -12247,19 +12242,15 @@ mod amm_transfer_fee_tests {
     #[test]
     fn ledger_105502369_terminal_book_output_keeps_ratio_guard_digits() {
         assert!(matches!(
-            super::book_output_fee_rounding(true, true, false),
+            super::book_output_fee_rounding(true, false),
             TransferFeeRounding::BookStepRatio
         ));
         assert!(matches!(
-            super::book_output_fee_rounding(false, true, false),
+            super::book_output_fee_rounding(false, false),
             TransferFeeRounding::Down
         ));
         assert!(matches!(
-            super::book_output_fee_rounding(true, false, false),
-            TransferFeeRounding::Down
-        ));
-        assert!(matches!(
-            super::book_output_fee_rounding(true, true, true),
+            super::book_output_fee_rounding(true, true),
             TransferFeeRounding::Down
         ));
         let gross = IOUAmount::from_decimal_string("1067.201303501945").unwrap();
