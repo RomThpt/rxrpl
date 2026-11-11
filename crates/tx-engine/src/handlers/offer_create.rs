@@ -3258,7 +3258,12 @@ fn cross_book_hop_with_reaps(
                     number_switchover,
                     PayInOptions {
                         skip_taker_debit: skip_input_debit,
-                        allow_dust_drain: true,
+                        allow_dust_drain: book_payment_dust_drain(
+                            full_take,
+                            ctx.tx.get("TransactionType").and_then(Value::as_str)
+                                == Some("Payment")
+                                && taker == dest,
+                        ),
                     },
                 )?;
             } else {
@@ -7206,6 +7211,13 @@ fn debit_drains_source(source_funds: &Leg, debit: &Leg) -> bool {
     relative <= precision
 }
 
+/// A self-payment's complete offer take spends its exact TakerPays. Keep a
+/// smaller source remainder even when it falls below the dust threshold
+/// (105502095 / TX16). OfferCreate retains its FlowCross drain behavior.
+fn book_payment_dust_drain(full_take: bool, self_payment: bool) -> bool {
+    !self_payment || !full_take
+}
+
 fn hop_out_done(remaining: &Leg, demand: &Leg) -> bool {
     remaining.is_zero() || remaining_is_filled(remaining, demand)
 }
@@ -9494,12 +9506,13 @@ mod taker_crossing_tests {
     use super::{
         BalanceRounding, Leg, TakerCrossType, add_iou_balance, add_iou_balance_downward,
         add_iou_balance_half_upward, aggregate_flow_source_balance_number, amm_pool_debit_rounding,
-        amm_step_allows_clob, book_step_input_exhausted, clob_band_allows_terminal_amm,
-        composed_quality, consumes_full_offer, crossing_quality_threshold, crossing_threshold,
-        debit_drains_source, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou,
-        full_offer_take, funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out,
-        in_for_out_offer, in_for_out_round, input_limited_uses_full_budget, leftover_is_dust,
-        leftover_leg, leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
+        amm_step_allows_clob, book_payment_dust_drain, book_step_input_exhausted,
+        clob_band_allows_terminal_amm, composed_quality, consumes_full_offer,
+        crossing_quality_threshold, crossing_threshold, debit_drains_source, flow_iou_to_iou,
+        flow_iou_to_xrp, flow_net_input, flow_xrp_to_iou, full_offer_take,
+        funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
+        in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
+        leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
         legacy_intermediate_xrp_rounding_applies, net_book_payment_input, net_offer_input_budget,
         number_to_leg, out_for_in, own_tip_can_be_reaped, pack_rate, parity_rate,
         preserve_flow_input_limited_iou_ulp, preserve_next_quality_self_offer, qual_div, qual_mul,
@@ -9882,6 +9895,25 @@ mod taker_crossing_tests {
 
         assert!(debit_drains_source(&source_funds, &priced_debit));
         assert!(!debit_drains_source(&source_funds, &material_remainder));
+    }
+
+    #[test]
+    fn ledger_105502095_full_offer_take_preserves_source_remainder() {
+        let source_funds = iou("518.9660669417391");
+        let offer_pays = iou("518.9660669417388");
+        let source_balance = source_funds.iou.negate();
+
+        // The relative dust check alone would zero this high-account line.
+        assert!(debit_drains_source(&source_funds, &offer_pays));
+        assert!(!book_payment_dust_drain(true, true));
+        assert!(book_payment_dust_drain(false, true));
+        assert!(book_payment_dust_drain(true, false));
+        assert_eq!(
+            IOUAmount::add_round(&source_balance, &offer_pays.iou)
+                .unwrap()
+                .to_decimal_string(),
+            "-0.0000000000003"
+        );
     }
 
     #[test]
