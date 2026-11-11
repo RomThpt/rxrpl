@@ -15,10 +15,10 @@ use crate::view::ledger_view::LedgerView;
 use crate::view::read_view::ReadView;
 use crate::view::sandbox::{Sandbox, SandboxChanges};
 
-/// OfferStream removes expired offers in its permanent view even when the
-/// crossing attempt later claims a fee. Reap only offers that existed before
-/// the handler and were already expired at the parent close time.
-fn retain_expired_offer_deletions(
+/// OfferStream keeps expired and permanently tiny tip removals even when the
+/// crossing attempt later claims a fee. Only inspect offers that existed
+/// before the handler and were deleted in its child sandbox.
+fn retain_permanent_offer_deletions(
     tx: &Value,
     sandbox: &mut Sandbox<'_>,
     changes: &SandboxChanges,
@@ -34,12 +34,7 @@ fn retain_expired_offer_deletions(
         let Ok(offer) = serde_json::from_slice::<Value>(&bytes) else {
             continue;
         };
-        if offer.get("LedgerEntryType").and_then(Value::as_str) != Some("Offer")
-            || offer
-                .get("Expiration")
-                .and_then(Value::as_u64)
-                .is_none_or(|exp| exp > sandbox.parent_close_time() as u64)
-        {
+        if offer.get("LedgerEntryType").and_then(Value::as_str) != Some("Offer") {
             continue;
         }
         let Some(owner) = offer
@@ -56,12 +51,23 @@ fn retain_expired_offer_deletions(
         else {
             continue;
         };
+        let expired = offer
+            .get("Expiration")
+            .and_then(Value::as_u64)
+            .is_some_and(|exp| exp <= sandbox.parent_close_time() as u64);
         let mut ctx = ApplyContext {
             tx,
             view: sandbox,
             rules,
             fees,
         };
+        if !expired
+            && !crate::handlers::offer_create::is_permanently_tiny_offer(
+                &mut ctx, &offer, &owner, &book_dir,
+            )
+        {
+            continue;
+        }
         crate::handlers::offer_create::reap_offer(&mut ctx, &owner, &key, &book_dir)
             .map_err(TxEngineError::TransactionFailed)?;
     }
@@ -584,7 +590,7 @@ impl TxEngine {
                         return Ok(result);
                     }
                     if tx_type == TransactionType::OfferCreate {
-                        retain_expired_offer_deletions(
+                        retain_permanent_offer_deletions(
                             tx,
                             &mut sandbox,
                             &child_changes,
@@ -592,7 +598,7 @@ impl TxEngine {
                             fees,
                         )?;
                     }
-                    // tec: keep the fee and permanent expired-offer removals.
+                    // tec: keep the fee and permanent offer removals.
                     (result, true)
                 }
                 Err(result) => {

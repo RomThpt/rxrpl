@@ -1275,6 +1275,20 @@ fn cross_offers(
         && (in_leg.is_xrp || out_leg.is_xrp)
         && !offer_crossing_strand_reaches_limit(ctx, taker, taker_gets, taker_pays, threshold)
     {
+        // A sell IOC can encounter a partially funded offer at the first
+        // book tip even when its quoted quality rejects the strand. If
+        // reducing that offer to its owner funds makes its XRP side round to
+        // zero, OfferStream removes it while materialising the tip
+        // (105502572/TX138). Keep the ordinary out-of-quality offers intact.
+        if is_sell
+            && ctx.tx.get("Flags").and_then(Value::as_u64).unwrap_or(0) & TF_IMMEDIATE_OR_CANCEL
+                != 0
+            && let Some(quality) = book_tip_quality(ctx, inverse_book)
+            && quality > threshold
+        {
+            let dir_key = book_dir_with_quality(inverse_book, quality);
+            reap_out_of_quality_tiny_tips(ctx, taker, taker_acct, &dir_key)?;
+        }
         return Ok((
             taker_pays.clone(),
             taker_gets.clone(),
@@ -5933,6 +5947,26 @@ fn should_reap_tiny_increased_quality(
         &leg_as_quality_iou(owner_funds),
     )
     .is_ok_and(|effective_quality| effective_quality > quality)
+}
+
+/// Check a deleted offer against the fee-claim view. Flow keeps a tiny-tip
+/// removal even when the crossing later returns a claimed failure, but a
+/// partial fill or a newly exhausted maker must remain in the child sandbox.
+pub(crate) fn is_permanently_tiny_offer(
+    ctx: &mut ApplyContext<'_>,
+    offer: &Value,
+    owner: &AccountId,
+    book_dir: &Hash256,
+) -> bool {
+    let (Some(offer_in), Some(offer_out)) = (
+        offer.get("TakerPays").and_then(Leg::parse),
+        offer.get("TakerGets").and_then(Leg::parse),
+    ) else {
+        return false;
+    };
+    let funds = owner_funds_leg(ctx, owner, &offer_out);
+    let quality = u64::from_be_bytes(book_dir.as_bytes()[24..32].try_into().unwrap());
+    should_reap_tiny_increased_quality(owner, &offer_in, &offer_out, &funds, quality)
 }
 
 /// FlowOfferStream only adds a tiny reduced-quality offer to its permanent
@@ -15854,6 +15888,133 @@ mod flow_cross_own_unfunded {
                 .to_iou()
                 .to_decimal_string(),
             "46"
+        );
+    }
+
+    #[test]
+    fn ledger_105502572_reaps_out_of_quality_sub_drop_maker_without_crossing() {
+        let mut ledger = Ledger::genesis();
+        for addr in [ISS, TAKER, MAKER] {
+            let id = decode_account_id(addr).unwrap();
+            ledger
+                .put_state(
+                    keylet::account(&id),
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "AccountRoot", "Account": addr,
+                        "Balance": "1000000000", "Sequence": 1,
+                        "OwnerCount": 0, "Flags": 0,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        put_usd_line(&mut ledger, MAKER, 100_000);
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let usd =
+            |value: &str| serde_json::json!({"currency": "USD", "issuer": ISS, "value": value});
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": MAKER,
+                    "Fee": "10", "Sequence": 1, "Flags": TF_PASSIVE,
+                    "TakerGets": usd("99085.77"), "TakerPays": "37010749",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        let maker = decode_account_id(MAKER).unwrap();
+        let issuer = decode_account_id(ISS).unwrap();
+        let offer_key = keylet::offer(&maker, 1);
+        let offer: Value = serde_json::from_slice(&sandbox.read(&offer_key).unwrap()).unwrap();
+        let book_dir: Hash256 = offer["BookDirectory"].as_str().unwrap().parse().unwrap();
+        let line_key = keylet::trust_line(&maker, &issuer, &helpers::currency_to_bytes("USD"));
+        let mut line: Value = serde_json::from_slice(&sandbox.read(&line_key).unwrap()).unwrap();
+        line["Balance"]["value"] = Value::from(if maker.as_bytes() < issuer.as_bytes() {
+            "0.00072515"
+        } else {
+            "-0.00072515"
+        });
+        sandbox
+            .update(line_key, serde_json::to_vec(&line).unwrap())
+            .unwrap();
+        // TX92 placed the offer before TX138 in the same ledger. Carry the
+        // resulting state into TX138's base view, including its tiny balance.
+        let changes = sandbox.into_changes();
+        for (key, bytes) in changes.inserts.into_iter().chain(changes.updates) {
+            ledger.put_state(key, bytes).unwrap();
+        }
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        assert_eq!(owner_count(&sandbox, MAKER), 1);
+
+        let maker_xrp = xrp_balance(&sandbox, MAKER);
+        let taker_xrp = xrp_balance(&sandbox, TAKER);
+        let taker = decode_account_id(TAKER).unwrap();
+        let mut taker_acct: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::account(&taker)).unwrap()).unwrap();
+        let taker_gets = Value::String("36820892".into());
+        let taker_pays = usd("99084.78");
+        let source_budget = Leg::parse(&taker_gets).unwrap();
+        let out = Leg::parse(&taker_pays).unwrap();
+        let inverse_book = keylet::book_dir(
+            &source_budget.currency,
+            &source_budget.issuer,
+            &out.currency,
+            &out.issuer,
+        );
+        let tx = serde_json::json!({"Flags": TF_SELL | TF_IMMEDIATE_OR_CANCEL});
+        let rules = Rules::from_enabled([feature_id("FlowCross")]);
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let threshold = flow_crossing_threshold(&ctx, &taker, &source_budget, &out, false, false);
+        let quality = book_tip_quality(&ctx, &inverse_book).unwrap();
+        assert!(quality > threshold);
+        let offer_out = Leg::parse(&offer["TakerGets"]).unwrap();
+        let offer_in = Leg::parse(&offer["TakerPays"]).unwrap();
+        let funds = owner_funds_leg(&mut ctx, &maker, &offer_out);
+        assert!(should_reap_tiny_increased_quality(
+            &maker, &offer_in, &offer_out, &funds, quality
+        ));
+        assert!(!offer_crossing_strand_reaches_limit(
+            &ctx,
+            &taker,
+            &taker_gets,
+            &taker_pays,
+            threshold,
+        ));
+        let (remaining_pays, remaining_gets, crossed, _) = cross_offers(
+            &mut ctx,
+            &taker,
+            &mut taker_acct,
+            &taker_pays,
+            &taker_gets,
+            &inverse_book,
+            true,
+            false,
+            &source_budget,
+            false,
+        )
+        .unwrap();
+        assert_eq!(remaining_pays, taker_pays);
+        assert_eq!(remaining_gets, taker_gets);
+        assert!(!crossed);
+        assert!(sandbox.read(&offer_key).is_none());
+        assert!(sandbox.read(&book_dir).is_none());
+        assert_eq!(owner_count(&sandbox, MAKER), 0);
+        assert_eq!(xrp_balance(&sandbox, MAKER), maker_xrp);
+        assert_eq!(xrp_balance(&sandbox, TAKER), taker_xrp);
+        assert!(
+            sandbox
+                .read(&keylet::offer(&decode_account_id(TAKER).unwrap(), 1))
+                .is_none()
         );
     }
 
