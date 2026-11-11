@@ -1,7 +1,8 @@
 use rxrpl_amendment::feature::feature_id;
 use rxrpl_amount::{IOUAmount, number::Number};
 use rxrpl_codec::address::classic::decode_account_id;
-use rxrpl_primitives::AccountId;
+use rxrpl_crypto::sha512_half::sha512_half;
+use rxrpl_primitives::{AccountId, Hash256};
 use rxrpl_protocol::flags::account_root::LSF_PASSWORD_SPENT;
 use rxrpl_protocol::{TransactionResult, keylet};
 use serde_json::Value;
@@ -50,6 +51,89 @@ fn mpt_entry_amount(entry: &Value, field: &str) -> Option<u64> {
     })
 }
 
+fn payment_credential_ids(
+    tx: &Value,
+    rules: &rxrpl_amendment::Rules,
+) -> Result<Option<Vec<Hash256>>, TransactionResult> {
+    let Some(entries) = tx.get("CredentialIDs") else {
+        return Ok(None);
+    };
+    if !rules.enabled(&feature_id("Credentials")) {
+        return Err(TransactionResult::TemDisabled);
+    }
+    let entries = entries.as_array().ok_or(TransactionResult::TemMalformed)?;
+    if entries.is_empty() || entries.len() > 8 {
+        return Err(TransactionResult::TemMalformed);
+    }
+    let mut ids = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let id = entry
+            .as_str()
+            .and_then(|text| text.parse::<Hash256>().ok())
+            .ok_or(TransactionResult::TemMalformed)?;
+        if (rules.enabled(&feature_id("fixCleanup3_4_0")) && id == Hash256::new([0; 32]))
+            || ids.contains(&id)
+        {
+            return Err(TransactionResult::TemMalformed);
+        }
+        ids.push(id);
+    }
+    Ok(Some(ids))
+}
+
+fn credential_preauth_key(owner: &AccountId, pairs: &[(AccountId, Vec<u8>)]) -> Hash256 {
+    let mut hashes = Vec::with_capacity(pairs.len() * 32);
+    for (issuer, credential_type) in pairs {
+        hashes.extend_from_slice(sha512_half(&[issuer.as_bytes(), credential_type]).as_bytes());
+    }
+    sha512_half(&[
+        &[0, b'P'],
+        owner.as_bytes(),
+        &hashes,
+        &(pairs.len() as u64).to_be_bytes(),
+    ])
+}
+
+fn authorized_payment_credentials(
+    view: &dyn ReadView,
+    ids: &[Hash256],
+    source: &AccountId,
+    destination: &AccountId,
+) -> Result<bool, TransactionResult> {
+    let mut pairs = Vec::with_capacity(ids.len());
+    for id in ids {
+        let bytes = view.read(id).ok_or(TransactionResult::TecBadCredential)?;
+        let credential: Value =
+            serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+        if credential.get("LedgerEntryType").and_then(Value::as_str) != Some("Credential")
+            || credential
+                .get("Subject")
+                .and_then(Value::as_str)
+                .and_then(|address| decode_account_id(address).ok())
+                != Some(*source)
+            || helpers::get_flags(&credential) & crate::handlers::credentials::LSF_ACCEPTED == 0
+        {
+            return Err(TransactionResult::TecBadCredential);
+        }
+        let issuer = credential
+            .get("Issuer")
+            .and_then(Value::as_str)
+            .and_then(|address| decode_account_id(address).ok())
+            .ok_or(TransactionResult::TefInternal)?;
+        let credential_type = credential
+            .get("CredentialType")
+            .and_then(Value::as_str)
+            .and_then(|value| hex::decode(value).ok())
+            .ok_or(TransactionResult::TefInternal)?;
+        pairs.push((issuer, credential_type));
+    }
+    pairs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()).then(a.1.cmp(&b.1)));
+    if pairs.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(TransactionResult::TefInternal);
+    }
+    Ok(view.exists(&credential_preauth_key(destination, &pairs)))
+}
+
 impl PaymentTransactor {
     /// Read an AccountRoot from the view and parse it as JSON.
     fn read_account(
@@ -66,6 +150,7 @@ impl Transactor for PaymentTransactor {
     fn preflight(&self, ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
         // Destination must be present
         helpers::get_destination(ctx.tx)?;
+        payment_credential_ids(ctx.tx, ctx.rules)?;
 
         let account = helpers::get_account(ctx.tx)?;
         let destination = helpers::get_destination(ctx.tx)?;
@@ -121,6 +206,10 @@ impl Transactor for PaymentTransactor {
         let dst_id = decode_account_id(destination_str)
             .map_err(|_| TransactionResult::TemInvalidAccountId)?;
 
+        if let Some(ids) = payment_credential_ids(ctx.tx, ctx.rules)? {
+            authorized_payment_credentials(ctx.view, &ids, &src_id, &dst_id)?;
+        }
+
         // Check destination exists
         let dst_key = keylet::account(&dst_id);
         let dst_bytes = ctx.view.read(&dst_key);
@@ -170,6 +259,26 @@ impl Transactor for PaymentTransactor {
     fn apply(&self, ctx: &mut ApplyContext<'_>) -> Result<TransactionResult, TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
         let destination_str = helpers::get_destination(ctx.tx)?;
+        let credential_ids = payment_credential_ids(ctx.tx, ctx.rules)?;
+        if let Some(ids) = &credential_ids {
+            let mut found_expired = false;
+            for id in ids {
+                if let Some(bytes) = ctx.view.read(id) {
+                    let credential: Value = serde_json::from_slice(&bytes)
+                        .map_err(|_| TransactionResult::TefInternal)?;
+                    if crate::handlers::credentials::check_expired(
+                        &credential,
+                        ctx.view.parent_close_time(),
+                    ) {
+                        crate::handlers::credentials::delete_credential(ctx.view, id, &credential)?;
+                        found_expired = true;
+                    }
+                }
+            }
+            if found_expired {
+                return Ok(TransactionResult::TecExpired);
+            }
+        }
 
         // DepositAuth / RequireDestTag: these return a `tec` that rippled claims
         // (fee + seq charged). The engine consumes fee + seq centrally in the
@@ -192,7 +301,14 @@ impl Transactor for PaymentTransactor {
                         let src_id = decode_account_id(account_str)
                             .map_err(|_| TransactionResult::TemInvalidAccountId)?;
                         let preauth_key = keylet::deposit_preauth(&dst_id, &src_id);
-                        if !ctx.view.exists(&preauth_key) {
+                        let authorized = if ctx.view.exists(&preauth_key) {
+                            true
+                        } else if let Some(ids) = &credential_ids {
+                            authorized_payment_credentials(ctx.view, ids, &src_id, &dst_id)?
+                        } else {
+                            false
+                        };
+                        if !authorized {
                             return Err(TransactionResult::TecNoPermission);
                         }
                     }

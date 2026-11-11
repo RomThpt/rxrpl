@@ -11,6 +11,122 @@ use rxrpl_ledger::Ledger;
 const SRC_ADDRESS: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
 const DST_ADDRESS: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
 
+#[test]
+fn ledger_105502838_payment_uses_credential_deposit_preauth() {
+    const SOURCE: &str = "rGe24P5aZckhpfsXSsSwRa68pgtaio4yZw";
+    const DESTINATION: &str = "rLx9S9JPW9pmN9VeiveytN8AtHQMEGnp8D";
+    const CREDENTIAL_TYPE: &str = "787370656E63652E6D616B6577617665732E32303236";
+    const CREDENTIAL_ID: &str = "31B951BBF3005D00DDB9CDE8242F3CCD90AECF4B8D0B079795A2D76265FBDCF2";
+    const PREAUTH_ID: &str = "BC10BBAE8ADCC6626E2B820FE37E2D6626CAC41A23B7639193CAD62B488E0BE0";
+
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, SOURCE, "9611629", None);
+    put_account(&mut ledger, DESTINATION, "49999882", None);
+    let source_id = decode_account_id(SOURCE).unwrap();
+    let destination_id = decode_account_id(DESTINATION).unwrap();
+    let destination_key = keylet::account(&destination_id);
+    let mut destination: Value =
+        serde_json::from_slice(ledger.get_state(&destination_key).unwrap()).unwrap();
+    destination["Flags"] = serde_json::json!(0x0100_0000u32);
+    ledger
+        .put_state(destination_key, serde_json::to_vec(&destination).unwrap())
+        .unwrap();
+
+    let credential_type = hex::decode(CREDENTIAL_TYPE).unwrap();
+    let credential_key = keylet::credential(&source_id, &destination_id, &credential_type);
+    assert_eq!(credential_key.to_string(), CREDENTIAL_ID);
+    ledger
+        .put_state(
+            credential_key,
+            serde_json::to_vec(&serde_json::json!({
+                "LedgerEntryType": "Credential", "Subject": SOURCE,
+                "Issuer": DESTINATION, "CredentialType": CREDENTIAL_TYPE,
+                "Flags": crate::handlers::credentials::LSF_ACCEPTED,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+    let tx = serde_json::json!({
+        "TransactionType": "Payment", "Account": SOURCE,
+        "Destination": DESTINATION, "Amount": "1000000", "Fee": "12",
+        "Sequence": 74897492, "CredentialIDs": [CREDENTIAL_ID],
+    });
+    let rules = Rules::from_enabled([rxrpl_amendment::feature::feature_id("Credentials")]);
+    let fees = FeeSettings {
+        reserve_base: 1_000_000,
+        ..FeeSettings::default()
+    };
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut unauthorized = Sandbox::new(&view);
+    let mut unauthorized_ctx = ApplyContext {
+        tx: &tx,
+        view: &mut unauthorized,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut unauthorized_ctx),
+        Err(TransactionResult::TecNoPermission)
+    );
+
+    let preauth_key: rxrpl_primitives::Hash256 = PREAUTH_ID.parse().unwrap();
+    assert_eq!(
+        super::credential_preauth_key(&destination_id, &[(destination_id, credential_type)]),
+        preauth_key
+    );
+    ledger
+        .put_state(
+            preauth_key,
+            serde_json::to_vec(&serde_json::json!({
+                "LedgerEntryType": "DepositPreauth", "Account": DESTINATION,
+                "AuthorizeCredentials": [{"Credential": {
+                    "Issuer": DESTINATION, "CredentialType": CREDENTIAL_TYPE,
+                }}],
+                "Flags": 0,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let preflight = PreflightContext {
+        tx: &tx,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(PaymentTransactor.preflight(&preflight), Ok(()));
+    let preclaim = PreclaimContext {
+        tx: &tx,
+        view: &view,
+        rules: &rules,
+    };
+    assert_eq!(PaymentTransactor.preclaim(&preclaim), Ok(()));
+    let mut ctx = ApplyContext {
+        tx: &tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut ctx),
+        Ok(TransactionResult::TesSuccess)
+    );
+    let source_key = keylet::account(&source_id);
+    let source_after: Value = serde_json::from_slice(&sandbox.read(&source_key).unwrap()).unwrap();
+    let destination_after: Value =
+        serde_json::from_slice(&sandbox.read(&destination_key).unwrap()).unwrap();
+    // The engine charges the fee; the Payment handler transfers only Amount.
+    assert_eq!(source_after["Balance"], "8611629");
+    assert_eq!(destination_after["Balance"], "50999882");
+    let changes = sandbox.into_changes();
+    assert_eq!(
+        changes.updates.len(),
+        2,
+        "credential and preauth remain untouched"
+    );
+}
+
 fn setup_ledger_with_account(address: &str, balance: u64) -> Ledger {
     let mut ledger = Ledger::genesis();
     let account_id = decode_account_id(address).unwrap();
