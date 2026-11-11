@@ -3304,6 +3304,7 @@ fn cross_book_hop_with_reaps(
                 // keeps the untrimmed leftover (105500157 C32058ED).
                 if should_trim_input_limited_iou_leftover(
                     skip_input_debit,
+                    skip_output_credit,
                     budget_binds,
                     &new_gets,
                     preserve_input_limited_iou_ulp,
@@ -3507,6 +3508,7 @@ fn input_limited_uses_full_budget(
 
 fn should_trim_input_limited_iou_leftover(
     skip_input_debit: bool,
+    skip_output_credit: bool,
     budget_binds: bool,
     new_gets: &Leg,
     preserve_input_limited_iou_ulp: bool,
@@ -3514,6 +3516,7 @@ fn should_trim_input_limited_iou_leftover(
     remaining_out: &Leg,
 ) -> bool {
     skip_input_debit
+        && !skip_output_credit
         && budget_binds
         && !new_gets.is_xrp
         && !preserve_input_limited_iou_ulp
@@ -10201,16 +10204,33 @@ mod taker_crossing_tests {
         let partial = iou("0.8");
 
         assert!(!should_trim_input_limited_iou_leftover(
-            true, false, &leftover, false, &requested, &requested
+            true, false, false, &leftover, false, &requested, &requested
         ));
         assert!(!should_trim_input_limited_iou_leftover(
-            true, true, &leftover, false, &requested, &requested
+            true, false, true, &leftover, false, &requested, &requested
         ));
         assert!(should_trim_input_limited_iou_leftover(
-            true, true, &leftover, false, &partial, &requested
+            true, false, true, &leftover, false, &partial, &requested
         ));
         assert!(!should_trim_input_limited_iou_leftover(
-            true, true, &leftover, true, &partial, &requested
+            true, false, true, &leftover, true, &partial, &requested
+        ));
+    }
+
+    #[test]
+    fn ledger_105501907_interior_xah_offer_keeps_rounded_leftover() {
+        let previous = iou("54617.53022130543");
+        let filled = iou("7202.132638204216");
+        let remaining = leftover_leg(&previous, &filled, true);
+        assert_eq!(remaining.iou.to_decimal_string(), "47415.39758310121");
+        assert!(!should_trim_input_limited_iou_leftover(
+            true,
+            true,
+            true,
+            &remaining,
+            false,
+            &filled,
+            &iou("10000"),
         ));
     }
 
