@@ -3256,6 +3256,19 @@ fn cross_book_hop_with_reaps(
                     &net_remaining_in,
                     &in_for_out_offer(&offer_in, &take_out, &offer_out, &eff_rate),
                 )
+            } else if !skip_input_debit
+                && skip_output_credit
+                && offer_in.is_xrp
+                && !offer_out.is_xrp
+                && leg_gt(&offer_out, &take_out)
+                && leg_ge(&net_remaining_in, &offer_in)
+            {
+                // The reverse pass may demand slightly less than this offer's
+                // TakerGets while its XRP TakerPays fits SendMax exactly. The
+                // directory-quality estimate can floor below that demand,
+                // but BookStep::fwdImp keeps limitStepOut's reverse output and
+                // clamps the input cost to TakerPays (105503019/TX39).
+                false
             } else {
                 leg_ge(&take_out, &budget_out)
             };
