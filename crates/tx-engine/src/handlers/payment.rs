@@ -879,12 +879,16 @@ fn apply_iou(
     if source_is_short {
         return Err(TransactionResult::TecPathPartial);
     }
-    src_trust["Balance"]["value"] = serde_json::Value::String(new_src_value);
-    let src_trust_data =
-        serde_json::to_vec(&src_trust).map_err(|_| TransactionResult::TefInternal)?;
-    ctx.view
-        .update(src_trust_key, src_trust_data)
-        .map_err(|_| TransactionResult::TefInternal)?;
+    // A large IOU balance can round back to the same 16-digit mantissa after
+    // this debit. Do not mark the line as modified when its balance is unchanged.
+    if src_trust["Balance"]["value"].as_str() != Some(new_src_value.as_str()) {
+        src_trust["Balance"]["value"] = serde_json::Value::String(new_src_value);
+        let src_trust_data =
+            serde_json::to_vec(&src_trust).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(src_trust_key, src_trust_data)
+            .map_err(|_| TransactionResult::TefInternal)?;
+    }
 
     // `directSendNoFeeIOU` ultimately uses `rippleCredit`, which reaps a
     // source trust line when redeeming its entire balance leaves the line in
@@ -3523,3 +3527,99 @@ fn remove_offer_from_book(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod no_op_source_line_regression {
+    use super::*;
+    use crate::fees::FeeSettings;
+    use crate::view::ledger_view::LedgerView;
+    use crate::view::sandbox::Sandbox;
+    use rxrpl_amendment::Rules;
+    use rxrpl_ledger::Ledger;
+
+    #[test]
+    fn ledger_105501977_direct_zero_payment_does_not_touch_unchanged_source_line() {
+        const SOURCE: &str = "rEdSkWj9BmrnXkL17YFQHXyh5Pzgmzmt8o";
+        const DESTINATION: &str = "rw2iFSKXhjPn2ZvHYHRK9tBuCVYkrZLr75";
+        const ISSUER: &str = "rfH4wavPbouU5bceEuP2Y7vrwVzKLdZero";
+        const CURRENCY: &str = "5A45524F00000000000000000000000000000000";
+        let mut ledger = Ledger::genesis();
+        for account in [SOURCE, DESTINATION, ISSUER] {
+            let account_id = decode_account_id(account).unwrap();
+            let root = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": account,
+                "Balance": "100000000", "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+            });
+            ledger
+                .put_state(
+                    keylet::account(&account_id),
+                    serde_json::to_vec(&root).unwrap(),
+                )
+                .unwrap();
+        }
+
+        let issuer_id = decode_account_id(ISSUER).unwrap();
+        let currency = helpers::currency_to_bytes(CURRENCY);
+        let put_line = |ledger: &mut Ledger, holder: &str, balance: &str| {
+            let holder_id = decode_account_id(holder).unwrap();
+            let holder_is_low = holder_id.as_bytes() < issuer_id.as_bytes();
+            let stored = if holder_is_low {
+                balance.to_owned()
+            } else {
+                format!("-{balance}")
+            };
+            let (low, high) = if holder_is_low {
+                (holder, ISSUER)
+            } else {
+                (ISSUER, holder)
+            };
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0,
+                "Balance": {"currency": CURRENCY, "issuer": ISSUER, "value": stored},
+                "LowLimit": {"currency": CURRENCY, "issuer": low, "value": "0"},
+                "HighLimit": {"currency": CURRENCY, "issuer": high, "value": "0"},
+            });
+            let key = keylet::trust_line(&holder_id, &issuer_id, &currency);
+            ledger
+                .put_state(key, serde_json::to_vec(&line).unwrap())
+                .unwrap();
+            key
+        };
+        // At this magnitude, debiting 1000 is smaller than one IOU ULP.
+        let source_key = put_line(&mut ledger, SOURCE, "100000000000000000000");
+        let destination_key = put_line(&mut ledger, DESTINATION, "290860");
+        assert_eq!(
+            source_key.to_string(),
+            "33ED676D86D20720BA4D2C1372A47DC4BF9E60E95ADACAA62F11B5C9F8D8F8BB"
+        );
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment", "Account": SOURCE,
+            "Destination": DESTINATION,
+            "Amount": {"currency": CURRENCY, "issuer": ISSUER, "value": "1000"},
+            "Flags": 2147483648u32, "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            PaymentTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        let source_before = view.read(&source_key).unwrap();
+        assert_eq!(sandbox.read(&source_key).unwrap(), source_before);
+        let destination: Value =
+            serde_json::from_slice(&sandbox.read(&destination_key).unwrap()).unwrap();
+        assert_eq!(destination["Balance"]["value"], "-291860");
+        let changes = sandbox.into_changes();
+        assert!(!changes.updates.contains_key(&source_key));
+        assert!(changes.updates.contains_key(&destination_key));
+    }
+}
