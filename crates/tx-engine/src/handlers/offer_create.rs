@@ -6163,11 +6163,6 @@ fn offer_crossing_strand_reaches_limit_with_amm_mode(
     if is_amm && !hop.in_leg.is_xrp && hop.in_leg.issuer != *taker {
         rate = rate.mul(&Number::from_iou(&transfer_rate(ctx, &hop.in_leg.issuer)));
     }
-    // BookOfferCrossingStep::adjustQualityWithFees waives the AMM output fee;
-    // keep the issuer rate for book offers.
-    if !is_amm && !hop.out_leg.is_xrp && hop.out_leg.issuer != *taker {
-        rate = rate.mul(&Number::from_iou(&transfer_rate(ctx, &hop.out_leg.issuer)));
-    }
     let Ok(limit) = from_rate(threshold) else {
         return false;
     };
@@ -12422,6 +12417,84 @@ mod taker_bridge_integration {
             fees,
         };
         OfferCreateTransactor.apply(&mut ctx).unwrap()
+    }
+
+    #[test]
+    fn ledger_105502305_clob_upper_bound_ignores_evr_output_fee() {
+        const ISSUER: &str = "ra9g3LAJm9xJu8Awe7oWzR6VXFB1mpFtSe";
+        const SELLER: &str = "rGBYufoUiwpT2DYvbPXh68HTRswmyDzKVh";
+        const MAKER: &str = "rsHHWwNemQXNxieW8nRoGGTP8kvzc6vrG4";
+        let mut ledger = Ledger::genesis();
+        let issuer = decode_account_id(ISSUER).unwrap();
+        ledger
+            .put_state(
+                keylet::account(&issuer),
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "AccountRoot", "Account": ISSUER,
+                    "Balance": "1000000000", "Sequence": 1, "OwnerCount": 0,
+                    "Flags": 0, "TransferRate": 1_002_000_000u64,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let tx = serde_json::json!({
+            "TransactionType": "OfferCreate", "Account": SELLER, "Flags": TF_SELL,
+            "TakerGets": "81000000",
+            "TakerPays": {"currency": "EVR", "issuer": ISSUER, "value": "788.535"},
+        });
+        let input = Leg::parse(&tx["TakerGets"]).unwrap();
+        let output = Leg::parse(&tx["TakerPays"]).unwrap();
+        let book = keylet::book_dir(
+            &input.currency,
+            &input.issuer,
+            &output.currency,
+            &output.issuer,
+        );
+        let maker_quality = 0x5A03_A620_F369_8C3B;
+        let directory = book_dir_with_quality(&book, maker_quality);
+        let maker_key = keylet::offer(&decode_account_id(MAKER).unwrap(), 102_225_795);
+        ledger
+            .put_state(
+                directory,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "DirectoryNode", "Indexes": [maker_key.to_string()],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::from_enabled([
+            feature_id("FlowCross"),
+            feature_id("fixUniversalNumber"),
+            feature_id("fixAMMv1_1"),
+        ]);
+        let ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let seller = decode_account_id(SELLER).unwrap();
+        let limit = flow_crossing_threshold(&ctx, &seller, &input, &output, true, false);
+        let raw = from_rate(maker_quality).unwrap();
+        let fee = IOUAmount::from_decimal_string("1.002").unwrap();
+        let with_output_fee = IOUAmount::mul_round(&raw, &fee, true).unwrap();
+        assert_eq!(raw.to_decimal_string(), "102708.5383076923");
+        assert_eq!(
+            from_rate(limit).unwrap().to_decimal_string(),
+            "102722.1366204417"
+        );
+        assert!(maker_quality < limit);
+        assert!(with_output_fee > from_rate(limit).unwrap());
+        assert!(offer_crossing_strand_reaches_limit(
+            &ctx,
+            &seller,
+            &tx["TakerGets"],
+            &tx["TakerPays"],
+            limit,
+        ));
     }
 
     #[test]
