@@ -3217,7 +3217,13 @@ fn cross_book_hop_with_reaps(
                         &net_remaining_in,
                     )
                 } else {
-                    let scaled = scale_funds_limited_input(&offer_in, &avail_out, &offer_out);
+                    let scaled = bridge_funded_xrp_input(
+                        &offer_in,
+                        &avail_out,
+                        &offer_out,
+                        &eff_rate,
+                        force_full_input_budget,
+                    );
                     let floor = leg_min(&leg_min(&scaled, &offer_in), &remaining_in);
                     // The post-hop +1 drop is part of rippled's transfer-fee
                     // gross-up path (30000046 B19E), not generic proportional
@@ -3530,6 +3536,26 @@ fn scale_funds_limited_input(offer_in: &Leg, available: &Leg, offer_out: &Leg) -
     let scaled =
         IOUAmount::multiply(&leg_as_quality_iou(offer_in), &ratio).unwrap_or(IOUAmount::ZERO);
     leg_from_magnitude(&scaled, offer_in)
+}
+
+/// The XRP bridge's first book must exhaust a maker whose funded XRP is one
+/// drop above the output bought by proportional pricing of its drifted fields.
+/// Its fixed directory quality supplies the exact funded cap (105502181/TX36).
+fn bridge_funded_xrp_input(
+    offer_in: &Leg,
+    available: &Leg,
+    offer_out: &Leg,
+    rate: &IOUAmount,
+    bridge_first_hop: bool,
+) -> Leg {
+    let scaled = scale_funds_limited_input(offer_in, available, offer_out);
+    if bridge_first_hop && available.is_xrp && !offer_in.is_xrp {
+        let repriced_out = out_for_in(&scaled, rate, offer_out);
+        if repriced_out.drops.checked_add(1) == Some(available.drops) {
+            return in_for_out(available, rate, offer_in);
+        }
+    }
+    scaled
 }
 
 fn zero_cost_funded_xrp_offer(
@@ -6244,6 +6270,7 @@ fn price_clob_band_reverse(
     is_last: bool,
     permanent_reaps: &mut Vec<PermanentOffer>,
     uncapped_for_source_limit: bool,
+    bridge_first_xrp: bool,
 ) -> Option<(Number, Number)> {
     let demand_leg = number_to_leg(demanded, &hop.out_leg);
     // A BookStep reverse pass starts from the requested output, before
@@ -6268,7 +6295,7 @@ fn price_clob_band_reverse(
             /*allow_amm=*/ false,
             /*lq_stop=*/ None,
             /*preserve_input_limited_iou_ulp=*/ false,
-            /*force_full_input_budget=*/ false,
+            /*force_full_input_budget=*/ bridge_first_xrp,
             /*source_input_rate=*/ 1_000_000_000,
             /*source_funds_limited=*/ false,
             Some(permanent_reaps),
@@ -6301,7 +6328,7 @@ fn price_clob_band_reverse(
         /*allow_amm=*/ false,
         /*lq_stop=*/ None,
         /*preserve_input_limited_iou_ulp=*/ false,
-        /*force_full_input_budget=*/ false,
+        /*force_full_input_budget=*/ bridge_first_xrp,
         /*source_input_rate=*/ 1_000_000_000,
         /*source_funds_limited=*/ false,
         Some(permanent_reaps),
@@ -6686,6 +6713,7 @@ fn execute_strand_pass(
                 is_last,
                 permanent_reaps,
                 !offer_create_bridge && n == 1 && !hop.in_leg.is_xrp && hop.out_leg.is_xrp,
+                offer_create_bridge && is_first && !is_last && hop.out_leg.is_xrp,
             )?;
             ins[h] = i;
             outs[h] = o;
@@ -9583,8 +9611,8 @@ mod taker_crossing_tests {
         BalanceRounding, Leg, TakerCrossType, add_iou_balance, add_iou_balance_downward,
         add_iou_balance_half_upward, aggregate_flow_source_balance_number, amm_pool_debit_rounding,
         amm_step_allows_clob, book_payment_dust_drain, book_step_input_exhausted,
-        clob_band_allows_terminal_amm, composed_quality, consumes_full_offer,
-        crossing_quality_threshold, crossing_threshold, debit_drains_source,
+        bridge_funded_xrp_input, clob_band_allows_terminal_amm, composed_quality,
+        consumes_full_offer, crossing_quality_threshold, crossing_threshold, debit_drains_source,
         flow_first_book_spends_source_funds, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input,
         flow_source_funds_limit_binds, flow_xrp_to_iou, full_offer_take,
         funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
@@ -10094,6 +10122,29 @@ mod taker_crossing_tests {
                 .to_decimal_string(),
             "22786.06049831"
         );
+    }
+
+    #[test]
+    fn ledger_105502181_funded_bridge_xrp_exhausts_maker() {
+        let offer_in = iou("22217.46261674315");
+        let offer_out = xrp(360_744_345);
+        let funded = xrp(713_587);
+        let rate = from_rate(0x5015_E161_7D97_7263).unwrap();
+        let proportional = bridge_funded_xrp_input(&offer_in, &funded, &offer_out, &rate, false);
+        assert_eq!(proportional.iou.to_decimal_string(), "43.94827726625594");
+        assert_eq!(out_for_in(&proportional, &rate, &offer_out).drops, 713_586);
+
+        let quoted = bridge_funded_xrp_input(&offer_in, &funded, &offer_out, &rate, true);
+        assert_eq!(quoted.iou.to_decimal_string(), "43.94827731577981");
+        assert_eq!(out_for_in(&quoted, &rate, &offer_out).drops, 713_587);
+        assert_eq!(
+            leftover_leg(&offer_in, &quoted, true)
+                .iou
+                .to_decimal_string(),
+            "22173.51433942737"
+        );
+        assert_eq!(offer_out.drops - funded.drops, 360_030_758);
+        assert_eq!(3_113_587 - funded.drops, 2_400_000);
     }
 
     #[test]
@@ -12640,6 +12691,7 @@ mod taker_bridge_integration {
             false,
             &mut Vec::new(),
             false,
+            false,
         )
         .unwrap();
 
@@ -12733,6 +12785,7 @@ mod taker_bridge_integration {
             true,
             true,
             &mut reaps,
+            false,
             false,
         )
         .unwrap();
