@@ -1122,6 +1122,12 @@ fn credit_line_with_rounding(
         BalanceRounding::HalfUpward => add_iou_balance_half_upward(&balance, &delta),
     }
     .map_err(|_| TransactionResult::TefInternal)?;
+    // A one-drop offer can price its IOU input below the trust line's ULP.
+    // rippleCredit leaves that line untouched when its rounded balance does
+    // not move; writing it would create an extra ModifiedNode (105501848).
+    if new == balance {
+        return Ok(());
+    }
     line["Balance"]["value"] = Value::String(new.to_decimal_string());
     let nb = serde_json::to_vec(&line).map_err(|_| TransactionResult::TefInternal)?;
     ctx.view
@@ -13095,6 +13101,54 @@ mod flow_cross_own_unfunded {
     const MAKER: &str = "rpP2JgiMyTF5jR5hLG3xHCPi1knBb1v9cM";
     const MAKER2: &str = "rf1BiGeXwwQoi8Z2ueFYTEXSwuJYfV2Jpn";
     const ISS: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
+
+    #[test]
+    fn ledger_105501848_one_drop_offer_skips_unchanged_trust_lines() {
+        let holder = decode_account_id(TAKER).unwrap();
+        let issuer = decode_account_id(ISS).unwrap();
+        let currency = helpers::currency_to_bytes("USD");
+        let key = keylet::trust_line(&holder, &issuer, &currency);
+        let mut ledger = Ledger::genesis();
+        let (low, high) = if holder.as_bytes() < issuer.as_bytes() {
+            (TAKER, ISS)
+        } else {
+            (ISS, TAKER)
+        };
+        let line = serde_json::json!({
+            "LedgerEntryType": "RippleState",
+            "Balance": {
+                "currency": "USD", "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji",
+                "value": "1000.123456789012"
+            },
+            "LowLimit": {"currency": "USD", "issuer": low, "value": "0"},
+            "HighLimit": {"currency": "USD", "issuer": high, "value": "0"},
+            "Flags": 0,
+        });
+        ledger
+            .put_state(key, serde_json::to_vec(&line).unwrap())
+            .unwrap();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({});
+        let rules = Rules::from_enabled([feature_id("fixUniversalNumber")]);
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        credit_line(
+            &mut ctx,
+            &holder,
+            &issuer,
+            &currency,
+            &IOUAmount::from_decimal_string("0.00000000000001").unwrap(),
+            true,
+        )
+        .unwrap();
+        assert!(sandbox.into_changes().updates.is_empty());
+    }
 
     fn apply_flow(
         sandbox: &mut Sandbox<'_>,
