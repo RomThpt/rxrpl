@@ -2032,13 +2032,25 @@ fn cross_offers(
 
     if clob_source_spent.len() > 1
         && is_sell
-        && remaining_in.is_zero()
         && !mixed_clob_quality
         && !non_clob_source_spent
         && let Some(source) = source_balance.as_ref()
     {
         let spent = sum_smallest_to_largest(&clob_source_spent);
-        reconcile_flow_source_balance(ctx, source, &spent);
+        // A final input-limited offer can price a few Number ULPs below the
+        // sell budget even though Flow's source DirectStep consumes that entire
+        // budget. The offer reductions retain their priced values; only the
+        // source endpoint settles the full gross input (105500187 / TX13).
+        let spent_leg = number_to_leg(&spent, &in_leg);
+        let budget_drained = debit_drains_source(source_budget, &spent_leg);
+        if remaining_in.is_zero() || budget_drained {
+            let source_debit = if budget_drained {
+                leg_to_number(source_budget)
+            } else {
+                spent
+            };
+            reconcile_flow_source_balance(ctx, source, &source_debit);
+        }
     }
 
     Ok((
@@ -9895,6 +9907,34 @@ mod taker_crossing_tests {
 
         assert!(debit_drains_source(&source_funds, &priced_debit));
         assert!(!debit_drains_source(&source_funds, &material_remainder));
+    }
+
+    #[test]
+    fn ledger_105500187_multi_offer_sell_settles_full_source_budget() {
+        let source_balance = IOUAmount::from_decimal_string("1026.811695831073").unwrap();
+        let budget = iou("1026.811695");
+        let first = IOUAmount::from_decimal_string("1026.80024893322").unwrap();
+        let second = IOUAmount::from_decimal_string("0.01144606677961959").unwrap();
+        let spent = sum_smallest_to_largest(&[Number::from_iou(&first), Number::from_iou(&second)]);
+
+        assert!(debit_drains_source(
+            &budget,
+            &super::number_to_leg(&spent, &budget)
+        ));
+        assert_eq!(
+            aggregate_flow_source_balance_number(&source_balance, &spent, false)
+                .to_decimal_string(),
+            "0.00000083107338"
+        );
+        assert_eq!(
+            aggregate_flow_source_balance_number(
+                &source_balance,
+                &Number::from_iou(&budget.iou),
+                false,
+            )
+            .to_decimal_string(),
+            "0.000000831073"
+        );
     }
 
     #[test]
