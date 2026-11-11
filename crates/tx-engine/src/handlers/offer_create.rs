@@ -5712,11 +5712,11 @@ pub(crate) fn flow_net_input(amount: &Number, rate: Option<IOUAmount>) -> Number
         .unwrap_or(*amount)
 }
 
-/// The input-limited forward AMM BookStep divides its carried gross input by
-/// the issuer rate in Flow's `Number` domain before landing on the IOU grid.
-/// Truncating the STAmount quotient can lose one input ULP, which the terminal
-/// swap amplifies to three output ULPs (105502136 / TX32).
-fn flow_net_input_amm_forward(amount: &Number, rate: IOUAmount) -> Number {
+/// An input-limited terminal BookStep divides its carried gross input by the
+/// issuer rate in Flow's `Number` domain before landing on the IOU grid.
+/// STAmount truncation loses one input ULP for both AMM (105502136/TX32)
+/// and CLOB (105502606/TX17) terminal hops.
+fn flow_net_input_terminal_forward(amount: &Number, rate: IOUAmount) -> Number {
     Number::from_iou(&amount.div(&Number::from_iou(&rate)).to_iou())
 }
 
@@ -6934,10 +6934,9 @@ fn execute_strand_pass(
             let input_rate = flow_book_input_rate(ctx, &hop.in_leg, dest);
             if is_last
                 && h > limiting
-                && kinds[h] == HopKindR::Amm
                 && let Some(rate) = input_rate.filter(|rate| *rate > parity_rate())
             {
-                flow_net_input_amm_forward(&carry, rate)
+                flow_net_input_terminal_forward(&carry, rate)
             } else {
                 flow_net_input(&carry, input_rate)
             }
@@ -10223,7 +10222,7 @@ mod taker_crossing_tests {
             rxrpl_amount::number::MantissaScale::Small,
         );
         let down = flow_net_input(&Number::from_iou(&gross), Some(rate));
-        let net = super::flow_net_input_amm_forward(&Number::from_iou(&gross), rate);
+        let net = super::flow_net_input_terminal_forward(&Number::from_iou(&gross), rate);
         assert_eq!(down.to_iou().to_decimal_string(), "3089264.060266666");
         assert_eq!(net.to_iou().to_decimal_string(), "3089264.060266667");
 
@@ -10241,6 +10240,24 @@ mod taker_crossing_tests {
                 .unwrap()
                 .to_decimal_string(),
             "303488682.3923252"
+        );
+    }
+
+    #[test]
+    fn ledger_105502606_terminal_clob_keeps_forward_fee_digit() {
+        let gross = Number::from_iou(&IOUAmount::from_decimal_string("0.6036034909578").unwrap());
+        let rate = IOUAmount::from_decimal_string("1.002").unwrap();
+        assert_eq!(
+            flow_net_input(&gross, Some(rate))
+                .to_iou()
+                .to_decimal_string(),
+            "0.6023986935706586"
+        );
+        assert_eq!(
+            super::flow_net_input_terminal_forward(&gross, rate)
+                .to_iou()
+                .to_decimal_string(),
+            "0.6023986935706587"
         );
     }
 
