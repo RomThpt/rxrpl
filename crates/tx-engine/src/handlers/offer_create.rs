@@ -1410,6 +1410,12 @@ fn cross_offers(
         {
             set_flow_source_balance(ctx, source, &IOUAmount::ZERO);
         }
+        if is_sell
+            && source_funds_limited
+            && let Some(source) = source_balance.as_ref()
+        {
+            clear_one_ulp_source_overdraft(ctx, source, source_budget);
+        }
         let delivered = number_to_leg(&delivered, &out_leg);
         let spent = number_to_leg(&spent_total, &in_leg);
         let remaining_out = if leg_ge(&delivered, &out_leg) {
@@ -2069,6 +2075,18 @@ fn cross_offers(
             };
             reconcile_flow_source_balance(ctx, source, &source_debit);
         }
+    }
+
+    // A funds-capped tfSell can leave a one-ULP negative source balance after
+    // separate AMM/book debits even though the original holding was the entire
+    // crossing budget. Flow's source step settles that exhausted holding at
+    // zero (105502451/TX25); keep larger overdrafts visible.
+    if is_sell
+        && source_funds_limited
+        && crossed
+        && let Some(source) = source_balance.as_ref()
+    {
+        clear_one_ulp_source_overdraft(ctx, source, source_budget);
     }
 
     Ok((
@@ -5535,6 +5553,42 @@ fn flow_holder_funds(balance: &IOUAmount, holder_is_high: bool) -> Number {
         Number::ZERO
     } else {
         Number::from_iou(&holding)
+    }
+}
+
+fn source_has_one_ulp_overdraft(
+    source: &FlowSourceBalance,
+    budget: &Leg,
+    final_balance: &IOUAmount,
+) -> bool {
+    if !flow_holder_funds(&source.balance, source.holder_is_high)
+        .sub(&leg_to_number(budget))
+        .is_zero()
+    {
+        return false;
+    }
+    let holder_final = if source.holder_is_high {
+        final_balance.negate()
+    } else {
+        *final_balance
+    };
+    let one_ulp =
+        IOUAmount::from_parts(1, source.balance.exponent(), false).unwrap_or(IOUAmount::ZERO);
+    holder_final.is_negative() && holder_final.abs() <= one_ulp
+}
+
+fn clear_one_ulp_source_overdraft(
+    ctx: &mut ApplyContext<'_>,
+    source: &FlowSourceBalance,
+    budget: &Leg,
+) {
+    let current = ctx
+        .view
+        .read(&source.key)
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|line| IOUAmount::from_decimal_string(line["Balance"]["value"].as_str()?).ok());
+    if current.is_some_and(|balance| source_has_one_ulp_overdraft(source, budget, &balance)) {
+        set_flow_source_balance(ctx, source, &IOUAmount::ZERO);
     }
 }
 
@@ -10295,6 +10349,74 @@ mod taker_crossing_tests {
             .to_decimal_string(),
             "0.000000831073"
         );
+    }
+
+    #[test]
+    fn ledger_105502451_funds_capped_ogre_sell_clears_one_ulp_overdraft() {
+        let source = super::FlowSourceBalance {
+            key: rxrpl_primitives::Hash256::new([0; 32]),
+            balance: IOUAmount::from_decimal_string("2484.5").unwrap(),
+            holder_is_high: false,
+        };
+        let budget = iou("2484.5");
+        let final_balance = IOUAmount::from_decimal_string("-0.000000000001").unwrap();
+        assert!(super::source_has_one_ulp_overdraft(
+            &source,
+            &budget,
+            &final_balance
+        ));
+        assert!(!super::source_has_one_ulp_overdraft(
+            &source,
+            &budget,
+            &IOUAmount::from_decimal_string("-0.000000000002").unwrap()
+        ));
+        assert!(!super::source_has_one_ulp_overdraft(
+            &source,
+            &budget,
+            &IOUAmount::from_decimal_string("0.000000000001").unwrap()
+        ));
+        assert!(!super::source_has_one_ulp_overdraft(
+            &source,
+            &iou("2484.4"),
+            &final_balance
+        ));
+        let high_source = super::FlowSourceBalance {
+            key: source.key,
+            balance: source.balance.negate(),
+            holder_is_high: true,
+        };
+        assert!(super::source_has_one_ulp_overdraft(
+            &high_source,
+            &budget,
+            &final_balance.negate()
+        ));
+
+        let mut ledger = rxrpl_ledger::Ledger::genesis();
+        ledger
+            .put_state(
+                source.key,
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "RippleState",
+                    "Balance": {"value": "-0.000000000001"},
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let fees = crate::fees::FeeSettings::default();
+        let view = crate::view::ledger_view::LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = crate::view::sandbox::Sandbox::new(&view);
+        let rules = rxrpl_amendment::Rules::new();
+        let tx = serde_json::json!({});
+        let mut ctx = crate::transactor::ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        super::clear_one_ulp_source_overdraft(&mut ctx, &source, &budget);
+        let line: serde_json::Value =
+            serde_json::from_slice(&ctx.view.read(&source.key).unwrap()).unwrap();
+        assert_eq!(line["Balance"]["value"], "0");
     }
 
     #[test]
