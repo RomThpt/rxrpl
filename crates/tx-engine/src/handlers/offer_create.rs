@@ -1960,11 +1960,17 @@ fn cross_offers(
                 let mut reduced = offer.clone();
                 reduced["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
                 reduced["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
-                let rb =
-                    serde_json::to_vec(&reduced).map_err(|_| TransactionResult::TefInternal)?;
-                ctx.view
-                    .update(offer_key, rb)
-                    .map_err(|_| TransactionResult::TefInternal)?;
+                // A real sub-ULP fill can transfer funds while both offer legs
+                // canonically remain unchanged. Do not emit an empty ModifiedNode.
+                if reduced["TakerGets"] != offer["TakerGets"]
+                    || reduced["TakerPays"] != offer["TakerPays"]
+                {
+                    let rb =
+                        serde_json::to_vec(&reduced).map_err(|_| TransactionResult::TefInternal)?;
+                    ctx.view
+                        .update(offer_key, rb)
+                        .map_err(|_| TransactionResult::TefInternal)?;
+                }
                 // Quality quantisation can make `take_out` compare just below
                 // the original offer even though canonical subtraction rounds
                 // one residual side to zero. Such a dry offer is consumed and
@@ -16044,6 +16050,140 @@ mod flow_cross_own_unfunded {
                 .to_decimal_string(),
             "0"
         );
+    }
+
+    #[test]
+    fn ledger_105502705_microfill_settles_without_touching_unchanged_offer() {
+        const RLUSD_ISS: &str = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De";
+        let mut ledger = Ledger::genesis();
+        for addr in [ISS, RLUSD_ISS, TAKER, MAKER, MAKER2] {
+            let id = decode_account_id(addr).unwrap();
+            ledger
+                .put_state(
+                    keylet::account(&id),
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "AccountRoot", "Account": addr,
+                        "Balance": "1000000000", "Sequence": 1,
+                        "OwnerCount": 0, "Flags": 0,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let put_line = |ledger: &mut Ledger,
+                        holder: &str,
+                        issuer: &str,
+                        code: &str,
+                        balance: &str| {
+            let holder_id = decode_account_id(holder).unwrap();
+            let issuer_id = decode_account_id(issuer).unwrap();
+            let currency = helpers::currency_to_bytes(code);
+            let holder_is_low = holder_id.as_bytes() < issuer_id.as_bytes();
+            let stored = if balance == "0" || holder_is_low {
+                balance.to_string()
+            } else {
+                format!("-{balance}")
+            };
+            let (low, high) = if holder_is_low {
+                (holder, issuer)
+            } else {
+                (issuer, holder)
+            };
+            ledger
+                .put_state(
+                    keylet::trust_line(&holder_id, &issuer_id, &currency),
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "RippleState",
+                        "Balance": {"currency": code, "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": stored},
+                        "LowLimit": {"currency": code, "issuer": low, "value": "1000000"},
+                        "HighLimit": {"currency": code, "issuer": high, "value": "1000000"},
+                        "Flags": 0,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        };
+        for (holder, issuer, currency, balance) in [
+            (TAKER, ISS, "BBR", "1056.354569321967"),
+            (TAKER, RLUSD_ISS, "USD", "49.01300127837607"),
+            (MAKER, ISS, "BBR", "0"),
+            (MAKER, RLUSD_ISS, "USD", "204.6088496552258"),
+            (MAKER2, ISS, "BBR", "0"),
+            (MAKER2, RLUSD_ISS, "USD", "20000"),
+        ] {
+            put_line(&mut ledger, holder, issuer, currency, balance);
+        }
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut placement = Sandbox::new(&view);
+        let bbr =
+            |value: &str| serde_json::json!({"currency": "BBR", "issuer": ISS, "value": value});
+        let usd = |value: &str| serde_json::json!({"currency": "USD", "issuer": RLUSD_ISS, "value": value});
+        for (account, gets, pays) in [
+            (MAKER, "407.5063312366158", "2103.8736869084"),
+            (MAKER2, "14948.505014623", "77180.626241"),
+        ] {
+            assert_eq!(
+                apply_flow(
+                    &mut placement,
+                    &fees,
+                    &serde_json::json!({
+                        "TransactionType": "OfferCreate", "Account": account,
+                        "Fee": "10", "Sequence": 1,
+                        "TakerGets": usd(gets), "TakerPays": bbr(pays),
+                    }),
+                ),
+                TransactionResult::TesSuccess
+            );
+        }
+        let maker = decode_account_id(MAKER).unwrap();
+        let second = keylet::offer(&decode_account_id(MAKER2).unwrap(), 1);
+        let first = keylet::offer(&maker, 1);
+        let changes = placement.into_changes();
+        for (key, bytes) in changes.inserts.into_iter().chain(changes.updates) {
+            ledger.put_state(key, bytes).unwrap();
+        }
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let second_before = sandbox.read(&second).unwrap();
+        let tx = serde_json::json!({
+            "TransactionType": "OfferCreate", "Account": TAKER,
+            "Fee": "10", "Sequence": 1,
+            "Flags": TF_SELL | TF_IMMEDIATE_OR_CANCEL,
+            "TakerGets": bbr("1056.354569"), "TakerPays": usd("204.240553"),
+        });
+        let rules =
+            Rules::from_enabled([feature_id("FlowCross"), feature_id("fixUniversalNumber")]);
+        assert_eq!(
+            OfferCreateTransactor
+                .apply(&mut ApplyContext {
+                    tx: &tx,
+                    view: &mut sandbox,
+                    rules: &rules,
+                    fees: &fees,
+                })
+                .unwrap(),
+            TransactionResult::TesSuccess
+        );
+        assert!(sandbox.read(&first).is_none());
+        assert_eq!(sandbox.read(&second).unwrap(), second_before);
+        let taker = decode_account_id(TAKER).unwrap();
+        for (issuer, currency, expected) in [
+            (ISS, "BBR", "0.000000321967"),
+            (RLUSD_ISS, "USD", "253.6218509336021"),
+        ] {
+            let issuer_id = decode_account_id(issuer).unwrap();
+            let key = keylet::trust_line(&taker, &issuer_id, &helpers::currency_to_bytes(currency));
+            let line: Value = serde_json::from_slice(&sandbox.read(&key).unwrap()).unwrap();
+            let stored = if taker.as_bytes() < issuer_id.as_bytes() {
+                expected.to_string()
+            } else {
+                format!("-{expected}")
+            };
+            assert_eq!(line["Balance"]["value"], stored);
+        }
+        let changes = sandbox.into_changes();
+        assert!(!changes.updates.contains_key(&second));
     }
 
     #[test]
