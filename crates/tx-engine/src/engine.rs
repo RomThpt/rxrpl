@@ -13,7 +13,60 @@ use crate::transactor::{ApplyContext, PreclaimContext, PreflightContext};
 use crate::view::apply_view::ApplyView;
 use crate::view::ledger_view::LedgerView;
 use crate::view::read_view::ReadView;
-use crate::view::sandbox::Sandbox;
+use crate::view::sandbox::{Sandbox, SandboxChanges};
+
+/// OfferStream removes expired offers in its permanent view even when the
+/// crossing attempt later claims a fee. Reap only offers that existed before
+/// the handler and were already expired at the parent close time.
+fn retain_expired_offer_deletions(
+    tx: &Value,
+    sandbox: &mut Sandbox<'_>,
+    changes: &SandboxChanges,
+    rules: &Rules,
+    fees: &FeeSettings,
+) -> Result<(), TxEngineError> {
+    let mut keys: Vec<_> = changes.deletes.keys().copied().collect();
+    keys.sort_unstable();
+    for key in keys {
+        let Some(bytes) = sandbox.read(&key) else {
+            continue;
+        };
+        let Ok(offer) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if offer.get("LedgerEntryType").and_then(Value::as_str) != Some("Offer")
+            || offer
+                .get("Expiration")
+                .and_then(Value::as_u64)
+                .is_none_or(|exp| exp > sandbox.parent_close_time() as u64)
+        {
+            continue;
+        }
+        let Some(owner) = offer
+            .get("Account")
+            .and_then(Value::as_str)
+            .and_then(|s| decode_account_id(s).ok())
+        else {
+            continue;
+        };
+        let Some(book_dir) = offer
+            .get("BookDirectory")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse().ok())
+        else {
+            continue;
+        };
+        let mut ctx = ApplyContext {
+            tx,
+            view: sandbox,
+            rules,
+            fees,
+        };
+        crate::handlers::offer_create::reap_offer(&mut ctx, &owner, &key, &book_dir)
+            .map_err(TxEngineError::TransactionFailed)?;
+    }
+    Ok(())
+}
 
 /// Check that the transaction's Sequence matches the AccountRoot's Sequence.
 ///
@@ -530,7 +583,16 @@ impl TxEngine {
                     if tap_retry && result.is_retryable_tec() {
                         return Ok(result);
                     }
-                    // tec: discard child mutations, keep fee deduction
+                    if tx_type == TransactionType::OfferCreate {
+                        retain_expired_offer_deletions(
+                            tx,
+                            &mut sandbox,
+                            &child_changes,
+                            rules,
+                            fees,
+                        )?;
+                    }
+                    // tec: keep the fee and permanent expired-offer removals.
                     (result, true)
                 }
                 Err(result) => {
@@ -820,6 +882,35 @@ mod tests {
         }
     }
 
+    /// Simulates a crossing attempt that reaps an expired offer, then fails.
+    struct ExpiredOfferTecTransactor;
+
+    impl Transactor for ExpiredOfferTecTransactor {
+        fn preflight(&self, _ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
+            Ok(())
+        }
+        fn preclaim(&self, _ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
+            Ok(())
+        }
+        fn apply(
+            &self,
+            ctx: &mut ApplyContext<'_>,
+        ) -> Result<TransactionResult, TransactionResult> {
+            let owner = decode_account_id(ctx.tx["Account"].as_str().unwrap()).unwrap();
+            let offer_key = keylet::offer(&owner, 1);
+            ctx.view.erase(&offer_key).unwrap();
+            // A failed crossing must not retain unrelated child mutations.
+            let account_key = keylet::account(&owner);
+            let mut account: Value =
+                serde_json::from_slice(&ctx.view.read(&account_key).unwrap()).unwrap();
+            account["Balance"] = Value::from("1");
+            ctx.view
+                .update(account_key, serde_json::to_vec(&account).unwrap())
+                .unwrap();
+            Ok(TransactionResult::TecKilled)
+        }
+    }
+
     /// A test transactor whose `preclaim` fails with a tec (claimed cost).
     struct PreclaimTecTransactor;
 
@@ -1067,6 +1158,71 @@ mod tests {
         let data = ledger.get_state(&key).unwrap();
         let account: Value = rxrpl_ledger::sle_codec::decode_state(data).unwrap();
         assert_eq!(account["Balance"].as_str().unwrap(), "999990");
+    }
+
+    #[test]
+    fn offer_tec_keeps_expired_reap_but_discards_crossing() {
+        let address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let owner = decode_account_id(address).unwrap();
+        let offer_key = keylet::offer(&owner, 1);
+        let owner_dir = keylet::owner_dir(&owner);
+        let book_dir = rxrpl_primitives::Hash256::new([0xAB; 32]);
+        let mut ledger = Ledger::genesis();
+        let entries = [
+            (
+                keylet::account(&owner),
+                serde_json::json!({
+                    "LedgerEntryType": "AccountRoot", "Account": address,
+                    "Balance": "1000000", "Sequence": 1, "OwnerCount": 1, "Flags": 0
+                }),
+            ),
+            (
+                offer_key,
+                serde_json::json!({
+                    "LedgerEntryType": "Offer", "Account": address, "Sequence": 1,
+                    "TakerPays": "100", "TakerGets": "200", "Expiration": 0,
+                    "BookDirectory": book_dir.to_string(), "OwnerNode": "0000000000000000",
+                    "BookNode": "0000000000000000", "Flags": 0
+                }),
+            ),
+            (
+                owner_dir,
+                serde_json::json!({
+                    "LedgerEntryType": "DirectoryNode", "RootIndex": owner_dir.to_string(),
+                    "Owner": address, "Indexes": [offer_key.to_string()], "Flags": 0
+                }),
+            ),
+            (
+                book_dir,
+                serde_json::json!({
+                    "LedgerEntryType": "DirectoryNode", "RootIndex": book_dir.to_string(),
+                    "Indexes": [offer_key.to_string()], "Flags": 0
+                }),
+            ),
+        ];
+        for (key, entry) in entries {
+            let encoded =
+                rxrpl_ledger::sle_codec::encode_sle(&serde_json::to_vec(&entry).unwrap()).unwrap();
+            ledger.put_state(key, encoded).unwrap();
+        }
+        let mut tx = make_tx("OfferCreate");
+        tx["TakerPays"] = Value::from("100");
+        tx["TakerGets"] = Value::from("200");
+        let engine = test_engine_with(TransactionType::OfferCreate, ExpiredOfferTecTransactor);
+        let result = engine
+            .apply(&tx, &mut ledger, &Rules::new(), &FeeSettings::default())
+            .unwrap();
+        assert_eq!(result, TransactionResult::TecKilled);
+        let account: Value = rxrpl_ledger::sle_codec::decode_state(
+            ledger.get_state(&keylet::account(&owner)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(account["Balance"], "999990");
+        assert_eq!(account["Sequence"], 2);
+        assert_eq!(account["OwnerCount"], 0);
+        assert!(ledger.get_state(&offer_key).is_none());
+        assert!(ledger.get_state(&owner_dir).is_none());
+        assert!(ledger.get_state(&book_dir).is_none());
     }
 
     #[test]
