@@ -3332,6 +3332,8 @@ fn cross_book_hop_with_reaps(
             } else {
                 BalanceRounding::Legacy
             };
+            let fee_rounding =
+                book_output_fee_rounding(budget_binds, skip_input_debit, skip_output_credit);
             let net_out = pay_out_gross(
                 ctx,
                 taker,
@@ -3343,7 +3345,7 @@ fn cross_book_hop_with_reaps(
                 balance_rounding,
                 balance_rounding,
                 skip_output_credit,
-                TransferFeeRounding::Down,
+                fee_rounding,
                 false,
             )?;
             // Debiting Gets (e=-19) into a 22.45 BTC line (e=-14) truncates 1
@@ -7682,7 +7684,59 @@ fn pay_out(
 #[derive(Clone, Copy)]
 enum TransferFeeRounding {
     Down,
+    BookStepRatio,
     Nearest,
+}
+
+fn book_output_fee_rounding(
+    budget_binds: bool,
+    skip_input_debit: bool,
+    skip_output_credit: bool,
+) -> TransferFeeRounding {
+    // Only an input-limited last hop forwarded from a preceding step needs
+    // BookStep's retained ratio digits (105502369/TX41). A demand-limited last
+    // hop must keep its existing truncation (105502169/TX86).
+    if budget_binds && skip_input_debit && !skip_output_credit {
+        TransferFeeRounding::BookStepRatio
+    } else {
+        TransferFeeRounding::Down
+    }
+}
+
+/// Positive IOU `mulRatio(gross, QUALITY_ONE, rate, false)` for a BookStep
+/// output. rippled retains ratio digits up to its signed 64-bit intermediate
+/// before IOUAmount normalizes through Number. Truncating the quotient at the
+/// original 16-digit mantissa loses the guard digits needed for that rounding.
+fn book_output_net_ratio(gross: &IOUAmount, rate: u32) -> IOUAmount {
+    if gross.is_zero() {
+        return *gross;
+    }
+    // This caller has a positive canonical IOU (mantissa < 10^16) and
+    // transfer_rate_value returns a fee rate > 10^9. The unscaled quotient is
+    // below 10^16; mulRatio's decimal expansion reaches at most 10^18,
+    // which fits the signed 64-bit intermediate used by rippled.
+    debug_assert!(!gross.sign_bit());
+    debug_assert!(rate > 1_000_000_000);
+    let denominator = u128::from(rate);
+    let product = u128::from(gross.mantissa()) * 1_000_000_000;
+    let mut quotient = product / denominator;
+    let mut remainder = product % denominator;
+    let mut exponent = gross.exponent();
+    if remainder != 0 {
+        // IOUAmount.cpp mulRatio: kFl64 - ceil(log10(quotient)). The
+        // intermediate is truncated only after filling this available room.
+        let ceil_log10 = (quotient - 1).ilog10() + 1;
+        let room = 18u32.saturating_sub(ceil_log10);
+        if room > 0 {
+            let scale = 10u128.pow(room);
+            quotient *= scale;
+            remainder *= scale;
+            quotient += remainder / denominator;
+            exponent -= room as i32;
+        }
+    }
+    debug_assert!(quotient <= i64::MAX as u128);
+    rxrpl_amount::number::Number::new(false, quotient as u64, exponent).to_iou()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7716,8 +7770,8 @@ fn pay_out_gross(
     }
     // The fee applies only when neither party is the issuer (rippled charges no
     // transfer fee on issuance/redemption). When it applies, the recipient nets
-    // `gross / rate` rounded down; otherwise net == gross. For an intermediate
-    // hop (`skip_recipient_credit`) the output funds the next book directly, so
+    // `gross / rate` using the selected ratio rounding; otherwise net == gross.
+    // For an intermediate hop (`skip_recipient_credit`) the output funds the next book, so
     // there is no fee-charged recipient and the net carried forward is the gross.
     let fee_applies = !waive_transfer_fee
         && !skip_recipient_credit
@@ -7736,6 +7790,9 @@ fn pay_out_gross(
                         false,
                     )
                     .unwrap_or(amount.iou),
+                TransferFeeRounding::BookStepRatio => {
+                    book_output_net_ratio(&amount.iou, transfer_rate_value(ctx, &amount.issuer))
+                }
                 TransferFeeRounding::Nearest if round => {
                     let _scale = rxrpl_amount::number::MantissaScaleGuard::new(
                         rxrpl_amount::number::MantissaScale::Large,
@@ -12020,6 +12077,40 @@ mod amm_transfer_fee_tests {
                 assert_eq!(Some(pool_after), offer_pool_after);
                 assert_eq!(delivered.iou.to_decimal_string(), "0.0004802801886559575");
             }
+        }
+    }
+
+    #[test]
+    fn ledger_105502369_terminal_book_output_keeps_ratio_guard_digits() {
+        assert!(matches!(
+            super::book_output_fee_rounding(true, true, false),
+            TransferFeeRounding::BookStepRatio
+        ));
+        assert!(matches!(
+            super::book_output_fee_rounding(false, true, false),
+            TransferFeeRounding::Down
+        ));
+        assert!(matches!(
+            super::book_output_fee_rounding(true, false, false),
+            TransferFeeRounding::Down
+        ));
+        assert!(matches!(
+            super::book_output_fee_rounding(true, true, true),
+            TransferFeeRounding::Down
+        ));
+        let gross = IOUAmount::from_decimal_string("1067.201303501945").unwrap();
+        let truncated = gross
+            .mul_ratio(1_000_000_000, 1_002_000_000, false)
+            .unwrap();
+        assert_eq!(truncated.to_decimal_string(), "1065.071161179585");
+        assert_eq!(
+            super::book_output_net_ratio(&gross, 1_002_000_000).to_decimal_string(),
+            "1065.071161179586"
+        );
+        let max_gross = IOUAmount::from_parts(9_999_999_999_999_999, 0, false).unwrap();
+        for rate in [1_000_000_001, u32::MAX] {
+            let net = super::book_output_net_ratio(&max_gross, rate);
+            assert!(net > IOUAmount::ZERO && net <= max_gross);
         }
     }
 
