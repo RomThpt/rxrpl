@@ -1529,8 +1529,8 @@ fn cross_offers(
             if let Some(b) = &bridge {
                 let before = remaining_out.clone();
                 let source_before_bridge = source_remaining.clone();
-                let multi_path = offer_crossing_strand_reaches_limit(
-                    ctx, taker, taker_gets, taker_pays, threshold,
+                let multi_path = offer_crossing_strand_reaches_limit_with_amm_mode(
+                    ctx, taker, taker_gets, taker_pays, threshold, true,
                 );
                 try_bridge_step(
                     ctx,
@@ -1972,8 +1972,9 @@ fn cross_offers(
     if !remaining_out.is_zero() && !remaining_in.is_zero() {
         if let Some(b) = &bridge {
             let source_before_bridge = source_remaining.clone();
-            let multi_path =
-                offer_crossing_strand_reaches_limit(ctx, taker, taker_gets, taker_pays, threshold);
+            let multi_path = offer_crossing_strand_reaches_limit_with_amm_mode(
+                ctx, taker, taker_gets, taker_pays, threshold, true,
+            );
             try_bridge_step(
                 ctx,
                 taker,
@@ -2376,6 +2377,8 @@ fn try_bridge_step(
         amm_ctx.clear();
         let ri = leg_to_number(&budget);
         let ro = leg_to_number(&demand);
+        let pass_cp = ctx.view.checkpoint();
+        let taker_acct_before_pass = taker_acct.clone();
         let Some(res) = execute_strand_pass(
             ctx,
             taker,
@@ -2400,6 +2403,22 @@ fn try_bridge_step(
             break;
         }
         let pass_quality_adjusted = res.quality_adjusted;
+        // A quality-limited AMM pass must itself meet the taker's limit.
+        // Earlier profitable bands can make the aggregate look acceptable even
+        // when the final AMM fragment is worse (105501906 / TX20). Keep the
+        // preceding bands, but discard this speculative fragment.
+        if pass_quality_adjusted
+            && !bridge_adjusted_pass_meets_limit(
+                &res.in_amt,
+                &res.out_amt,
+                cq,
+                ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+            )
+        {
+            ctx.view.rollback(pass_cp);
+            *taker_acct = taker_acct_before_pass;
+            break;
+        }
         quality_adjusted |= pass_quality_adjusted;
         pass_ins.push(res.in_amt);
         pass_outs.push(res.out_amt);
@@ -2452,6 +2471,25 @@ fn try_bridge_step(
     };
     *crossed = true;
     Ok(())
+}
+
+fn bridge_adjusted_pass_meets_limit(
+    input: &Number,
+    output: &Number,
+    limit: u64,
+    round_even: bool,
+) -> bool {
+    let input = num_quality_iou(input, false);
+    let output = num_quality_iou(output, false);
+    let rate = if round_even {
+        rxrpl_amount::get_rate_round_even(&input, &output)
+    } else {
+        rxrpl_amount::get_rate(&input, &output)
+    };
+    rate.is_ok_and(|rate| {
+        rxrpl_amount::is_better_quality(rate, limit)
+            || rxrpl_amount::within_relative_distance(rate, limit)
+    })
 }
 
 /// Output deliverable for a given input at a resting offer's price. This mirrors
@@ -5945,6 +5983,22 @@ fn offer_crossing_strand_reaches_limit(
     taker_pays: &Value,
     threshold: u64,
 ) -> bool {
+    offer_crossing_strand_reaches_limit_with_amm_mode(
+        ctx, taker, taker_gets, taker_pays, threshold, false,
+    )
+}
+
+/// The first bridge selection quotes both candidate strands with AMM fib
+/// offers. A spot-priced single-strand quote can admit a direct AMM whose fee
+/// makes its first fib offer worse than the taker's limit (105501906 / TX20).
+fn offer_crossing_strand_reaches_limit_with_amm_mode(
+    ctx: &ApplyContext<'_>,
+    taker: &AccountId,
+    taker_gets: &Value,
+    taker_pays: &Value,
+    threshold: u64,
+    multi_path: bool,
+) -> bool {
     let Some(strand) = build_flow_strand(ctx, &[taker_gets.clone(), taker_pays.clone()]) else {
         return false;
     };
@@ -5952,7 +6006,7 @@ fn offer_crossing_strand_reaches_limit(
         return false;
     };
     let clob = book_tip_quality(ctx, &hop.inverse_book);
-    let amm_threshold = offer_crossing_amm_threshold(clob, Some(threshold), false);
+    let amm_threshold = offer_crossing_amm_threshold(clob, Some(threshold), multi_path);
     let amm = match (hop.liquidity.as_ref(), hop.amm_pool.as_ref()) {
         (Some(liq), Some(pool)) => {
             let pool_in = pool_balance_number(
@@ -5969,8 +6023,13 @@ fn offer_crossing_strand_reaches_limit(
                 &hop.out_leg.currency,
                 &hop.out_leg.issuer,
             );
-            liq.get_offer(&pool_in, &pool_out, amm_threshold, &AmmContext::new(false))
-                .map(|offer| offer.quality)
+            liq.get_offer(
+                &pool_in,
+                &pool_out,
+                amm_threshold,
+                &AmmContext::new(multi_path),
+            )
+            .map(|offer| offer.quality)
         }
         _ => None,
     };
@@ -6358,6 +6417,13 @@ fn limit_strand_output_by_quality(
     }
 }
 
+/// A calculated quality cap ends a strand only when this pass actually
+/// delivers up to it. An earlier book band may limit the pass first, leaving
+/// other bands available to the next pass.
+fn strand_quality_cap_reached(requested: &Number, capped: &Number, delivered: &Number) -> bool {
+    !capped.sub(requested).is_zero() && num_ge(delivered, capped)
+}
+
 /// Execute ONE pass of a (multi-hop, AMM and/or CLOB) strand with rippled's
 /// reverse-then-forward `StrandFlow` algorithm (StrandFlow.h:80-281).
 ///
@@ -6429,7 +6495,6 @@ fn execute_strand_pass(
             )
         })
         .unwrap_or(*remaining_out);
-    let quality_adjusted = !remaining_out.sub(&requested_out).is_zero();
 
     // Whether a hop consumes its AMM fib chunk this pass, or its CLOB tip band.
     // rippled's `BookStep` tries the AMM FIRST at the CLOB tip quality; the AMM
@@ -6469,7 +6534,6 @@ fn execute_strand_pass(
             }
             _ => None,
         };
-
         if let Some(offer) = amm_offer {
             kinds[h] = HopKindR::Amm;
             let pool_id = amm_hops[h].as_ref()?.pool_id;
@@ -6580,6 +6644,11 @@ fn execute_strand_pass(
         let is_first = h == 0;
         let is_last = h == n - 1;
         let clob_q = funded_book_tip_quality(ctx, taker, &hop.inverse_book);
+        let amm_threshold = if offer_create_bridge {
+            offer_crossing_amm_threshold(clob_q, limit_quality, amm_ctx.multi_path())
+        } else {
+            clob_q
+        };
         let available_input = if is_first {
             source_available
         } else {
@@ -6592,7 +6661,8 @@ fn execute_strand_pass(
                 let (in_num, out_num) = if is_first && source_capped {
                     // Source-limited: re-price hop 0 forward from the budget.
                     let liq = hop.liquidity.as_ref()?;
-                    let offer = liq.get_offer(&amm.pool_in, &amm.pool_out, clob_q, amm_ctx)?;
+                    let offer =
+                        liq.get_offer(&amm.pool_in, &amm.pool_out, amm_threshold, amm_ctx)?;
                     offer.limit_in(&source_available, false)
                 } else if h <= limiting {
                     // Reverse-priced; conserved by construction (outs[h-1] == ins[h]).
@@ -6601,7 +6671,8 @@ fn execute_strand_pass(
                     // Past the limiting step: re-price forward against the reduced
                     // carry (`limitStepIn`, round the output down), keeping quality.
                     let liq = hop.liquidity.as_ref()?;
-                    let offer = liq.get_offer(&amm.pool_in, &amm.pool_out, clob_q, amm_ctx)?;
+                    let offer =
+                        liq.get_offer(&amm.pool_in, &amm.pool_out, amm_threshold, amm_ctx)?;
                     if num_ge(&offer.in_num, &available_input) {
                         offer.limit_in(&available_input, false)
                     } else {
@@ -6725,6 +6796,7 @@ fn execute_strand_pass(
         return None;
     }
     source_in = flow_gross_input(&source_in, source_rate);
+    let quality_adjusted = strand_quality_cap_reached(&requested_out, &remaining_out, &carry);
     Some(StrandPass {
         in_amt: source_in,
         out_amt: carry,
@@ -13289,6 +13361,174 @@ mod flow_cross_own_unfunded {
                 serde_json::to_vec(&line).unwrap(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn ledger_105501906_direct_amm_fib_quote_does_not_activate_second_strand() {
+        const TAKER: &str = "rTeLeproT3BVgjWoYrDYpKbBLXPaVMkge";
+        const XAH_ISSUER: &str = "rswh1fvyLqHizBS2awu1vs6QcmwTBd9qiv";
+        const RLUSD_ISSUER: &str = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De";
+        const POOL: &str = "rK9WLBTBxvgMtCsPo5aq7da6NhXoSKZor7";
+        const RLUSD: &str = "524C555344000000000000000000000000000000";
+        let pool = decode_account_id(POOL).unwrap();
+        let xah_issuer = decode_account_id(XAH_ISSUER).unwrap();
+        let rlusd_issuer = decode_account_id(RLUSD_ISSUER).unwrap();
+        let xah = helpers::currency_to_bytes("XAH");
+        let rlusd = helpers::currency_to_bytes(RLUSD);
+        let mut ledger = Ledger::genesis();
+        for (issuer, currency, holding) in [
+            (XAH_ISSUER, "XAH", "241898.5753545085"),
+            (RLUSD_ISSUER, RLUSD, "4371.101523406265"),
+        ] {
+            let issuer_id = decode_account_id(issuer).unwrap();
+            let (low, high, stored) = if pool.as_bytes() < issuer_id.as_bytes() {
+                (POOL, issuer, holding.to_string())
+            } else {
+                (issuer, POOL, format!("-{holding}"))
+            };
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState",
+                "Balance": {"currency": currency, "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": stored},
+                "LowLimit": {"currency": currency, "issuer": low, "value": "0"},
+                "HighLimit": {"currency": currency, "issuer": high, "value": "0"},
+                "Flags": 0,
+            });
+            ledger
+                .put_state(
+                    keylet::trust_line(&pool, &issuer_id, &helpers::currency_to_bytes(currency)),
+                    serde_json::to_vec(&line).unwrap(),
+                )
+                .unwrap();
+        }
+        let amm = serde_json::json!({
+            "LedgerEntryType": "AMM", "Account": POOL, "TradingFee": 953,
+        });
+        ledger
+            .put_state(
+                keylet::amm(&xah, &xah_issuer, &rlusd, &rlusd_issuer),
+                serde_json::to_vec(&amm).unwrap(),
+            )
+            .unwrap();
+        // The best direct offer is far outside this taker's limit.
+        let book = keylet::book_dir(&xah, &xah_issuer, &rlusd, &rlusd_issuer);
+        let poor_quality = rxrpl_amount::get_rate_round_even(
+            &IOUAmount::from_decimal_string("200000").unwrap(),
+            &IOUAmount::from_decimal_string("11.399999772").unwrap(),
+        )
+        .unwrap();
+        ledger
+            .put_state(
+                book_dir_with_quality(&book, poor_quality),
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "DirectoryNode",
+                    "Indexes": [Hash256::new([3u8; 32]).to_string()],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules =
+            Rules::from_enabled([feature_id("FlowCross"), feature_id("fixUniversalNumber")]);
+        let tx = serde_json::json!({
+            "TakerGets": {"currency": "XAH", "issuer": XAH_ISSUER, "value": "100000"},
+            "TakerPays": {"currency": RLUSD, "issuer": RLUSD_ISSUER, "value": "1805"},
+            "Flags": TF_SELL,
+        });
+        let ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let taker = decode_account_id(TAKER).unwrap();
+        let input = Leg::parse(&tx["TakerGets"]).unwrap();
+        let output = Leg::parse(&tx["TakerPays"]).unwrap();
+        let limit = flow_crossing_threshold(&ctx, &taker, &input, &output, true, false);
+        assert!(offer_crossing_strand_reaches_limit(
+            &ctx,
+            &taker,
+            &tx["TakerGets"],
+            &tx["TakerPays"],
+            limit,
+        ));
+        assert!(!offer_crossing_strand_reaches_limit_with_amm_mode(
+            &ctx,
+            &taker,
+            &tx["TakerGets"],
+            &tx["TakerPays"],
+            limit,
+            true,
+        ));
+    }
+
+    #[test]
+    fn ledger_105501906_bridge_forward_uses_reverse_amm_threshold() {
+        // TX20: the XRP/RLUSD AMM is selected in the reverse pass after the
+        // direct strand drops out. Its spot quote is worse than the resting
+        // CLOB tip, so repricing the forward pass against that tip dries the
+        // bridge after the XAH/XRP CLOB has already produced 672659411 drops.
+        let pool_in = Number::from_int(1_859_904_487_328);
+        let pool_out =
+            Number::from_iou(&IOUAmount::from_decimal_string("2066118.962732664").unwrap());
+        let amm = AmmLiquidity {
+            in_is_xrp: true,
+            out_is_xrp: false,
+            round_even_quality: true,
+            fix_amm_v1_2: true,
+            tfee: 208,
+            initial_pool_in: pool_in,
+            initial_pool_out: pool_out,
+        };
+        let clob = 6_494_189_227_102_275_047;
+        let limit = clob - 1;
+        let ctx = AmmContext::new(false);
+        assert!(
+            amm.get_offer(&pool_in, &pool_out, Some(clob), &ctx)
+                .is_none()
+        );
+        let threshold = offer_crossing_amm_threshold(Some(clob), Some(limit), ctx.multi_path());
+        assert_eq!(threshold, None);
+        let offer = amm.get_offer(&pool_in, &pool_out, threshold, &ctx).unwrap();
+        let (_, delivered) = offer.limit_in(&Number::from_int(672_659_411), false);
+        assert!(!delivered.is_zero());
+    }
+
+    #[test]
+    fn ledger_105501906_first_bridge_band_does_not_reach_quality_cap() {
+        let requested = Number::from_int(1_000_000_000);
+        let cap = Number::from_iou(&IOUAmount::from_decimal_string("10167.66431569803").unwrap());
+        let first_band =
+            Number::from_iou(&IOUAmount::from_decimal_string("745.416355142").unwrap());
+        assert!(!strand_quality_cap_reached(&requested, &cap, &first_band));
+        assert!(strand_quality_cap_reached(&requested, &cap, &cap));
+        assert!(!strand_quality_cap_reached(&cap, &cap, &cap));
+    }
+
+    #[test]
+    fn ledger_105501906_adjusted_amm_fragment_worse_than_offer_limit() {
+        let limit = rxrpl_amount::get_rate_round_even(
+            &IOUAmount::from_decimal_string("100000").unwrap(),
+            &IOUAmount::from_decimal_string("1805").unwrap(),
+        )
+        .unwrap();
+        let first = Number::from_iou(&IOUAmount::from_decimal_string("41108.90641193176").unwrap());
+        let first_out = Number::from_iou(&IOUAmount::from_decimal_string("745.416355142").unwrap());
+        assert!(bridge_adjusted_pass_meets_limit(
+            &first, &first_out, limit, true
+        ));
+        let surplus =
+            Number::from_iou(&IOUAmount::from_decimal_string("13482.9877506115").unwrap());
+        let surplus_out =
+            Number::from_iou(&IOUAmount::from_decimal_string("242.7407044606865").unwrap());
+        assert!(!bridge_adjusted_pass_meets_limit(
+            &surplus,
+            &surplus_out,
+            limit,
+            true,
+        ));
     }
 
     #[test]
