@@ -469,6 +469,24 @@ impl Transactor for PaymentTransactor {
                             .and_then(Value::as_array)
                             .is_some_and(|paths| paths.len() == 1)
                         && flow_strands_have_amm(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]);
+                    // A single explicit IOU -> IOU strand can still interleave
+                    // an AMM with a resting book at an interior hop. Flow must
+                    // select the AMM's better quality first, then forward its
+                    // residual into the partial CLOB fill (105503019/TX12).
+                    let single_iou_mixed_amm_strand = flow_strand_count == 1
+                        && account_str == destination_str
+                        && !send_max.is_string()
+                        && !ctx.tx["Amount"].is_string()
+                        && ctx.tx.get("DeliverMin").is_some()
+                        && helpers::get_flags(ctx.tx)
+                            & rxrpl_protocol::flags::payment::TF_NO_RIPPLE_DIRECT
+                            != 0
+                        && ctx
+                            .tx
+                            .get("Paths")
+                            .and_then(Value::as_array)
+                            .is_some_and(|paths| paths.len() == 1)
+                        && flow_strands_have_amm(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]);
                     // Either native boundary can mix AMM and CLOB liquidity.
                     // The single-swap shortcut spends all SendMax in the AMM
                     // before the book gets a turn (105501273, IOU -> XRP).
@@ -485,6 +503,7 @@ impl Transactor for PaymentTransactor {
                     if direct_native_amm_book
                         || single_native_amm_strand
                         || single_iou_to_native_amm_strand
+                        || single_iou_mixed_amm_strand
                         || (flow_strand_count >= 2
                             && flow_strands_have_amm(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]))
                     {
@@ -1194,9 +1213,8 @@ fn get_send_max_iou(tx: &serde_json::Value) -> Option<(&str, &str, &str)> {
     ))
 }
 
-/// Extract a DeliverMin IOU object as (currency, issuer, value). Returned
-/// only when `DeliverMin` is set as an IOU object; XRP-amount variants are
-/// not yet supported here (they only matter for XRP-only Payments).
+/// Extract a DeliverMin IOU object as (currency, issuer, value). Callers that
+/// also handle native XRP must compare the complete DeliverMin value instead.
 fn get_deliver_min_iou(tx: &serde_json::Value) -> Option<(&str, &str, &str)> {
     let dm = tx.get("DeliverMin")?;
     if !dm.is_object() {
@@ -1670,13 +1688,8 @@ fn apply_paths_payment(
         if !delivered_meets_target(&delivered, &amount) {
             return Err(TransactionResult::TecPathPartial);
         }
-    } else if let Some((dm_cur, dm_iss, dm_val)) = get_deliver_min_iou(ctx.tx) {
-        let (d_cur, d_iss) = asset_of(&delivered);
-        let target = serde_json::json!({
-            "currency": dm_cur, "issuer": dm_iss, "value": dm_val,
-        });
-        let _ = (d_cur, d_iss);
-        if !delivered_meets_target(&delivered, &target) {
+    } else if let Some(target) = ctx.tx.get("DeliverMin") {
+        if !delivered_meets_target(&delivered, target) {
             return Err(TransactionResult::TecPathPartial);
         }
     }
@@ -2165,6 +2178,7 @@ fn apply_paths_payment_multi(
                 && ctx.tx.get("DeliverMin").is_some()
                 && strands.len() == 1
                 && strands[0].is_two_hop_clob_path()
+                && !amount.is_string()
             {
                 TransactionResult::TecPathPartial
             } else {
