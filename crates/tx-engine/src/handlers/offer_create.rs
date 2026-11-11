@@ -1526,6 +1526,14 @@ fn cross_offers(
             QualityAdvanceMode::Speculative,
         )?
         .funded_tip_remains;
+        // After consuming a maker's available funds, OfferStream::step walks
+        // past every now-unfunded tip before BookStep compares the AMM with a
+        // funded book quality. Do not finish at an emptied intermediate page:
+        // the next quality may hold another offer from that maker that must be
+        // reaped first (105502488/TX27).
+        if advance_after_exhausted_tip && !funded_tip_before_amm {
+            continue;
+        }
         // Interleave the AMM at this quality band BEFORE the resting CLOB offers.
         // rippled crosses whichever of the synthetic AMM offer / CLOB tip is
         // better at each quality level (BookStep tryAMM/execOffer). `amm_hop`'s
@@ -15742,6 +15750,110 @@ mod flow_cross_own_unfunded {
                     &currency
                 ))
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn ledger_105502488_reaps_next_unfunded_quality_before_amm_finishes() {
+        let mut ledger = Ledger::genesis();
+        for (addr, drops) in [
+            (ISS, 1_000_000_000u64),
+            (TAKER, 1_000_000_000),
+            (MAKER, 1_000_000_000),
+            (MAKER2, 9_900_000_000),
+        ] {
+            let id = decode_account_id(addr).unwrap();
+            ledger
+                .put_state(
+                    keylet::account(&id),
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "AccountRoot", "Account": addr,
+                        "Balance": drops.to_string(), "Sequence": 1,
+                        "OwnerCount": 0, "Flags": 0,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        put_usd_line(&mut ledger, MAKER, 100);
+        put_usd_line(&mut ledger, MAKER2, 1_000_000);
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let usd =
+            |value: &str| serde_json::json!({"currency": "USD", "issuer": ISS, "value": value});
+        for (seq, pays) in [(1, "437000"), (2, "460000"), (3, "464600")] {
+            assert_eq!(
+                apply_flow(
+                    &mut sandbox,
+                    &fees,
+                    &serde_json::json!({
+                        "TransactionType": "OfferCreate", "Account": MAKER,
+                        "Fee": "10", "Sequence": seq,
+                        "TakerGets": usd("46"), "TakerPays": pays,
+                    }),
+                ),
+                TransactionResult::TesSuccess
+            );
+        }
+        assert_eq!(owner_count(&sandbox, MAKER), 3);
+        let maker = decode_account_id(MAKER).unwrap();
+        let issuer = decode_account_id(ISS).unwrap();
+        let currency = helpers::currency_to_bytes("USD");
+        let maker_line = keylet::trust_line(&maker, &issuer, &currency);
+        let mut line: Value = serde_json::from_slice(&sandbox.read(&maker_line).unwrap()).unwrap();
+        line["Balance"]["value"] = Value::from(if maker.as_bytes() < issuer.as_bytes() {
+            "14"
+        } else {
+            "-14"
+        });
+        sandbox
+            .update(maker_line, serde_json::to_vec(&line).unwrap())
+            .unwrap();
+        let last_offer: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::offer(&maker, 3)).unwrap()).unwrap();
+        let last_dir: Hash256 = last_offer["BookDirectory"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let zero = AccountId::from([0u8; 20]);
+        sandbox
+            .insert(
+                keylet::amm(&[0u8; 20], &zero, &currency, &issuer),
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "AMM", "Account": MAKER2,
+                    "TradingFee": 0, "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER,
+                    "Fee": "10", "Sequence": 1,
+                    "TakerGets": "463503", "TakerPays": usd("46"),
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        for seq in 1..=3 {
+            assert!(
+                sandbox.read(&keylet::offer(&maker, seq)).is_none(),
+                "maker offer {seq} must be consumed or reaped"
+            );
+        }
+        assert!(sandbox.read(&last_dir).is_none());
+        assert_eq!(owner_count(&sandbox, MAKER), 0);
+        let taker = decode_account_id(TAKER).unwrap();
+        assert_eq!(
+            crate::amm_helpers::iou_holding_number(&sandbox, &taker, &issuer, &currency)
+                .to_iou()
+                .to_decimal_string(),
+            "46"
         );
     }
 
