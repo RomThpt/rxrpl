@@ -1303,6 +1303,11 @@ fn cross_offers(
     // is partial: ledger 105500430 reaches 9889.176237768096 after summing the
     // preceding fills, while canonicalising every subtraction yields ...8100.
     let mut remaining_out_num = leg_to_number(&out_leg);
+    // Flow accumulates strand outputs from smallest to largest. Preserve the
+    // exact AMM and CLOB deliveries so a later partial offer uses the aggregate
+    // remainder, rather than repeated rounded subtraction (105502845/TX16).
+    let mut direct_outputs = Vec::new();
+    let mut direct_amm_used = false;
     let mut remaining_in = in_leg.clone();
     let mut source_remaining = source_budget.clone();
     // The source DirectStep settles one aggregate input for a CLOB pass. Keep
@@ -1588,7 +1593,7 @@ fn cross_offers(
             if !domain_only && !skip_amm_after_self_tip {
                 let before = remaining_out.clone();
                 let source_before_amm = source_remaining.clone();
-                let continue_to_clob = try_amm_step(
+                let (mut continue_to_clob, amm_delivered) = try_amm_step(
                     ctx,
                     taker,
                     taker_acct,
@@ -1601,6 +1606,17 @@ fn cross_offers(
                     is_sell,
                     /*cap_ending_spot_price=*/ true,
                 )?;
+                if number_switchover
+                    && bridge.is_none()
+                    && !is_sell
+                    && let Some(delivered) = amm_delivered
+                {
+                    direct_outputs.push(leg_to_number(&delivered));
+                    direct_amm_used = true;
+                    (remaining_out, remaining_out_num) =
+                        aggregate_output_remainder(&out_leg, &direct_outputs);
+                    continue_to_clob = !remaining_out.is_zero();
+                }
                 amm_consumed_in_band = leg_gt(&source_before_amm, &source_remaining);
                 non_clob_source_spent |= amm_consumed_in_band;
                 if continue_to_clob {
@@ -1622,7 +1638,9 @@ fn cross_offers(
                         advance.funded_tip_remains,
                     );
                 }
-                if !leg_ge(&before, &remaining_out) || !leg_ge(&remaining_out, &before) {
+                if !direct_amm_used
+                    && (!leg_ge(&before, &remaining_out) || !leg_ge(&remaining_out, &before))
+                {
                     remaining_out_num = leg_to_number(&remaining_out);
                 }
                 if !continue_to_clob || remaining_out.is_zero() || remaining_in.is_zero() {
@@ -1989,12 +2007,20 @@ fn cross_offers(
             remaining_out = if leg_ge(&order_out, &remaining_out) {
                 remaining_out_num = rxrpl_amount::number::Number::ZERO;
                 leg_sub(&remaining_out, &remaining_out)
+            } else if direct_amm_used {
+                direct_outputs.push(leg_to_number(&order_out));
+                let (remainder, number) = aggregate_output_remainder(&out_leg, &direct_outputs);
+                remaining_out_num = number;
+                remainder
             } else if number_switchover {
                 remaining_out_num = remaining_out_num.sub(&leg_to_number(&order_out));
                 number_to_leg(&remaining_out_num, &out_leg)
             } else {
                 leg_sub(&remaining_out, &order_out)
             };
+            if number_switchover && bridge.is_none() && !is_sell && !direct_amm_used {
+                direct_outputs.push(leg_to_number(&order_out));
+            }
             // FlowCross carries the taker's remaining input as a Number. Round
             // the aggregate remainder once per fill under fixUniversalNumber;
             // truncating each subtraction can leave one extra ULP for the next
@@ -2320,14 +2346,14 @@ fn try_amm_step(
     fok: bool,
     is_sell: bool,
     cap_ending_spot_price: bool,
-) -> Result<bool, TransactionResult> {
+) -> Result<(bool, Option<Leg>), TransactionResult> {
     // rippled's flowCross limits the crossing input to the taker's funds
     // (`sendMax = min(takerAmount.in, accountFunds)`, OfferCreate.cpp:400): the
     // AMM swap would otherwise overdraw the taker (its sold-asset balance goes
     // negative) when TakerGets exceeds what it holds.
     let budget = leg_min(remaining_in, source_remaining);
     if budget.is_zero() {
-        return Ok(true);
+        return Ok((true, None));
     }
     // A tfSell offer sells its whole TakerGets and accepts any TakerPays (rippled
     // deliver = kMaxNative), so the AMM crosses the whole input budget rather than
@@ -2390,9 +2416,12 @@ fn try_amm_step(
         *remaining_in = leg_sub(remaining_in, &spent);
         *source_remaining = leg_sub(source_remaining, &spent);
         *crossed = true;
-        return Ok(amm_step_allows_clob(is_sell, remaining_out));
+        return Ok((
+            amm_step_allows_clob(is_sell, remaining_out),
+            Some(delivered),
+        ));
     }
-    Ok(true)
+    Ok((true, None))
 }
 
 fn amm_step_allows_clob(is_sell: bool, remaining_out: &Leg) -> bool {
@@ -6341,6 +6370,16 @@ fn sum_smallest_to_largest(v: &[Number]) -> Number {
     acc
 }
 
+fn aggregate_output_remainder(requested: &Leg, outputs: &[Number]) -> (Leg, Number) {
+    let requested_num = leg_to_number(requested);
+    let delivered = sum_smallest_to_largest(outputs);
+    if num_ge(&delivered, &requested_num) {
+        return (leg_sub(requested, requested), Number::ZERO);
+    }
+    let remainder = requested_num.sub(&delivered);
+    (number_to_leg(&remainder, requested), remainder)
+}
+
 fn next_flow_strands(cur: &[usize], winner_pos: usize) -> Vec<usize> {
     let mut next = Vec::with_capacity(cur.len() - winner_pos);
     next.extend_from_slice(&cur[winner_pos..]);
@@ -9856,10 +9895,11 @@ fn taker_cross(
 mod taker_crossing_tests {
     use super::{
         BalanceRounding, Leg, TakerCrossType, add_iou_balance, add_iou_balance_downward,
-        add_iou_balance_half_upward, aggregate_flow_source_balance_number, amm_pool_debit_rounding,
-        amm_step_allows_clob, book_payment_dust_drain, book_step_input_exhausted,
-        bridge_funded_xrp_input, clob_band_allows_terminal_amm, composed_quality,
-        consumes_full_offer, crossing_quality_threshold, crossing_threshold, debit_drains_source,
+        add_iou_balance_half_upward, aggregate_flow_source_balance_number,
+        aggregate_output_remainder, amm_pool_debit_rounding, amm_step_allows_clob,
+        book_payment_dust_drain, book_step_input_exhausted, bridge_funded_xrp_input,
+        clob_band_allows_terminal_amm, composed_quality, consumes_full_offer,
+        crossing_quality_threshold, crossing_threshold, debit_drains_source,
         flow_first_book_spends_source_funds, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input,
         flow_source_funds_limit_binds, flow_xrp_to_iou, full_offer_take,
         funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
@@ -10912,6 +10952,37 @@ mod taker_crossing_tests {
             &filled,
             &iou("10000"),
         ));
+    }
+
+    #[test]
+    fn ledger_105502845_mixed_amm_clob_sums_outputs_before_partial_take() {
+        let requested = iou("10949.219057");
+        let prior = [
+            "0.098032",
+            "99.946703",
+            "0.172355",
+            "0.229574",
+            "0.100023",
+            "320.881453",
+            "218.6293587155448",
+            "539.676994197",
+        ]
+        .map(|value| Number::from_iou(&IOUAmount::from_decimal_string(value).unwrap()));
+        let (last_fill, _) = aggregate_output_remainder(&requested, &prior);
+        assert_eq!(last_fill.iou.to_decimal_string(), "9769.484564087455");
+        assert_eq!(
+            leftover_leg(&iou("9995.8657958886"), &last_fill, true)
+                .iou
+                .to_decimal_string(),
+            "226.381231801145"
+        );
+        let taker_before = IOUAmount::from_decimal_string("2709.846304599723").unwrap();
+        assert_eq!(
+            IOUAmount::add_round(&taker_before, &requested.iou)
+                .unwrap()
+                .to_decimal_string(),
+            "13659.06536159972"
+        );
     }
 
     #[test]
