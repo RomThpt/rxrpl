@@ -1342,6 +1342,8 @@ fn cross_offers(
     let mut skip_amm_after_self_tip = false;
     let book_prefix = &inverse_book.as_bytes()[0..24];
     let fok = ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_FILL_OR_KILL != 0;
+    let ioc =
+        ctx.tx.get("Flags").and_then(|v| v.as_u64()).unwrap_or(0) & TF_IMMEDIATE_OR_CANCEL != 0;
     // Autobridge: when NEITHER leg is XRP, the offer also competes an
     // XRP-intermediate path (`in -> XRP -> out`) against the direct book. Prebuild
     // that two-hop strand once; `try_bridge_step` crosses it per band by quality.
@@ -1761,6 +1763,12 @@ fn cross_offers(
                 &avail_out,
                 is_sell,
             );
+            let stop_after_input_limited_partial = ioc
+                && is_sell
+                && !full_take
+                && use_full_input
+                && !leg_ge(&take_out, &avail_out)
+                && leg_gt(&offer_in, &net_spendable_in);
             let (order_out, order_in) = if full_take {
                 (offer_out.clone(), offer_in.clone())
             } else if use_full_input && !leg_ge(&take_out, &avail_out) {
@@ -1960,6 +1968,16 @@ fn cross_offers(
             remaining_in = leftover_leg(&remaining_in, &order_in, number_switchover);
             source_remaining = leftover_leg(&source_remaining, &gross_in, number_switchover);
             crossed = true;
+            // An input-limited partial tfSell+IOC fill stops before the next
+            // self-owned tip (105502352/TX8). A non-IOC sell still advances to
+            // reap that tip (105500733/TX280), and a fully consumed maker tip
+            // keeps the existing post-fill advance path.
+            if stop_after_input_limited_partial
+                && remaining_in.is_zero()
+                && !advance_after_exhausted_tip
+            {
+                break 'walk;
+            }
         }
     }
 
@@ -12547,6 +12565,134 @@ mod taker_bridge_integration {
             &tx["TakerPays"],
             limit,
         ));
+    }
+
+    fn assert_partial_sell_followed_by_self_offer(ioc: bool) {
+        let mut ledger = Ledger::genesis();
+        for account in [ISS, TAKER, O1] {
+            put_acct(&mut ledger, account, 1_000_000_000, 0);
+        }
+        for (holder, code, balance) in [
+            (TAKER, b"AAA", 1000),
+            (TAKER, b"BBB", 100),
+            (O1, b"AAA", 0),
+            (O1, b"BBB", 100),
+        ] {
+            put_line(&mut ledger, holder, code, balance);
+        }
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let aaa =
+            |value: &str| serde_json::json!({"currency": "AAA", "issuer": ISS, "value": value});
+        let bbb =
+            |value: &str| serde_json::json!({"currency": "BBB", "issuer": ISS, "value": value});
+        for (owner, gets, pays) in [
+            (O1, "49.5134019592343", "255.548570192"),
+            (TAKER, "57.3606413970318", "296.0554784425"),
+        ] {
+            assert_eq!(
+                apply_offer(
+                    &mut sandbox,
+                    &fees,
+                    &serde_json::json!({
+                        "TransactionType": "OfferCreate", "Account": owner,
+                        "Fee": "10", "Sequence": 1, "Flags": TF_PASSIVE | TF_SELL,
+                        "TakerGets": bbb(gets), "TakerPays": aaa(pays),
+                    }),
+                ),
+                TransactionResult::TesSuccess
+            );
+        }
+        let taker = decode_account_id(TAKER).unwrap();
+        let maker = decode_account_id(O1).unwrap();
+        let own_key = keylet::offer(&taker, 1);
+        let own_before = sandbox.read(&own_key).unwrap();
+        let own_offer: Value = serde_json::from_slice(&own_before).unwrap();
+        let own_dir: Hash256 = own_offer["BookDirectory"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let maker_before: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::offer(&maker, 1)).unwrap()).unwrap();
+        let maker_dir: Hash256 = maker_before["BookDirectory"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let maker_quality = u64::from_be_bytes(maker_dir.as_bytes()[24..32].try_into().unwrap());
+        let own_quality = u64::from_be_bytes(own_dir.as_bytes()[24..32].try_into().unwrap());
+        assert!(
+            maker_quality < own_quality,
+            "self offer follows at a worse quality"
+        );
+        let dir_before = sandbox.read(&own_dir).unwrap();
+        let owner_before: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::account(&taker)).unwrap()).unwrap();
+        assert_eq!(owner_before["OwnerCount"], 1);
+        let rules =
+            Rules::from_enabled([feature_id("FlowCross"), feature_id("fixUniversalNumber")]);
+        let flags = if ioc {
+            TF_SELL | TF_IMMEDIATE_OR_CANCEL
+        } else {
+            TF_SELL
+        };
+        let tx = serde_json::json!({
+            "TransactionType": "OfferCreate", "Account": TAKER,
+            "Fee": "10", "Sequence": 2,
+            "Flags": flags,
+            "TakerGets": aaa("255.545538"),
+            "TakerPays": bbb("49.423691"),
+        });
+        let threshold = crossing_quality_threshold(
+            &Leg::parse(&tx["TakerGets"]).unwrap(),
+            &Leg::parse(&tx["TakerPays"]).unwrap(),
+            true,
+            false,
+        );
+        assert!(
+            own_quality < threshold,
+            "self offer is within the taker's limit"
+        );
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            OfferCreateTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        let maker_after: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::offer(&maker, 1)).unwrap()).unwrap();
+        assert_eq!(maker_after["TakerPays"]["value"], "0.003032192");
+        // Both synthetic assets use one issuer; its canonical Gets remainder
+        // differs from TX8 by one ULP while the partial-fill boundary matches.
+        assert_eq!(maker_after["TakerGets"]["value"], "0.00058749748121");
+        assert_eq!(line_bal(&sandbox, TAKER, b"AAA"), "744.454462");
+        let owner_after: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::account(&taker)).unwrap()).unwrap();
+        if ioc {
+            assert_eq!(sandbox.read(&own_key).unwrap(), own_before);
+            assert_eq!(sandbox.read(&own_dir).unwrap(), dir_before);
+            assert_eq!(owner_after["OwnerCount"], owner_before["OwnerCount"]);
+        } else {
+            assert!(sandbox.read(&own_key).is_none());
+            assert!(sandbox.read(&own_dir).is_none());
+            assert_eq!(owner_after["OwnerCount"], 0);
+        }
+    }
+
+    #[test]
+    fn ledger_105502352_partial_sell_ioc_keeps_next_quality_self_offer() {
+        assert_partial_sell_followed_by_self_offer(true);
+    }
+
+    #[test]
+    fn ledger_105500733_partial_sell_non_ioc_reaps_next_quality_self_offer() {
+        assert_partial_sell_followed_by_self_offer(false);
     }
 
     #[test]
