@@ -241,6 +241,50 @@ impl Transactor for PaymentTransactor {
                         send_max_value,
                     );
                 } else {
+                    // Amount issued by the destination is an endpoint alias:
+                    // it accepts the SendMax issuer's IOU on a direct path.
+                    // When both trust lines exist, no order-book conversion is
+                    // needed (105502001 45CB4D92).
+                    if sm_cur == am_cur
+                        && am_iss == destination_str
+                        && ctx.tx.get("Paths").is_none()
+                        && helpers::get_flags(ctx.tx)
+                            & rxrpl_protocol::flags::payment::TF_NO_RIPPLE_DIRECT
+                            == 0
+                    {
+                        let source_id = decode_account_id(account_str)
+                            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+                        let destination_id = decode_account_id(destination_str)
+                            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+                        let send_issuer_id = decode_account_id(&sm_iss)
+                            .map_err(|_| TransactionResult::TemInvalidAccountId)?;
+                        let currency = helpers::currency_to_bytes(&sm_cur);
+                        let amount_value = ctx.tx["Amount"]
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .ok_or(TransactionResult::TemBadAmount)?;
+                        let target = IOUAmount::from_decimal_string(amount_value)
+                            .map_err(|_| TransactionResult::TemBadAmount)?;
+                        let source_line =
+                            keylet::trust_line(&source_id, &send_issuer_id, &currency);
+                        let destination_line =
+                            keylet::trust_line(&destination_id, &send_issuer_id, &currency);
+                        let receive_capacity =
+                            iou_receive_capacity(ctx, &destination_id, &send_issuer_id, &currency);
+                        if ctx.view.exists(&source_line)
+                            && ctx.view.exists(&destination_line)
+                            && num_le(&Number::from_iou(&target), &receive_capacity)
+                        {
+                            return apply_iou(
+                                ctx,
+                                account_str,
+                                destination_str,
+                                &sm_cur,
+                                &sm_iss,
+                                amount_value,
+                            );
+                        }
+                    }
                     // Every cross-asset conversion ends in a book followed by
                     // the destination issuer's DirectStep. Reject strands that
                     // rippled cannot construct before selecting the specialized
@@ -3527,6 +3571,110 @@ fn remove_offer_from_book(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod destination_issuer_alias_regression {
+    use super::*;
+    use crate::fees::FeeSettings;
+    use crate::view::ledger_view::LedgerView;
+    use crate::view::sandbox::Sandbox;
+    use rxrpl_amendment::Rules;
+    use rxrpl_ledger::Ledger;
+
+    #[test]
+    fn ledger_105502001_direct_third_party_iou_to_destination_issuer_alias() {
+        const SOURCE: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
+        const DESTINATION: &str = "rGWrZyQqhTp9Xu7G5Pkayo7bXjH4k4QYpf";
+        const ISSUER: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let mut ledger = Ledger::genesis();
+        for account in [SOURCE, DESTINATION, ISSUER] {
+            let id = decode_account_id(account).unwrap();
+            let mut root = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": account,
+                "Balance": "100000000", "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+            });
+            if account == ISSUER {
+                root["TransferRate"] = serde_json::json!(1_001_500_000u32);
+            }
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&root).unwrap())
+                .unwrap();
+        }
+
+        let issuer_id = decode_account_id(ISSUER).unwrap();
+        let currency = helpers::currency_to_bytes("USD");
+        let put_line = |ledger: &mut Ledger, holder: &str, balance: &str| {
+            let holder_id = decode_account_id(holder).unwrap();
+            let holder_is_low = holder_id.as_bytes() < issuer_id.as_bytes();
+            let stored = if holder_is_low {
+                balance.to_owned()
+            } else {
+                format!("-{balance}")
+            };
+            let (low, high) = if holder_is_low {
+                (holder, ISSUER)
+            } else {
+                (ISSUER, holder)
+            };
+            let line = serde_json::json!({
+                "LedgerEntryType": "RippleState", "Flags": 0,
+                "Balance": {"currency": "USD", "issuer": ISSUER, "value": stored},
+                "LowLimit": {"currency": "USD", "issuer": low, "value": "1"},
+                "HighLimit": {"currency": "USD", "issuer": high, "value": "1"},
+            });
+            let key = keylet::trust_line(&holder_id, &issuer_id, &currency);
+            ledger
+                .put_state(key, serde_json::to_vec(&line).unwrap())
+                .unwrap();
+            key
+        };
+        let source_line = put_line(&mut ledger, SOURCE, "1");
+        let destination_line = put_line(&mut ledger, DESTINATION, "0");
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment", "Account": SOURCE,
+            "Destination": DESTINATION,
+            "Amount": {"currency": "USD", "issuer": DESTINATION, "value": "0.01"},
+            "SendMax": {"currency": "USD", "issuer": ISSUER, "value": "0.010015"},
+            "Fee": "10", "Sequence": 1,
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            PaymentTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        let source: Value = serde_json::from_slice(&sandbox.read(&source_line).unwrap()).unwrap();
+        let destination: Value =
+            serde_json::from_slice(&sandbox.read(&destination_line).unwrap()).unwrap();
+        let source_id = decode_account_id(SOURCE).unwrap();
+        let destination_id = decode_account_id(DESTINATION).unwrap();
+        let source_expected = if source_id.as_bytes() < issuer_id.as_bytes() {
+            "0.989985"
+        } else {
+            "-0.989985"
+        };
+        let destination_expected = if destination_id.as_bytes() < issuer_id.as_bytes() {
+            "0.01"
+        } else {
+            "-0.01"
+        };
+        assert_eq!(source["Balance"]["value"], source_expected);
+        assert_eq!(destination["Balance"]["value"], destination_expected);
+        let changes = sandbox.into_changes();
+        assert_eq!(changes.updates.len(), 2);
+        assert!(changes.updates.contains_key(&source_line));
+        assert!(changes.updates.contains_key(&destination_line));
+    }
+}
 
 #[cfg(test)]
 mod no_op_source_line_regression {
