@@ -626,17 +626,24 @@ impl Transactor for OfferCreateTransactor {
         // `remaining_offer` normalises a source-exhausted remainder to two
         // zeroes. FillOrKill must inspect its exact side before that collapse:
         // a regular offer requires all requested output, while tfSell requires
-        // all offered input to be consumed. Otherwise a funds-limited partial
-        // cross can look fully filled and escape the tecKILLED rollback.
+        // all funded input to be consumed. Flow caps sendMax at the source's
+        // liquid funds, so a sell can finish its funded budget with nominal
+        // TakerGets still remaining (105503179/F352BE04).
         if ctx.rules.enabled(&feature_id("FlowCross")) && tx_flags & TF_FILL_OR_KILL != 0 {
             let (exact_remainder, exact_total) = if is_sell {
                 (&remaining_gets, &taker_gets)
             } else {
                 (&remaining_pays, &taker_pays)
             };
-            let fully_filled = Leg::parse(exact_remainder)
-                .zip(Leg::parse(exact_total))
-                .is_some_and(|(remaining, total)| remaining_is_filled(&remaining, &total));
+            let fully_filled = (is_sell
+                && crossed
+                && source_exhausted
+                && flow_source_budget
+                    .as_ref()
+                    .is_some_and(|(_, funds_limited)| *funds_limited))
+                || Leg::parse(exact_remainder)
+                    .zip(Leg::parse(exact_total))
+                    .is_some_and(|(remaining, total)| remaining_is_filled(&remaining, &total));
             if !fully_filled {
                 return Ok(TransactionResult::TecKilled);
             }
@@ -15909,6 +15916,108 @@ mod flow_cross_own_unfunded {
         assert_eq!(xrp_balance(&sandbox, TAKER), taker_xrp_before);
         assert_eq!(xrp_balance(&sandbox, MAKER), maker_xrp_before);
         assert_eq!(owner_count(&sandbox, MAKER), 1);
+    }
+
+    /// 105503179/F352BE04: tfSell spends the entire liquid XRP budget in an
+    /// AMM even though TakerGets names a larger amount. The ticket was already
+    /// consumed and the fee already charged when this handler sees the state.
+    #[test]
+    fn ledger_105503179_sell_fok_spends_funded_amm_budget() {
+        const SOURCE: &str = "rHcnqECUfVe4xWzPFNZWnBC5s5RjAzu3fQ";
+        const ISSUER: &str = "rGG3wQ4kUzd7Jnmk1n5NWPZjjut62kCBfC";
+        const POOL: &str = "rnsRq5ahgbFeRiAgBVvFTafyAgiS9x9Ztn";
+        const ARMY: &str = "41524D5900000000000000000000000000000000";
+        let mut ledger = Ledger::genesis();
+        for (address, balance, owner_count) in [
+            (SOURCE, "1005654094", 54),
+            (ISSUER, "1000000000", 0),
+            (POOL, "230646272324", 1),
+        ] {
+            let id = decode_account_id(address).unwrap();
+            let account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": address,
+                "Balance": balance, "Sequence": 1,
+                "OwnerCount": owner_count, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        let source = decode_account_id(SOURCE).unwrap();
+        let issuer = decode_account_id(ISSUER).unwrap();
+        let pool = decode_account_id(POOL).unwrap();
+        let currency = helpers::currency_to_bytes(ARMY);
+        let (low, high, stored) = if pool.as_bytes() < issuer.as_bytes() {
+            (POOL, ISSUER, "43921711.81633347")
+        } else {
+            (ISSUER, POOL, "-43921711.81633347")
+        };
+        let pool_line = serde_json::json!({
+            "LedgerEntryType": "RippleState", "Flags": 16842752,
+            "Balance": {"currency": ARMY, "issuer": "rrrrrrrrrrrrrrrrrrrrBZbvji", "value": stored},
+            "LowLimit": {"currency": ARMY, "issuer": low, "value": "0"},
+            "HighLimit": {"currency": ARMY, "issuer": high, "value": "0"},
+        });
+        ledger
+            .put_state(
+                keylet::trust_line(&pool, &issuer, &currency),
+                serde_json::to_vec(&pool_line).unwrap(),
+            )
+            .unwrap();
+        ledger
+            .put_state(
+                keylet::amm(&[0u8; 20], &AccountId::from([0u8; 20]), &currency, &issuer),
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "AMM", "Account": POOL, "TradingFee": 0, "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let fees = FeeSettings {
+            base_fee: 10,
+            reserve_base: 1_000_000,
+            reserve_increment: 200_000,
+        };
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "OfferCreate", "Account": SOURCE,
+            "Fee": "12", "Sequence": 0, "TicketSequence": 103313020,
+            "Flags": TF_FILL_OR_KILL | TF_SELL,
+            "TakerGets": "4050000000",
+            "TakerPays": {"currency": ARMY, "issuer": ISSUER, "value": "764744.5"},
+        });
+        let rules = Rules::from_enabled([
+            feature_id("FlowCross"),
+            feature_id("fixUniversalNumber"),
+            feature_id("fixAMMv1_2"),
+        ]);
+        let result = {
+            let mut ctx = ApplyContext {
+                tx: &tx,
+                view: &mut sandbox,
+                rules: &rules,
+                fees: &fees,
+            };
+            OfferCreateTransactor.apply(&mut ctx).unwrap()
+        };
+        assert_eq!(result, TransactionResult::TesSuccess);
+        assert_eq!(xrp_balance(&sandbox, SOURCE), 11_800_000);
+        assert_eq!(xrp_balance(&sandbox, POOL), 231_640_126_418);
+        let pool_line: Value = serde_json::from_slice(
+            &sandbox
+                .read(&keylet::trust_line(&pool, &issuer, &currency))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pool_line["Balance"]["value"], "43733265.30760822");
+        let source_line: Value = serde_json::from_slice(
+            &sandbox
+                .read(&keylet::trust_line(&source, &issuer, &currency))
+                .expect("AMM trade creates source ARMY trust line"),
+        )
+        .unwrap();
+        assert_eq!(source_line["Balance"]["value"], "-188446.50872525");
     }
 
     /// Ledger 105501294: a stale book tip must not cap an AMM fill after the
