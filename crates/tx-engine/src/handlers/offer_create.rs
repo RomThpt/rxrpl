@@ -1905,6 +1905,7 @@ fn cross_offers(
                     PayInOptions {
                         skip_taker_debit: false,
                         allow_dust_drain: source_funds_limited,
+                        gross_override: None,
                     },
                 )?;
             } else {
@@ -3426,6 +3427,7 @@ fn cross_book_hop_with_reaps(
                                 == Some("Payment")
                                 && taker == dest,
                         ),
+                        gross_override: None,
                     },
                 )?;
             } else {
@@ -4626,7 +4628,8 @@ fn amm_hop(
     let pool_spent = number_to_leg(&spent_num, budget_in);
     let source_spent = if input_fee_applies {
         let mut gross = pool_spent.clone();
-        gross.iou = grossed(&pool_spent.iou, &transfer_rate(ctx, &budget_in.issuer));
+        gross.iou =
+            gross_amm_book_input(&pool_spent.iou, transfer_rate_value(ctx, &budget_in.issuer));
         gross
     } else {
         pool_spent.clone()
@@ -4699,6 +4702,7 @@ fn amm_hop(
             PayInOptions {
                 skip_taker_debit: skip_input_debit,
                 allow_dust_drain: true,
+                gross_override: input_fee_applies.then_some(source_spent.iou),
             },
         )?;
     }
@@ -4833,6 +4837,7 @@ fn apply_amm_move(
             PayInOptions {
                 skip_taker_debit: skip_input_debit,
                 allow_dust_drain: true,
+                gross_override: None,
             },
         )?;
     }
@@ -7616,6 +7621,7 @@ fn leftover_leg(a: &Leg, b: &Leg, number_switchover: bool) -> Leg {
 struct PayInOptions {
     skip_taker_debit: bool,
     allow_dust_drain: bool,
+    gross_override: Option<IOUAmount>,
 }
 
 fn pay_in(
@@ -7647,7 +7653,9 @@ fn pay_in(
         } else {
             transfer_rate(ctx, &amount.issuer)
         };
-        let gross = grossed(&amount.iou, &rate);
+        let gross = options
+            .gross_override
+            .unwrap_or_else(|| grossed(&amount.iou, &rate));
         let source_funds = owner_funds_leg(ctx, taker, amount);
         let mut gross_leg = amount.clone();
         gross_leg.iou = gross;
@@ -7747,6 +7755,7 @@ fn pay_in_book_payment(
         PayInOptions {
             skip_taker_debit: true,
             allow_dust_drain: true,
+            gross_override: None,
         },
     )
 }
@@ -8053,6 +8062,44 @@ fn grossed(amount: &IOUAmount, rate: &IOUAmount) -> IOUAmount {
         Ok(rxrpl_amount::Amount::Iou(v)) => v,
         _ => *amount,
     }
+}
+
+/// BookStep's input transfer fee uses rippled `mulRatio(..., roundUp=true)`.
+/// Its signed 64-bit intermediate retains available guard digits before IOU
+/// normalization;
+/// a nonzero final remainder then advances the normalized amount once more.
+/// At 105503160/TX21, BTC 0.001079810327359199 at rate 1.0015 first
+/// normalizes to gross ...238 and the remaining ratio fraction makes ...239.
+/// STAmount multiplication and the simpler IOU mul_ratio both yield ...238.
+fn gross_amm_book_input(net: &IOUAmount, rate: u32) -> IOUAmount {
+    if net.is_zero() || rate <= 1_000_000_000 || net.sign_bit() {
+        return *net;
+    }
+    let denominator = 1_000_000_000u128;
+    let product = u128::from(net.mantissa()) * u128::from(rate);
+    let mut quotient = product / denominator;
+    let mut remainder = product % denominator;
+    let mut exponent = net.exponent();
+    if remainder != 0 {
+        // IOUAmount.cpp: roomToGrow = floor(log10(INT64_MAX)) - ceil(log10(low)).
+        let ceil_log10 = (quotient - 1).ilog10() + 1;
+        let room = 18u32.saturating_sub(ceil_log10);
+        if room > 0 {
+            let scale = 10u128.pow(room);
+            quotient *= scale;
+            remainder *= scale;
+            quotient += remainder / denominator;
+            remainder %= denominator;
+            exponent -= room as i32;
+        }
+    }
+    debug_assert!(quotient <= i64::MAX as u128);
+    let normalized = rxrpl_amount::number::Number::new(false, quotient as u64, exponent).to_iou();
+    if remainder == 0 {
+        return normalized;
+    }
+    IOUAmount::from_parts(normalized.mantissa() + 1, normalized.exponent(), false)
+        .unwrap_or(normalized)
 }
 
 fn gross_book_output_cap_nets_short(gross: &IOUAmount, demand: &IOUAmount, rate: u32) -> bool {
@@ -12199,6 +12246,46 @@ mod amm_transfer_fee_tests {
     const RECIPIENT: &str = "rGWrZyQqhTp9Xu7G5Pkayo7bXjH4k4QYpf";
 
     #[test]
+    fn btc_amm_input_ratio_preserves_source_balance_ulp() {
+        // Ledger 105503160/TX21: the pool receives this exact IOU input for
+        // 62,602,418 XRP drops. BookStep's input fee has a ratio remainder
+        // after its 64-bit expansion and IOU normalization.
+        let source_before = IOUAmount::from_decimal_string("-0.001660967674287171").unwrap();
+        let pool_before = IOUAmount::from_decimal_string("1.76720087586459").unwrap();
+        let (pool_input, output) = crate::amm_helpers::limit_input_quality(
+            &Number::from_iou(&pool_before),
+            &Number::from_int(102_536_221_174),
+            0x4A06_20C2_97A2_3C00,
+            19,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(output.to_xrp_drops(), 62_602_418);
+        let pool_net = pool_input.to_iou();
+        assert_eq!(pool_net.to_decimal_string(), "0.001079810327359199");
+        let gross = gross_amm_book_input(&pool_net, 1_001_500_000);
+        assert_eq!(gross.to_decimal_string(), "0.001081430042850239");
+        assert_eq!(
+            IOUAmount::add_round(&source_before, &gross)
+                .unwrap()
+                .to_decimal_string(),
+            "-0.000579537631436932"
+        );
+        assert_eq!(
+            IOUAmount::add_round(&pool_before, &pool_net)
+                .unwrap()
+                .to_decimal_string(),
+            "1.768280686191949"
+        );
+        assert_eq!(
+            gross_amm_book_input(&IOUAmount::from_decimal_string("1").unwrap(), 1_001_500_000)
+                .to_decimal_string(),
+            "1.0015"
+        );
+    }
+
+    #[test]
     fn amm_input_reports_the_source_gross_spend() {
         let pool_net = IOUAmount::from_decimal_string("1.066554203744208").unwrap();
         let rate = IOUAmount::from_parts(1_002_000_000, -9, false).unwrap();
@@ -12538,6 +12625,7 @@ mod amm_transfer_fee_tests {
             PayInOptions {
                 skip_taker_debit: false,
                 allow_dust_drain: true,
+                gross_override: None,
             },
         )
         .unwrap();
