@@ -1914,6 +1914,24 @@ fn cross_offers(
                 input_rate,
                 leg_ge(&order_in, &net_source_remaining),
             );
+            // A funds-limited quote can round its XRP output down to whole
+            // drops while spending the entire IOU source. Flow rejects that
+            // strand when its realized quality falls below the offer limit;
+            // otherwise a tiny IOC crosses when rippled returns tecKILLED
+            // (105503439/3D0B0D74).
+            if source_funds_bind
+                && reject_quality(
+                    quality_threshold(
+                        &leg_as_quality_iou(&gross_in),
+                        &order_out,
+                        number_switchover,
+                        false,
+                    ),
+                    threshold,
+                )
+            {
+                break 'walk;
+            }
             if input_rate == 1_000_000_000 {
                 pay_in(
                     ctx,
@@ -10529,6 +10547,14 @@ mod taker_crossing_tests {
         );
         assert_eq!(pays["value"], "0");
         assert_eq!(gets, serde_json::json!("0"));
+    }
+
+    #[test]
+    fn ledger_105503439_tiny_ioc_fill_fails_realized_quality() {
+        let limit = crossing_quality_threshold(&iou("0.079619"), &xrp(71_884), true, false);
+        let realized =
+            crossing_quality_threshold(&iou("0.00000664629441625"), &xrp(6), true, false);
+        assert!(reject_quality(realized, limit));
     }
 
     #[test]
