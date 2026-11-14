@@ -37,7 +37,7 @@ impl Transactor for NFTokenAcceptOfferTransactor {
 
     fn preclaim(&self, ctx: &PreclaimContext<'_>) -> Result<(), TransactionResult> {
         let account_str = helpers::get_account(ctx.tx)?;
-        helpers::read_account_by_address(ctx.view, account_str)?;
+        let (_, account) = helpers::read_account_by_address(ctx.view, account_str)?;
 
         // Verify referenced offers exist
         if let Some(sell_id) = helpers::get_str_field(ctx.tx, "NFTokenSellOffer") {
@@ -46,6 +46,28 @@ impl Transactor for NFTokenAcceptOfferTransactor {
                 Hash256::from_slice(&key_bytes).map_err(|_| TransactionResult::TemMalformed)?;
             if !ctx.view.exists(&key) {
                 return Err(TransactionResult::TecObjectNotFound);
+            }
+            if helpers::get_str_field(ctx.tx, "NFTokenBuyOffer").is_none() {
+                let offer_bytes = ctx
+                    .view
+                    .read(&key)
+                    .ok_or(TransactionResult::TecObjectNotFound)?;
+                let offer: Value = serde_json::from_slice(&offer_bytes)
+                    .map_err(|_| TransactionResult::TefInternal)?;
+                if let Some(amount) = offer
+                    .get("Amount")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    let liquid = helpers::get_balance(&account).saturating_sub(
+                        ctx.view
+                            .fees()
+                            .account_reserve(helpers::get_owner_count(&account)),
+                    );
+                    if liquid < amount {
+                        return Err(TransactionResult::TecInsufficientFunds);
+                    }
+                }
             }
         }
         if let Some(buy_id) = helpers::get_str_field(ctx.tx, "NFTokenBuyOffer") {
@@ -900,6 +922,45 @@ mod tests {
             NFTokenAcceptOfferTransactor.preclaim(&ctx),
             Err(TransactionResult::TecObjectNotFound)
         );
+    }
+
+    #[test]
+    fn direct_xrp_sell_offer_requires_liquid_funds_before_fee() {
+        let (mut ledger, _, offer_id) = setup_with_sell_offer_for(SELLER, 0, 1_000_000);
+        let buyer_key = keylet::account(&decode_account_id(BUYER).unwrap());
+        let buyer_bytes = ledger.get_state(&buyer_key).unwrap();
+        let mut buyer: Value = serde_json::from_slice(buyer_bytes).unwrap();
+        buyer["OwnerCount"] = Value::from(4);
+        let fees = FeeSettings {
+            base_fee: 10,
+            reserve_base: 1_000_000,
+            reserve_increment: 200_000,
+        };
+        let rules = Rules::new();
+        let tx = serde_json::json!({
+            "TransactionType": "NFTokenAcceptOffer",
+            "Account": BUYER,
+            "NFTokenSellOffer": offer_id,
+            "Fee": "10",
+            "Sequence": 1,
+        });
+
+        for (balance, expected) in [
+            (2_399_904_u64, Err(TransactionResult::TecInsufficientFunds)),
+            (2_800_000_u64, Ok(())),
+        ] {
+            buyer["Balance"] = Value::String(balance.to_string());
+            ledger
+                .put_state(buyer_key, serde_json::to_vec(&buyer).unwrap())
+                .unwrap();
+            let view = LedgerView::with_fees(&ledger, fees.clone());
+            let ctx = PreclaimContext {
+                tx: &tx,
+                view: &view,
+                rules: &rules,
+            };
+            assert_eq!(NFTokenAcceptOfferTransactor.preclaim(&ctx), expected);
+        }
     }
 
     #[test]
