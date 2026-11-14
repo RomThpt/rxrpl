@@ -11,6 +11,11 @@ use crate::node::SHAMapNode;
 use crate::node_id::BRANCH_FACTOR;
 use crate::node_store::NodeStore;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static HASH_COMPUTATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A child slot that can be either loaded (node in memory) or unloaded (only hash known).
 /// Uses `OnceLock` for thread-safe lazy initialization behind `&self`.
 struct LazyChild {
@@ -83,8 +88,16 @@ impl InnerNode {
         }
     }
 
+    /// Return the stored hash without computing a dirty node's hash.
+    pub(crate) fn cached_hash(&self) -> Hash256 {
+        self.hash
+    }
+
     /// Hash = SHA-512-Half(INNER_NODE || hash[0] || hash[1] || ... || hash[15])
     fn compute_hash(&self) -> Hash256 {
+        #[cfg(test)]
+        HASH_COMPUTATIONS.with(|count| count.set(count.get() + 1));
+
         let prefix = HashPrefix::INNER_NODE.to_bytes();
         let mut data = Vec::with_capacity(4 + BRANCH_FACTOR * 32);
         data.extend_from_slice(&prefix);
@@ -184,6 +197,7 @@ impl InnerNode {
     pub fn set_child_hash(&mut self, branch: u8, hash: Hash256) {
         self.hashes[branch as usize] = hash;
         self.is_branch |= 1 << branch;
+        self.invalidate_hash();
     }
 
     /// Set the cached hash directly, avoiding recomputation when loading from store.
@@ -356,7 +370,9 @@ mod tests {
     fn set_child_hash_marks_branch() {
         let mut node = InnerNode::new();
         let hash = Hash256::new([0xAA; 32]);
+        node.set_cached_hash(Hash256::new([0xBB; 32]));
         node.set_child_hash(5, hash);
+        assert!(node.cached_hash().is_zero());
         assert!(!node.is_empty_branch(5));
         assert_eq!(node.child_hash(5), hash);
         // Node is not loaded yet

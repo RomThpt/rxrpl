@@ -1507,18 +1507,16 @@ impl SHAMap {
 
     /// Recursively update hashes for all dirty nodes.
     ///
-    /// Descends only into subtrees modified since the parent map. `put_leaf` /
-    /// `insert` / `delete` rebuild just the root→leaf path they touch (via
-    /// `take_child` + `Arc::try_unwrap`), so a modified subtree is uniquely owned
-    /// (`Arc::get_mut` succeeds) while an untouched one stays Arc-shared with the
-    /// parent snapshot and keeps its already-valid cached hash. Skipping the
-    /// shared subtrees keeps a ledger close proportional to what the block
-    /// changed rather than re-cloning and rehashing the whole state tree — for a
-    /// mainnet-sized ~19M-node map that is the difference between milliseconds and
-    /// ~a minute per close under continuous replay. Verified byte-identical to the
-    /// unconditional walk on replayed mainnet ledgers.
+    /// Writes replace children through `take_child` and `set_child`, invalidating
+    /// each ancestor on the modified path. Lazy loads and snapshots preserve
+    /// cached hashes, so even a uniquely owned loaded subtree can be skipped.
     fn update_hashes(node: &mut SHAMapNode) {
         if let SHAMapNode::Inner(inner) = node {
+            // A populated cache means no child on this path has been replaced.
+            // This also covers uniquely owned subtrees loaded from a checkpoint.
+            if !inner.cached_hash().is_zero() {
+                return;
+            }
             let mut mask = inner.branch_mask();
             while mask != 0 {
                 let branch = mask.trailing_zeros() as u8;
@@ -1608,6 +1606,7 @@ pub fn transaction_set_root(ids: &[Hash256]) -> Hash256 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inner_node::HASH_COMPUTATIONS;
     use crate::node_store::InMemoryNodeStore;
     use std::str::FromStr;
 
@@ -2612,6 +2611,50 @@ mod tests {
         let reloaded = SHAMap::from_root_hash(root_hash_2, LeafNode::account_state, store).unwrap();
         assert_eq!(reloaded.get(&k1), Some(&[99][..]));
         assert_eq!(reloaded.get(&k2), Some(&[2][..]));
+    }
+
+    #[test]
+    fn loaded_clean_subtree_skips_hashing_but_mutated_path_rehashes() {
+        let store = Arc::new(InMemoryNodeStore::new());
+        let mut original = SHAMap::account_state_with_store(store.clone());
+        let k1 = make_key("1000000000000000000000000000000000000000000000000000000000000000");
+        let k2 = make_key("1100000000000000000000000000000000000000000000000000000000000000");
+        let k3 = make_key("2000000000000000000000000000000000000000000000000000000000000000");
+        original.put(k1, vec![1]).unwrap();
+        original.put(k2, vec![2]).unwrap();
+        let checkpoint = original.flush().unwrap();
+
+        let mut loaded =
+            SHAMap::from_root_hash(checkpoint, LeafNode::account_state, store).unwrap();
+        assert_eq!(loaded.get(&k1), Some(&[1][..]));
+        let SHAMapNode::Inner(root) = loaded.root.as_ref() else {
+            panic!("expected inner root");
+        };
+        let Some(child) = root.child(1) else {
+            panic!("expected loaded child");
+        };
+        let SHAMapNode::Inner(child) = child.as_ref() else {
+            panic!("expected inner child");
+        };
+        assert!(!child.cached_hash().is_zero());
+
+        let before = HASH_COMPUTATIONS.with(|count| count.get());
+        assert_eq!(loaded.root_hash(), checkpoint);
+        assert_eq!(HASH_COMPUTATIONS.with(|count| count.get()) - before, 0);
+
+        loaded.put(k3, vec![3]).unwrap();
+        original.put(k3, vec![3]).unwrap();
+        let expected = original.root_hash();
+        let before = HASH_COMPUTATIONS.with(|count| count.get());
+        assert_eq!(loaded.root_hash(), expected);
+        assert_eq!(HASH_COMPUTATIONS.with(|count| count.get()) - before, 1);
+
+        loaded.put(k1, vec![4]).unwrap();
+        original.put(k1, vec![4]).unwrap();
+        let expected = original.root_hash();
+        let before = HASH_COMPUTATIONS.with(|count| count.get());
+        assert_eq!(loaded.root_hash(), expected);
+        assert_eq!(HASH_COMPUTATIONS.with(|count| count.get()) - before, 2);
     }
 
     #[test]
