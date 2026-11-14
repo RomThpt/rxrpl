@@ -5747,6 +5747,20 @@ fn flow_holder_funds(balance: &IOUAmount, holder_is_high: bool) -> Number {
     }
 }
 
+fn flow_live_source_funds(ctx: &ApplyContext<'_>, source: &FlowSourceBalance) -> Option<Number> {
+    let bytes = ctx.view.read(&source.key)?;
+    let line: Value = serde_json::from_slice(&bytes).ok()?;
+    let balance = IOUAmount::from_decimal_string(line["Balance"]["value"].as_str()?).ok()?;
+    Some(flow_holder_funds(&balance, source.holder_is_high))
+}
+
+fn flow_source_pass_budget(accounting: Number, live: Option<Number>) -> Number {
+    match live {
+        Some(funds) if num_le(&funds, &accounting) => funds,
+        _ => accounting,
+    }
+}
+
 fn source_has_one_ulp_overdraft(
     source: &FlowSourceBalance,
     budget: &Leg,
@@ -7356,7 +7370,17 @@ pub(crate) fn flow_multi(
             d
         };
         let remaining_in = {
-            let r = input_limit.sub(&sum_smallest_to_largest(&saved_ins));
+            let accounting = input_limit.sub(&sum_smallest_to_largest(&saved_ins));
+            // The source DirectStep checks accountFunds on every pass. Its
+            // live trust-line balance can be one IOU ULP below SendMax minus
+            // the rounded pass totals; use the smaller value before quoting
+            // the next offer (105503522/ABC2668D).
+            let r = flow_source_pass_budget(
+                accounting,
+                source_balance
+                    .as_ref()
+                    .and_then(|source| flow_live_source_funds(ctx, source)),
+            );
             if r.is_zero() || r.negative() {
                 break;
             }
@@ -12239,8 +12263,8 @@ mod flow_source_balance_tests {
     use super::{
         Leg, aggregate_flow_destination_balance_passes, aggregate_flow_source_balance_number,
         aggregate_flow_source_balance_passes, can_fund_new_trust_line, flow_gross_input,
-        flow_holder_funds, flow_input_limit, flow_net_input, leftover_leg, next_flow_strands,
-        preserve_flow_output_ulp, sum_smallest_to_largest,
+        flow_holder_funds, flow_input_limit, flow_net_input, flow_source_pass_budget, leftover_leg,
+        next_flow_strands, preserve_flow_output_ulp, sum_smallest_to_largest,
     };
     use rxrpl_amount::IOUAmount;
     use rxrpl_amount::number::{MantissaScale, MantissaScaleGuard, Number};
@@ -12368,6 +12392,22 @@ mod flow_source_balance_tests {
                 .to_decimal_string(),
             "0.000000000000001"
         );
+    }
+
+    #[test]
+    fn ledger_105503522_caps_flow_pass_at_live_source_funds() {
+        let _scale = MantissaScaleGuard::new(MantissaScale::Small);
+        let accounting =
+            Number::from_iou(&IOUAmount::from_decimal_string("130.903458197998").unwrap());
+        let live = Number::from_iou(&IOUAmount::from_decimal_string("130.9034581979979").unwrap());
+        assert_eq!(
+            flow_source_pass_budget(accounting, Some(live))
+                .to_iou()
+                .to_decimal_string(),
+            "130.9034581979979"
+        );
+        assert_eq!(flow_source_pass_budget(accounting, None), accounting);
+        assert_eq!(flow_source_pass_budget(live, Some(accounting)), live);
     }
 
     #[test]
