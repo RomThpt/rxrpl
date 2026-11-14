@@ -2243,7 +2243,14 @@ fn cross_offers(
                 {
                     remaining_out_num = leg_to_number(&remaining_out);
                 }
-                if !continue_to_clob || remaining_out.is_zero() || remaining_in.is_zero() {
+                if !continue_to_clob {
+                    // A selected AMM that cannot deliver an integral output
+                    // ends this pass. Do not execute the funded CLOB tip or
+                    // retry the same dry pool at the terminal quality.
+                    terminal_amm_allowed = false;
+                    break 'walk;
+                }
+                if remaining_out.is_zero() || remaining_in.is_zero() {
                     break 'walk; // AMM alone met the demand (or exhausted the taker's funds)
                 }
             }
@@ -3088,7 +3095,7 @@ fn try_amm_step(
                 !leg.is_xrp && transfer_rate_value(ctx, &leg.issuer) == 1_000_000_000
             });
     let tail_snapshot = strict_tail_quality.then(|| (ctx.view.checkpoint(), taker_acct.clone()));
-    if let Some((delivered, spent)) = amm_hop(
+    let quote = amm_hop(
         ctx,
         taker,
         taker_acct,
@@ -3104,7 +3111,9 @@ fn try_amm_step(
         /*pool_target_quality=*/ Some(pool_quality),
         cap_ending_spot_price,
         /*waive_output_transfer_fee=*/ true,
-    )? {
+    )?;
+    let selected_zero_output = matches!(&quote, AmmHopResult::ZeroOutput);
+    if let AmmHopResult::Filled(delivered, spent) = quote {
         if strict_tail_quality {
             // The final spot-price cap can quote an integral IOU fragment whose
             // realised input/output rate is just worse than the offer limit.
@@ -3143,7 +3152,7 @@ fn try_amm_step(
             Some(delivered),
         ));
     }
-    Ok((true, None))
+    Ok((!selected_zero_output, None))
 }
 
 fn amm_step_allows_clob(is_sell: bool, remaining_out: &Leg) -> bool {
@@ -3892,7 +3901,7 @@ fn cross_book_hop_with_reaps(
                 leg_min(&remaining_in, &owner_funds_leg(ctx, taker, budget_in))
             };
             if !amm_budget.is_zero() {
-                if let Some((amm_out, amm_spent)) = amm_hop(
+                let amm_quote = amm_hop(
                     ctx,
                     taker,
                     taker_acct,
@@ -3908,12 +3917,17 @@ fn cross_book_hop_with_reaps(
                     /*pool_target_quality=*/ Some(dir_quality),
                     /*cap_ending_spot_price=*/ true,
                     /*waive_output_transfer_fee=*/ false,
-                )? {
-                    remaining_out = leg_sub_round(&remaining_out, &amm_out);
-                    remaining_in = leg_sub_round(&remaining_in, &amm_spent);
-                    delivered = leg_add(&delivered, &amm_out);
-                    delivered_parts.push(leg_to_number(&amm_out));
-                    spent = leg_add(&spent, &amm_spent);
+                )?;
+                match amm_quote {
+                    AmmHopResult::Filled(amm_out, amm_spent) => {
+                        remaining_out = leg_sub_round(&remaining_out, &amm_out);
+                        remaining_in = leg_sub_round(&remaining_in, &amm_spent);
+                        delivered = leg_add(&delivered, &amm_out);
+                        delivered_parts.push(leg_to_number(&amm_out));
+                        spent = leg_add(&spent, &amm_spent);
+                    }
+                    AmmHopResult::ZeroOutput => break 'walk,
+                    AmmHopResult::Unavailable => {}
                 }
             }
             if remaining_in.is_zero() || hop_out_done(&remaining_out, demand_out) {
@@ -5061,7 +5075,7 @@ pub(crate) fn cross_path_payment(
         let residual_budget = leg_sub(&budget, &clob_spent);
         let residual_demand = leg_sub(&demand, &clob_out);
         if !residual_budget.is_zero() && !residual_demand.is_zero() {
-            if let Some((amm_out, amm_spent)) = amm_hop(
+            if let AmmHopResult::Filled(amm_out, amm_spent) = amm_hop(
                 ctx,
                 taker,
                 taker_acct,
@@ -5641,9 +5655,9 @@ fn pool_balance_number(
 }
 
 /// Swap one hop through an AMM pool for the `(budget_in -> demand_out)` pair,
-/// delivering up to `demand_out` while spending up to `budget_in`. Returns
-/// `Some((delivered, spent))` or `None` when no AMM SLE exists for the pair (the
-/// caller then treats the hop as order-book-only).
+/// delivering up to `demand_out` while spending up to `budget_in`. Distinguish
+/// an unavailable AMM from a selected quote whose funded output rounds to zero;
+/// the latter ends this quality-band pass before the resting offer executes.
 ///
 /// Mirrors [`super::payment`]'s `try_amm_conversion` (byte-exact `swapAssetIn` /
 /// `swapAssetOut` on the live pool reserves), with the multi-hop skip flags: an
@@ -5784,6 +5798,14 @@ fn adjusted_amm_quality_allows(
         || rxrpl_amount::within_relative_distance(realised, target)
 }
 
+enum AmmHopResult {
+    Unavailable,
+    /// The pool wins the quality comparison, but the funded output does not
+    /// reach one unit on the destination's amount grid.
+    ZeroOutput,
+    Filled(Leg, Leg),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn amm_hop(
     ctx: &mut ApplyContext<'_>,
@@ -5801,7 +5823,7 @@ fn amm_hop(
     pool_target_quality: Option<u64>,
     cap_ending_spot_price: bool,
     waive_output_transfer_fee: bool,
-) -> Result<Option<(Leg, Leg)>, TransactionResult> {
+) -> Result<AmmHopResult, TransactionResult> {
     let in_xrp = budget_in.is_xrp;
     let out_xrp = demand_out.is_xrp;
 
@@ -5812,16 +5834,16 @@ fn amm_hop(
         &demand_out.issuer,
     );
     let Some(amm_bytes) = ctx.view.read(&amm_key) else {
-        return Ok(None);
+        return Ok(AmmHopResult::Unavailable);
     };
     let Ok(amm): Result<Value, _> = serde_json::from_slice(&amm_bytes) else {
-        return Ok(None);
+        return Ok(AmmHopResult::Unavailable);
     };
     let Some(pool_str) = amm.get("Account").and_then(|v| v.as_str()) else {
-        return Ok(None);
+        return Ok(AmmHopResult::Unavailable);
     };
     let Ok(pool_id) = decode_account_id(pool_str) else {
-        return Ok(None);
+        return Ok(AmmHopResult::Unavailable);
     };
     let tfee = amm.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
 
@@ -5840,7 +5862,7 @@ fn amm_hop(
         &demand_out.issuer,
     );
     if pool_in.is_zero() || pool_out.is_zero() {
-        return Ok(None);
+        return Ok(AmmHopResult::Unavailable);
     }
 
     // An intermediate book output is a gross IOU amount just like a direct
@@ -5856,7 +5878,7 @@ fn amm_hop(
     let budget_num = leg_to_number(&pool_budget);
     let demand_num = leg_to_number(demand_out);
     if budget_num.is_zero() || budget_num.negative() {
-        return Ok(None);
+        return Ok(AmmHopResult::Unavailable);
     }
 
     // Spot-price-quality gate (rippled AMMLiquidity::getOffer, AMMLiquidity.cpp:
@@ -5876,12 +5898,12 @@ fn amm_hop(
         }
         .ok();
         let Some(spq) = spq else {
-            return Ok(None);
+            return Ok(AmmHopResult::Unavailable);
         };
         if !rxrpl_amount::is_better_quality(spq, cq)
             || rxrpl_amount::within_relative_distance(spq, cq)
         {
-            return Ok(None);
+            return Ok(AmmHopResult::Unavailable);
         }
     }
 
@@ -5909,7 +5931,7 @@ fn amm_hop(
         ))
     };
     let Some((quality_budget, quality_output)) = quality_cap else {
-        return Ok(None);
+        return Ok(AmmHopResult::Unavailable);
     };
     let capped_by_quality = num_le(&quality_budget, &budget_num);
     let capped_budget = if capped_by_quality {
@@ -5927,7 +5949,7 @@ fn amm_hop(
     } else if !partial {
         match crate::amm_helpers::swap_asset_out(&pool_in, &pool_out, &demand_num, tfee, in_xrp) {
             Some(needed) if num_le(&needed, &capped_budget) => (needed, demand_num),
-            _ => return Ok(None),
+            _ => return Ok(AmmHopResult::Unavailable),
         }
     } else if out_full.sub(&demand_num).negative() {
         (capped_budget, out_full)
@@ -5937,8 +5959,11 @@ fn amm_hop(
             _ => (capped_budget, out_full),
         }
     };
-    if deliver_num.is_zero() || spent_num.is_zero() {
-        return Ok(None);
+    if spent_num.is_zero() {
+        return Ok(AmmHopResult::Unavailable);
+    }
+    if number_to_leg(&deliver_num, demand_out).is_zero() {
+        return Ok(AmmHopResult::ZeroOutput);
     }
 
     // The AMM math prices the NET amount received by the pool. When the input
@@ -5973,7 +5998,7 @@ fn amm_hop(
                 ctx.rules.enabled(&feature_id("fixUniversalNumber")),
             )
         {
-            return Ok(None);
+            return Ok(AmmHopResult::Unavailable);
         }
     }
 
@@ -5996,7 +6021,7 @@ fn amm_hop(
                 can_fund_new_trust_line(account, ctx.fees.account_reserve(next))
             });
             if !can_create {
-                return Ok(None);
+                return Ok(AmmHopResult::Unavailable);
             }
         }
     }
@@ -6077,7 +6102,7 @@ fn amm_hop(
         )?
     };
 
-    Ok(Some((delivered, source_spent)))
+    Ok(AmmHopResult::Filled(delivered, source_spent))
 }
 
 /// Per-hop AMM pool snapshot for the reverse-then-forward strand flow.
@@ -14071,7 +14096,7 @@ mod amm_transfer_fee_tests {
                 assert!(remaining_out.is_zero());
                 output.clone()
             } else {
-                amm_hop(
+                let AmmHopResult::Filled(delivered, _) = amm_hop(
                     &mut ctx,
                     &taker,
                     &mut taker_account,
@@ -14088,9 +14113,10 @@ mod amm_transfer_fee_tests {
                     false,
                     false,
                 )
-                .unwrap()
-                .unwrap()
-                .0
+                .unwrap() else {
+                    panic!("AMM quote should fill");
+                };
+                delivered
             };
             let pool_after = holding(&sandbox, POOL);
             assert!(pool_after < IOUAmount::from_decimal_string("10").unwrap());
@@ -16188,6 +16214,108 @@ mod taker_bridge_integration {
         assert_eq!(line_bal(&sandbox, O3, b"SHR"), "100000");
         assert_eq!(xrp_bal(&sandbox, TAKER), 1_000_000_000);
         assert_eq!(line_bal(&sandbox, TAKER, b"SHR"), "100");
+    }
+
+    #[test]
+    fn zero_drop_selected_amm_keeps_funded_inverse_self_offer() {
+        let mut ledger = Ledger::genesis();
+        put_acct(&mut ledger, ISS, 1_000_000_000, 0);
+        put_acct(&mut ledger, TAKER, 1_000_000_000, 0);
+        put_acct(&mut ledger, O3, 1_000_000_000_000, 0);
+        put_line(&mut ledger, TAKER, b"SHR", 0);
+        put_line(&mut ledger, O3, b"SHR", 80_000_000);
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let taker = decode_account_id(TAKER).unwrap();
+        let issuer = decode_account_id(ISS).unwrap();
+
+        // Place a funded inverse offer before the AMM exists. It sells XRP,
+        // so the taker's tiny SHR holding does not make this old offer dry.
+        assert_eq!(
+            apply_offer(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER,
+                    "Fee": "12", "Sequence": 1,
+                    "TakerGets": "465532",
+                    "TakerPays": {"currency": "SHR", "issuer": ISS, "value": "46"},
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        let old_key = keylet::offer(&taker, 1);
+        let old_before = sandbox.read(&old_key).unwrap();
+        let old_offer: Value = serde_json::from_slice(&old_before).unwrap();
+        let old_dir: Hash256 = old_offer["BookDirectory"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let old_quality = u64::from_be_bytes(old_dir.as_bytes()[24..32].try_into().unwrap());
+
+        let line_key = keylet::trust_line(&taker, &issuer, &ccy(b"SHR"));
+        let mut line: Value = serde_json::from_slice(&sandbox.read(&line_key).unwrap()).unwrap();
+        let tiny_balance = "0.00000000212625";
+        line["Balance"]["value"] = Value::String(if taker.as_bytes() < issuer.as_bytes() {
+            tiny_balance.to_string()
+        } else {
+            format!("-{tiny_balance}")
+        });
+        sandbox
+            .update(line_key, serde_json::to_vec(&line).unwrap())
+            .unwrap();
+
+        let zero = AccountId::from([0u8; 20]);
+        sandbox
+            .insert(
+                keylet::amm(&[0u8; 20], &zero, &ccy(b"SHR"), &issuer),
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "AMM", "Account": O3,
+                    "TradingFee": 0, "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let pool_spot = rxrpl_amount::get_rate(
+            &IOUAmount::from_decimal_string("80000000").unwrap(),
+            &IOUAmount::from_decimal_string("1000000000000").unwrap(),
+        )
+        .unwrap();
+        assert!(rxrpl_amount::is_better_quality(pool_spot, old_quality));
+        let out = crate::amm_helpers::swap_asset_in(
+            &Number::from_iou(&IOUAmount::from_decimal_string("80000000").unwrap()),
+            &Number::from_int(1_000_000_000_000),
+            &Number::from_iou(&IOUAmount::from_decimal_string(tiny_balance).unwrap()),
+            0,
+            true,
+        );
+        assert_eq!(out.to_xrp_drops(), 0);
+
+        let tx = serde_json::json!({
+            "TransactionType": "OfferCreate", "Account": TAKER,
+            "Fee": "12", "Sequence": 2,
+            "TakerGets": {"currency": "SHR", "issuer": ISS, "value": "46"},
+            "TakerPays": "465237",
+        });
+        let rules =
+            Rules::from_enabled([feature_id("FlowCross"), feature_id("fixUniversalNumber")]);
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            OfferCreateTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        assert_eq!(sandbox.read(&old_key), Some(old_before));
+        assert!(sandbox.read(&keylet::offer(&taker, 2)).is_some());
+        assert_eq!(oc(&sandbox, TAKER), 2);
+        assert_eq!(xrp_bal(&sandbox, O3), 1_000_000_000_000);
+        assert_eq!(line_bal(&sandbox, O3, b"SHR"), "80000000");
     }
 
     #[test]
