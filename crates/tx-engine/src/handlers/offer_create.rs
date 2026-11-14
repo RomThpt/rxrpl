@@ -2703,23 +2703,20 @@ fn try_bridge_step(
             };
         }
         amm_ctx.update();
-        // Flow ranks both strands again after each pass. A direct AMM Fibonacci
-        // offer can outrank the next bridge book band (105503523 / 27E2ED6D).
-        if cq == threshold
-            && let Some(direct) = build_flow_strand(
-                ctx,
-                &[ctx.tx["TakerGets"].clone(), ctx.tx["TakerPays"].clone()],
-            )
-            && direct.terminal_has_amm()
-            && let (Some(direct_q), Some(bridge_q), Some(limit_q)) = (
-                strand_quality_ub(ctx, &direct, taker, &amm_ctx),
-                strand_quality_ub(ctx, bridge, taker, &amm_ctx),
-                bridge_limit.as_ref(),
-            )
-            && num_le(&direct_q, &bridge_q)
+        // Flow ranks both strands again after each pass. The direct path may
+        // overtake the next bridge band through either an AMM (105503523) or
+        // a resting book offer (105503720).
+        if let Some(direct) = build_flow_strand(
+            ctx,
+            &[ctx.tx["TakerGets"].clone(), ctx.tx["TakerPays"].clone()],
+        ) && let (Some(direct_q), Some(bridge_q), Some(limit_q)) = (
+            strand_quality_ub(ctx, &direct, taker, &amm_ctx),
+            strand_quality_ub(ctx, bridge, taker, &amm_ctx),
+            bridge_limit.as_ref(),
+        ) && num_le(&direct_q, &bridge_q)
             && num_le(&direct_q, limit_q)
         {
-            handoff_to_direct = true;
+            handoff_to_direct = direct.terminal_has_amm();
             break;
         }
         if pass_quality_adjusted {
@@ -6510,11 +6507,15 @@ fn strand_quality_ub(
         }
         rate = rate.mul(&hop_rate);
     }
-    // The explicit rippled strand ends with a DirectStep from the delivered
-    // issue's issuer to the destination. Preserve that step's transfer rate in
-    // the collapsed representation as well.
+    // A Payment ends with an issuer-to-destination DirectStep that may charge
+    // a transfer fee. OfferCreate's crossing DirectStep waives that fee; using
+    // it here can incorrectly rank a better direct CLOB behind the XRP bridge
+    // (105503720 / E5F3CA37).
     let terminal = &strand.hops.last()?.out_leg;
-    if !terminal.is_xrp && terminal.issuer != *dest {
+    if !terminal.is_xrp
+        && terminal.issuer != *dest
+        && ctx.tx.get("TransactionType").and_then(Value::as_str) != Some("OfferCreate")
+    {
         rate = rate.mul(&Number::from_iou(&transfer_rate(ctx, &terminal.issuer)));
     }
     Some(rate)
