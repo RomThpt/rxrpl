@@ -1629,6 +1629,11 @@ fn cross_offers(
                 }
                 amm_consumed_in_band = leg_gt(&source_before_amm, &source_remaining);
                 non_clob_source_spent |= amm_consumed_in_band;
+                // A funds-capped AMM fill exhausts the taker's source before
+                // BookStep can visit the next offer, including a self offer.
+                if amm_consumed_in_band && source_funds_limited && source_remaining.is_zero() {
+                    break 'walk;
+                }
                 if continue_to_clob {
                     // execOffer evaluates self-cross removal before its CLOB
                     // callback checks the now-remaining budget. Mirror that
