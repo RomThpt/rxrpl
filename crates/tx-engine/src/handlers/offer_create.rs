@@ -1284,20 +1284,6 @@ fn cross_offers(
         && (in_leg.is_xrp || out_leg.is_xrp)
         && !offer_crossing_strand_reaches_limit(ctx, taker, taker_gets, taker_pays, threshold)
     {
-        // A sell IOC can encounter a partially funded offer at the first
-        // book tip even when its quoted quality rejects the strand. If
-        // reducing that offer to its owner funds makes its XRP side round to
-        // zero, OfferStream removes it while materialising the tip
-        // (105502572/TX138). Keep the ordinary out-of-quality offers intact.
-        if is_sell
-            && ctx.tx.get("Flags").and_then(Value::as_u64).unwrap_or(0) & TF_IMMEDIATE_OR_CANCEL
-                != 0
-            && let Some(quality) = book_tip_quality(ctx, inverse_book)
-            && quality > threshold
-        {
-            let dir_key = book_dir_with_quality(inverse_book, quality);
-            reap_out_of_quality_tiny_tips(ctx, taker, taker_acct, &dir_key)?;
-        }
         return Ok((
             taker_pays.clone(),
             taker_gets.clone(),
@@ -1507,12 +1493,6 @@ fn cross_offers(
                 continue;
             }
             if !post_clob_cleanup {
-                // OfferStream materialises the first CLOB tip before BookStep
-                // rejects its quality. Preserve the historical rule that an
-                // ordinary unfunded offer beyond the taker's limit is left
-                // alone, but remove a partially funded tip whose strict
-                // reduction would worsen its quality (105500437).
-                reap_out_of_quality_tiny_tips(ctx, taker, taker_acct, &dir_key)?;
                 // A single-path AMM can keep the strand active even though the
                 // CLOB tip is worse than the taker's limit. rippled constructs
                 // OfferStream before trying that AMM, so expired/invalid tips
@@ -1525,6 +1505,10 @@ fn cross_offers(
                     deferred_out_of_quality_dir = Some(dir_key);
                     break;
                 }
+                // Once the strand passes its quality bound, OfferStream may
+                // materialise the first CLOB tip and remove a partially funded
+                // offer whose strict reduction worsens its quality (105500437).
+                reap_out_of_quality_tiny_tips(ctx, taker, taker_acct, &dir_key)?;
             }
             let mode = quality_advance_mode(
                 dir_quality,
@@ -16984,7 +16968,7 @@ mod flow_cross_own_unfunded {
     }
 
     #[test]
-    fn ledger_105502572_reaps_out_of_quality_sub_drop_maker_without_crossing() {
+    fn out_of_quality_ioc_keeps_sub_drop_maker_when_strand_is_rejected() {
         let mut ledger = Ledger::genesis();
         for addr in [ISS, TAKER, MAKER] {
             let id = decode_account_id(addr).unwrap();
@@ -17033,8 +17017,7 @@ mod flow_cross_own_unfunded {
         sandbox
             .update(line_key, serde_json::to_vec(&line).unwrap())
             .unwrap();
-        // TX92 placed the offer before TX138 in the same ledger. Carry the
-        // resulting state into TX138's base view, including its tiny balance.
+        // Carry a partially funded maker offer into the IOC's base view.
         let changes = sandbox.into_changes();
         for (key, bytes) in changes.inserts.into_iter().chain(changes.updates) {
             ledger.put_state(key, bytes).unwrap();
@@ -17098,9 +17081,9 @@ mod flow_cross_own_unfunded {
         assert_eq!(remaining_pays, taker_pays);
         assert_eq!(remaining_gets, taker_gets);
         assert!(!crossed);
-        assert!(sandbox.read(&offer_key).is_none());
-        assert!(sandbox.read(&book_dir).is_none());
-        assert_eq!(owner_count(&sandbox, MAKER), 0);
+        assert!(sandbox.read(&offer_key).is_some());
+        assert!(sandbox.read(&book_dir).is_some());
+        assert_eq!(owner_count(&sandbox, MAKER), 1);
         assert_eq!(xrp_balance(&sandbox, MAKER), maker_xrp);
         assert_eq!(xrp_balance(&sandbox, TAKER), taker_xrp);
         assert!(
