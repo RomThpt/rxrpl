@@ -2437,7 +2437,21 @@ fn try_amm_step(
     // (`sendMax = min(takerAmount.in, accountFunds)`, OfferCreate.cpp:400): the
     // AMM swap would otherwise overdraw the taker (its sold-asset balance goes
     // negative) when TakerGets exceeds what it holds.
-    let budget = leg_min(remaining_in, source_remaining);
+    let input_rate = if remaining_in.is_xrp || taker == &remaining_in.issuer {
+        1_000_000_000
+    } else {
+        transfer_rate_value(ctx, &remaining_in.issuer)
+    };
+    let gross_input_budget = input_rate > 1_000_000_000
+        && ctx.tx.get("TransactionType").and_then(Value::as_str) == Some("OfferCreate");
+    let budget = if gross_input_budget {
+        let mut gross = remaining_in.clone();
+        gross.iou = IOUAmount::mul_round(&gross.iou, &transfer_rate(ctx, &gross.issuer), true)
+            .unwrap_or(gross.iou);
+        leg_min(&gross, source_remaining)
+    } else {
+        leg_min(remaining_in, source_remaining)
+    };
     if budget.is_zero() {
         return Ok((true, None));
     }
@@ -2533,7 +2547,12 @@ fn try_amm_step(
         } else {
             leg_sub(remaining_out, &delivered)
         };
-        *remaining_in = leg_sub(remaining_in, &spent);
+        let net_spent = if gross_input_budget {
+            net_book_payment_input(&spent, input_rate)
+        } else {
+            spent.clone()
+        };
+        *remaining_in = leg_sub(remaining_in, &net_spent);
         *source_remaining = leg_sub(source_remaining, &spent);
         *crossed = true;
         return Ok((
