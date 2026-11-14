@@ -218,8 +218,9 @@ impl Transactor for NFTokenCreateOfferTransactor {
             // (tokenOfferCreateApply), so it serialises even for a buy offer
             // (Flags 0). It is NOT default-droppable here — omitting it diverges
             // the account_hash (the metadata NewFields hides the zero, so the
-            // per-tx value check cannot see it).
-            "Flags": flags,
+            // per-tx value check cannot see it). Transaction-only flags such as
+            // tfFullyCanonicalSig do not belong on the ledger entry.
+            "Flags": flags & TF_SELL_NFTOKEN,
             "Owner": account_str,
             "NFTokenID": nftoken_id,
             "OwnerNode": format!("{owner_node:016X}"),
@@ -322,7 +323,7 @@ mod tests {
             "Account": ACCOUNT,
             "NFTokenID": NFTOKEN_ID,
             "Amount": "1000000",
-            "Flags": TF_SELL_NFTOKEN,
+            "Flags": TF_SELL_NFTOKEN | 0x8000_0000u32,
             "Fee": "12",
             "Sequence": 1,
         });
