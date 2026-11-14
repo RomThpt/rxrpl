@@ -3659,6 +3659,7 @@ pub(crate) fn cross_book_payment(
         /*force_full_input_budget=*/ false,
         source_input_rate,
         source_funds_limited,
+        /*direct_payment_demand=*/ true,
     )?;
     Ok((
         delivered.with_amount(&delivered.iou, delivered.drops),
@@ -3698,6 +3699,7 @@ fn cross_book_hop(
     force_full_input_budget: bool,
     source_input_rate: u32,
     source_funds_limited: bool,
+    direct_payment_demand: bool,
 ) -> Result<(Leg, Leg), TransactionResult> {
     cross_book_hop_with_reaps(
         ctx,
@@ -3718,6 +3720,7 @@ fn cross_book_hop(
         None,
         false,
         false,
+        direct_payment_demand,
     )
 }
 
@@ -3749,6 +3752,7 @@ fn cross_book_hop_direct_tail(
         None,
         true,
         false,
+        false,
     )
 }
 
@@ -3776,6 +3780,7 @@ fn cross_book_hop_with_reaps(
     mut permanent_reaps: Option<&mut Vec<PermanentOffer>>,
     reverse_direct_tail: bool,
     preserve_source_residual: bool,
+    direct_payment_demand: bool,
 ) -> Result<(Leg, Leg), TransactionResult> {
     let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
     let inverse_book = keylet::book_dir(
@@ -4503,24 +4508,22 @@ fn cross_book_hop_with_reaps(
     }
 
     // Per-fill dest credits truncate; their sum sat 5e-14 below Amount on
-    // 63B72EB4. When remaining is zero or dust, rewrite dest as one add of
-    // Amount, not the truncated delivered sum.
+    // 63B72EB4. Reconcile with one add of the canonical BookStep output;
+    // a direct conversion uses its realised delivery when it misses Amount.
     if let Some(before_s) = dest_line_before {
         if dest != &demand_out.issuer {
-            let leftover_dust = remaining_is_filled(&remaining_out, demand_out);
-            let credit = if remaining_out.is_zero() || leftover_dust {
-                demand_out.iou
-            } else if should_bump_partial_path_credit(
-                skip_input_debit,
-                consumed_whole_offer,
-                taker,
-                dest,
-            ) {
-                let d = delivered.iou;
-                IOUAmount::from_parts(d.mantissa() + 1, d.exponent(), false).unwrap_or(d)
-            } else {
-                delivered.iou
-            };
+            let credit = book_destination_credit(
+                demand_out,
+                &remaining_out,
+                &delivered,
+                direct_payment_demand,
+                should_bump_partial_path_credit(
+                    skip_input_debit,
+                    consumed_whole_offer,
+                    taker,
+                    dest,
+                ),
+            );
             if let Ok(before) = IOUAmount::from_decimal_string(&before_s) {
                 let holder_is_high = dest.as_bytes() > demand_out.issuer.as_bytes();
                 let delta = if holder_is_high {
@@ -4750,6 +4753,29 @@ fn should_bump_partial_path_credit(
     // account. Its destination line must use the delivered amount verbatim;
     // adding the path-credit ULP would count that rounding correction twice.
     skip_input_debit && !consumed_whole_offer && taker != dest
+}
+
+fn book_destination_credit(
+    demand: &Leg,
+    remaining: &Leg,
+    delivered: &Leg,
+    direct_payment_demand: bool,
+    bump_partial_path: bool,
+) -> IOUAmount {
+    // Flow's reverse quote supplies a canonical sub-demand for a BookStep,
+    // even on a partial Payment. A direct conversion instead supplies Amount
+    // as a ceiling; dust below that ceiling is an actual delivery shortfall.
+    if remaining.is_zero()
+        || (remaining_is_filled(remaining, demand)
+            && (!direct_payment_demand || leg_ge(delivered, demand)))
+    {
+        demand.iou
+    } else if bump_partial_path {
+        let d = delivered.iou;
+        IOUAmount::from_parts(d.mantissa() + 1, d.exponent(), false).unwrap_or(d)
+    } else {
+        delivered.iou
+    }
 }
 
 /// The reverse BookStep quotes the requested output before the source budget
@@ -5063,6 +5089,7 @@ pub(crate) fn cross_path_payment(
             /*force_full_input_budget=*/ false,
             source_input_rate,
             /*source_funds_limited=*/ false,
+            /*direct_payment_demand=*/ false,
         )?;
 
         // Residual liquidity from the AMM pool for this pair, on the budget not
@@ -5398,6 +5425,7 @@ pub(crate) fn cross_book_direct_path(
         false,
         1_000_000_000,
         false,
+        false,
     );
     ctx.view.rollback(checkpoint);
     *taker_acct = acct_before;
@@ -5436,6 +5464,7 @@ pub(crate) fn cross_book_direct_path(
         false,
         false,
         1_000_000_000,
+        false,
         false,
     )?;
     if got_first.is_zero() {
@@ -5479,6 +5508,7 @@ pub(crate) fn cross_book_direct_path(
             false,
             false,
             1_000_000_000,
+            false,
             false,
         )?
     } else {
@@ -7928,6 +7958,7 @@ fn price_clob_band_reverse(
             Some(permanent_reaps),
             false,
             false,
+            /*direct_payment_demand=*/ false,
         )
         .ok();
         ctx.view.rollback(cp);
@@ -7963,6 +7994,7 @@ fn price_clob_band_reverse(
         Some(permanent_reaps),
         false,
         false,
+        /*direct_payment_demand=*/ false,
     );
     ctx.view.rollback(cp);
     *taker_acct = taker_acct_before;
@@ -8618,6 +8650,7 @@ fn execute_strand_pass(
                         && is_first
                         && source_rate.is_some_and(|rate| rate > parity_rate())
                         && amm_ctx.cur_iters() > 0,
+                    /*direct_payment_demand=*/ false,
                 )
                 .ok()?;
                 if delivered.is_zero()
@@ -11495,9 +11528,9 @@ mod taker_crossing_tests {
         BalanceRounding, Leg, TakerCrossType, add_iou_balance, add_iou_balance_downward,
         add_iou_balance_half_upward, aggregate_flow_source_balance_number,
         aggregate_output_remainder, amm_pool_debit_rounding, amm_step_allows_clob,
-        book_payment_dust_drain, book_step_input_exhausted, bridge_funded_xrp_input,
-        clob_band_allows_terminal_amm, composed_quality, consumes_full_offer,
-        crossing_quality_threshold, crossing_threshold, debit_drains_source,
+        book_destination_credit, book_payment_dust_drain, book_step_input_exhausted,
+        bridge_funded_xrp_input, clob_band_allows_terminal_amm, composed_quality,
+        consumes_full_offer, crossing_quality_threshold, crossing_threshold, debit_drains_source,
         flow_first_book_spends_source_funds, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input,
         flow_source_funds_limit_binds, flow_xrp_to_iou, full_offer_take,
         funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
@@ -12742,6 +12775,52 @@ mod taker_crossing_tests {
         assert!(!should_bump_partial_path_credit(
             false, false, &taker, &other
         ));
+    }
+
+    #[test]
+    fn ledger_105507013_dust_remainder_credits_realised_delivery() {
+        // TX80 ED6A2D9A: Payment to self XRP->XRPN. The offer and maker line
+        // lose the realised amount, and DeliveredAmount is one ULP below Amount.
+        // The destination line must agree with that oracle delivery.
+        let demand = iou("1754.385964912281");
+        let delivered = iou("1754.38596491228");
+        let remaining = iou("0.000000000001");
+        assert!(remaining_is_filled(&remaining, &demand));
+        assert_eq!(
+            book_destination_credit(&demand, &remaining, &delivered, true, false),
+            delivered.iou
+        );
+
+        // A truly consumed demand still uses Amount to replace the sum of
+        // truncated per-fill credits (30000046 63B72EB4).
+        assert_eq!(
+            book_destination_credit(&demand, &iou("0"), &delivered, true, false),
+            demand.iou
+        );
+        assert_eq!(
+            book_destination_credit(&demand, &remaining, &demand, true, false),
+            demand.iou
+        );
+    }
+
+    #[test]
+    fn ledger_105502605_reverse_quoted_partial_delivery_keeps_demand_ulp() {
+        // TX65 6BE62E3E: a partial XRP->SOLO self-payment asks for
+        // 1.31710991664361 SOLO, with DeliverMin 0.851731079429536.
+        // Flow's reverse quote caps this BookStep at the canonical partial
+        // output, one ULP above the sum of its forward fills.
+        let demand = iou("0.8780609555281941");
+        let delivered = iou("0.878060955528194");
+        let remaining = iou("0.0000000000000001");
+        assert!(remaining_is_filled(&remaining, &demand));
+        let credit = book_destination_credit(&demand, &remaining, &delivered, false, false);
+        assert_eq!(credit, demand.iou);
+        assert_eq!(
+            add_iou_balance(&IOUAmount::ZERO, &credit.negate(), true)
+                .unwrap()
+                .to_decimal_string(),
+            "-0.8780609555281941"
+        );
     }
 
     #[test]
@@ -15030,6 +15109,7 @@ mod taker_bridge_integration {
             false,
             1_000_000_000,
             false,
+            false,
         )
         .unwrap();
 
@@ -15357,6 +15437,7 @@ mod taker_bridge_integration {
             true,
             1_000_000_000,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(delivered.drops, 2_702_825);
@@ -15488,6 +15569,7 @@ mod taker_bridge_integration {
             false,
             false,
             1_000_000_000,
+            false,
             false,
         )
         .unwrap();
@@ -15629,6 +15711,7 @@ mod taker_bridge_integration {
             false,
             false,
             1_000_000_000,
+            false,
             false,
         )
         .unwrap();
