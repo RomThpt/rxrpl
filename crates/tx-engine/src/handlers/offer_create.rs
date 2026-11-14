@@ -338,6 +338,115 @@ mod ledger_105504157_tests {
         );
         assert!(changes.deletes.is_empty());
     }
+
+    #[test]
+    fn ledger_105504158_direct_book_and_amm_match_oracle() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("ledger_105504158_fixture.json")).unwrap();
+        let mut ledger = Ledger::genesis();
+        for (key, entry) in fixture["entries"].as_object().unwrap() {
+            ledger
+                .put_state(key.parse().unwrap(), serde_json::to_vec(entry).unwrap())
+                .unwrap();
+        }
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::from_enabled([
+            feature_id("FlowCross"),
+            feature_id("FlowSortStrands"),
+            feature_id("fixUniversalNumber"),
+            feature_id("fixAMMv1_2"),
+            feature_id("fixAMMv1_3"),
+            feature_id("fixReducedOffersV1"),
+            feature_id("fixReducedOffersV2"),
+        ]);
+        let tx = &fixture["tx"];
+        let mut ctx = ApplyContext {
+            tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let strand =
+            build_flow_strand(&ctx, &[tx["TakerGets"].clone(), tx["TakerPays"].clone()]).unwrap();
+        assert!(first_fib_offer_beats_clob(&ctx, &strand));
+        assert_eq!(
+            OfferCreateTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        let source_key =
+            keylet::account(&decode_account_id(tx["Account"].as_str().unwrap()).unwrap());
+        let mut expected_updates = HashSet::new();
+        let mut expected_inserts = HashSet::new();
+        for node in fixture["tx"]["meta"]["AffectedNodes"].as_array().unwrap() {
+            let Some(entry) = node.get("ModifiedNode").or_else(|| node.get("CreatedNode")) else {
+                continue;
+            };
+            let kind = entry["LedgerEntryType"].as_str().unwrap();
+            let key: Hash256 = entry["LedgerIndex"].as_str().unwrap().parse().unwrap();
+            if node.get("ModifiedNode").is_some() {
+                expected_updates.insert(key);
+            } else {
+                expected_inserts.insert(key);
+            }
+            let actual: Value = serde_json::from_slice(&sandbox.read(&key).unwrap()).unwrap();
+            let expected = entry.get("FinalFields").unwrap_or(&entry["NewFields"]);
+            match kind {
+                "Offer" => {
+                    assert_eq!(actual["TakerGets"], expected["TakerGets"], "offer {key}");
+                    assert_eq!(actual["TakerPays"], expected["TakerPays"], "offer {key}");
+                }
+                "RippleState" => {
+                    let parse_balance = |text: &str| {
+                        if let Some((mantissa, exponent)) = text.split_once('e') {
+                            let signed: i64 = mantissa.parse().unwrap();
+                            IOUAmount::from_parts(
+                                signed.unsigned_abs(),
+                                exponent.parse().unwrap(),
+                                signed.is_negative(),
+                            )
+                            .unwrap()
+                        } else {
+                            IOUAmount::from_decimal_string(text).unwrap()
+                        }
+                    };
+                    let actual_balance =
+                        parse_balance(actual["Balance"]["value"].as_str().unwrap());
+                    let expected_balance =
+                        parse_balance(expected["Balance"]["value"].as_str().unwrap());
+                    assert_eq!(actual_balance, expected_balance, "trust line {key}");
+                }
+                "AccountRoot" => {
+                    if let Some(balance) = expected.get("Balance") {
+                        if key == source_key {
+                            let fee: u64 = tx["Fee"].as_str().unwrap().parse().unwrap();
+                            let actual_balance: u64 =
+                                actual["Balance"].as_str().unwrap().parse().unwrap();
+                            let expected_balance: u64 = balance.as_str().unwrap().parse().unwrap();
+                            assert_eq!(actual_balance - fee, expected_balance, "account {key}");
+                        } else {
+                            assert_eq!(&actual["Balance"], balance, "account {key}");
+                        }
+                    }
+                    if let Some(owner_count) = expected.get("OwnerCount") {
+                        assert_eq!(&actual["OwnerCount"], owner_count, "account {key}");
+                    }
+                }
+                _ => {}
+            }
+        }
+        let changes = sandbox.into_changes();
+        assert_eq!(
+            changes.updates.keys().copied().collect::<HashSet<_>>(),
+            expected_updates
+        );
+        assert_eq!(
+            changes.inserts.keys().copied().collect::<HashSet<_>>(),
+            expected_inserts
+        );
+        assert!(changes.deletes.is_empty());
+    }
 }
 
 /// The order-book directory index for a given quality: the book base with its
@@ -1713,22 +1822,23 @@ fn cross_offers(
         None
     };
 
-    // With no crossable direct book offer and no issuer fees, the direct
-    // IOU/IOU AMM competes with the XRP autobridge on every Flow pass. An
-    // out-of-quality CLOB tip does not disable that competition when the
-    // direct AMM leads the initial quality ranking (105504157 / D778CAF8).
-    // A passive offer or a better initial bridge stays on the original walk
-    // (105500132 / C3670F5D and 105501838 / E619EA7E).
-    // The sorted strand selector preserves their shared AMM iteration state.
+    // An IOU/IOU AMM competes with the XRP autobridge on every Flow pass when
+    // its first Fibonacci offer leads the direct CLOB and the bridge. The
+    // bridge's presence keeps AMM sizing in multi-path mode even when its
+    // quality is outside this taker's limit (105504158 / 85F8EBBF).
     if let Some(bridge_strand) = bridge.as_ref()
         && let Some(direct_strand) =
             build_flow_strand(ctx, &[taker_gets.clone(), taker_pays.clone()])
         && ctx.rules.enabled(&feature_id("FlowSortStrands"))
         && direct_strand.terminal_has_amm()
-        && (!direct_strand.hops[0].has_clob
+        && ((!direct_strand.hops[0].has_clob
+            && transfer_rate_value(ctx, &in_leg.issuer) == 1_000_000_000)
             || (!passive
-                && book_tip_quality(ctx, &direct_strand.hops[0].inverse_book)
-                    .is_none_or(|q| reject_quality(q, clob_threshold))
+                && ((transfer_rate_value(ctx, &in_leg.issuer) == 1_000_000_000
+                    && book_tip_quality(ctx, &direct_strand.hops[0].inverse_book)
+                        .is_none_or(|q| reject_quality(q, clob_threshold)))
+                    || (transfer_rate_value(ctx, &in_leg.issuer) > 1_000_000_000
+                        && first_fib_offer_beats_clob(ctx, &direct_strand)))
                 && offer_crossing_strand_reaches_limit_with_amm_mode(
                     ctx, taker, taker_gets, taker_pays, threshold, true,
                 )
@@ -1739,7 +1849,6 @@ fn cross_offers(
                     ),
                     (Some(direct), Some(bridge)) if num_le(&direct, &bridge)
                 )))
-        && transfer_rate_value(ctx, &in_leg.issuer) == 1_000_000_000
         && transfer_rate_value(ctx, &out_leg.issuer) == 1_000_000_000
     {
         let demand = if is_sell {
@@ -5922,6 +6031,19 @@ fn apply_amm_move(
             },
         );
         if waive_output_transfer_fee && !skip_output_credit {
+            if dest == taker
+                && amount.issuer != *dest
+                && ctx
+                    .view
+                    .read(&keylet::trust_line(dest, &amount.issuer, &amount.currency))
+                    .is_none()
+            {
+                let next = helpers::get_owner_count(taker_acct).saturating_add(1);
+                if !can_fund_new_trust_line(taker_acct, ctx.fees.account_reserve(next)) {
+                    return Err(TransactionResult::TecPathDry);
+                }
+                create_iou_trust_line(ctx, dest, taker_acct, &amount.issuer, &amount.currency)?;
+            }
             // BookOfferCrossingStep uses parity for an AMM's output transfer
             // rate. Move the same gross amount off the pool line and onto the
             // taker's line; unlike Payment flow, no issuer fee is burned.
@@ -7360,6 +7482,37 @@ fn offer_crossing_initial_bound(ctx: &ApplyContext<'_>, strand: &FlowStrand) -> 
     Some(rate)
 }
 
+/// The first multi-path AMM offer must actually outrank the resting direct
+/// book before the shared strand selector takes over an in-quality CLOB walk.
+fn first_fib_offer_beats_clob(ctx: &ApplyContext<'_>, strand: &FlowStrand) -> bool {
+    let Some(hop) = strand.hops.first() else {
+        return false;
+    };
+    let Some(clob) = book_tip_quality(ctx, &hop.inverse_book) else {
+        return false;
+    };
+    let (Some(liquidity), Some(pool)) = (&hop.liquidity, &hop.amm_pool) else {
+        return false;
+    };
+    let pool_in = pool_balance_number(
+        ctx,
+        pool,
+        hop.in_leg.is_xrp,
+        &hop.in_leg.currency,
+        &hop.in_leg.issuer,
+    );
+    let pool_out = pool_balance_number(
+        ctx,
+        pool,
+        hop.out_leg.is_xrp,
+        &hop.out_leg.currency,
+        &hop.out_leg.issuer,
+    );
+    liquidity
+        .get_offer(&pool_in, &pool_out, Some(clob), &AmmContext::new(true))
+        .is_some_and(|offer| rxrpl_amount::is_better_quality(offer.quality, clob))
+}
+
 /// Whether the default OfferCreate strand survives Flow's quality-upper-bound
 /// gate. BookStep::tip chooses the synthetic AMM offer only when it beats the
 /// CLOB tip. BookOfferCrossingStep adjusts the selected AMM's bound for the
@@ -8438,9 +8591,10 @@ pub(crate) fn flow_multi(
                 .collect();
             eprintln!("[flow]   try={cur_try} rank [{}]", qs.join(" "));
         }
-        // (B) multiPath toggle, from the live strand count (seeded at setup like
-        // rippled `Flow.cpp:106` = `strands.size() > 1`).
-        amm_ctx.set_multi_path(cur.len() > 1);
+        // (B) Flow.cpp seeds multiPath from the original strand count. A bridge
+        // rejected by the quality gate still keeps direct AMM offers Fibonacci
+        // sized for the entire crossing.
+        amm_ctx.set_multi_path(strands.len() > 1);
 
         // (D) pick the FIRST surviving strand (checkpoint per trial; roll back
         // losers; keep the winner's mutation).
@@ -8459,7 +8613,8 @@ pub(crate) fn flow_multi(
                 &remaining_in,
                 &remaining_out,
                 amm_ctx,
-                /*offer_create_bridge=*/ false,
+                /*offer_create_bridge=*/
+                ctx.tx.get("TransactionType").and_then(Value::as_str) == Some("OfferCreate"),
                 source_funds_limited,
                 None,
                 &mut permanent_reaps,
