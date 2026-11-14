@@ -343,6 +343,11 @@ mod ledger_105504157_tests {
     fn ledger_105504158_direct_book_and_amm_match_oracle() {
         let fixture: Value =
             serde_json::from_str(include_str!("ledger_105504158_fixture.json")).unwrap();
+        // This historical amendment ID predates feature_id(name) derivation.
+        let default_ripple: Hash256 =
+            "1562511F573A19AE9BD103B5D6B9E01B3B46805AEC5D3C4805C902B514399146"
+                .parse()
+                .unwrap();
         let mut ledger = Ledger::genesis();
         for (key, entry) in fixture["entries"].as_object().unwrap() {
             ledger
@@ -353,6 +358,7 @@ mod ledger_105504157_tests {
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let mut sandbox = Sandbox::new(&view);
         let rules = Rules::from_enabled([
+            default_ripple,
             feature_id("FlowCross"),
             feature_id("FlowSortStrands"),
             feature_id("fixUniversalNumber"),
@@ -398,6 +404,7 @@ mod ledger_105504157_tests {
                     assert_eq!(actual["TakerPays"], expected["TakerPays"], "offer {key}");
                 }
                 "RippleState" => {
+                    assert_eq!(actual["Flags"], expected["Flags"], "trust line {key}");
                     let parse_balance = |text: &str| {
                         if let Some((mantissa, exponent)) = text.split_once('e') {
                             let signed: i64 = mantissa.parse().unwrap();
@@ -3567,6 +3574,7 @@ fn cross_book_hop(
         source_funds_limited,
         None,
         false,
+        false,
     )
 }
 
@@ -3597,6 +3605,7 @@ fn cross_book_hop_direct_tail(
         false,
         None,
         true,
+        false,
     )
 }
 
@@ -3623,6 +3632,7 @@ fn cross_book_hop_with_reaps(
     source_funds_limited: bool,
     mut permanent_reaps: Option<&mut Vec<PermanentOffer>>,
     reverse_direct_tail: bool,
+    preserve_source_residual: bool,
 ) -> Result<(Leg, Leg), TransactionResult> {
     let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
     let inverse_book = keylet::book_dir(
@@ -4184,12 +4194,13 @@ fn cross_book_hop_with_reaps(
                     number_switchover,
                     PayInOptions {
                         skip_taker_debit: skip_input_debit,
-                        allow_dust_drain: book_payment_dust_drain(
-                            full_take,
-                            ctx.tx.get("TransactionType").and_then(Value::as_str)
-                                == Some("Payment")
-                                && taker == dest,
-                        ),
+                        allow_dust_drain: !preserve_source_residual
+                            && book_payment_dust_drain(
+                                full_take,
+                                ctx.tx.get("TransactionType").and_then(Value::as_str)
+                                    == Some("Payment")
+                                    && taker == dest,
+                            ),
                         gross_override: None,
                     },
                 )?;
@@ -7747,6 +7758,7 @@ fn price_clob_band_reverse(
             /*source_funds_limited=*/ false,
             Some(permanent_reaps),
             false,
+            false,
         )
         .ok();
         ctx.view.rollback(cp);
@@ -7780,6 +7792,7 @@ fn price_clob_band_reverse(
         /*source_input_rate=*/ 1_000_000_000,
         /*source_funds_limited=*/ false,
         Some(permanent_reaps),
+        false,
         false,
     );
     ctx.view.rollback(cp);
@@ -8380,7 +8393,7 @@ fn execute_strand_pass(
                         number_to_leg(&available_input, &hop.in_leg),
                     )
                 };
-                let (delivered, spent) = cross_book_hop(
+                let (delivered, spent) = cross_book_hop_with_reaps(
                     ctx,
                     taker,
                     taker_acct,
@@ -8419,6 +8432,17 @@ fn execute_strand_pass(
                         ),
                     /*source_input_rate=*/ 1_000_000_000,
                     /*source_funds_limited=*/ false,
+                    /*permanent_reaps=*/ None,
+                    /*reverse_direct_tail=*/ false,
+                    // The source DirectStep retains its Number residual when
+                    // a charged source finishes an AMM + CLOB crossing. A
+                    // local dust-drain heuristic would erase that nonzero
+                    // residual and delete the trust line (105504158/TX41).
+                    /*preserve_source_residual=*/
+                    offer_create_bridge
+                        && is_first
+                        && source_rate.is_some_and(|rate| rate > parity_rate())
+                        && amm_ctx.cur_iters() > 0,
                 )
                 .ok()?;
                 if delivered.is_zero()
