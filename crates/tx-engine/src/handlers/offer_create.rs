@@ -6797,6 +6797,8 @@ fn price_clob_band_reverse(
 ) -> Option<(Number, Number)> {
     let demand_leg = number_to_leg(demanded, &hop.out_leg);
     let single_band = !(bridge_first_xrp && span_quality_pages);
+    let first_xrp_input_limited =
+        source_budget.is_some() && is_first && !is_last && hop.in_leg.is_xrp && !hop.out_leg.is_xrp;
     // A BookStep reverse pass starts from the requested output, before
     // StrandFlow compares its required input with SendMax. The capped quote
     // below preserves our existing forward pricing, but would stop before
@@ -6819,7 +6821,7 @@ fn price_clob_band_reverse(
             /*allow_amm=*/ false,
             /*lq_stop=*/ None,
             /*preserve_input_limited_iou_ulp=*/ false,
-            /*force_full_input_budget=*/ bridge_first_xrp,
+            /*force_full_input_budget=*/ bridge_first_xrp || first_xrp_input_limited,
             /*source_input_rate=*/ 1_000_000_000,
             /*source_funds_limited=*/ false,
             Some(permanent_reaps),
@@ -6852,7 +6854,7 @@ fn price_clob_band_reverse(
         /*allow_amm=*/ false,
         /*lq_stop=*/ None,
         /*preserve_input_limited_iou_ulp=*/ false,
-        /*force_full_input_budget=*/ bridge_first_xrp,
+        /*force_full_input_budget=*/ bridge_first_xrp || first_xrp_input_limited,
         /*source_input_rate=*/ 1_000_000_000,
         /*source_funds_limited=*/ false,
         Some(permanent_reaps),
@@ -7158,6 +7160,7 @@ fn execute_strand_pass(
     let mut outs: Vec<Number> = vec![Number::ZERO; n];
     let mut kinds: Vec<HopKindR> = vec![HopKindR::Amm; n];
     let mut bridge_xrp_spans_pages = vec![false; n];
+    let mut first_xrp_budgeted_quote = false;
     // The lowest-index hop whose band cannot meet the demand pulled back to it;
     // `n` means "no interior limit" (only the source budget may bind).
     let mut limiting = n;
@@ -7251,6 +7254,34 @@ fn execute_strand_pass(
                 bridge_first_xrp,
                 false,
             )?;
+            // The first XRP book is reverse-priced without SendMax. Only when
+            // that quote exceeds the source budget must BookStep rerun it with
+            // an input limit, spending the full drop budget and flooring its
+            // IOU output at the fixed directory quality (105504137). Keep the
+            // unbounded quote for all other strands.
+            if n == 2
+                && is_first
+                && hop.in_leg.is_xrp
+                && !hop.out_leg.is_xrp
+                && num_gt(&quote.0, remaining_in)
+            {
+                quote = price_clob_band_reverse(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    dest,
+                    hop,
+                    &demanded,
+                    Some(remaining_in),
+                    is_first,
+                    is_last,
+                    permanent_reaps,
+                    uncapped_for_source_limit,
+                    bridge_first_xrp,
+                    false,
+                )?;
+                first_xrp_budgeted_quote = true;
+            }
             if bridge_xrp_one_drop_tip_needs_more_pages(bridge_first_xrp, &demanded, &quote.1)
                 && let Some(expanded) = price_clob_band_reverse(
                     ctx,
@@ -7313,6 +7344,8 @@ fn execute_strand_pass(
     if source_capped {
         limiting = 0;
     }
+    let first_xrp_source_budget_binds =
+        first_xrp_budgeted_quote && limiting == 0 && num_ge(&ins[0], remaining_in);
 
     // --- FORWARD PASS: apply, threading the intermediate so it conserves. ---
     let mut source_in = ins[0];
@@ -7452,6 +7485,7 @@ fn execute_strand_pass(
                     // (105500249 4C84DE5C).
                     /*force_full_input_budget=*/
                     bridge_xrp_reverse
+                        || (is_first && first_xrp_source_budget_binds)
                         || flow_first_book_spends_source_funds(
                             source_funds_limited,
                             source_capped,
@@ -13928,6 +13962,119 @@ mod taker_bridge_integration {
         assert_eq!(priced.1.to_iou().to_decimal_string(), "10");
         assert_eq!(taker_acct, taker_before);
         assert_eq!(ctx.view.read(&offer_key).unwrap(), offer_before);
+    }
+
+    #[test]
+    fn first_xrp_book_caps_drifted_offer_at_source_budget() {
+        let mut ledger = Ledger::genesis();
+        for account in [ISS, TAKER, O2, O3] {
+            put_acct(&mut ledger, account, 1_000_000_000, 0);
+        }
+        put_line(&mut ledger, O2, b"BBB", 2_000);
+        put_line(&mut ledger, O3, b"BBB", 0);
+        put_line(&mut ledger, O3, b"CCC", 360);
+        put_line(&mut ledger, TAKER, b"CCC", 0);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        for (owner, gets, pays) in [
+            (
+                O2,
+                serde_json::json!({"currency": "BBB", "issuer": ISS, "value": "1134.832047866812"}),
+                serde_json::json!("195145211"),
+            ),
+            (
+                O3,
+                serde_json::json!({"currency": "CCC", "issuer": ISS, "value": "359.99705"}),
+                serde_json::json!({"currency": "BBB", "issuer": ISS, "value": "277.99"}),
+            ),
+        ] {
+            assert_eq!(
+                apply_offer(
+                    &mut sandbox,
+                    &fees,
+                    &serde_json::json!({
+                        "TransactionType": "OfferCreate", "Account": owner,
+                        "Fee": "12", "Sequence": 1,
+                        "TakerGets": gets, "TakerPays": pays,
+                    }),
+                ),
+                TransactionResult::TesSuccess
+            );
+        }
+
+        // The offer's live fields can drift from its fixed directory quality.
+        // Its remaining Pays/ Gets ratio is slightly better than the fixed
+        // directory rate. Buying 277.99 BBB at that rate costs 47803036 drops,
+        // one above SendMax.
+        let first_key = keylet::offer(&decode_account_id(O2).unwrap(), 1);
+        let mut first: Value = serde_json::from_slice(&sandbox.read(&first_key).unwrap()).unwrap();
+        first["TakerPays"] = Value::String("195145206".into());
+        first["TakerGets"]["value"] = Value::String("1134.832046187368".into());
+        sandbox
+            .update(first_key, serde_json::to_vec(&first).unwrap())
+            .unwrap();
+
+        let taker = decode_account_id(TAKER).unwrap();
+        let mut taker_acct: Value =
+            serde_json::from_slice(&sandbox.read(&keylet::account(&taker)).unwrap()).unwrap();
+        let rules =
+            Rules::from_enabled([feature_id("FlowCross"), feature_id("fixUniversalNumber")]);
+        let tx = serde_json::json!({"TransactionType": "Payment"});
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let strand = build_flow_strand(
+            &ctx,
+            &[
+                serde_json::json!("47803035"),
+                serde_json::json!({"currency": "BBB", "issuer": ISS, "value": "277.99"}),
+                serde_json::json!({"currency": "CCC", "issuer": ISS, "value": "359.99705"}),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            book_tip_quality(&ctx, &strand.hops[0].inverse_book),
+            Some(0x5A06_1BF6_885D_7CDF)
+        );
+        let requested = leg_to_number(
+            &Leg::parse(&serde_json::json!({
+                "currency": "CCC", "issuer": ISS, "value": "359.99705"
+            }))
+            .unwrap(),
+        );
+        let pass = execute_strand_pass(
+            &mut ctx,
+            &taker,
+            &mut taker_acct,
+            &taker,
+            &strand,
+            &Number::from_int(47_803_035),
+            &requested,
+            &mut AmmContext::new(false),
+            false,
+            false,
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(pass.in_amt.to_xrp_drops(), 47_803_035);
+        assert_eq!(
+            pass.out_amt.to_iou().to_decimal_string(),
+            "359.9970426831127"
+        );
+        let second: Value = serde_json::from_slice(
+            &ctx.view
+                .read(&keylet::offer(&decode_account_id(O3).unwrap(), 1))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(second["TakerPays"]["value"], "0.000005650106");
+        assert_eq!(second["TakerGets"]["value"], "0.0000073168873");
     }
 
     #[test]
