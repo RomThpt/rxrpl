@@ -46,9 +46,12 @@ rxrpl replay-segment \
 `PARENT + 1` must equal `START`. It emits one JSON object for every ledger in
 the exact inclusive range `START..=END`, followed by one summary object. Logs
 and diagnostics must stay on stderr so consumers can parse stdout as JSON Lines.
-`--output-state` is optional; it atomically writes the last faithful state as an
-XSCP checkpoint. If replay stops on a divergence, that checkpoint is the exact
-parent, never the divergent child.
+`--output-state` is optional; it atomically writes the last state reached as an
+XSCP checkpoint. The worker stops on state, drops, or failed-transaction
+divergence, but can continue after a transaction or ledger hash mismatch.
+`--compact` omits transaction metadata on ledgers whose three hashes and drops
+match; it retains metadata on divergent ledgers. A zero exit code only means
+the command ran: verify all four match flags and `failed == 0` for every ledger.
 
 ## Protocol conventions
 
