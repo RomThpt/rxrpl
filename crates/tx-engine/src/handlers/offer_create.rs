@@ -1754,7 +1754,18 @@ fn cross_offers(
             if reject_quality(dir_quality, clob_threshold) {
                 break 'walk;
             }
-            let avail_out = leg_min(&offer_out, &funds);
+            // BookStep first caps the owner's gross IOU debit to its funds,
+            // then divides by the output transfer rate to find the net offer
+            // output. Comparing the offer directly with gross funds can debit
+            // more than the maker holds when the issuer charges a transfer fee
+            // (105503215/CB282698).
+            let output_rate =
+                if offer_out.is_xrp || owner == offer_out.issuer || taker == &offer_out.issuer {
+                    1_000_000_000
+                } else {
+                    transfer_rate_value(ctx, &offer_out.issuer)
+                };
+            let avail_out = leg_min(&offer_out, &net_book_payment_input(&funds, output_rate));
             // flowCross cannot spend more than the source `sendMax` captured
             // before the walk. Decrement that shared budget after every fill;
             // the unspent offer remainder stays based on the original amount and
@@ -7842,6 +7853,29 @@ fn pay_out(
             &gross.negate(),
             round,
         )?;
+        // FlowCross settles the maker's IOU debit through rippleCredit. A
+        // default trust line drained by that debit is deleted before the
+        // exhausted offer is reaped, releasing both owner reserves.
+        let owner_key = keylet::account(owner);
+        let owner_bytes = ctx
+            .view
+            .read(&owner_key)
+            .ok_or(TransactionResult::TefInternal)?;
+        let mut owner_acct: Value =
+            serde_json::from_slice(&owner_bytes).map_err(|_| TransactionResult::TefInternal)?;
+        if crate::handlers::trust_set::maybe_delete_drained_trust_line(
+            ctx,
+            owner,
+            &mut owner_acct,
+            &amount.issuer,
+            &amount.currency,
+        )? {
+            let owner_data =
+                serde_json::to_vec(&owner_acct).map_err(|_| TransactionResult::TefInternal)?;
+            ctx.view
+                .update(owner_key, owner_data)
+                .map_err(|_| TransactionResult::TefInternal)?;
+        }
     }
     // FlowCross settles the taker's output through rippleCredit, which creates
     // a zero-limit trust line on demand when this is the first delivery of the
@@ -10414,6 +10448,35 @@ mod taker_crossing_tests {
             &available,
             &xrp(6_550_072),
         ));
+    }
+
+    #[test]
+    fn ledger_105503215_output_fee_caps_maker_funds() {
+        // CB282698: a 1.0001 SOLO transfer rate leaves less than the maker's
+        // gross 647.151311454168 balance available to the taker. Flow consumes
+        // the full line, pays 8,773,980 drops, and deletes the unfunded offer
+        // with these nonzero residual fields.
+        let offer_out = iou("647.151311454168");
+        let offer_in = xrp(8_774_858);
+        let net_available = net_book_payment_input(&offer_out, 1_000_100_000);
+        assert_eq!(net_available.iou.to_decimal_string(), "647.0866027938886");
+        assert_eq!(
+            super::grossed(
+                &net_available.iou,
+                &IOUAmount::from_decimal_string("1.0001").unwrap(),
+            ),
+            offer_out.iou,
+        );
+        let quality = from_rate(0x5904_D133_DE36_2968).unwrap();
+        let spent = in_for_out_round(&net_available, &quality, &offer_in, false);
+        assert_eq!(spent.drops, 8_773_980);
+        assert_eq!(
+            leftover_leg(&offer_out, &net_available, true)
+                .iou
+                .to_decimal_string(),
+            "0.0647086602794"
+        );
+        assert_eq!(leftover_leg(&offer_in, &spent, true).drops, 878);
     }
 
     #[test]
