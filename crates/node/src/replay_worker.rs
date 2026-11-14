@@ -494,7 +494,7 @@ where
 {
     validate_range(checkpoint, start, end)?;
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(1 << 20, file);
     let state = seed_state_from_reader(&mut reader, checkpoint)?;
     replay_segment_with_seeded_state(state, ledger_packs, checkpoint, start, end, emit)
 }

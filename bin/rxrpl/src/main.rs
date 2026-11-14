@@ -629,7 +629,7 @@ fn cmd_replay_segment(
     if let Some(path) = output_state {
         let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
         let file = std::fs::File::create(&tmp_path)?;
-        let mut writer = std::io::BufWriter::new(file);
+        let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
         let count = rxrpl_node::replay_worker::write_state_pack(
             &mut writer,
             u64::from(resume_ledger.header.sequence),
