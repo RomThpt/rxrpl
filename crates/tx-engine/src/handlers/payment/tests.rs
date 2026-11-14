@@ -13,6 +13,15 @@ const DST_ADDRESS: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
 
 #[test]
 fn ledger_105503019_xrp_to_iou_path_consumes_exact_first_offer() {
+    run_ledger_105503019_xrp_to_iou_path(false);
+}
+
+#[test]
+fn two_hop_partial_payment_with_zero_receive_capacity_is_path_dry() {
+    run_ledger_105503019_xrp_to_iou_path(true);
+}
+
+fn run_ledger_105503019_xrp_to_iou_path(zero_receive_capacity: bool) {
     const SOURCE: &str = "rapido5rxPmP4YkMZZEeXSHqWefxHEkqv6";
     const ISSUER: &str = "rKiCet8SdvWxPXnAgYarFUXMh1zCPz432Y";
     const FIRST_MAKER: &str = "rEepZ4ok2UWuvBedU54XjfjxeiePexxEsq";
@@ -45,8 +54,14 @@ fn ledger_105503019_xrp_to_iou_path_consumes_exact_first_offer() {
         let line = serde_json::json!({
             "LedgerEntryType": "RippleState", "Flags": 1114112,
             "Balance": iou(currency, ISSUER, &stored.to_decimal_string()),
-            "LowLimit": iou(currency, low, "1000000000"),
-            "HighLimit": iou(currency, high, "1000000000"),
+            "LowLimit": iou(currency, low,
+                if zero_receive_capacity && holder == SOURCE && currency == "XLM" && holder_low {
+                    "0"
+                } else { "1000000000" }),
+            "HighLimit": iou(currency, high,
+                if zero_receive_capacity && holder == SOURCE && currency == "XLM" && !holder_low {
+                    "0"
+                } else { "1000000000" }),
         });
         ledger
             .put_state(
@@ -136,10 +151,13 @@ fn ledger_105503019_xrp_to_iou_path_consumes_exact_first_offer() {
         rules: &rules,
         fees: &fees,
     };
-    assert_eq!(
-        PaymentTransactor.apply(&mut ctx),
-        Ok(TransactionResult::TesSuccess)
-    );
+    let result = PaymentTransactor.apply(&mut ctx);
+    if zero_receive_capacity {
+        assert_eq!(result, Err(TransactionResult::TecPathDry));
+        assert_eq!(sandbox.take_delivered_amount(), None);
+        return;
+    }
+    assert_eq!(result, Ok(TransactionResult::TesSuccess));
     assert_eq!(sandbox.take_delivered_amount(), None);
     assert!(sandbox.read(&first_offer).is_none());
     let line_balance = |holder: &str, currency: &str| {

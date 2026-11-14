@@ -2274,6 +2274,7 @@ fn apply_paths_payment_multi(
         return Err(
             if helpers::get_flags(ctx.tx) & rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT != 0
                 && ctx.tx.get("DeliverMin").is_some()
+                && !flow_deliver_req.is_zero()
                 && strands.len() == 1
                 && strands[0].is_two_hop_clob_path()
                 && !amount.is_string()
