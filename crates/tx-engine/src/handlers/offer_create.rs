@@ -1317,6 +1317,7 @@ fn cross_offers(
     // remainder, rather than repeated rounded subtraction (105502845/TX16).
     let mut direct_outputs = Vec::new();
     let mut direct_amm_used = false;
+    let mut direct_fib_pass_used = false;
     let mut remaining_in = in_leg.clone();
     let mut source_remaining = source_budget.clone();
     // The source DirectStep settles one aggregate input for a CLOB pass. Keep
@@ -1576,7 +1577,7 @@ fn cross_offers(
                 let multi_path = offer_crossing_strand_reaches_limit_with_amm_mode(
                     ctx, taker, taker_gets, taker_pays, threshold, true,
                 );
-                try_bridge_step(
+                let _ = try_bridge_step(
                     ctx,
                     taker,
                     taker_acct,
@@ -2096,12 +2097,13 @@ fn cross_offers(
     // rather than gating it on whether any CLOB crossed, so this is NOT `!crossed`
     // gated: a single crossed CLOB offer must not suppress better AMM liquidity.
     if !remaining_out.is_zero() && !remaining_in.is_zero() {
+        let mut direct_flow_pass = false;
         if let Some(b) = &bridge {
             let source_before_bridge = source_remaining.clone();
             let multi_path = offer_crossing_strand_reaches_limit_with_amm_mode(
                 ctx, taker, taker_gets, taker_pays, threshold, true,
             );
-            try_bridge_step(
+            let bridge_handoff = try_bridge_step(
                 ctx,
                 taker,
                 taker_acct,
@@ -2117,12 +2119,37 @@ fn cross_offers(
                 is_sell,
             )?;
             non_clob_source_spent |= leg_gt(&source_before_bridge, &source_remaining);
+            if let Some(mut amm_ctx) = bridge_handoff {
+                let source_before_direct = source_remaining.clone();
+                direct_fib_pass_used = try_direct_flow_amm_pass(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    taker_gets,
+                    taker_pays,
+                    &in_leg,
+                    &out_leg,
+                    &mut remaining_out,
+                    &mut remaining_in,
+                    &mut source_remaining,
+                    &mut crossed,
+                    threshold,
+                    is_sell,
+                    &mut amm_ctx,
+                )?;
+                non_clob_source_spent |= leg_gt(&source_before_direct, &source_remaining);
+                direct_flow_pass = true;
+            }
         }
         // BookStep retries AMM with no CLOB quality only when the book was
         // empty at the start of this pass. Reaping a self-owned tip with no
         // fill ends that pass dry; it must not reopen the AMM at the looser
         // taker limit (105501188).
-        if !domain_only && terminal_amm_allowed && (!reaped_self_offer || crossed) {
+        if !direct_flow_pass
+            && !domain_only
+            && terminal_amm_allowed
+            && (!reaped_self_offer || crossed)
+        {
             let source_before_amm = source_remaining.clone();
             let _ = try_amm_step(
                 ctx,
@@ -2154,6 +2181,14 @@ fn cross_offers(
                 )?;
             }
         }
+    }
+
+    if direct_fib_pass_used && let Some(source) = source_balance.as_ref() {
+        // Flow's source DirectStep settles the aggregate strand input. Applying
+        // the bridge and direct AMM debits separately can shift the source
+        // trust line by one IOU ULP (105503523 / 27E2ED6D).
+        let spent = leg_to_number(&in_leg).sub(&leg_to_number(&remaining_in));
+        reconcile_flow_source_balance(ctx, source, &spent);
     }
 
     if clob_source_spent.len() > 1
@@ -2428,6 +2463,22 @@ fn try_amm_step(
     // liquidity source. The AMM may contribute a partial step that combines
     // with CLOB liquidity; the exact-side check in the transactor either keeps
     // the complete aggregate fill or rolls every step back with tecKILLED.
+    let strict_tail_quality = !cap_ending_spot_price
+        && ctx
+            .tx
+            .get("TakerGets")
+            .and_then(Leg::parse)
+            .is_some_and(|leg| {
+                !leg.is_xrp && transfer_rate_value(ctx, &leg.issuer) == 1_000_000_000
+            })
+        && ctx
+            .tx
+            .get("TakerPays")
+            .and_then(Leg::parse)
+            .is_some_and(|leg| {
+                !leg.is_xrp && transfer_rate_value(ctx, &leg.issuer) == 1_000_000_000
+            });
+    let tail_snapshot = strict_tail_quality.then(|| (ctx.view.checkpoint(), taker_acct.clone()));
     if let Some((delivered, spent)) = amm_hop(
         ctx,
         taker,
@@ -2445,6 +2496,24 @@ fn try_amm_step(
         cap_ending_spot_price,
         /*waive_output_transfer_fee=*/ true,
     )? {
+        if strict_tail_quality {
+            // The final spot-price cap can quote an integral IOU fragment whose
+            // realised input/output rate is just worse than the offer limit.
+            // Flow discards that entire pass (105503523 / 4061C8DC).
+            let realised = quality_threshold(
+                &leg_as_quality_iou(&spent),
+                &delivered,
+                ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+                false,
+            );
+            if reject_quality(realised, cq) {
+                if let Some((cp, account_before)) = tail_snapshot {
+                    ctx.view.rollback(cp);
+                    *taker_acct = account_before;
+                }
+                return Ok((true, None));
+            }
+        }
         // A tfSell fill can deliver more than the remaining TakerPays demand;
         // clamp the demand at zero rather than underflowing the drops/mantissa.
         *remaining_out = if is_sell && leg_ge(&delivered, remaining_out) {
@@ -2516,7 +2585,7 @@ fn try_bridge_step(
     crossed: &mut bool,
     cq: u64,
     is_sell: bool,
-) -> Result<(), TransactionResult> {
+) -> Result<Option<AmmContext>, TransactionResult> {
     // Flow evaluates the strand quality limit and its AMM amounts using the
     // transaction's Number precision. The 16-digit scale applies until the
     // vault or lending amendments enable the larger mantissa.
@@ -2548,7 +2617,7 @@ fn try_bridge_step(
         .map(|rate| Number::from_iou(&rate));
     if !matches!((bridge_bound, bridge_limit), (Some(bound), Some(limit)) if num_le(&bound, &limit))
     {
-        return Ok(());
+        return Ok(None);
     }
 
     // One Flow strand execution is an atomic candidate. rippled walks all of
@@ -2566,6 +2635,7 @@ fn try_bridge_step(
     let mut pass_outs = Vec::new();
     let mut bridge_reaps = Vec::new();
     let mut quality_adjusted = false;
+    let mut handoff_to_direct = false;
     let mut demand = if is_sell {
         unbounded_leg(out_leg)
     } else {
@@ -2633,6 +2703,25 @@ fn try_bridge_step(
             };
         }
         amm_ctx.update();
+        // Flow ranks both strands again after each pass. A direct AMM Fibonacci
+        // offer can outrank the next bridge book band (105503523 / 27E2ED6D).
+        if cq == threshold
+            && let Some(direct) = build_flow_strand(
+                ctx,
+                &[ctx.tx["TakerGets"].clone(), ctx.tx["TakerPays"].clone()],
+            )
+            && direct.terminal_has_amm()
+            && let (Some(direct_q), Some(bridge_q), Some(limit_q)) = (
+                strand_quality_ub(ctx, &direct, taker, &amm_ctx),
+                strand_quality_ub(ctx, bridge, taker, &amm_ctx),
+                bridge_limit.as_ref(),
+            )
+            && num_le(&direct_q, &bridge_q)
+            && num_le(&direct_q, limit_q)
+        {
+            handoff_to_direct = true;
+            break;
+        }
         if pass_quality_adjusted {
             break;
         }
@@ -2641,7 +2730,7 @@ fn try_bridge_step(
     if pass_ins.is_empty() {
         ctx.view.rollback(cp);
         *taker_acct = taker_acct_before;
-        return Ok(());
+        return Ok(None);
     }
     let total_in = sum_smallest_to_largest(&pass_ins);
     let total_out = sum_smallest_to_largest(&pass_outs);
@@ -2658,7 +2747,7 @@ fn try_bridge_step(
     {
         ctx.view.rollback(cp);
         *taker_acct = taker_acct_before;
-        return Ok(());
+        return Ok(None);
     }
 
     let spent = leg_from_magnitude(&total_in.to_iou(), in_leg);
@@ -2672,7 +2761,92 @@ fn try_bridge_step(
         leftover_leg(remaining_out, &delivered, number_switchover)
     };
     *crossed = true;
-    Ok(())
+    Ok(handoff_to_direct.then_some(amm_ctx))
+}
+
+/// Execute the direct strand's next AMM Fibonacci offer after the bridge yields
+/// to it. The regular terminal AMM swap spans a larger spot-price interval and
+/// over-delivers when both strands remain active (105503523 / 27E2ED6D).
+#[allow(clippy::too_many_arguments)]
+fn try_direct_flow_amm_pass(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    taker_gets: &Value,
+    taker_pays: &Value,
+    in_leg: &Leg,
+    out_leg: &Leg,
+    remaining_out: &mut Leg,
+    remaining_in: &mut Leg,
+    source_remaining: &mut Leg,
+    crossed: &mut bool,
+    threshold: u64,
+    is_sell: bool,
+    amm_ctx: &mut AmmContext,
+) -> Result<bool, TransactionResult> {
+    let Some(direct) = build_flow_strand(ctx, &[taker_gets.clone(), taker_pays.clone()]) else {
+        return Ok(false);
+    };
+    let budget = leg_min(remaining_in, source_remaining);
+    if budget.is_zero() || (!is_sell && remaining_out.is_zero()) {
+        return Ok(false);
+    }
+    let demand = if is_sell {
+        unbounded_leg(out_leg)
+    } else {
+        remaining_out.clone()
+    };
+    let cp = ctx.view.checkpoint();
+    let taker_acct_before = taker_acct.clone();
+    let mut reaps = Vec::new();
+    amm_ctx.set_multi_path(true);
+    amm_ctx.clear();
+    let pass = execute_strand_pass(
+        ctx,
+        taker,
+        taker_acct,
+        taker,
+        &direct,
+        &leg_to_number(&budget),
+        &leg_to_number(&demand),
+        amm_ctx,
+        /*offer_create_bridge=*/ true,
+        /*source_funds_limited=*/ false,
+        Some(threshold),
+        &mut reaps,
+    );
+    let Some(pass) = pass else {
+        ctx.view.rollback(cp);
+        *taker_acct = taker_acct_before;
+        return Ok(false);
+    };
+    if pass.in_amt.is_zero() || pass.out_amt.is_zero() || pass.offers_used != 0 {
+        ctx.view.rollback(cp);
+        *taker_acct = taker_acct_before;
+        return Ok(false);
+    }
+    let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+    let limit_rate =
+        Number::from_iou(&from_rate(threshold).map_err(|_| TransactionResult::TefInternal)?);
+    let realised_rate = pass.in_amt.div(&pass.out_amt);
+    if num_gt(&realised_rate, &limit_rate) {
+        ctx.view.rollback(cp);
+        *taker_acct = taker_acct_before;
+        return Ok(false);
+    }
+
+    let spent = leg_from_magnitude(&pass.in_amt.to_iou(), in_leg);
+    let delivered = leg_from_magnitude(&pass.out_amt.to_iou(), out_leg);
+    *remaining_in = leftover_leg(remaining_in, &spent, number_switchover);
+    *source_remaining = leftover_leg(source_remaining, &spent, number_switchover);
+    *remaining_out = if leg_ge(&delivered, remaining_out) {
+        leg_sub(remaining_out, remaining_out)
+    } else {
+        leftover_leg(remaining_out, &delivered, number_switchover)
+    };
+    *crossed = true;
+    amm_ctx.update();
+    Ok(true)
 }
 
 fn bridge_adjusted_pass_meets_limit(
