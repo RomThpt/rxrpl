@@ -3568,9 +3568,24 @@ fn cross_book_hop_with_reaps(
                 // Terminal hops: BookStep ceils IOU input (`Quality::ceilOutStrict`)
                 // after limiting the offer itself with `roundUp=false`; the
                 // transfer-rate gross-up happens later in `step_in`. XRP
-                // TakerPays stays proportional: ceiling it over-spent 2127
-                // drops on 30000046/63B72EB4.
-                let order_in = if terminal && !offer_in.is_xrp {
+                // TakerPays normally stays proportional: ceiling it over-spent
+                // 2127 drops on 30000046/63B72EB4.
+                let order_in = if skip_input_debit
+                    && !skip_output_credit
+                    && offer_in.is_xrp
+                    && ctx.tx.get("TransactionType").and_then(Value::as_str) == Some("OfferCreate")
+                {
+                    // The last XRP bridge book prices a funded maker's XRP
+                    // input at its fixed directory quality, even when the
+                    // offer's current fields have drifted (105503833).
+                    leg_min(
+                        &leg_min(
+                            &in_for_out_round(&take_out, &eff_rate, &offer_in, false),
+                            &offer_in,
+                        ),
+                        &net_remaining_in,
+                    )
+                } else if terminal && !offer_in.is_xrp {
                     leg_min(
                         &leg_min(
                             &in_for_out_round(&take_out, &eff_rate, &offer_in, false),
