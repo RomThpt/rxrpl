@@ -332,6 +332,34 @@ impl SandboxChanges {
         tx_id_hex: &str,
         ledger_seq: u32,
     ) -> HashMap<Hash256, (serde_json::Value, serde_json::Value)> {
+        // A payment may restore a trust line, and offer replacement may restore
+        // directory pages, within one transaction. Stamping those entries would
+        // create spurious modified nodes (105503524, 105503615). Keep unchanged
+        // AccountRoots: newly created objects still thread their owners.
+        let originals = &self.originals;
+        self.updates.retain(|key, data| {
+            let Some(original) = originals.get(key) else {
+                return true;
+            };
+            let Ok(before) = serde_json::from_slice::<serde_json::Value>(original) else {
+                return true;
+            };
+            if !matches!(
+                before
+                    .get("LedgerEntryType")
+                    .and_then(serde_json::Value::as_str),
+                Some("RippleState" | "DirectoryNode")
+            ) {
+                return true;
+            }
+            if original == data {
+                return false;
+            }
+            match serde_json::from_slice::<serde_json::Value>(data) {
+                Ok(after) => before != after,
+                _ => true,
+            }
+        });
         // rippled records a modified node's node-level PreviousTxnID as the
         // value the SLE carried BEFORE this tx threaded it
         // (`ApplyStateTable::threadItem` -> `SLE::thread`). A directory emptied
@@ -517,6 +545,87 @@ mod tests {
         let mut sandbox = Sandbox::new(&view);
         sandbox.update(key, vec![2]).unwrap();
         assert_eq!(sandbox.read(&key), Some(vec![2]));
+    }
+
+    #[test]
+    fn net_zero_trust_line_is_not_threaded_or_reported() {
+        let key = Hash256::new([0xAD; 32]);
+        let mut changes = SandboxChanges {
+            inserts: HashMap::new(),
+            updates: HashMap::new(),
+            deletes: HashMap::new(),
+            originals: HashMap::new(),
+            destroyed_drops: 0,
+        };
+        changes.originals.insert(
+            key,
+            br#"{"LedgerEntryType":"RippleState","Balance":{"value":"0"},"PreviousTxnID":"OLD","PreviousTxnLgrSeq":7}"#.to_vec(),
+        );
+        changes.updates.insert(
+            key,
+            br#"{"PreviousTxnLgrSeq":7,"PreviousTxnID":"OLD","Balance":{"value":"0"},"LedgerEntryType":"RippleState"}"#.to_vec(),
+        );
+
+        let previous = changes.stamp_previous_txn("NEW", 105503524);
+        assert!(previous.is_empty());
+        assert!(changes.updates.is_empty());
+        assert!(
+            changes
+                .build_metadata(73, 0, &previous, None, None)
+                .affected_nodes
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn restored_directory_page_is_not_threaded_or_reported() {
+        let key = Hash256::new([0xAF; 32]);
+        let mut changes = SandboxChanges {
+            inserts: HashMap::new(),
+            updates: HashMap::new(),
+            deletes: HashMap::new(),
+            originals: HashMap::new(),
+            destroyed_drops: 0,
+        };
+        let original = br#"{"LedgerEntryType":"DirectoryNode","Indexes":["A"],"PreviousTxnID":"OLD","PreviousTxnLgrSeq":7}"#.to_vec();
+        changes.originals.insert(key, original.clone());
+        changes.updates.insert(key, original);
+
+        let previous = changes.stamp_previous_txn("NEW", 105503615);
+        assert!(previous.is_empty());
+        assert!(changes.updates.is_empty());
+        assert!(
+            changes
+                .build_metadata(95, 0, &previous, None, None)
+                .affected_nodes
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unchanged_trust_line_owner_is_still_threaded() {
+        let key = Hash256::new([0xAE; 32]);
+        let mut changes = SandboxChanges {
+            inserts: HashMap::new(),
+            updates: HashMap::new(),
+            deletes: HashMap::new(),
+            originals: HashMap::new(),
+            destroyed_drops: 0,
+        };
+        let account = br#"{"LedgerEntryType":"AccountRoot","Balance":"100","PreviousTxnID":"OLD","PreviousTxnLgrSeq":7}"#.to_vec();
+        changes.originals.insert(key, account.clone());
+        changes.updates.insert(key, account);
+
+        let previous = changes.stamp_previous_txn("NEW", 105503525);
+        assert!(changes.updates.contains_key(&key));
+        assert_eq!(previous[&key].0, "OLD");
+        assert_eq!(
+            changes
+                .build_metadata(47, 0, &previous, None, None)
+                .affected_nodes
+                .len(),
+            1
+        );
     }
 
     #[test]
