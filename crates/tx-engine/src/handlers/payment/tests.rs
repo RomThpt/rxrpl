@@ -235,6 +235,17 @@ fn run_ledger_105504154_direct_steps(block_first_direct: bool) {
         "5.098404955259634"
     );
     assert_eq!(line_balance(SOURCE, XLM_ISSUER, "XLM"), "10.78981966663491");
+    let tail_key: rxrpl_primitives::Hash256 =
+        "CCEBD90BBBB0A315CB9B21F885B7A9B6ECC3E1D58F02CD27101D14C7C0A5B8D6"
+            .parse()
+            .unwrap();
+    let tail: Value = serde_json::from_slice(&sandbox.read(&tail_key).unwrap()).unwrap();
+    assert_eq!(
+        line_balance(XLM_MAKER, XLM_ISSUER, "XLM"),
+        "10712.18907155572"
+    );
+    assert_eq!(tail["TakerGets"]["value"], "886.210180333365");
+    assert_eq!(tail["TakerPays"]["value"], "167.6275418202364");
     assert_eq!(sandbox.take_delivered_amount(), None);
 }
 

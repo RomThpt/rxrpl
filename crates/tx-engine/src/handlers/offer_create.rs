@@ -1,4 +1,5 @@
 use rxrpl_amendment::feature::feature_id;
+use rxrpl_amount::number::RoundingMode;
 use rxrpl_amount::{
     IOUAmount, from_rate, get_rate, offer_quality, offer_quality_round_even, round_quality,
 };
@@ -988,6 +989,7 @@ enum BalanceRounding {
     Legacy,
     Nearest,
     HalfUpward,
+    DebitOwner,
 }
 
 fn amm_pool_debit_rounding(intermediate_output: bool) -> BalanceRounding {
@@ -1129,6 +1131,18 @@ fn credit_line_with_rounding(
         BalanceRounding::Legacy => add_iou_balance(&balance, &delta, false),
         BalanceRounding::Nearest => add_iou_balance(&balance, &delta, true),
         BalanceRounding::HalfUpward => add_iou_balance_half_upward(&balance, &delta),
+        BalanceRounding::DebitOwner => {
+            use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode};
+            let direction = if holder_is_high {
+                RoundingMode::Upward
+            } else {
+                RoundingMode::Downward
+            };
+            let _round = RoundModeGuard::new(direction);
+            Ok(Number::from_iou(&balance)
+                .add(&Number::from_iou(&delta))
+                .to_iou())
+        }
     }
     .map_err(|_| TransactionResult::TefInternal)?;
     // A one-drop offer can price its IOU input below the trust line's ULP.
@@ -3105,6 +3119,37 @@ fn cross_book_hop(
         source_input_rate,
         source_funds_limited,
         None,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cross_book_hop_direct_tail(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    demand_out: &Leg,
+    budget_in: &Leg,
+) -> Result<(Leg, Leg), TransactionResult> {
+    cross_book_hop_with_reaps(
+        ctx,
+        taker,
+        taker_acct,
+        dest,
+        demand_out,
+        budget_in,
+        true,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        1_000_000_000,
+        false,
+        None,
+        true,
     )
 }
 
@@ -3130,6 +3175,7 @@ fn cross_book_hop_with_reaps(
     source_input_rate: u32,
     source_funds_limited: bool,
     mut permanent_reaps: Option<&mut Vec<PermanentOffer>>,
+    reverse_direct_tail: bool,
 ) -> Result<(Leg, Leg), TransactionResult> {
     let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
     let inverse_book = keylet::book_dir(
@@ -3721,6 +3767,11 @@ fn cross_book_hop_with_reaps(
             } else {
                 BalanceRounding::Legacy
             };
+            let owner_rounding = if reverse_direct_tail {
+                BalanceRounding::DebitOwner
+            } else {
+                balance_rounding
+            };
             let fee_rounding = book_output_fee_rounding(budget_binds, skip_output_credit);
             let net_out = pay_out_gross(
                 ctx,
@@ -3730,7 +3781,7 @@ fn cross_book_hop_with_reaps(
                 dest,
                 &order_out,
                 number_switchover,
-                balance_rounding,
+                owner_rounding,
                 balance_rounding,
                 skip_output_credit,
                 fee_rounding,
@@ -3765,7 +3816,11 @@ fn cross_book_hop_with_reaps(
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
             } else {
                 let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
-                let mut new_gets = leftover_leg(&offer_out, &order_out, number_switchover);
+                let mut new_gets = if reverse_direct_tail {
+                    leg_sub_directional(&offer_out, &order_out, RoundingMode::Downward)
+                } else {
+                    leftover_leg(&offer_out, &order_out, number_switchover)
+                };
                 // Last-hop input-limited: `out_for_in` floors 1 ULP below the
                 // consumed Gets (30000066 33FB4822 leftover `…6341` vs `…634`).
                 // Apply that correction only while the hop remains partial. If
@@ -3788,7 +3843,11 @@ fn cross_book_hop_with_reaps(
                         new_gets.iou = trimmed;
                     }
                 }
-                let new_pays = leftover_leg(&offer_in, &order_in, number_switchover);
+                let new_pays = if reverse_direct_tail {
+                    leg_sub_directional(&offer_in, &order_in, RoundingMode::Upward)
+                } else {
+                    leftover_leg(&offer_in, &order_in, number_switchover)
+                };
                 let mut reduced = offer.clone();
                 reduced["TakerGets"] = new_gets.with_amount(&new_gets.iou, new_gets.drops);
                 reduced["TakerPays"] = new_pays.with_amount(&new_pays.iou, new_pays.drops);
@@ -4786,24 +4845,42 @@ pub(crate) fn cross_book_direct_path(
     let second_carry = second_step.forward(ctx, first_carry)?;
     let mut last_budget = last_in.clone();
     last_budget.iou = second_carry;
-    let (delivered, spent_last) = cross_book_hop(
-        ctx,
-        taker,
-        taker_acct,
-        dest,
-        &last_out,
-        &last_budget,
-        true,
-        false,
-        false,
-        false,
-        None,
-        false,
-        false,
-        1_000_000_000,
-        false,
-    )?;
-    if delivered.is_zero() || !legs_eq_or_one_ulp(&spent_last, &last_budget) {
+    let source_limited =
+        !leg_ge(&got_first, &first_demand) || spent_first.drops >= source_budget.drops;
+    let (delivered, spent_last) = if source_limited {
+        cross_book_hop(
+            ctx,
+            taker,
+            taker_acct,
+            dest,
+            &last_out,
+            &last_budget,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+            1_000_000_000,
+            false,
+        )?
+    } else {
+        // StrandFlow keeps the reverse-priced terminal book when the source
+        // does not limit the strand. Reapply that quote after the direct carry.
+        cross_book_hop_direct_tail(
+            ctx,
+            taker,
+            taker_acct,
+            dest,
+            &last_out,
+            &unbounded_leg(&last_in),
+        )?
+    };
+    if delivered.is_zero()
+        || leg_gt(&spent_last, &last_budget)
+        || !legs_eq_or_one_ulp(&spent_last, &last_budget)
+    {
         return Err(TransactionResult::TecPathPartial);
     }
     Ok((
@@ -7178,6 +7255,7 @@ fn price_clob_band_reverse(
             /*source_input_rate=*/ 1_000_000_000,
             /*source_funds_limited=*/ false,
             Some(permanent_reaps),
+            false,
         )
         .ok();
         ctx.view.rollback(cp);
@@ -7211,6 +7289,7 @@ fn price_clob_band_reverse(
         /*source_input_rate=*/ 1_000_000_000,
         /*source_funds_limited=*/ false,
         Some(permanent_reaps),
+        false,
     );
     ctx.view.rollback(cp);
     *taker_acct = taker_acct_before;
@@ -8320,6 +8399,22 @@ fn leg_sub_round(a: &Leg, b: &Leg) -> Leg {
         out.drops = a.drops - b.drops;
     } else {
         out.iou = IOUAmount::add_round(&a.iou, &b.iou.negate()).unwrap_or(IOUAmount::ZERO);
+    }
+    out
+}
+
+/// A reverse-priced BookStep retains directional canonicalisation when it
+/// records the unconsumed sides of the resting offer.
+fn leg_sub_directional(a: &Leg, b: &Leg, mode: RoundingMode) -> Leg {
+    use rxrpl_amount::number::{Number, RoundModeGuard};
+    let mut out = a.clone();
+    if a.is_xrp {
+        out.drops = a.drops - b.drops;
+    } else {
+        let _round = RoundModeGuard::new(mode);
+        out.iou = Number::from_iou(&a.iou)
+            .sub(&Number::from_iou(&b.iou))
+            .to_iou();
     }
     out
 }
