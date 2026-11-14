@@ -19,6 +19,96 @@ fn u64_hex(n: u64) -> String {
 }
 
 #[cfg(test)]
+mod ledger_105504216_tests {
+    use super::*;
+    use crate::fees::FeeSettings;
+    use crate::view::ledger_view::LedgerView;
+    use crate::view::read_view::ReadView;
+    use crate::view::sandbox::Sandbox;
+    use rxrpl_amendment::Rules;
+    use rxrpl_ledger::Ledger;
+
+    #[test]
+    fn direct_amm_then_book_sell_preserves_final_input_ulp() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("offer_105504216_fixture.json")).unwrap();
+        let mut ledger = Ledger::genesis();
+        for (key, entry) in fixture["entries"].as_object().unwrap() {
+            ledger
+                .put_state(key.parse().unwrap(), serde_json::to_vec(entry).unwrap())
+                .unwrap();
+        }
+        let fees = FeeSettings {
+            base_fee: 10,
+            reserve_base: 1_000_000,
+            reserve_increment: 200_000,
+        };
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let amendments =
+            fixture["entries"]["7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4"]
+                ["Amendments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().parse::<Hash256>().unwrap());
+        let rules = Rules::from_enabled(amendments);
+        let tx = &fixture["tx"];
+        let taker = decode_account_id(tx["Account"].as_str().unwrap()).unwrap();
+        let taker_key = keylet::account(&taker);
+        let mut taker_acct = fixture["entries"][taker_key.to_string()].clone();
+        let input = Leg::parse(&tx["TakerGets"]).unwrap();
+        let output = Leg::parse(&tx["TakerPays"]).unwrap();
+        let book = keylet::book_dir(
+            &input.currency,
+            &input.issuer,
+            &output.currency,
+            &output.issuer,
+        );
+        let mut ctx = ApplyContext {
+            tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let (_, remaining_gets, crossed, _) = cross_offers(
+            &mut ctx,
+            &taker,
+            &mut taker_acct,
+            &tx["TakerPays"],
+            &tx["TakerGets"],
+            &book,
+            true,
+            false,
+            &input,
+            true,
+        )
+        .unwrap();
+        assert!(crossed);
+        assert!(Leg::parse(&remaining_gets).unwrap().is_zero());
+
+        let read_value = |key: &str| -> Value {
+            serde_json::from_slice(&sandbox.read(&key.parse().unwrap()).unwrap()).unwrap()
+        };
+        assert_eq!(
+            read_value("5D8356933D94445F18B28524D630D7EC46C1F6ED8FE4E4236B693FED5C3CE12C")["TakerPays"]
+                ["value"],
+            "3377300.70469152"
+        );
+        assert_eq!(
+            read_value("87E53FB83D74CCD09A8CE008BDA2FA4CCB8F2BA26B1EDF99547E715562F8305C")["Balance"]
+                ["value"],
+            "-113519487.1298968"
+        );
+        assert_eq!(
+            read_value("CBED18D17A90C6A827CC3B2FEC3FFBF2D11888A983357279B9670DD7EBE564FD")["Balance"]
+                ["value"],
+            "-0.00000001"
+        );
+    }
+}
+
+#[cfg(test)]
 mod ledger_105504157_tests {
     use super::*;
     use crate::fees::FeeSettings;
@@ -1840,7 +1930,6 @@ fn cross_offers(
             ));
         }
     };
-
     // Taker's quality limit in the inverse book = TakerGets / TakerPays.
     // The threshold must be computed with the SAME divide canonicalisation
     // used to store the offers' BookDirectory qualities (`offer_book_quality`):
@@ -1925,6 +2014,8 @@ fn cross_offers(
         None
     };
     let mut clob_source_spent = Vec::new();
+    let mut direct_amm_source_spent = Vec::new();
+    let mut aggregate_direct_source_exhausted = false;
     let mut clob_quality = None;
     let mut mixed_clob_quality = false;
     let mut non_clob_source_spent = false;
@@ -2197,7 +2288,7 @@ fn cross_offers(
             if !domain_only && !skip_amm_after_self_tip {
                 let before = remaining_out.clone();
                 let source_before_amm = source_remaining.clone();
-                let (mut continue_to_clob, amm_delivered) = try_amm_step(
+                let (mut continue_to_clob, amm_fill) = try_amm_step(
                     ctx,
                     taker,
                     taker_acct,
@@ -2210,10 +2301,13 @@ fn cross_offers(
                     is_sell,
                     /*cap_ending_spot_price=*/ true,
                 )?;
+                if let Some((_, spent)) = &amm_fill {
+                    direct_amm_source_spent.push(leg_to_number(spent));
+                }
                 if number_switchover
                     && bridge.is_none()
                     && !is_sell
-                    && let Some(delivered) = amm_delivered
+                    && let Some((delivered, _)) = amm_fill
                 {
                     direct_outputs.push(leg_to_number(&delivered));
                     direct_amm_used = true;
@@ -2391,8 +2485,33 @@ fn cross_offers(
             // The source budget includes the issuer's transfer fee. Price the
             // offer against the net amount that its owner will receive.
             let net_source_remaining = net_book_payment_input(&source_remaining, input_rate);
-            let net_spendable_in =
+            let mut net_spendable_in =
                 net_offer_input_budget(&remaining_in, &source_remaining, input_rate);
+            let mut aggregate_direct_source_budget_bound = false;
+            // Flow's direct source step accounts for the sum of its saved
+            // inputs. Repeatedly rounding the residual budget can leave an
+            // extra IOU ULP after AMM and book fragments share that source.
+            if is_sell
+                && number_switchover
+                && source_funds_limited
+                && bridge.is_none()
+                && input_rate == 1_000_000_000
+                && !direct_amm_source_spent.is_empty()
+            {
+                let spent = number_to_leg(
+                    &canonical_direct_source_input(&direct_amm_source_spent, &clob_source_spent),
+                    source_budget,
+                );
+                let aggregate_remaining = if leg_ge(&spent, source_budget) {
+                    number_to_leg(&Number::ZERO, source_budget)
+                } else {
+                    leftover_leg(source_budget, &spent, true)
+                };
+                if leg_gt(&net_spendable_in, &aggregate_remaining) {
+                    net_spendable_in = aggregate_remaining;
+                    aggregate_direct_source_budget_bound = true;
+                }
+            }
             if net_spendable_in.is_zero() {
                 break 'walk;
             }
@@ -2556,7 +2675,10 @@ fn cross_offers(
                     number_switchover,
                     PayInOptions {
                         skip_taker_debit: false,
-                        allow_dust_drain: source_funds_limited,
+                        // A canonical sendMax cap can leave a real ULP on
+                        // the live line; do not erase it as relative dust.
+                        allow_dust_drain: source_funds_limited
+                            && !aggregate_direct_source_budget_bound,
                         gross_override: None,
                     },
                 )?;
@@ -2680,6 +2802,12 @@ fn cross_offers(
             // offer and make a tfSell cross spend above its TakerGets ceiling.
             remaining_in = leftover_leg(&remaining_in, &order_in, number_switchover);
             source_remaining = leftover_leg(&source_remaining, &gross_in, number_switchover);
+            if aggregate_direct_source_budget_bound && leg_ge(&order_in, &net_spendable_in) {
+                // The saved-input sum has reached sendMax even if sequential
+                // subtraction still shows a representable residual.
+                remaining_in = number_to_leg(&Number::ZERO, &remaining_in);
+                aggregate_direct_source_exhausted = true;
+            }
             crossed = true;
             // Flow's sendMax was capped to the taker's actual funds. A partial
             // BookStep take that spends those funds stops this offer stream;
@@ -2764,7 +2892,7 @@ fn cross_offers(
             && (!reaped_self_offer || crossed)
         {
             let source_before_amm = source_remaining.clone();
-            let _ = try_amm_step(
+            let (_, amm_fill) = try_amm_step(
                 ctx,
                 taker,
                 taker_acct,
@@ -2777,6 +2905,9 @@ fn cross_offers(
                 is_sell,
                 /*cap_ending_spot_price=*/ false,
             )?;
+            if let Some((_, spent)) = amm_fill {
+                direct_amm_source_spent.push(leg_to_number(&spent));
+            }
             non_clob_source_spent |= leg_gt(&source_before_amm, &source_remaining);
             if terminal_amm_reaches_deferred_clob(
                 is_sell,
@@ -2825,6 +2956,24 @@ fn cross_offers(
             };
             reconcile_flow_source_balance(ctx, source, &source_debit);
         }
+    }
+
+    // A direct AMM fragment and later CLOB fills share the source DirectStep.
+    // Reconcile a budget exhausted by sequential debits from their canonical
+    // sum. When that sum itself capped the final take, keep the live line's
+    // representable residual from the actual per-pass debits.
+    if is_sell
+        && number_switchover
+        && source_funds_limited
+        && remaining_in.is_zero()
+        && !aggregate_direct_source_exhausted
+        && bridge.is_none()
+        && !direct_amm_source_spent.is_empty()
+        && !clob_source_spent.is_empty()
+        && let Some(source) = source_balance.as_ref()
+    {
+        let spent = canonical_direct_source_input(&direct_amm_source_spent, &clob_source_spent);
+        reconcile_flow_source_balance(ctx, source, &spent);
     }
 
     // A funds-capped tfSell can leave a one-ULP negative source balance after
@@ -3033,7 +3182,7 @@ fn try_amm_step(
     fok: bool,
     is_sell: bool,
     cap_ending_spot_price: bool,
-) -> Result<(bool, Option<Leg>), TransactionResult> {
+) -> Result<(bool, Option<(Leg, Leg)>), TransactionResult> {
     // rippled's flowCross limits the crossing input to the taker's funds
     // (`sendMax = min(takerAmount.in, accountFunds)`, OfferCreate.cpp:400): the
     // AMM swap would otherwise overdraw the taker (its sold-asset balance goes
@@ -3155,15 +3304,42 @@ fn try_amm_step(
         } else {
             spent.clone()
         };
-        *remaining_in = leg_sub(remaining_in, &net_spent);
-        *source_remaining = leg_sub(source_remaining, &spent);
+        // Flow carries the post-AMM input budget through Number subtraction
+        // once fixUniversalNumber is active. Truncating the AMM debit here can
+        // leave one extra IOU ULP for the next BookStep partial take.
+        let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
+        subtract_amm_input_budgets(
+            remaining_in,
+            source_remaining,
+            &net_spent,
+            &spent,
+            number_switchover,
+        );
         *crossed = true;
         return Ok((
             amm_step_allows_clob(is_sell, remaining_out),
-            Some(delivered),
+            Some((delivered, spent)),
         ));
     }
     Ok((!selected_zero_output, None))
+}
+
+fn subtract_amm_input_budgets(
+    remaining_in: &mut Leg,
+    source_remaining: &mut Leg,
+    net_spent: &Leg,
+    gross_spent: &Leg,
+    number_switchover: bool,
+) {
+    *remaining_in = leftover_leg(remaining_in, net_spent, number_switchover);
+    *source_remaining = leftover_leg(source_remaining, gross_spent, number_switchover);
+}
+
+fn canonical_direct_source_input(amm_inputs: &[Number], book_inputs: &[Number]) -> Number {
+    let mut inputs = Vec::with_capacity(amm_inputs.len() + book_inputs.len());
+    inputs.extend_from_slice(amm_inputs);
+    inputs.extend_from_slice(book_inputs);
+    Number::from_iou(&sum_smallest_to_largest(&inputs).to_iou())
 }
 
 fn amm_step_allows_clob(is_sell: bool, remaining_out: &Leg) -> bool {
@@ -11543,10 +11719,11 @@ mod taker_crossing_tests {
         add_iou_balance_half_upward, aggregate_flow_source_balance_number,
         aggregate_output_remainder, amm_pool_debit_rounding, amm_recipient_rounding,
         amm_step_allows_clob, book_destination_credit, book_payment_dust_drain,
-        book_step_input_exhausted, bridge_funded_xrp_input, clob_band_allows_terminal_amm,
-        composed_quality, consumes_full_offer, crossing_quality_threshold, crossing_threshold,
-        debit_drains_source, flow_first_book_spends_source_funds, flow_iou_to_iou, flow_iou_to_xrp,
-        flow_net_input, flow_source_funds_limit_binds, flow_xrp_to_iou, full_offer_take,
+        book_step_input_exhausted, bridge_funded_xrp_input, canonical_direct_source_input,
+        clob_band_allows_terminal_amm, composed_quality, consumes_full_offer,
+        crossing_quality_threshold, crossing_threshold, debit_drains_source,
+        flow_first_book_spends_source_funds, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input,
+        flow_source_funds_limit_binds, flow_xrp_to_iou, full_offer_take,
         funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
         in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
         leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
@@ -13108,6 +13285,58 @@ mod taker_crossing_tests {
 
         let charged = gross_book_payment_input(&net, &gross, 1_000_100_000, true);
         assert_eq!(charged.iou, gross.iou);
+    }
+
+    #[test]
+    fn ledger_105504216_amm_book_budget_rounds_before_final_sell_take() {
+        let starting_input = iou("24447779.49563729");
+        let amm_inputs =
+            ["1108899.236167675", "7109767.630200984"].map(|amount| leg_to_number(&iou(amount)));
+        let book_inputs = [
+            "136266.67320261",
+            "138173.61791939",
+            "99999",
+            "825309.4910591472",
+            "275202.99504814",
+        ]
+        .map(|amount| leg_to_number(&iou(amount)));
+        let prior_spent = canonical_direct_source_input(&amm_inputs, &book_inputs);
+        assert_eq!(
+            prior_spent.to_iou().to_decimal_string(),
+            "9693618.643597946"
+        );
+        let book_budget = leftover_leg(
+            &starting_input,
+            &number_to_leg(&prior_spent, &starting_input),
+            true,
+        );
+        assert_eq!(book_budget.iou.to_decimal_string(), "14754160.85203934");
+
+        let book_rate = from_rate(0x5309_C97E_BB59_228F).unwrap();
+        assert_eq!(
+            out_for_in(&book_budget, &book_rate, &xrp(658_172_055)).drops,
+            535_576_038
+        );
+        assert_eq!(
+            leftover_leg(&iou("18131461.55673086"), &book_budget, true)
+                .iou
+                .to_decimal_string(),
+            "3377300.70469152"
+        );
+        let maker_balance = IOUAmount::add_round(
+            &IOUAmount::from_decimal_string("-98765326.27785751").unwrap(),
+            &book_budget.iou.negate(),
+        )
+        .unwrap();
+        assert_eq!(maker_balance.to_decimal_string(), "-113519487.1298968");
+
+        // The live source line still held .35 before the final .34 debit.
+        let taker_balance = IOUAmount::add_round(
+            &IOUAmount::from_decimal_string("-14754160.85203935").unwrap(),
+            &book_budget.iou,
+        )
+        .unwrap();
+        assert_eq!(taker_balance.to_decimal_string(), "-0.00000001");
     }
 
     #[test]
