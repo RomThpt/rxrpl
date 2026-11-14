@@ -470,17 +470,14 @@ impl Transactor for PaymentTransactor {
                             .is_some_and(|paths| paths.len() == 1)
                         && flow_strands_have_amm(ctx.view, ctx.tx, send_max, &ctx.tx["Amount"]);
                     // A single explicit IOU -> IOU strand can still interleave
-                    // an AMM with a resting book at an interior hop. Flow must
-                    // select the AMM's better quality first, then forward its
-                    // residual into the partial CLOB fill (105503019/TX12).
+                    // an AMM with a resting book. Flow must choose the better
+                    // quality even when the implicit direct path is permitted
+                    // (105503019/TX12, 105503665/CBE4F785).
                     let single_iou_mixed_amm_strand = flow_strand_count == 1
                         && account_str == destination_str
                         && !send_max.is_string()
                         && !ctx.tx["Amount"].is_string()
                         && ctx.tx.get("DeliverMin").is_some()
-                        && helpers::get_flags(ctx.tx)
-                            & rxrpl_protocol::flags::payment::TF_NO_RIPPLE_DIRECT
-                            != 0
                         && ctx
                             .tx
                             .get("Paths")
