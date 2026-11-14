@@ -115,6 +115,28 @@ impl Transactor for SignerListSetTransactor {
             // The signer list carries lsfOneOwnerCount and counts as a single
             // owner-reserve item (MultiSignReserve, retired/permanent).
             let flags = LSF_ONE_OWNER_COUNT;
+            // The transaction preserves the submitted order, while the ledger
+            // entry stores signers in AccountID order (105504188).
+            let mut signer_entries: Vec<_> = ctx
+                .tx
+                .get("SignerEntries")
+                .and_then(Value::as_array)
+                .ok_or(TransactionResult::TemMalformed)?
+                .iter()
+                .map(|entry| {
+                    let account = entry
+                        .get("SignerEntry")
+                        .and_then(|signer| signer.get("Account"))
+                        .and_then(Value::as_str)
+                        .ok_or(TransactionResult::TemMalformed)?;
+                    let id =
+                        decode_account_id(account).map_err(|_| TransactionResult::TemMalformed)?;
+                    Ok((id, entry.clone()))
+                })
+                .collect::<Result<_, TransactionResult>>()?;
+            signer_entries.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+            let signer_entries: Vec<Value> =
+                signer_entries.into_iter().map(|(_, entry)| entry).collect();
             // rippled's writeSignersToSLE always sets sfSignerListID to the
             // default signer-list id (0); both sfSignerListID and sfOwnerNode are
             // SoeRequired and serialized onto the SLE.
@@ -122,7 +144,7 @@ impl Transactor for SignerListSetTransactor {
                 "LedgerEntryType": "SignerList",
                 "Owner": account_str,
                 "SignerQuorum": quorum,
-                "SignerEntries": ctx.tx.get("SignerEntries").cloned().unwrap_or(Value::Array(vec![])),
+                "SignerEntries": signer_entries,
                 "Flags": flags,
                 // SoeRequired, default signer-list id.
                 "SignerListID": 0u32,
@@ -177,5 +199,76 @@ impl Transactor for SignerListSetTransactor {
         }
 
         Ok(TransactionResult::TesSuccess)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fees::FeeSettings;
+    use crate::view::ledger_view::LedgerView;
+    use crate::view::read_view::ReadView;
+    use crate::view::sandbox::Sandbox;
+    use rxrpl_amendment::Rules;
+    use rxrpl_ledger::Ledger;
+
+    #[test]
+    fn signer_list_stores_oracle_account_order_without_reordering_transaction() {
+        const OWNER: &str = "raqKDKYkGCvqzoLbiH4hPc9yf3vppVfwWu";
+        const FIRST: &str = "rEsyRbvUpbwZ6WkBFs916uNKmj8LKLDHrg";
+        const SECOND: &str = "rGCMLFsMMKoEs6yopeLweEYjeC2uEm7zKd";
+        const THIRD: &str = "rHwqgN9zAZKKujtRcRj4BGL8iNdQJQD4cR";
+
+        let owner_id = decode_account_id(OWNER).unwrap();
+        let mut ledger = Ledger::genesis();
+        let account = serde_json::json!({
+            "LedgerEntryType": "AccountRoot",
+            "Account": OWNER,
+            "Balance": "100000000",
+            "Sequence": 1,
+            "OwnerCount": 0,
+            "Flags": 0,
+        });
+        ledger
+            .put_state(
+                keylet::account(&owner_id),
+                serde_json::to_vec(&account).unwrap(),
+            )
+            .unwrap();
+        let tx = serde_json::json!({
+            "TransactionType": "SignerListSet",
+            "Account": OWNER,
+            "SignerQuorum": 2,
+            "SignerEntries": [
+                {"SignerEntry": {"Account": SECOND, "SignerWeight": 1}},
+                {"SignerEntry": {"Account": FIRST, "SignerWeight": 1}},
+                {"SignerEntry": {"Account": THIRD, "SignerWeight": 1}},
+            ],
+        });
+        let rules = Rules::new();
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        assert_eq!(
+            SignerListSetTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+
+        let bytes = sandbox.read(&keylet::signer_list(&owner_id)).unwrap();
+        let list: Value = serde_json::from_slice(&bytes).unwrap();
+        let stored: Vec<_> = list["SignerEntries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["SignerEntry"]["Account"].as_str().unwrap())
+            .collect();
+        assert_eq!(stored, [FIRST, SECOND, THIRD]);
+        assert_eq!(tx["SignerEntries"][0]["SignerEntry"]["Account"], SECOND);
     }
 }
