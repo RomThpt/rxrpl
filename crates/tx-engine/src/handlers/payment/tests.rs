@@ -1268,6 +1268,46 @@ fn iou(currency: &str, issuer: &str, value: &str) -> serde_json::Value {
 }
 
 #[test]
+fn ledger_105503524_terminal_payment_requires_issuer_authorization_at_zero_balance() {
+    const USDV_ISSUER: &str = "rfffsukWALJB1PXYk7H8xkR6UJUDT8nMJE";
+    const DESTINATION: &str = "rGidge2jZYXk2vMy9yjEXyEx6JipQpaxek";
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, USDV_ISSUER, "100000000", None);
+    put_account(&mut ledger, DESTINATION, "100000000", None);
+    put_trust_line(&mut ledger, DESTINATION, USDV_ISSUER, "USDV", 0.0);
+
+    let issuer = decode_account_id(USDV_ISSUER).unwrap();
+    let destination = decode_account_id(DESTINATION).unwrap();
+    let amount = iou("USDV", USDV_ISSUER, "12.71097025458741");
+    let blocked = |ledger: &Ledger| {
+        let view = LedgerView::with_fees(ledger, FeeSettings::default());
+        terminal_direct_step_blocked(&view, &destination, &amount)
+    };
+    assert!(!blocked(&ledger));
+
+    let account_key = keylet::account(&issuer);
+    let mut account: Value =
+        serde_json::from_slice(ledger.get_state(&account_key).unwrap()).unwrap();
+    account["Flags"] = Value::from(0x0004_0000u64);
+    ledger
+        .put_state(account_key, serde_json::to_vec(&account).unwrap())
+        .unwrap();
+    assert!(blocked(&ledger));
+
+    let line_key = keylet::trust_line(&destination, &issuer, &helpers::currency_to_bytes("USDV"));
+    let mut line: Value = serde_json::from_slice(ledger.get_state(&line_key).unwrap()).unwrap();
+    line["Flags"] = Value::from(if issuer.as_bytes() > destination.as_bytes() {
+        0x0008_0000u64
+    } else {
+        0x0004_0000u64
+    });
+    ledger
+        .put_state(line_key, serde_json::to_vec(&line).unwrap())
+        .unwrap();
+    assert!(!blocked(&ledger));
+}
+
+#[test]
 fn ledger_105501848_payment_preserves_one_drop_offer_remainder() {
     const SOURCE: &str = "rapido5rxPmP4YkMZZEeXSHqWefxHEkqv6";
     const RLUSD_ISSUER: &str = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De";

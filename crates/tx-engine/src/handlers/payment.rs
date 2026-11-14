@@ -1831,10 +1831,8 @@ fn direct_pair_has_amm_and_clob(
 }
 
 /// Whether rippled's terminal `DirectStep` from an IOU issuer to the payment
-/// destination would fail `checkFreeze`. Flow paths containing a book are not
-/// pure issue/redeem paths, so the terminal step must honor the destination's
-/// regular freeze bit, either side's deep-freeze bit, and destination global
-/// freeze before any liquidity is consumed.
+/// destination would fail its trust-line checks. Flow paths containing a book
+/// must honor authorization, freeze, and NoRipple before consuming liquidity.
 fn terminal_direct_step_blocked(
     view: &dyn crate::view::read_view::ReadView,
     destination: &rxrpl_primitives::AccountId,
@@ -1847,6 +1845,9 @@ fn terminal_direct_step_blocked(
     const LSF_HIGH_DEEP_FREEZE: u64 = 0x0400_0000;
     const LSF_LOW_NO_RIPPLE: u64 = 0x0010_0000;
     const LSF_HIGH_NO_RIPPLE: u64 = 0x0020_0000;
+    const LSF_LOW_AUTH: u64 = 0x0004_0000;
+    const LSF_HIGH_AUTH: u64 = 0x0008_0000;
+    const LSF_REQUIRE_AUTH: u64 = 0x0004_0000;
 
     let Some((is_xrp, currency, issuer)) = amm_asset_of(amount) else {
         return false;
@@ -1864,11 +1865,34 @@ fn terminal_direct_step_blocked(
         return true;
     }
 
-    let line_flags = view
+    let Some(line) = view
         .read(&keylet::trust_line(destination, &issuer, &currency))
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .and_then(|line| line.get("Flags").and_then(serde_json::Value::as_u64))
+    else {
+        return false;
+    };
+    let line_flags = line
+        .get("Flags")
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let issuer_flags = view
+        .read(&keylet::account(&issuer))
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|account| account.get("Flags").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0);
+    let issuer_auth = if issuer.as_bytes() > destination.as_bytes() {
+        LSF_HIGH_AUTH
+    } else {
+        LSF_LOW_AUTH
+    };
+    if issuer_flags & LSF_REQUIRE_AUTH != 0
+        && line_flags & issuer_auth == 0
+        && line
+            .get("Balance")
+            .is_some_and(|balance| value_to_number(balance).is_zero())
+    {
+        return true;
+    }
     let destination_freeze = if destination.as_bytes() > issuer.as_bytes() {
         LSF_HIGH_FREEZE
     } else {
