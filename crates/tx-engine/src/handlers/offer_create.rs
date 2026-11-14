@@ -454,6 +454,137 @@ mod ledger_105504157_tests {
         );
         assert!(changes.deletes.is_empty());
     }
+
+    #[test]
+    fn passive_sell_crosses_tiny_xrp_bridge_before_resting() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("ledger_105504193_fixture.json")).unwrap();
+        let next_quality = "29958A9E8FDB4462AB486E269C735F52ADDAEDF354F9F40E4F03E9A2B7566C00";
+        assert_eq!(
+            fixture["entries"][next_quality]["Indexes"][0],
+            "467FB20E63BE08A19C7B81EC75DABBBDA0D726FC120C4A72F906359C763D2538"
+        );
+        let mut ledger = Ledger::genesis();
+        for (key, entry) in fixture["entries"].as_object().unwrap() {
+            ledger
+                .put_state(key.parse().unwrap(), serde_json::to_vec(entry).unwrap())
+                .unwrap();
+        }
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::from_enabled([
+            feature_id("FlowCross"),
+            feature_id("FlowSortStrands"),
+            feature_id("fixUniversalNumber"),
+            feature_id("fixAMMv1_2"),
+            feature_id("fixAMMv1_3"),
+            feature_id("fixReducedOffersV1"),
+            feature_id("fixReducedOffersV2"),
+        ]);
+        let tx = &fixture["tx"];
+        let mut ctx = ApplyContext {
+            tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let taker = decode_account_id(tx["Account"].as_str().unwrap()).unwrap();
+        let in_leg = Leg::parse(&tx["TakerGets"]).unwrap();
+        let out_leg = Leg::parse(&tx["TakerPays"]).unwrap();
+        let threshold = flow_crossing_threshold(&ctx, &taker, &in_leg, &out_leg, true, true);
+        let direct =
+            build_flow_strand(&ctx, &[tx["TakerGets"].clone(), tx["TakerPays"].clone()]).unwrap();
+        let bridge = build_flow_strand(
+            &ctx,
+            &[
+                tx["TakerGets"].clone(),
+                Value::String("0".into()),
+                tx["TakerPays"].clone(),
+            ],
+        )
+        .unwrap();
+        assert!(num_gt(
+            &offer_crossing_initial_bound(&ctx, &direct).unwrap(),
+            &Number::from_iou(&from_rate(threshold).unwrap()),
+        ));
+        assert!(num_le(
+            &offer_crossing_initial_bound(&ctx, &bridge).unwrap(),
+            &Number::from_iou(&from_rate(threshold).unwrap()),
+        ));
+        assert!(!offer_crossing_strand_reaches_limit_with_amm_mode(
+            &ctx,
+            &taker,
+            &tx["TakerGets"],
+            &tx["TakerPays"],
+            threshold,
+            true,
+        ));
+        assert_eq!(
+            OfferCreateTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        let consumed: Hash256 = "E869F2408F8351C1703E198B182446FB66C8A63A41959D164CA90DE218FFF742"
+            .parse()
+            .unwrap();
+        assert!(
+            sandbox.read(&consumed).is_none(),
+            "bridge offer should be consumed"
+        );
+        for node in fixture["tx"]["meta"]["AffectedNodes"].as_array().unwrap() {
+            let Some(entry) = node.get("ModifiedNode").or_else(|| node.get("CreatedNode")) else {
+                continue;
+            };
+            let kind = entry["LedgerEntryType"].as_str().unwrap();
+            if kind == "AccountRoot" && entry["FinalFields"]["Account"] == tx["Account"] {
+                continue;
+            }
+            if kind != "AccountRoot" && kind != "RippleState" && kind != "Offer" {
+                continue;
+            }
+            let key: Hash256 = entry["LedgerIndex"].as_str().unwrap().parse().unwrap();
+            let actual: Value = serde_json::from_slice(&sandbox.read(&key).unwrap()).unwrap();
+            let expected = entry.get("FinalFields").unwrap_or(&entry["NewFields"]);
+            match kind {
+                "AccountRoot" => {
+                    assert_eq!(actual["Balance"], expected["Balance"], "account {key}")
+                }
+                "RippleState" => {
+                    assert_eq!(actual["Balance"], expected["Balance"], "trust line {key}")
+                }
+                "Offer" => {
+                    assert_eq!(
+                        actual["TakerGets"], expected["TakerGets"],
+                        "offer gets {key}"
+                    );
+                    assert_eq!(
+                        actual["TakerPays"], expected["TakerPays"],
+                        "offer pays {key}"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+        let changes = sandbox.into_changes();
+        for (kind, actual) in [
+            ("ModifiedNode", &changes.updates),
+            ("CreatedNode", &changes.inserts),
+            ("DeletedNode", &changes.deletes),
+        ] {
+            let expected: HashSet<Hash256> = fixture["tx"]["meta"]["AffectedNodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|node| node.get(kind))
+                .map(|entry| entry["LedgerIndex"].as_str().unwrap().parse().unwrap())
+                .collect();
+            assert_eq!(
+                actual.keys().copied().collect::<HashSet<_>>(),
+                expected,
+                "{kind}"
+            );
+        }
+    }
 }
 
 /// The order-book directory index for a given quality: the book base with its
@@ -3050,9 +3181,8 @@ fn amm_offer_allows_partial_output(_fok: bool, _is_sell: bool) -> bool {
 /// two-hop `bridge` strand) as a competing source in the `cross_offers` walk,
 /// mirroring [`try_amm_step`]: cross bridge passes whose realised quality still
 /// beats `cq` (the current CLOB band, or the taker's overall limit at the tail),
-/// updating the remaining demand/budget in place. The bridge is evaluated
-/// atomically across all bands because Flow compares its aggregate realised
-/// quality with the competing direct path or the taker's limit.
+/// updating the remaining demand/budget in place. Sells can stop before a
+/// worse next band; buys retain the bounded-demand aggregate quality check.
 #[allow(clippy::too_many_arguments)]
 fn try_bridge_step(
     ctx: &mut ApplyContext<'_>,
@@ -3098,16 +3228,17 @@ fn try_bridge_step(
     let bridge_limit = from_rate(threshold)
         .ok()
         .map(|rate| Number::from_iou(&rate));
+    let pass_limit = is_sell
+        .then(|| from_rate(cq).ok().map(|rate| Number::from_iou(&rate)))
+        .flatten();
     if !matches!((bridge_bound, bridge_limit), (Some(bound), Some(limit)) if num_le(&bound, &limit))
     {
         return Ok(None);
     }
 
-    // One Flow strand execution is an atomic candidate. rippled walks all of
-    // its successive book bands, computes quality from the aggregate input and
-    // output, then rolls the whole candidate back when that average misses the
-    // limit. Committing each individually-profitable band diverged for both
-    // sell and buy OfferCreate transactions (mainnet 105500132 and 105500135).
+    // Keep a checkpoint for the complete candidate and another for each pass.
+    // A sell can keep an earlier favorable band when the next one misses its
+    // limit; buys still evaluate the complete candidate atomically.
     let cp = ctx.view.checkpoint();
     // `taker_acct` is a detached JSON value held by OfferCreate while the rest
     // of the candidate lives in the sandbox. Candidate execution may update its
@@ -3158,17 +3289,20 @@ fn try_bridge_step(
             break;
         }
         let pass_quality_adjusted = res.quality_adjusted;
-        // A quality-limited AMM pass must itself meet the taker's limit.
-        // Earlier profitable bands can make the aggregate look acceptable even
-        // when the final AMM fragment is worse (105501906 / TX20). Keep the
-        // preceding bands, but discard this speculative fragment.
-        if pass_quality_adjusted
-            && !bridge_adjusted_pass_meets_limit(
-                &res.in_amt,
-                &res.out_amt,
-                cq,
-                ctx.rules.enabled(&feature_id("fixUniversalNumber")),
-            )
+        // A sell can keep its favorable first pass when the next pass exceeds
+        // its quality limit. A buy keeps its bounded output demand and checks
+        // the aggregate below; retaining the first pass changes its result.
+        let pass_exceeds_limit = pass_limit
+            .as_ref()
+            .is_some_and(|limit| num_gt(&res.in_amt.div(&res.out_amt), limit));
+        if (!pass_quality_adjusted && pass_exceeds_limit)
+            || (pass_quality_adjusted
+                && !bridge_adjusted_pass_meets_limit(
+                    &res.in_amt,
+                    &res.out_amt,
+                    cq,
+                    ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+                ))
         {
             ctx.view.rollback(pass_cp);
             *taker_acct = taker_acct_before_pass;
@@ -3962,13 +4096,23 @@ fn cross_book_hop_with_reaps(
             // bounded demand (single-book conversion). An interior hop carries the
             // unbounded-demand sentinel, so its ceilOut input cost is meaningless;
             // keep the output-side test there (the #337 walk-stop relies on it).
-            let budget_binds = if funds_limited_offer_fits_budget(
-                &offer_in,
-                &offer_out,
-                &avail_out,
-                &take_out,
-                &net_remaining_in,
-            ) || zero_cost_funded
+            // For a fully funded XRP offer, the exact TakerPays can fit the
+            // source budget even when flooring by the rounded directory quality
+            // yields zero drops. The full offer remains affordable in that case.
+            let budget_binds = if (force_full_input_budget
+                && offer_out.is_xrp
+                && leg_ge(&avail_out, &offer_out)
+                && leg_ge(&take_out, &offer_out)
+                && budget_out.is_zero()
+                && leg_ge(&net_remaining_in, &offer_in))
+                || funds_limited_offer_fits_budget(
+                    &offer_in,
+                    &offer_out,
+                    &avail_out,
+                    &take_out,
+                    &net_remaining_in,
+                )
+                || zero_cost_funded
             {
                 false
             } else if terminal {
@@ -8218,7 +8362,13 @@ fn execute_strand_pass(
                 )?;
                 first_xrp_budgeted_quote = true;
             }
-            if bridge_xrp_one_drop_tip_needs_more_pages(bridge_first_xrp, &demanded, &quote.1)
+            // A sell has an unbounded output demand: consume each quality
+            // page as a separate pass so the next page is checked against the
+            // taker's quality limit before it can dilute a favorable tip.
+            let sell_bridge = offer_create_bridge
+                && ctx.tx.get("Flags").and_then(Value::as_u64).unwrap_or(0) & TF_SELL != 0;
+            if !sell_bridge
+                && bridge_xrp_one_drop_tip_needs_more_pages(bridge_first_xrp, &demanded, &quote.1)
                 && let Some(expanded) = price_clob_band_reverse(
                     ctx,
                     taker,
