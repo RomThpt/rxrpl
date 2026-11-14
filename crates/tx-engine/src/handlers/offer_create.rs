@@ -3252,7 +3252,7 @@ fn try_amm_step(
             .get("TakerPays")
             .and_then(Leg::parse)
             .is_some_and(|leg| {
-                !leg.is_xrp && transfer_rate_value(ctx, &leg.issuer) == 1_000_000_000
+                leg.is_xrp || transfer_rate_value(ctx, &leg.issuer) == 1_000_000_000
             });
     let tail_snapshot = strict_tail_quality.then(|| (ctx.view.checkpoint(), taker_acct.clone()));
     let quote = amm_hop(
@@ -3275,16 +3275,19 @@ fn try_amm_step(
     let selected_zero_output = matches!(&quote, AmmHopResult::ZeroOutput);
     if let AmmHopResult::Filled(delivered, spent) = quote {
         if strict_tail_quality {
-            // The final spot-price cap can quote an integral IOU fragment whose
-            // realised input/output rate is just worse than the offer limit.
-            // Flow discards that entire pass (105503523 / 4061C8DC).
+            // The final spot-price cap can quote a fragment whose realised
+            // input/output rate is worse than the offer limit. This also
+            // happens when an IOU-to-XRP swap rounds the output to a few drops
+            // (105504224 / CA0AEA56). Flow discards that entire pass.
             let realised = quality_threshold(
                 &leg_as_quality_iou(&spent),
                 &delivered,
                 ctx.rules.enabled(&feature_id("fixUniversalNumber")),
                 false,
             );
-            if reject_quality(realised, cq) {
+            let within_xrp_rounding =
+                delivered.is_xrp && rxrpl_amount::within_relative_distance(realised, cq);
+            if reject_quality(realised, cq) && !within_xrp_rounding {
                 if let Some((cp, account_before)) = tail_snapshot {
                     ctx.view.rollback(cp);
                     *taker_acct = account_before;
@@ -12245,6 +12248,23 @@ mod taker_crossing_tests {
         let realized =
             crossing_quality_threshold(&iou("0.00000664629441625"), &xrp(6), true, false);
         assert!(reject_quality(realized, limit));
+    }
+
+    #[test]
+    fn ledger_105504224_terminal_amm_drops_fail_realized_quality() {
+        let limit = crossing_quality_threshold(&iou("0.000011"), &xrp(9), true, false);
+        let realized = crossing_quality_threshold(&iou("0.0000037263352474"), &xrp(3), true, false);
+        assert!(reject_quality(realized, limit));
+        assert!(!rxrpl_amount::within_relative_distance(realized, limit));
+    }
+
+    #[test]
+    fn ledger_105501853_terminal_amm_quality_is_within_rounding_margin() {
+        let limit = crossing_quality_threshold(&iou("46"), &xrp(462_781), true, false);
+        let realized =
+            crossing_quality_threshold(&iou("30.2745704791096"), &xrp(304_576), true, false);
+        assert!(reject_quality(realized, limit));
+        assert!(rxrpl_amount::within_relative_distance(realized, limit));
     }
 
     #[test]
