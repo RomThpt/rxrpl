@@ -247,6 +247,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             start,
             end,
             output_state,
+            compact,
         } => {
             return cmd_replay_segment(
                 &state,
@@ -255,6 +256,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 start,
                 end,
                 output_state.as_deref(),
+                compact,
             );
         }
 
@@ -574,6 +576,7 @@ fn cmd_replay_segment(
     start: u64,
     end: u64,
     output_state: Option<&std::path::Path>,
+    compact: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let checkpoint = resolve_replay_range(checkpoint, start, end)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -589,35 +592,7 @@ fn cmd_replay_segment(
         start,
         end,
         |r| {
-            let txs: Vec<serde_json::Value> = r
-                .txs
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "txid": t.txid.to_string(),
-                        "meta": hex::encode_upper(&t.meta_blob),
-                    })
-                })
-                .collect();
-            let line = serde_json::json!({
-                "seq": r.seq,
-                "observed_order_replay": r.observed_order_replay,
-                "account_hash_match": r.account_hash_match,
-                "tx_hash_match": r.tx_hash_match,
-                "ledger_hash_match": r.ledger_hash_match,
-                "drops_match": r.drops_match,
-                "applied": r.applied,
-                "failed": r.failed,
-                "computed_account_hash": r.computed_account_hash.to_string(),
-                "expected_account_hash": r.expected_account_hash.to_string(),
-                "computed_tx_hash": r.computed_tx_hash.to_string(),
-                "expected_tx_hash": r.expected_tx_hash.to_string(),
-                "computed_ledger_hash": r.computed_ledger_hash.to_string(),
-                "expected_ledger_hash": r.expected_ledger_hash.to_string(),
-                "computed_drops": r.computed_drops,
-                "expected_drops": r.expected_drops,
-                "txs": txs,
-            });
+            let line = replay_ledger_json(&r, compact);
             println!(
                 "{}",
                 serde_json::to_string(&line).map_err(|e| e.to_string())?
@@ -667,6 +642,48 @@ fn cmd_replay_segment(
     Ok(())
 }
 
+fn replay_ledger_json(r: &rxrpl_node::replay_worker::LedgerReport, compact: bool) -> Value {
+    let omit_meta = compact
+        && r.account_hash_match
+        && r.tx_hash_match
+        && r.ledger_hash_match
+        && r.drops_match
+        && r.failed == 0;
+    let txs: Vec<Value> = r
+        .txs
+        .iter()
+        .map(|t| {
+            if omit_meta {
+                serde_json::json!({ "txid": t.txid.to_string() })
+            } else {
+                serde_json::json!({
+                    "txid": t.txid.to_string(),
+                    "meta": hex::encode_upper(&t.meta_blob),
+                })
+            }
+        })
+        .collect();
+    serde_json::json!({
+        "seq": r.seq,
+        "observed_order_replay": r.observed_order_replay,
+        "account_hash_match": r.account_hash_match,
+        "tx_hash_match": r.tx_hash_match,
+        "ledger_hash_match": r.ledger_hash_match,
+        "drops_match": r.drops_match,
+        "applied": r.applied,
+        "failed": r.failed,
+        "computed_account_hash": r.computed_account_hash.to_string(),
+        "expected_account_hash": r.expected_account_hash.to_string(),
+        "computed_tx_hash": r.computed_tx_hash.to_string(),
+        "expected_tx_hash": r.expected_tx_hash.to_string(),
+        "computed_ledger_hash": r.computed_ledger_hash.to_string(),
+        "expected_ledger_hash": r.expected_ledger_hash.to_string(),
+        "computed_drops": r.computed_drops,
+        "expected_drops": r.expected_drops,
+        "txs": txs,
+    })
+}
+
 fn cmd_config_validate(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let path = path.ok_or("no config path provided (use --config or pass a path)")?;
     match rxrpl_config::load_config(path) {
@@ -679,5 +696,115 @@ fn cmd_config_validate(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error:
             Ok(())
         }
         Err(e) => Err(format!("config invalid ({}): {e}", path.display()).into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rxrpl_node::replay_worker::{LedgerReport, TxReport};
+
+    fn report() -> LedgerReport {
+        LedgerReport {
+            seq: 42,
+            observed_order_replay: false,
+            account_hash_match: true,
+            tx_hash_match: true,
+            ledger_hash_match: true,
+            drops_match: true,
+            applied: 1,
+            failed: 0,
+            computed_account_hash: rxrpl::Hash256::ZERO,
+            expected_account_hash: rxrpl::Hash256::ZERO,
+            computed_tx_hash: rxrpl::Hash256::ZERO,
+            expected_tx_hash: rxrpl::Hash256::ZERO,
+            computed_ledger_hash: rxrpl::Hash256::ZERO,
+            expected_ledger_hash: rxrpl::Hash256::ZERO,
+            computed_drops: 100,
+            expected_drops: 100,
+            txs: vec![TxReport {
+                txid: rxrpl::Hash256::ZERO,
+                meta_blob: vec![0xAB, 0xCD],
+            }],
+        }
+    }
+
+    #[test]
+    fn compact_replay_preserves_exactness_fields_and_txids() {
+        let full = replay_ledger_json(&report(), false);
+        let compact = replay_ledger_json(&report(), true);
+        assert_eq!(full["txs"][0]["meta"], "ABCD");
+        assert!(compact["txs"][0].get("meta").is_none());
+        assert_eq!(compact["txs"][0]["txid"], full["txs"][0]["txid"]);
+        for key in [
+            "seq",
+            "observed_order_replay",
+            "account_hash_match",
+            "tx_hash_match",
+            "ledger_hash_match",
+            "drops_match",
+            "applied",
+            "failed",
+            "computed_account_hash",
+            "expected_account_hash",
+            "computed_tx_hash",
+            "expected_tx_hash",
+            "computed_ledger_hash",
+            "expected_ledger_hash",
+            "computed_drops",
+            "expected_drops",
+        ] {
+            assert_eq!(compact[key], full[key], "{key}");
+        }
+    }
+
+    #[test]
+    fn compact_replay_keeps_metadata_on_every_divergence() {
+        for field in 0..5 {
+            let mut divergent = report();
+            match field {
+                0 => divergent.account_hash_match = false,
+                1 => divergent.tx_hash_match = false,
+                2 => divergent.ledger_hash_match = false,
+                3 => divergent.drops_match = false,
+                _ => divergent.failed = 1,
+            }
+            assert_eq!(
+                replay_ledger_json(&divergent, true)["txs"][0]["meta"],
+                "ABCD"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_flag_is_scoped_to_replay_segment() {
+        let args = [
+            "rxrpl",
+            "replay-segment",
+            "--state",
+            "state.pack",
+            "--ledgers",
+            "ledger.pack",
+            "--start",
+            "2",
+            "--end",
+            "2",
+        ];
+        assert!(matches!(
+            Cli::try_parse_from(args).unwrap().command,
+            Commands::ReplaySegment { compact: false, .. }
+        ));
+        let mut with_compact = args.to_vec();
+        with_compact.push("--compact");
+        assert!(matches!(
+            Cli::try_parse_from(with_compact).unwrap().command,
+            Commands::ReplaySegment { compact: true, .. }
+        ));
+        assert!(Cli::try_parse_from(["rxrpl", "version", "--compact"]).is_err());
+        let help = Cli::try_parse_from(["rxrpl", "replay-segment", "--help"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(help.contains("--compact"));
     }
 }

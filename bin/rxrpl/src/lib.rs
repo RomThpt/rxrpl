@@ -276,6 +276,9 @@ pub enum Commands {
         /// Write the last faithful ledger state as a resumable XSCP checkpoint.
         #[arg(long)]
         output_state: Option<PathBuf>,
+        /// Omit transaction metadata from ledgers whose hashes all match.
+        #[arg(long)]
+        compact: bool,
     },
 }
 
