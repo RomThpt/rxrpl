@@ -66,6 +66,28 @@ mod ledger_105504157_tests {
         let direct_tip = book_tip_quality(&ctx, &direct.hops[0].inverse_book).unwrap();
         assert!(reject_quality(direct_tip, threshold));
         assert!(direct.terminal_has_amm());
+        let bridge = build_flow_strand(
+            &ctx,
+            &[
+                tx["TakerGets"].clone(),
+                Value::String("0".into()),
+                tx["TakerPays"].clone(),
+            ],
+        )
+        .unwrap();
+        assert!(num_le(
+            &offer_crossing_initial_bound(&ctx, &direct).unwrap(),
+            &offer_crossing_initial_bound(&ctx, &bridge).unwrap(),
+        ));
+        let taker = decode_account_id(tx["Account"].as_str().unwrap()).unwrap();
+        assert!(offer_crossing_strand_reaches_limit_with_amm_mode(
+            &ctx,
+            &taker,
+            &tx["TakerGets"],
+            &tx["TakerPays"],
+            threshold,
+            true,
+        ));
         assert_eq!(
             OfferCreateTransactor.apply(&mut ctx),
             Ok(TransactionResult::TesSuccess)
@@ -112,6 +134,208 @@ mod ledger_105504157_tests {
             expected_keys
         );
         assert!(changes.inserts.is_empty());
+        assert!(changes.deletes.is_empty());
+    }
+
+    #[test]
+    fn ledger_105501838_bridge_only_keeps_xrp_offer_drop() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("ledger_105501838_fixture.json")).unwrap();
+        let mut ledger = Ledger::genesis();
+        for (key, entry) in fixture["entries"].as_object().unwrap() {
+            ledger
+                .put_state(key.parse().unwrap(), serde_json::to_vec(entry).unwrap())
+                .unwrap();
+        }
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::from_enabled([
+            feature_id("FlowCross"),
+            feature_id("FlowSortStrands"),
+            feature_id("fixUniversalNumber"),
+            feature_id("fixAMMv1_2"),
+            feature_id("fixAMMv1_3"),
+            feature_id("fixReducedOffersV1"),
+            feature_id("fixReducedOffersV2"),
+        ]);
+        let tx = &fixture["tx"];
+        let mut ctx = ApplyContext {
+            tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let direct =
+            build_flow_strand(&ctx, &[tx["TakerGets"].clone(), tx["TakerPays"].clone()]).unwrap();
+        let bridge = build_flow_strand(
+            &ctx,
+            &[
+                tx["TakerGets"].clone(),
+                Value::String("0".into()),
+                tx["TakerPays"].clone(),
+            ],
+        )
+        .unwrap();
+        let direct_bound = offer_crossing_initial_bound(&ctx, &direct).unwrap();
+        let bridge_bound = offer_crossing_initial_bound(&ctx, &bridge).unwrap();
+        assert!(!num_le(&direct_bound, &bridge_bound));
+        assert_eq!(
+            OfferCreateTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        for key in [
+            "22BE8C70663D60BA04CEE4D53689B2313D56CB0699774E14E08EE18759D81070",
+            "C94457B9FF18C020673E1ECE05A141E3BB58CB0F82DF874C2AC2135E197080C0",
+        ] {
+            let key: Hash256 = key.parse().unwrap();
+            let actual: Value = serde_json::from_slice(&sandbox.read(&key).unwrap()).unwrap();
+            let node = fixture["tx"]["meta"]["AffectedNodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["ModifiedNode"]["LedgerIndex"].as_str() == Some(&key.to_string()))
+                .unwrap();
+            let expected = &node["ModifiedNode"]["FinalFields"];
+            assert_eq!(actual["TakerGets"], expected["TakerGets"], "offer {key}");
+            assert_eq!(actual["TakerPays"], expected["TakerPays"], "offer {key}");
+        }
+        for node in fixture["tx"]["meta"]["AffectedNodes"].as_array().unwrap() {
+            let modified = &node["ModifiedNode"];
+            let kind = modified["LedgerEntryType"].as_str().unwrap();
+            if kind == "Offer"
+                || (kind == "AccountRoot" && modified["FinalFields"]["Account"] == tx["Account"])
+            {
+                continue;
+            }
+            let key: Hash256 = modified["LedgerIndex"].as_str().unwrap().parse().unwrap();
+            let current: Value = serde_json::from_slice(&sandbox.read(&key).unwrap()).unwrap();
+            let expected = &modified["FinalFields"];
+            if kind == "RippleState" {
+                assert_eq!(current["Balance"], expected["Balance"], "trust line {key}");
+            } else if kind == "AccountRoot" {
+                assert_eq!(current["Balance"], expected["Balance"], "maker {key}");
+            }
+        }
+        let changes = sandbox.into_changes();
+        let expected_keys: HashSet<Hash256> = fixture["tx"]["meta"]["AffectedNodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| {
+                n["ModifiedNode"]["LedgerIndex"]
+                    .as_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            changes.updates.keys().copied().collect::<HashSet<_>>(),
+            expected_keys
+        );
+        assert!(changes.inserts.is_empty());
+        assert!(changes.deletes.is_empty());
+    }
+
+    #[test]
+    fn ledger_105500132_passive_offer_rests_without_crossing() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("ledger_105500132_fixture.json")).unwrap();
+        let mut ledger = Ledger::genesis();
+        for (key, entry) in fixture["entries"].as_object().unwrap() {
+            ledger
+                .put_state(key.parse().unwrap(), serde_json::to_vec(entry).unwrap())
+                .unwrap();
+        }
+        let fees = FeeSettings {
+            base_fee: 10,
+            reserve_base: 1_000_000,
+            reserve_increment: 200_000,
+        };
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::from_enabled([
+            feature_id("FlowCross"),
+            feature_id("FlowSortStrands"),
+            feature_id("fixUniversalNumber"),
+            feature_id("fixAMMv1_2"),
+            feature_id("fixAMMv1_3"),
+            feature_id("fixReducedOffersV1"),
+            feature_id("fixReducedOffersV2"),
+        ]);
+        let tx = &fixture["tx"];
+        let mut ctx = ApplyContext {
+            tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let direct =
+            build_flow_strand(&ctx, &[tx["TakerGets"].clone(), tx["TakerPays"].clone()]).unwrap();
+        let bridge = build_flow_strand(
+            &ctx,
+            &[
+                tx["TakerGets"].clone(),
+                Value::String("0".into()),
+                tx["TakerPays"].clone(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(tx["Flags"].as_u64().unwrap() & TF_PASSIVE, TF_PASSIVE);
+        assert!(direct.hops[0].has_clob);
+        assert!(direct.terminal_has_amm());
+        assert!(!num_le(
+            &offer_crossing_initial_bound(&ctx, &direct).unwrap(),
+            &offer_crossing_initial_bound(&ctx, &bridge).unwrap(),
+        ));
+        assert_eq!(
+            OfferCreateTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        let created = fixture["tx"]["meta"]["AffectedNodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|n| {
+                n.get("CreatedNode")
+                    .filter(|v| v["LedgerEntryType"] == "Offer")
+            })
+            .unwrap();
+        let key: Hash256 = created["LedgerIndex"].as_str().unwrap().parse().unwrap();
+        let actual: Value = serde_json::from_slice(&sandbox.read(&key).unwrap()).unwrap();
+        assert_eq!(actual["TakerGets"], created["NewFields"]["TakerGets"]);
+        assert_eq!(actual["TakerPays"], created["NewFields"]["TakerPays"]);
+        let changes = sandbox.into_changes();
+        let mut expected_updates = HashSet::new();
+        let mut expected_inserts = HashSet::new();
+        for node in fixture["tx"]["meta"]["AffectedNodes"].as_array().unwrap() {
+            if let Some(modified) = node.get("ModifiedNode") {
+                expected_updates.insert(
+                    modified["LedgerIndex"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<Hash256>()
+                        .unwrap(),
+                );
+            } else if let Some(created) = node.get("CreatedNode") {
+                expected_inserts.insert(
+                    created["LedgerIndex"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<Hash256>()
+                        .unwrap(),
+                );
+            }
+        }
+        assert_eq!(
+            changes.updates.keys().copied().collect::<HashSet<_>>(),
+            expected_updates
+        );
+        assert_eq!(
+            changes.inserts.keys().copied().collect::<HashSet<_>>(),
+            expected_inserts
+        );
         assert!(changes.deletes.is_empty());
     }
 }
@@ -1491,8 +1715,10 @@ fn cross_offers(
 
     // With no crossable direct book offer and no issuer fees, the direct
     // IOU/IOU AMM competes with the XRP autobridge on every Flow pass. An
-    // out-of-quality CLOB tip must not disable this competition just because
-    // its directory exists (105504157 / D778CAF8).
+    // out-of-quality CLOB tip does not disable that competition when the
+    // direct AMM leads the initial quality ranking (105504157 / D778CAF8).
+    // A passive offer or a better initial bridge stays on the original walk
+    // (105500132 / C3670F5D and 105501838 / E619EA7E).
     // The sorted strand selector preserves their shared AMM iteration state.
     if let Some(bridge_strand) = bridge.as_ref()
         && let Some(direct_strand) =
@@ -1500,8 +1726,19 @@ fn cross_offers(
         && ctx.rules.enabled(&feature_id("FlowSortStrands"))
         && direct_strand.terminal_has_amm()
         && (!direct_strand.hops[0].has_clob
-            || book_tip_quality(ctx, &direct_strand.hops[0].inverse_book)
-                .is_none_or(|q| reject_quality(q, clob_threshold)))
+            || (!passive
+                && book_tip_quality(ctx, &direct_strand.hops[0].inverse_book)
+                    .is_none_or(|q| reject_quality(q, clob_threshold))
+                && offer_crossing_strand_reaches_limit_with_amm_mode(
+                    ctx, taker, taker_gets, taker_pays, threshold, true,
+                )
+                && matches!(
+                    (
+                        offer_crossing_initial_bound(ctx, &direct_strand),
+                        offer_crossing_initial_bound(ctx, bridge_strand),
+                    ),
+                    (Some(direct), Some(bridge)) if num_le(&direct, &bridge)
+                )))
         && transfer_rate_value(ctx, &in_leg.issuer) == 1_000_000_000
         && transfer_rate_value(ctx, &out_leg.issuer) == 1_000_000_000
     {
