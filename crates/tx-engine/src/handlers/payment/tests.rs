@@ -12,6 +12,77 @@ const SRC_ADDRESS: &str = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
 const DST_ADDRESS: &str = "rDTXLQ7ZKZVKz33zJbHjgVShjsBnqMBhmN";
 
 #[test]
+fn ledger_105502155_payment_keeps_active_strand_amm_sizing() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("../ledger_105502155_fixture.json")).unwrap();
+    let mut ledger = Ledger::genesis();
+    for (key, entry) in fixture["entries"].as_object().unwrap() {
+        ledger
+            .put_state(key.parse().unwrap(), serde_json::to_vec(entry).unwrap())
+            .unwrap();
+    }
+    let fees = FeeSettings::default();
+    let view = LedgerView::with_fees(&ledger, fees.clone());
+    let mut sandbox = Sandbox::new(&view);
+    let rules = Rules::from_enabled([
+        feature_id("AMM"),
+        feature_id("FlowCross"),
+        feature_id("FlowSortStrands"),
+        feature_id("fixUniversalNumber"),
+        feature_id("fixAMMv1_2"),
+        feature_id("fixAMMv1_3"),
+        feature_id("fixReducedOffersV1"),
+        feature_id("fixReducedOffersV2"),
+    ]);
+    let tx = &fixture["tx"];
+    let mut ctx = ApplyContext {
+        tx,
+        view: &mut sandbox,
+        rules: &rules,
+        fees: &fees,
+    };
+    assert_eq!(
+        PaymentTransactor.apply(&mut ctx),
+        Ok(TransactionResult::TesSuccess)
+    );
+    for node in fixture["tx"]["meta"]["AffectedNodes"].as_array().unwrap() {
+        let entry = &node["ModifiedNode"];
+        if entry["LedgerEntryType"] != "RippleState" {
+            continue;
+        }
+        let key: Hash256 = entry["LedgerIndex"].as_str().unwrap().parse().unwrap();
+        let actual: Value = serde_json::from_slice(&sandbox.read(&key).unwrap()).unwrap();
+        assert_eq!(
+            actual["Balance"], entry["FinalFields"]["Balance"],
+            "trust line {key}"
+        );
+    }
+    let changes = sandbox.into_changes();
+    let expected_updates: std::collections::HashSet<Hash256> = tx["meta"]["AffectedNodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| {
+            node["ModifiedNode"]["LedgerIndex"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        changes
+            .updates
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>(),
+        expected_updates
+    );
+    assert!(changes.inserts.is_empty());
+    assert!(changes.deletes.is_empty());
+}
+
+#[test]
 fn ledger_105504154_xrp_books_and_direct_usd_steps_match_oracle() {
     run_ledger_105504154_direct_steps(false);
 }

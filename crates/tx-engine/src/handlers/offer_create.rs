@@ -8615,10 +8615,17 @@ pub(crate) fn flow_multi(
                 .collect();
             eprintln!("[flow]   try={cur_try} rank [{}]", qs.join(" "));
         }
-        // (B) Flow.cpp seeds multiPath from the original strand count. A bridge
-        // rejected by the quality gate still keeps direct AMM offers Fibonacci
-        // sized for the entire crossing.
-        amm_ctx.set_multi_path(strands.len() > 1);
+        // OfferCreate keeps the syntactic XRP bridge in its AMM sizing even
+        // when that bridge misses the taker's limit (105504158). Payment's
+        // existing strand selector sizes from the surviving active paths;
+        // changing it to the original count regresses earlier payments.
+        let offer_crossing =
+            ctx.tx.get("TransactionType").and_then(Value::as_str) == Some("OfferCreate");
+        amm_ctx.set_multi_path(if offer_crossing {
+            strands.len() > 1
+        } else {
+            cur.len() > 1
+        });
 
         // (D) pick the FIRST surviving strand (checkpoint per trial; roll back
         // losers; keep the winner's mutation).
