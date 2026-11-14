@@ -3242,7 +3242,14 @@ fn cross_book_hop_with_reaps(
             // bounded demand (single-book conversion). An interior hop carries the
             // unbounded-demand sentinel, so its ceilOut input cost is meaningless;
             // keep the output-side test there (the #337 walk-stop relies on it).
-            let budget_binds = if zero_cost_funded {
+            let budget_binds = if funds_limited_offer_fits_budget(
+                &offer_in,
+                &offer_out,
+                &avail_out,
+                &take_out,
+                &net_remaining_in,
+            ) || zero_cost_funded
+            {
                 false
             } else if terminal {
                 terminal_budget_binds(
@@ -3641,6 +3648,25 @@ fn terminal_budget_binds(
         }
     }
     !leg_ge(budget_out, take_out) || !leg_ge(remaining_in, &proportional_cost)
+}
+
+/// BookStep reduces an underfunded maker's offer to its available output
+/// before comparing that offer's proportional XRP input with the taker's
+/// budget. A quality-floor quote may buy slightly less output with the same
+/// integral drop cost, but the affordable reduced offer still drains the maker.
+fn funds_limited_offer_fits_budget(
+    offer_in: &Leg,
+    offer_out: &Leg,
+    available: &Leg,
+    requested: &Leg,
+    remaining_in: &Leg,
+) -> bool {
+    leg_gt(offer_out, available)
+        && leg_ge(requested, available)
+        && leg_ge(
+            remaining_in,
+            &scale_funds_limited_input(offer_in, available, offer_out),
+        )
 }
 
 fn funds_limited_xrp_rounds_up(
@@ -10354,6 +10380,40 @@ mod taker_crossing_tests {
 
         assert!(debit_drains_source(&source_funds, &priced_debit));
         assert!(!debit_drains_source(&source_funds, &material_remainder));
+    }
+
+    #[test]
+    fn ledger_105503179_funded_maker_fits_integral_xrp_budget() {
+        // F7A30553, first book hop: the maker holds less DROP than its offer
+        // names. Quality-floor pricing leaves a 0.000000259520157 DROP sliver,
+        // but the entire funded output costs the same 6,550,073 XRP drops.
+        let offer_in = xrp(6_759_601_435);
+        let offer_out = iou("3809.89083842443");
+        let available = iou("3.691795308929194");
+        let remaining_in = xrp(6_550_073);
+        let rate = from_rate(0x5B06_4DA5_D16E_696C).unwrap();
+
+        let quality_quote = out_for_in(&remaining_in, &rate, &offer_out);
+        assert_eq!(quality_quote.iou.to_decimal_string(), "3.691795049409037");
+        assert!(leg_gt(&available, &quality_quote));
+        assert_eq!(
+            scale_funds_limited_input(&offer_in, &available, &offer_out).drops,
+            6_550_073
+        );
+        assert!(super::funds_limited_offer_fits_budget(
+            &offer_in,
+            &offer_out,
+            &available,
+            &available,
+            &remaining_in,
+        ));
+        assert!(!super::funds_limited_offer_fits_budget(
+            &offer_in,
+            &offer_out,
+            &available,
+            &available,
+            &xrp(6_550_072),
+        ));
     }
 
     #[test]
