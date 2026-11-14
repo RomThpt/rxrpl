@@ -1571,6 +1571,17 @@ fn amm_pool_debit_rounding(intermediate_output: bool) -> BalanceRounding {
     }
 }
 
+fn amm_recipient_rounding(offer_crossing: bool, number_switchover: bool) -> BalanceRounding {
+    // A modern OfferCreate AMM's terminal BookOfferCrossingStep credits the
+    // taker through normal IOUAmount/Number addition. Keep the existing
+    // rounding for payment hops and pre-Number crossing.
+    if offer_crossing && number_switchover {
+        BalanceRounding::Nearest
+    } else {
+        BalanceRounding::HalfUpward
+    }
+}
+
 #[cfg(test)]
 fn add_iou_balance_downward(a: &IOUAmount, b: &IOUAmount) -> IOUAmount {
     use rxrpl_amount::number::{Number, RoundModeGuard, RoundingMode};
@@ -6116,6 +6127,9 @@ fn amm_hop(
             }
         }
         let gross = number_to_leg(&deliver_num, demand_out);
+        let offer_crossing = waive_output_transfer_fee
+            && ctx.tx.get("TransactionType").and_then(Value::as_str) == Some("OfferCreate");
+        let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
         pay_out_gross(
             ctx,
             taker,
@@ -6123,9 +6137,9 @@ fn amm_hop(
             &pool_id,
             dest,
             &gross,
-            ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+            number_switchover,
             amm_pool_debit_rounding(skip_output_credit),
-            BalanceRounding::HalfUpward,
+            amm_recipient_rounding(offer_crossing, number_switchover),
             skip_output_credit,
             TransferFeeRounding::Nearest,
             waive_output_transfer_fee,
@@ -11527,12 +11541,12 @@ mod taker_crossing_tests {
     use super::{
         BalanceRounding, Leg, TakerCrossType, add_iou_balance, add_iou_balance_downward,
         add_iou_balance_half_upward, aggregate_flow_source_balance_number,
-        aggregate_output_remainder, amm_pool_debit_rounding, amm_step_allows_clob,
-        book_destination_credit, book_payment_dust_drain, book_step_input_exhausted,
-        bridge_funded_xrp_input, clob_band_allows_terminal_amm, composed_quality,
-        consumes_full_offer, crossing_quality_threshold, crossing_threshold, debit_drains_source,
-        flow_first_book_spends_source_funds, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input,
-        flow_source_funds_limit_binds, flow_xrp_to_iou, full_offer_take,
+        aggregate_output_remainder, amm_pool_debit_rounding, amm_recipient_rounding,
+        amm_step_allows_clob, book_destination_credit, book_payment_dust_drain,
+        book_step_input_exhausted, bridge_funded_xrp_input, clob_band_allows_terminal_amm,
+        composed_quality, consumes_full_offer, crossing_quality_threshold, crossing_threshold,
+        debit_drains_source, flow_first_book_spends_source_funds, flow_iou_to_iou, flow_iou_to_xrp,
+        flow_net_input, flow_source_funds_limit_binds, flow_xrp_to_iou, full_offer_take,
         funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
         in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
         leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
@@ -11710,6 +11724,38 @@ mod taker_crossing_tests {
                 .unwrap()
                 .to_decimal_string(),
             "-334.6644516244193"
+        );
+    }
+
+    #[test]
+    fn ledger_105507029_offer_amm_recipient_halfway_credit() {
+        let before = IOUAmount::from_decimal_string("-97610.72207438135").unwrap();
+        let received = IOUAmount::from_decimal_string("13008.0553478498").unwrap();
+        let delta = received.negate();
+
+        assert!(matches!(
+            amm_recipient_rounding(true, true),
+            BalanceRounding::Nearest
+        ));
+        assert!(matches!(
+            amm_recipient_rounding(false, true),
+            BalanceRounding::HalfUpward
+        ));
+        assert!(matches!(
+            amm_recipient_rounding(true, false),
+            BalanceRounding::HalfUpward
+        ));
+        assert_eq!(
+            add_iou_balance(&before, &delta, true)
+                .unwrap()
+                .to_decimal_string(),
+            "-110618.7774222312"
+        );
+        assert_eq!(
+            add_iou_balance_half_upward(&before, &delta)
+                .unwrap()
+                .to_decimal_string(),
+            "-110618.7774222311"
         );
     }
 
