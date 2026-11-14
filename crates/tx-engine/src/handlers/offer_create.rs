@@ -1817,6 +1817,11 @@ fn cross_offers(
             } else {
                 leg_min(&desired_out, &affordable_out)
             };
+            // A source remainder that buys no output makes this strand dry.
+            // Do not debit the input or count it as a crossed offer.
+            if take_out.is_zero() {
+                break 'walk;
+            }
 
             // Full take when the taker consumes the whole original offer;
             // otherwise a partial take of `take_out`, priced at the offer's
