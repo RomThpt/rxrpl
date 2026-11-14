@@ -670,10 +670,12 @@ impl Transactor for OfferCreateTransactor {
                 )
             }
             .unwrap_or(0);
+            let flow_remaining_pays =
+                Leg::parse(&remaining_pays).ok_or(TransactionResult::TefInternal)?;
             remaining_offer(
                 is_sell,
                 orig_quality,
-                &Leg::parse(&remaining_pays).ok_or(TransactionResult::TefInternal)?,
+                &flow_buy_remaining_output(&flow_remaining_pays, &pays_leg, is_sell, crossed),
                 &Leg::parse(&remaining_gets).ok_or(TransactionResult::TefInternal)?,
                 &pays_leg,
                 &gets_leg,
@@ -7565,6 +7567,23 @@ fn remaining_is_filled(remaining: &Leg, demand: &Leg) -> bool {
     remaining_is_filled_at(remaining, demand, -30)
 }
 
+/// Flow's 16-digit output total can satisfy a buy offer while the collapsed
+/// per-liquidity-source subtraction leaves a sub-ULP IOU remainder. Clear that
+/// remainder before scaling a resting offer; otherwise it can create a dust
+/// offer from a fully delivered buy (105503215/CB282698).
+fn flow_buy_remaining_output(
+    remaining: &Leg,
+    requested: &Leg,
+    is_sell: bool,
+    crossed: bool,
+) -> Leg {
+    if crossed && !is_sell && remaining_is_filled(remaining, requested) {
+        leg_sub(remaining, remaining)
+    } else {
+        remaining.clone()
+    }
+}
+
 fn remaining_is_filled_at(remaining: &Leg, demand: &Leg, max_exp: i32) -> bool {
     if remaining.is_zero() {
         return true;
@@ -10477,6 +10496,39 @@ mod taker_crossing_tests {
             "0.0647086602794"
         );
         assert_eq!(leftover_leg(&offer_in, &spent, true).drops, 878);
+    }
+
+    #[test]
+    fn ledger_105503215_fully_delivered_buy_has_no_dust_offer() {
+        let requested = iou("2000");
+        let raw_remainder = iou("0.0000000000004");
+        let sold = xrp(40_000_000);
+        let normalized = super::flow_buy_remaining_output(&raw_remainder, &requested, false, true);
+        assert!(normalized.is_zero());
+        assert_eq!(
+            super::flow_buy_remaining_output(&iou("0.00000000004"), &requested, false, true)
+                .iou
+                .to_decimal_string(),
+            "0.00000000004"
+        );
+        assert_eq!(
+            super::flow_buy_remaining_output(&raw_remainder, &requested, true, true)
+                .iou
+                .to_decimal_string(),
+            "0.0000000000004"
+        );
+        let quality = get_rate(&leg_as_quality_iou(&sold), &requested.iou).unwrap();
+        let (pays, gets) = remaining_offer(
+            false,
+            quality,
+            &normalized,
+            &xrp(12_868_512),
+            &requested,
+            &sold,
+            true,
+        );
+        assert_eq!(pays["value"], "0");
+        assert_eq!(gets, serde_json::json!("0"));
     }
 
     #[test]
