@@ -4459,6 +4459,359 @@ pub(crate) fn cross_path_payment(
     ))
 }
 
+/// Explicit payment strand entries. Direct steps carry obligations between
+/// adjacent accounts; they cannot be represented by a book boundary alone.
+pub(crate) enum ResolvedPathStep {
+    Book {
+        input: Value,
+        output: Value,
+    },
+    Direct {
+        src: AccountId,
+        dst: AccountId,
+        currency: [u8; 20],
+    },
+}
+
+struct DirectPaymentStep {
+    src: AccountId,
+    dst: AccountId,
+    currency: [u8; 20],
+    src_q_out: u32,
+    dst_q_in: u32,
+    max_src_to_dst: IOUAmount,
+    redeeming: bool,
+    src_no_ripple: bool,
+    dst_no_ripple: bool,
+}
+
+impl DirectPaymentStep {
+    fn from_view(
+        ctx: &ApplyContext<'_>,
+        src: AccountId,
+        dst: AccountId,
+        currency: [u8; 20],
+        prev_redeems: bool,
+        prev_q_in: u32,
+    ) -> Result<Self, TransactionResult> {
+        let key = keylet::trust_line(&src, &dst, &currency);
+        let bytes = ctx.view.read(&key).ok_or(TransactionResult::TecPathDry)?;
+        let line: Value =
+            serde_json::from_slice(&bytes).map_err(|_| TransactionResult::TefInternal)?;
+        let flags = line.get("Flags").and_then(Value::as_u64).unwrap_or(0);
+        let src_low = src.as_bytes() < dst.as_bytes();
+        let src_frozen = if src_low { 0x0040_0000 } else { 0x0080_0000 };
+        let dst_frozen = if src_low { 0x0080_0000 } else { 0x0040_0000 };
+        let src_no_ripple = flags & if src_low { 0x0010_0000 } else { 0x0020_0000 } != 0;
+        let dst_no_ripple = flags & if src_low { 0x0020_0000 } else { 0x0010_0000 } != 0;
+        if flags & (src_frozen | dst_frozen | 0x0600_0000) != 0 {
+            return Err(TransactionResult::TecPathDry);
+        }
+        let quality = |field: &str| -> u32 {
+            line.get(field)
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .filter(|v| *v != 0)
+                .unwrap_or(1_000_000_000)
+        };
+        let dst_q_in = quality(if src_low {
+            "HighQualityIn"
+        } else {
+            "LowQualityIn"
+        });
+        let src_quality_out = quality(if src_low {
+            "LowQualityOut"
+        } else {
+            "HighQualityOut"
+        });
+        let stored = IOUAmount::from_decimal_string(
+            line.get("Balance")
+                .and_then(|b| b.get("value"))
+                .and_then(Value::as_str)
+                .ok_or(TransactionResult::TefInternal)?,
+        )
+        .map_err(|_| TransactionResult::TefInternal)?;
+        let src_holds = if src_low { stored } else { stored.negate() };
+        let src_flags = ctx
+            .view
+            .read(&keylet::account(&src))
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|account| account.get("Flags").and_then(Value::as_u64))
+            .unwrap_or(0);
+        if src_flags & 0x0040_0000 != 0 {
+            return Err(TransactionResult::TecPathDry);
+        }
+        let src_auth = if src_low { 0x0004_0000 } else { 0x0008_0000 };
+        if src_flags & 0x0004_0000 != 0 && flags & src_auth == 0 && stored.is_zero() {
+            return Err(TransactionResult::TecPathDry);
+        }
+        let redeeming = !src_holds.is_zero() && !src_holds.is_negative();
+        let src_q_out = if redeeming {
+            src_quality_out.max(prev_q_in)
+        } else if prev_redeems {
+            transfer_rate_value(ctx, &src)
+        } else {
+            1_000_000_000
+        };
+        let max_src_to_dst = if redeeming {
+            src_holds
+        } else {
+            let limit = IOUAmount::from_decimal_string(
+                line.get(if src_low { "HighLimit" } else { "LowLimit" })
+                    .and_then(|v| v.get("value"))
+                    .and_then(Value::as_str)
+                    .ok_or(TransactionResult::TefInternal)?,
+            )
+            .map_err(|_| TransactionResult::TefInternal)?;
+            IOUAmount::add_round(&limit, &src_holds).map_err(|_| TransactionResult::TefInternal)?
+        };
+        if max_src_to_dst.is_zero() || max_src_to_dst.is_negative() {
+            return Err(TransactionResult::TecPathDry);
+        }
+        Ok(Self {
+            src,
+            dst,
+            currency,
+            src_q_out,
+            dst_q_in,
+            max_src_to_dst,
+            redeeming,
+            src_no_ripple,
+            dst_no_ripple,
+        })
+    }
+
+    fn reverse(&self, out: IOUAmount) -> Result<(IOUAmount, IOUAmount), TransactionResult> {
+        let requested = out
+            .mul_ratio(1_000_000_000, self.dst_q_in, true)
+            .map_err(|_| TransactionResult::TefInternal)?;
+        if requested > self.max_src_to_dst {
+            return Err(TransactionResult::TecPathPartial);
+        }
+        let input = requested
+            .mul_ratio(self.src_q_out, 1_000_000_000, true)
+            .map_err(|_| TransactionResult::TefInternal)?;
+        Ok((input, requested))
+    }
+
+    fn forward(
+        &self,
+        ctx: &mut ApplyContext<'_>,
+        input: IOUAmount,
+    ) -> Result<IOUAmount, TransactionResult> {
+        let moved = input
+            .mul_ratio(1_000_000_000, self.src_q_out, false)
+            .map_err(|_| TransactionResult::TefInternal)?
+            .min(self.max_src_to_dst);
+        if moved.is_zero() {
+            return Err(TransactionResult::TecPathDry);
+        }
+        let output = moved
+            .mul_ratio(self.dst_q_in, 1_000_000_000, false)
+            .map_err(|_| TransactionResult::TefInternal)?;
+        credit_line(
+            ctx,
+            &self.src,
+            &self.dst,
+            &self.currency,
+            &moved.negate(),
+            true,
+        )?;
+        Ok(output)
+    }
+}
+
+/// A book, two account ripples, and a terminal book. Reverse pricing fixes
+/// each interior demand before the forward pass mutates the view.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cross_book_direct_path(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    dest: &AccountId,
+    steps: &[ResolvedPathStep],
+    target: &Value,
+    budget: &Value,
+) -> Result<(Value, Value), TransactionResult> {
+    let [
+        ResolvedPathStep::Book {
+            input: first_in,
+            output: first_out,
+        },
+        ResolvedPathStep::Direct {
+            src: first_src,
+            dst: first_dst,
+            currency: first_currency,
+        },
+        ResolvedPathStep::Direct {
+            src: second_src,
+            dst: second_dst,
+            currency: second_currency,
+        },
+        ResolvedPathStep::Book {
+            input: last_in,
+            output: last_out,
+        },
+    ] = steps
+    else {
+        return Err(TransactionResult::TecPathDry);
+    };
+    if first_dst != second_src
+        || first_currency != second_currency
+        || last_out != target
+        || first_in != budget
+    {
+        return Err(TransactionResult::TecPathDry);
+    }
+    let first_in = Leg::parse(first_in).ok_or(TransactionResult::TemBadAmount)?;
+    let first_out = Leg::parse(first_out).ok_or(TransactionResult::TemBadAmount)?;
+    let last_in = Leg::parse(last_in).ok_or(TransactionResult::TemBadAmount)?;
+    let last_out = Leg::parse(last_out).ok_or(TransactionResult::TemBadAmount)?;
+    if !first_in.is_xrp
+        || first_out.is_xrp
+        || last_in.is_xrp
+        || last_out.is_xrp
+        || first_out.issuer != *first_src
+        || last_in.issuer != *second_dst
+        || first_out.currency != *first_currency
+        || last_in.currency != *second_currency
+    {
+        return Err(TransactionResult::TecPathDry);
+    }
+    let source_funds = owner_funds_leg(ctx, taker, &first_in);
+    let source_budget = leg_min(&first_in, &source_funds);
+
+    let first_direct = DirectPaymentStep::from_view(
+        ctx,
+        *first_src,
+        *first_dst,
+        *first_currency,
+        true,
+        1_000_000_000,
+    )?;
+    let second_direct = DirectPaymentStep::from_view(
+        ctx,
+        *second_src,
+        *second_dst,
+        *second_currency,
+        first_direct.redeeming,
+        first_direct.dst_q_in,
+    )?;
+    if first_direct.src_no_ripple
+        || (first_direct.dst_no_ripple && second_direct.src_no_ripple)
+        || second_direct.dst_no_ripple
+    {
+        return Err(TransactionResult::TecPathDry);
+    }
+    // A speculative book walk obtains the exact input needed by the terminal
+    // CLOB. Its account and ledger changes are discarded before application.
+    let checkpoint = ctx.view.checkpoint();
+    let acct_before = taker_acct.clone();
+    let last_quote = cross_book_hop(
+        ctx,
+        taker,
+        taker_acct,
+        dest,
+        &last_out,
+        &unbounded_leg(&last_in),
+        true,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        1_000_000_000,
+        false,
+    );
+    ctx.view.rollback(checkpoint);
+    *taker_acct = acct_before;
+    let (quoted_out, required_last_in) = last_quote?;
+    if quoted_out.is_zero() {
+        return Err(TransactionResult::TecPathDry);
+    }
+    // The terminal book's reverse quote can be one canonical IOU unit below
+    // the amount moved by its preceding DirectStep. Retain that guard unit in
+    // the upstream demand; the forward book may spend one unit less.
+    if required_last_in.iou.is_zero() {
+        return Err(TransactionResult::TecPathDry);
+    }
+    let guarded_last_in = IOUAmount::from_parts(
+        required_last_in.iou.mantissa() + 1,
+        required_last_in.iou.exponent(),
+        false,
+    )
+    .map_err(|_| TransactionResult::TefInternal)?;
+    let (second_required, _) = second_direct.reverse(guarded_last_in)?;
+    let (first_required, _) = first_direct.reverse(second_required)?;
+    let mut first_demand = first_out.clone();
+    first_demand.iou = first_required;
+    let (got_first, spent_first) = cross_book_hop(
+        ctx,
+        taker,
+        taker_acct,
+        dest,
+        &first_demand,
+        &source_budget,
+        false,
+        true,
+        false,
+        false,
+        None,
+        false,
+        false,
+        1_000_000_000,
+        false,
+    )?;
+    if got_first.is_zero() {
+        return Err(TransactionResult::TecPathDry);
+    }
+    let first_step = DirectPaymentStep::from_view(
+        ctx,
+        *first_src,
+        *first_dst,
+        *first_currency,
+        true,
+        1_000_000_000,
+    )?;
+    let first_carry = first_step.forward(ctx, got_first.iou)?;
+    let second_step = DirectPaymentStep::from_view(
+        ctx,
+        *second_src,
+        *second_dst,
+        *second_currency,
+        first_step.redeeming,
+        first_step.dst_q_in,
+    )?;
+    let second_carry = second_step.forward(ctx, first_carry)?;
+    let mut last_budget = last_in.clone();
+    last_budget.iou = second_carry;
+    let (delivered, spent_last) = cross_book_hop(
+        ctx,
+        taker,
+        taker_acct,
+        dest,
+        &last_out,
+        &last_budget,
+        true,
+        false,
+        false,
+        false,
+        None,
+        false,
+        false,
+        1_000_000_000,
+        false,
+    )?;
+    if delivered.is_zero() || !legs_eq_or_one_ulp(&spent_last, &last_budget) {
+        return Err(TransactionResult::TecPathPartial);
+    }
+    Ok((
+        delivered.with_amount(&delivered.iou, delivered.drops),
+        spent_first.with_amount(&spent_first.iou, spent_first.drops),
+    ))
+}
+
 /// Equality of two like-typed legs (exact drops, exact IOU magnitude).
 fn legs_eq(a: &Leg, b: &Leg) -> bool {
     if a.is_xrp {

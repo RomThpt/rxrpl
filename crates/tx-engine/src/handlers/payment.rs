@@ -1578,6 +1578,71 @@ fn build_path_boundaries(
     Some(out)
 }
 
+/// Resolve the explicit book, account ripple, account ripple, book strand.
+/// Other path shapes continue through the existing strand resolvers.
+fn resolve_two_direct_path(
+    path: &[Value],
+    send_max: &Value,
+    amount: &Value,
+) -> Option<Vec<crate::handlers::offer_create::ResolvedPathStep>> {
+    use crate::handlers::offer_create::ResolvedPathStep;
+    if !send_max.is_string() || amount.is_string() || path.len() != 6 {
+        return None;
+    }
+    let first = &path[0];
+    let last = &path[4];
+    let first_currency = first.get("currency")?.as_str()?;
+    let first_issuer = first.get("issuer")?.as_str()?;
+    let last_currency = last.get("currency")?.as_str()?;
+    let last_issuer = last.get("issuer")?.as_str()?;
+    if first.get("account").is_some()
+        || last.get("account").is_some()
+        || first_currency == "XRP"
+        || last_currency == "XRP"
+        || (last_currency.to_owned(), last_issuer.to_owned()) != asset_of(amount)
+        || path[1].get("account")?.as_str()? != first_issuer
+        || path[5].get("account")?.as_str()? != last_issuer
+    {
+        return None;
+    }
+    let account_step = |index: usize| -> Option<&str> {
+        let step = &path[index];
+        if step.get("currency").is_some() || step.get("issuer").is_some() {
+            return None;
+        }
+        step.get("account")?.as_str()
+    };
+    let middle = account_step(2)?;
+    let second_issuer = account_step(3)?;
+    if first_issuer == middle || middle == second_issuer || second_issuer != last_issuer {
+        return None;
+    }
+    let asset = |currency: &str, issuer: &str| serde_json::json!({"currency": currency, "issuer": issuer, "value": "0"});
+    let first_out = asset(first_currency, first_issuer);
+    let second_out = asset(first_currency, second_issuer);
+    let currency = helpers::currency_to_bytes(first_currency);
+    Some(vec![
+        ResolvedPathStep::Book {
+            input: send_max.clone(),
+            output: first_out,
+        },
+        ResolvedPathStep::Direct {
+            src: decode_account_id(first_issuer).ok()?,
+            dst: decode_account_id(middle).ok()?,
+            currency,
+        },
+        ResolvedPathStep::Direct {
+            src: decode_account_id(middle).ok()?,
+            dst: decode_account_id(second_issuer).ok()?,
+            currency,
+        },
+        ResolvedPathStep::Book {
+            input: second_out,
+            output: amount.clone(),
+        },
+    ])
+}
+
 /// Apply a cross-currency Payment that carries `Paths` and a native (XRP)
 /// source or destination leg. Resolves the first viable path into a book chain
 /// and crosses it forward via the shared byte-exact Taker engine
@@ -1612,6 +1677,50 @@ fn apply_paths_payment(
         .get("Paths")
         .and_then(|v| v.as_array())
         .ok_or(TransactionResult::TemBadPath)?;
+
+    if account_str == destination_str
+        && helpers::get_flags(ctx.tx) & rxrpl_protocol::flags::payment::TF_LIMIT_QUALITY == 0
+        && paths.len() == 1
+        && let Some(path) = paths[0].as_array()
+        && let Some(steps) = resolve_two_direct_path(path, &send_max, &amount)
+    {
+        let checkpoint = ctx.view.checkpoint();
+        let result = crate::handlers::offer_create::cross_book_direct_path(
+            ctx, &src_id, &mut acct, &dst_id, &steps, &amount, &send_max,
+        );
+        let (got, _spent) = match result {
+            Ok(amounts) => amounts,
+            Err(error) => {
+                ctx.view.rollback(checkpoint);
+                return Err(error);
+            }
+        };
+        let got_number = value_to_number(&got);
+        if got_number.is_zero() || got_number.negative() {
+            ctx.view.rollback(checkpoint);
+            return Err(TransactionResult::TecPathDry);
+        }
+        let partial =
+            helpers::get_flags(ctx.tx) & rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT != 0;
+        let reached = num_le(&value_to_number(&amount), &got_number)
+            || (partial
+                && ctx
+                    .tx
+                    .get("DeliverMin")
+                    .is_none_or(|min| num_le(&value_to_number(min), &got_number)));
+        if !reached {
+            ctx.view.rollback(checkpoint);
+            return Err(TransactionResult::TecPathPartial);
+        }
+        if got != amount {
+            ctx.view.set_delivered_amount(got);
+        }
+        let nb = serde_json::to_vec(&acct).map_err(|_| TransactionResult::TefInternal)?;
+        ctx.view
+            .update(src_key, nb)
+            .map_err(|_| TransactionResult::TefInternal)?;
+        return Ok(TransactionResult::TesSuccess);
+    }
 
     // Fill every viable path in order with remaining Amount/SendMax.
     // 30000103 70135FCE: path 0 (XLM) delivers 912 CNY then path 1 (JPY)
