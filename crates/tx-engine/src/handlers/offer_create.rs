@@ -1625,6 +1625,8 @@ fn cross_offers(
                     direct_amm_used = true;
                     (remaining_out, remaining_out_num) =
                         aggregate_output_remainder(&out_leg, &direct_outputs);
+                    remaining_out =
+                        flow_buy_remaining_output(&remaining_out, &out_leg, is_sell, crossed);
                     continue_to_clob = !remaining_out.is_zero();
                 }
                 amm_consumed_in_band = leg_gt(&source_before_amm, &source_remaining);
