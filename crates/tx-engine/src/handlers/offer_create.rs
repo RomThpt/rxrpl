@@ -18,6 +18,104 @@ fn u64_hex(n: u64) -> String {
     format!("{n:016X}")
 }
 
+#[cfg(test)]
+mod ledger_105504157_tests {
+    use super::*;
+    use crate::fees::FeeSettings;
+    use crate::view::ledger_view::LedgerView;
+    use crate::view::read_view::ReadView;
+    use crate::view::sandbox::Sandbox;
+    use rxrpl_amendment::Rules;
+    use rxrpl_ledger::Ledger;
+
+    #[test]
+    fn offer_create_crosses_xah_xrp_bridge_and_direct_rlusd_amm() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("ledger_105504157_fixture.json")).unwrap();
+        let mut ledger = Ledger::genesis();
+        for (key, entry) in fixture["entries"].as_object().unwrap() {
+            ledger
+                .put_state(key.parse().unwrap(), serde_json::to_vec(entry).unwrap())
+                .unwrap();
+        }
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let rules = Rules::from_enabled([
+            feature_id("FlowCross"),
+            feature_id("FlowSortStrands"),
+            feature_id("fixUniversalNumber"),
+            feature_id("fixAMMv1_2"),
+            feature_id("fixAMMv1_3"),
+            feature_id("fixReducedOffersV1"),
+            feature_id("fixReducedOffersV2"),
+        ]);
+        let tx = &fixture["tx"];
+        let mut ctx = ApplyContext {
+            tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+        let input = Leg::parse(&tx["TakerGets"]).unwrap();
+        let output = Leg::parse(&tx["TakerPays"]).unwrap();
+        let threshold = crossing_quality_threshold(&input, &output, true, false);
+        let direct =
+            build_flow_strand(&ctx, &[tx["TakerGets"].clone(), tx["TakerPays"].clone()]).unwrap();
+        assert!(direct.hops[0].has_clob);
+        let direct_tip = book_tip_quality(&ctx, &direct.hops[0].inverse_book).unwrap();
+        assert!(reject_quality(direct_tip, threshold));
+        assert!(direct.terminal_has_amm());
+        assert_eq!(
+            OfferCreateTransactor.apply(&mut ctx),
+            Ok(TransactionResult::TesSuccess)
+        );
+        for node in fixture["tx"]["meta"]["AffectedNodes"].as_array().unwrap() {
+            let modified = &node["ModifiedNode"];
+            let kind = modified["LedgerEntryType"].as_str().unwrap();
+            if kind != "RippleState" && kind != "Offer" && kind != "AccountRoot" {
+                continue;
+            }
+            if kind == "AccountRoot" && modified["FinalFields"]["Account"] == tx["Account"] {
+                continue;
+            }
+            let key: Hash256 = modified["LedgerIndex"].as_str().unwrap().parse().unwrap();
+            let current: Value = serde_json::from_slice(&sandbox.read(&key).unwrap()).unwrap();
+            let expected = &modified["FinalFields"];
+            if kind == "RippleState" {
+                assert_eq!(
+                    current["Balance"]["value"], expected["Balance"]["value"],
+                    "trust line {key}"
+                );
+            } else if kind == "Offer" {
+                assert_eq!(current["TakerGets"], expected["TakerGets"], "offer {key}");
+                assert_eq!(current["TakerPays"], expected["TakerPays"], "offer {key}");
+            } else {
+                assert_eq!(current["Balance"], expected["Balance"], "maker {key}");
+            }
+        }
+        let changes = sandbox.into_changes();
+        let expected_keys: HashSet<Hash256> = fixture["tx"]["meta"]["AffectedNodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| {
+                node["ModifiedNode"]["LedgerIndex"]
+                    .as_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            changes.updates.keys().copied().collect::<HashSet<_>>(),
+            expected_keys
+        );
+        assert!(changes.inserts.is_empty());
+        assert!(changes.deletes.is_empty());
+    }
+}
+
 /// The order-book directory index for a given quality: the book base with its
 /// low 64 bits replaced by the quality (rate).
 pub(crate) fn book_dir_with_quality(book_base: &Hash256, quality: u64) -> Hash256 {
@@ -1391,16 +1489,19 @@ fn cross_offers(
         None
     };
 
-    // With an empty direct book and no issuer fees, the direct IOU/IOU AMM
-    // competes with the XRP autobridge on every Flow pass. Walking the bridge
-    // to completion first loses better-quality direct AMM Fibonacci fills.
+    // With no crossable direct book offer and no issuer fees, the direct
+    // IOU/IOU AMM competes with the XRP autobridge on every Flow pass. An
+    // out-of-quality CLOB tip must not disable this competition just because
+    // its directory exists (105504157 / D778CAF8).
     // The sorted strand selector preserves their shared AMM iteration state.
     if let Some(bridge_strand) = bridge.as_ref()
         && let Some(direct_strand) =
             build_flow_strand(ctx, &[taker_gets.clone(), taker_pays.clone()])
         && ctx.rules.enabled(&feature_id("FlowSortStrands"))
         && direct_strand.terminal_has_amm()
-        && !direct_strand.hops[0].has_clob
+        && (!direct_strand.hops[0].has_clob
+            || book_tip_quality(ctx, &direct_strand.hops[0].inverse_book)
+                .is_none_or(|q| reject_quality(q, clob_threshold)))
         && transfer_rate_value(ctx, &in_leg.issuer) == 1_000_000_000
         && transfer_rate_value(ctx, &out_leg.issuer) == 1_000_000_000
     {
