@@ -487,9 +487,14 @@ impl Transactor for PaymentTransactor {
                     // Either native boundary can mix AMM and CLOB liquidity.
                     // The single-swap shortcut spends all SendMax in the AMM
                     // before the book gets a turn (105501273, IOU -> XRP).
+                    // Partial payments without DeliverMin have the same mixed
+                    // strand (105504120, IOU -> XRP).
                     let direct_native_amm_book = account_str == destination_str
                         && (send_max.is_string() || ctx.tx["Amount"].is_string())
-                        && ctx.tx.get("DeliverMin").is_some()
+                        && (ctx.tx.get("DeliverMin").is_some()
+                            || helpers::get_flags(ctx.tx)
+                                & rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT
+                                != 0)
                         && ctx.tx.get("Paths").is_none()
                         && direct_pair_has_amm_and_clob(
                             ctx,
@@ -1821,10 +1826,82 @@ fn direct_pair_has_amm_and_clob(
     else {
         return Ok(false);
     };
-    Ok(
+    let Some(book_quality) =
         best_book_dir_quality(ctx, &taker, &in_cur, &in_iss, &out_cur, &out_iss, out_xrp)?
-            .is_some(),
+    else {
+        return Ok(false);
+    };
+    if ctx.tx.get("DeliverMin").is_some() {
+        return Ok(true);
+    }
+
+    // Without DeliverMin, keep the existing book-first conversion when its
+    // first funded offer beats the pool (105502386). Flow is needed only when
+    // the pool takes the first quality band (105504120).
+    let Some((in_xrp, _, _)) = amm_asset_of(send_max) else {
+        return Ok(false);
+    };
+    let amm_key = keylet::amm(&in_cur, &in_iss, &out_cur, &out_iss);
+    let Some(amm_bytes) = ctx.view.read(&amm_key) else {
+        return Ok(false);
+    };
+    let Ok(amm): Result<serde_json::Value, _> = serde_json::from_slice(&amm_bytes) else {
+        return Ok(false);
+    };
+    let Some(pool_id) = amm
+        .get("Account")
+        .and_then(|v| v.as_str())
+        .and_then(|s| decode_account_id(s).ok())
+    else {
+        return Ok(false);
+    };
+    let pool_in = amm_pool_balance(ctx, &pool_id, in_xrp, &in_cur, &in_iss);
+    let pool_out = amm_pool_balance(ctx, &pool_id, out_xrp, &out_cur, &out_iss);
+    if pool_in.is_zero() || pool_out.is_zero() {
+        return Ok(false);
+    }
+    let fee = amm.get("TradingFee").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+    Ok(amm_spot_beats_book(
+        &pool_in,
+        &pool_out,
+        fee,
+        in_xrp,
+        out_xrp,
+        book_quality,
+    ))
+}
+
+fn amm_spot_beats_book(
+    pool_in: &rxrpl_amount::number::Number,
+    pool_out: &rxrpl_amount::number::Number,
+    fee: u16,
+    in_xrp: bool,
+    out_xrp: bool,
+    book_quality: u64,
+) -> bool {
+    let q_iou = |n: &rxrpl_amount::number::Number, is_xrp: bool| {
+        if is_xrp {
+            rxrpl_amount::IOUAmount::from_decimal_string(&n.to_xrp_drops().to_string())
+                .unwrap_or(rxrpl_amount::IOUAmount::ZERO)
+        } else {
+            n.to_iou()
+        }
+    };
+    let one_minus_fee = rxrpl_amount::IOUAmount::divide(
+        &rxrpl_amount::IOUAmount::from_decimal_string(&(100_000u32 - u32::from(fee)).to_string())
+            .unwrap_or(rxrpl_amount::IOUAmount::ZERO),
+        &rxrpl_amount::IOUAmount::from_decimal_string("100000")
+            .unwrap_or(rxrpl_amount::IOUAmount::ZERO),
     )
+    .unwrap_or(rxrpl_amount::IOUAmount::ZERO);
+    let out_q = q_iou(pool_out, out_xrp);
+    let out_adj = rxrpl_amount::IOUAmount::multiply(&out_q, &one_minus_fee).unwrap_or(out_q);
+    if let Ok(spot_quality) = rxrpl_amount::get_rate(&q_iou(pool_in, in_xrp), &out_adj) {
+        rxrpl_amount::is_better_quality(spot_quality, book_quality)
+            && !rxrpl_amount::within_relative_distance(spot_quality, book_quality)
+    } else {
+        true
+    }
 }
 
 /// Whether rippled's terminal `DirectStep` from an IOU issuer to the payment
@@ -2580,31 +2657,8 @@ fn try_amm_conversion(
     if let Some(cq) =
         best_book_dir_quality(ctx, user_id, &in_cur, &in_iss, &out_cur, &out_iss, out_xrp)?
     {
-        let q_iou = |n: &Number, is_xrp: bool| {
-            if is_xrp {
-                rxrpl_amount::IOUAmount::from_decimal_string(&n.to_xrp_drops().to_string())
-                    .unwrap_or(rxrpl_amount::IOUAmount::ZERO)
-            } else {
-                n.to_iou()
-            }
-        };
-        let one_minus_fee = rxrpl_amount::IOUAmount::divide(
-            &rxrpl_amount::IOUAmount::from_decimal_string(
-                &(100_000u32 - u32::from(tfee)).to_string(),
-            )
-            .unwrap_or(rxrpl_amount::IOUAmount::ZERO),
-            &rxrpl_amount::IOUAmount::from_decimal_string("100000")
-                .unwrap_or(rxrpl_amount::IOUAmount::ZERO),
-        )
-        .unwrap_or(rxrpl_amount::IOUAmount::ZERO);
-        let out_q = q_iou(&pool_out, out_xrp);
-        let out_adj = rxrpl_amount::IOUAmount::multiply(&out_q, &one_minus_fee).unwrap_or(out_q);
-        if let Ok(spq) = rxrpl_amount::get_rate(&q_iou(&pool_in, in_xrp), &out_adj) {
-            if !rxrpl_amount::is_better_quality(spq, cq)
-                || rxrpl_amount::within_relative_distance(spq, cq)
-            {
-                return Ok(None);
-            }
+        if !amm_spot_beats_book(&pool_in, &pool_out, tfee, in_xrp, out_xrp, cq) {
+            return Ok(None);
         }
     }
 

@@ -3615,22 +3615,39 @@ fn ledger_105502719_unfunded_book_tip_is_reaped_before_amm_swap() {
 
 #[test]
 fn direct_iou_to_xrp_conversion_splits_amm_and_book() {
-    run_direct_iou_to_xrp_conversion_splits_amm_and_book("25.3309569946823", "15446876", true);
+    run_direct_iou_to_xrp_conversion_splits_amm_and_book(
+        "25.3309569946823",
+        Some("15446876"),
+        true,
+    );
+}
+
+#[test]
+fn direct_partial_iou_to_xrp_without_deliver_min_splits_amm_and_book() {
+    run_direct_iou_to_xrp_conversion_splits_amm_and_book("25.3309569946823", None, true);
 }
 
 #[test]
 fn direct_iou_to_xrp_conversion_caps_send_max_at_source_funds() {
-    run_direct_iou_to_xrp_conversion_splits_amm_and_book("26.3309569946823", "15446876", true);
+    run_direct_iou_to_xrp_conversion_splits_amm_and_book(
+        "26.3309569946823",
+        Some("15446876"),
+        true,
+    );
 }
 
 #[test]
 fn direct_iou_to_xrp_conversion_enforces_native_deliver_min() {
-    run_direct_iou_to_xrp_conversion_splits_amm_and_book("25.3309569946823", "30000000", false);
+    run_direct_iou_to_xrp_conversion_splits_amm_and_book(
+        "25.3309569946823",
+        Some("30000000"),
+        false,
+    );
 }
 
 fn run_direct_iou_to_xrp_conversion_splits_amm_and_book(
     send_max_value: &str,
-    deliver_min: &str,
+    deliver_min: Option<&str>,
     expect_success: bool,
 ) {
     let mut ledger = Ledger::genesis();
@@ -3684,12 +3701,15 @@ fn run_direct_iou_to_xrp_conversion_splits_amm_and_book(
     let view = LedgerView::with_fees(&ledger, fees.clone());
     let mut sandbox = Sandbox::new(&view);
     let rules = Rules::new();
-    let tx = serde_json::json!({
+    let mut tx = serde_json::json!({
         "TransactionType": "Payment", "Account": ALICE, "Destination": ALICE,
-        "Amount": "100000000000000000", "DeliverMin": deliver_min,
+        "Amount": "100000000000000000",
         "SendMax": iou("USD", ISSUER, send_max_value),
         "Flags": rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT, "Fee": "12",
     });
+    if let Some(deliver_min) = deliver_min {
+        tx["DeliverMin"] = serde_json::json!(deliver_min);
+    }
     let mut ctx = ApplyContext {
         tx: &tx,
         view: &mut sandbox,
