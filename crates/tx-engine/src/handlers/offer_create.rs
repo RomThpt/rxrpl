@@ -3439,7 +3439,7 @@ fn cross_book_hop_with_reaps(
                 (take_out.clone(), order_in)
             };
 
-            let (order_out, order_in) = {
+            let (order_out, mut order_in) = {
                 let mut order_in = order_in;
                 if legacy_intermediate_xrp_rounding_applies(
                     skip_input_debit,
@@ -3453,6 +3453,30 @@ fn cross_book_hop_with_reaps(
                 }
                 (order_out, order_in)
             };
+
+            // The fee-capped forward pass can quote one IOU ULP below the
+            // amount removed from the resting offer after Number rounds its
+            // residual. For a newly created maker line, rippled credits that
+            // canonical consumed amount (105503449/BEF9CAC7).
+            if terminal
+                && budget_binds
+                && source_input_rate != 1_000_000_000
+                && !order_in.is_xrp
+                && ctx
+                    .view
+                    .read(&keylet::trust_line(
+                        &owner,
+                        &order_in.issuer,
+                        &order_in.currency,
+                    ))
+                    .is_none()
+            {
+                let residual = leftover_leg(&offer_in, &order_in, number_switchover);
+                let canonical = leftover_leg(&offer_in, &residual, number_switchover);
+                if leg_gt(&canonical, &order_in) {
+                    order_in = canonical;
+                }
+            }
 
             let step_in =
                 gross_book_payment_input(&order_in, &remaining_in, source_input_rate, budget_binds);
@@ -10555,6 +10579,16 @@ mod taker_crossing_tests {
         let realized =
             crossing_quality_threshold(&iou("0.00000664629441625"), &xrp(6), true, false);
         assert!(reject_quality(realized, limit));
+    }
+
+    #[test]
+    fn ledger_105503449_fee_limited_offer_input_round_trip() {
+        let offer_in = iou("746.836934443318");
+        let quoted = iou("12.83858365582099");
+        let remaining = leftover_leg(&offer_in, &quoted, true);
+        assert_eq!(remaining.iou.to_decimal_string(), "733.998350787497");
+        let credited = leftover_leg(&offer_in, &remaining, true);
+        assert_eq!(credited.iou.to_decimal_string(), "12.838583655821");
     }
 
     #[test]
