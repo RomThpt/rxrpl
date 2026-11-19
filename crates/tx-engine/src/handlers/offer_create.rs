@@ -1985,6 +1985,7 @@ fn cross_offers(
     // exact AMM and CLOB deliveries so a later partial offer uses the aggregate
     // remainder, rather than repeated rounded subtraction (105502845/TX16).
     let mut direct_outputs = Vec::new();
+    let mut bridge_outputs = Vec::new();
     let mut direct_amm_used = false;
     let mut direct_fib_pass_used = false;
     let mut remaining_in = in_leg.clone();
@@ -2300,6 +2301,7 @@ fn cross_offers(
                     &mut remaining_in,
                     &mut source_remaining,
                     &mut crossed,
+                    &mut bridge_outputs,
                     dir_quality,
                     is_sell,
                 )?;
@@ -2331,17 +2333,18 @@ fn cross_offers(
                     direct_amm_source_spent.push(leg_to_number(spent));
                 }
                 if number_switchover
-                    && bridge.is_none()
                     && !is_sell
                     && let Some((delivered, _)) = amm_fill
                 {
                     direct_outputs.push(leg_to_number(&delivered));
                     direct_amm_used = true;
-                    (remaining_out, remaining_out_num) =
-                        aggregate_output_remainder(&out_leg, &direct_outputs);
-                    remaining_out =
-                        flow_buy_remaining_output(&remaining_out, &out_leg, is_sell, crossed);
-                    continue_to_clob = !remaining_out.is_zero();
+                    if bridge.is_none() {
+                        (remaining_out, remaining_out_num) =
+                            aggregate_output_remainder(&out_leg, &direct_outputs);
+                        remaining_out =
+                            flow_buy_remaining_output(&remaining_out, &out_leg, is_sell, crossed);
+                        continue_to_clob = !remaining_out.is_zero();
+                    }
                 }
                 amm_consumed_in_band = leg_gt(&source_before_amm, &source_remaining);
                 non_clob_source_spent |= amm_consumed_in_band;
@@ -2842,7 +2845,7 @@ fn cross_offers(
             } else {
                 leg_sub(&remaining_out, &order_out)
             };
-            if number_switchover && bridge.is_none() && !is_sell && !direct_amm_used {
+            if number_switchover && !is_sell && !direct_amm_used {
                 direct_outputs.push(leg_to_number(&order_out));
             }
             // FlowCross carries the taker's remaining input as a Number. Round
@@ -2910,13 +2913,14 @@ fn cross_offers(
                 &mut remaining_in,
                 &mut source_remaining,
                 &mut crossed,
+                &mut bridge_outputs,
                 threshold,
                 is_sell,
             )?;
             non_clob_source_spent |= leg_gt(&source_before_bridge, &source_remaining);
             if let Some(mut amm_ctx) = bridge_handoff {
                 let source_before_direct = source_remaining.clone();
-                direct_fib_pass_used = try_direct_flow_amm_pass(
+                let direct_fib_output = try_direct_flow_amm_pass(
                     ctx,
                     taker,
                     taker_acct,
@@ -2932,6 +2936,14 @@ fn cross_offers(
                     is_sell,
                     &mut amm_ctx,
                 )?;
+                direct_fib_pass_used = direct_fib_output.is_some();
+                if number_switchover
+                    && !is_sell
+                    && let Some(output) = direct_fib_output
+                {
+                    direct_outputs.push(output);
+                    direct_amm_used = true;
+                }
                 non_clob_source_spent |= leg_gt(&source_before_direct, &source_remaining);
                 direct_flow_pass = true;
             }
@@ -3007,6 +3019,17 @@ fn cross_offers(
             rxrpl_amount::number::MantissaScale::Small,
         );
         (remaining_out, remaining_out_num) = aggregate_output_remainder(&out_leg, &direct_outputs);
+    }
+
+    if number_switchover
+        && bridge.is_some()
+        && !is_sell
+        && !remaining_out.is_zero()
+        && !bridge_outputs.is_empty()
+    {
+        let mut outputs = direct_outputs.clone();
+        outputs.extend(bridge_outputs);
+        (remaining_out, remaining_out_num) = aggregate_output_remainder(&out_leg, &outputs);
     }
 
     if direct_fib_pass_used && let Some(source) = source_balance.as_ref() {
@@ -3495,6 +3518,7 @@ fn try_bridge_step(
     remaining_in: &mut Leg,
     source_remaining: &mut Leg,
     crossed: &mut bool,
+    bridge_outputs: &mut Vec<Number>,
     cq: u64,
     is_sell: bool,
 ) -> Result<Option<AmmContext>, TransactionResult> {
@@ -3503,6 +3527,8 @@ fn try_bridge_step(
     // vault or lending amendments enable the larger mantissa.
     let _number_scale = crate::amm_helpers::amm_number_scale_guard(ctx.rules);
     let mut budget = leg_min(remaining_in, source_remaining);
+    let prior_in = leg_to_number(in_leg).sub(&leg_to_number(remaining_in));
+    let prior_out = leg_to_number(out_leg).sub(&leg_to_number(remaining_out));
     // Flow uses Fibonacci AMM chunks only while both the direct and bridge
     // strands remain eligible. A dry direct book leaves a single bridge strand
     // (105500435); funded direct liquidity keeps the multi-path mode
@@ -3527,11 +3553,15 @@ fn try_bridge_step(
     let bridge_limit = from_rate(threshold)
         .ok()
         .map(|rate| Number::from_iou(&rate));
+    let competition_limit = from_rate(cq).ok().map(|rate| Number::from_iou(&rate));
     let pass_limit = is_sell
         .then(|| from_rate(cq).ok().map(|rate| Number::from_iou(&rate)))
         .flatten();
-    if !matches!((bridge_bound, bridge_limit), (Some(bound), Some(limit)) if num_le(&bound, &limit))
-    {
+    if !matches!(
+        (bridge_bound.as_ref(), bridge_limit.as_ref(), competition_limit.as_ref()),
+        (Some(bound), Some(limit), Some(competition))
+            if num_le(bound, limit) && num_le(bound, competition)
+    ) {
         return Ok(None);
     }
 
@@ -3647,17 +3677,19 @@ fn try_bridge_step(
     }
     let total_in = sum_smallest_to_largest(&pass_ins);
     let total_out = sum_smallest_to_largest(&pass_outs);
-    let in_q = num_quality_iou(&total_in, in_leg.is_xrp);
-    let out_q = num_quality_iou(&total_out, out_leg.is_xrp);
-    let eff_q = if ctx.rules.enabled(&feature_id("fixUniversalNumber")) {
-        rxrpl_amount::get_rate_round_even(&in_q, &out_q)
-    } else {
-        rxrpl_amount::get_rate(&in_q, &out_q)
-    }
-    .unwrap_or(u64::MAX);
-    if !(rxrpl_amount::is_better_quality(eff_q, cq)
-        || quality_adjusted && rxrpl_amount::within_relative_distance(eff_q, cq))
-    {
+    let quality_limit = if is_sell { cq } else { threshold };
+    if !bridge_candidate_meets_limit(
+        &prior_in,
+        &prior_out,
+        &total_in,
+        &total_out,
+        is_sell,
+        in_leg.is_xrp,
+        out_leg.is_xrp,
+        quality_limit,
+        ctx.rules.enabled(&feature_id("fixUniversalNumber")),
+        quality_adjusted,
+    ) {
         ctx.view.rollback(cp);
         *taker_acct = taker_acct_before;
         return Ok(None);
@@ -3665,6 +3697,7 @@ fn try_bridge_step(
 
     let spent = leg_from_magnitude(&total_in.to_iou(), in_leg);
     let delivered = leg_from_magnitude(&total_out.to_iou(), out_leg);
+    bridge_outputs.extend(pass_outs);
     let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
     *remaining_in = leftover_leg(remaining_in, &spent, number_switchover);
     *source_remaining = leftover_leg(source_remaining, &spent, number_switchover);
@@ -3696,13 +3729,13 @@ fn try_direct_flow_amm_pass(
     threshold: u64,
     is_sell: bool,
     amm_ctx: &mut AmmContext,
-) -> Result<bool, TransactionResult> {
+) -> Result<Option<Number>, TransactionResult> {
     let Some(direct) = build_flow_strand(ctx, &[taker_gets.clone(), taker_pays.clone()]) else {
-        return Ok(false);
+        return Ok(None);
     };
     let budget = leg_min(remaining_in, source_remaining);
     if budget.is_zero() || (!is_sell && remaining_out.is_zero()) {
-        return Ok(false);
+        return Ok(None);
     }
     let demand = if is_sell {
         unbounded_leg(out_leg)
@@ -3731,12 +3764,12 @@ fn try_direct_flow_amm_pass(
     let Some(pass) = pass else {
         ctx.view.rollback(cp);
         *taker_acct = taker_acct_before;
-        return Ok(false);
+        return Ok(None);
     };
     if pass.in_amt.is_zero() || pass.out_amt.is_zero() || pass.offers_used != 0 {
         ctx.view.rollback(cp);
         *taker_acct = taker_acct_before;
-        return Ok(false);
+        return Ok(None);
     }
     let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
     let limit_rate =
@@ -3745,7 +3778,7 @@ fn try_direct_flow_amm_pass(
     if num_gt(&realised_rate, &limit_rate) {
         ctx.view.rollback(cp);
         *taker_acct = taker_acct_before;
-        return Ok(false);
+        return Ok(None);
     }
 
     let spent = leg_from_magnitude(&pass.in_amt.to_iou(), in_leg);
@@ -3759,7 +3792,7 @@ fn try_direct_flow_amm_pass(
     };
     *crossed = true;
     amm_ctx.update();
-    Ok(true)
+    Ok(Some(pass.out_amt))
 }
 
 fn bridge_adjusted_pass_meets_limit(
@@ -3779,6 +3812,41 @@ fn bridge_adjusted_pass_meets_limit(
         rxrpl_amount::is_better_quality(rate, limit)
             || rxrpl_amount::within_relative_distance(rate, limit)
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bridge_candidate_meets_limit(
+    prior_input: &Number,
+    prior_output: &Number,
+    candidate_input: &Number,
+    candidate_output: &Number,
+    is_sell: bool,
+    input_is_xrp: bool,
+    output_is_xrp: bool,
+    limit: u64,
+    round_even: bool,
+    quality_adjusted: bool,
+) -> bool {
+    let input = if is_sell {
+        *candidate_input
+    } else {
+        prior_input.add(candidate_input)
+    };
+    let output = if is_sell {
+        *candidate_output
+    } else {
+        prior_output.add(candidate_output)
+    };
+    let input = num_quality_iou(&input, input_is_xrp);
+    let output = num_quality_iou(&output, output_is_xrp);
+    let rate = if round_even {
+        rxrpl_amount::get_rate_round_even(&input, &output)
+    } else {
+        rxrpl_amount::get_rate(&input, &output)
+    }
+    .unwrap_or(u64::MAX);
+    rxrpl_amount::is_better_quality(rate, limit)
+        || quality_adjusted && rxrpl_amount::within_relative_distance(rate, limit)
 }
 
 /// Output deliverable for a given input at a resting offer's price. This mirrors
@@ -4405,7 +4473,26 @@ fn cross_book_hop_with_reaps(
             {
                 break 'walk;
             }
-            let avail_out = leg_min(&offer_out, &funds);
+            let fee_applies = !skip_output_credit
+                && !offer_out.is_xrp
+                && offer_out.issuer != owner
+                && offer_out.issuer != *dest;
+            let bridge_terminal_net_offer = fee_applies
+                && skip_input_debit
+                && !skip_output_credit
+                && offer_in.is_xrp
+                && ctx.tx.get("TransactionType").and_then(Value::as_str) == Some("OfferCreate");
+            let output_rate = if fee_applies {
+                transfer_rate_value(ctx, &offer_out.issuer)
+            } else {
+                1_000_000_000
+            };
+            let available_offer_out = if bridge_terminal_net_offer {
+                net_book_payment_input(&funds, output_rate)
+            } else {
+                funds.clone()
+            };
+            let avail_out = leg_min(&offer_out, &available_offer_out);
             // OfferStream continues stepping invalid entries after source funds
             // are exhausted, so expired/unfunded offers are still reaped. A
             // funded IOU remainder may also cost less than one XRP drop when a
@@ -4445,11 +4532,7 @@ fn cross_book_hop_with_reaps(
             // remaining (30000046 63B72EB4: 1.002 left a 50 JPY shortfall that
             // walked worse JPY/XRP offers).
             let terminal = !skip_input_debit && !skip_output_credit;
-            let fee_applies = !skip_output_credit
-                && !offer_out.is_xrp
-                && offer_out.issuer != owner
-                && offer_out.issuer != *dest;
-            let remaining_out_cap = if fee_applies {
+            let remaining_out_cap = if fee_applies && !bridge_terminal_net_offer {
                 let rate = transfer_rate(ctx, &offer_out.issuer);
                 let one = IOUAmount::from_parts(1_000_000_000, -9, false).unwrap();
                 if rate > one {
@@ -4761,10 +4844,10 @@ fn cross_book_hop_with_reaps(
                     skip_input_debit,
                 )?;
             }
-            // `order_out` is the GROSS the offer/owner gives (the TakerGets it
-            // reduces by); `net_out` is what `dest` actually receives after the
-            // output issuer's transfer fee. The book demand (`remaining_out`) is
-            // tracked in NET terms, so it decrements by `net_out`, not the gross.
+            // `order_out` normally reduces the offer and debits the owner. A
+            // terminal autobridge with an output fee instead keeps `order_out`
+            // net for the offer reduction and computes a separate gross owner
+            // debit below. Book demand is always tracked in net terms.
             let balance_rounding = if number_switchover {
                 BalanceRounding::Nearest
             } else {
@@ -4776,13 +4859,20 @@ fn cross_book_hop_with_reaps(
                 balance_rounding
             };
             let fee_rounding = book_output_fee_rounding(budget_binds, skip_output_credit);
+            let gross_owner_out = if bridge_terminal_net_offer {
+                let mut gross = order_out.clone();
+                gross.iou = grossed(&order_out.iou, &transfer_rate(ctx, &offer_out.issuer));
+                leg_min(&gross, &funds)
+            } else {
+                order_out.clone()
+            };
             let net_out = pay_out_gross(
                 ctx,
                 taker,
                 taker_acct,
                 &owner,
                 dest,
-                &order_out,
+                &gross_owner_out,
                 number_switchover,
                 owner_rounding,
                 balance_rounding,
@@ -14362,11 +14452,11 @@ mod flow_source_balance_tests {
     use super::{
         Leg, aggregate_flow_destination_balance_number, aggregate_flow_destination_balance_passes,
         aggregate_flow_source_balance_number, aggregate_flow_source_balance_passes,
-        aggregate_output_remainder, can_fund_new_trust_line, flow_gross_input, flow_holder_funds,
-        flow_input_limit, flow_net_input, flow_source_pass_budget, is_pure_direct_iou_buy,
-        leftover_leg, next_flow_strands, preserve_flow_output_ulp,
-        should_reconcile_direct_destination, should_reconcile_pure_clob_output_remainder,
-        sum_smallest_to_largest,
+        aggregate_output_remainder, bridge_candidate_meets_limit, can_fund_new_trust_line,
+        flow_gross_input, flow_holder_funds, flow_input_limit, flow_net_input,
+        flow_source_pass_budget, is_pure_direct_iou_buy, leftover_leg, net_book_payment_input,
+        next_flow_strands, preserve_flow_output_ulp, should_reconcile_direct_destination,
+        should_reconcile_pure_clob_output_remainder, sum_smallest_to_largest,
     };
     use rxrpl_amount::IOUAmount;
     use rxrpl_amount::number::{MantissaScale, MantissaScaleGuard, Number};
@@ -14631,6 +14721,86 @@ mod flow_source_balance_tests {
         assert!(!should_reconcile_pure_clob_output_remainder(
             false, true, 8, false,
         ));
+    }
+
+    #[test]
+    fn ledger_105504340_accepts_bridge_at_cumulative_buy_quality() {
+        let _scale = MantissaScaleGuard::new(MantissaScale::Small);
+        let prior_input = Number::from_iou(&IOUAmount::from_decimal_string("1908.97401").unwrap());
+        let prior_output = Number::from_iou(&IOUAmount::from_decimal_string("0.02989").unwrap());
+        let candidate_input =
+            Number::from_iou(&IOUAmount::from_decimal_string("158.384944602552").unwrap());
+        let candidate_output =
+            Number::from_iou(&IOUAmount::from_decimal_string("0.00247813160299974").unwrap());
+        let aggregate_rate = rxrpl_amount::get_rate_round_even(
+            &prior_input.add(&candidate_input).to_iou(),
+            &prior_output.add(&candidate_output).to_iou(),
+        )
+        .unwrap();
+        assert_eq!(aggregate_rate, 6_419_512_889_114_504_315);
+
+        assert!(!bridge_candidate_meets_limit(
+            &Number::ZERO,
+            &Number::ZERO,
+            &candidate_input,
+            &candidate_output,
+            false,
+            false,
+            false,
+            6_419_512_889_114_504_316,
+            true,
+            false,
+        ));
+        assert!(bridge_candidate_meets_limit(
+            &prior_input,
+            &prior_output,
+            &candidate_input,
+            &candidate_output,
+            false,
+            false,
+            false,
+            6_419_512_889_114_504_316,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn ledger_105504340_separates_net_offer_output_from_owner_debit() {
+        let gross = Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: IOUAmount::from_decimal_string("0.001598399976539127").unwrap(),
+            currency: [1; 20],
+            issuer: AccountId::from([2; 20]),
+        };
+        let net = net_book_payment_input(&gross, 1_001_500_000);
+
+        assert_eq!(net.iou.to_decimal_string(), "0.001596005967587745");
+    }
+
+    #[test]
+    fn ledger_105504340_aggregates_direct_and_bridge_remainder() {
+        let _scale = MantissaScaleGuard::new(MantissaScale::Small);
+        let requested = Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: IOUAmount::from_decimal_string("0.15636").unwrap(),
+            currency: [1; 20],
+            issuer: AccountId::from([2; 20]),
+        };
+        let outputs = [
+            "0.02989",
+            "0.000441062817706",
+            "0.001596005967587745",
+            "0.000441062817706",
+            "0.04484",
+        ]
+        .map(|value| Number::from_iou(&IOUAmount::from_decimal_string(value).unwrap()));
+
+        let (remaining, precise) = aggregate_output_remainder(&requested, &outputs);
+        assert_eq!(remaining.iou.to_decimal_string(), "0.07915186839700026");
+        assert_eq!(precise.to_iou().to_decimal_string(), "0.07915186839700026");
     }
 
     #[test]
