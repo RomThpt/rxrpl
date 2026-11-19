@@ -2013,6 +2013,31 @@ fn cross_offers(
     } else {
         None
     };
+    // Flow settles the destination DirectStep once from the aggregate strand
+    // output. Keep an existing positive holding's pre-crossing balance so a
+    // direct AMM/CLOB pass can replace synthetic per-fragment credits with that
+    // canonical addition. A zero/debt balance stays on the normal transfer
+    // path, which owns trust-line deletion and owner-count bookkeeping.
+    let destination_balance = if number_switchover && !out_leg.is_xrp && out_leg.issuer != *taker {
+        let key = keylet::trust_line(taker, &out_leg.issuer, &out_leg.currency);
+        ctx.view
+            .read(&key)
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|line| {
+                IOUAmount::from_decimal_string(line["Balance"]["value"].as_str()?).ok()
+            })
+            .and_then(|balance| {
+                let destination = FlowSourceBalance {
+                    key,
+                    balance,
+                    holder_is_high: taker.as_bytes() > out_leg.issuer.as_bytes(),
+                };
+                (!flow_holder_funds(&destination.balance, destination.holder_is_high).is_zero())
+                    .then_some(destination)
+            })
+    } else {
+        None
+    };
     let mut clob_source_spent = Vec::new();
     let mut direct_amm_source_spent = Vec::new();
     let mut aggregate_direct_source_exhausted = false;
@@ -2934,9 +2959,14 @@ fn cross_offers(
                 is_sell,
                 /*cap_ending_spot_price=*/ false,
             )?;
-            if let Some((_, spent)) = amm_fill {
-                direct_amm_source_spent.push(leg_to_number(&spent));
+            if let Some((_, spent)) = amm_fill.as_ref() {
+                direct_amm_source_spent.push(leg_to_number(spent));
             }
+            // This tail is quality-capped, not an output-limited BookStep fill.
+            // Do not append its delivery to `direct_outputs` or rewrite
+            // `remaining_out_num`: a partial tail can round the canonical Leg
+            // remainder to zero without satisfying the precise demand
+            // (105502488 / BDC7FE8F).
             non_clob_source_spent |= leg_gt(&source_before_amm, &source_remaining);
             if terminal_amm_reaches_deferred_clob(
                 is_sell,
@@ -2985,6 +3015,24 @@ fn cross_offers(
             };
             reconcile_flow_source_balance(ctx, source, &source_debit);
         }
+    }
+
+    if should_reconcile_direct_destination(
+        number_switchover,
+        bridge.is_some(),
+        is_sell,
+        remaining_out_num.is_zero(),
+        !direct_outputs.is_empty(),
+        destination_balance.is_some(),
+    ) && let Some(destination) = destination_balance.as_ref()
+    {
+        // When the final output-limited fragment satisfies a buy, BookStep pins
+        // its result to the requested output and the terminal DirectStep credits
+        // that amount once. Synthetic per-fragment credits can otherwise finish
+        // a pre-existing trust-line balance one IOU ULP low
+        // (105504324 / 42E485D7).
+        let delivered = leg_to_number(&out_leg);
+        reconcile_flow_destination_balance(ctx, destination, &delivered);
     }
 
     // A direct AMM fragment and later CLOB fills share the source DirectStep.
@@ -7323,6 +7371,36 @@ fn aggregate_flow_source_balance_number(
     .to_iou()
 }
 
+fn aggregate_flow_destination_balance_number(
+    balance: &IOUAmount,
+    delivered: &Number,
+    holder_is_high: bool,
+) -> IOUAmount {
+    let balance = Number::from_iou(balance);
+    if holder_is_high {
+        balance.sub(delivered)
+    } else {
+        balance.add(delivered)
+    }
+    .to_iou()
+}
+
+fn should_reconcile_direct_destination(
+    number_switchover: bool,
+    has_bridge: bool,
+    is_sell: bool,
+    output_complete: bool,
+    has_direct_outputs: bool,
+    destination_has_funds: bool,
+) -> bool {
+    number_switchover
+        && !has_bridge
+        && !is_sell
+        && output_complete
+        && has_direct_outputs
+        && destination_has_funds
+}
+
 fn aggregate_flow_source_balance_passes(
     balance: &IOUAmount,
     saved_ins: &[Number],
@@ -7443,6 +7521,19 @@ fn reconcile_flow_source_balance(
     let balance =
         aggregate_flow_source_balance_number(&source.balance, spent, source.holder_is_high);
     set_flow_source_balance(ctx, source, &balance);
+}
+
+fn reconcile_flow_destination_balance(
+    ctx: &mut ApplyContext<'_>,
+    destination: &FlowSourceBalance,
+    delivered: &Number,
+) {
+    let balance = aggregate_flow_destination_balance_number(
+        &destination.balance,
+        delivered,
+        destination.holder_is_high,
+    );
+    set_flow_source_balance(ctx, destination, &balance);
 }
 
 fn reconcile_flow_source_balance_passes(
@@ -14170,13 +14261,15 @@ mod amm_quality_gate_tests {
 #[cfg(test)]
 mod flow_source_balance_tests {
     use super::{
-        Leg, aggregate_flow_destination_balance_passes, aggregate_flow_source_balance_number,
-        aggregate_flow_source_balance_passes, can_fund_new_trust_line, flow_gross_input,
-        flow_holder_funds, flow_input_limit, flow_net_input, flow_source_pass_budget, leftover_leg,
-        next_flow_strands, preserve_flow_output_ulp, sum_smallest_to_largest,
+        Leg, aggregate_flow_destination_balance_number, aggregate_flow_destination_balance_passes,
+        aggregate_flow_source_balance_number, aggregate_flow_source_balance_passes,
+        aggregate_output_remainder, can_fund_new_trust_line, flow_gross_input, flow_holder_funds,
+        flow_input_limit, flow_net_input, flow_source_pass_budget, leftover_leg, next_flow_strands,
+        preserve_flow_output_ulp, should_reconcile_direct_destination, sum_smallest_to_largest,
     };
     use rxrpl_amount::IOUAmount;
     use rxrpl_amount::number::{MantissaScale, MantissaScaleGuard, Number};
+    use rxrpl_primitives::AccountId;
 
     #[test]
     fn aggregates_multi_pass_source_debit_before_rounding() {
@@ -14283,6 +14376,93 @@ mod flow_source_balance_tests {
                 .to_decimal_string(),
             "-206257073438.9547"
         );
+    }
+
+    #[test]
+    fn ledger_105504324_credits_aggregate_offer_output_once() {
+        let balance = IOUAmount::from_decimal_string("8166.601966663777").unwrap();
+        let outputs = [
+            "4753.64016",
+            "1.855495",
+            "16.520864",
+            "532.823381912",
+            "79.790328",
+            "4.8544593281238",
+            "25",
+            "29.9738387596715",
+            "1.885473",
+        ]
+        .map(|value| Number::from_iou(&IOUAmount::from_decimal_string(value).unwrap()));
+        let aggregate = sum_smallest_to_largest(&outputs);
+        assert_eq!(aggregate.to_iou().to_decimal_string(), "5446.343999999795");
+        let requested = Number::from_iou(&IOUAmount::from_decimal_string("5446.344").unwrap());
+        assert_eq!(
+            aggregate_flow_destination_balance_number(&balance, &requested, false)
+                .to_decimal_string(),
+            "13612.94596666378"
+        );
+    }
+
+    #[test]
+    fn completed_direct_buy_reconciliation_requires_safe_endpoint() {
+        let eligible = |has_bridge, is_sell, output_complete, has_outputs, has_funds| {
+            should_reconcile_direct_destination(
+                true,
+                has_bridge,
+                is_sell,
+                output_complete,
+                has_outputs,
+                has_funds,
+            )
+        };
+
+        assert!(eligible(false, false, true, true, true));
+        assert!(!eligible(true, false, true, true, true));
+        assert!(!eligible(false, true, true, true, true));
+        assert!(!eligible(false, false, false, true, true));
+        assert!(!eligible(false, false, true, false, true));
+        assert!(!eligible(false, false, true, true, false));
+        assert!(!should_reconcile_direct_destination(
+            false, false, false, true, true, true,
+        ));
+    }
+
+    #[test]
+    fn ledger_105502488_terminal_amm_dust_does_not_complete_direct_buy() {
+        let requested = Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: IOUAmount::from_parts(1_000_000_000_000_001, -96, false).unwrap(),
+            currency: [1; 20],
+            issuer: AccountId::from([2; 20]),
+        };
+        let partial =
+            Number::from_iou(&IOUAmount::from_parts(1_000_000_000_000_000, -96, false).unwrap());
+
+        let (remaining_leg, remaining_number) = aggregate_output_remainder(&requested, &[partial]);
+        assert!(remaining_leg.is_zero());
+        assert!(!remaining_number.is_zero());
+        assert!(!should_reconcile_direct_destination(
+            true,
+            false,
+            false,
+            remaining_number.is_zero(),
+            true,
+            true,
+        ));
+
+        let complete = Number::from_iou(&requested.iou);
+        let (remaining_leg, remaining_number) = aggregate_output_remainder(&requested, &[complete]);
+        assert!(remaining_leg.is_zero());
+        assert!(remaining_number.is_zero());
+        assert!(should_reconcile_direct_destination(
+            true,
+            false,
+            false,
+            remaining_number.is_zero(),
+            true,
+            true,
+        ));
     }
 
     #[test]
