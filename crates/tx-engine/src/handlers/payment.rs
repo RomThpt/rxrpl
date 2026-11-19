@@ -938,13 +938,22 @@ fn apply_iou(
         return Ok(TransactionResult::TesSuccess);
     }
 
-    // Explicit paths must respect the destination's trust limit. The direct
-    // pathless transfer is handled by the legacy direct-payment rule below.
-    if ctx.tx.get("Paths").is_some()
-        && dest_id != issuer_id
-        && iou_receive_capacity(ctx, &dest_id, &issuer_id, &cur_bytes).is_zero()
+    if dest_id != issuer_id && iou_receive_capacity(ctx, &dest_id, &issuer_id, &cur_bytes).is_zero()
     {
-        return Err(TransactionResult::TecPathDry);
+        let partial_payment =
+            helpers::get_flags(ctx.tx) & rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT != 0;
+        let destination_holding =
+            crate::amm_helpers::iou_holding_number(ctx.view, &dest_id, &issuer_id, &cur_bytes);
+        // Explicit paths always honor the destination limit. The legacy
+        // pathless route permits a zero-limit endpoint, except when a partial
+        // payment would increase an already-positive over-limit balance.
+        if ctx.tx.get("Paths").is_some()
+            || (partial_payment
+                && !destination_holding.is_zero()
+                && !destination_holding.negative())
+        {
+            return Err(TransactionResult::TecPathDry);
+        }
     }
 
     // Non-issuer IOU send: debit source's RippleState. If the destination is

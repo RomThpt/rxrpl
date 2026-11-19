@@ -2125,6 +2125,83 @@ fn ledger_105504372_direct_iou_distinguishes_dry_from_partial_source() {
 }
 
 #[test]
+fn ledger_105504459_direct_iou_requires_destination_capacity() {
+    const SOURCE: &str = "rGDreBvnHrX1get7na3J4oowN19ny4GzFn";
+    const DESTINATION: &str = "rLRSVjtKbtGFUdKNnzxxFTmcQY3ZJ1naX3";
+    const RLUSD_ISSUER: &str = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De";
+    const RLUSD: &str = "524C555344000000000000000000000000000000";
+
+    let mut ledger = Ledger::genesis();
+    put_account(&mut ledger, RLUSD_ISSUER, "100000000", None);
+    put_account(&mut ledger, SOURCE, "50000000", None);
+    put_account(&mut ledger, DESTINATION, "50000000", None);
+    put_trust_line(&mut ledger, SOURCE, RLUSD_ISSUER, RLUSD, 100.0);
+    put_trust_line(
+        &mut ledger,
+        DESTINATION,
+        RLUSD_ISSUER,
+        RLUSD,
+        0.014_131_098_999_99,
+    );
+
+    let currency = helpers::currency_to_bytes(RLUSD);
+    let source_id = decode_account_id(SOURCE).unwrap();
+    let destination_id = decode_account_id(DESTINATION).unwrap();
+    let issuer_id = decode_account_id(RLUSD_ISSUER).unwrap();
+    assert!(destination_id.as_bytes() < issuer_id.as_bytes());
+    let source_key = keylet::trust_line(&source_id, &issuer_id, &currency);
+    let destination_key = keylet::trust_line(&destination_id, &issuer_id, &currency);
+
+    let fees = FeeSettings::default();
+    let source_before = ledger.get_state(&source_key).unwrap().to_vec();
+    let destination_before = ledger.get_state(&destination_key).unwrap().to_vec();
+    let rules = Rules::new();
+    let tx = serde_json::json!({
+        "TransactionType": "Payment",
+        "Account": SOURCE,
+        "Destination": DESTINATION,
+        "Amount": iou(RLUSD, RLUSD_ISSUER, "17"),
+        "Flags": rxrpl_protocol::flags::payment::TF_PARTIAL_PAYMENT,
+        "Fee": "20",
+        "Sequence": 1,
+    });
+    let mut registry = crate::registry::TransactorRegistry::new();
+    crate::handlers::register_phase_a(&mut registry);
+    let engine = crate::engine::TxEngine::new_without_sig_check(registry);
+
+    assert_eq!(
+        engine.apply(&tx, &mut ledger, &rules, &fees).unwrap(),
+        TransactionResult::TecPathDry
+    );
+    assert_eq!(ledger.get_state(&source_key).unwrap(), source_before);
+    assert_eq!(
+        ledger.get_state(&destination_key).unwrap(),
+        destination_before
+    );
+
+    let source_account: Value = rxrpl_ledger::sle_codec::decode_state(
+        ledger.get_state(&keylet::account(&source_id)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(source_account["Balance"], "49999980");
+    assert_eq!(source_account["Sequence"], 2);
+
+    let tx_hash = rxrpl_protocol::tx::compute_tx_hash(&tx).unwrap();
+    let leaf = ledger.tx_map.get(&tx_hash).unwrap();
+    let (_, metadata) = rxrpl_codec::binary::decode_tx_leaf(leaf).unwrap();
+    assert_eq!(
+        metadata["TransactionResult"],
+        TransactionResult::TecPathDry.code()
+    );
+    assert_eq!(metadata["AffectedNodes"].as_array().unwrap().len(), 1);
+    assert!(metadata.get("DeliveredAmount").is_none());
+    assert_eq!(
+        metadata["AffectedNodes"][0]["ModifiedNode"]["LedgerIndex"],
+        keylet::account(&source_id).to_string()
+    );
+}
+
+#[test]
 fn apply_iou_redemption_reaps_default_source_trust_line() {
     let mut ledger = Ledger::genesis();
     put_account(&mut ledger, ISSUER, "100000000", None);
