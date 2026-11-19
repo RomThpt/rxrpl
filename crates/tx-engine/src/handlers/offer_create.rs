@@ -2986,6 +2986,29 @@ fn cross_offers(
         }
     }
 
+    // A pure CLOB BookStep records every winning output, then Flow sums those
+    // values smallest-first before deriving the replacement offer. Sequential
+    // subtraction can retain an extra IOU ULP (105504339 / 5F066B3E). Skip any
+    // path with AMM or bridge spending because those have separate remainder
+    // semantics and may intentionally omit a quality-capped terminal fragment.
+    if should_reconcile_pure_clob_output_remainder(
+        number_switchover,
+        is_pure_direct_iou_buy(
+            bridge.is_some(),
+            is_sell,
+            out_leg.is_xrp,
+            direct_amm_used,
+            non_clob_source_spent,
+        ),
+        direct_outputs.len(),
+        remaining_out.is_zero() || remaining_out_num.is_zero(),
+    ) {
+        let _scale = rxrpl_amount::number::MantissaScaleGuard::new(
+            rxrpl_amount::number::MantissaScale::Small,
+        );
+        (remaining_out, remaining_out_num) = aggregate_output_remainder(&out_leg, &direct_outputs);
+    }
+
     if direct_fib_pass_used && let Some(source) = source_balance.as_ref() {
         // Flow's source DirectStep settles the aggregate strand input. Applying
         // the bridge and direct AMM debits separately can shift the source
@@ -8251,6 +8274,25 @@ fn aggregate_output_remainder(requested: &Leg, outputs: &[Number]) -> (Leg, Numb
     }
     let remainder = requested_num.sub(&delivered);
     (number_to_leg(&remainder, requested), remainder)
+}
+
+fn should_reconcile_pure_clob_output_remainder(
+    number_switchover: bool,
+    pure_direct_iou_buy: bool,
+    output_count: usize,
+    remainder_complete: bool,
+) -> bool {
+    number_switchover && pure_direct_iou_buy && output_count > 1 && !remainder_complete
+}
+
+fn is_pure_direct_iou_buy(
+    has_bridge: bool,
+    is_sell: bool,
+    output_is_xrp: bool,
+    direct_amm_used: bool,
+    non_clob_source_spent: bool,
+) -> bool {
+    !has_bridge && !is_sell && !output_is_xrp && !direct_amm_used && !non_clob_source_spent
 }
 
 fn next_flow_strands(cur: &[usize], winner_pos: usize) -> Vec<usize> {
@@ -14321,8 +14363,10 @@ mod flow_source_balance_tests {
         Leg, aggregate_flow_destination_balance_number, aggregate_flow_destination_balance_passes,
         aggregate_flow_source_balance_number, aggregate_flow_source_balance_passes,
         aggregate_output_remainder, can_fund_new_trust_line, flow_gross_input, flow_holder_funds,
-        flow_input_limit, flow_net_input, flow_source_pass_budget, leftover_leg, next_flow_strands,
-        preserve_flow_output_ulp, should_reconcile_direct_destination, sum_smallest_to_largest,
+        flow_input_limit, flow_net_input, flow_source_pass_budget, is_pure_direct_iou_buy,
+        leftover_leg, next_flow_strands, preserve_flow_output_ulp,
+        should_reconcile_direct_destination, should_reconcile_pure_clob_output_remainder,
+        sum_smallest_to_largest,
     };
     use rxrpl_amount::IOUAmount;
     use rxrpl_amount::number::{MantissaScale, MantissaScaleGuard, Number};
@@ -14519,6 +14563,73 @@ mod flow_source_balance_tests {
             remaining_number.is_zero(),
             true,
             true,
+        ));
+    }
+
+    #[test]
+    fn ledger_105504339_aggregates_pure_clob_replacement_remainder() {
+        let requested = Leg {
+            is_xrp: false,
+            drops: 0,
+            iou: IOUAmount::from_decimal_string("1909.84835").unwrap(),
+            currency: [1; 20],
+            issuer: AccountId::from([2; 20]),
+        };
+        let outputs = [
+            "4.646366",
+            "79.107197",
+            "10.512723",
+            "32.7957594696894",
+            "1.73497687343051",
+            "99.7",
+            "8.415",
+            "1315.5142181",
+        ]
+        .map(|value| Number::from_iou(&IOUAmount::from_decimal_string(value).unwrap()));
+
+        let sequential = outputs
+            .iter()
+            .fold(Number::from_iou(&requested.iou), |remaining, output| {
+                remaining.sub(output)
+            });
+        assert_eq!(sequential.to_iou().to_decimal_string(), "357.4221095568801");
+        let _scale = MantissaScaleGuard::new(MantissaScale::Small);
+        let total = sum_smallest_to_largest(&outputs);
+        assert_eq!(total.to_iou().to_decimal_string(), "1552.42624044312");
+        let (remaining, precise) = aggregate_output_remainder(&requested, &outputs);
+        assert_eq!(remaining.iou.to_decimal_string(), "357.42210955688");
+        assert_eq!(precise.to_iou().to_decimal_string(), "357.42210955688");
+
+        let eligible = |has_bridge,
+                        is_sell,
+                        output_is_xrp,
+                        direct_amm_used,
+                        non_clob_source_spent,
+                        output_count,
+                        remainder_complete| {
+            should_reconcile_pure_clob_output_remainder(
+                true,
+                is_pure_direct_iou_buy(
+                    has_bridge,
+                    is_sell,
+                    output_is_xrp,
+                    direct_amm_used,
+                    non_clob_source_spent,
+                ),
+                output_count,
+                remainder_complete,
+            )
+        };
+        assert!(eligible(false, false, false, false, false, 8, false));
+        assert!(!eligible(true, false, false, false, false, 8, false));
+        assert!(!eligible(false, true, false, false, false, 8, false));
+        assert!(!eligible(false, false, true, false, false, 8, false));
+        assert!(!eligible(false, false, false, true, false, 8, false));
+        assert!(!eligible(false, false, false, false, true, 8, false));
+        assert!(!eligible(false, false, false, false, false, 1, false));
+        assert!(!eligible(false, false, false, false, false, 8, true));
+        assert!(!should_reconcile_pure_clob_output_remainder(
+            false, true, 8, false,
         ));
     }
 
