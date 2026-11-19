@@ -152,6 +152,21 @@ mod tests {
     }
 
     #[test]
+    fn same_account_tickets_sort_by_ticket_sequence_not_txid() {
+        let acct = AccountId([0x7b; 20]);
+        let lower_ticket = txid(0xff);
+        let higher_ticket = txid(0x01);
+        let txs = vec![
+            (higher_ticket, ticket_blob(acct, 81_365_802)),
+            (lower_ticket, ticket_blob(acct, 81_365_799)),
+        ];
+
+        let ordered = canonical_order(txid(0xaa), txs);
+        assert_eq!(ordered[0].0, lower_ticket);
+        assert_eq!(ordered[1].0, higher_ticket);
+    }
+
+    #[test]
     fn order_is_deterministic_for_a_given_salt() {
         let a = AccountId([0x22; 20]);
         let b = AccountId([0x33; 20]);
