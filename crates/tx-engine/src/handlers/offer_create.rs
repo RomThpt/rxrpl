@@ -2281,8 +2281,11 @@ fn cross_offers(
         // raw reserve-ratio spot gate admits the AMM only when it strictly beats
         // `dir_quality`, so this fires exactly when the AMM is at least as good
         // as the offers about to cross at this band; it is a no-op otherwise.
+        // Once speculative advancement removes every tip in the directory,
+        // there is no CLOB quality left to bind the synthetic offer. Let the
+        // terminal pass quote the pool once at the taker's aggregate limit.
         let mut amm_consumed_in_band = false;
-        if !remaining_out.is_zero() && !remaining_in.is_zero() {
+        if funded_tip_before_amm && !remaining_out.is_zero() && !remaining_in.is_zero() {
             if let Some(b) = &bridge {
                 let before = remaining_out.clone();
                 let source_before_bridge = source_remaining.clone();
@@ -13163,6 +13166,7 @@ mod taker_crossing_tests {
     #[test]
     fn ledger_105500731_dry_clob_pass_stops_terminal_amm() {
         assert!(!clob_band_allows_terminal_amm(true, true, false));
+        assert!(clob_band_allows_terminal_amm(true, false, false));
         assert!(clob_band_allows_terminal_amm(true, true, true));
         assert!(clob_band_allows_terminal_amm(false, true, false));
     }
@@ -19119,6 +19123,152 @@ mod flow_cross_own_unfunded {
                     &currency
                 ))
                 .is_some()
+        );
+    }
+
+    /// 105504467/EFA2D842: after removing the only unfunded CLOB tip, Flow
+    /// quotes the AMM once at the taker's aggregate limit. Reusing the stale
+    /// directory quality splits this sell into two passes and rejects the
+    /// second half even though the complete swap satisfies the limit.
+    #[test]
+    fn ledger_105504467_sell_ioc_ignores_reaped_clob_quality() {
+        let mut ledger = Ledger::genesis();
+        for (addr, drops) in [
+            (ISS, 1_000_000_000_u64),
+            (TAKER, 1_000_000_000),
+            (MAKER, 1_000_000_000),
+            (MAKER2, 463_161_905),
+        ] {
+            let id = decode_account_id(addr).unwrap();
+            ledger
+                .put_state(
+                    keylet::account(&id),
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "AccountRoot", "Account": addr,
+                        "Balance": drops.to_string(), "Sequence": 1,
+                        "OwnerCount": 0, "Flags": 0,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        put_usd_line(&mut ledger, MAKER, 300_000);
+        put_usd_line(&mut ledger, MAKER2, 54_521_195);
+
+        let maker = decode_account_id(MAKER).unwrap();
+        let pool = decode_account_id(MAKER2).unwrap();
+        let taker = decode_account_id(TAKER).unwrap();
+        let issuer = decode_account_id(ISS).unwrap();
+        let currency = helpers::currency_to_bytes("USD");
+        let pool_line_key = keylet::trust_line(&pool, &issuer, &currency);
+        let mut pool_line: Value =
+            serde_json::from_slice(ledger.get_state(&pool_line_key).unwrap()).unwrap();
+        let pool_holds_positive = pool.as_bytes() < issuer.as_bytes();
+        pool_line["Balance"]["value"] = Value::from(if pool_holds_positive {
+            "54521195.73413439"
+        } else {
+            "-54521195.73413439"
+        });
+        ledger
+            .put_state(pool_line_key, serde_json::to_vec(&pool_line).unwrap())
+            .unwrap();
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let usd =
+            |value: &str| serde_json::json!({"currency": "USD", "issuer": ISS, "value": value});
+
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": MAKER,
+                    "Fee": "10", "Sequence": 1, "Flags": TF_PASSIVE,
+                    "TakerGets": usd("295766.097410443"),
+                    "TakerPays": "2556798",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+        let stale_offer = keylet::offer(&maker, 1);
+        assert!(sandbox.read(&stale_offer).is_some());
+
+        let maker_line_key = keylet::trust_line(&maker, &issuer, &currency);
+        let mut maker_line: Value =
+            serde_json::from_slice(&sandbox.read(&maker_line_key).unwrap()).unwrap();
+        maker_line["Balance"]["value"] = Value::from("0");
+        sandbox
+            .update(maker_line_key, serde_json::to_vec(&maker_line).unwrap())
+            .unwrap();
+
+        let zero = AccountId::from([0u8; 20]);
+        sandbox
+            .insert(
+                keylet::amm(&[0u8; 20], &zero, &currency, &issuer),
+                serde_json::to_vec(&serde_json::json!({
+                    "LedgerEntryType": "AMM", "Account": MAKER2,
+                    "TradingFee": 714, "Flags": 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let tx = serde_json::json!({
+            "TransactionType": "OfferCreate", "Account": TAKER,
+            "Fee": "80", "Sequence": 1,
+            "Flags": TF_IMMEDIATE_OR_CANCEL | TF_SELL,
+            "TakerGets": "8259600",
+            "TakerPays": usd("948542.751430308"),
+        });
+        let rules = Rules::from_enabled([
+            feature_id("FlowCross"),
+            feature_id("fixUniversalNumber"),
+            feature_id("fixAMMv1_2"),
+        ]);
+        let result = {
+            let mut ctx = ApplyContext {
+                tx: &tx,
+                view: &mut sandbox,
+                rules: &rules,
+                fees: &fees,
+            };
+            OfferCreateTransactor.apply(&mut ctx).unwrap()
+        };
+
+        assert_eq!(result, TransactionResult::TesSuccess);
+        assert!(sandbox.read(&stale_offer).is_none());
+        assert!(sandbox.read(&keylet::offer(&taker, 1)).is_none());
+        assert_eq!(owner_count(&sandbox, MAKER), 0);
+        assert_eq!(xrp_balance(&sandbox, TAKER), 991_740_400);
+        assert_eq!(xrp_balance(&sandbox, MAKER2), 471_421_505);
+
+        let pool_line: Value = serde_json::from_slice(
+            &sandbox
+                .read(&keylet::trust_line(&pool, &issuer, &currency))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            pool_line["Balance"]["value"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches('-'),
+            "53572652.03302812"
+        );
+        let taker_line: Value = serde_json::from_slice(
+            &sandbox
+                .read(&keylet::trust_line(&taker, &issuer, &currency))
+                .expect("AMM trade creates taker USD trust line"),
+        )
+        .unwrap();
+        assert_eq!(
+            taker_line["Balance"]["value"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches('-'),
+            "948543.70110627"
         );
     }
 
