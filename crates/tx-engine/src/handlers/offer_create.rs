@@ -3554,9 +3554,10 @@ fn try_bridge_step(
         .ok()
         .map(|rate| Number::from_iou(&rate));
     let competition_limit = from_rate(cq).ok().map(|rate| Number::from_iou(&rate));
-    let pass_limit = is_sell
-        .then(|| from_rate(cq).ok().map(|rate| Number::from_iou(&rate)))
-        .flatten();
+    let pass_quality_limit = bridge_pass_quality_limit(is_sell, cq, threshold);
+    let pass_limit = from_rate(pass_quality_limit)
+        .ok()
+        .map(|rate| Number::from_iou(&rate));
     if !matches!(
         (bridge_bound.as_ref(), bridge_limit.as_ref(), competition_limit.as_ref()),
         (Some(bound), Some(limit), Some(competition))
@@ -3566,8 +3567,8 @@ fn try_bridge_step(
     }
 
     // Keep a checkpoint for the complete candidate and another for each pass.
-    // A sell can keep an earlier favorable band when the next one misses its
-    // limit; buys still evaluate the complete candidate atomically.
+    // A favorable pass remains committed when the following pass misses the
+    // transaction limit; Flow then ends with that partial result.
     let cp = ctx.view.checkpoint();
     // `taker_acct` is a detached JSON value held by OfferCreate while the rest
     // of the candidate lives in the sandbox. Candidate execution may update its
@@ -3618,9 +3619,9 @@ fn try_bridge_step(
             break;
         }
         let pass_quality_adjusted = res.quality_adjusted;
-        // A sell can keep its favorable first pass when the next pass exceeds
-        // its quality limit. A buy keeps its bounded output demand and checks
-        // the aggregate below; retaining the first pass changes its result.
+        // Flow validates every realized strand pass against limitQuality. A
+        // rejected pass is rolled back while earlier favorable passes remain
+        // committed (105504341 / F1B05A39).
         let pass_exceeds_limit = pass_limit
             .as_ref()
             .is_some_and(|limit| num_gt(&res.in_amt.div(&res.out_amt), limit));
@@ -3629,7 +3630,7 @@ fn try_bridge_step(
                 && !bridge_adjusted_pass_meets_limit(
                     &res.in_amt,
                     &res.out_amt,
-                    cq,
+                    pass_quality_limit,
                     ctx.rules.enabled(&feature_id("fixUniversalNumber")),
                 ))
         {
@@ -3812,6 +3813,10 @@ fn bridge_adjusted_pass_meets_limit(
         rxrpl_amount::is_better_quality(rate, limit)
             || rxrpl_amount::within_relative_distance(rate, limit)
     })
+}
+
+fn bridge_pass_quality_limit(is_sell: bool, competition: u64, threshold: u64) -> u64 {
+    if is_sell { competition } else { threshold }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14452,11 +14457,12 @@ mod flow_source_balance_tests {
     use super::{
         Leg, aggregate_flow_destination_balance_number, aggregate_flow_destination_balance_passes,
         aggregate_flow_source_balance_number, aggregate_flow_source_balance_passes,
-        aggregate_output_remainder, bridge_candidate_meets_limit, can_fund_new_trust_line,
-        flow_gross_input, flow_holder_funds, flow_input_limit, flow_net_input,
-        flow_source_pass_budget, is_pure_direct_iou_buy, leftover_leg, net_book_payment_input,
-        next_flow_strands, preserve_flow_output_ulp, should_reconcile_direct_destination,
-        should_reconcile_pure_clob_output_remainder, sum_smallest_to_largest,
+        aggregate_output_remainder, bridge_candidate_meets_limit, bridge_pass_quality_limit,
+        can_fund_new_trust_line, flow_gross_input, flow_holder_funds, flow_input_limit,
+        flow_net_input, flow_source_pass_budget, is_pure_direct_iou_buy, leftover_leg,
+        net_book_payment_input, next_flow_strands, num_gt, preserve_flow_output_ulp,
+        should_reconcile_direct_destination, should_reconcile_pure_clob_output_remainder,
+        sum_smallest_to_largest,
     };
     use rxrpl_amount::IOUAmount;
     use rxrpl_amount::number::{MantissaScale, MantissaScaleGuard, Number};
@@ -14763,6 +14769,30 @@ mod flow_source_balance_tests {
             true,
             false,
         ));
+    }
+
+    #[test]
+    fn ledger_105504341_keeps_favorable_buy_bridge_pass() {
+        let _scale = MantissaScaleGuard::new(MantissaScale::Small);
+        let input =
+            Number::from_iou(&IOUAmount::from_decimal_string("0.0003919669617548625").unwrap());
+        let output = Number::from_iou(&IOUAmount::from_decimal_string("25").unwrap());
+        let realized = input.div(&output);
+        let competition = 5_766_173_856_145_044_489;
+        let threshold = 5_766_175_650_794_217_077;
+        let competition_rate = Number::from_iou(&rxrpl_amount::from_rate(competition).unwrap());
+        let threshold_rate = Number::from_iou(&rxrpl_amount::from_rate(threshold).unwrap());
+
+        assert!(num_gt(&realized, &competition_rate));
+        assert!(!num_gt(&realized, &threshold_rate));
+        assert_eq!(
+            bridge_pass_quality_limit(false, competition, threshold),
+            threshold
+        );
+        assert_eq!(
+            bridge_pass_quality_limit(true, competition, threshold),
+            competition
+        );
     }
 
     #[test]
