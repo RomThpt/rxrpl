@@ -2021,6 +2021,7 @@ fn cross_offers(
     let mut non_clob_source_spent = false;
     let mut crossed = false;
     let mut reaped_self_offer = false;
+    let mut permanent_reaps = Vec::new();
     // A CLOB-bounded AMM pass can leave only a self/unfunded tip behind. In
     // rippled, the next pass removes that tip, delivers nothing, and ends the
     // strand as dry. Do not turn that dry pass into a second AMM crossing at
@@ -2361,6 +2362,7 @@ fn cross_offers(
             }
         }
         let offers = book_dir_indexes(ctx, &dir_key);
+        let mut quoted_current_band = false;
 
         for offer_key in offers {
             if !is_sell
@@ -2458,6 +2460,28 @@ fn cross_offers(
             }
             if reject_quality(dir_quality, clob_threshold) {
                 break 'walk;
+            }
+            // StrandFlow reverse-prices the requested output before maxIn caps
+            // the forward pass. Keep permanent OfferStream removals found by
+            // that quote even when the taker's source funds later stop in the
+            // middle of this funded offer (105504323/TX20). Domain books need
+            // their scoped key, and combined AMM+CLOB quotes need the AMM
+            // synthetic offer, so neither uses this public-book collector.
+            if !quoted_current_band
+                && source_funds_limited
+                && !domain_only
+                && !is_sell
+                && bridge.is_none()
+                && !amm_consumed_in_band
+            {
+                permanent_reaps.extend(collect_direct_reverse_quote_reaps(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    &remaining_out,
+                    &in_leg,
+                ));
+                quoted_current_band = true;
             }
             // BookStep first caps the owner's gross IOU debit to its funds,
             // then divides by the output transfer rate to find the net offer
@@ -2829,6 +2853,11 @@ fn cross_offers(
                 break 'walk;
             }
         }
+    }
+
+    let taker_reaps = apply_permanent_reaps(ctx, &permanent_reaps);
+    if taker_reaps != 0 {
+        helpers::adjust_owner_count(taker_acct, -(taker_reaps as i32));
     }
 
     // Tail: the AMM may still beat every remaining CLOB up to the taker's overall
@@ -3907,6 +3936,7 @@ fn cross_book_hop(
         force_full_input_budget,
         source_input_rate,
         source_funds_limited,
+        false,
         None,
         false,
         false,
@@ -3939,6 +3969,7 @@ fn cross_book_hop_direct_tail(
         false,
         1_000_000_000,
         false,
+        false,
         None,
         true,
         false,
@@ -3948,7 +3979,58 @@ fn cross_book_hop_direct_tail(
 
 /// A reverse quote rolls its sandbox back, but FlowOfferStream keeps offers that
 /// were already invalid in the parent view for deletion after strand selection.
-type PermanentOffer = (AccountId, Hash256, Hash256);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PermanentOfferReason {
+    Invalid,
+    SelfCross,
+}
+
+type PermanentOffer = (AccountId, Hash256, Hash256, PermanentOfferReason);
+
+/// Run the direct public-book BookStep reverse quote on a rollback-only sandbox
+/// and retain only offers that FlowOfferStream classified for permanent removal.
+/// The subsequent forward pass remains bounded by the taker's real source funds.
+fn collect_direct_reverse_quote_reaps(
+    ctx: &mut ApplyContext<'_>,
+    taker: &AccountId,
+    taker_acct: &mut Value,
+    demand_out: &Leg,
+    input: &Leg,
+) -> Vec<PermanentOffer> {
+    let checkpoint = ctx.view.checkpoint();
+    let taker_before = taker_acct.clone();
+    let mut reaps = Vec::new();
+    let source_input_rate = if input.is_xrp || taker == &input.issuer {
+        1_000_000_000
+    } else {
+        transfer_rate_value(ctx, &input.issuer)
+    };
+    let _ = cross_book_hop_with_reaps(
+        ctx,
+        taker,
+        taker_acct,
+        taker,
+        demand_out,
+        &unbounded_leg(input),
+        /*skip_input_debit=*/ true,
+        /*skip_output_credit=*/ false,
+        /*single_band=*/ true,
+        /*allow_amm=*/ false,
+        /*lq_stop=*/ None,
+        /*preserve_input_limited_iou_ulp=*/ false,
+        /*force_full_input_budget=*/ false,
+        source_input_rate,
+        /*source_funds_limited=*/ false,
+        /*allow_self_cross_reaps=*/ true,
+        Some(&mut reaps),
+        /*reverse_direct_tail=*/ false,
+        /*preserve_source_residual=*/ false,
+        /*direct_payment_demand=*/ false,
+    );
+    ctx.view.rollback(checkpoint);
+    *taker_acct = taker_before;
+    reaps
+}
 
 #[allow(clippy::too_many_arguments)]
 fn cross_book_hop_with_reaps(
@@ -3967,6 +4049,7 @@ fn cross_book_hop_with_reaps(
     force_full_input_budget: bool,
     source_input_rate: u32,
     source_funds_limited: bool,
+    allow_self_cross_reaps: bool,
     mut permanent_reaps: Option<&mut Vec<PermanentOffer>>,
     reverse_direct_tail: bool,
     preserve_source_residual: bool,
@@ -4009,6 +4092,15 @@ fn cross_book_hop_with_reaps(
     let mut delivered_parts: Vec<Number> = Vec::new();
     let mut spent = leg_from_magnitude(&IOUAmount::ZERO, budget_in);
     spent.drops = 0;
+    // A rollback-only reverse quote retains OfferStream's permanent removals.
+    // If a fully consumed offer satisfies the demand exactly, rippled advances
+    // once more: invalid tips are removed before the next funded offer stops
+    // the callback. Keep this behavior isolated from ordinary forward walks.
+    let reap_scan_enabled =
+        single_band && lq_stop.is_none() && !allow_amm && permanent_reaps.is_some();
+    let offer_crossing_quote = allow_self_cross_reaps
+        && ctx.tx.get("TransactionType").and_then(Value::as_str) == Some("OfferCreate");
+    let mut scan_after_exact_fill = false;
     let book_prefix = inverse_book.as_bytes()[0..24].to_vec();
     let mut probe = book_dir_with_quality(&inverse_book, 0);
     'walk: while let Some(dir_key) = ctx.view.succ(&probe) {
@@ -4017,6 +4109,8 @@ fn cross_book_hop_with_reaps(
         }
         probe = dir_key;
         let dir_quality = u64::from_be_bytes(dir_key.as_bytes()[24..32].try_into().unwrap());
+        let scan_invalid_next_band =
+            reap_scan_enabled && band_quality.is_some_and(|quality| quality != dir_quality);
         // Bounded to a single quality band: once an offer at quality Q has been
         // filled, stop at the first page of a worse quality.
         if let Some((prefix, limit)) = lq_stop {
@@ -4035,12 +4129,11 @@ fn cross_book_hop_with_reaps(
             if limit != 0 && pq > limit {
                 break 'walk;
             }
-        } else if single_band {
-            if let Some(bq) = band_quality {
-                if bq != dir_quality {
-                    break 'walk;
-                }
-            }
+        } else if single_band
+            && band_quality.is_some_and(|quality| quality != dir_quality)
+            && !scan_invalid_next_band
+        {
+            break 'walk;
         }
         let offers = book_dir_indexes(ctx, &dir_key);
         // BookStep asks the AMM to compete with the first crossable offer, not
@@ -4132,7 +4225,7 @@ fn cross_book_hop_with_reaps(
         let rate = rxrpl_amount::from_rate(dir_quality).unwrap_or(IOUAmount::ZERO);
 
         for offer_key in offers {
-            if hop_out_done(&remaining_out, demand_out) {
+            if hop_out_done(&remaining_out, demand_out) && !scan_after_exact_fill {
                 break 'walk;
             }
             // After an ordinary input exhaustion, BookStep stops before the
@@ -4155,7 +4248,15 @@ fn cross_book_hop_with_reaps(
             let Ok(owner) = decode_account_id(owner_str) else {
                 continue;
             };
-            if &owner == taker {
+            let self_offer = &owner == taker;
+            // Generic Payment/autobridge settlement still keeps self offers
+            // outside this collapsed primitive. During the post-fill cleanup
+            // scan, stop at that funded sentinel instead of skipping through
+            // it and collecting unrelated offers behind it.
+            if self_offer && !allow_self_cross_reaps {
+                if scan_after_exact_fill || scan_invalid_next_band {
+                    break 'walk;
+                }
                 continue;
             }
             let Some(offer_out) = Leg::parse(&offer["TakerGets"]) else {
@@ -4171,7 +4272,7 @@ fn cross_book_hop_with_reaps(
             {
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
                 if let Some(reaps) = permanent_reaps.as_mut() {
-                    reaps.push((owner, offer_key, dir_key));
+                    reaps.push((owner, offer_key, dir_key, PermanentOfferReason::Invalid));
                 }
                 continue;
             }
@@ -4184,7 +4285,7 @@ fn cross_book_hop_with_reaps(
                     original_owner_funds_leg(ctx, &owner, &offer_out).is_zero();
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
                 if originally_unfunded && let Some(reaps) = permanent_reaps.as_mut() {
-                    reaps.push((owner, offer_key, dir_key));
+                    reaps.push((owner, offer_key, dir_key, PermanentOfferReason::Invalid));
                 }
                 continue;
             }
@@ -4199,9 +4300,29 @@ fn cross_book_hop_with_reaps(
                     tiny_offer_is_permanently_reapable(ctx, &owner, &offer_out, &funds);
                 reap_offer(ctx, &owner, &offer_key, &dir_key)?;
                 if originally_tiny && let Some(reaps) = permanent_reaps.as_mut() {
-                    reaps.push((owner, offer_key, dir_key));
+                    reaps.push((owner, offer_key, dir_key, PermanentOfferReason::Invalid));
                 }
                 continue;
+            }
+            // OfferStream removes invalid entries before BookStep compares the
+            // next funded offer's quality. A funded self offer in a worse band
+            // is therefore a stop sentinel; at the consumed quality, offer
+            // crossing removes it permanently and continues advancing.
+            if scan_invalid_next_band {
+                break 'walk;
+            }
+            if self_offer && offer_crossing_quote {
+                reap_offer(ctx, &owner, &offer_key, &dir_key)?;
+                if let Some(reaps) = permanent_reaps.as_mut() {
+                    reaps.push((owner, offer_key, dir_key, PermanentOfferReason::SelfCross));
+                }
+                continue;
+            }
+            // A fully consumed offer may have satisfied the reverse demand,
+            // but `offers.step()` has already exposed this next funded tip.
+            // The callback returns false without consuming it.
+            if scan_after_exact_fill {
+                break 'walk;
             }
             // Keep inspecting invalid offers after source funds are exhausted,
             // but do not spend a representable arithmetic remainder on a later
@@ -4687,6 +4808,12 @@ fn cross_book_hop_with_reaps(
             if single_band {
                 band_quality = Some(dir_quality);
             }
+            if reap_scan_enabled
+                && hop_out_done(&remaining_out, demand_out)
+                && (full_take || funds_limited)
+            {
+                scan_after_exact_fill = true;
+            }
         }
     }
 
@@ -5025,7 +5152,7 @@ fn reap_expired_reverse_xrp_book_tail(
                 .and_then(Value::as_u64)
                 .is_some_and(|expiration| expiration <= ctx.view.parent_close_time() as u64)
             {
-                reaps.push((owner, offer_key, dir_key));
+                reaps.push((owner, offer_key, dir_key, PermanentOfferReason::Invalid));
                 continue;
             }
             // BookStep checks the next funded offer's quality only after the
@@ -8148,6 +8275,7 @@ fn price_clob_band_reverse(
             /*force_full_input_budget=*/ bridge_first_xrp || first_xrp_input_limited,
             /*source_input_rate=*/ 1_000_000_000,
             /*source_funds_limited=*/ false,
+            /*allow_self_cross_reaps=*/ false,
             Some(permanent_reaps),
             false,
             false,
@@ -8184,6 +8312,7 @@ fn price_clob_band_reverse(
         /*force_full_input_budget=*/ bridge_first_xrp || first_xrp_input_limited,
         /*source_input_rate=*/ 1_000_000_000,
         /*source_funds_limited=*/ false,
+        /*allow_self_cross_reaps=*/ false,
         Some(permanent_reaps),
         false,
         false,
@@ -8211,9 +8340,19 @@ fn price_clob_band_reverse(
     Some((leg_to_number(&spent), leg_to_number(&delivered)))
 }
 
-fn apply_permanent_reaps(ctx: &mut ApplyContext<'_>, reaps: &[PermanentOffer]) {
+fn apply_permanent_reaps(ctx: &mut ApplyContext<'_>, reaps: &[PermanentOffer]) -> usize {
     let mut seen = HashSet::new();
-    for &(owner, offer_key, dir_key) in reaps {
+    let mut taker_reaps = 0;
+    let offer_crossing_taker =
+        if ctx.tx.get("TransactionType").and_then(Value::as_str) == Some("OfferCreate") {
+            ctx.tx
+                .get("Account")
+                .and_then(Value::as_str)
+                .and_then(|account| decode_account_id(account).ok())
+        } else {
+            None
+        };
+    for &(owner, offer_key, dir_key, reason) in reaps {
         if !seen.insert(offer_key) {
             continue;
         }
@@ -8239,14 +8378,23 @@ fn apply_permanent_reaps(ctx: &mut ApplyContext<'_>, reaps: &[PermanentOffer]) {
         let tiny =
             should_reap_tiny_increased_quality(&owner, &offer_in, &offer_out, &funds, quality)
                 && tiny_offer_is_permanently_reapable(ctx, &owner, &offer_out, &funds);
-        if !expired && !tiny && (!funds.is_zero() || !originally_unfunded) {
+        let still_permanent = match reason {
+            PermanentOfferReason::Invalid => {
+                expired || tiny || (funds.is_zero() && originally_unfunded)
+            }
+            PermanentOfferReason::SelfCross => offer_crossing_taker.as_ref() == Some(&owner),
+        };
+        if !still_permanent {
             continue;
         }
         let cp = ctx.view.checkpoint();
         if reap_offer(ctx, &owner, &offer_key, &dir_key).is_err() {
             ctx.view.rollback(cp);
+        } else if offer_crossing_taker.as_ref() == Some(&owner) {
+            taker_reaps += 1;
         }
     }
+    taker_reaps
 }
 
 /// The AMM quality cap for a BookOfferCrossingStep at the current CLOB tip.
@@ -8832,6 +8980,7 @@ fn execute_strand_pass(
                         ),
                     /*source_input_rate=*/ 1_000_000_000,
                     /*source_funds_limited=*/ false,
+                    /*allow_self_cross_reaps=*/ false,
                     /*permanent_reaps=*/ None,
                     /*reverse_direct_tail=*/ false,
                     // The source DirectStep retains its Number residual when
@@ -15766,9 +15915,9 @@ mod taker_bridge_integration {
         let fees = FeeSettings::default();
         let view = LedgerView::with_fees(&ledger, fees.clone());
         let mut placement = Sandbox::new(&view);
-        for (account, sequence) in [(O2, 1), (O2, 2)]
+        for (account, sequence, pays) in [(O2, 1, "100000000"), (O2, 2, "100000000")]
             .into_iter()
-            .chain((1..=4).map(|seq| (O3, seq)))
+            .chain((1..=4).map(|seq| (O3, seq, "200000000")))
         {
             assert_eq!(
                 apply_offer(
@@ -15778,7 +15927,7 @@ mod taker_bridge_integration {
                         "TransactionType": "OfferCreate", "Account": account,
                         "Fee": "12", "Sequence": sequence,
                         "TakerGets": {"currency": "BBB", "issuer": ISS, "value": "100"},
-                        "TakerPays": "100000000",
+                        "TakerPays": pays,
                     }),
                 ),
                 TransactionResult::TesSuccess
@@ -15841,7 +15990,11 @@ mod taker_bridge_integration {
         assert_eq!(quoted.0.to_xrp_drops(), 10_000_000);
         assert_eq!(quoted.1.to_iou().to_decimal_string(), "10");
         assert_eq!(reaps.len(), 4);
-        assert!(reaps.iter().all(|(_, key, _)| *key != became_unfunded_key));
+        assert!(
+            reaps
+                .iter()
+                .all(|(_, key, _, _)| *key != became_unfunded_key)
+        );
         for key in &invalid_keys {
             assert!(
                 ctx.view.read(key).is_some(),
@@ -18606,6 +18759,484 @@ mod flow_cross_own_unfunded {
                 .to_decimal_string(),
             "0"
         );
+    }
+
+    #[test]
+    fn ledger_105504323_tx20_retains_reverse_quote_permanent_reap() {
+        const SENTINEL: &str = "rKkBNf2dZRGzKbfDPtqx5DAVG9yLn9FNaf";
+        let mut ledger = Ledger::genesis();
+        for (addr, balance, owner_count) in [
+            (ISS, 1_000_000_000_u64, 0_u64),
+            (TAKER, 51_200_000, 1),
+            (MAKER, 1_000_000_000, 0),
+            (MAKER2, 1_000_000_000, 0),
+            (SENTINEL, 1_000_000_000, 0),
+        ] {
+            let id = decode_account_id(addr).unwrap();
+            ledger
+                .put_state(
+                    keylet::account(&id),
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "AccountRoot", "Account": addr,
+                        "Balance": balance.to_string(), "Sequence": 1,
+                        "OwnerCount": owner_count, "Flags": 0,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        put_usd_line(&mut ledger, TAKER, 0);
+        put_usd_line(&mut ledger, MAKER, 100);
+        put_usd_line(&mut ledger, MAKER2, 100);
+        put_usd_line(&mut ledger, SENTINEL, 100);
+
+        let fees = FeeSettings {
+            base_fee: 10,
+            reserve_base: 1_000_000,
+            reserve_increment: 200_000,
+        };
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut placement = Sandbox::new(&view);
+        let usd =
+            |value: &str| serde_json::json!({"currency": "USD", "issuer": ISS, "value": value});
+        for (maker, pays) in [
+            (MAKER, "100000000"),
+            (MAKER2, "200000000"),
+            (SENTINEL, "300000000"),
+        ] {
+            assert_eq!(
+                apply_flow(
+                    &mut placement,
+                    &fees,
+                    &serde_json::json!({
+                        "TransactionType": "OfferCreate", "Account": maker,
+                        "Fee": "10", "Sequence": 1,
+                        "TakerGets": usd("100"), "TakerPays": pays,
+                    }),
+                ),
+                TransactionResult::TesSuccess
+            );
+        }
+        let changes = placement.into_changes();
+        for (key, bytes) in changes.inserts.into_iter().chain(changes.updates) {
+            ledger.put_state(key, bytes).unwrap();
+        }
+        for key in changes.deletes.keys() {
+            ledger.delete_state(key).unwrap();
+        }
+
+        // TX19 has already drained this owner. The offer remains in the book,
+        // and both the current and cancel views of TX20 report zero funds.
+        put_usd_line(&mut ledger, MAKER2, 0);
+
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let taker = decode_account_id(TAKER).unwrap();
+        let maker = decode_account_id(MAKER).unwrap();
+        let invalid_maker = decode_account_id(MAKER2).unwrap();
+        let sentinel = decode_account_id(SENTINEL).unwrap();
+        let funded_offer = keylet::offer(&maker, 1);
+        let invalid_offer = keylet::offer(&invalid_maker, 1);
+        let sentinel_offer = keylet::offer(&sentinel, 1);
+        let sentinel_before = sandbox.read(&sentinel_offer).unwrap();
+        assert!(sandbox.read(&funded_offer).is_some());
+        assert!(sandbox.read(&invalid_offer).is_some());
+
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER,
+                    "Fee": "10", "Sequence": 1,
+                    "Flags": TF_IMMEDIATE_OR_CANCEL,
+                    "TakerGets": "200000000", "TakerPays": usd("200"),
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+
+        let funded: Value = serde_json::from_slice(&sandbox.read(&funded_offer).unwrap()).unwrap();
+        assert_eq!(funded["TakerGets"]["value"], "50");
+        assert_eq!(funded["TakerPays"], "50000000");
+        assert!(
+            sandbox.read(&invalid_offer).is_none(),
+            "the reverse quote must retain the already-unfunded offer reap"
+        );
+        assert_eq!(owner_count(&sandbox, MAKER2), 0);
+        assert_eq!(
+            sandbox.read(&sentinel_offer).unwrap(),
+            sentinel_before,
+            "the reverse quote must stop at the first funded worse-quality offer"
+        );
+        assert_eq!(xrp_balance(&sandbox, TAKER), 1_200_000);
+        assert!(sandbox.read(&keylet::offer(&taker, 1)).is_none());
+        let issuer = decode_account_id(ISS).unwrap();
+        let currency = helpers::currency_to_bytes("USD");
+        assert_eq!(
+            crate::amm_helpers::iou_holding_number(&sandbox, &taker, &issuer, &currency)
+                .to_iou()
+                .to_decimal_string(),
+            "50"
+        );
+    }
+
+    #[test]
+    fn source_limited_iou_direct_quote_retains_permanent_reap() {
+        const SENTINEL: &str = "rKkBNf2dZRGzKbfDPtqx5DAVG9yLn9FNaf";
+        let mut ledger = Ledger::genesis();
+        for (addr, owner_count) in [
+            (ISS, 0_u64),
+            (TAKER, 1),
+            (MAKER, 0),
+            (MAKER2, 0),
+            (SENTINEL, 0),
+        ] {
+            let id = decode_account_id(addr).unwrap();
+            ledger
+                .put_state(
+                    keylet::account(&id),
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "AccountRoot", "Account": addr,
+                        "Balance": "1000000000", "Sequence": 1,
+                        "OwnerCount": owner_count, "Flags": 0,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let issuer = decode_account_id(ISS).unwrap();
+        let issuer_key = keylet::account(&issuer);
+        let mut issuer_root: Value =
+            serde_json::from_slice(ledger.get_state(&issuer_key).unwrap()).unwrap();
+        issuer_root["TransferRate"] = Value::from(1_250_000_000_u64);
+        ledger
+            .put_state(issuer_key, serde_json::to_vec(&issuer_root).unwrap())
+            .unwrap();
+        put_usd_line(&mut ledger, TAKER, 50);
+        put_usd_line(&mut ledger, MAKER, 0);
+        put_usd_line(&mut ledger, MAKER2, 0);
+        put_usd_line(&mut ledger, SENTINEL, 0);
+
+        let fees = FeeSettings {
+            base_fee: 10,
+            reserve_base: 1_000_000,
+            reserve_increment: 200_000,
+        };
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut placement = Sandbox::new(&view);
+        let usd =
+            |value: &str| serde_json::json!({"currency": "USD", "issuer": ISS, "value": value});
+        for (maker, pays) in [(MAKER, "100"), (MAKER2, "200"), (SENTINEL, "300")] {
+            assert_eq!(
+                apply_flow(
+                    &mut placement,
+                    &fees,
+                    &serde_json::json!({
+                        "TransactionType": "OfferCreate", "Account": maker,
+                        "Fee": "10", "Sequence": 1,
+                        "TakerGets": "100000000", "TakerPays": usd(pays),
+                    }),
+                ),
+                TransactionResult::TesSuccess
+            );
+        }
+        let changes = placement.into_changes();
+        for (key, bytes) in changes.inserts.into_iter().chain(changes.updates) {
+            ledger.put_state(key, bytes).unwrap();
+        }
+        for key in changes.deletes.keys() {
+            ledger.delete_state(key).unwrap();
+        }
+
+        // Leave the second maker with exactly its owner reserve so its XRP
+        // offer is already unfunded in both the current and cancel views.
+        let invalid_maker = decode_account_id(MAKER2).unwrap();
+        let invalid_root_key = keylet::account(&invalid_maker);
+        let mut invalid_root: Value =
+            serde_json::from_slice(ledger.get_state(&invalid_root_key).unwrap()).unwrap();
+        invalid_root["Balance"] = Value::String("1200000".into());
+        ledger
+            .put_state(invalid_root_key, serde_json::to_vec(&invalid_root).unwrap())
+            .unwrap();
+
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let taker = decode_account_id(TAKER).unwrap();
+        let maker = decode_account_id(MAKER).unwrap();
+        let sentinel = decode_account_id(SENTINEL).unwrap();
+        let funded_offer = keylet::offer(&maker, 1);
+        let invalid_offer = keylet::offer(&invalid_maker, 1);
+        let sentinel_offer = keylet::offer(&sentinel, 1);
+        let sentinel_before = sandbox.read(&sentinel_offer).unwrap();
+
+        assert_eq!(
+            apply_flow(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER,
+                    "Fee": "10", "Sequence": 1,
+                    "Flags": TF_IMMEDIATE_OR_CANCEL,
+                    "TakerGets": usd("200"), "TakerPays": "200000000",
+                }),
+            ),
+            TransactionResult::TesSuccess
+        );
+
+        let funded: Value = serde_json::from_slice(&sandbox.read(&funded_offer).unwrap()).unwrap();
+        assert_eq!(funded["TakerGets"], "60000000");
+        assert_eq!(funded["TakerPays"]["value"], "60");
+        assert!(sandbox.read(&invalid_offer).is_none());
+        assert_eq!(owner_count(&sandbox, MAKER2), 0);
+        assert_eq!(sandbox.read(&sentinel_offer).unwrap(), sentinel_before);
+        assert!(sandbox.read(&keylet::offer(&taker, 1)).is_none());
+        assert_eq!(xrp_balance(&sandbox, TAKER), 1_040_000_000);
+        let currency = helpers::currency_to_bytes("USD");
+        assert!(
+            crate::amm_helpers::iou_holding_number(&sandbox, &taker, &issuer, &currency).is_zero()
+        );
+    }
+
+    #[test]
+    fn exact_reverse_fill_reaps_invalid_then_stops_at_worse_self_offer() {
+        const FOLLOWER: &str = "rU9Ubyq4aRiUqU9m7BgF8ja6yx8z3Q5ZTn";
+        let mut ledger = Ledger::genesis();
+        for (addr, owner_count) in [
+            (ISS, 0_u64),
+            (TAKER, 1),
+            (MAKER, 1),
+            (MAKER2, 1),
+            (FOLLOWER, 1),
+        ] {
+            let id = decode_account_id(addr).unwrap();
+            ledger
+                .put_state(
+                    keylet::account(&id),
+                    serde_json::to_vec(&serde_json::json!({
+                        "LedgerEntryType": "AccountRoot", "Account": addr,
+                        "Balance": "1000000000", "Sequence": 1,
+                        "OwnerCount": owner_count, "Flags": 0,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        for holder in [TAKER, MAKER, MAKER2, FOLLOWER] {
+            put_usd_line(&mut ledger, holder, 100);
+        }
+
+        let fees = FeeSettings {
+            base_fee: 10,
+            reserve_base: 1_000_000,
+            reserve_increment: 200_000,
+        };
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut placement = Sandbox::new(&view);
+        let usd =
+            |value: &str| serde_json::json!({"currency": "USD", "issuer": ISS, "value": value});
+        for (account, sequence, pays) in [
+            (MAKER, 1, "100000000"),
+            (MAKER2, 1, "100000000"),
+            (TAKER, 1, "100000000"),
+            (FOLLOWER, 1, "100000000"),
+            (TAKER, 2, "200000000"),
+            (FOLLOWER, 2, "300000000"),
+        ] {
+            assert_eq!(
+                apply_flow(
+                    &mut placement,
+                    &fees,
+                    &serde_json::json!({
+                        "TransactionType": "OfferCreate", "Account": account,
+                        "Fee": "10", "Sequence": sequence,
+                        "TakerGets": usd("100"), "TakerPays": pays,
+                    }),
+                ),
+                TransactionResult::TesSuccess
+            );
+        }
+        let changes = placement.into_changes();
+        for (key, bytes) in changes.inserts.into_iter().chain(changes.updates) {
+            ledger.put_state(key, bytes).unwrap();
+        }
+        for key in changes.deletes.keys() {
+            ledger.delete_state(key).unwrap();
+        }
+
+        let issuer = decode_account_id(ISS).unwrap();
+        let currency = helpers::currency_to_bytes("USD");
+        for holder in [MAKER2, FOLLOWER] {
+            let holder = decode_account_id(holder).unwrap();
+            let line_key = keylet::trust_line(&holder, &issuer, &currency);
+            let mut line: Value =
+                serde_json::from_slice(ledger.get_state(&line_key).unwrap()).unwrap();
+            line["Balance"]["value"] = Value::String("0".into());
+            ledger
+                .put_state(line_key, serde_json::to_vec(&line).unwrap())
+                .unwrap();
+        }
+
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let taker = decode_account_id(TAKER).unwrap();
+        let maker = decode_account_id(MAKER).unwrap();
+        let invalid_maker = decode_account_id(MAKER2).unwrap();
+        let follower = decode_account_id(FOLLOWER).unwrap();
+        let funded_offer = keylet::offer(&maker, 1);
+        let invalid_offer = keylet::offer(&invalid_maker, 1);
+        let same_band_self = keylet::offer(&taker, 1);
+        let same_band_follower = keylet::offer(&follower, 1);
+        let worse_self = keylet::offer(&taker, 2);
+        let worse_follower = keylet::offer(&follower, 2);
+        let quality = |sandbox: &Sandbox<'_>, key: &Hash256| {
+            let offer: Value = serde_json::from_slice(&sandbox.read(key).unwrap()).unwrap();
+            let dir: Hash256 = offer["BookDirectory"].as_str().unwrap().parse().unwrap();
+            u64::from_be_bytes(dir.as_bytes()[24..32].try_into().unwrap())
+        };
+        assert_eq!(
+            quality(&sandbox, &funded_offer),
+            quality(&sandbox, &invalid_offer)
+        );
+        assert_eq!(
+            quality(&sandbox, &funded_offer),
+            quality(&sandbox, &same_band_self)
+        );
+        assert_eq!(
+            quality(&sandbox, &funded_offer),
+            quality(&sandbox, &same_band_follower)
+        );
+        assert!(quality(&sandbox, &funded_offer) < quality(&sandbox, &worse_self));
+        assert!(quality(&sandbox, &worse_self) < quality(&sandbox, &worse_follower));
+
+        let tx = serde_json::json!({
+            "TransactionType": "OfferCreate", "Account": TAKER,
+            "Fee": "10", "Sequence": 3,
+            "TakerGets": "100000000", "TakerPays": usd("100"),
+        });
+        let rules = Rules::from_enabled([feature_id("FlowCross")]);
+        let taker_root = sandbox.read(&keylet::account(&taker)).unwrap();
+        let mut taker_acct: Value = serde_json::from_slice(&taker_root).unwrap();
+        let demand = Leg::parse(&usd("100")).unwrap();
+        let input = Leg::parse(&Value::String("100000000".into())).unwrap();
+
+        // Payments do not apply OfferCreate's default-path self-cross rule.
+        // Once this exact fill exposes a funded same-band self offer, the
+        // callback stops before the invalid follower behind it.
+        let payment_tx = serde_json::json!({
+            "TransactionType": "Payment", "Account": TAKER,
+            "Destination": TAKER, "Amount": usd("100"),
+            "SendMax": "100000000", "Fee": "10", "Sequence": 3,
+        });
+        let payment_checkpoint = sandbox.checkpoint();
+        let taker_before_payment = taker_acct.clone();
+        let mut payment_reaps = Vec::new();
+        {
+            let mut ctx = ApplyContext {
+                tx: &payment_tx,
+                view: &mut sandbox,
+                rules: &rules,
+                fees: &fees,
+            };
+            cross_book_hop_with_reaps(
+                &mut ctx,
+                &taker,
+                &mut taker_acct,
+                &taker,
+                &demand,
+                &unbounded_leg(&input),
+                true,
+                false,
+                true,
+                false,
+                None,
+                false,
+                false,
+                1_000_000_000,
+                false,
+                false,
+                Some(&mut payment_reaps),
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        }
+        sandbox.rollback(payment_checkpoint);
+        taker_acct = taker_before_payment;
+        assert!(
+            payment_reaps
+                .iter()
+                .any(|(_, key, _, _)| key == &invalid_offer)
+        );
+        assert!(
+            !payment_reaps
+                .iter()
+                .any(|(_, key, _, _)| key == &same_band_self)
+        );
+        assert!(
+            !payment_reaps
+                .iter()
+                .any(|(_, key, _, _)| key == &same_band_follower)
+        );
+
+        let reaps = {
+            let mut ctx = ApplyContext {
+                tx: &tx,
+                view: &mut sandbox,
+                rules: &rules,
+                fees: &fees,
+            };
+            collect_direct_reverse_quote_reaps(&mut ctx, &taker, &mut taker_acct, &demand, &input)
+        };
+
+        assert!(
+            reaps.iter().any(|(_, key, _, reason)| key == &invalid_offer
+                && *reason == PermanentOfferReason::Invalid)
+        );
+        assert!(
+            reaps
+                .iter()
+                .any(|(_, key, _, reason)| key == &same_band_self
+                    && *reason == PermanentOfferReason::SelfCross)
+        );
+        assert!(
+            reaps
+                .iter()
+                .any(|(_, key, _, reason)| key == &same_band_follower
+                    && *reason == PermanentOfferReason::Invalid)
+        );
+        assert!(!reaps.iter().any(|(_, key, _, _)| key == &worse_self));
+        assert!(!reaps.iter().any(|(_, key, _, _)| key == &worse_follower));
+        for key in [
+            funded_offer,
+            invalid_offer,
+            same_band_self,
+            same_band_follower,
+            worse_self,
+            worse_follower,
+        ] {
+            assert!(
+                sandbox.read(&key).is_some(),
+                "the quote must roll back {key}"
+            );
+        }
+
+        let taker_reaps = {
+            let mut ctx = ApplyContext {
+                tx: &tx,
+                view: &mut sandbox,
+                rules: &rules,
+                fees: &fees,
+            };
+            apply_permanent_reaps(&mut ctx, &reaps)
+        };
+        assert_eq!(taker_reaps, 1);
+        assert!(sandbox.read(&invalid_offer).is_none());
+        assert!(sandbox.read(&same_band_self).is_none());
+        assert!(sandbox.read(&same_band_follower).is_none());
+        assert!(sandbox.read(&worse_self).is_some());
+        assert!(sandbox.read(&worse_follower).is_some());
     }
 
     #[test]
