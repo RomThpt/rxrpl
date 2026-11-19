@@ -2084,6 +2084,47 @@ fn direct_iou_payment_respects_implicit_send_max_with_transfer_fee() {
 }
 
 #[test]
+fn ledger_105504372_direct_iou_distinguishes_dry_from_partial_source() {
+    for (source_balance, transfer_rate, expected) in [
+        (0.0, None, TransactionResult::TecPathDry),
+        (0.0, Some(1_060_000_000), TransactionResult::TecPathDry),
+        (1.0, None, TransactionResult::TecPathPartial),
+    ] {
+        let mut ledger = Ledger::genesis();
+        put_account(&mut ledger, ISSUER, "100000000", transfer_rate);
+        put_account(&mut ledger, ALICE, "50000000", None);
+        put_account(&mut ledger, BOB, "50000000", None);
+        put_trust_line(&mut ledger, ALICE, ISSUER, "USD", source_balance);
+        put_trust_line(&mut ledger, BOB, ISSUER, "USD", 0.0);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let tx = serde_json::json!({
+            "TransactionType": "Payment",
+            "Account": ALICE,
+            "Destination": BOB,
+            "Amount": iou("USD", ISSUER, "2"),
+            "Fee": "10",
+        });
+        let rules = Rules::new();
+        let mut ctx = ApplyContext {
+            tx: &tx,
+            view: &mut sandbox,
+            rules: &rules,
+            fees: &fees,
+        };
+
+        assert_eq!(PaymentTransactor.apply(&mut ctx), Err(expected));
+        assert_eq!(
+            holder_balance(&sandbox, ALICE, ISSUER, "USD"),
+            source_balance
+        );
+        assert_eq!(holder_balance(&sandbox, BOB, ISSUER, "USD"), 0.0);
+    }
+}
+
+#[test]
 fn apply_iou_redemption_reaps_default_source_trust_line() {
     let mut ledger = Ledger::genesis();
     put_account(&mut ledger, ISSUER, "100000000", None);

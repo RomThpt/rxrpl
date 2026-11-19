@@ -955,6 +955,21 @@ fn apply_iou(
         return Err(TransactionResult::TemBadAmount);
     }
 
+    // Flow checks whether the first direct step has any usable source funds
+    // before applying transfer-rate or SendMax constraints. An empty source
+    // is dry; only a positive but insufficient source is partial.
+    let src_trust_key = keylet::trust_line(&src_id, &issuer_id, &cur_bytes);
+    let src_trust_bytes = ctx
+        .view
+        .read(&src_trust_key)
+        .ok_or(TransactionResult::TecPathDry)?;
+    let mut src_trust: serde_json::Value =
+        serde_json::from_slice(&src_trust_bytes).map_err(|_| TransactionResult::TefInternal)?;
+    let source_holding = compute_holder_balance(&src_trust, &issuer_id, &src_id);
+    if source_holding <= 0.0 {
+        return Err(TransactionResult::TecPathDry);
+    }
+
     // TransferRate: when the issuer charges a transfer fee and is not party
     // to the transfer, the source is debited `value * rate` while the
     // destination still receives `value`. The grossed-up debit must fit
@@ -984,15 +999,6 @@ fn apply_iou(
             }
         }
     }
-
-    // Source debits ITS trust line balance toward issuer.
-    let src_trust_key = keylet::trust_line(&src_id, &issuer_id, &cur_bytes);
-    let src_trust_bytes = ctx
-        .view
-        .read(&src_trust_key)
-        .ok_or(TransactionResult::TecPathDry)?;
-    let mut src_trust: serde_json::Value =
-        serde_json::from_slice(&src_trust_bytes).map_err(|_| TransactionResult::TefInternal)?;
 
     // Flow gives a pathless payment without SendMax an implicit source cap
     // equal to Amount. With tfPartialPayment, a transfer fee reduces what the
@@ -1062,8 +1068,7 @@ fn apply_iou(
     let new_src_value =
         adjust_iou_balance(&src_trust, &format!("-{debit_text}"), &issuer_id, &src_id)?;
     // Source must have sufficient balance (cannot go below 0 from holder's perspective).
-    let source_is_short = partial_quote.is_none()
-        && compute_holder_balance(&src_trust, &issuer_id, &src_id) < src_debit_value - 1e-9;
+    let source_is_short = partial_quote.is_none() && source_holding < src_debit_value - 1e-9;
     if source_is_short {
         return Err(TransactionResult::TecPathPartial);
     }
