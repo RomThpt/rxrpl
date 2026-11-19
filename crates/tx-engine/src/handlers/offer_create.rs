@@ -7976,10 +7976,11 @@ fn should_reap_tiny_increased_quality(
     .is_ok_and(|effective_quality| effective_quality > quality)
 }
 
-/// Check a deleted offer against the fee-claim view. Flow keeps a tiny-tip
-/// removal even when the crossing later returns a claimed failure, but a
-/// partial fill or a newly exhausted maker must remain in the child sandbox.
-pub(crate) fn is_permanently_tiny_offer(
+/// Check a deleted offer against the fee-claim view. Flow keeps an offer that
+/// was already unfunded, or a permanent tiny-tip removal, when crossing later
+/// returns a claimed failure. A partial fill or a newly exhausted maker must
+/// remain in the discarded child sandbox.
+pub(crate) fn is_permanently_unfunded_or_tiny_offer(
     ctx: &mut ApplyContext<'_>,
     offer: &Value,
     owner: &AccountId,
@@ -7992,6 +7993,9 @@ pub(crate) fn is_permanently_tiny_offer(
         return false;
     };
     let funds = owner_funds_leg(ctx, owner, &offer_out);
+    if funds.is_zero() {
+        return true;
+    }
     let quality = u64::from_be_bytes(book_dir.as_bytes()[24..32].try_into().unwrap());
     should_reap_tiny_increased_quality(owner, &offer_in, &offer_out, &funds, quality)
 }

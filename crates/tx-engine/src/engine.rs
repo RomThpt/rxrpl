@@ -62,7 +62,7 @@ fn retain_permanent_offer_deletions(
             fees,
         };
         if !expired
-            && !crate::handlers::offer_create::is_permanently_tiny_offer(
+            && !crate::handlers::offer_create::is_permanently_unfunded_or_tiny_offer(
                 &mut ctx, &offer, &owner, &book_dir,
             )
         {
@@ -889,9 +889,9 @@ mod tests {
     }
 
     /// Simulates a crossing attempt that reaps an expired offer, then fails.
-    struct ExpiredOfferTecTransactor;
+    struct DeletedOfferTecTransactor;
 
-    impl Transactor for ExpiredOfferTecTransactor {
+    impl Transactor for DeletedOfferTecTransactor {
         fn preflight(&self, _ctx: &PreflightContext<'_>) -> Result<(), TransactionResult> {
             Ok(())
         }
@@ -1214,10 +1214,85 @@ mod tests {
         let mut tx = make_tx("OfferCreate");
         tx["TakerPays"] = Value::from("100");
         tx["TakerGets"] = Value::from("200");
-        let engine = test_engine_with(TransactionType::OfferCreate, ExpiredOfferTecTransactor);
+        let engine = test_engine_with(TransactionType::OfferCreate, DeletedOfferTecTransactor);
         let result = engine
             .apply(&tx, &mut ledger, &Rules::new(), &FeeSettings::default())
             .unwrap();
+        assert_eq!(result, TransactionResult::TecKilled);
+        let account: Value = rxrpl_ledger::sle_codec::decode_state(
+            ledger.get_state(&keylet::account(&owner)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(account["Balance"], "999990");
+        assert_eq!(account["Sequence"], 2);
+        assert_eq!(account["OwnerCount"], 0);
+        assert!(ledger.get_state(&offer_key).is_none());
+        assert!(ledger.get_state(&owner_dir).is_none());
+        assert!(ledger.get_state(&book_dir).is_none());
+    }
+
+    #[test]
+    fn ledger_105504436_offer_tec_keeps_unfunded_reap() {
+        let address = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh";
+        let owner = decode_account_id(address).unwrap();
+        let offer_key = keylet::offer(&owner, 1);
+        let owner_dir = keylet::owner_dir(&owner);
+        let book_dir = rxrpl_primitives::Hash256::new([0xAC; 32]);
+        let unfunded_gets = serde_json::json!({
+            "currency": "USD",
+            "issuer": "rG1QQv2nh2gr7RCZ1P8YYcBUKCCN633jCn",
+            "value": "200"
+        });
+        let mut ledger = Ledger::genesis();
+        let entries = [
+            (
+                keylet::account(&owner),
+                serde_json::json!({
+                    "LedgerEntryType": "AccountRoot", "Account": address,
+                    "Balance": "1000000", "Sequence": 1, "OwnerCount": 1, "Flags": 0
+                }),
+            ),
+            (
+                offer_key,
+                serde_json::json!({
+                    "LedgerEntryType": "Offer", "Account": address, "Sequence": 1,
+                    "TakerPays": "100", "TakerGets": unfunded_gets,
+                    "BookDirectory": book_dir.to_string(), "OwnerNode": "0000000000000000",
+                    "BookNode": "0000000000000000", "Flags": 0
+                }),
+            ),
+            (
+                owner_dir,
+                serde_json::json!({
+                    "LedgerEntryType": "DirectoryNode", "RootIndex": owner_dir.to_string(),
+                    "Owner": address, "Indexes": [offer_key.to_string()], "Flags": 0
+                }),
+            ),
+            (
+                book_dir,
+                serde_json::json!({
+                    "LedgerEntryType": "DirectoryNode", "RootIndex": book_dir.to_string(),
+                    "Indexes": [offer_key.to_string()], "Flags": 0
+                }),
+            ),
+        ];
+        for (key, entry) in entries {
+            let encoded =
+                rxrpl_ledger::sle_codec::encode_sle(&serde_json::to_vec(&entry).unwrap()).unwrap();
+            ledger.put_state(key, encoded).unwrap();
+        }
+        let mut tx = make_tx("OfferCreate");
+        tx["TakerPays"] = Value::from("100");
+        tx["TakerGets"] = serde_json::json!({
+            "currency": "USD",
+            "issuer": "rG1QQv2nh2gr7RCZ1P8YYcBUKCCN633jCn",
+            "value": "200"
+        });
+        let engine = test_engine_with(TransactionType::OfferCreate, DeletedOfferTecTransactor);
+        let result = engine
+            .apply(&tx, &mut ledger, &Rules::new(), &FeeSettings::default())
+            .unwrap();
+
         assert_eq!(result, TransactionResult::TecKilled);
         let account: Value = rxrpl_ledger::sle_codec::decode_state(
             ledger.get_state(&keylet::account(&owner)).unwrap(),
