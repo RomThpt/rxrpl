@@ -4768,9 +4768,15 @@ fn cross_book_hop_with_reaps(
                 false,
             )?;
             // Debiting Gets (e=-19) into a 22.45 BTC line (e=-14) truncates 1
-            // ULP vs mainnet (30000099 0C0344E7). Give it back when the line
-            // is coarser than Gets by 4+ exponents.
-            if full_take && skip_input_debit && !skip_output_credit {
+            // ULP vs mainnet (30000099 0C0344E7). This repairs legacy
+            // STAmount truncation only; modern Number subtraction is already
+            // exact and must not receive a second credit (105504335/36ABFB73).
+            if should_credit_full_take_owner_ulp(
+                full_take,
+                skip_input_debit,
+                skip_output_credit,
+                owner_rounding,
+            ) {
                 credit_line_ulp_if_coarse(ctx, &owner, &order_out, number_switchover)?;
             }
 
@@ -9893,6 +9899,18 @@ fn book_output_fee_rounding(budget_binds: bool, skip_output_credit: bool) -> Tra
     }
 }
 
+fn should_credit_full_take_owner_ulp(
+    full_take: bool,
+    skip_input_debit: bool,
+    skip_output_credit: bool,
+    owner_rounding: BalanceRounding,
+) -> bool {
+    full_take
+        && skip_input_debit
+        && !skip_output_credit
+        && matches!(owner_rounding, BalanceRounding::Legacy)
+}
+
 /// Positive IOU `mulRatio(gross, QUALITY_ONE, rate, false)` for a BookStep
 /// output. rippled retains ratio digits up to its signed 64-bit intermediate
 /// before IOUAmount normalizes through Number. Truncating the quotient at the
@@ -11975,9 +11993,10 @@ mod taker_crossing_tests {
         preserve_flow_input_limited_iou_ulp, preserve_next_quality_self_offer, qual_div, qual_mul,
         reject_quality, remaining_is_filled, remaining_is_filled_at, remaining_offer,
         scale_funds_limited_input, select_path, sell_clamp_sub, should_bump_partial_path_credit,
-        should_reap_tiny_increased_quality, should_trim_input_limited_iou_leftover,
-        sum_smallest_to_largest, terminal_amm_reaches_deferred_clob, terminal_budget_binds,
-        zero_cost_funded_xrp_offer, zero_cost_xrp_clob_fill,
+        should_credit_full_take_owner_ulp, should_reap_tiny_increased_quality,
+        should_trim_input_limited_iou_leftover, sum_smallest_to_largest,
+        terminal_amm_reaches_deferred_clob, terminal_budget_binds, zero_cost_funded_xrp_offer,
+        zero_cost_xrp_clob_fill,
     };
     use rxrpl_amount::number::Number;
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, get_rate_round_even, offer_quality};
@@ -12087,6 +12106,44 @@ mod taker_crossing_tests {
                 .to_decimal_string(),
             "-2178.567102560522"
         );
+    }
+
+    #[test]
+    fn ledger_105504335_skips_legacy_ulp_correction_for_modern_debit() {
+        let before = IOUAmount::from_decimal_string("103169.1853511904").unwrap();
+        let debit = IOUAmount::from_decimal_string("20.8164870375002").unwrap();
+        let delta = debit.negate();
+
+        assert_eq!(
+            add_iou_balance(&before, &delta, false)
+                .unwrap()
+                .to_decimal_string(),
+            "103148.3688641529"
+        );
+        assert_eq!(
+            add_iou_balance(&before, &delta, true)
+                .unwrap()
+                .to_decimal_string(),
+            "103148.3688641529"
+        );
+        assert!(should_credit_full_take_owner_ulp(
+            true,
+            true,
+            false,
+            BalanceRounding::Legacy,
+        ));
+        assert!(!should_credit_full_take_owner_ulp(
+            true,
+            true,
+            false,
+            BalanceRounding::Nearest,
+        ));
+        assert!(!should_credit_full_take_owner_ulp(
+            true,
+            true,
+            false,
+            BalanceRounding::DebitOwner,
+        ));
     }
 
     #[test]
