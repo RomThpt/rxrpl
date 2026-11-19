@@ -3697,10 +3697,18 @@ fn try_bridge_step(
     }
 
     let spent = leg_from_magnitude(&total_in.to_iou(), in_leg);
+    // Flow reports actualAmountIn including the source issuer's transfer fee.
+    // OfferCreate removes only the non-gateway amount from TakerGets before it
+    // derives the resting remainder at the original offer quality.
+    let net_spent = if in_leg.is_xrp || taker == &in_leg.issuer {
+        spent.clone()
+    } else {
+        net_offer_crossing_input(&spent, &transfer_rate(ctx, &in_leg.issuer))
+    };
     let delivered = leg_from_magnitude(&total_out.to_iou(), out_leg);
     bridge_outputs.extend(pass_outs);
     let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
-    *remaining_in = leftover_leg(remaining_in, &spent, number_switchover);
+    *remaining_in = leftover_leg(remaining_in, &net_spent, number_switchover);
     *source_remaining = leftover_leg(source_remaining, &spent, number_switchover);
     *remaining_out = if leg_ge(&delivered, remaining_out) {
         leg_sub(remaining_out, remaining_out)
@@ -10281,6 +10289,18 @@ fn net_book_payment_input(gross: &Leg, rate: u32) -> Leg {
     net
 }
 
+/// Convert Flow's fee-inclusive actualAmountIn to the amount removed from a
+/// sell offer's nominal TakerGets. Mirrors OfferCreate::flowCross dividing by
+/// the gateway transfer rate with roundUp=true.
+fn net_offer_crossing_input(gross: &Leg, rate: &IOUAmount) -> Leg {
+    if gross.is_xrp || *rate == parity_rate() {
+        return gross.clone();
+    }
+    let mut net = gross.clone();
+    net.iou = IOUAmount::div_round(&gross.iou, rate, true).unwrap_or(gross.iou);
+    net
+}
+
 /// OfferCreate tracks the unfilled offer in net units and Flow's source
 /// allowance in gross units. A direct BookStep may spend only the smaller net
 /// amount after the input issuer's transfer fee is removed.
@@ -12125,15 +12145,15 @@ mod taker_crossing_tests {
         funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
         in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
         leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
-        legacy_intermediate_xrp_rounding_applies, net_book_payment_input, net_offer_input_budget,
-        number_to_leg, out_for_in, own_tip_can_be_reaped, pack_rate, parity_rate,
-        preserve_flow_input_limited_iou_ulp, preserve_next_quality_self_offer, qual_div, qual_mul,
-        reject_quality, remaining_is_filled, remaining_is_filled_at, remaining_offer,
-        scale_funds_limited_input, select_path, sell_clamp_sub, should_bump_partial_path_credit,
-        should_credit_full_take_owner_ulp, should_reap_tiny_increased_quality,
-        should_trim_input_limited_iou_leftover, sum_smallest_to_largest,
-        terminal_amm_reaches_deferred_clob, terminal_budget_binds, zero_cost_funded_xrp_offer,
-        zero_cost_xrp_clob_fill,
+        legacy_intermediate_xrp_rounding_applies, net_book_payment_input, net_offer_crossing_input,
+        net_offer_input_budget, number_to_leg, out_for_in, own_tip_can_be_reaped, pack_rate,
+        parity_rate, preserve_flow_input_limited_iou_ulp, preserve_next_quality_self_offer,
+        qual_div, qual_mul, reject_quality, remaining_is_filled, remaining_is_filled_at,
+        remaining_offer, scale_funds_limited_input, select_path, sell_clamp_sub,
+        should_bump_partial_path_credit, should_credit_full_take_owner_ulp,
+        should_reap_tiny_increased_quality, should_trim_input_limited_iou_leftover,
+        sum_smallest_to_largest, terminal_amm_reaches_deferred_clob, terminal_budget_binds,
+        zero_cost_funded_xrp_offer, zero_cost_xrp_clob_fill,
     };
     use rxrpl_amount::number::Number;
     use rxrpl_amount::{IOUAmount, from_rate, get_rate, get_rate_round_even, offer_quality};
@@ -14108,6 +14128,37 @@ mod taker_crossing_tests {
 
         assert_eq!(remaining_gets.as_str(), Some("78583592"));
         assert_eq!(remaining_pays["value"], "0.04880669731935998");
+    }
+
+    #[test]
+    fn ledger_105504402_sell_remainder_removes_gateway_fee_from_bridge_input() {
+        let input = iou("0.1563");
+        let output = iou("10002.552918");
+        let direct_spent = iou("0.02983");
+        let bridge_gross = iou("0.0003910067910997");
+        let rate = IOUAmount::from_decimal_string("1.0015").unwrap();
+        let bridge_net = net_offer_crossing_input(&bridge_gross, &rate);
+        assert_eq!(bridge_net.iou.to_decimal_string(), "0.0003904211593606591");
+
+        let remaining = leftover_leg(
+            &leftover_leg(&input, &direct_spent, true),
+            &bridge_net,
+            true,
+        );
+        let orig_quality =
+            get_rate_round_even(&leg_as_quality_iou(&input), &leg_as_quality_iou(&output)).unwrap();
+        let (remaining_pays, remaining_gets) = remaining_offer(
+            true,
+            orig_quality,
+            &output,
+            &remaining,
+            &output,
+            &input,
+            true,
+        );
+
+        assert_eq!(remaining_gets["value"], "0.1260795788406393");
+        assert_eq!(remaining_pays["value"], "8068.571076344512");
     }
 
     #[test]
