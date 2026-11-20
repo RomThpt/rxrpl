@@ -3581,6 +3581,7 @@ fn try_bridge_step(
     let mut pass_ins = Vec::new();
     let mut pass_outs = Vec::new();
     let mut bridge_reaps = Vec::new();
+    let mut took_self_offer = false;
     let mut quality_adjusted = false;
     let mut handoff_to_direct = false;
     let mut demand = if is_sell {
@@ -3642,6 +3643,7 @@ fn try_bridge_step(
             break;
         }
         quality_adjusted |= pass_quality_adjusted;
+        took_self_offer |= res.took_self_offer;
         pass_ins.push(res.in_amt);
         pass_outs.push(res.out_amt);
         budget = leg_sub(&budget, &spent);
@@ -3711,7 +3713,8 @@ fn try_bridge_step(
     let delivered = leg_from_magnitude(&total_out.to_iou(), out_leg);
     bridge_outputs.extend(pass_outs);
     let number_switchover = ctx.rules.enabled(&feature_id("fixUniversalNumber"));
-    *remaining_in = leftover_leg(remaining_in, &net_spent, number_switchover);
+    *remaining_in =
+        bridge_offer_input_remainder(remaining_in, &net_spent, number_switchover, took_self_offer);
     *source_remaining = leftover_leg(source_remaining, &spent, number_switchover);
     *remaining_out = if leg_ge(&delivered, remaining_out) {
         leg_sub(remaining_out, remaining_out)
@@ -4092,6 +4095,8 @@ fn cross_book_hop(
         source_input_rate,
         source_funds_limited,
         false,
+        false,
+        None,
         None,
         false,
         false,
@@ -4125,6 +4130,8 @@ fn cross_book_hop_direct_tail(
         1_000_000_000,
         false,
         false,
+        false,
+        None,
         None,
         true,
         false,
@@ -4177,6 +4184,8 @@ fn collect_direct_reverse_quote_reaps(
         source_input_rate,
         /*source_funds_limited=*/ false,
         /*allow_self_cross_reaps=*/ true,
+        /*take_self_offers=*/ false,
+        /*took_self_offer=*/ None,
         Some(&mut reaps),
         /*reverse_direct_tail=*/ false,
         /*preserve_source_residual=*/ false,
@@ -4205,6 +4214,8 @@ fn cross_book_hop_with_reaps(
     source_input_rate: u32,
     source_funds_limited: bool,
     allow_self_cross_reaps: bool,
+    take_self_offers: bool,
+    mut took_self_offer_out: Option<&mut bool>,
     mut permanent_reaps: Option<&mut Vec<PermanentOffer>>,
     reverse_direct_tail: bool,
     preserve_source_residual: bool,
@@ -4245,6 +4256,8 @@ fn cross_book_hop_with_reaps(
     let mut delivered = leg_from_magnitude(&IOUAmount::ZERO, demand_out);
     delivered.drops = 0;
     let mut delivered_parts: Vec<Number> = Vec::new();
+    let mut balance_delivered_parts: Vec<Number> = Vec::new();
+    let mut took_self_offer = false;
     let mut spent = leg_from_magnitude(&IOUAmount::ZERO, budget_in);
     spent.drops = 0;
     // A rollback-only reverse quote retains OfferStream's permanent removals.
@@ -4318,7 +4331,7 @@ fn cross_book_hop_with_reaps(
             else {
                 return false;
             };
-            if &owner == taker {
+            if &owner == taker && !take_self_offers {
                 return false;
             }
             let Some(offer_out) = Leg::parse(&offer["TakerGets"]) else {
@@ -4408,7 +4421,7 @@ fn cross_book_hop_with_reaps(
             // outside this collapsed primitive. During the post-fill cleanup
             // scan, stop at that funded sentinel instead of skipping through
             // it and collecting unrelated offers behind it.
-            if self_offer && !allow_self_cross_reaps {
+            if self_offer && !allow_self_cross_reaps && !take_self_offers {
                 if scan_after_exact_fill || scan_invalid_next_band {
                     break 'walk;
                 }
@@ -4882,20 +4895,30 @@ fn cross_book_hop_with_reaps(
             } else {
                 order_out.clone()
             };
-            let net_out = pay_out_gross(
-                ctx,
-                taker,
-                taker_acct,
-                &owner,
-                dest,
-                &gross_owner_out,
-                number_switchover,
-                owner_rounding,
-                balance_rounding,
-                skip_output_credit,
-                fee_rounding,
-                false,
-            )?;
+            let net_out = if self_offer && take_self_offers {
+                took_self_offer = true;
+                if let Some(took_self_offer) = took_self_offer_out.as_mut() {
+                    **took_self_offer = true;
+                }
+                // A self-owned offer on a non-default bridge is reduced, but
+                // its output move is a self-payment and changes no balance.
+                gross_owner_out.clone()
+            } else {
+                pay_out_gross(
+                    ctx,
+                    taker,
+                    taker_acct,
+                    &owner,
+                    dest,
+                    &gross_owner_out,
+                    number_switchover,
+                    owner_rounding,
+                    balance_rounding,
+                    skip_output_credit,
+                    fee_rounding,
+                    false,
+                )?
+            };
             // Debiting Gets (e=-19) into a 22.45 BTC line (e=-14) truncates 1
             // ULP vs mainnet (30000099 0C0344E7). This repairs legacy
             // STAmount truncation only; modern Number subtraction is already
@@ -4985,6 +5008,9 @@ fn cross_book_hop_with_reaps(
             remaining_in = leg_sub_round(&remaining_in, &step_in);
             delivered = leg_add(&delivered, &net_out);
             delivered_parts.push(leg_to_number(&net_out));
+            if !self_offer {
+                balance_delivered_parts.push(leg_to_number(&net_out));
+            }
             spent = leg_add(&spent, &step_in);
             // Lock the band on the first funded fill: subsequent pages of a worse
             // quality are not consumed this call.
@@ -5012,7 +5038,7 @@ fn cross_book_hop_with_reaps(
     // a direct conversion uses its realised delivery when it misses Amount.
     if let Some(before_s) = dest_line_before {
         if dest != &demand_out.issuer {
-            let credit = book_destination_credit(
+            let credit = book_balance_destination_credit(
                 demand_out,
                 &remaining_out,
                 &delivered,
@@ -5023,6 +5049,8 @@ fn cross_book_hop_with_reaps(
                     taker,
                     dest,
                 ),
+                took_self_offer,
+                &balance_delivered_parts,
             );
             if let Ok(before) = IOUAmount::from_decimal_string(&before_s) {
                 let holder_is_high = dest.as_bytes() > demand_out.issuer.as_bytes();
@@ -5275,6 +5303,28 @@ fn book_destination_credit(
         IOUAmount::from_parts(d.mantissa() + 1, d.exponent(), false).unwrap_or(d)
     } else {
         delivered.iou
+    }
+}
+
+fn book_balance_destination_credit(
+    demand: &Leg,
+    remaining: &Leg,
+    delivered: &Leg,
+    direct_payment_demand: bool,
+    bump_partial_path: bool,
+    took_self_offer: bool,
+    balance_delivered_parts: &[Number],
+) -> IOUAmount {
+    if took_self_offer {
+        sum_smallest_to_largest(balance_delivered_parts).to_iou()
+    } else {
+        book_destination_credit(
+            demand,
+            remaining,
+            delivered,
+            direct_payment_demand,
+            bump_partial_path,
+        )
     }
 }
 
@@ -7429,6 +7479,7 @@ struct StrandPass {
     in_amt: Number,
     out_amt: Number,
     offers_used: u32,
+    took_self_offer: bool,
     preserve_output_ulp: bool,
     quality_adjusted: bool,
 }
@@ -7856,6 +7907,7 @@ fn funded_book_tip_quality(
     ctx: &mut ApplyContext<'_>,
     taker: &AccountId,
     inverse_book: &Hash256,
+    take_self_offers: bool,
 ) -> Option<u64> {
     let prefix = &inverse_book.as_bytes()[0..24];
     let mut probe = book_dir_with_quality(inverse_book, 0);
@@ -7882,7 +7934,7 @@ fn funded_book_tip_quality(
             else {
                 continue;
             };
-            if owner == *taker {
+            if owner == *taker && !take_self_offers {
                 continue;
             }
             let (Some(offer_in), Some(offer_out)) = (
@@ -8494,6 +8546,7 @@ fn price_clob_band_reverse(
     uncapped_for_source_limit: bool,
     bridge_first_xrp: bool,
     span_quality_pages: bool,
+    take_self_offers: bool,
 ) -> Option<(Number, Number)> {
     let demand_leg = number_to_leg(demanded, &hop.out_leg);
     let single_band = !(bridge_first_xrp && span_quality_pages);
@@ -8525,6 +8578,8 @@ fn price_clob_band_reverse(
             /*source_input_rate=*/ 1_000_000_000,
             /*source_funds_limited=*/ false,
             /*allow_self_cross_reaps=*/ false,
+            take_self_offers,
+            None,
             Some(permanent_reaps),
             false,
             false,
@@ -8562,6 +8617,8 @@ fn price_clob_band_reverse(
         /*source_input_rate=*/ 1_000_000_000,
         /*source_funds_limited=*/ false,
         /*allow_self_cross_reaps=*/ false,
+        take_self_offers,
+        None,
         Some(permanent_reaps),
         false,
         false,
@@ -8896,7 +8953,8 @@ fn execute_strand_pass(
         let hop = &strand.hops[h];
         let is_first = h == 0;
         let is_last = h == n - 1;
-        let clob_quality = funded_book_tip_quality(ctx, taker, &hop.inverse_book);
+        let clob_quality =
+            funded_book_tip_quality(ctx, taker, &hop.inverse_book, offer_create_bridge);
 
         // Try the AMM fib chunk first, gated to the CLOB tip quality.
         // BookOfferCrossingStep compares the AMM's synthetic offer with the
@@ -8980,6 +9038,7 @@ fn execute_strand_pass(
                 uncapped_for_source_limit,
                 bridge_first_xrp,
                 false,
+                offer_create_bridge,
             )?;
             // The first XRP book is reverse-priced without SendMax. Only when
             // that quote exceeds the source budget must BookStep rerun it with
@@ -9006,6 +9065,7 @@ fn execute_strand_pass(
                     uncapped_for_source_limit,
                     bridge_first_xrp,
                     false,
+                    offer_create_bridge,
                 )?;
                 first_xrp_budgeted_quote = true;
             }
@@ -9030,6 +9090,7 @@ fn execute_strand_pass(
                     uncapped_for_source_limit,
                     bridge_first_xrp,
                     true,
+                    offer_create_bridge,
                 )
                 && num_gt(&expanded.1, &quote.1)
             {
@@ -9083,11 +9144,12 @@ fn execute_strand_pass(
     // --- FORWARD PASS: apply, threading the intermediate so it conserves. ---
     let mut source_in = ins[0];
     let mut carry = Number::ZERO;
+    let mut took_self_offer = false;
     for h in 0..n {
         let hop = &strand.hops[h];
         let is_first = h == 0;
         let is_last = h == n - 1;
-        let clob_q = funded_book_tip_quality(ctx, taker, &hop.inverse_book);
+        let clob_q = funded_book_tip_quality(ctx, taker, &hop.inverse_book, offer_create_bridge);
         let amm_threshold = if offer_create_bridge {
             offer_crossing_amm_threshold(clob_q, limit_quality, amm_ctx.multi_path())
         } else {
@@ -9230,6 +9292,8 @@ fn execute_strand_pass(
                     /*source_input_rate=*/ 1_000_000_000,
                     /*source_funds_limited=*/ false,
                     /*allow_self_cross_reaps=*/ false,
+                    /*take_self_offers=*/ offer_create_bridge,
+                    /*took_self_offer=*/ Some(&mut took_self_offer),
                     /*permanent_reaps=*/ None,
                     /*reverse_direct_tail=*/ false,
                     // The source DirectStep retains its Number residual when
@@ -9278,6 +9342,7 @@ fn execute_strand_pass(
         in_amt: source_in,
         out_amt: carry,
         offers_used: 0,
+        took_self_offer,
         quality_adjusted,
         preserve_output_ulp: n > 1
             && limiting < n - 1
@@ -9773,6 +9838,19 @@ fn pay_in(
     options: PayInOptions,
 ) -> Result<(), TransactionResult> {
     if amount.is_xrp {
+        if owner == taker {
+            // An interior BookStep carries its input without first crediting
+            // the taker.  When the resting offer is also the taker's, paying
+            // that offer materialises the carried XRP on the detached account
+            // value that OfferCreate writes back at the end of the crossing.
+            if options.skip_taker_debit {
+                helpers::set_balance(
+                    taker_acct,
+                    helpers::get_balance(taker_acct) + amount.drops as u64,
+                );
+            }
+            return Ok(());
+        }
         if !options.skip_taker_debit {
             let bal = helpers::get_balance(taker_acct) as i64 - amount.drops;
             if bal < 0 {
@@ -10306,6 +10384,22 @@ fn net_offer_crossing_input(gross: &Leg, rate: &IOUAmount) -> Leg {
     let mut net = gross.clone();
     net.iou = IOUAmount::div_round(&gross.iou, rate, true).unwrap_or(gross.iou);
     net
+}
+
+/// OfferCreate's unfilled TakerGets is an upper bound. After Flow removes a
+/// fee-inclusive bridge input, rippled canonicalises the positive remainder
+/// downward before deriving TakerPays at the original offer quality.
+fn bridge_offer_input_remainder(
+    remaining: &Leg,
+    spent: &Leg,
+    round: bool,
+    took_self_offer: bool,
+) -> Leg {
+    if round && took_self_offer {
+        leg_sub_directional(remaining, spent, RoundingMode::Downward)
+    } else {
+        leftover_leg(remaining, spent, round)
+    }
 }
 
 /// OfferCreate tracks the unfilled offer in net units and Flow's source
@@ -12143,12 +12237,12 @@ mod taker_crossing_tests {
         BalanceRounding, Leg, TakerCrossType, add_iou_balance, add_iou_balance_downward,
         add_iou_balance_half_upward, aggregate_flow_source_balance_number,
         aggregate_output_remainder, amm_pool_debit_rounding, amm_recipient_rounding,
-        amm_step_allows_clob, book_destination_credit, book_payment_dust_drain,
-        book_step_input_exhausted, bridge_funded_xrp_input, canonical_direct_source_input,
-        clob_band_allows_terminal_amm, composed_quality, consumes_full_offer,
-        crossing_quality_threshold, crossing_threshold, debit_drains_source,
-        flow_first_book_spends_source_funds, flow_iou_to_iou, flow_iou_to_xrp, flow_net_input,
-        flow_source_funds_limit_binds, flow_xrp_to_iou, full_offer_take,
+        amm_step_allows_clob, book_balance_destination_credit, book_destination_credit,
+        book_payment_dust_drain, book_step_input_exhausted, bridge_funded_xrp_input,
+        bridge_offer_input_remainder, canonical_direct_source_input, clob_band_allows_terminal_amm,
+        composed_quality, consumes_full_offer, crossing_quality_threshold, crossing_threshold,
+        debit_drains_source, flow_first_book_spends_source_funds, flow_iou_to_iou, flow_iou_to_xrp,
+        flow_net_input, flow_source_funds_limit_binds, flow_xrp_to_iou, full_offer_take,
         funds_limited_xrp_rounds_up, gross_book_payment_input, in_for_out, in_for_out_offer,
         in_for_out_round, input_limited_uses_full_budget, leftover_is_dust, leftover_leg,
         leg_as_quality_iou, leg_ge, leg_gt, leg_max, leg_to_number,
@@ -14148,10 +14242,11 @@ mod taker_crossing_tests {
         let bridge_net = net_offer_crossing_input(&bridge_gross, &rate);
         assert_eq!(bridge_net.iou.to_decimal_string(), "0.0003904211593606591");
 
-        let remaining = leftover_leg(
+        let remaining = bridge_offer_input_remainder(
             &leftover_leg(&input, &direct_spent, true),
             &bridge_net,
             true,
+            false,
         );
         let orig_quality =
             get_rate_round_even(&leg_as_quality_iou(&input), &leg_as_quality_iou(&output)).unwrap();
@@ -14167,6 +14262,68 @@ mod taker_crossing_tests {
 
         assert_eq!(remaining_gets["value"], "0.1260795788406393");
         assert_eq!(remaining_pays["value"], "8068.571076344512");
+    }
+
+    #[test]
+    fn ledger_105504598_sell_bridge_remainder_rounds_down() {
+        let input = iou("0.1562");
+        let output = iou("10003.338532");
+        let direct_spent = iou("0.02981");
+        let bridge_gross = iou("0.000884652164378876");
+        let rate = IOUAmount::from_decimal_string("1.0015").unwrap();
+        let bridge_net = net_offer_crossing_input(&bridge_gross, &rate);
+        assert_eq!(bridge_net.iou.to_decimal_string(), "0.0008833271736184484");
+
+        let remaining = bridge_offer_input_remainder(
+            &leftover_leg(&input, &direct_spent, true),
+            &bridge_net,
+            true,
+            true,
+        );
+        assert_eq!(remaining.iou.to_decimal_string(), "0.1255066728263815");
+
+        let orig_quality =
+            get_rate_round_even(&leg_as_quality_iou(&input), &leg_as_quality_iou(&output)).unwrap();
+        let (remaining_pays, remaining_gets) = remaining_offer(
+            true,
+            orig_quality,
+            &output,
+            &remaining,
+            &output,
+            &input,
+            true,
+        );
+        assert_eq!(remaining_gets["value"], "0.1255066728263815");
+        assert_eq!(remaining_pays["value"], "8037.680770212926");
+    }
+
+    #[test]
+    fn self_owned_bridge_offer_does_not_credit_destination_balance() {
+        let demand = iou("100");
+        let remaining = iou("40");
+        let delivered = iou("60");
+        let self_only = book_balance_destination_credit(
+            &demand,
+            &remaining,
+            &delivered,
+            false,
+            false,
+            true,
+            &[],
+        );
+        assert!(self_only.is_zero());
+
+        let external = Number::from_iou(&IOUAmount::from_decimal_string("3.5").unwrap());
+        let mixed = book_balance_destination_credit(
+            &demand,
+            &remaining,
+            &delivered,
+            false,
+            false,
+            true,
+            &[external],
+        );
+        assert_eq!(mixed.to_decimal_string(), "3.5");
     }
 
     #[test]
@@ -16234,6 +16391,7 @@ mod taker_bridge_integration {
             false,
             false,
             false,
+            false,
         )
         .unwrap();
 
@@ -16437,6 +16595,7 @@ mod taker_bridge_integration {
             false,
             true,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(ordinary_quote.1.to_xrp_drops(), 1);
@@ -16464,6 +16623,7 @@ mod taker_bridge_integration {
             false,
             true,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(quoted.1.to_xrp_drops(), 2_702_825);
@@ -16589,6 +16749,7 @@ mod taker_bridge_integration {
             true,
             true,
             &mut reaps,
+            false,
             false,
             false,
             false,
@@ -16737,7 +16898,7 @@ mod taker_bridge_integration {
         };
 
         assert_eq!(
-            funded_book_tip_quality(&mut ctx, &taker, &book),
+            funded_book_tip_quality(&mut ctx, &taker, &book, false),
             Some(quality)
         );
         assert!(ctx.view.read(&offer_key).is_none());
@@ -19908,6 +20069,8 @@ mod flow_cross_own_unfunded {
                 1_000_000_000,
                 false,
                 false,
+                false,
+                None,
                 Some(&mut payment_reaps),
                 false,
                 false,
