@@ -2394,6 +2394,7 @@ fn cross_offers(
         }
         let offers = book_dir_indexes(ctx, &dir_key);
         let mut quoted_current_band = false;
+        let mut clob_crossed_in_band = false;
 
         for offer_key in offers {
             if !is_sell
@@ -2702,12 +2703,21 @@ fn cross_offers(
                 input_rate,
                 leg_ge(&order_in, &net_source_remaining),
             );
+            // An output-limited XRP buy rounds its input up to whole drops.
+            // When that fill is the entire BookStep pass, StrandFlow compares
+            // its realised quality against the limit independently of earlier
+            // bands (105504641 / 47AD0F81).
+            let output_limited_xrp_pass = !is_sell
+                && order_in.is_xrp
+                && !clob_crossed_in_band
+                && !leg_ge(&take_out, &avail_out)
+                && leg_ge(&take_out, &remaining_out);
             // A funds-limited quote can round its XRP output down to whole
             // drops while spending the entire IOU source. Flow rejects that
             // strand when its realized quality falls below the offer limit;
             // otherwise a tiny IOC crosses when rippled returns tecKILLED
             // (105503439/3D0B0D74).
-            if source_funds_bind
+            if (source_funds_bind || output_limited_xrp_pass)
                 && reject_quality(
                     quality_threshold(
                         &leg_as_quality_iou(&gross_in),
@@ -2718,6 +2728,7 @@ fn cross_offers(
                     threshold,
                 )
             {
+                terminal_amm_allowed &= !output_limited_xrp_pass;
                 break 'walk;
             }
             if input_rate == 1_000_000_000 {
@@ -2764,6 +2775,7 @@ fn cross_offers(
                 clob_source_spent.push(leg_to_number(&gross_in));
             }
             clob_offer_attempted = true;
+            clob_crossed_in_band = true;
             skip_amm_after_self_tip = false;
             terminal_amm_allowed = true;
 
@@ -17773,12 +17785,21 @@ mod flow_cross_own_unfunded {
         tx: &serde_json::Value,
     ) -> TransactionResult {
         let rules = Rules::from_enabled([feature_id("FlowCross")]);
+        apply_flow_with_rules(sandbox, fees, tx, &rules)
+    }
+
+    fn apply_flow_with_rules(
+        sandbox: &mut Sandbox<'_>,
+        fees: &FeeSettings,
+        tx: &Value,
+        rules: &Rules,
+    ) -> TransactionResult {
         let mut child = sandbox.child();
         let result = {
             let mut ctx = ApplyContext {
                 tx,
                 view: &mut child,
-                rules: &rules,
+                rules,
                 fees,
             };
             OfferCreateTransactor.apply(&mut ctx).unwrap()
@@ -17837,6 +17858,73 @@ mod flow_cross_own_unfunded {
                 serde_json::to_vec(&line).unwrap(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn ledger_105504641_rejects_rounded_xrp_cost_in_next_book_band() {
+        let mut ledger = Ledger::genesis();
+        for addr in [ISS, TAKER] {
+            let id = decode_account_id(addr).unwrap();
+            let account = serde_json::json!({
+                "LedgerEntryType": "AccountRoot", "Account": addr,
+                "Balance": "10000000000", "Sequence": 1, "OwnerCount": 0, "Flags": 0,
+            });
+            ledger
+                .put_state(keylet::account(&id), serde_json::to_vec(&account).unwrap())
+                .unwrap();
+        }
+        put_usd_line(&mut ledger, TAKER, 1);
+
+        let fees = FeeSettings::default();
+        let view = LedgerView::with_fees(&ledger, fees.clone());
+        let mut sandbox = Sandbox::new(&view);
+        let usd = |value| serde_json::json!({"currency": "USD", "issuer": ISS, "value": value});
+        let maker = decode_account_id(ISS).unwrap();
+        let rules =
+            Rules::from_enabled([feature_id("FlowCross"), feature_id("fixUniversalNumber")]);
+        // Combine the earlier favourable bands into a single fill. The
+        // next band meets the directory limit but misses it after XRP rounds.
+        for (sequence, input, output) in [
+            (1, "194786739", "214.6972692536599"),
+            (2, "9069009280", "9995.862028416"),
+        ] {
+            assert_eq!(
+                apply_flow_with_rules(
+                    &mut sandbox,
+                    &fees,
+                    &serde_json::json!({
+                        "TransactionType": "OfferCreate", "Account": ISS,
+                        "Fee": "10", "Sequence": sequence,
+                        "TakerGets": usd(output), "TakerPays": input,
+                    }),
+                    &rules,
+                ),
+                TransactionResult::TesSuccess
+            );
+        }
+
+        let next_offer = keylet::offer(&maker, 2);
+        let before = sandbox.read(&next_offer).unwrap();
+        let first_fill_cost = 194_786_739;
+        assert_eq!(
+            apply_flow_with_rules(
+                &mut sandbox,
+                &fees,
+                &serde_json::json!({
+                    "TransactionType": "OfferCreate", "Account": TAKER,
+                    "Fee": "10", "Sequence": 1, "Flags": TF_IMMEDIATE_OR_CANCEL,
+                    "TakerGets": "2643760818", "TakerPays": usd("2913.9531735"),
+                }),
+                &rules,
+            ),
+            TransactionResult::TesSuccess
+        );
+        assert!(sandbox.read(&keylet::offer(&maker, 1)).is_none());
+        assert_eq!(sandbox.read(&next_offer).unwrap(), before);
+        assert_eq!(
+            xrp_balance(&sandbox, TAKER),
+            10_000_000_000 - first_fill_cost
+        );
     }
 
     #[test]
